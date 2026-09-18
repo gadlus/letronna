@@ -12,13 +12,13 @@ pub(crate) const GATEWAYS: &[Gateway] = &[
         name: "Upstream Free",
         base: Upstream,
         needs_key: false,
-        blurb: "Guest access to the Upstream catalog. No key, a few replies per session.",
+        blurb: "Guest access to the free catalog. No key, a few replies per session.",
     },
     Gateway {
         name: "Upstream",
         base: Upstream,
         needs_key: true,
-        blurb: "Your Upstream account with an API key. Full catalog and quota.",
+        blurb: "Your Upstream account with an API key. Marketplace catalog and quota.",
     },
     Gateway {
         name: "OpenAI",

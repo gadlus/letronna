@@ -25,6 +25,8 @@ pub struct Connection {
     pub endpoint: String,
     pub model: String,
     pub key: String,
+    /// Use the Upstream guest route (free catalog, cookie session) instead of the keyed API.
+    pub guest: bool,
 }
 
 pub enum Event {
@@ -33,10 +35,8 @@ pub enum Event {
     Finished(Result<(), String>),
 }
 
-/// Free-catalog models go through the guest endpoint only when no API key is set.
-/// With a key, every model uses the authenticated OpenAI-compatible route.
 pub fn uses_guest_route(connection: &Connection) -> bool {
-    connection.model.starts_with("pool-free/") && connection.key.trim().is_empty()
+    connection.guest
 }
 
 /// The marketplace API does not know the `pool-free/` prefix; with a key, send the bare id
@@ -73,7 +73,10 @@ pub fn validate(connection: &Connection) -> Result<String, String> {
     let base = connection.endpoint.trim().trim_end_matches('/');
     if uses_guest_route(connection) {
         if base != "https://pool.example/v1" {
-            return Err("upstream Free models use the Upstream connection: https://pool.example/v1".into());
+            return Err("Upstream Free uses the Upstream base URL: https://pool.example/v1".into());
+        }
+        if !connection.model.starts_with("pool-free/") {
+            return Err("Upstream Free only serves models from the free catalog. Switch to the Upstream gateway for marketplace models.".into());
         }
         return Ok("https://chat.pool.example/api/free/chat/completions".into());
     }
@@ -361,6 +364,7 @@ mod tests {
             endpoint: "http://localhost:11434/v1/".into(),
             model: "test-model".into(),
             key: String::new(),
+            guest: false,
         }
     }
     #[test]
@@ -402,6 +406,7 @@ mod tests {
             endpoint: "https://pool.example/v1".into(),
             model: "pool-free/gpt-oss-20b".into(),
             key: String::new(),
+            guest: true,
         };
         assert_eq!(
             validate(&c).unwrap(),
@@ -409,6 +414,7 @@ mod tests {
         );
         let with_key = Connection {
             key: "sk-test".into(),
+            guest: false,
             ..c
         };
         assert_eq!(
@@ -425,6 +431,7 @@ mod tests {
                 endpoint: "https://pool.example/v1".into(),
                 model: "pool-free/gpt-oss-20b".into(),
                 key: String::new(),
+                guest: true,
             },
             vec![Message {
                 role: "user".into(),

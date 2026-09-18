@@ -35,6 +35,8 @@ First launch uses the Upstream Free gateway, which needs no key and gives a few 
 |-------------|-----------------------------------|----------|
 | Upstream Free   | `https://pool.example/v1`          | none     |
 | Upstream        | `https://pool.example/v1`          | required |
+
+Upstream Free talks to the guest chat API and lists the free catalog (`pool-free/…` ids). Upstream talks to the marketplace API with your key and lists its own catalog. The two catalogs are separate, so a model shown on one gateway is not necessarily served on the other.
 | OpenAI      | `https://api.openai.com/v1`       | required |
 | OpenRouter  | `https://openrouter.ai/api/v1`    | required |
 | Ollama      | `http://localhost:11434/v1`       | none     |
@@ -58,7 +60,8 @@ Requirements: Rust, Visual Studio C++ build tools, and a Windows SDK with `fxc.e
 
 ```powershell
 cargo build --release
-targetelease\letronna.exe   # registers itself on first run
+target
+elease\letronna.exe   # registers itself on first run
 ```
 
 Checks:
