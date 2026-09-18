@@ -235,7 +235,7 @@ fn free_session(client: &reqwest::blocking::Client) -> Result<(String, u64), Str
             "Cannot save the Upstream session. Check your data-folder permissions.".to_owned()
         })?;
     if remaining == 0 {
-        return Err("Your Upstream guest allowance is used up. Sign in at chat.pool.example to continue there; native account sign-in is not implemented yet. No paid fallback was used.".into());
+        return Err("Upstream guest replies are used up. Open Settings, pick the Upstream gateway and add your API key to keep going.".into());
     }
     Ok((cookie, remaining))
 }
