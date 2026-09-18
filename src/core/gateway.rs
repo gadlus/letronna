@@ -1,4 +1,5 @@
-use crate::prelude::*;
+
+pub(crate) const Upstream: &str = "https://pool.example/v1";
 
 pub(crate) struct Gateway {
     pub(crate) name: &'static str,
