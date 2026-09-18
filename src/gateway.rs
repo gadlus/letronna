@@ -46,6 +46,15 @@ pub(crate) const GATEWAYS: &[Gateway] = &[
     },
 ];
 
+/// Both Upstream gateways share one saved key.
+pub(crate) fn key_slot(name: &str) -> &str {
+    if gateway(name).base == Upstream {
+        "Upstream"
+    } else {
+        name
+    }
+}
+
 pub(crate) fn gateway(name: &str) -> &'static Gateway {
     GATEWAYS
         .iter()
