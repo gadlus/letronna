@@ -23,6 +23,16 @@ const MAX_REPLY: usize = 4000;
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub(crate) struct Config {
     #[serde(default)]
+    pub(crate) telegram: Telegram,
+    #[serde(default)]
+    pub(crate) discord: Discord,
+}
+
+/// Two-way: Telegram hands out messages over long polling, so Letronna can
+/// both hear and answer without being reachable from the internet.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub(crate) struct Telegram {
+    #[serde(default)]
     pub(crate) enabled: bool,
     #[serde(default)]
     pub(crate) token: String,
@@ -35,9 +45,26 @@ pub(crate) struct Config {
     pub(crate) allow_tools: bool,
 }
 
-impl Config {
+impl Telegram {
     pub(crate) fn ready(&self) -> bool {
         self.enabled && !self.token.trim().is_empty()
+    }
+}
+
+/// One-way. A webhook posts into a channel and cannot read anything back:
+/// Discord has no polling endpoint for bots, so hearing replies would mean
+/// holding a Gateway WebSocket open. Reporting results is what this is for.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub(crate) struct Discord {
+    #[serde(default)]
+    pub(crate) enabled: bool,
+    #[serde(default)]
+    pub(crate) webhook: String,
+}
+
+impl Discord {
+    pub(crate) fn ready(&self) -> bool {
+        self.enabled && self.webhook.trim().starts_with("https://")
     }
 }
 
@@ -122,11 +149,16 @@ pub(crate) fn send(token: &str, chat: i64, text: &str) -> Result<(), String> {
 }
 
 fn trim_reply(text: &str) -> String {
-    if text.chars().count() <= MAX_REPLY {
+    trim_to(text, MAX_REPLY)
+}
+
+/// Every chat service caps message length; trim rather than lose the message.
+fn trim_to(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
         return text.to_owned();
     }
-    let kept: String = text.chars().take(MAX_REPLY).collect();
-    format!("{kept}\n… (trimmed)")
+    let kept: String = text.chars().take(max).collect();
+    format!("{kept}\n\u{2026} (trimmed)")
 }
 
 /// Confirm the token works and return the bot's name.
@@ -233,4 +265,38 @@ mod tests {
         assert!(trimmed.chars().count() < MAX_REPLY + 20);
         assert!(trimmed.ends_with("… (trimmed)"));
     }
+}
+
+/// Post to a Discord channel. Send-only by nature: nothing comes back.
+pub(crate) fn discord_send(webhook: &str, text: &str) -> Result<(), String> {
+    let client = client().ok_or("Cannot initialize connection.")?;
+    // Discord's own limit is 2000 characters.
+    let text = trim_to(text, 1900);
+    client
+        .post(webhook.trim())
+        .json(&serde_json::json!({"content": text}))
+        .send()
+        .map_err(|_| "Cannot reach Discord.".to_owned())?
+        .error_for_status()
+        .map_err(|_| "Discord rejected the message.".to_owned())?;
+    Ok(())
+}
+
+/// Confirm the webhook exists and say what it is called.
+pub(crate) fn discord_check(webhook: &str) -> Result<String, String> {
+    let url = webhook.trim();
+    if !url.starts_with("https://") {
+        return Err("Paste the full webhook URL, starting with https://".into());
+    }
+    let client = client().ok_or("Cannot initialize connection.")?;
+    let body: serde_json::Value = client
+        .get(url)
+        .send()
+        .map_err(|_| "Cannot reach Discord.".to_owned())?
+        .json()
+        .map_err(|_| "That does not look like a Discord webhook.".to_owned())?;
+    body["id"]
+        .as_str()
+        .ok_or_else(|| "Discord did not recognise that webhook.".to_owned())?;
+    Ok(body["name"].as_str().unwrap_or("webhook").to_owned())
 }

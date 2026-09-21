@@ -122,10 +122,15 @@ pub(crate) struct Chat {
     pub(crate) messaging: crate::core::messaging::Config,
     /// A chat that has messaged the bot but has not been allowed yet.
     pub(crate) pairing: Option<(i64, String)>,
+    /// Sessions a schedule opened, so their result can be reported onward.
+    pub(crate) scheduled: std::collections::HashSet<u64>,
     /// Sessions opened for a remote chat, so the reply goes back to it.
     pub(crate) remote: std::collections::HashMap<u64, i64>,
     pub(crate) messaging_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub(crate) token_input: Entity<InputState>,
+    pub(crate) webhook_input: Entity<InputState>,
+    /// The webhook's name, once it has been checked.
+    pub(crate) hook_name: Option<String>,
     /// The connected bot's @name, once the token has been checked.
     pub(crate) bot_name: Option<String>,
     /// Selected row on the Messaging page.
@@ -211,7 +216,12 @@ impl Chat {
             InputState::new(window, cx)
                 .masked(true)
                 .placeholder("Bot token from @BotFather")
-                .default_value(crate::core::messaging::load().token)
+                .default_value(crate::core::messaging::load().telegram.token)
+        });
+        let webhook_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("https://discord.com/api/webhooks/...")
+                .default_value(crate::core::messaging::load().discord.webhook)
         });
         let skill_name =
             cx.new(|cx| InputState::new(window, cx).placeholder("Review these changes"));
@@ -285,9 +295,12 @@ impl Chat {
             job_prompt,
             messaging: crate::core::messaging::load(),
             pairing: None,
+            scheduled: std::collections::HashSet::new(),
             remote: std::collections::HashMap::new(),
             messaging_stop: None,
             token_input,
+            webhook_input,
+            hook_name: None,
             bot_name: None,
             channel: 0,
             skills: crate::core::skills::load(),
@@ -538,12 +551,13 @@ impl Chat {
         });
         self.store.active = self.store.conversations.len() - 1;
         self.page = Page::Chat;
+        let session = self.store.conversations[self.store.active].id;
+        self.scheduled.insert(session);
         // Nobody is necessarily watching, so an unattended schedule skips the
         // approval cards that would otherwise stall it -- but only in the
         // session it just opened.
         if schedule.unattended {
-            let id = self.store.conversations[self.store.active].id;
-            self.unattended.insert(id);
+            self.unattended.insert(session);
         }
         let _ = self.dispatch(schedule.prompt.clone(), cx);
     }
@@ -741,12 +755,12 @@ impl Chat {
         if let Some(stop) = self.messaging_stop.take() {
             stop.store(true, Ordering::Relaxed);
         }
-        if !self.messaging.ready() {
+        if !self.messaging.telegram.ready() {
             return;
         }
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let (tx, rx) = async_channel::unbounded();
-        crate::core::messaging::poll(self.messaging.token.clone(), stop.clone(), tx);
+        crate::core::messaging::poll(self.messaging.telegram.token.clone(), stop.clone(), tx);
         self.messaging_stop = Some(stop);
         cx.spawn(async move |this, cx| {
             while let Ok(message) = rx.recv().await {
@@ -762,7 +776,7 @@ impl Chat {
     }
 
     fn tell_remote(&self, chat: i64, text: &str, cx: &mut Context<Self>) {
-        let token = self.messaging.token.clone();
+        let token = self.messaging.telegram.token.clone();
         let text = text.to_owned();
         cx.background_executor()
             .spawn(async move {
@@ -774,7 +788,7 @@ impl Chat {
     /// A message arrived from the bot. Anything from a chat the user has not
     /// approved is held for approval rather than acted on.
     fn on_remote(&mut self, message: crate::core::messaging::Incoming, cx: &mut Context<Self>) {
-        if self.messaging.chat != Some(message.chat) {
+        if self.messaging.telegram.chat != Some(message.chat) {
             self.pairing = Some((message.chat, message.from));
             cx.notify();
             return;
@@ -803,9 +817,42 @@ impl Chat {
         // Nobody on the far end can answer an approval card, so unless the
         // user has said otherwise a remote message may look but not touch.
         let was_plan = self.plan_mode;
-        self.plan_mode = !self.messaging.allow_tools;
+        self.plan_mode = !self.messaging.telegram.allow_tools;
         let _ = self.dispatch(message.text, cx);
         self.plan_mode = was_plan;
+    }
+
+    /// A scheduled run has no one watching, so post what it concluded to
+    /// Discord if a webhook is set up. One-way is enough here: the point is
+    /// to find out what happened while away.
+    fn report_scheduled(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.streaming_id else { return };
+        if !self.scheduled.remove(&id) || !self.messaging.discord.ready() {
+            return;
+        }
+        let Some(ix) = self.store.index_of(id) else {
+            return;
+        };
+        let conversation = &self.store.conversations[ix];
+        let Some(reply) = conversation
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant" && !m.content.is_empty())
+        else {
+            return;
+        };
+        let text = format!(
+            "**{}**
+{}",
+            conversation.title, reply.content
+        );
+        let webhook = self.messaging.discord.webhook.clone();
+        cx.background_executor()
+            .spawn(async move {
+                let _ = crate::core::messaging::discord_send(&webhook, &text);
+            })
+            .detach();
     }
 
     /// Send the finished reply back to the chat that asked for it.
@@ -904,6 +951,7 @@ impl Chat {
 
     fn finish(&mut self, cx: &mut Context<Self>) {
         self.answer_remote(cx);
+        self.report_scheduled(cx);
         self.busy = false;
         self.streaming_id = None;
         self.pending_calls.clear();
