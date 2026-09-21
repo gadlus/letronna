@@ -5,5 +5,6 @@ pub(crate) mod chat;
 pub(crate) mod gateway;
 pub(crate) mod jobs;
 pub(crate) mod schedule;
+pub(crate) mod skills;
 pub(crate) mod store;
 pub(crate) mod tools;

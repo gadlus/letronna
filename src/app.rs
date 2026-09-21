@@ -119,6 +119,10 @@ pub(crate) struct Chat {
     pub(crate) editing: Option<u64>,
     pub(crate) job_name: Entity<InputState>,
     pub(crate) job_prompt: Entity<InputState>,
+    pub(crate) skills: Vec<crate::core::skills::Skill>,
+    pub(crate) editing_skill: Option<u64>,
+    pub(crate) skill_name: Entity<InputState>,
+    pub(crate) skill_prompt: Entity<InputState>,
     pub(crate) live_tokens: u64,
     pub(crate) live_per_second: f32,
     pub(crate) live_prompt: u64,
@@ -192,6 +196,14 @@ impl Chat {
         let rename = cx.new(|cx| InputState::new(window, cx).placeholder("Session name"));
         let answer = cx.new(|cx| InputState::new(window, cx).placeholder("Your answer…"));
         let job_name = cx.new(|cx| InputState::new(window, cx).placeholder("Morning check"));
+        let skill_name =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Review these changes"));
+        let skill_prompt = cx.new(|cx| {
+            InputState::new(window, cx)
+                .multi_line(true)
+                .auto_grow(3, 10)
+                .placeholder("What should Letronna do?")
+        });
         let job_prompt = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
@@ -254,6 +266,10 @@ impl Chat {
             editing: None,
             job_name,
             job_prompt,
+            skills: crate::core::skills::load(),
+            editing_skill: None,
+            skill_name,
+            skill_prompt,
             live_tokens: 0,
             live_per_second: 0.,
             live_prompt: 0,
@@ -846,6 +862,10 @@ impl Render for Chat {
 
         let body: AnyElement = if self.page == Page::Jobs {
             self.schedules_page(cx).into_any_element()
+        } else if self.page == Page::Artifacts {
+            self.artifacts_page(cx).into_any_element()
+        } else if self.page == Page::Skills {
+            self.skills_page(cx).into_any_element()
         } else if self.page != Page::Chat {
             self.page_view(self.page, cx).into_any_element()
         } else if conversation.messages.is_empty() && !streaming_here {
