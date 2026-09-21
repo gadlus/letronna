@@ -3472,6 +3472,7 @@ name = "letronna"
 version = "0.1.0-alpha.1"
 dependencies = [
  "async-channel 2.5.0",
+ "chrono",
  "discord-rich-presence",
  "embed-resource",
  "gpui",

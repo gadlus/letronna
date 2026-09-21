@@ -61,7 +61,8 @@ impl Page {
                 "Connect Telegram, Discord, Slack or email gateways. No channel configured yet."
             }
             Page::Artifacts => "Files, images and links produced in sessions will collect here.",
-            Page::Jobs => "Recurring tasks on a schedule. No jobs yet.",
+            // Jobs renders its own page; this blurb is only a fallback.
+            Page::Jobs => "Prompts that run on a timer.",
         }
     }
 }
@@ -108,6 +109,11 @@ pub(crate) struct Chat {
     pub(crate) job_tick: bool,
     /// Plan mode: the model may read and ask, but not change anything.
     pub(crate) plan_mode: bool,
+    pub(crate) schedules: Vec<crate::core::schedule::Schedule>,
+    /// Id of the schedule being edited on the Scheduled jobs page.
+    pub(crate) editing: Option<u64>,
+    pub(crate) job_name: Entity<InputState>,
+    pub(crate) job_prompt: Entity<InputState>,
     pub(crate) live_tokens: u64,
     pub(crate) live_per_second: f32,
     pub(crate) live_prompt: u64,
@@ -180,6 +186,13 @@ impl Chat {
         let settings_page = cx.new(|_| "Gateways");
         let rename = cx.new(|cx| InputState::new(window, cx).placeholder("Session name"));
         let answer = cx.new(|cx| InputState::new(window, cx).placeholder("Your answer…"));
+        let job_name = cx.new(|cx| InputState::new(window, cx).placeholder("Morning check"));
+        let job_prompt = cx.new(|cx| {
+            InputState::new(window, cx)
+                .multi_line(true)
+                .auto_grow(2, 6)
+                .placeholder("Run the tests and tell me what broke.")
+        });
         let subscriptions = vec![
             cx.subscribe_in(&model_search, window, |_, _, _: &InputEvent, _, cx| {
                 cx.notify()
@@ -231,6 +244,10 @@ impl Chat {
             answer,
             job_tick: false,
             plan_mode: false,
+            schedules: crate::core::schedule::load(),
+            editing: None,
+            job_name,
+            job_prompt,
             live_tokens: 0,
             live_per_second: 0.,
             live_prompt: 0,
@@ -241,6 +258,7 @@ impl Chat {
             _subscriptions: subscriptions,
         };
         this.load_models(window, cx);
+        Self::watch_schedules(cx);
         if this.store.presence == "off" {
             plugins::set_enabled(cx, plugins::DISCORD, false);
             this.store.presence = "detailed".into();
@@ -357,6 +375,21 @@ impl Chat {
             cx.notify();
             return;
         }
+        self.composer
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        if self.dispatch(prompt, cx).is_err() {
+            self.open_settings(window, cx);
+        }
+    }
+
+    /// Send a prompt in the active session. Split out of `send` so a schedule
+    /// can fire one with no window in hand. `Err` means the gateway is not
+    /// usable; the caller decides whether to open Settings about it.
+    pub(crate) fn dispatch(
+        &mut self,
+        prompt: String,
+        cx: &mut Context<Self>,
+    ) -> std::result::Result<(), ()> {
         let connection = Connection {
             endpoint: self.endpoint.read(cx).value().to_string(),
             model: self.model.read(cx).value().to_string(),
@@ -368,14 +401,17 @@ impl Chat {
         };
         if let Err(error) = backend::validate(&connection) {
             self.error = Some(error);
-            self.open_settings(window, cx);
             cx.notify();
-            return;
+            return Err(());
         }
         self.store.endpoint = connection.endpoint.clone();
         self.store.model = connection.model.clone();
         let conversation = &mut self.store.conversations[self.store.active];
-        if conversation.messages.is_empty() {
+        // Name an untitled session after its first prompt, but leave a name
+        // that was set deliberately, such as a scheduled job's.
+        if conversation.messages.is_empty()
+            && (conversation.title.is_empty() || conversation.title == "New session")
+        {
             conversation.title = prompt.chars().take(40).collect();
         }
         conversation.updated = backend::now();
@@ -385,8 +421,6 @@ impl Chat {
             ..Default::default()
         });
         let target_id = conversation.id;
-        self.composer
-            .update(cx, |input, cx| input.set_value("", window, cx));
         self.busy = true;
         self.streaming_id = Some(target_id);
         self.rounds = 0;
@@ -403,6 +437,70 @@ impl Chat {
         self.save();
         self.scroll.scroll_to_bottom();
         self.run_turn(connection, cx);
+        Ok(())
+    }
+
+    /// Check every half minute for a schedule that is due and run it. Only one
+    /// fires per check, so a backlog drains one at a time instead of opening a
+    /// dozen sessions at once.
+    pub(crate) fn watch_schedules(cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(30))
+                    .await;
+                if this.update(cx, |this, cx| this.run_due(cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn run_due(&mut self, cx: &mut Context<Self>) {
+        // A run in progress owns the agent loop; wait rather than interleave.
+        if self.busy {
+            return;
+        }
+        let now = chrono::Local::now();
+        let Some(index) = self
+            .schedules
+            .iter()
+            .position(|s| crate::core::schedule::is_due(s, now))
+        else {
+            return;
+        };
+        self.schedules[index].last_run = backend::now();
+        crate::core::schedule::save(&self.schedules);
+        let schedule = self.schedules[index].clone();
+        self.start_scheduled(&schedule, cx);
+    }
+
+    /// Open a fresh session for a schedule and send its prompt.
+    pub(crate) fn start_scheduled(
+        &mut self,
+        schedule: &crate::core::schedule::Schedule,
+        cx: &mut Context<Self>,
+    ) {
+        self.store.conversations.push(Conversation {
+            id: self.store.next_id(),
+            title: schedule.name.clone(),
+            updated: backend::now(),
+            workspace: schedule.workspace.clone(),
+            ..Default::default()
+        });
+        self.store.active = self.store.conversations.len() - 1;
+        self.page = Page::Chat;
+        // Nobody is necessarily watching, so an unattended schedule skips the
+        // approval cards that would otherwise stall it.
+        if schedule.unattended {
+            for tool in crate::core::tools::all() {
+                if tool.needs_approval() && tool.name() != crate::core::tools::ASK_USER {
+                    self.session_allow.insert(tool.name().to_owned());
+                }
+            }
+        }
+        let _ = self.dispatch(schedule.prompt.clone(), cx);
     }
 
     /// One model call. If it ends in tool calls, run them and go again.
@@ -730,7 +828,9 @@ impl Render for Chat {
         // Only the session the reply was sent from shows the live row.
         let streaming_here = self.busy && self.streaming_id == Some(conversation.id);
 
-        let body: AnyElement = if self.page != Page::Chat {
+        let body: AnyElement = if self.page == Page::Jobs {
+            self.schedules_page(cx).into_any_element()
+        } else if self.page != Page::Chat {
             self.page_view(self.page, cx).into_any_element()
         } else if conversation.messages.is_empty() && !streaming_here {
             self.empty_state(cx).into_any_element()
