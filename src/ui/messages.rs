@@ -207,13 +207,7 @@ impl Chat {
                             .truncate()
                             .child(summary),
                     )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .text_color(color)
-                            .truncate()
-                            .child(status),
-                    )
+                    .child(div().min_w_0().text_color(color).truncate().child(status))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if !this.thinking_open.remove(&index) {
                             this.thinking_open.insert(index);

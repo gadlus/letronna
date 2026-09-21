@@ -54,6 +54,8 @@ impl AssetSource for Assets {
             "circle-user",
             "plugs",
             "palette",
+            "list-checks",
+            "circle",
             "list-filter"
         ))
     }
@@ -84,6 +86,8 @@ pub(crate) enum AppIcon {
     Robot,
     Plugs,
     Palette,
+    Checklist,
+    Circle,
 }
 impl IconNamed for AppIcon {
     fn path(self) -> SharedString {
@@ -108,6 +112,8 @@ impl IconNamed for AppIcon {
             AppIcon::Robot => "icons/bot.svg",
             AppIcon::Plugs => "icons/plugs.svg",
             AppIcon::Palette => "icons/palette.svg",
+            AppIcon::Checklist => "icons/list-checks.svg",
+            AppIcon::Circle => "icons/circle.svg",
         }
         .into()
     }

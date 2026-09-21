@@ -168,6 +168,58 @@ impl Chat {
         });
     }
 
+    /// The model's checklist, above the composer while work is outstanding.
+    /// It disappears on its own once everything is done.
+    pub(crate) fn todo_panel(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let todos = &self.store.conversations[self.store.active].todos;
+        if todos.is_empty() || todos.iter().all(|t| t.status == "done") {
+            return None;
+        }
+        let done = todos.iter().filter(|t| t.status == "done").count();
+        let rows = todos.iter().enumerate().map(|(i, todo)| {
+            // The three states use icons from different sets, so build the
+            // element in each arm rather than passing a name around.
+            let (icon, color) = match todo.status.as_str() {
+                "done" => (Icon::new(IconName::CircleCheck), cx.theme().green),
+                "doing" => (Icon::new(IconName::LoaderCircle), cx.theme().primary),
+                _ => (Icon::new(AppIcon::Circle), cx.theme().muted_foreground),
+            };
+            h_flex()
+                .gap_2()
+                .items_center()
+                .text_xs()
+                .child(icon.size_3().text_color(color))
+                .child(
+                    div()
+                        .when(todo.status == "done", |d| {
+                            d.line_through().text_color(cx.theme().muted_foreground)
+                        })
+                        .child(todo.text.clone()),
+                )
+                .id(("todo", i))
+        });
+        Some(
+            v_flex()
+                .w_full()
+                .gap_1p5()
+                .mb_2()
+                .px_3()
+                .py_2p5()
+                .rounded(cx.theme().radius)
+                .border_1()
+                .border_color(cx.theme().border)
+                .bg(cx.theme().secondary.opacity(0.3))
+                .child(
+                    div()
+                        .text_xs()
+                        .font_family(HEADING_FONT)
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!("Plan · {done} of {} done", todos.len())),
+                )
+                .children(rows),
+        )
+    }
+
     pub(crate) fn composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let chat = cx.entity();
         let attach = Button::new("attach")
@@ -235,6 +287,32 @@ impl Chat {
                         .appearance(false)
                         .disabled(self.busy),
                 ),
+            )
+            .child(
+                Button::new("plan-mode")
+                    .ghost()
+                    .xsmall()
+                    .tooltip(if self.plan_mode {
+                        "Plan mode on: reads and asks only. Click to let it act."
+                    } else {
+                        "Plan mode off. Click to stop it writing or running anything."
+                    })
+                    .text_color(if self.plan_mode {
+                        cx.theme().primary
+                    } else {
+                        cx.theme().muted_foreground
+                    })
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(Icon::new(AppIcon::Checklist).size_3())
+                            .child("Plan"),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.plan_mode = !this.plan_mode;
+                        cx.notify();
+                    })),
             )
             .child(self.model_picker(cx))
             .child(

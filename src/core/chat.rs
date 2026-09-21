@@ -58,6 +58,8 @@ pub struct Connection {
     pub tools: bool,
     /// Folder the session works in, shown to the model.
     pub workspace: Option<std::path::PathBuf>,
+    /// Plan mode: read and ask only, nothing that changes the project.
+    pub plan: bool,
 }
 
 pub enum Event {
@@ -168,6 +170,9 @@ fn body(connection: &Connection, messages: &[Message]) -> Value {
     } else {
         system.push_str(" You have no tools or filesystem access on this gateway.");
     }
+    if connection.plan {
+        system.push_str(" Plan mode is on: you can read, search and ask, but you cannot write files or run commands, and those tools are unavailable. Work out what you would do and lay out the plan, then let the user turn plan mode off to carry it out.");
+    }
     let mut context = vec![json!({"role": "system", "content": system})];
     let window = &messages[start..];
     for (i, m) in window.iter().enumerate() {
@@ -195,7 +200,7 @@ fn body(connection: &Connection, messages: &[Message]) -> Value {
         "stream_options": {"include_usage": true}
     });
     if connection.tools {
-        body["tools"] = Value::Array(super::tools::specs());
+        body["tools"] = Value::Array(super::tools::specs(connection.plan));
     }
     body
 }
@@ -235,6 +240,13 @@ fn wire_message(m: &Message) -> Value {
             .collect();
     }
     v
+}
+
+/// Statuses worth one retry: gateway and edge failures that say nothing about
+/// the request itself. 520-527 are Cloudflare's own (525 is a failed TLS
+/// handshake between the edge and the origin).
+fn transient(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 502 | 503 | 504 | 520..=527)
 }
 
 fn unwrap_response(value: &Value) -> Result<&Value, String> {
@@ -467,7 +479,24 @@ fn stream(
         }
         None
     };
-    let response = request.send().map_err(|_| "Cannot reach the model. Check that your server is running and the endpoint is correct (120-second request timeout).".to_owned())?;
+    // A transient edge failure part way through an agent loop would otherwise
+    // lose the whole task, so give it one more go before giving up.
+    let mut attempt = 0;
+    let response = loop {
+        attempt += 1;
+        let send = request
+            .try_clone()
+            .ok_or("Could not prepare the request.")?
+            .send();
+        match send {
+            Ok(response) if transient(response.status()) && attempt == 1 => {
+                std::thread::sleep(Duration::from_millis(600));
+            }
+            Ok(response) => break response,
+            Err(_) if attempt == 1 => std::thread::sleep(Duration::from_millis(600)),
+            Err(_) => return Err("Cannot reach the model. Check that your server is running and the endpoint is correct (120-second request timeout).".to_owned()),
+        }
+    };
     let status = response.status();
     if !status.is_success() {
         let detail = response
@@ -475,10 +504,14 @@ fn stream(
             .ok()
             .and_then(|v| unwrap_response(&v).err());
         return Err(detail.unwrap_or_else(|| {
-            format!(
-                "Provider returned HTTP {}. Check connection settings and quota.",
-                status.as_u16()
-            )
+            let code = status.as_u16();
+            if transient(status) {
+                format!(
+                    "The gateway is having trouble right now (HTTP {code}). This is at                      the provider's end, not your settings. Try again in a moment, or                      switch gateway in Settings."
+                )
+            } else {
+                format!("Provider returned HTTP {code}. Check connection settings and quota.")
+            }
         }));
     }
     if response
@@ -575,6 +608,7 @@ mod tests {
             guest: false,
             tools: false,
             workspace: None,
+            plan: false,
         }
     }
     #[test]
@@ -624,6 +658,7 @@ mod tests {
             guest: true,
             tools: false,
             workspace: None,
+            plan: false,
         };
         assert_eq!(
             validate(&c).unwrap(),
@@ -651,6 +686,7 @@ mod tests {
                 guest: true,
                 tools: false,
                 workspace: None,
+                plan: false,
             },
             vec![Message {
                 role: "user".into(),
@@ -685,6 +721,7 @@ mod tests {
             guest: false,
             tools: true,
             workspace: Some(std::env::current_dir().unwrap()),
+            plan: false,
         };
         let ctx = super::super::tools::ToolContext {
             workspace: connection.workspace.clone(),
@@ -801,14 +838,43 @@ mod tests {
         assert_eq!(calls[0].id, "c1");
         assert_eq!(calls[0].name, "read_file");
         assert_eq!(calls[0].arguments, r#"{"path":"a.rs"}"#);
-        let tools = body(
-            &Connection {
-                tools: true,
-                ..connection()
-            },
-            &[],
-        );
-        assert_eq!(tools["tools"].as_array().unwrap().len(), 10);
+        let names = |plan: bool| -> Vec<String> {
+            body(
+                &Connection {
+                    tools: true,
+                    plan,
+                    ..connection()
+                },
+                &[],
+            )["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["function"]["name"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        let full = names(false);
+        assert!(full.contains(&"read_file".to_owned()));
+        assert!(full.contains(&"write_file".to_owned()));
+        // Plan mode offers the same tools minus everything that acts.
+        let planning = names(true);
+        assert!(planning.contains(&"read_file".to_owned()));
+        for blocked in ["write_file", "edit_file", "run_command", "stop_job"] {
+            assert!(
+                !planning.contains(&blocked.to_owned()),
+                "{blocked} in plan mode"
+            );
+        }
+    }
+    #[test]
+    fn transient_statuses_are_retried_not_blamed_on_the_user() {
+        use reqwest::StatusCode;
+        for code in [502, 503, 504, 520, 525, 527] {
+            assert!(transient(StatusCode::from_u16(code).unwrap()), "{code}");
+        }
+        for code in [400, 401, 403, 404, 429, 500] {
+            assert!(!transient(StatusCode::from_u16(code).unwrap()), "{code}");
+        }
     }
     #[test]
     fn dangling_tool_calls_get_placeholder_results() {

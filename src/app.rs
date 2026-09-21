@@ -106,6 +106,8 @@ pub(crate) struct Chat {
     pub(crate) answer: Entity<InputState>,
     /// Whether the footer is already polling background jobs.
     pub(crate) job_tick: bool,
+    /// Plan mode: the model may read and ask, but not change anything.
+    pub(crate) plan_mode: bool,
     pub(crate) live_tokens: u64,
     pub(crate) live_per_second: f32,
     pub(crate) thinking_open: std::collections::HashSet<usize>,
@@ -226,6 +228,7 @@ impl Chat {
             session_allow: std::collections::HashSet::new(),
             answer,
             job_tick: false,
+            plan_mode: false,
             live_tokens: 0,
             live_per_second: 0.,
             thinking_open: std::collections::HashSet::new(),
@@ -357,6 +360,7 @@ impl Chat {
             guest: self.store.gateway == GATEWAYS[0].name,
             tools: self.store.gateway != GATEWAYS[0].name,
             workspace: None,
+            plan: self.plan_mode,
         };
         if let Err(error) = backend::validate(&connection) {
             self.error = Some(error);
@@ -519,6 +523,10 @@ impl Chat {
             }
             return;
         };
+        if call.name == crate::core::tools::TODO {
+            self.apply_todo(&call.arguments, cx);
+            return;
+        }
         let gated = crate::core::tools::needs_approval(&call.name)
             && (call.name == crate::core::tools::ASK_USER
                 || !(self.store.skip_approvals || self.session_allow.contains(&call.name)));
@@ -572,6 +580,37 @@ impl Chat {
         });
         self.follow();
         self.advance_tools(cx);
+    }
+
+    /// Store the model's checklist on the session so the composer can show it.
+    fn apply_todo(&mut self, arguments: &str, cx: &mut Context<Self>) {
+        let result = crate::core::tools::parse_args(arguments).and_then(|args| {
+            let items = args["items"]
+                .as_array()
+                .ok_or_else(|| "`items` is required.".to_owned())?;
+            let todos: Vec<Todo> = items
+                .iter()
+                .map(|item| Todo {
+                    text: item["text"].as_str().unwrap_or_default().to_owned(),
+                    status: item["status"].as_str().unwrap_or("pending").to_owned(),
+                })
+                .filter(|todo| !todo.text.is_empty())
+                .collect();
+            let done = todos.iter().filter(|t| t.status == "done").count();
+            Ok((todos, done))
+        });
+        let message = match result {
+            Ok((todos, done)) => {
+                let total = todos.len();
+                if let Some(ix) = self.streaming_id.and_then(|id| self.store.index_of(id)) {
+                    self.store.conversations[ix].todos = todos;
+                    self.save();
+                }
+                Ok(format!("Checklist updated: {done} of {total} done."))
+            }
+            Err(error) => Err(error),
+        };
+        self.record_result(message, cx);
     }
 
     /// The user answered the approval card.
@@ -771,12 +810,13 @@ impl Render for Chat {
             .child(body)
             .when(self.page == Page::Chat, |this| {
                 this.child(
-                    div()
+                    v_flex()
                         .w_full()
                         .when(self.sidebar_open, |d| d.max_w(relative(0.82)))
                         .mx_auto()
                         .px_6()
                         .pb_2()
+                        .children(self.todo_panel(cx))
                         .child(self.composer(cx)),
                 )
             })

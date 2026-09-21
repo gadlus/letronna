@@ -25,6 +25,11 @@ pub trait Tool: Send + Sync {
     fn needs_approval(&self) -> bool {
         false
     }
+    /// Whether the tool changes anything outside Letronna. Plan mode hides
+    /// these so the model can look and propose but not act.
+    fn mutates(&self) -> bool {
+        false
+    }
     /// What the approval card shows: a diff, the file body, the command line.
     fn preview(&self, args: &Value, ctx: &ToolContext) -> String {
         let _ = ctx;
@@ -33,6 +38,7 @@ pub trait Tool: Send + Sync {
 }
 
 pub const ASK_USER: &str = "ask_user";
+pub const TODO: &str = "todo";
 /// The tool result the model gets when the user denies a call.
 pub const DECLINED: &str = "The user declined this action. Ask before trying a different approach.";
 const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
@@ -55,6 +61,7 @@ pub fn all() -> Vec<Box<dyn Tool>> {
         Box::new(StopJob),
         Box::new(Wait),
         Box::new(AskUser),
+        Box::new(Todo),
     ]
 }
 
@@ -89,10 +96,12 @@ pub fn preview(name: &str, args: &str, ctx: &ToolContext) -> String {
     }
 }
 
-/// The `tools` array for a chat completion request.
-pub fn specs() -> Vec<Value> {
+/// The `tools` array for a chat completion request. In plan mode the tools
+/// that change things are left out entirely, so the model cannot try them.
+pub fn specs(plan: bool) -> Vec<Value> {
     all()
         .iter()
+        .filter(|t| !plan || !t.mutates())
         .map(|t| {
             json!({"type": "function", "function": {
                 "name": t.name(),
@@ -143,6 +152,10 @@ pub fn summary(name: &str, args: &str) -> String {
             _ => format!("{}s", v["seconds"].as_f64().unwrap_or(10.)),
         },
         ASK_USER => v["question"].as_str().unwrap_or_default().to_owned(),
+        TODO => {
+            let items = v["items"].as_array().map(Vec::len).unwrap_or(0);
+            format!("{items} items")
+        }
         _ => v["path"].as_str().unwrap_or(".").to_owned(),
     };
     one_line(&text)
@@ -252,6 +265,9 @@ fn run_shell(command: &str, cwd: Option<&Path>) -> Result<String, String> {
 
 struct WriteFile;
 impl Tool for WriteFile {
+    fn mutates(&self) -> bool {
+        true
+    }
     fn name(&self) -> &'static str {
         "write_file"
     }
@@ -283,6 +299,9 @@ impl Tool for WriteFile {
 
 struct EditFile;
 impl Tool for EditFile {
+    fn mutates(&self) -> bool {
+        true
+    }
     fn name(&self) -> &'static str {
         "edit_file"
     }
@@ -332,6 +351,9 @@ impl Tool for EditFile {
 
 struct RunCommand;
 impl Tool for RunCommand {
+    fn mutates(&self) -> bool {
+        true
+    }
     fn name(&self) -> &'static str {
         "run_command"
     }
@@ -421,6 +443,9 @@ impl Tool for ReadJob {
 
 struct StopJob;
 impl Tool for StopJob {
+    fn mutates(&self) -> bool {
+        true
+    }
     fn name(&self) -> &'static str {
         "stop_job"
     }
@@ -519,6 +544,30 @@ impl Tool for AskUser {
     }
     fn run(&self, _: &Value, _: &ToolContext) -> Result<String, String> {
         Err("ask_user is answered by the user.".into())
+    }
+}
+
+/// A checklist the model keeps for itself. The app stores the items on the
+/// conversation and draws them above the composer; see `Chat::apply_todo`.
+struct Todo;
+impl Tool for Todo {
+    fn name(&self) -> &'static str {
+        TODO
+    }
+    fn description(&self) -> &'static str {
+        "Record or update your plan as a checklist the user can see. Send the whole list every time, with each item's status. Use it for work with several steps, and mark items done as you go."
+    }
+    fn parameters(&self) -> Value {
+        json!({"type": "object", "properties": {
+            "items": {"type": "array", "items": {"type": "object", "properties": {
+                "text": {"type": "string"},
+                "status": {"type": "string", "enum": ["pending", "doing", "done"]}
+            }, "required": ["text", "status"]}}
+        }, "required": ["items"]})
+    }
+    fn run(&self, args: &Value, _: &ToolContext) -> Result<String, String> {
+        let items = args["items"].as_array().ok_or("`items` is required.")?;
+        Ok(format!("Noted {} items.", items.len()))
     }
 }
 

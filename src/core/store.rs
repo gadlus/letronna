@@ -15,6 +15,16 @@ pub(crate) struct Conversation {
     /// Project folder attached to this session, if any.
     #[serde(default)]
     pub(crate) workspace: Option<PathBuf>,
+    /// The model's own checklist for the work in progress.
+    #[serde(default)]
+    pub(crate) todos: Vec<Todo>,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub(crate) struct Todo {
+    pub(crate) text: String,
+    /// "pending", "doing" or "done".
+    pub(crate) status: String,
 }
 #[derive(Default, Serialize, Deserialize)]
 pub(crate) struct Store {
