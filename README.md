@@ -21,9 +21,21 @@ Letronna is a chat-first desktop app built on [GPUI](https://github.com/zed-indu
 
 ## Run it
 
-Download or build `letronna.exe` and double-click it. Windows only for now.
+Download or build it and run it.
 
-On first launch it registers itself: the executable is copied to `%LOCALAPPDATA%\Programs\Letronna`, a Start Menu entry is added so it shows up in Windows search, and an entry appears in Apps & features. Newer builds re-register on launch. Uninstall from Apps & features, or run `Letronna.exe --uninstall`.
+On **Windows**, first launch copies the executable to `%LOCALAPPDATA%\Programs\Letronna`, adds a Start Menu entry so it shows up in Windows search, and registers in Apps & features. Newer builds re-register on launch. Uninstall from Apps & features, or run `Letronna.exe --uninstall`.
+
+On **Linux**, first launch copies the binary to `~/.local/bin/letronna` and writes `~/.local/share/applications/letronna.desktop`, so it appears in the application menu. Uninstall with `letronna --uninstall`. The tray icon uses StatusNotifierItem over D-Bus, which needs a panel that supports it (KDE does; GNOME needs an extension such as AppIndicator Support). There is no backdrop blur behind dialogs, and closing the window minimises rather than hiding to the tray.
+
+On **macOS** the app runs in place: no install, no tray, no blur. A proper install there means an `.app` bundle, which is not built yet.
+
+| | Windows | Linux | macOS |
+|---|---|---|---|
+| Chat and agent tools | yes | yes | yes |
+| Install / uninstall | yes | yes | no |
+| Single instance | yes, focuses the open window | yes, second launch exits | no |
+| Tray icon | yes, themed menu | yes, native menu | no |
+| Backdrop blur | yes | no | no |
 
 If Discord is running, Letronna shows a rich presence (Idle, or Chatting with the model). Set `LETRONNA_DISCORD_APP_ID` to your own Discord application id, and upload a `letronna` art asset to it, for the icon to appear.
 
@@ -58,7 +70,9 @@ Chat text is sent to the gateway you selected and nowhere else.
 
 ## Build
 
-Requirements: Rust, Visual Studio C++ build tools, and a Windows SDK with `fxc.exe`. Set `GPUI_FXC_PATH` in `.cargo/config.toml` to your SDK's shader compiler.
+Requirements on Windows: Rust, Visual Studio C++ build tools, and a Windows SDK with `fxc.exe`. Set `GPUI_FXC_PATH` in `.cargo/config.toml` to your SDK's shader compiler.
+
+On Linux you need gpui's usual build dependencies (Vulkan, X11 or Wayland, and `libxkbcommon`). The tray needs no extra system libraries: the KSNI backend talks D-Bus directly.
 
 ```powershell
 cargo build --release
@@ -97,7 +111,7 @@ src/plugins/        optional integrations behind a Plugin trait + event bus
   mod.rs            Plugin trait, AppEvent, registry, emit()
   discord.rs        Discord rich presence
 
-src/platform/       Windows-only OS integration (cfg(windows))
+src/platform/       OS integration; same API everywhere, per-OS behind cfg
   install.rs        first-run registration and --uninstall
   tray.rs           notification-area icon and menu
   window.rs         Win32 window helpers

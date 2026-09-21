@@ -32,7 +32,6 @@ pub struct JobInfo {
     pub id: u64,
     pub command: String,
     pub running: bool,
-    pub exit_code: Option<i32>,
 }
 
 fn registry() -> &'static Mutex<BTreeMap<u64, Job>> {
@@ -163,7 +162,6 @@ pub fn list() -> Vec<JobInfo> {
             id: job.id,
             command: job.command.clone(),
             running: !job.finished.load(Ordering::Relaxed),
-            exit_code: job.exit_code.lock().ok().and_then(|c| *c),
         })
         .collect()
 }

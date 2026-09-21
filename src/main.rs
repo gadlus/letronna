@@ -2,7 +2,6 @@
 mod app;
 mod assets;
 mod core;
-#[cfg(windows)]
 mod platform;
 mod plugins;
 mod prelude;
@@ -12,14 +11,11 @@ mod ui;
 use prelude::*;
 
 fn main() {
-    #[cfg(windows)]
-    {
-        if std::env::args().any(|a| a == "--uninstall") {
-            platform::install::uninstall();
-        }
-        if platform::install::ensure_installed() || !platform::install::single_instance() {
-            return;
-        }
+    if std::env::args().any(|a| a == "--uninstall") {
+        platform::install::uninstall();
+    }
+    if platform::install::ensure_installed() || !platform::install::single_instance() {
+        return;
     }
     Application::new().with_assets(Assets).run(|cx| {
         gpui_component::init(cx);
@@ -41,7 +37,6 @@ fn main() {
                 Some("Input"),
             ),
         ]);
-        #[cfg(windows)]
         platform::tray::init(cx);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
@@ -76,15 +71,16 @@ fn main() {
                 },
             )
             .expect("Could not open native application window");
-        #[cfg(windows)]
-        let _ = window.update(cx, |_, window, cx| {
-            window.on_window_should_close(cx, |window, _| {
-                platform::window::hide(window);
-                false
+        // With a tray to bring it back, closing the window tucks the app
+        // away; without one that would strand it, so let it close.
+        if platform::tray::available() {
+            let _ = window.update(cx, |_, window, cx| {
+                window.on_window_should_close(cx, |window, _| {
+                    platform::window::hide(window);
+                    false
+                });
             });
-        });
-        #[cfg(not(windows))]
-        let _ = window;
+        }
         cx.activate(true);
     });
 }
