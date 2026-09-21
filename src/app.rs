@@ -104,6 +104,8 @@ pub(crate) struct Chat {
     pub(crate) session_allow: std::collections::HashSet<String>,
     /// Text field on the `ask_user` card.
     pub(crate) answer: Entity<InputState>,
+    /// Whether the footer is already polling background jobs.
+    pub(crate) job_tick: bool,
     pub(crate) live_tokens: u64,
     pub(crate) live_per_second: f32,
     pub(crate) thinking_open: std::collections::HashSet<usize>,
@@ -223,6 +225,7 @@ impl Chat {
             pending: None,
             session_allow: std::collections::HashSet::new(),
             answer,
+            job_tick: false,
             live_tokens: 0,
             live_per_second: 0.,
             thinking_open: std::collections::HashSet::new(),
@@ -610,6 +613,27 @@ impl Chat {
 
 impl Render for Chat {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A job starting or exiting happens off the UI thread, so the footer
+        // chips need a poll while any of them is alive. It stops on its own.
+        if !self.job_tick && crate::core::jobs::list().iter().any(|job| job.running) {
+            self.job_tick = true;
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_secs(1))
+                        .await;
+                    let alive = crate::core::jobs::list().iter().any(|job| job.running);
+                    let sent = this.update(cx, |this, cx| {
+                        this.job_tick = alive;
+                        cx.notify();
+                    });
+                    if sent.is_err() || !alive {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
         if let Some(error) = self.error.take() {
             let text = error.clone();
             window.push_notification(
@@ -706,17 +730,10 @@ impl Render for Chat {
             }
             let rows: Vec<AnyElement> = turns
                 .into_iter()
-                // min_w_0 + clipping keep an unbreakable line (a long command,
-                // a wide path) from widening the column past the composer.
-                .map(|turn| {
-                    v_flex()
-                        .w_full()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .gap_3()
-                        .children(turn)
-                        .into_any_element()
-                })
+                // No min_w_0 or clipping here: both break list layout in the
+                // markdown renderer, which sizes items against this width.
+                // Long lines are held in by the row and code-block widths.
+                .map(|turn| v_flex().w_full().gap_3().children(turn).into_any_element())
                 .collect();
             // The scrollbar must sit outside the scrolling element, or it
             // scrolls away with the content.
@@ -724,22 +741,23 @@ impl Render for Chat {
                 .relative()
                 .flex_1()
                 .min_h_0()
+                // Constrain the scroll area itself rather than the column
+                // inside it. A max width on the inner column loses to the
+                // markdown renderer's intrinsic width, which then drags the
+                // whole chat wider than the composer. Here min_w_0 pins this
+                // box to 82%, so everything inside inherits a definite width
+                // and cannot push back.
+                .min_w_0()
+                .w_full()
+                .when(self.sidebar_open, |d| d.max_w(relative(0.82)))
+                .mx_auto()
                 .child(
                     div()
                         .id("messages")
                         .size_full()
                         .overflow_y_scroll()
                         .track_scroll(&self.scroll)
-                        .child(
-                            v_flex()
-                                .w_full()
-                                .when(self.sidebar_open, |d| d.max_w(relative(0.82)))
-                                .mx_auto()
-                                .px_6()
-                                .py_6()
-                                .gap_6()
-                                .children(rows),
-                        ),
+                        .child(v_flex().w_full().px_6().py_6().gap_6().children(rows)),
                 )
                 .vertical_scrollbar(&self.scroll)
                 .into_any_element()

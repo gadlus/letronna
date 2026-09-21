@@ -143,6 +143,38 @@ impl Chat {
             .on_click(cx.listener(|this, _, window, cx| this.attach_workspace(window, cx)))
     }
 
+    /// One chip per background job, with a stop button. Only running jobs are
+    /// shown: a finished one is history, and the agent can still read its log.
+    fn job_chips(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let jobs = crate::core::jobs::list();
+        h_flex().gap_1().children(
+            jobs.into_iter()
+                .filter(|job| job.running)
+                .map(|job| {
+                    let label = crate::core::tools::one_line(&job.command);
+                    Button::new(("job", job.id as usize))
+                        .ghost()
+                        .xsmall()
+                        .text_color(cx.theme().muted_foreground)
+                        .tooltip(format!("Job #{}: {label} — click to stop", job.id))
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .items_center()
+                                .max_w(px(180.))
+                                .child(div().size(px(6.)).rounded_full().bg(cx.theme().green))
+                                .child(div().truncate().child(label))
+                                .child(Icon::new(IconName::Close).size_3()),
+                        )
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            let _ = crate::core::jobs::stop(job.id);
+                            cx.notify();
+                        }))
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
     pub(crate) fn status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .h(px(20.))
@@ -153,6 +185,7 @@ impl Chat {
             .text_color(cx.theme().muted_foreground)
             .child(self.gateway_chip(cx))
             .child(self.workspace_chip(cx))
+            .child(self.job_chips(cx))
             .when_some(self.free_remaining, |this, n| {
                 this.child(format!("{n} free replies left"))
             })

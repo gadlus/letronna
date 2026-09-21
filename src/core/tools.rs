@@ -36,6 +36,9 @@ pub const ASK_USER: &str = "ask_user";
 /// The tool result the model gets when the user denies a call.
 pub const DECLINED: &str = "The user declined this action. Ask before trying a different approach.";
 const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// How long a background command gets to print something before the tool
+/// replies, so the first message can carry a port or an early crash.
+const SETTLE: std::time::Duration = std::time::Duration::from_millis(1200);
 
 const MAX_OUTPUT: usize = 24_000;
 const SKIP_DIRS: &[&str] = &[".git", "node_modules", "target", ".next", "dist", "build"];
@@ -48,6 +51,9 @@ pub fn all() -> Vec<Box<dyn Tool>> {
         Box::new(WriteFile),
         Box::new(EditFile),
         Box::new(RunCommand),
+        Box::new(ReadJob),
+        Box::new(StopJob),
+        Box::new(Wait),
         Box::new(AskUser),
     ]
 }
@@ -116,15 +122,8 @@ pub fn clamp_lines(text: &str, max: usize) -> String {
     if total <= max {
         return text.to_owned();
     }
-    let mut out: String = text.lines().take(max).collect::<Vec<_>>().join(
-        "
-",
-    );
-    out.push_str(&format!(
-        "
-… {} more lines",
-        total - max
-    ));
+    let mut out: String = text.lines().take(max).collect::<Vec<_>>().join("\n");
+    out.push_str(&format!("\n… {} more lines", total - max));
     out
 }
 
@@ -137,6 +136,12 @@ pub fn summary(name: &str, args: &str) -> String {
             .map(|q| format!("\"{q}\""))
             .unwrap_or_default(),
         "run_command" => v["command"].as_str().unwrap_or_default().to_owned(),
+        "read_job" | "stop_job" => format!("#{}", v["id"].as_u64().unwrap_or(0)),
+        "wait" => match (v["job"].as_u64(), v["until"].as_str()) {
+            (Some(id), Some(until)) => format!("job #{id} until \"{until}\""),
+            (Some(id), None) => format!("job #{id}"),
+            _ => format!("{}s", v["seconds"].as_f64().unwrap_or(10.)),
+        },
         ASK_USER => v["question"].as_str().unwrap_or_default().to_owned(),
         _ => v["path"].as_str().unwrap_or(".").to_owned(),
     };
@@ -169,9 +174,9 @@ fn resolve_write(raw: &str, ctx: &ToolContext) -> Result<PathBuf, String> {
     Ok(target)
 }
 
-fn run_shell(command: &str, cwd: Option<&Path>) -> Result<String, String> {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
+/// The platform shell, configured the way every caller needs it.
+pub fn shell(command: &str, cwd: Option<&Path>) -> std::process::Command {
+    use std::process::Command;
     let mut cmd = if cfg!(windows) {
         let mut c = Command::new("powershell");
         c.args(["-NoProfile", "-NonInteractive", "-Command", command]);
@@ -193,7 +198,13 @@ fn run_shell(command: &str, cwd: Option<&Path>) -> Result<String, String> {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    let mut child = cmd
+    cmd
+}
+
+fn run_shell(command: &str, cwd: Option<&Path>) -> Result<String, String> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = shell(command, cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -219,7 +230,9 @@ fn run_shell(command: &str, cwd: Option<&Path>) -> Result<String, String> {
         if started.elapsed() > COMMAND_TIMEOUT {
             let _ = child.kill();
             return Err(format!(
-                "Timed out after {}s. Long-running commands are not supported yet.",
+                "Timed out after {}s and was stopped. If this command is meant to \
+                 keep running, such as a dev server, call it again with \
+                 background: true.",
                 COMMAND_TIMEOUT.as_secs()
             ));
         }
@@ -324,14 +337,15 @@ impl Tool for RunCommand {
     }
     fn description(&self) -> &'static str {
         if cfg!(windows) {
-            "Run a PowerShell command in the project folder and return its output. 2 minute limit; do not start servers or watchers."
+            "Run a PowerShell command in the project folder. Waits for it to finish and returns its output, with a 2 minute limit. For anything meant to keep running, such as a dev server or a watcher, pass background: true instead."
         } else {
-            "Run a shell (sh) command in the project folder and return its output. 2 minute limit; do not start servers or watchers."
+            "Run a shell (sh) command in the project folder. Waits for it to finish and returns its output, with a 2 minute limit. For anything meant to keep running, such as a dev server or a watcher, pass background: true instead."
         }
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
-            "command": {"type": "string"}
+            "command": {"type": "string"},
+            "background": {"type": "boolean", "description": "Leave the command running and return a job number straight away. Read its output later with read_job, and end it with stop_job."}
         }, "required": ["command"]})
     }
     fn needs_approval(&self) -> bool {
@@ -346,8 +360,143 @@ impl Tool for RunCommand {
             .workspace
             .as_deref()
             .ok_or("No project folder is attached. Ask the user to attach one first.")?;
-        run_shell(command, Some(cwd))
+        if !args["background"].as_bool().unwrap_or(false) {
+            return run_shell(command, Some(cwd));
+        }
+        let id = super::jobs::start(command, cwd)?;
+        // Give it a moment to fail or announce a port, so the first reply says
+        // something more useful than "started".
+        std::thread::sleep(SETTLE);
+        let log = super::jobs::log(id).unwrap_or_default();
+        let state = if super::jobs::running(id).unwrap_or(false) {
+            "running"
+        } else {
+            "already exited"
+        };
+        Ok(format!(
+            "Started as job #{id} ({state}). First output:\n{}",
+            if log.trim().is_empty() {
+                "[nothing yet]"
+            } else {
+                log.trim_end()
+            }
+        ))
     }
+}
+
+struct ReadJob;
+impl Tool for ReadJob {
+    fn name(&self) -> &'static str {
+        "read_job"
+    }
+    fn description(&self) -> &'static str {
+        "Read what a background job has printed so far, and whether it is still running."
+    }
+    fn parameters(&self) -> Value {
+        json!({"type": "object", "properties": {
+            "id": {"type": "integer"}
+        }, "required": ["id"]})
+    }
+    fn run(&self, args: &Value, _: &ToolContext) -> Result<String, String> {
+        let id = job_id(args)?;
+        let log = super::jobs::log(id)?;
+        let state = if super::jobs::running(id)? {
+            "running".to_owned()
+        } else {
+            match super::jobs::exit_code(id)? {
+                Some(code) => format!("exited with code {code}"),
+                None => "stopped".to_owned(),
+            }
+        };
+        Ok(format!(
+            "Job #{id} is {state}.\n{}",
+            if log.trim().is_empty() {
+                "[no output]"
+            } else {
+                log.trim_end()
+            }
+        ))
+    }
+}
+
+struct StopJob;
+impl Tool for StopJob {
+    fn name(&self) -> &'static str {
+        "stop_job"
+    }
+    fn description(&self) -> &'static str {
+        "Stop a background job."
+    }
+    fn parameters(&self) -> Value {
+        json!({"type": "object", "properties": {
+            "id": {"type": "integer"}
+        }, "required": ["id"]})
+    }
+    fn run(&self, args: &Value, _: &ToolContext) -> Result<String, String> {
+        let id = job_id(args)?;
+        super::jobs::stop(id)?;
+        Ok(format!("Stopped job #{id}."))
+    }
+}
+
+struct Wait;
+impl Tool for Wait {
+    fn name(&self) -> &'static str {
+        "wait"
+    }
+    fn description(&self) -> &'static str {
+        "Pause before continuing: for a number of seconds, or until a background job prints something. Use it to let a server come up before calling it."
+    }
+    fn parameters(&self) -> Value {
+        json!({"type": "object", "properties": {
+            "seconds": {"type": "number", "description": "How long to wait. Also the limit when waiting for output."},
+            "job": {"type": "integer", "description": "Wait for this job to print `until`, or to exit."},
+            "until": {"type": "string", "description": "Text to watch for in the job's output, such as `ready` or `listening`."}
+        }})
+    }
+    fn run(&self, args: &Value, _: &ToolContext) -> Result<String, String> {
+        let seconds = args["seconds"].as_f64().unwrap_or(10.).clamp(0., 120.);
+        let limit = std::time::Duration::from_secs_f64(seconds);
+        let Some(id) = args["job"].as_u64() else {
+            std::thread::sleep(limit);
+            return Ok(format!("Waited {seconds:.0}s."));
+        };
+        let until = args["until"].as_str().unwrap_or_default();
+        let started = std::time::Instant::now();
+        loop {
+            let log = super::jobs::log(id)?;
+            if !until.is_empty() && log.contains(until) {
+                return Ok(format!(
+                    "Job #{id} printed `{until}` after {:.0}s.",
+                    started.elapsed().as_secs_f32()
+                ));
+            }
+            if !super::jobs::running(id)? {
+                return Ok(format!(
+                    "Job #{id} exited before printing `{until}`. Output:\n{}",
+                    log.trim_end()
+                ));
+            }
+            if started.elapsed() >= limit {
+                return Ok(format!(
+                    "Job #{id} is still running after {seconds:.0}s{}. Latest output:\n{}",
+                    if until.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" without printing `{until}`")
+                    },
+                    log.trim_end()
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    }
+}
+
+fn job_id(args: &Value) -> Result<u64, String> {
+    args["id"]
+        .as_u64()
+        .ok_or_else(|| "`id` is required and must be a job number.".to_owned())
 }
 
 /// Answered in the chat, not here.

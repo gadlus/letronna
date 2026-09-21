@@ -34,5 +34,8 @@ strip = true
 debug = 0
 
 [patch.crates-io]
-# Backport of longbridge/gpui-kit#3129: configurable heading gap in markdown.
+# Fork of gpui-component 0.5.1 with two markdown fixes:
+# - configurable heading gap (upstream longbridge/gpui-kit#3129)
+# - list item content flexes instead of shrink-to-fit, so items are not
+#   clipped to one character and do not widen the chat column
 gpui-component = { git = "https://github.com/wweziza/gpui-kit", branch = "v0.5.1-heading-gap" }

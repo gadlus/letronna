@@ -113,7 +113,11 @@ impl Chat {
             .when(!is_user && (!message.reasoning.is_empty()), |this| {
                 this.child(self.thinking_block(index, message, streaming, window, cx))
             })
-            .child(div().pb_1().child(body))
+            // The markdown renderer reports an intrinsic width wider than the
+            // column for some documents (lists after a wrapped paragraph),
+            // which pushes the whole chat past the composer. Clipping here
+            // clamps it; min_w_0 would instead collapse list layout.
+            .child(div().w_full().overflow_hidden().pb_1().child(body))
             .when(
                 !is_user && message.tokens > 0 && !message.content.is_empty(),
                 |this| {
@@ -167,6 +171,12 @@ impl Chat {
                 h_flex()
                     .id(("tool", index))
                     .h(px(26.))
+                    // Without this the row's nowrap text sets a min width that
+                    // widens the whole column past the composer. It belongs
+                    // here, not on the turn: clipping a turn breaks the
+                    // markdown renderer's list layout.
+                    .min_w_0()
+                    .w_full()
                     .px_2()
                     .gap_1p5()
                     .items_center()
@@ -192,11 +202,18 @@ impl Chat {
                     .child(
                         div()
                             .font_family(MONO_FONT)
+                            .min_w_0()
                             .max_w(relative(0.6))
                             .truncate()
                             .child(summary),
                     )
-                    .child(div().text_color(color).truncate().child(status))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .text_color(color)
+                            .truncate()
+                            .child(status),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if !this.thinking_open.remove(&index) {
                             this.thinking_open.insert(index);

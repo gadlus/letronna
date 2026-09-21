@@ -49,6 +49,12 @@ fn main() {
             }
         })
         .detach();
+        // Background jobs are children of this process; do not outlive it.
+        cx.on_app_quit(|_| {
+            core::jobs::stop_all();
+            async {}
+        })
+        .detach();
         let window = cx
             .open_window(
                 WindowOptions {

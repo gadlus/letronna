@@ -808,7 +808,7 @@ mod tests {
             },
             &[],
         );
-        assert_eq!(tools["tools"].as_array().unwrap().len(), 7);
+        assert_eq!(tools["tools"].as_array().unwrap().len(), 10);
     }
     #[test]
     fn dangling_tool_calls_get_placeholder_results() {
