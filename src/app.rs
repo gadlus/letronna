@@ -119,6 +119,15 @@ pub(crate) struct Chat {
     pub(crate) editing: Option<u64>,
     pub(crate) job_name: Entity<InputState>,
     pub(crate) job_prompt: Entity<InputState>,
+    pub(crate) messaging: crate::core::messaging::Config,
+    /// A chat that has messaged the bot but has not been allowed yet.
+    pub(crate) pairing: Option<(i64, String)>,
+    /// Sessions opened for a remote chat, so the reply goes back to it.
+    pub(crate) remote: std::collections::HashMap<u64, i64>,
+    pub(crate) messaging_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    pub(crate) token_input: Entity<InputState>,
+    /// The connected bot's @name, once the token has been checked.
+    pub(crate) bot_name: Option<String>,
     pub(crate) skills: Vec<crate::core::skills::Skill>,
     pub(crate) editing_skill: Option<u64>,
     pub(crate) skill_name: Entity<InputState>,
@@ -196,6 +205,12 @@ impl Chat {
         let rename = cx.new(|cx| InputState::new(window, cx).placeholder("Session name"));
         let answer = cx.new(|cx| InputState::new(window, cx).placeholder("Your answer…"));
         let job_name = cx.new(|cx| InputState::new(window, cx).placeholder("Morning check"));
+        let token_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .masked(true)
+                .placeholder("Bot token from @BotFather")
+                .default_value(crate::core::messaging::load().token)
+        });
         let skill_name =
             cx.new(|cx| InputState::new(window, cx).placeholder("Review these changes"));
         let skill_prompt = cx.new(|cx| {
@@ -266,6 +281,12 @@ impl Chat {
             editing: None,
             job_name,
             job_prompt,
+            messaging: crate::core::messaging::load(),
+            pairing: None,
+            remote: std::collections::HashMap::new(),
+            messaging_stop: None,
+            token_input,
+            bot_name: None,
             skills: crate::core::skills::load(),
             editing_skill: None,
             skill_name,
@@ -281,6 +302,7 @@ impl Chat {
         };
         this.load_models(window, cx);
         Self::watch_schedules(cx);
+        this.restart_messaging(cx);
         if this.store.presence == "off" {
             plugins::set_enabled(cx, plugins::DISCORD, false);
             this.store.presence = "detailed".into();
@@ -709,6 +731,101 @@ impl Chat {
         self.advance_tools(cx);
     }
 
+    /// Stop any running poller and start one if messaging is set up. Called
+    /// whenever the settings change, so the worker always matches them.
+    pub(crate) fn restart_messaging(&mut self, cx: &mut Context<Self>) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        if let Some(stop) = self.messaging_stop.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        if !self.messaging.ready() {
+            return;
+        }
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (tx, rx) = async_channel::unbounded();
+        crate::core::messaging::poll(self.messaging.token.clone(), stop.clone(), tx);
+        self.messaging_stop = Some(stop);
+        cx.spawn(async move |this, cx| {
+            while let Ok(message) = rx.recv().await {
+                if this
+                    .update(cx, |this, cx| this.on_remote(message, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn tell_remote(&self, chat: i64, text: &str, cx: &mut Context<Self>) {
+        let token = self.messaging.token.clone();
+        let text = text.to_owned();
+        cx.background_executor()
+            .spawn(async move {
+                let _ = crate::core::messaging::send(&token, chat, &text);
+            })
+            .detach();
+    }
+
+    /// A message arrived from the bot. Anything from a chat the user has not
+    /// approved is held for approval rather than acted on.
+    fn on_remote(&mut self, message: crate::core::messaging::Incoming, cx: &mut Context<Self>) {
+        if self.messaging.chat != Some(message.chat) {
+            self.pairing = Some((message.chat, message.from));
+            cx.notify();
+            return;
+        }
+        if self.busy {
+            self.tell_remote(
+                message.chat,
+                "Busy with something else right now. Send that again in a moment.",
+                cx,
+            );
+            return;
+        }
+        let workspace = self.store.conversations[self.store.active]
+            .workspace
+            .clone();
+        self.store.conversations.push(Conversation {
+            id: self.store.next_id(),
+            title: message.text.chars().take(40).collect(),
+            updated: backend::now(),
+            workspace,
+            ..Default::default()
+        });
+        self.store.active = self.store.conversations.len() - 1;
+        let id = self.store.conversations[self.store.active].id;
+        self.remote.insert(id, message.chat);
+        // Nobody on the far end can answer an approval card, so unless the
+        // user has said otherwise a remote message may look but not touch.
+        let was_plan = self.plan_mode;
+        self.plan_mode = !self.messaging.allow_tools;
+        let _ = self.dispatch(message.text, cx);
+        self.plan_mode = was_plan;
+    }
+
+    /// Send the finished reply back to the chat that asked for it.
+    fn answer_remote(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.streaming_id else { return };
+        let Some(chat) = self.remote.remove(&id) else {
+            return;
+        };
+        let reply = self
+            .store
+            .index_of(id)
+            .and_then(|ix| {
+                self.store.conversations[ix]
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == "assistant" && !m.content.is_empty())
+            })
+            .map(|m| m.content.clone())
+            .unwrap_or_else(|| "That did not produce an answer.".to_owned());
+        self.tell_remote(chat, &reply, cx);
+    }
+
     /// Whether this call has to wait for the user. `ask_user` always does:
     /// it is a question, not an action to permit.
     pub(crate) fn needs_user(&self, name: &str) -> bool {
@@ -783,6 +900,7 @@ impl Chat {
     }
 
     fn finish(&mut self, cx: &mut Context<Self>) {
+        self.answer_remote(cx);
         self.busy = false;
         self.streaming_id = None;
         self.pending_calls.clear();
@@ -866,6 +984,8 @@ impl Render for Chat {
             self.artifacts_page(cx).into_any_element()
         } else if self.page == Page::Skills {
             self.skills_page(cx).into_any_element()
+        } else if self.page == Page::Messaging {
+            self.messaging_page(cx).into_any_element()
         } else if self.page != Page::Chat {
             self.page_view(self.page, cx).into_any_element()
         } else if conversation.messages.is_empty() && !streaming_here {
