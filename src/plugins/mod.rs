@@ -12,6 +12,7 @@ pub(crate) mod hello;
 
 use crate::prelude::*;
 pub(crate) use discord::PresenceMode;
+use std::sync::Arc;
 
 /// Stable id of the Discord presence plugin.
 pub(crate) const DISCORD: &str = "discord-presence";
@@ -57,6 +58,21 @@ pub(crate) trait Plugin: 'static {
     fn settings(&self, _cx: &App) -> Option<AnyElement> {
         None
     }
+    /// Tools this plugin adds to the agent, offered only while it is enabled.
+    /// They run on worker threads, so everything they capture must be `Send`.
+    fn tools(&self) -> Vec<Arc<dyn crate::core::tools::Tool>> {
+        Vec::new()
+    }
+}
+
+/// Publish the tools of every enabled plugin so the agent can call them.
+fn refresh_tools(plugins: &[Box<dyn Plugin>]) {
+    let tools = plugins
+        .iter()
+        .filter(|p| p.enabled())
+        .flat_map(|p| p.tools())
+        .collect();
+    crate::core::tools::set_plugin_tools(tools);
 }
 
 /// A snapshot of a plugin for the Settings list.
@@ -95,6 +111,7 @@ pub(crate) fn init(cx: &mut App, plugins: Vec<Box<dyn Plugin>>) {
         plugin.set_enabled(*saved.get(plugin.id()).unwrap_or(&true));
         plugin.init(cx);
     }
+    refresh_tools(&plugins);
     cx.set_global(Registry(plugins));
 }
 
@@ -149,5 +166,6 @@ pub(crate) fn set_enabled(cx: &App, id: &str, enabled: bool) {
             }
         }
         save_enabled(&map);
+        refresh_tools(&registry.0);
     }
 }

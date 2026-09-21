@@ -18,6 +18,7 @@ pub(crate) trait Plugin: 'static {
     fn enabled(&self) -> bool;             // current state
     fn builtin(&self) -> bool { true }     // false for externally loaded plugins
     fn settings(&self, cx: &App) -> Option<AnyElement> { None } // your own UI, shown under the row
+    fn tools(&self) -> Vec<Arc<dyn Tool>> { Vec::new() }        // tools you give the agent
 }
 ```
 
@@ -51,11 +52,20 @@ opened, a tool ran, the window focused), not UI details.
 ## Hooks are trait methods
 
 There are no mixins in Rust. A hook is simply a method the app calls on your
-plugin. You get two kinds:
+plugin. You get three kinds:
 
 - **Event hooks** — `handle(&AppEvent)` reacts to what the app is doing.
 - **UI hooks** — `settings(&App) -> Option<AnyElement>` lets you render your own
   controls. The Plugins page shows whatever you return under your plugin's row.
+- **Tool hooks** — `tools() -> Vec<Arc<dyn Tool>>` adds tools the model can call.
+  They are offered only while your plugin is enabled, and withdrawn the moment
+  it is switched off. A plugin cannot take over the name of a built-in tool.
+
+A tool runs on a worker thread with no access to `App`, so everything it holds
+must be `Send + Sync` — share your plugin's state through an `Arc`, as
+`hello.rs` does with its reply counter. Implement `mutates()` if the tool
+changes anything outside Letronna; those are hidden in Plan mode. Implement
+`needs_approval()` if the user should confirm each call.
 
 Your plugin owns its state (an `Arc<AtomicBool>`, a struct behind a `Mutex`, a
 file on disk) and moves clones of it into the closures it builds in `settings`.

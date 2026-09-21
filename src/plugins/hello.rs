@@ -1,13 +1,15 @@
-//! A minimal example plugin. It reacts to an event (counts replies) and
-//! contributes its own settings control (a toggle) through the `settings` hook.
-//! Copy this file as the starting point for a real plugin.
+//! A minimal example plugin. It reacts to an event (counts replies), adds its
+//! own settings control through the `settings` hook, and gives the agent a tool
+//! through the `tools` hook. Copy this file as the starting point for a real one.
 //!
 //! Hooks are just trait methods. Rust has no mixins; the app calls the methods
 //! the plugin implements. The plugin owns its state in `Arc`s and moves clones
 //! into its UI closures, so nothing external is needed to wire it up.
 
 use super::{AppEvent, Plugin};
+use crate::core::tools::{Tool, ToolContext};
 use crate::prelude::*;
+use serde_json::{Value, json};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -40,6 +42,14 @@ impl Plugin for Hello {
     }
 
     fn init(&self, _cx: &mut App) {}
+
+    /// The tool hook. The agent sees this only while the plugin is enabled.
+    /// It shares the plugin's own counter, so the tool reports live state.
+    fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        vec![Arc::new(RepliesSoFar {
+            replies: self.replies.clone(),
+        })]
+    }
 
     fn handle(&self, event: &AppEvent) {
         if let AppEvent::ChatStarted { model, .. } = event {
@@ -92,5 +102,29 @@ impl Plugin for Hello {
                 )
                 .into_any_element(),
         )
+    }
+}
+
+/// A tool contributed by the Hello plugin, reading the same counter the event
+/// hook increments.
+struct RepliesSoFar {
+    replies: Arc<AtomicU64>,
+}
+
+impl Tool for RepliesSoFar {
+    fn name(&self) -> &'static str {
+        "hello_replies"
+    }
+    fn description(&self) -> &'static str {
+        "Example plugin tool: how many replies Letronna has started since it was launched."
+    }
+    fn parameters(&self) -> Value {
+        json!({"type": "object", "properties": {}})
+    }
+    fn run(&self, _: &Value, _: &ToolContext) -> Result<String, String> {
+        Ok(format!(
+            "{} replies so far this session.",
+            self.replies.load(Ordering::Relaxed)
+        ))
     }
 }
