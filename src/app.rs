@@ -128,6 +128,8 @@ pub(crate) struct Chat {
     pub(crate) token_input: Entity<InputState>,
     /// The connected bot's @name, once the token has been checked.
     pub(crate) bot_name: Option<String>,
+    /// Selected row on the Messaging page.
+    pub(crate) channel: usize,
     pub(crate) skills: Vec<crate::core::skills::Skill>,
     pub(crate) editing_skill: Option<u64>,
     pub(crate) skill_name: Entity<InputState>,
@@ -287,6 +289,7 @@ impl Chat {
             messaging_stop: None,
             token_input,
             bot_name: None,
+            channel: 0,
             skills: crate::core::skills::load(),
             editing_skill: None,
             skill_name,
