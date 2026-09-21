@@ -197,9 +197,13 @@ impl Chat {
                             .ghost()
                             .small()
                             .label("Cancel")
-                            .on_click(cx.listener(|this, _, _, cx| {
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                // A job that was never given a prompt was never
+                                // really created; do not leave the row behind.
+                                this.schedules
+                                    .retain(|s| s.id != id || !s.prompt.is_empty());
                                 this.editing = None;
-                                cx.notify();
+                                this.save_schedules(cx);
                             })),
                     ),
             )

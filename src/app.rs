@@ -103,6 +103,11 @@ pub(crate) struct Chat {
     pub(crate) pending: Option<Pending>,
     /// Tools the user allowed for the rest of this run of the app.
     pub(crate) session_allow: std::collections::HashSet<String>,
+    /// Sessions started by an unattended schedule, which run tools without
+    /// asking. Keyed by session so the grant cannot reach the user's own
+    /// chats: a job saying "do not ask me at 9am" is not permission to stop
+    /// asking everywhere else.
+    pub(crate) unattended: std::collections::HashSet<u64>,
     /// Text field on the `ask_user` card.
     pub(crate) answer: Entity<InputState>,
     /// Whether the footer is already polling background jobs.
@@ -241,6 +246,7 @@ impl Chat {
             rounds: 0,
             pending: None,
             session_allow: std::collections::HashSet::new(),
+            unattended: std::collections::HashSet::new(),
             answer,
             job_tick: false,
             plan_mode: false,
@@ -492,13 +498,11 @@ impl Chat {
         self.store.active = self.store.conversations.len() - 1;
         self.page = Page::Chat;
         // Nobody is necessarily watching, so an unattended schedule skips the
-        // approval cards that would otherwise stall it.
+        // approval cards that would otherwise stall it -- but only in the
+        // session it just opened.
         if schedule.unattended {
-            for tool in crate::core::tools::all() {
-                if tool.needs_approval() && tool.name() != crate::core::tools::ASK_USER {
-                    self.session_allow.insert(tool.name().to_owned());
-                }
-            }
+            let id = self.store.conversations[self.store.active].id;
+            self.unattended.insert(id);
         }
         let _ = self.dispatch(schedule.prompt.clone(), cx);
     }
@@ -637,10 +641,7 @@ impl Chat {
             self.apply_todo(&call.arguments, cx);
             return;
         }
-        let gated = crate::core::tools::needs_approval(&call.name)
-            && (call.name == crate::core::tools::ASK_USER
-                || !(self.store.skip_approvals || self.session_allow.contains(&call.name)));
-        if gated {
+        if self.needs_user(&call.name) {
             cx.notify();
             return;
         }
@@ -690,6 +691,21 @@ impl Chat {
         });
         self.follow();
         self.advance_tools(cx);
+    }
+
+    /// Whether this call has to wait for the user. `ask_user` always does:
+    /// it is a question, not an action to permit.
+    pub(crate) fn needs_user(&self, name: &str) -> bool {
+        if !crate::core::tools::needs_approval(name) {
+            return false;
+        }
+        if name == crate::core::tools::ASK_USER {
+            return true;
+        }
+        let unattended = self
+            .streaming_id
+            .is_some_and(|id| self.unattended.contains(&id));
+        !(self.store.skip_approvals || unattended || self.session_allow.contains(name))
     }
 
     /// Store the model's checklist on the session so the composer can show it.

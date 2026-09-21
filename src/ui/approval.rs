@@ -28,10 +28,7 @@ impl Chat {
             workspace: pending.connection.workspace.clone(),
         };
         let summary = tools::summary(&call.name, &call.arguments);
-        let gated = tools::needs_approval(&call.name)
-            && (call.name == tools::ASK_USER
-                || !(self.store.skip_approvals || self.session_allow.contains(&call.name)));
-        if !gated {
+        if !self.needs_user(&call.name) {
             return Some(
                 h_flex()
                     .gap_2()
