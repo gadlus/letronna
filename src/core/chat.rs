@@ -17,6 +17,10 @@ pub struct Message {
     pub tokens: u64,
     #[serde(default)]
     pub per_second: f32,
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub cached_tokens: u64,
     /// Calls the assistant asked for in this turn.
     #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
@@ -68,6 +72,11 @@ pub enum Event {
     Usage {
         completion: u64,
         per_second: f32,
+        /// Input tokens, and how many of them the provider served from its
+        /// prompt cache. Cached input costs a fraction of fresh input, so this
+        /// is the number to watch when tuning the context window.
+        prompt: u64,
+        cached: u64,
     },
     FreeRemaining(u64),
     /// Sent once, before `Finished`, when the model asked for tools.
@@ -140,25 +149,47 @@ fn budget(messages: &[Message]) -> usize {
         .sum()
 }
 
-fn body(connection: &Connection, messages: &[Message]) -> Value {
-    // Walk back over whole user turns until the budget runs out. The latest
-    // turn always goes in, whatever its size: dropping it (one huge tool
-    // result can exceed the budget by itself) would leave the model with no
-    // prompt at all, and it answers by introducing itself.
+/// Messages in the window, whatever the character budget says. Guards against
+/// a long run of tiny messages.
+const MAX_MESSAGES: usize = 60;
+/// How much the window drops when it no longer fits, in messages. The start is
+/// always a whole number of these from the beginning, so appending a turn
+/// cannot nudge it: it either stays exactly where it was or jumps a step.
+const COMPACT_STEP: usize = 16;
+
+/// Where the context window starts.
+///
+/// Providers cache on an exact prefix, so what matters as much as the size of
+/// the window is that it stops moving. Trimming the oldest turn each time the
+/// budget is exceeded would shift the prefix on every single request and miss
+/// the cache every time — exactly in the long agent sessions that cost the
+/// most. Instead the window halves when it no longer fits, and then stays put
+/// for many turns, so requests in between are byte-identical from the front.
+///
+/// The latest user turn always goes in whatever its size: dropping it (a single
+/// huge tool result can exceed the budget by itself) would leave the model with
+/// no prompt at all, and it answers by introducing itself.
+///
+/// This is deliberately stateless: the same message list always yields the same
+/// start, so nothing needs saving and two requests over the same history agree.
+fn window_start(messages: &[Message]) -> usize {
     let last_user = messages.iter().rposition(|m| m.role == "user").unwrap_or(0);
-    let mut start = last_user;
-    let mut chars = budget(&messages[last_user..]);
-    for i in (0..last_user).rev() {
-        if messages[i].role != "user" {
-            continue;
-        }
-        let size = budget(&messages[i..start]);
-        if chars + size > CONTEXT_CHARS || messages.len() - i > 40 {
-            break;
-        }
-        chars += size;
-        start = i;
+    let mut start = 0;
+    while start < last_user
+        && (budget(&messages[start..]) > CONTEXT_CHARS || messages.len() - start > MAX_MESSAGES)
+    {
+        // Drop a fixed step, then round forward to a user turn so the window
+        // never begins midway through a tool exchange.
+        let next = (start + COMPACT_STEP).min(last_user);
+        start = (next..=last_user)
+            .find(|i| messages[*i].role == "user")
+            .unwrap_or(last_user);
     }
+    start
+}
+
+fn body(connection: &Connection, messages: &[Message]) -> Value {
+    let start = window_start(messages);
     let mut system =
         String::from("You are Letronna, a personal assistant. Be clear, concise, and honest.");
     if connection.tools {
@@ -270,6 +301,8 @@ struct Chunk {
     content: Option<String>,
     reasoning: Option<String>,
     completion_tokens: Option<u64>,
+    prompt_tokens: Option<u64>,
+    cached_tokens: Option<u64>,
     /// Fragments of `(index, id, name, arguments)`; the stream assembles them.
     tool_calls: Vec<(usize, String, String, String)>,
 }
@@ -305,6 +338,15 @@ fn parse_event(data: &str) -> Result<Chunk, String> {
     let completion_tokens = inner
         .pointer("/usage/completion_tokens")
         .and_then(Value::as_u64);
+    let prompt_tokens = inner
+        .pointer("/usage/prompt_tokens")
+        .and_then(Value::as_u64);
+    // OpenAI reports cache hits under prompt_tokens_details; DeepSeek uses its
+    // own field. Gateways pass through whichever the upstream provider sent.
+    let cached_tokens = inner
+        .pointer("/usage/prompt_tokens_details/cached_tokens")
+        .or_else(|| inner.pointer("/usage/prompt_cache_hit_tokens"))
+        .and_then(Value::as_u64);
     let tool_calls = delta
         .and_then(|d| d["tool_calls"].as_array())
         .map(|calls| {
@@ -327,6 +369,8 @@ fn parse_event(data: &str) -> Result<Chunk, String> {
         content,
         reasoning,
         completion_tokens,
+        prompt_tokens,
+        cached_tokens,
         tool_calls,
     })
 }
@@ -540,6 +584,8 @@ fn stream(
     let mut received = false;
     let mut complete = false;
     let mut completion_tokens = 0u64;
+    let mut prompt_tokens = 0u64;
+    let mut cached_tokens = 0u64;
     let mut calls: Vec<ToolCall> = Vec::new();
     let began = std::time::Instant::now();
     for line in BufReader::new(response).lines() {
@@ -555,6 +601,12 @@ fn stream(
         let chunk = parse_event(data)?;
         if let Some(n) = chunk.completion_tokens {
             completion_tokens = n;
+        }
+        if let Some(n) = chunk.prompt_tokens {
+            prompt_tokens = n;
+        }
+        if let Some(n) = chunk.cached_tokens {
+            cached_tokens = n;
         }
         merge_tool_calls(&mut calls, &chunk);
         if let Some(text) = chunk.reasoning {
@@ -574,6 +626,8 @@ fn stream(
         let _ = sender.send_blocking(Event::Usage {
             completion: completion_tokens,
             per_second: completion_tokens as f32 / secs,
+            prompt: prompt_tokens,
+            cached: cached_tokens,
         });
     }
     if !complete {
@@ -866,6 +920,48 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn window_holds_still_so_the_cache_prefix_survives() {
+        // Providers cache on an exact prefix, so the front of the request must
+        // not move on every turn.
+        let turn = |i: usize| {
+            [
+                Message {
+                    role: "user".into(),
+                    content: format!("question {i} {}", "x".repeat(600)),
+                    ..Default::default()
+                },
+                Message {
+                    role: "assistant".into(),
+                    content: format!("answer {i} {}", "y".repeat(600)),
+                    ..Default::default()
+                },
+            ]
+        };
+        let mut messages: Vec<Message> = Vec::new();
+        let mut starts = Vec::new();
+        for i in 0..40 {
+            messages.extend(turn(i));
+            starts.push(window_start(&messages));
+        }
+
+        // It must compact at some point, or the budget means nothing.
+        let compactions = starts.windows(2).filter(|w| w[0] != w[1]).count();
+        assert!(compactions > 0, "window never compacted: {starts:?}");
+        // But rarely: sliding one turn at a time would move it nearly every turn.
+        assert!(
+            compactions < starts.len() / 4,
+            "window moved {compactions} times in {} turns: {starts:?}",
+            starts.len()
+        );
+        // And it only ever moves forward, onto a user turn.
+        assert!(starts.windows(2).all(|w| w[0] <= w[1]), "{starts:?}");
+        for start in &starts {
+            assert_eq!(messages[*start].role, "user", "start {start} is not a turn");
+        }
+        assert!(budget(&messages[*starts.last().unwrap()..]) <= CONTEXT_CHARS);
+    }
+
     #[test]
     fn transient_statuses_are_retried_not_blamed_on_the_user() {
         use reqwest::StatusCode;

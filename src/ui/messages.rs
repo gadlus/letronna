@@ -125,10 +125,7 @@ impl Chat {
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(format!(
-                                "{} tokens · {:.1} tok/s",
-                                message.tokens, message.per_second
-                            )),
+                            .child(usage_line(message)),
                     )
                 },
             )
@@ -342,5 +339,51 @@ impl Chat {
                     .text_color(cx.theme().muted_foreground)
                     .child(page.blurb()),
             )
+    }
+}
+
+/// The line under a reply. Cached input is a fraction of the price of fresh
+/// input, so the hit rate is worth showing whenever the provider reports it.
+fn usage_line(message: &Message) -> String {
+    let mut parts = vec![format!("{} out", message.tokens)];
+    if message.per_second > 0. {
+        parts.push(format!("{:.1} tok/s", message.per_second));
+    }
+    if message.prompt_tokens > 0 {
+        parts.push(format!("{} in", message.prompt_tokens));
+        if message.cached_tokens > 0 {
+            let share = 100 * message.cached_tokens / message.prompt_tokens;
+            parts.push(format!("{share}% cached"));
+        }
+    }
+    parts.join(" · ")
+}
+
+#[cfg(test)]
+mod tests {
+    // Deliberately not `use super::*`: the prelude re-exports gpui, whose own
+    // `test` macro would shadow the built-in attribute here.
+    use super::usage_line;
+    use crate::core::chat::Message;
+
+    #[test]
+    fn usage_line_reports_the_cache_hit_rate() {
+        let message = Message {
+            tokens: 16,
+            per_second: 18.4,
+            prompt_tokens: 3291,
+            cached_tokens: 3200,
+            ..Default::default()
+        };
+        assert_eq!(
+            usage_line(&message),
+            "16 out · 18.4 tok/s · 3291 in · 97% cached"
+        );
+        // A provider that reports no cache figure says nothing about caching.
+        let uncached = Message {
+            cached_tokens: 0,
+            ..message.clone()
+        };
+        assert_eq!(usage_line(&uncached), "16 out · 18.4 tok/s · 3291 in");
     }
 }

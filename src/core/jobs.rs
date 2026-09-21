@@ -189,6 +189,19 @@ mod tests {
         }
     }
 
+    /// Poll until `ready` or the deadline. A cold PowerShell start can take
+    /// several seconds on a loaded machine, so the limit is generous.
+    fn until(mut ready: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            if ready() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        false
+    }
+
     #[test]
     fn runs_collects_and_stops() {
         let dir = std::env::temp_dir();
@@ -198,26 +211,19 @@ mod tests {
             format!("echo ready; {}", sleep_command(30))
         };
         let id = start(&echo, &dir).unwrap();
-        let mut seen = String::new();
-        for _ in 0..50 {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            seen = log(id).unwrap();
-            if seen.contains("ready") {
-                break;
-            }
-        }
-        assert!(seen.contains("ready"), "{seen:?}");
+        assert!(
+            until(|| log(id).unwrap().contains("ready")),
+            "job never printed: {:?}",
+            log(id).unwrap()
+        );
         assert!(running(id).unwrap());
         assert!(list().iter().any(|j| j.id == id && j.running));
 
         stop(id).unwrap();
-        for _ in 0..50 {
-            if !running(id).unwrap() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        assert!(!running(id).unwrap(), "job kept running after stop");
+        assert!(
+            until(|| !running(id).unwrap()),
+            "job kept running after stop"
+        );
         assert!(log(999).is_err());
     }
 }

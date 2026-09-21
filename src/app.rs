@@ -110,6 +110,8 @@ pub(crate) struct Chat {
     pub(crate) plan_mode: bool,
     pub(crate) live_tokens: u64,
     pub(crate) live_per_second: f32,
+    pub(crate) live_prompt: u64,
+    pub(crate) live_cached: u64,
     pub(crate) thinking_open: std::collections::HashSet<usize>,
     pub(crate) error: Option<String>,
     pub(crate) scroll: ScrollHandle,
@@ -231,6 +233,8 @@ impl Chat {
             plan_mode: false,
             live_tokens: 0,
             live_per_second: 0.,
+            live_prompt: 0,
+            live_cached: 0,
             thinking_open: std::collections::HashSet::new(),
             error,
             scroll: ScrollHandle::new(),
@@ -417,6 +421,8 @@ impl Chat {
         self.pending_calls.clear();
         self.live_tokens = 0;
         self.live_per_second = 0.;
+        self.live_prompt = 0;
+        self.live_cached = 0;
         self.follow();
         cx.notify();
         cx.spawn(async move |this, cx| {
@@ -430,9 +436,13 @@ impl Chat {
                             Event::Usage {
                                 completion,
                                 per_second,
+                                prompt,
+                                cached,
                             } => {
                                 this.live_tokens = completion;
                                 this.live_per_second = per_second;
+                                this.live_prompt = prompt;
+                                this.live_cached = cached;
                             }
                             Event::FreeRemaining(n) => this.free_remaining = Some(n),
                             Event::ToolCalls(calls) => this.pending_calls = calls,
@@ -451,6 +461,8 @@ impl Chat {
                                     reasoning: std::mem::take(&mut this.partial_reasoning),
                                     tokens: this.live_tokens,
                                     per_second: this.live_per_second,
+                                    prompt_tokens: this.live_prompt,
+                                    cached_tokens: this.live_cached,
                                     tool_calls: calls.clone(),
                                     ..Default::default()
                                 };
@@ -752,6 +764,8 @@ impl Render for Chat {
                         reasoning: self.partial_reasoning.clone(),
                         tokens: self.live_tokens,
                         per_second: self.live_per_second,
+                        prompt_tokens: self.live_prompt,
+                        cached_tokens: self.live_cached,
                         ..Default::default()
                     };
                     turn.push(self.message_row(
