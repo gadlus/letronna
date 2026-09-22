@@ -65,10 +65,9 @@ impl Runner {
         self.persist();
 
         let mut turn = Turn::new(connection);
-        let mut answer = String::new();
         loop {
             let reply = self.stream_once(&mut turn, session)?;
-            answer = reply.content.clone();
+            let answer = reply.content.clone();
             let calls = reply.tool_calls.clone();
             self.store.conversations[session].updated = chat::now();
             self.store.conversations[session].messages.push(reply);
@@ -91,12 +90,14 @@ impl Runner {
         );
         let mut out = Stream::default();
         let mut printed_header = false;
+        let mut waiting = Some(crate::spinner::Spinner::start());
         loop {
             let event = receiver
                 .recv_blocking()
                 .map_err(|_| "The model connection closed unexpectedly.".to_owned())?;
             if let Event::Delta(text) = &event {
                 if !printed_header {
+                    waiting.take();
                     render::blank();
                     render::line(&render::blue(&self.store.settings.model));
                     printed_header = true;
@@ -105,6 +106,7 @@ impl Runner {
             }
             turn.absorb(&event);
             if let Event::Finished(result) = event {
+                waiting.take();
                 out.end();
                 result?;
                 break;

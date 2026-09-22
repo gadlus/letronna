@@ -5,8 +5,10 @@
 //! started here can be carried on there and the other way round.
 
 mod input;
+mod prompt;
 mod render;
 mod session;
+mod spinner;
 
 use letronna_core::store;
 use session::Runner;
@@ -88,7 +90,7 @@ fn main() {
     }
 
     let workspace = std::env::current_dir().ok();
-    let session = runner.open(args.resume, workspace.clone());
+    let mut session = runner.open(args.resume, workspace.clone());
 
     // One question, one answer, no banner: this form gets piped.
     if let Some(prompt) = args.prompt {
@@ -102,37 +104,128 @@ fn main() {
         return;
     }
 
-    banner(&runner, workspace.as_deref());
+    let folder = folder_name(workspace.as_deref());
+    render::clear();
+    render::title(&format!("letronna — {folder}"));
+    banner(&runner, &folder);
+
     loop {
         render::blank();
-        let Some(line) = input::read(&format!("{} ", render::blue("›"))) else {
+        let Some(line) = prompt::read(&format!("{} ", render::blue("›"))) else {
             break;
         };
-        let line = line.trim();
+        let line = line.trim().to_owned();
         if line.is_empty() {
             continue;
         }
-        if matches!(line, "/exit" | "/quit" | "exit" | "quit") {
-            break;
+        if line.starts_with('/') {
+            match command(&mut runner, &line, &mut session, workspace.as_deref()) {
+                Flow::Stop => break,
+                Flow::Handled => continue,
+                Flow::Unknown => {
+                    render::line(&render::dim(&format!(
+                        "{line} is not a command. Type / to see what is."
+                    )));
+                    continue;
+                }
+            }
         }
-        if line == "/help" {
-            print!("{HELP}");
-            continue;
-        }
-        if let Err(error) = runner.ask(session, line) {
+        if let Err(error) = runner.ask(session, &line) {
             render::blank();
             render::line(&render::red(&error));
         }
         runner.persist();
     }
+    render::title("");
     render::blank();
 }
 
-fn banner(runner: &Runner, workspace: Option<&std::path::Path>) {
-    let folder = workspace
+enum Flow {
+    Handled,
+    Stop,
+    Unknown,
+}
+
+fn command(
+    runner: &mut Runner,
+    line: &str,
+    session: &mut usize,
+    workspace: Option<&std::path::Path>,
+) -> Flow {
+    match line {
+        "/exit" | "/quit" => Flow::Stop,
+        "/help" => {
+            render::blank();
+            for entry in prompt::COMMANDS {
+                render::line(&format!(
+                    "{}  {}",
+                    render::bold(entry.name),
+                    render::dim(entry.blurb)
+                ));
+            }
+            Flow::Handled
+        }
+        "/clear" => {
+            render::clear();
+            banner(runner, &folder_name(workspace));
+            Flow::Handled
+        }
+        "/new" => {
+            *session = runner.open(false, workspace.map(|p| p.to_path_buf()));
+            runner.persist();
+            render::blank();
+            render::line(&render::dim("New session."));
+            Flow::Handled
+        }
+        "/plan" => {
+            runner.plan = !runner.plan;
+            render::blank();
+            render::line(&render::dim(if runner.plan {
+                "Plan mode on: reads and searches, never writes or runs."
+            } else {
+                "Plan mode off."
+            }));
+            Flow::Handled
+        }
+        "/model" => {
+            let settings = &runner.store.settings;
+            render::blank();
+            render::line(&format!(
+                "{}  {}",
+                render::bold(&settings.model),
+                render::dim(&settings.gateway)
+            ));
+            Flow::Handled
+        }
+        "/where" => {
+            render::blank();
+            render::line(&format!(
+                "{}  {}",
+                render::dim("project"),
+                workspace
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "none".into())
+            ));
+            let id = runner.store.conversations[*session].id;
+            render::line(&format!(
+                "{}  {}",
+                render::dim("session"),
+                store::sessions_dir().join(format!("{id}.jsonl")).display()
+            ));
+            Flow::Handled
+        }
+        _ => Flow::Unknown,
+    }
+}
+
+fn folder_name(workspace: Option<&std::path::Path>) -> String {
+    workspace
         .and_then(|p| p.file_name())
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "no project".into());
+        .unwrap_or_else(|| "no project".into())
+}
+
+fn banner(runner: &Runner, folder: &str) {
     render::blank();
     render::line(&format!(
         "{}  {}  {}  {}  {}",
@@ -152,7 +245,7 @@ fn banner(runner: &Runner, workspace: Option<&std::path::Path>) {
     if let Some(mode) = mode {
         render::line(&render::dim(mode));
     }
-    render::line(&render::dim("/help for commands, /exit to leave"));
+    render::line(&render::dim("type / for commands"));
 }
 
 /// Start the window. It is a separate binary because a GUI-subsystem
@@ -161,8 +254,16 @@ fn launch_window() {
     let beside = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join(window_name())));
-    let candidates = [beside, Some(std::path::PathBuf::from(window_name()))];
-    for candidate in candidates.into_iter().flatten() {
+    // Installed, the window sits one level up from the bin folder holding this.
+    let above = std::env::current_exe().ok().and_then(|p| {
+        p.parent()
+            .and_then(|d| d.parent())
+            .map(|d| d.join("Letronna.exe"))
+    });
+    for candidate in [beside, above, Some(std::path::PathBuf::from(window_name()))]
+        .into_iter()
+        .flatten()
+    {
         if std::process::Command::new(&candidate).spawn().is_ok() {
             return;
         }
@@ -192,12 +293,12 @@ mod tests {
         assert!(bare.prompt.is_none() && !bare.resume && !bare.yes);
 
         assert_eq!(args(&["-p", "hello"]).prompt.as_deref(), Some("hello"));
-        assert_eq!(
-            args(&["--print", "hello"]).prompt.as_deref(),
-            Some("hello")
-        );
+        assert_eq!(args(&["--print", "hello"]).prompt.as_deref(), Some("hello"));
         // A bare word is a prompt, so quoting alone is enough.
-        assert_eq!(args(&["what is this"]).prompt.as_deref(), Some("what is this"));
+        assert_eq!(
+            args(&["what is this"]).prompt.as_deref(),
+            Some("what is this")
+        );
         // A flag after it must not be swallowed as the prompt.
         let mixed = args(&["--plan", "look around"]);
         assert!(mixed.plan);

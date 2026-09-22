@@ -7,6 +7,30 @@
 
 use std::io::{IsTerminal, Write};
 
+/// Whether stdin is a terminal, so the line editor can take over keystrokes.
+/// Piped input has to go through the plain reader instead.
+pub fn interactive() -> bool {
+    std::io::stdin().is_terminal() && colour()
+}
+
+/// Name the window after the session, the way a terminal program should, and
+/// put the old title back on the way out.
+pub fn title(text: &str) {
+    if colour() {
+        print!("]0;{text}");
+        flush();
+    }
+}
+
+/// Start from a clean screen, so the shell's own banner is not the first
+/// thing in the transcript.
+pub fn clear() {
+    if colour() {
+        print!("[2J[3J[H");
+        flush();
+    }
+}
+
 /// ANSI, unless output is being piped or the terminal has opted out.
 pub fn colour() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -33,9 +57,6 @@ pub fn bold(text: &str) -> String {
 }
 pub fn blue(text: &str) -> String {
     wrap("38;5;69", text)
-}
-pub fn green(text: &str) -> String {
-    wrap("38;5;71", text)
 }
 pub fn red(text: &str) -> String {
     wrap("38;5;167", text)
