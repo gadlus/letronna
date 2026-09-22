@@ -103,7 +103,8 @@ impl Chat {
                         if this.busy || this.store.conversations.len() <= index {
                             return;
                         }
-                        this.store.conversations.remove(index);
+                        // Through the store, so the session's file goes too.
+                        this.store.remove(index);
                         if this.store.conversations.is_empty() {
                             this.new_chat(window, cx);
                             return;

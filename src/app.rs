@@ -131,14 +131,9 @@ pub(crate) struct Chat {
 
 impl Chat {
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let (mut store, error) = match std::fs::read(data_path()) {
-            Ok(bytes) => match serde_json::from_slice::<Store>(&bytes) {
-                Ok(store) => (store, None),
-                Err(_) => (Store::default(), Some("Saved chats could not be read. The original file is retained until you send or start a chat.".into())),
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Store::default(), None),
-            Err(_) => (Store::default(), Some("Could not read local chat history.".into())),
-        };
+        // Sessions are separate files now, so a damaged one costs that
+        // session rather than the history.
+        let (mut store, error) = (crate::core::store::load(), None);
         if store.conversations.is_empty() {
             store.conversations.push(Conversation {
                 title: "New session".into(),
@@ -148,20 +143,21 @@ impl Chat {
         }
         store.assign_ids();
         store.active = store.active.min(store.conversations.len() - 1);
-        if store.gateway.is_empty() {
-            store.gateway = GATEWAYS[0].name.into();
+        if store.settings.gateway.is_empty() {
+            store.settings.gateway = GATEWAYS[0].name.into();
         }
-        if store.endpoint.is_empty() {
-            store.endpoint = std::env::var("AGENT_BASE_URL").unwrap_or_else(|_| Upstream.into());
+        if store.settings.endpoint.is_empty() {
+            store.settings.endpoint =
+                std::env::var("AGENT_BASE_URL").unwrap_or_else(|_| Upstream.into());
         }
         let keys = load_keys();
         let saved_key = keys
-            .get(key_slot(&store.gateway))
+            .get(key_slot(&store.settings.gateway))
             .cloned()
             .or_else(|| std::env::var("AGENT_API_KEY").ok())
             .unwrap_or_default();
-        if store.model.is_empty() {
-            store.model =
+        if store.settings.model.is_empty() {
+            store.settings.model =
                 std::env::var("AGENT_MODEL").unwrap_or_else(|_| "pool-free/gpt-oss-20b".into());
         }
         let greeting = GREETINGS[(backend::now() % GREETINGS.len() as u64) as usize];
@@ -173,11 +169,11 @@ impl Chat {
         });
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search sessions…"));
         let endpoint =
-            cx.new(|cx| InputState::new(window, cx).default_value(store.endpoint.clone()));
+            cx.new(|cx| InputState::new(window, cx).default_value(store.settings.endpoint.clone()));
         let model = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Model ID")
-                .default_value(store.model.clone())
+                .default_value(store.settings.model.clone())
         });
         let key = cx.new(|cx| {
             InputState::new(window, cx)
@@ -186,8 +182,8 @@ impl Chat {
                 .default_value(saved_key)
         });
         let model_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search models…"));
-        let gateway_pick = cx.new(|_| store.gateway.clone());
-        let presence_pick = cx.new(|_| store.presence.clone());
+        let gateway_pick = cx.new(|_| store.settings.gateway.clone());
+        let presence_pick = cx.new(|_| store.settings.presence.clone());
         let settings_page = cx.new(|_| "Gateways");
         let rename = cx.new(|cx| InputState::new(window, cx).placeholder("Session name"));
         let answer = cx.new(|cx| InputState::new(window, cx).placeholder("Your answer…"));
@@ -291,14 +287,16 @@ impl Chat {
         this.load_models(window, cx);
         Self::watch_schedules(cx);
         this.restart_messaging(cx);
-        if this.store.presence == "off" {
+        if this.store.settings.presence == "off" {
             plugins::set_enabled(cx, plugins::DISCORD, false);
-            this.store.presence = "detailed".into();
+            this.store.settings.presence = "detailed".into();
             this.save();
         }
         plugins::emit(
             cx,
-            plugins::AppEvent::PresenceMode(plugins::PresenceMode::from_str(&this.store.presence)),
+            plugins::AppEvent::PresenceMode(plugins::PresenceMode::from_str(
+                &this.store.settings.presence,
+            )),
         );
         this
     }
@@ -310,7 +308,7 @@ impl Chat {
         self.loading_models = true;
         let base = self.endpoint.read(cx).value().to_string();
         let key = self.key.read(cx).value().to_string();
-        let guest = self.store.gateway == GATEWAYS[0].name;
+        let guest = self.store.settings.gateway == GATEWAYS[0].name;
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
             let result = if guest {
@@ -349,23 +347,14 @@ impl Chat {
             self.endpoint
                 .update(cx, |input, cx| input.set_value(Upstream, window, cx));
         }
-        self.store.model = id;
+        self.store.settings.model = id;
         self.model_open = false;
         self.save();
         cx.notify();
     }
 
     pub(crate) fn save(&mut self) {
-        let path = data_path();
-        let result = (|| -> std::result::Result<(), Box<dyn std::error::Error>> {
-            std::fs::create_dir_all(path.parent().unwrap())?;
-            let bytes = serde_json::to_vec_pretty(&self.store)?;
-            let temp = path.with_extension("tmp");
-            std::fs::write(&temp, bytes)?;
-            std::fs::rename(temp, path)?;
-            Ok(())
-        })();
-        if result.is_err() {
+        if self.store.save().is_err() {
             self.error =
                 Some("Could not save chat history. Your current chat remains in memory.".into());
         }
@@ -426,8 +415,8 @@ impl Chat {
             endpoint: self.endpoint.read(cx).value().to_string(),
             model: self.model.read(cx).value().to_string(),
             key: self.key.read(cx).value().to_string(),
-            guest: self.store.gateway == GATEWAYS[0].name,
-            tools: self.store.gateway != GATEWAYS[0].name,
+            guest: self.store.settings.gateway == GATEWAYS[0].name,
+            tools: self.store.settings.gateway != GATEWAYS[0].name,
             workspace: None,
             plan: self.plan_mode,
         };
@@ -436,8 +425,8 @@ impl Chat {
             cx.notify();
             return Err(());
         }
-        self.store.endpoint = connection.endpoint.clone();
-        self.store.model = connection.model.clone();
+        self.store.settings.endpoint = connection.endpoint.clone();
+        self.store.settings.model = connection.model.clone();
         let conversation = &mut self.store.conversations[self.store.active];
         // Name an untitled session after its first prompt, but leave a name
         // that was set deliberately, such as a scheduled job's.
@@ -461,7 +450,7 @@ impl Chat {
         plugins::emit(
             cx,
             plugins::AppEvent::ChatStarted {
-                model: self.store.model.clone(),
+                model: self.store.settings.model.clone(),
                 title: convo_title,
             },
         );
@@ -590,7 +579,7 @@ impl Chat {
 
     /// A reply finished: store it, then either run what it asked for or stop.
     fn on_reply(&mut self, cx: &mut Context<Self>) {
-        let model = self.store.model.clone();
+        let model = self.store.settings.model.clone();
         let Some(turn) = self.turn.as_mut() else {
             return;
         };
@@ -808,7 +797,7 @@ impl Chat {
             .is_some_and(|id| self.unattended.contains(&id));
         agent::needs_user(
             name,
-            self.store.skip_approvals,
+            self.store.settings.skip_approvals,
             &self.session_allow,
             unattended,
         )
@@ -1001,7 +990,7 @@ impl Render for Chat {
                 if let Some(live) = self.turn.as_ref().filter(|_| idle).map(|turn| Message {
                     role: "assistant".into(),
                     content: turn.live.content.clone(),
-                    model: self.store.model.clone(),
+                    model: self.store.settings.model.clone(),
                     reasoning: turn.live.reasoning.clone(),
                     tokens: turn.live.tokens,
                     per_second: turn.live.per_second,

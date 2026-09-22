@@ -19,7 +19,7 @@ impl Chat {
         cx: &mut Context<Self>,
     ) {
         let g = gateway(name);
-        self.store.gateway = name.into();
+        self.store.settings.gateway = name.into();
         self.gateway_pick.update(cx, |g, cx| {
             *g = name.into();
             cx.notify();
@@ -35,10 +35,10 @@ impl Chat {
     }
 
     pub(crate) fn apply_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.store.endpoint = self.endpoint.read(cx).value().to_string();
-        self.store.model = self.model.read(cx).value().to_string();
+        self.store.settings.endpoint = self.endpoint.read(cx).value().to_string();
+        self.store.settings.model = self.model.read(cx).value().to_string();
         let key = self.key.read(cx).value().to_string();
-        let slot = key_slot(&self.store.gateway).to_string();
+        let slot = key_slot(&self.store.settings.gateway).to_string();
         if key.is_empty() {
             self.keys.remove(&slot);
         } else {
@@ -223,9 +223,8 @@ impl Chat {
                 cx,
             )
             .into_any_element(),
-            "Privacy" => {
-                privacy_page(&chat, &presence, self.store.skip_approvals, cx).into_any_element()
-            }
+            "Privacy" => privacy_page(&chat, &presence, self.store.settings.skip_approvals, cx)
+                .into_any_element(),
             "Plugins" => plugins_page(&chat, cx).into_any_element(),
             "About" => about_page(cx).into_any_element(),
             _ => gateway_page(&pick, &endpoint, &key, &chat, cx).into_any_element(),
@@ -400,7 +399,7 @@ fn privacy_page(chat: &Entity<Chat>, presence: &Entity<String>, skip: bool, cx: 
             });
             plugins::emit(cx, plugins::AppEvent::PresenceMode(mode));
             chat.update(cx, |this, cx| {
-                this.store.presence = mode.as_str().into();
+                this.store.settings.presence = mode.as_str().into();
                 this.save();
                 cx.notify();
             });
@@ -487,7 +486,7 @@ fn privacy_page(chat: &Entity<Chat>, presence: &Entity<String>, skip: bool, cx: 
                         let chat = chat.clone();
                         move |_, _, cx| {
                             chat.update(cx, |this, cx| {
-                                this.store.skip_approvals = !skip;
+                                this.store.settings.skip_approvals = !skip;
                                 this.save();
                                 cx.notify();
                             })

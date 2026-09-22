@@ -17,7 +17,7 @@ impl Chat {
         let label: String = if is_user {
             "You".into()
         } else if message.model.is_empty() {
-            self.store.model.clone()
+            self.store.settings.model.clone()
         } else {
             message.model.clone()
         };

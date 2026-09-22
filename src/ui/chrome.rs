@@ -85,19 +85,23 @@ impl Chat {
             (
                 cx.theme().muted_foreground,
                 "checking",
-                format!("{}: loading model list", self.store.gateway),
+                format!("{}: loading model list", self.store.settings.gateway),
             )
         } else if let Some(e) = &self.gateway_error {
             (
                 cx.theme().danger,
                 "error",
-                format!("{}: {e}", self.store.gateway),
+                format!("{}: {e}", self.store.settings.gateway),
             )
         } else {
             (
                 cx.theme().green,
                 "ready",
-                format!("{}: {} models", self.store.gateway, self.models.len()),
+                format!(
+                    "{}: {} models",
+                    self.store.settings.gateway,
+                    self.models.len()
+                ),
             )
         };
         Button::new("gateway")
