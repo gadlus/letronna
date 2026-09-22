@@ -27,7 +27,7 @@ On **Windows**, first launch copies the executable to `%LOCALAPPDATA%\Programs\L
 
 On **Linux**, first launch copies the binary to `~/.local/bin/letronna` and writes `~/.local/share/applications/letronna.desktop`, so it appears in the application menu. Uninstall with `letronna --uninstall`. The tray icon uses StatusNotifierItem over D-Bus, which needs a panel that supports it (KDE does; GNOME needs an extension such as AppIndicator Support). There is no backdrop blur behind dialogs, and closing the window minimises rather than hiding to the tray.
 
-On **macOS** the app runs in place: no install, no tray, no blur. A proper install there means an `.app` bundle, which is not built yet.
+On **macOS** the app runs in place: no install, no tray, no blur. `scripts/bundle-macos.sh` wraps the release binary in `target/Letronna.app`, which macOS needs before it will show a Dock icon and the right name; drag it wherever you like. It does not register itself, so `--uninstall` has nothing to do and a second launch opens a second window.
 
 | | Windows | Linux | macOS |
 |---|---|---|---|
@@ -60,7 +60,7 @@ Model lists come from `GET {base}/models`. Streaming uses SSE chat completions.
 
 ## Local data
 
-`%LOCALAPPDATA%\Letronna\`
+`%LOCALAPPDATA%\Letronna\` on Windows, `~/Library/Application Support/Letronna/` on macOS, `~/.local/share/Letronna/` on Linux. `AGENT_DATA_DIR` overrides all three.
 
 - `chats.json` sessions and the selected gateway, endpoint and model
 - `keys.json` API keys per gateway, plain text on your disk only
@@ -73,6 +73,8 @@ Chat text is sent to the gateway you selected and nowhere else.
 Requirements on Windows: Rust, Visual Studio C++ build tools, and a Windows SDK with `fxc.exe`. Set `GPUI_FXC_PATH` in `.cargo/config.toml` to your SDK's shader compiler.
 
 On Linux you need gpui's usual build dependencies (Vulkan, X11 or Wayland, and `libxkbcommon`). The tray needs no extra system libraries: the KSNI backend talks D-Bus directly.
+
+On macOS the Command Line Tools are enough. gpui normally compiles its Metal shaders with `xcrun metal`, which only ships in Xcode's separately downloaded Metal toolchain. The macOS build enables gpui's `runtime_shaders` feature instead, so the Metal driver compiles them at startup. Run `scripts/bundle-macos.sh` after the release build for an `.app`.
 
 ```powershell
 cargo build --release
@@ -118,7 +120,7 @@ src/platform/       OS integration; same API everywhere, per-OS behind cfg
   backdrop.rs       captures and blurs the window for modal backdrops
 
 assets/             icon, avatar, SVG icons
-scripts/            icon sync, window capture for UI checks
+scripts/            icon sync, macOS .app bundling, window capture for UI checks
 ```
 
 Adding an integration (a new plugin) is one file in `src/plugins` implementing

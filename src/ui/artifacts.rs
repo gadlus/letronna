@@ -55,7 +55,7 @@ pub(crate) fn collect(store: &Store) -> Vec<Artifact> {
             }
         }
     }
-    found.sort_by(|a, b| b.written.cmp(&a.written));
+    found.sort_by_key(|a| std::cmp::Reverse(a.written));
     found
 }
 

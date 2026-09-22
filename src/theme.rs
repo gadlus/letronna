@@ -1,12 +1,26 @@
 use crate::prelude::*;
 
+// A family the system cannot resolve drops every glyph to Helvetica without
+// warning, so each platform names fonts it actually ships. gpui turns
+// ".SystemUIFont" into the platform's own UI face; "monospace" is a fontconfig
+// generic, which Linux resolves and macOS does not.
+#[cfg(target_os = "macos")]
+pub(crate) const HEADING_FONT: &str = ".SystemUIFont";
+#[cfg(target_os = "macos")]
+pub(crate) const BODY_FONT: &str = ".SystemUIFont";
+#[cfg(target_os = "macos")]
+pub(crate) const MONO_FONT: &str = "Menlo";
+
+#[cfg(not(target_os = "macos"))]
 pub(crate) const HEADING_FONT: &str = "Segoe UI Variable Display";
+#[cfg(not(target_os = "macos"))]
 pub(crate) const BODY_FONT: &str = "Segoe UI Variable Text";
-pub(crate) const WORDMARK_FONT: &str = "Georgia";
 #[cfg(windows)]
 pub(crate) const MONO_FONT: &str = "Cascadia Mono";
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub(crate) const MONO_FONT: &str = "monospace";
+
+pub(crate) const WORDMARK_FONT: &str = "Georgia";
 
 pub(crate) fn apply(cx: &mut App) {
     Theme::change(ThemeMode::Dark, None, cx);

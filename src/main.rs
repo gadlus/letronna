@@ -30,7 +30,8 @@ fn main() {
             ],
         );
         cx.bind_keys([
-            KeyBinding::new("ctrl-n", NewSession, None),
+            // "secondary" is cmd on macOS and ctrl everywhere else.
+            KeyBinding::new("secondary-n", NewSession, None),
             KeyBinding::new(
                 "shift-enter",
                 gpui_component::input::Enter { secondary: true },

@@ -382,7 +382,12 @@ pub fn data_dir() -> std::path::PathBuf {
     std::env::var_os("LOCALAPPDATA")
         .map(std::path::PathBuf::from)
         .or_else(|| {
-            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share"))
+            let under_home = if cfg!(target_os = "macos") {
+                "Library/Application Support"
+            } else {
+                ".local/share"
+            };
+            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(under_home))
         })
         .unwrap_or_else(std::env::temp_dir)
         .join("Letronna")
@@ -664,6 +669,22 @@ mod tests {
             workspace: None,
             plan: false,
         }
+    }
+    #[test]
+    fn data_dir_is_the_platform_convention() {
+        // Both overrides win over HOME, so there is nothing to assert under them.
+        if std::env::var_os("AGENT_DATA_DIR").is_some()
+            || std::env::var_os("LOCALAPPDATA").is_some()
+        {
+            return;
+        }
+        let dir = data_dir();
+        let expected = if cfg!(target_os = "macos") {
+            "Library/Application Support/Letronna"
+        } else {
+            ".local/share/Letronna"
+        };
+        assert!(dir.ends_with(expected), "{dir:?}");
     }
     #[test]
     fn endpoint_validation() {

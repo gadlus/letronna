@@ -59,13 +59,9 @@ impl Chat {
     }
 
     pub(crate) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Snapshot the window before the overlay covers it.
-        #[cfg(windows)]
-        {
-            self.settings_backdrop = crate::platform::backdrop::capture(window);
-        }
-        #[cfg(not(windows))]
-        let _ = window;
+        // Snapshot the window before the overlay covers it. Platforms that
+        // cannot sample it return None, which falls back to the plain scrim.
+        self.settings_backdrop = crate::platform::backdrop::capture(window);
         self.settings_open = true;
         self.settings_closing = false;
         cx.notify();

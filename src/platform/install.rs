@@ -232,6 +232,7 @@ mod windows_impl {
 
 /// The XDG desktop entry that puts Letronna in the application menu.
 /// Pure so it can be checked from any platform.
+#[cfg(any(target_os = "linux", test))]
 fn desktop_entry(exec: &str, icon: &str) -> String {
     format!(
         "[Desktop Entry]\n\

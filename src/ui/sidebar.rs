@@ -172,7 +172,7 @@ impl Chat {
                     .gap_0p5()
                     .child(
                         self.nav_item("new", AppIcon::SquarePen, "New session", None, cx)
-                            .child(Kbd::new(Keystroke::parse("ctrl-n").unwrap()).text_xs())
+                            .child(Kbd::new(Keystroke::parse("secondary-n").unwrap()).text_xs())
                             .on_click(cx.listener(|this, _, window, cx| this.new_chat(window, cx))),
                     )
                     .child(self.nav_item(

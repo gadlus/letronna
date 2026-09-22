@@ -3,3 +3,5 @@
 .env
 .env.*
 *.log
+.CLAUDE.MD
+CLAUDE.md

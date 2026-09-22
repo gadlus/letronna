@@ -3,6 +3,9 @@
 use crate::prelude::*;
 
 /// Put the window back in front of the user, from the tray or a second launch.
+/// Kept everywhere per this module's contract, though only the tray and the
+/// single-instance check ever call it.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 pub(crate) fn show(window: &mut Window) {
     #[cfg(windows)]
     win::set_visible(window, true);
