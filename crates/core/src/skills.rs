@@ -4,34 +4,36 @@
 //! composer rather than sending it, so it can be adjusted first: a playbook is
 //! a starting point, not a command.
 
-use crate::prelude::*;
+use crate::chat::{self as backend};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct Skill {
-    pub(crate) id: u64,
-    pub(crate) name: String,
-    pub(crate) prompt: String,
+pub struct Skill {
+    pub id: u64,
+    pub name: String,
+    pub prompt: String,
 }
 
-pub(crate) fn path() -> PathBuf {
+pub fn path() -> PathBuf {
     backend::data_dir().join("skills.json")
 }
 
-pub(crate) fn load() -> Vec<Skill> {
+pub fn load() -> Vec<Skill> {
     std::fs::read(path())
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_else(defaults)
 }
 
-pub(crate) fn save(skills: &[Skill]) {
+pub fn save(skills: &[Skill]) {
     let _ = std::fs::create_dir_all(backend::data_dir());
     if let Ok(bytes) = serde_json::to_vec_pretty(skills) {
         let _ = std::fs::write(path(), bytes);
     }
 }
 
-pub(crate) fn next_id(skills: &[Skill]) -> u64 {
+pub fn next_id(skills: &[Skill]) -> u64 {
     skills.iter().map(|s| s.id).max().unwrap_or(0) + 1
 }
 

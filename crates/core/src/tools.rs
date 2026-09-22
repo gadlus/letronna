@@ -410,12 +410,12 @@ impl Tool for RunCommand {
         if !args["background"].as_bool().unwrap_or(false) {
             return run_shell(command, Some(cwd));
         }
-        let id = super::jobs::start(command, cwd)?;
+        let id = crate::jobs::start(command, cwd)?;
         // Give it a moment to fail or announce a port, so the first reply says
         // something more useful than "started".
         std::thread::sleep(SETTLE);
-        let log = super::jobs::log(id).unwrap_or_default();
-        let state = if super::jobs::running(id).unwrap_or(false) {
+        let log = crate::jobs::log(id).unwrap_or_default();
+        let state = if crate::jobs::running(id).unwrap_or(false) {
             "running"
         } else {
             "already exited"
@@ -446,11 +446,11 @@ impl Tool for ReadJob {
     }
     fn run(&self, args: &Value, _: &ToolContext) -> Result<String, String> {
         let id = job_id(args)?;
-        let log = super::jobs::log(id)?;
-        let state = if super::jobs::running(id)? {
+        let log = crate::jobs::log(id)?;
+        let state = if crate::jobs::running(id)? {
             "running".to_owned()
         } else {
-            match super::jobs::exit_code(id)? {
+            match crate::jobs::exit_code(id)? {
                 Some(code) => format!("exited with code {code}"),
                 None => "stopped".to_owned(),
             }
@@ -484,7 +484,7 @@ impl Tool for StopJob {
     }
     fn run(&self, args: &Value, _: &ToolContext) -> Result<String, String> {
         let id = job_id(args)?;
-        super::jobs::stop(id)?;
+        crate::jobs::stop(id)?;
         Ok(format!("Stopped job #{id}."))
     }
 }
@@ -514,14 +514,14 @@ impl Tool for Wait {
         let until = args["until"].as_str().unwrap_or_default();
         let started = std::time::Instant::now();
         loop {
-            let log = super::jobs::log(id)?;
+            let log = crate::jobs::log(id)?;
             if !until.is_empty() && log.contains(until) {
                 return Ok(format!(
                     "Job #{id} printed `{until}` after {:.0}s.",
                     started.elapsed().as_secs_f32()
                 ));
             }
-            if !super::jobs::running(id)? {
+            if !crate::jobs::running(id)? {
                 return Ok(format!(
                     "Job #{id} exited before printing `{until}`. Output:\n{}",
                     log.trim_end()

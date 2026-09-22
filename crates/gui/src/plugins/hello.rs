@@ -7,7 +7,7 @@
 //! into its UI closures, so nothing external is needed to wire it up.
 
 use super::{AppEvent, Plugin};
-use crate::core::tools::{Tool, ToolContext};
+use letronna_core::tools::{Tool, ToolContext};
 use crate::prelude::*;
 use serde_json::{Value, json};
 use std::sync::Arc;

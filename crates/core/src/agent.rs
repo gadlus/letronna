@@ -12,8 +12,8 @@
 //! into whichever model fitted the other worse. Instead the loop says what it
 //! needs next and stops, and the caller comes back when it has it.
 
-use super::chat::{Connection, Event, Message, ToolCall};
-use super::tools;
+use crate::chat::{Connection, Event, Message, ToolCall};
+use crate::tools;
 use std::collections::{HashSet, VecDeque};
 
 /// Tool rounds per user message. Enough for a real investigation, small

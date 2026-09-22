@@ -3486,7 +3486,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a79a3332a6609480d7d0c9eab957bca6b455b91bb84e66d19f5ff66294b85b8"
 
 [[package]]
-name = "letronna"
+name = "letronna-cli"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "async-channel 2.5.0",
+ "letronna-core",
+ "serde_json",
+]
+
+[[package]]
+name = "letronna-core"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "async-channel 2.5.0",
+ "chrono",
+ "reqwest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "letronna-gui"
 version = "0.1.0-alpha.1"
 dependencies = [
  "async-channel 2.5.0",
@@ -3496,9 +3516,9 @@ dependencies = [
  "gpui",
  "gpui-component",
  "image",
+ "letronna-core",
  "raw-window-handle",
  "reqwest",
- "serde",
  "serde_json",
  "tray-icon",
  "windows-sys 0.59.0",

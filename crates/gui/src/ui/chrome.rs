@@ -150,12 +150,12 @@ impl Chat {
     /// One chip per background job, with a stop button. Only running jobs are
     /// shown: a finished one is history, and the agent can still read its log.
     fn job_chips(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let jobs = crate::core::jobs::list();
+        let jobs = letronna_core::jobs::list();
         h_flex().gap_1().children(
             jobs.into_iter()
                 .filter(|job| job.running)
                 .map(|job| {
-                    let label = crate::core::tools::one_line(&job.command);
+                    let label = letronna_core::tools::one_line(&job.command);
                     Button::new(("job", job.id as usize))
                         .ghost()
                         .xsmall()
@@ -171,7 +171,7 @@ impl Chat {
                                 .child(Icon::new(IconName::Close).size_3()),
                         )
                         .on_click(cx.listener(move |_, _, _, cx| {
-                            let _ = crate::core::jobs::stop(job.id);
+                            let _ = letronna_core::jobs::stop(job.id);
                             cx.notify();
                         }))
                 })

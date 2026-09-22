@@ -1,7 +1,7 @@
 //! The card the chat shows when a tool needs the user: approve a write or a
 //! command, or answer an `ask_user` question.
 
-use crate::core::tools;
+use letronna_core::tools;
 use crate::prelude::*;
 
 impl Chat {
@@ -26,7 +26,7 @@ impl Chat {
         // `true` here means "show me whatever is at the front", running or
         // not; the gate below decides which of the two this is.
         let call = match turn.next(|_| true) {
-            crate::core::agent::Next::AskUser(call) => call,
+            letronna_core::agent::Next::AskUser(call) => call,
             _ => return None,
         };
         let ctx = tools::ToolContext {

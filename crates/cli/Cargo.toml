@@ -1,0 +1,17 @@
+[package]
+name = "letronna-cli"
+description = "Letronna in the terminal"
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+
+# The name people type. The window is a separate binary it can launch.
+[[bin]]
+name = "letronna"
+path = "src/main.rs"
+
+[dependencies]
+letronna-core.workspace = true
+serde_json.workspace = true
+async-channel.workspace = true

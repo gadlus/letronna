@@ -1,13 +1,13 @@
-pub(crate) const Upstream: &str = "https://pool.example/v1";
+pub const Upstream: &str = "https://pool.example/v1";
 
-pub(crate) struct Gateway {
-    pub(crate) name: &'static str,
-    pub(crate) base: &'static str,
-    pub(crate) needs_key: bool,
-    pub(crate) blurb: &'static str,
+pub struct Gateway {
+    pub name: &'static str,
+    pub base: &'static str,
+    pub needs_key: bool,
+    pub blurb: &'static str,
 }
 
-pub(crate) const GATEWAYS: &[Gateway] = &[
+pub const GATEWAYS: &[Gateway] = &[
     Gateway {
         name: "Upstream Free",
         base: Upstream,
@@ -47,7 +47,7 @@ pub(crate) const GATEWAYS: &[Gateway] = &[
 ];
 
 /// Both Upstream gateways share one saved key.
-pub(crate) fn key_slot(name: &str) -> &str {
+pub fn key_slot(name: &str) -> &str {
     if gateway(name).base == Upstream {
         "Upstream"
     } else {
@@ -55,7 +55,7 @@ pub(crate) fn key_slot(name: &str) -> &str {
     }
 }
 
-pub(crate) fn gateway(name: &str) -> &'static Gateway {
+pub fn gateway(name: &str) -> &'static Gateway {
     GATEWAYS
         .iter()
         .find(|g| g.name == name)

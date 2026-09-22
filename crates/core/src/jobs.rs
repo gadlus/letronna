@@ -69,7 +69,7 @@ fn pump(mut source: impl Read + Send + 'static, log: Arc<Mutex<String>>) {
 }
 
 pub fn start(command: &str, cwd: &Path) -> Result<u64, String> {
-    let mut child = super::tools::shell(command, Some(cwd))
+    let mut child = crate::tools::shell(command, Some(cwd))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

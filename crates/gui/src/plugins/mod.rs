@@ -60,7 +60,7 @@ pub(crate) trait Plugin: 'static {
     }
     /// Tools this plugin adds to the agent, offered only while it is enabled.
     /// They run on worker threads, so everything they capture must be `Send`.
-    fn tools(&self) -> Vec<Arc<dyn crate::core::tools::Tool>> {
+    fn tools(&self) -> Vec<Arc<dyn letronna_core::tools::Tool>> {
         Vec::new()
     }
 }
@@ -72,7 +72,7 @@ fn refresh_tools(plugins: &[Box<dyn Plugin>]) {
         .filter(|p| p.enabled())
         .flat_map(|p| p.tools())
         .collect();
-    crate::core::tools::set_plugin_tools(tools);
+    letronna_core::tools::set_plugin_tools(tools);
 }
 
 /// A snapshot of a plugin for the Settings list.

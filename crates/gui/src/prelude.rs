@@ -12,15 +12,9 @@ pub(crate) use gpui_component::{
     text::TextView,
     v_flex,
 };
-pub(crate) use serde::{Deserialize, Serialize};
 pub(crate) use std::{borrow::Cow, path::PathBuf};
 
-pub(crate) use crate::{
-    app::*,
-    assets::*,
-    core::chat::{self as backend, Connection, Event, Message},
-    core::gateway::*,
-    core::store::*,
-    plugins,
-    theme::*,
-};
+pub(crate) use crate::{app::*, assets::*, plugins, theme::*};
+pub(crate) use letronna_core::chat::{self as backend, Connection, Event, Message};
+pub(crate) use letronna_core::gateway::*;
+pub(crate) use letronna_core::store::*;

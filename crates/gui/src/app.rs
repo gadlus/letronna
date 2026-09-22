@@ -1,4 +1,4 @@
-use crate::core::agent;
+use letronna_core::agent;
 use crate::prelude::*;
 
 pub(crate) const BRAND: &str = "Letronna";
@@ -98,12 +98,12 @@ pub(crate) struct Chat {
     pub(crate) job_tick: bool,
     /// Plan mode: the model may read and ask, but not change anything.
     pub(crate) plan_mode: bool,
-    pub(crate) schedules: Vec<crate::core::schedule::Schedule>,
+    pub(crate) schedules: Vec<letronna_core::schedule::Schedule>,
     /// Id of the schedule being edited on the Scheduled jobs page.
     pub(crate) editing: Option<u64>,
     pub(crate) job_name: Entity<InputState>,
     pub(crate) job_prompt: Entity<InputState>,
-    pub(crate) messaging: crate::core::messaging::Config,
+    pub(crate) messaging: letronna_core::messaging::Config,
     /// A chat that has messaged the bot but has not been allowed yet.
     pub(crate) pairing: Option<(i64, String)>,
     /// Sessions a schedule opened, so their result can be reported onward.
@@ -119,7 +119,7 @@ pub(crate) struct Chat {
     pub(crate) bot_name: Option<String>,
     /// Selected row on the Messaging page.
     pub(crate) channel: usize,
-    pub(crate) skills: Vec<crate::core::skills::Skill>,
+    pub(crate) skills: Vec<letronna_core::skills::Skill>,
     pub(crate) editing_skill: Option<u64>,
     pub(crate) skill_name: Entity<InputState>,
     pub(crate) skill_prompt: Entity<InputState>,
@@ -133,7 +133,7 @@ impl Chat {
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         // Sessions are separate files now, so a damaged one costs that
         // session rather than the history.
-        let (mut store, error) = (crate::core::store::load(), None);
+        let (mut store, error) = (letronna_core::store::load(), None);
         if store.conversations.is_empty() {
             store.conversations.push(Conversation {
                 title: "New session".into(),
@@ -192,12 +192,12 @@ impl Chat {
             InputState::new(window, cx)
                 .masked(true)
                 .placeholder("Bot token from @BotFather")
-                .default_value(crate::core::messaging::load().telegram.token)
+                .default_value(letronna_core::messaging::load().telegram.token)
         });
         let webhook_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("https://discord.com/api/webhooks/...")
-                .default_value(crate::core::messaging::load().discord.webhook)
+                .default_value(letronna_core::messaging::load().discord.webhook)
         });
         let skill_name =
             cx.new(|cx| InputState::new(window, cx).placeholder("Review these changes"));
@@ -261,11 +261,11 @@ impl Chat {
             answer,
             job_tick: false,
             plan_mode: false,
-            schedules: crate::core::schedule::load(),
+            schedules: letronna_core::schedule::load(),
             editing: None,
             job_name,
             job_prompt,
-            messaging: crate::core::messaging::load(),
+            messaging: letronna_core::messaging::load(),
             pairing: None,
             scheduled: std::collections::HashSet::new(),
             remote: std::collections::HashMap::new(),
@@ -275,7 +275,7 @@ impl Chat {
             hook_name: None,
             bot_name: None,
             channel: 0,
-            skills: crate::core::skills::load(),
+            skills: letronna_core::skills::load(),
             editing_skill: None,
             skill_name,
             skill_prompt,
@@ -487,12 +487,12 @@ impl Chat {
         let Some(index) = self
             .schedules
             .iter()
-            .position(|s| crate::core::schedule::is_due(s, now))
+            .position(|s| letronna_core::schedule::is_due(s, now))
         else {
             return;
         };
         self.schedules[index].last_run = backend::now();
-        crate::core::schedule::save(&self.schedules);
+        letronna_core::schedule::save(&self.schedules);
         let schedule = self.schedules[index].clone();
         self.start_scheduled(&schedule, cx);
     }
@@ -500,7 +500,7 @@ impl Chat {
     /// Open a fresh session for a schedule and send its prompt.
     pub(crate) fn start_scheduled(
         &mut self,
-        schedule: &crate::core::schedule::Schedule,
+        schedule: &letronna_core::schedule::Schedule,
         cx: &mut Context<Self>,
     ) {
         self.store.conversations.push(Conversation {
@@ -611,7 +611,7 @@ impl Chat {
         match turn.next(gate) {
             agent::Next::Done => self.finish(cx),
             agent::Next::AskUser(_) => cx.notify(),
-            agent::Next::Run(call) if call.name == crate::core::tools::TODO => {
+            agent::Next::Run(call) if call.name == letronna_core::tools::TODO => {
                 self.apply_todo(&call.arguments.clone(), cx)
             }
             agent::Next::Run(call) => self.execute_call(call, cx),
@@ -634,7 +634,7 @@ impl Chat {
 
     /// Run one call off the UI thread and continue the queue when it returns.
     fn execute_call(&mut self, call: backend::ToolCall, cx: &mut Context<Self>) {
-        let ctx = crate::core::tools::ToolContext {
+        let ctx = letronna_core::tools::ToolContext {
             workspace: self
                 .turn
                 .as_ref()
@@ -642,7 +642,7 @@ impl Chat {
         };
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
-            let _ = tx.send_blocking(crate::core::tools::run(&call.name, &call.arguments, &ctx));
+            let _ = tx.send_blocking(letronna_core::tools::run(&call.name, &call.arguments, &ctx));
         });
         cx.spawn(async move |this, cx| {
             if let Ok(result) = rx.recv().await {
@@ -673,7 +673,7 @@ impl Chat {
         }
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let (tx, rx) = async_channel::unbounded();
-        crate::core::messaging::poll(self.messaging.telegram.token.clone(), stop.clone(), tx);
+        letronna_core::messaging::poll(self.messaging.telegram.token.clone(), stop.clone(), tx);
         self.messaging_stop = Some(stop);
         cx.spawn(async move |this, cx| {
             while let Ok(message) = rx.recv().await {
@@ -693,14 +693,14 @@ impl Chat {
         let text = text.to_owned();
         cx.background_executor()
             .spawn(async move {
-                let _ = crate::core::messaging::send(&token, chat, &text);
+                let _ = letronna_core::messaging::send(&token, chat, &text);
             })
             .detach();
     }
 
     /// A message arrived from the bot. Anything from a chat the user has not
     /// approved is held for approval rather than acted on.
-    fn on_remote(&mut self, message: crate::core::messaging::Incoming, cx: &mut Context<Self>) {
+    fn on_remote(&mut self, message: letronna_core::messaging::Incoming, cx: &mut Context<Self>) {
         if self.messaging.telegram.chat != Some(message.chat) {
             self.pairing = Some((message.chat, message.from));
             cx.notify();
@@ -763,7 +763,7 @@ impl Chat {
         let webhook = self.messaging.discord.webhook.clone();
         cx.background_executor()
             .spawn(async move {
-                let _ = crate::core::messaging::discord_send(&webhook, &text);
+                let _ = letronna_core::messaging::discord_send(&webhook, &text);
             })
             .detach();
     }
@@ -805,7 +805,7 @@ impl Chat {
 
     /// Store the model's checklist on the session so the composer can show it.
     fn apply_todo(&mut self, arguments: &str, cx: &mut Context<Self>) {
-        let result = crate::core::tools::parse_args(arguments).and_then(|args| {
+        let result = letronna_core::tools::parse_args(arguments).and_then(|args| {
             let items = args["items"]
                 .as_array()
                 .ok_or_else(|| "`items` is required.".to_owned())?;
@@ -848,7 +848,7 @@ impl Chat {
         };
         match verdict {
             Verdict::Answer(text) => self.record_result(Ok(text), cx),
-            Verdict::Deny => self.record_result(Err(crate::core::tools::DECLINED.into()), cx),
+            Verdict::Deny => self.record_result(Err(letronna_core::tools::DECLINED.into()), cx),
             Verdict::Allow { remember } => {
                 if remember {
                     self.session_allow.insert(call.name.clone());
@@ -883,14 +883,14 @@ impl Render for Chat {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // A job starting or exiting happens off the UI thread, so the footer
         // chips need a poll while any of them is alive. It stops on its own.
-        if !self.job_tick && crate::core::jobs::list().iter().any(|job| job.running) {
+        if !self.job_tick && letronna_core::jobs::list().iter().any(|job| job.running) {
             self.job_tick = true;
             cx.spawn(async move |this, cx| {
                 loop {
                     cx.background_executor()
                         .timer(std::time::Duration::from_secs(1))
                         .await;
-                    let alive = crate::core::jobs::list().iter().any(|job| job.running);
+                    let alive = letronna_core::jobs::list().iter().any(|job| job.running);
                     let sent = this.update(cx, |this, cx| {
                         this.job_tick = alive;
                         cx.notify();

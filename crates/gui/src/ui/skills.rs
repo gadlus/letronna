@@ -1,6 +1,6 @@
 //! The Skills page: saved prompts, loaded into the composer on demand.
 
-use crate::core::skills::{self, Skill};
+use letronna_core::skills::{self, Skill};
 use crate::prelude::*;
 
 impl Chat {
@@ -154,7 +154,7 @@ impl Chat {
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
                             .truncate()
-                            .child(crate::core::tools::one_line(&skill.prompt)),
+                            .child(letronna_core::tools::one_line(&skill.prompt)),
                     ),
             )
             .child(

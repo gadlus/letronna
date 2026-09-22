@@ -9,11 +9,13 @@
 //! time of day", which is what a desktop agent is actually asked for, and it
 //! reads back to the user without a syntax lesson.
 
-use crate::prelude::*;
+use crate::chat::{self as backend};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use chrono::{DateTime, Datelike, Local, TimeZone, Timelike};
 
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) enum Trigger {
+pub enum Trigger {
     /// Every N minutes since the last run.
     Every { minutes: u32 },
     /// At a wall-clock time each day, optionally only Monday to Friday.
@@ -25,7 +27,7 @@ pub(crate) enum Trigger {
 }
 
 impl Trigger {
-    pub(crate) fn label(&self) -> String {
+    pub fn label(&self) -> String {
         match self {
             Trigger::Every { minutes } if *minutes % 60 == 0 && *minutes >= 60 => {
                 let hours = minutes / 60;
@@ -49,22 +51,22 @@ impl Trigger {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct Schedule {
-    pub(crate) id: u64,
-    pub(crate) name: String,
-    pub(crate) prompt: String,
+pub struct Schedule {
+    pub id: u64,
+    pub name: String,
+    pub prompt: String,
     #[serde(default)]
-    pub(crate) workspace: Option<PathBuf>,
-    pub(crate) trigger: Trigger,
+    pub workspace: Option<PathBuf>,
+    pub trigger: Trigger,
     #[serde(default = "yes")]
-    pub(crate) enabled: bool,
+    pub enabled: bool,
     /// Epoch seconds of the last run; 0 if it has never run.
     #[serde(default)]
-    pub(crate) last_run: u64,
+    pub last_run: u64,
     /// Run tools without asking, for this schedule only. Off by default: an
     /// approval card with nobody watching would stall the run forever.
     #[serde(default)]
-    pub(crate) unattended: bool,
+    pub unattended: bool,
 }
 
 fn yes() -> bool {
@@ -115,7 +117,7 @@ fn due_at(schedule: &Schedule, now: DateTime<Local>) -> Option<u64> {
 }
 
 /// Whether the schedule should run now, given when it last did.
-pub(crate) fn is_due(schedule: &Schedule, now: DateTime<Local>) -> bool {
+pub fn is_due(schedule: &Schedule, now: DateTime<Local>) -> bool {
     if !schedule.enabled {
         return false;
     }
@@ -126,31 +128,31 @@ pub(crate) fn is_due(schedule: &Schedule, now: DateTime<Local>) -> bool {
 }
 
 /// When a newly created schedule starts counting from.
-pub(crate) fn armed_now(schedule: &mut Schedule) {
+pub fn armed_now(schedule: &mut Schedule) {
     if matches!(schedule.trigger, Trigger::Every { .. }) {
         schedule.last_run = backend::now();
     }
 }
 
-pub(crate) fn path() -> PathBuf {
+pub fn path() -> PathBuf {
     backend::data_dir().join("schedules.json")
 }
 
-pub(crate) fn load() -> Vec<Schedule> {
+pub fn load() -> Vec<Schedule> {
     std::fs::read(path())
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default()
 }
 
-pub(crate) fn save(schedules: &[Schedule]) {
+pub fn save(schedules: &[Schedule]) {
     let _ = std::fs::create_dir_all(backend::data_dir());
     if let Ok(bytes) = serde_json::to_vec_pretty(schedules) {
         let _ = std::fs::write(path(), bytes);
     }
 }
 
-pub(crate) fn next_id(schedules: &[Schedule]) -> u64 {
+pub fn next_id(schedules: &[Schedule]) -> u64 {
     schedules.iter().map(|s| s.id).max().unwrap_or(0) + 1
 }
 

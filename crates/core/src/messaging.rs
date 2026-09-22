@@ -12,7 +12,9 @@
 //! otherwise: the failure mode of getting that wrong is someone else running
 //! commands on this machine.
 
-use crate::prelude::*;
+use crate::chat::{self as backend};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 const API: &str = "https://api.telegram.org";
 /// How long the server holds a poll open with no messages.
@@ -21,32 +23,32 @@ const POLL_SECONDS: u32 = 25;
 const MAX_REPLY: usize = 4000;
 
 #[derive(Clone, Default, Serialize, Deserialize)]
-pub(crate) struct Config {
+pub struct Config {
     #[serde(default)]
-    pub(crate) telegram: Telegram,
+    pub telegram: Telegram,
     #[serde(default)]
-    pub(crate) discord: Discord,
+    pub discord: Discord,
 }
 
 /// Two-way: Telegram hands out messages over long polling, so Letronna can
 /// both hear and answer without being reachable from the internet.
 #[derive(Clone, Default, Serialize, Deserialize)]
-pub(crate) struct Telegram {
+pub struct Telegram {
     #[serde(default)]
-    pub(crate) enabled: bool,
+    pub enabled: bool,
     #[serde(default)]
-    pub(crate) token: String,
+    pub token: String,
     /// The one chat allowed to talk to this agent.
     #[serde(default)]
-    pub(crate) chat: Option<i64>,
+    pub chat: Option<i64>,
     /// Let remote messages use tools that change things. Off by default: the
     /// approval card has no one to ask on the other end.
     #[serde(default)]
-    pub(crate) allow_tools: bool,
+    pub allow_tools: bool,
 }
 
 impl Telegram {
-    pub(crate) fn ready(&self) -> bool {
+    pub fn ready(&self) -> bool {
         self.enabled && !self.token.trim().is_empty()
     }
 }
@@ -55,39 +57,39 @@ impl Telegram {
 /// Discord has no polling endpoint for bots, so hearing replies would mean
 /// holding a Gateway WebSocket open. Reporting results is what this is for.
 #[derive(Clone, Default, Serialize, Deserialize)]
-pub(crate) struct Discord {
+pub struct Discord {
     #[serde(default)]
-    pub(crate) enabled: bool,
+    pub enabled: bool,
     #[serde(default)]
-    pub(crate) webhook: String,
+    pub webhook: String,
 }
 
 impl Discord {
-    pub(crate) fn ready(&self) -> bool {
+    pub fn ready(&self) -> bool {
         self.enabled && self.webhook.trim().starts_with("https://")
     }
 }
 
 /// A message that arrived from Telegram.
-pub(crate) struct Incoming {
-    pub(crate) chat: i64,
+pub struct Incoming {
+    pub chat: i64,
     /// Who sent it, for the pairing prompt.
-    pub(crate) from: String,
-    pub(crate) text: String,
+    pub from: String,
+    pub text: String,
 }
 
-pub(crate) fn path() -> PathBuf {
+pub fn path() -> PathBuf {
     backend::data_dir().join("messaging.json")
 }
 
-pub(crate) fn load() -> Config {
+pub fn load() -> Config {
     std::fs::read(path())
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default()
 }
 
-pub(crate) fn save(config: &Config) {
+pub fn save(config: &Config) {
     let _ = std::fs::create_dir_all(backend::data_dir());
     if let Ok(bytes) = serde_json::to_vec_pretty(config) {
         let _ = std::fs::write(path(), bytes);
@@ -135,7 +137,7 @@ fn client() -> Option<reqwest::blocking::Client> {
 
 /// Send a reply. Telegram caps message length, so long answers are trimmed
 /// rather than silently dropped.
-pub(crate) fn send(token: &str, chat: i64, text: &str) -> Result<(), String> {
+pub fn send(token: &str, chat: i64, text: &str) -> Result<(), String> {
     let client = client().ok_or("Cannot initialize connection.")?;
     let text = trim_reply(text);
     client
@@ -162,7 +164,7 @@ fn trim_to(text: &str, max: usize) -> String {
 }
 
 /// Confirm the token works and return the bot's name.
-pub(crate) fn check(token: &str) -> Result<String, String> {
+pub fn check(token: &str) -> Result<String, String> {
     let client = client().ok_or("Cannot initialize connection.")?;
     let body: serde_json::Value = client
         .get(format!("{API}/bot{}/getMe", token.trim()))
@@ -181,7 +183,7 @@ pub(crate) fn check(token: &str) -> Result<String, String> {
 
 /// Long-poll for messages until `stop` is set. Runs on its own thread; each
 /// message goes down the channel for the app to deal with.
-pub(crate) fn poll(
+pub fn poll(
     token: String,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     sender: async_channel::Sender<Incoming>,
@@ -268,7 +270,7 @@ mod tests {
 }
 
 /// Post to a Discord channel. Send-only by nature: nothing comes back.
-pub(crate) fn discord_send(webhook: &str, text: &str) -> Result<(), String> {
+pub fn discord_send(webhook: &str, text: &str) -> Result<(), String> {
     let client = client().ok_or("Cannot initialize connection.")?;
     // Discord's own limit is 2000 characters.
     let text = trim_to(text, 1900);
@@ -283,7 +285,7 @@ pub(crate) fn discord_send(webhook: &str, text: &str) -> Result<(), String> {
 }
 
 /// Confirm the webhook exists and say what it is called.
-pub(crate) fn discord_check(webhook: &str) -> Result<String, String> {
+pub fn discord_check(webhook: &str) -> Result<String, String> {
     let url = webhook.trim();
     if !url.starts_with("https://") {
         return Err("Paste the full webhook URL, starting with https://".into());

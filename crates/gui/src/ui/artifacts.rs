@@ -5,7 +5,7 @@
 //! history on the way in. That means it can never disagree with what actually
 //! happened, and deleting a session takes its artifacts with it.
 
-use crate::core::tools;
+use letronna_core::tools;
 use crate::prelude::*;
 
 pub(crate) struct Artifact {
@@ -200,8 +200,8 @@ mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
     use super::collect;
-    use crate::core::chat::Message;
-    use crate::core::store::{Conversation, Store};
+    use letronna_core::chat::Message;
+    use letronna_core::store::{Conversation, Store};
 
     fn wrote(path: &str, name: &str, is_error: bool) -> Message {
         Message {

@@ -10,52 +10,54 @@
 //! two of them never tread on each other. A crash mid-write costs at most the
 //! last line instead of the whole history.
 
-use crate::prelude::*;
+use crate::chat::{self as backend, Message};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::io::Write;
 
 #[derive(Default, Serialize, Deserialize)]
-pub(crate) struct Conversation {
+pub struct Conversation {
     /// Stable identity, so a streaming reply lands in the session it was sent
     /// from even if the user switches or deletes sessions meanwhile.
     #[serde(default)]
-    pub(crate) id: u64,
-    pub(crate) title: String,
-    pub(crate) messages: Vec<Message>,
+    pub id: u64,
+    pub title: String,
+    pub messages: Vec<Message>,
     #[serde(default)]
-    pub(crate) updated: u64,
+    pub updated: u64,
     #[serde(default)]
-    pub(crate) pinned: bool,
+    pub pinned: bool,
     /// Project folder attached to this session, if any.
     #[serde(default)]
-    pub(crate) workspace: Option<PathBuf>,
+    pub workspace: Option<PathBuf>,
     /// The model's own checklist for the work in progress.
     #[serde(default)]
-    pub(crate) todos: Vec<Todo>,
+    pub todos: Vec<Todo>,
     /// Messages already on disk. Everything past this is appended on save.
     /// Only `flush` should touch it; it is visible because callers build a
     /// Conversation with `..Default::default()`.
     #[serde(skip)]
-    pub(crate) flushed: usize,
+    pub flushed: usize,
     /// The descriptive fields as last written, so save appends a `meta` line
     /// only when one of them actually changed.
     #[serde(skip)]
-    pub(crate) written: Option<Meta>,
+    pub written: Option<Meta>,
 }
 
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
-pub(crate) struct Meta {
-    pub(crate) title: String,
-    pub(crate) updated: u64,
-    pub(crate) pinned: bool,
-    pub(crate) workspace: Option<PathBuf>,
-    pub(crate) todos: Vec<Todo>,
+pub struct Meta {
+    pub title: String,
+    pub updated: u64,
+    pub pinned: bool,
+    pub workspace: Option<PathBuf>,
+    pub todos: Vec<Todo>,
 }
 
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
-pub(crate) struct Todo {
-    pub(crate) text: String,
+pub struct Todo {
+    pub text: String,
     /// "pending", "doing" or "done".
-    pub(crate) status: String,
+    pub status: String,
 }
 
 /// A line in a session file.
@@ -74,39 +76,39 @@ enum Record {
 
 /// Everything that is not a session.
 #[derive(Default, Serialize, Deserialize)]
-pub(crate) struct Settings {
-    pub(crate) endpoint: String,
-    pub(crate) model: String,
+pub struct Settings {
+    pub endpoint: String,
+    pub model: String,
     #[serde(default)]
-    pub(crate) gateway: String,
+    pub gateway: String,
     #[serde(default)]
-    pub(crate) presence: String,
+    pub presence: String,
     /// Run write and command tools without asking.
     #[serde(default)]
-    pub(crate) skip_approvals: bool,
+    pub skip_approvals: bool,
     /// Which session was open last, by id rather than position.
     #[serde(default)]
-    pub(crate) active_id: u64,
+    pub active_id: u64,
 }
 
 #[derive(Default)]
-pub(crate) struct Store {
-    pub(crate) conversations: Vec<Conversation>,
-    pub(crate) active: usize,
-    pub(crate) settings: Settings,
+pub struct Store {
+    pub conversations: Vec<Conversation>,
+    pub active: usize,
+    pub settings: Settings,
 }
 
 impl Store {
     /// An id no existing session uses. Ids also name files, so a collision
     /// would merge two histories; the folder is checked as well as memory.
-    pub(crate) fn next_id(&self) -> u64 {
+    pub fn next_id(&self) -> u64 {
         let highest = self.conversations.iter().map(|c| c.id).max().unwrap_or(0);
         let on_disk = session_ids().into_iter().max().unwrap_or(0);
         highest.max(on_disk) + 1
     }
 
     /// Give every session an id. Older saves have none.
-    pub(crate) fn assign_ids(&mut self) {
+    pub fn assign_ids(&mut self) {
         let mut next = self.next_id();
         for c in self.conversations.iter_mut() {
             if c.id == 0 {
@@ -116,13 +118,13 @@ impl Store {
         }
     }
 
-    pub(crate) fn index_of(&self, id: u64) -> Option<usize> {
+    pub fn index_of(&self, id: u64) -> Option<usize> {
         self.conversations.iter().position(|c| c.id == id)
     }
 
     /// Append whatever is new in each session, then the settings. Returns the
     /// first failure, so the caller can say the history is not safe.
-    pub(crate) fn save(&mut self) -> std::io::Result<()> {
+    pub fn save(&mut self) -> std::io::Result<()> {
         std::fs::create_dir_all(sessions_dir())?;
         for conversation in self.conversations.iter_mut() {
             conversation.flush()?;
@@ -140,7 +142,7 @@ impl Store {
     }
 
     /// Forget a session and remove its file.
-    pub(crate) fn remove(&mut self, index: usize) {
+    pub fn remove(&mut self, index: usize) {
         if index >= self.conversations.len() {
             return;
         }
@@ -236,7 +238,7 @@ fn replay(path: &std::path::Path) -> Option<Conversation> {
     Some(conversation)
 }
 
-pub(crate) fn sessions_dir() -> PathBuf {
+pub fn sessions_dir() -> PathBuf {
     backend::data_dir().join("sessions")
 }
 
@@ -244,7 +246,7 @@ fn session_path(id: u64) -> PathBuf {
     sessions_dir().join(format!("{id}.jsonl"))
 }
 
-pub(crate) fn settings_path() -> PathBuf {
+pub fn settings_path() -> PathBuf {
     backend::data_dir().join("settings.json")
 }
 
@@ -269,7 +271,7 @@ fn session_ids() -> Vec<u64> {
 }
 
 /// Load every session, newest last, plus the settings.
-pub(crate) fn load() -> Store {
+pub fn load() -> Store {
     migrate();
     let mut conversations: Vec<Conversation> = session_ids()
         .into_iter()
@@ -341,18 +343,18 @@ fn migrate() {
     }
 }
 
-pub(crate) fn keys_path() -> PathBuf {
+pub fn keys_path() -> PathBuf {
     backend::data_dir().join("keys.json")
 }
 
-pub(crate) fn load_keys() -> std::collections::HashMap<String, String> {
+pub fn load_keys() -> std::collections::HashMap<String, String> {
     std::fs::read(keys_path())
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default()
 }
 
-pub(crate) fn bucket(updated: u64, now: u64) -> &'static str {
+pub fn bucket(updated: u64, now: u64) -> &'static str {
     let age = now.saturating_sub(updated);
     match age / 86_400 {
         0 => "TODAY",
@@ -363,7 +365,7 @@ pub(crate) fn bucket(updated: u64, now: u64) -> &'static str {
     }
 }
 
-pub(crate) fn age_label(updated: u64, now: u64) -> String {
+pub fn age_label(updated: u64, now: u64) -> String {
     let age = now.saturating_sub(updated);
     if updated == 0 {
         String::new()
@@ -381,7 +383,7 @@ mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
     use super::{Conversation, Store, Todo, replay};
-    use crate::core::chat::Message;
+    use crate::chat::Message;
 
     fn scratch(name: &str) -> std::path::PathBuf {
         let dir =

@@ -147,13 +147,13 @@ impl Chat {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let open = self.thinking_open.contains(&index);
-        let summary = crate::core::tools::summary(&message.name, &message.args);
+        let summary = letronna_core::tools::summary(&message.name, &message.args);
         let lines = message.content.lines().count();
         let content = message.content.clone();
-        let one_line = crate::core::tools::one_line;
+        let one_line = letronna_core::tools::one_line;
         let (status, color) = if message.is_error {
             (one_line(&message.content), cx.theme().danger)
-        } else if message.name == crate::core::tools::ASK_USER {
+        } else if message.name == letronna_core::tools::ASK_USER {
             (
                 format!("→ {}", one_line(&message.content)),
                 cx.theme().foreground,
@@ -223,7 +223,7 @@ impl Chat {
                         .text_color(cx.theme().muted_foreground)
                         .child(crate::ui::code_block(
                             ("tool-out", index),
-                            crate::core::tools::clamp_lines(&content, 400),
+                            letronna_core::tools::clamp_lines(&content, 400),
                             px(220.),
                             window,
                             cx,
@@ -364,7 +364,7 @@ mod tests {
     // Deliberately not `use super::*`: the prelude re-exports gpui, whose own
     // `test` macro would shadow the built-in attribute here.
     use super::usage_line;
-    use crate::core::chat::Message;
+    use letronna_core::chat::Message;
 
     #[test]
     fn usage_line_reports_the_cache_hit_rate() {

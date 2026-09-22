@@ -231,7 +231,7 @@ fn body(connection: &Connection, messages: &[Message]) -> Value {
         "stream_options": {"include_usage": true}
     });
     if connection.tools {
-        body["tools"] = Value::Array(super::tools::specs(connection.plan));
+        body["tools"] = Value::Array(crate::tools::specs(connection.plan));
     }
     body
 }
@@ -777,7 +777,7 @@ mod tests {
             workspace: Some(std::env::current_dir().unwrap()),
             plan: false,
         };
-        let ctx = super::super::tools::ToolContext {
+        let ctx = crate::tools::ToolContext {
             workspace: connection.workspace.clone(),
         };
         let mut messages = vec![Message {
@@ -815,7 +815,7 @@ mod tests {
             }
             for call in calls {
                 println!("tool {} {}", call.name, call.arguments);
-                let content = super::super::tools::run(&call.name, &call.arguments, &ctx)
+                let content = crate::tools::run(&call.name, &call.arguments, &ctx)
                     .unwrap_or_else(|e| e);
                 messages.push(Message {
                     role: "tool".into(),

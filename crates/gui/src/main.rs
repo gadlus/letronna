@@ -1,7 +1,6 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 mod app;
 mod assets;
-mod core;
 mod platform;
 mod plugins;
 mod prelude;
@@ -46,7 +45,7 @@ fn main() {
         .detach();
         // Background jobs are children of this process; do not outlive it.
         cx.on_app_quit(|_| {
-            core::jobs::stop_all();
+            letronna_core::jobs::stop_all();
             async {}
         })
         .detach();
