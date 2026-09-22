@@ -36,7 +36,7 @@ pub struct Message {
     pub is_error: bool,
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,

@@ -22,10 +22,15 @@ impl Chat {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let pending = self.pending.as_ref()?;
-        let call = pending.calls.front()?;
+        let turn = self.turn.as_ref()?;
+        // `true` here means "show me whatever is at the front", running or
+        // not; the gate below decides which of the two this is.
+        let call = match turn.next(|_| true) {
+            crate::core::agent::Next::AskUser(call) => call,
+            _ => return None,
+        };
         let ctx = tools::ToolContext {
-            workspace: pending.connection.workspace.clone(),
+            workspace: turn.connection.workspace.clone(),
         };
         let summary = tools::summary(&call.name, &call.arguments);
         if !self.needs_user(&call.name) {
