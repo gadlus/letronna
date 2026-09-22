@@ -47,6 +47,38 @@ mod windows_impl {
     const VERSION: &str = env!("CARGO_PKG_VERSION");
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+    /// Bring the terminal binary along and make `letronna` a command.
+    ///
+    /// Done through PowerShell rather than by writing HKCU\Environment
+    /// directly: the .NET call preserves whether Path is REG_SZ or
+    /// REG_EXPAND_SZ and broadcasts the change itself, and getting either of
+    /// those wrong by hand damages an environment variable people depend on.
+    fn install_cli(current: &Path, dir: &Path) {
+        let Some(beside) = current.parent().map(|d| d.join("letronna.exe")) else {
+            return;
+        };
+        if !beside.exists() {
+            return;
+        }
+        // A `bin` subfolder, not beside the window: Windows compares file
+        // names without case, so `letronna.exe` and `Letronna.exe` are one
+        // file and the terminal binary would land on top of the window. It is
+        // also the shape everything else on PATH here already uses.
+        let bin = dir.join("bin");
+        if std::fs::create_dir_all(&bin).is_err() {
+            return;
+        }
+        let cli = bin.join("letronna.exe");
+        if !same_file(&beside, &cli) {
+            let _ = std::fs::copy(&beside, &cli);
+        }
+        // Append only, and only when it is not already there.
+        powershell(&format!(
+            "$d='{}'; $p=[Environment]::GetEnvironmentVariable('Path','User');              if (($p -split ';') -notcontains $d) {{                [Environment]::SetEnvironmentVariable('Path', ($p.TrimEnd(';') + ';' + $d), 'User') }}",
+            bin.display()
+        ));
+    }
+
     fn install_dir() -> Option<PathBuf> {
         Some(PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join(format!("Programs\\{BRAND}")))
     }
@@ -176,6 +208,7 @@ mod windows_impl {
             target.display(),
             dir.display()
         ));
+        install_cli(&current, &dir);
         let exe = target.display().to_string();
         set_value(&key, "DisplayName", BRAND);
         set_value(&key, "DisplayVersion", VERSION);
@@ -190,6 +223,13 @@ mod windows_impl {
     }
 
     /// Removes the shortcut, the registry entry, and the install folder, then exits.
+    fn remove_from_path(dir: &Path) {
+        powershell(&format!(
+            "$d='{}'; $p=[Environment]::GetEnvironmentVariable('Path','User');              $kept=($p -split ';' | Where-Object {{ $_ -and $_ -ne $d }}) -join ';';              [Environment]::SetEnvironmentVariable('Path', $kept, 'User')",
+            dir.display()
+        ));
+    }
+
     pub(super) fn uninstall() -> ! {
         use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RegDeleteTreeW};
         if let Some(lnk) = shortcut() {
@@ -199,6 +239,7 @@ mod windows_impl {
             RegDeleteTreeW(HKEY_CURRENT_USER, registry_key().as_ptr());
         }
         if let Some(dir) = install_dir() {
+            remove_from_path(&dir.join("bin"));
             let _ = Command::new("cmd")
                 .args([
                     "/C",
