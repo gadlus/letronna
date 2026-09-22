@@ -62,6 +62,9 @@ fn main() {
                     window_min_size: Some(size(px(720.), px(520.))),
                     titlebar: Some(TitlebarOptions {
                         title: Some(BRAND.into()),
+                        // Centre the 12px traffic lights in the 34px bar, at
+                        // the inset a stock macOS window gives them.
+                        traffic_light_position: Some(point(px(12.), px(11.))),
                         ..TitleBar::title_bar_options()
                     }),
                     ..Default::default()

@@ -287,8 +287,11 @@ fn plugins_page(chat: &Entity<Chat>, cx: &App) -> Div {
         let row = h_flex()
             .items_center()
             .justify_between()
+            .gap_3()
             .child(
                 v_flex()
+                    .flex_1()
+                    .min_w_0()
                     .gap_0p5()
                     .child(
                         h_flex()
@@ -318,7 +321,7 @@ fn plugins_page(chat: &Entity<Chat>, cx: &App) -> Div {
                     ),
             )
             .child(
-                div().cursor_pointer().child(
+                div().flex_shrink_0().cursor_pointer().child(
                     gpui_component::switch::Switch::new(SharedString::from(format!("plugin-{id}")))
                         .checked(enabled)
                         .on_click(move |_, _, cx| {
@@ -413,6 +416,7 @@ fn privacy_page(chat: &Entity<Chat>, presence: &Entity<String>, skip: bool, cx: 
     let level = h_flex()
         .items_center()
         .justify_between()
+        .gap_3()
         .px_3()
         .py_2p5()
         .rounded(cx.theme().radius)
@@ -458,12 +462,15 @@ fn privacy_page(chat: &Entity<Chat>, presence: &Entity<String>, skip: bool, cx: 
     let approvals = h_flex()
         .items_center()
         .justify_between()
+        .gap_3()
         .px_3()
         .py_2p5()
         .rounded(cx.theme().radius)
         .bg(cx.theme().secondary.opacity(0.3))
         .child(
             v_flex()
+                .flex_1()
+                .min_w_0()
                 .gap_0p5()
                 .child(div().text_sm().child("Skip tool approvals"))
                 .child(
@@ -476,7 +483,7 @@ fn privacy_page(chat: &Entity<Chat>, presence: &Entity<String>, skip: bool, cx: 
                 ),
         )
         .child(
-            div().cursor_pointer().child(
+            div().flex_shrink_0().cursor_pointer().child(
                 gpui_component::switch::Switch::new("skip-approvals")
                     .checked(skip)
                     .on_click({
@@ -617,7 +624,9 @@ fn gateway_page(
     let g = gateway(&current);
     let mut cards = v_flex().gap_3();
     for row in GATEWAYS.chunks(3) {
-        let mut line = h_flex().gap_3();
+        // A plain row, not h_flex: that centres its children, and these
+        // cards should stretch to the tallest one in the row.
+        let mut line = div().flex().flex_row().gap_3();
         for gw in row {
             let chat = chat.clone();
             let active = gw.name == current;
@@ -626,7 +635,9 @@ fn gateway_page(
                     .id(gw.name)
                     .flex_1()
                     .w_0()
-                    .h(px(120.))
+                    // A floor, not a fixed height: narrow cards wrap their
+                    // blurb onto more lines and the row stretches to match.
+                    .min_h(px(120.))
                     .p_3()
                     .gap_1p5()
                     .rounded(cx.theme().radius)

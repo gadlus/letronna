@@ -977,6 +977,10 @@ impl Render for Chat {
         let conversation = &self.store.conversations[active];
         // Only the session the reply was sent from shows the live row.
         let streaming_here = self.busy && self.streaming_id == Some(conversation.id);
+        // The chat column stays narrower than the pane beside the sidebar, but
+        // only while the pane is wide enough that the composer keeps room to
+        // type; at the minimum window size the cap is dropped.
+        let narrow_column = self.sidebar_open && window.viewport_size().width >= px(960.);
 
         let body: AnyElement = if self.page == Page::Jobs {
             self.schedules_page(cx).into_any_element()
@@ -1058,7 +1062,7 @@ impl Render for Chat {
                 // and cannot push back.
                 .min_w_0()
                 .w_full()
-                .when(self.sidebar_open, |d| d.max_w(relative(0.82)))
+                .when(narrow_column, |d| d.max_w(relative(0.82)))
                 .mx_auto()
                 .child(
                     div()
@@ -1082,7 +1086,7 @@ impl Render for Chat {
                 this.child(
                     v_flex()
                         .w_full()
-                        .when(self.sidebar_open, |d| d.max_w(relative(0.82)))
+                        .when(narrow_column, |d| d.max_w(relative(0.82)))
                         .mx_auto()
                         .px_6()
                         .pb_2()
@@ -1101,7 +1105,7 @@ impl Render for Chat {
             .text_sm()
             .relative()
             .on_action(cx.listener(|this, _: &NewSession, window, cx| this.new_chat(window, cx)))
-            .child(self.title_bar(cx))
+            .child(self.title_bar(window, cx))
             .child(
                 h_flex()
                     .flex_1()
