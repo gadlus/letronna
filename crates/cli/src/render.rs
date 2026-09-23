@@ -156,6 +156,14 @@ pub fn bullet() -> String {
     format!("{} ", blue("●"))
 }
 
+/// A line with a mark in front of it. The mark stands in the two columns the
+/// indent would otherwise occupy, so a marked line and an ordinary one put
+/// their text in the same place -- which is the whole point of the indent.
+pub fn said(mark: &str, text: &str) {
+    print!("{mark} {text}{}", nl());
+    flush();
+}
+
 /// Print streamed text as it arrives, indenting each new line so a wrapped
 /// answer keeps the column.
 ///

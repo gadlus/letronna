@@ -112,8 +112,10 @@ impl Runner {
             };
             if let Event::Delta(text) = &event {
                 if !opened {
+                    // The spinner was holding this line; the answer takes it
+                    // over. The gap above it was left when the question was
+                    // echoed, so nothing more is needed here.
                     waiting.take();
-                    render::blank();
                     opened = true;
                 }
                 out.push(text);

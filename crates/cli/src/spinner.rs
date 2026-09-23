@@ -54,10 +54,11 @@ impl Spinner {
                     String::new()
                 };
                 let mut out = std::io::stdout().lock();
+                // In the first column, where the bullet goes: this line is
+                // the answer's placeholder and should sit where it will.
                 let _ = write!(
                     out,
-                    "\r\x1b[2K{}{} {}{}",
-                    render::PAD,
+                    "\r\x1b[2K{} {}{}",
                     render::blue(FRAMES[frame % FRAMES.len()]),
                     render::dim(word),
                     render::dim(&elapsed)

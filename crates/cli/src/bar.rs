@@ -94,6 +94,11 @@ pub struct Bar {
     queued: VecDeque<String>,
     /// Rows the box is holding at the bottom of the window.
     height: u16,
+    /// The row the box was last painted on. After the window is resized that
+    /// is no longer where it belongs, and the old one has to be wiped: a
+    /// ghost box stranded in the middle of the conversation is exactly what
+    /// a maximise followed by a restore used to leave behind.
+    painted: Option<(u16, u16)>,
     /// False when the terminal cannot give us the bottom of the window, in
     /// which case this is a plain prompt.
     live: bool,
@@ -108,6 +113,7 @@ impl Bar {
             footer,
             queued: VecDeque::new(),
             height: FRAME,
+            painted: None,
             live: false,
             done: false,
         }
@@ -265,7 +271,10 @@ impl Bar {
     /// is in the scrollback where the answers are.
     fn echo(&self, line: &str) {
         render::blank();
-        render::line(&format!("{} {}", render::blue("›"), render::bold(line)));
+        render::said(&render::blue("›"), &render::bold(line));
+        // Room for the answer to start in, and for the spinner to sit in
+        // while there is nothing to show yet.
+        render::blank();
     }
 
     /// Redraw, resizing the held area first when the menu has opened or shut.
@@ -297,21 +306,33 @@ impl Bar {
     /// cursor at the bottom of it, which is where output will land. Safe to
     /// call as often as you like: it moves the frame without touching what is
     /// already on the screen.
-    fn frame(&self) {
+    fn frame(&mut self) {
         let (_, rows) = terminal::size().unwrap_or((80, 24));
         let bottom = rows.saturating_sub(self.height).max(1);
-        // Setting the region homes the cursor, so it has to be put back at
-        // the foot of the conversation afterwards.
+        // The region has to be off to reach rows outside it.
+        print!("\x1b[r");
+        self.erase(rows);
         print!("\x1b[1;{bottom}r");
         // Wipe whatever the old frame left below the new one.
         for row in (bottom + 1)..=rows {
             print!("\x1b[{row};1H\x1b[2K");
         }
+        // Setting the region homes the cursor, so put it back at the foot of
+        // the conversation, which is where output belongs.
         print!("\x1b[{bottom};1H");
         render::flush();
     }
 
-    fn draw(&self) {
+    /// Clear the rows the box was last painted on, wherever they are now.
+    fn erase(&mut self, rows: u16) {
+        if let Some((top, held)) = self.painted.take() {
+            for row in top..=(top + held).min(rows) {
+                print!("\x1b[{row};1H\x1b[2K");
+            }
+        }
+    }
+
+    fn draw(&mut self) {
         if !self.live {
             return;
         }
@@ -364,11 +385,17 @@ impl Bar {
         // Save and restore, so whatever was streaming into the conversation
         // carries on from where it was.
         let _ = write!(out, "\x1b7");
+        // Say again where the conversation ends. Restoring a window does not
+        // always arrive as a resize, and some terminals forget the region
+        // over the top of it; repeating it here costs nothing and means the
+        // box rights itself on the next keystroke rather than staying wrong.
+        let _ = write!(out, "\x1b[1;{}r", top.saturating_sub(1).max(1));
         for (i, text) in lines.iter().enumerate() {
             let _ = write!(out, "\x1b[{};1H\x1b[2K{text}", top + i as u16);
         }
         let _ = write!(out, "\x1b8");
         let _ = out.flush();
+        self.painted = Some((top, self.height.saturating_sub(1)));
     }
 }
 
