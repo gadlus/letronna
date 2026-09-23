@@ -163,6 +163,10 @@ fn command(
     session: &mut usize,
     workspace: Option<&std::path::Path>,
 ) -> Flow {
+    // A command may carry a word after it: `/model gpt` narrows the list
+    // rather than making you scroll it.
+    let (line, rest) = line.split_once(' ').unwrap_or((line, ""));
+    let rest = rest.trim();
     match line {
         "/exit" | "/quit" => Flow::Stop,
         "/help" => {
@@ -201,13 +205,7 @@ fn command(
             Flow::Handled
         }
         "/model" => {
-            let settings = &runner.store.settings;
-            render::blank();
-            render::line(&format!(
-                "{}  {}",
-                render::bold(&settings.model),
-                render::dim(&settings.gateway)
-            ));
+            switch_model(runner, rest);
             Flow::Handled
         }
         "/where" => {
@@ -229,6 +227,101 @@ fn command(
         }
         _ => Flow::Unknown,
     }
+}
+
+/// Models offered at once. Some gateways carry hundreds; a list longer than
+/// this is narrowed with a word rather than scrolled.
+const MODEL_CHOICES: usize = 10;
+
+/// Change the model, picking from what the gateway actually offers. `filter`
+/// narrows the list, and an exact name skips the asking entirely.
+fn switch_model(runner: &mut Runner, filter: &str) {
+    let settings = &runner.store.settings;
+    let guest = settings.gateway == letronna_core::gateway::GATEWAYS[0].name;
+    let key = store::load_keys()
+        .get(letronna_core::gateway::key_slot(&settings.gateway))
+        .cloned()
+        .unwrap_or_default();
+    let endpoint = settings.endpoint.clone();
+    let current = settings.model.clone();
+    let gateway = settings.gateway.clone();
+
+    render::blank();
+    render::said(&render::blue("●"), &render::bold("Models"));
+    // Fetching takes a moment over the network; say so rather than freezing.
+    screen::status(Some(format!(
+        "{}{}",
+        render::INSIDE,
+        render::dim(&format!("asking {gateway} what it has…"))
+    )));
+    let found = if guest {
+        letronna_core::chat::free_models()
+    } else {
+        letronna_core::chat::list_models(&endpoint, &key)
+    };
+    screen::status(None);
+
+    let mut models = match found {
+        Ok(models) if !models.is_empty() => models,
+        Ok(_) => {
+            render::line(&render::dim("That gateway offered no models."));
+            return;
+        }
+        Err(error) => {
+            render::line(&render::red(&error));
+            return;
+        }
+    };
+    models.sort();
+
+    // An exact name is an instruction, not a search.
+    if let Some(exact) = models.iter().find(|m| m.eq_ignore_ascii_case(filter)) {
+        let exact = exact.clone();
+        set_model(runner, exact);
+        return;
+    }
+
+    let needle = filter.to_lowercase();
+    let matching: Vec<String> = models
+        .iter()
+        .filter(|m| needle.is_empty() || m.to_lowercase().contains(&needle))
+        .cloned()
+        .collect();
+    if matching.is_empty() {
+        render::line(&render::dim(&format!(
+            "Nothing matching \"{filter}\" among {} models.",
+            models.len()
+        )));
+        return;
+    }
+
+    let shown: Vec<String> = matching.iter().take(MODEL_CHOICES).cloned().collect();
+    if matching.len() > shown.len() {
+        render::line(&render::dim(&format!(
+            "{} of {} shown — type /model <word> to narrow it.",
+            shown.len(),
+            matching.len()
+        )));
+    }
+    let mut options: Vec<&str> = shown.iter().map(String::as_str).collect();
+    options.push("Keep the one I have");
+
+    let question = format!("In use: {current}");
+    let Some(picked) = runner.bar.choose(&question, Vec::new(), &options) else {
+        return;
+    };
+    match shown.get(picked) {
+        Some(model) => set_model(runner, model.clone()),
+        None => render::line(&render::dim("Left as it was.")),
+    }
+}
+
+fn set_model(runner: &mut Runner, model: String) {
+    runner.store.settings.model = model.clone();
+    runner.persist();
+    let note = footer(runner);
+    runner.bar.set_footer(note);
+    render::said(&render::blue("›"), &render::bold(&model));
 }
 
 fn folder_name(workspace: Option<&std::path::Path>) -> String {

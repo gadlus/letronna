@@ -109,6 +109,9 @@ pub fn red(text: &str) -> String {
 pub fn green(text: &str) -> String {
     wrap("38;5;114", text)
 }
+pub fn amber(text: &str) -> String {
+    wrap("38;5;179", text)
+}
 
 /// The left margin of the input box.
 pub const MARGIN: &str = "  ";

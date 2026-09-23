@@ -111,6 +111,10 @@ pub struct Bar {
     /// Set while a question is on the screen, and taken away by the answer.
     choice: Option<Choice>,
     answer: Option<usize>,
+    /// True while a turn is in flight, which is what makes Escape mean stop
+    /// rather than clear the line.
+    working: bool,
+    interrupt: bool,
 }
 
 impl Bar {
@@ -124,6 +128,8 @@ impl Bar {
             done: false,
             choice: None,
             answer: None,
+            working: false,
+            interrupt: false,
         }
     }
 
@@ -233,6 +239,19 @@ impl Bar {
         }
     }
 
+    /// Say whether a turn is running, so Escape knows what it means.
+    pub fn working(&mut self, on: bool) {
+        self.working = on;
+        if !on {
+            self.interrupt = false;
+        }
+    }
+
+    /// Whether the user has asked to stop the turn, clearing the request.
+    pub fn interrupted(&mut self) -> bool {
+        std::mem::take(&mut self.interrupt)
+    }
+
     /// True once the user has asked to leave.
     pub fn finished(&self) -> bool {
         self.done
@@ -286,6 +305,12 @@ impl Bar {
             }
             (KeyCode::Down, _) if !options.is_empty() => {
                 self.picked = (self.picked + 1) % options.len();
+            }
+            // While an answer is coming, Escape stops waiting for it. There
+            // is nothing else it could usefully mean then, and a turn that
+            // has gone quiet needs a way out that is not killing the window.
+            (KeyCode::Esc, _) if self.working && self.text.is_empty() => {
+                self.interrupt = true;
             }
             (KeyCode::PageUp, _) => crate::screen::scroll(PAGE),
             (KeyCode::PageDown, _) => crate::screen::scroll(-PAGE),

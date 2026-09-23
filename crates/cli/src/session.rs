@@ -70,8 +70,19 @@ impl Runner {
         self.persist();
 
         let mut turn = Turn::new(connection);
+        self.bar.working(true);
+        let answer = self.work(&mut turn, session);
+        self.bar.working(false);
+        answer
+    }
+
+    fn work(&mut self, turn: &mut Turn, session: usize) -> Result<String, String> {
         loop {
-            let reply = self.stream_once(&mut turn, session)?;
+            let Some(reply) = self.stream_once(turn, session)? else {
+                render::blank();
+                render::said(&render::dim("●"), &render::dim("Stopped."));
+                return Ok(String::new());
+            };
             let answer = reply.content.clone();
             let calls = reply.tool_calls.clone();
             self.store.conversations[session].updated = chat::now();
@@ -81,14 +92,20 @@ impl Runner {
             if !turn.begin(calls) {
                 return Ok(answer);
             }
-            if !self.work_through(&mut turn, session)? {
+            if !self.work_through(turn, session)? {
                 return Ok(answer);
             }
         }
     }
 
     /// One model call, printed as it streams.
-    fn stream_once(&mut self, turn: &mut Turn, session: usize) -> Result<Message, String> {
+    /// One model call, printed as it streams. `None` when the user stopped
+    /// waiting for it.
+    fn stream_once(
+        &mut self,
+        turn: &mut Turn,
+        session: usize,
+    ) -> Result<Option<Message>, String> {
         let receiver = chat::start(
             turn.connection.clone(),
             self.store.conversations[session].messages.clone(),
@@ -103,6 +120,13 @@ impl Runner {
             // few milliseconds for a keystroke, which is also what keeps this
             // loop from spinning.
             self.bar.pump();
+            if self.bar.interrupted() {
+                // Dropping the receiver is enough: the worker finishes into a
+                // channel nobody is listening to and goes away.
+                waiting.take();
+                out.end();
+                return Ok(None);
+            }
             let event = match receiver.try_recv() {
                 Ok(event) => event,
                 Err(async_channel::TryRecvError::Empty) => continue,
@@ -136,7 +160,7 @@ impl Runner {
         if reply.tokens > 0 && !reply.content.is_empty() {
             render::line(&render::dim(&usage(&reply)));
         }
-        Ok(reply)
+        Ok(Some(reply))
     }
 
     /// Run the queued calls, asking first where the rules say to. False when
