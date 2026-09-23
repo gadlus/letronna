@@ -419,6 +419,8 @@ impl Chat {
             tools: self.store.settings.gateway != GATEWAYS[0].name,
             workspace: None,
             plan: self.plan_mode,
+            effort: self.store.settings.effort.clone(),
+            search: self.store.settings.search,
         };
         if let Err(error) = backend::validate(&connection) {
             self.error = Some(error);

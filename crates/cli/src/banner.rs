@@ -144,6 +144,12 @@ pub fn footer(runner: &Runner) -> String {
     } else if runner.yes {
         parts.push("no approvals".into());
     }
+    if !settings.effort.is_empty() {
+        parts.push(format!("thinking {}", settings.effort));
+    }
+    if settings.search {
+        parts.push("web".into());
+    }
     parts.join("  ·  ")
 }
 

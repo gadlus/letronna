@@ -194,6 +194,8 @@ mod tests {
             tools: true,
             workspace: None,
             plan: false,
+            effort: String::new(),
+            search: false,
         })
     }
 

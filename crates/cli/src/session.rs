@@ -45,6 +45,8 @@ impl Runner {
             tools: !guest,
             workspace,
             plan: self.plan,
+            effort: settings.effort.clone(),
+            search: settings.search,
         }
     }
 
@@ -118,6 +120,7 @@ impl Runner {
         // its bullet here.
         let mut out = Stream::opening_with(render::bullet());
         let mut opened = false;
+        let mut thought = false;
         self.bar.wait_line(true);
         loop {
             // Keys first, then whatever the model has sent: the pump waits a
@@ -138,11 +141,28 @@ impl Runner {
                     return Err("The model connection closed unexpectedly.".to_owned());
                 }
             };
+            if let Event::Reasoning(text) = &event {
+                if self.store.settings.thinking {
+                    if !thought {
+                        self.bar.wait_line(false);
+                        render::blank();
+                        render::said(&render::dim("·"), &render::dim("thinking"));
+                        thought = true;
+                    }
+                    // Dim, and its own column, so it cannot be mistaken for
+                    // the answer -- it is the model talking to itself.
+                    render::out(&render::dim(&text.replace('\n', " ")), false);
+                }
+            }
             if let Event::Delta(text) = &event {
                 if !opened {
                     // Nothing more is needed above the answer: the gap was
                     // left when the question was echoed.
                     self.bar.wait_line(false);
+                    if thought {
+                        render::out("", true);
+                        render::blank();
+                    }
                     opened = true;
                 }
                 out.push(text);

@@ -66,6 +66,36 @@ pub fn command(
             switch_model(runner, rest);
             Flow::Handled
         }
+        "/effort" => {
+            effort(runner, rest);
+            Flow::Handled
+        }
+        "/thinking" => {
+            runner.store.settings.thinking = !runner.store.settings.thinking;
+            runner.persist();
+            let note = footer(runner);
+            runner.bar.set_footer(note);
+            render::blank();
+            render::line(&render::dim(if runner.store.settings.thinking {
+                "Thinking shown as it arrives."
+            } else {
+                "Thinking hidden."
+            }));
+            Flow::Handled
+        }
+        "/search" => {
+            runner.store.settings.search = !runner.store.settings.search;
+            runner.persist();
+            let note = footer(runner);
+            runner.bar.set_footer(note);
+            render::blank();
+            render::line(&render::dim(if runner.store.settings.search {
+                "The model can search the web, and will cite what it read."
+            } else {
+                "Web search off."
+            }));
+            Flow::Handled
+        }
         "/jobs" => {
             jobs(rest);
             Flow::Handled
@@ -97,6 +127,45 @@ pub fn command(
         }
         _ => Flow::Unknown,
     }
+}
+
+/// How hard the model should think.
+///
+/// Sent to every model and ignored by the ones that cannot be told, which is
+/// why there is no capability check here: on a model that can, this is the
+/// difference between sixty-four reasoning tokens and seven hundred.
+fn effort(runner: &mut Runner, rest: &str) {
+    const LEVELS: [&str; 4] = ["low", "medium", "high", "whatever the model likes"];
+    let chosen = match rest {
+        "" => {
+            let current = match runner.store.settings.effort.as_str() {
+                "" => "whatever the model likes".to_owned(),
+                level => level.to_owned(),
+            };
+            let picked =
+                runner
+                    .bar
+                    .choose(&format!("Thinking effort: {current}"), Vec::new(), &LEVELS);
+            match picked {
+                Some(index) => LEVELS[index].to_owned(),
+                None => return,
+            }
+        }
+        asked => asked.to_lowercase(),
+    };
+    let effort = match chosen.as_str() {
+        "low" | "medium" | "high" => chosen,
+        _ => String::new(),
+    };
+    runner.store.settings.effort = effort;
+    runner.persist();
+    let note = footer(runner);
+    runner.bar.set_footer(note);
+    render::blank();
+    render::line(&render::dim(&match runner.store.settings.effort.as_str() {
+        "" => "Left to the model.".to_owned(),
+        level => format!("Thinking {level}."),
+    }));
 }
 
 /// What is still running, and a way to stop it.

@@ -91,6 +91,15 @@ pub struct Settings {
     /// Run write and command tools without asking.
     #[serde(default)]
     pub skip_approvals: bool,
+    /// How hard the model should think: empty, or low, medium or high.
+    #[serde(default)]
+    pub effort: String,
+    /// Show the model's thinking as it arrives, rather than only its answer.
+    #[serde(default)]
+    pub thinking: bool,
+    /// Let the gateway search the web.
+    #[serde(default)]
+    pub search: bool,
     /// Which session was open last, by id rather than position.
     #[serde(default)]
     pub active_id: u64,
@@ -505,6 +514,8 @@ fn migrate() {
             presence: old.presence,
             skip_approvals: old.skip_approvals,
             active_id: 0,
+            // Settings that did not exist when the old file was written.
+            ..Default::default()
         },
     };
     store.assign_ids();

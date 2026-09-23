@@ -46,6 +46,18 @@ pub const COMMANDS: &[Command] = &[
         blurb: "show or change the model",
     },
     Command {
+        name: "/effort",
+        blurb: "how hard the model should think",
+    },
+    Command {
+        name: "/thinking",
+        blurb: "show the model's thinking, or hide it",
+    },
+    Command {
+        name: "/search",
+        blurb: "let the model search the web",
+    },
+    Command {
         name: "/jobs",
         blurb: "commands still running in the background",
     },
