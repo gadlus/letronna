@@ -3,3 +3,6 @@
 .env
 .env.*
 *.log
+
+# Files the agent wrote while being tested in this folder
+/hello.asm
