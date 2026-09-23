@@ -161,9 +161,14 @@ fn paint(rows: &[Row]) -> Vec<String> {
             let body = clip(&format!("{mark} {text}"), width);
             match colour {
                 Some((back, front)) if render::colour() => {
+                    // The background and the default ink are set first, and
+                    // the code colours itself on top. Anything it leaves
+                    // alone falls back to the ink set here, which is what
+                    // keeps a removed line readable on red.
                     format!(
-                        "{}\x1b[48;5;{back}m\x1b[38;5;{front}m{body}\x1b[0m",
-                        render::PAD
+                        "{}\x1b[48;5;{back}m\x1b[38;5;{front}m{}\x1b[0m",
+                        render::PAD,
+                        crate::syntax::paint(&body)
                     )
                 }
                 _ => format!("{}{}", render::PAD, render::dim(&body)),

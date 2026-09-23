@@ -66,6 +66,14 @@ pub fn command(
             switch_model(runner, rest);
             Flow::Handled
         }
+        "/jobs" => {
+            jobs(rest);
+            Flow::Handled
+        }
+        "/skills" => {
+            skills(runner, rest);
+            Flow::Handled
+        }
         "/resume" => {
             resume(runner, session, workspace);
             Flow::Handled
@@ -89,6 +97,96 @@ pub fn command(
         }
         _ => Flow::Unknown,
     }
+}
+
+/// What is still running, and a way to stop it.
+///
+/// A command started in the background outlives the turn that started it and
+/// says nothing more unless asked. Without this the only way to find out was
+/// to ask the model to ask its tool, which is a long way round to a list the
+/// program already has.
+fn jobs(rest: &str) {
+    let running = letronna_core::jobs::list();
+    render::blank();
+    if running.is_empty() {
+        render::said(&render::blue("●"), &render::bold("Nothing running"));
+        return;
+    }
+
+    // `/jobs stop 3`, or a bare `/jobs` to look.
+    if let Some(id) = rest.strip_prefix("stop").map(str::trim) {
+        let Ok(id) = id.parse::<u64>() else {
+            render::said(
+                &render::blue("●"),
+                &render::bold("Which one? /jobs stop <id>"),
+            );
+            return;
+        };
+        match letronna_core::jobs::stop(id) {
+            Ok(()) => render::said(
+                &render::blue("●"),
+                &render::bold(&format!("Stopped job {id}")),
+            ),
+            Err(error) => render::line(&render::red(&error)),
+        }
+        return;
+    }
+
+    render::said(&render::blue("●"), &render::bold("Running"));
+    for job in &running {
+        let state = if job.running { "running" } else { "finished" };
+        render::line(&format!(
+            "{}  {}  {}",
+            render::bold(&job.id.to_string()),
+            letronna_core::tools::one_line(&job.command),
+            render::dim(state)
+        ));
+    }
+    render::line(&render::dim("/jobs stop <id> to stop one"));
+}
+
+/// The saved instructions, and a way to use one.
+///
+/// Skills are written in the window and were unreachable from here, which
+/// made them a feature of one half of the same program.
+fn skills(runner: &mut Runner, rest: &str) {
+    let saved = letronna_core::skills::load();
+    render::blank();
+    if saved.is_empty() {
+        render::said(&render::blue("●"), &render::bold("No skills saved"));
+        render::line(&render::dim("The window writes them; they show up here."));
+        return;
+    }
+
+    // Named, it goes to the model as the next thing said.
+    if !rest.is_empty() {
+        let wanted = rest.to_lowercase();
+        match saved
+            .iter()
+            .find(|s| s.name.to_lowercase() == wanted)
+            .or_else(|| {
+                saved
+                    .iter()
+                    .find(|s| s.name.to_lowercase().contains(&wanted))
+            }) {
+            Some(skill) => {
+                render::said(&render::blue("●"), &render::bold(&skill.name));
+                runner.bar.say(&skill.prompt);
+            }
+            None => render::line(&render::dim(&format!("No skill matching \"{rest}\"."))),
+        }
+        return;
+    }
+
+    render::said(&render::blue("●"), &render::bold("Skills"));
+    for skill in &saved {
+        render::line(&format!(
+            "{}  {}",
+            render::bold(&skill.name),
+            render::dim(&letronna_core::tools::one_line(&skill.prompt))
+        ));
+    }
+    render::line(&render::dim("/skills <name> to use one"));
 }
 
 /// Sessions offered at once. Older ones are still on disk and still open in

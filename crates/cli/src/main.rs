@@ -15,6 +15,7 @@ mod render;
 mod screen;
 mod session;
 mod spinner;
+mod syntax;
 mod title;
 
 use args::{HELP, Start, parse};
@@ -95,15 +96,19 @@ fn main() {
             continue;
         }
         if line.starts_with('/') {
-            match command(&mut runner, &line, &mut session, workspace.as_deref()) {
+            let flow = command(&mut runner, &line, &mut session, workspace.as_deref());
+            if let Flow::Unknown = flow {
+                render::line(&render::dim(&format!(
+                    "{line} is not a command. Type / to see what is."
+                )));
+            }
+            // Painting is throttled, so the last thing a command printed can
+            // still be sitting in the buffer with nothing coming after it to
+            // bring it out. Whatever it said, say it now.
+            screen::settle();
+            match flow {
                 Flow::Stop => break,
-                Flow::Handled => continue,
-                Flow::Unknown => {
-                    render::line(&render::dim(&format!(
-                        "{line} is not a command. Type / to see what is."
-                    )));
-                    continue;
-                }
+                _ => continue,
             }
         }
         if let Err(error) = runner.ask(session, &line) {
@@ -142,11 +147,13 @@ fn launch_window() {
     let beside = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join(window_name())));
-    // Installed, the window sits one level up from the bin folder holding this.
+    // Installed, the window sits one level up from the bin folder holding
+    // this. It is named for the app there rather than for the binary, and on
+    // Linux that name has no extension and a lowercase first letter.
     let above = std::env::current_exe().ok().and_then(|p| {
         p.parent()
             .and_then(|d| d.parent())
-            .map(|d| d.join("Letronna.exe"))
+            .map(|d| d.join(installed_name()))
     });
     for candidate in [beside, above, Some(std::path::PathBuf::from(window_name()))]
         .into_iter()
@@ -162,6 +169,16 @@ fn launch_window() {
 fn window_name() -> &'static str {
     if cfg!(windows) {
         "letronna-gui.exe"
+    } else {
+        "letronna-gui"
+    }
+}
+
+/// What the installed window is called, which is not what the binary is
+/// called in the build folder.
+fn installed_name() -> &'static str {
+    if cfg!(windows) {
+        "Letronna.exe"
     } else {
         "letronna-gui"
     }

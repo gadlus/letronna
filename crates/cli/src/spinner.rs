@@ -61,10 +61,32 @@ fn mood(word: &'static str, seconds: u64) -> (String, fn(&str) -> String) {
     }
 }
 
+/// The same escalation, for a wait that has a name. Escape stops a tool as
+/// well, so the late message reads the same.
+fn mood_about(what: &str, seconds: u64) -> (String, fn(&str) -> String) {
+    if seconds >= TOO_LONG {
+        (
+            format!("{what} — still going, esc to stop"),
+            render::red as fn(&str) -> String,
+        )
+    } else if seconds >= LONG {
+        (
+            format!("{what} — longer than usual"),
+            render::amber as fn(&str) -> String,
+        )
+    } else {
+        (what.to_owned(), render::blue as fn(&str) -> String)
+    }
+}
+
 /// One wait, from the moment the question went.
 pub struct Waiting {
     began: Instant,
     word: &'static str,
+    /// What is being waited for, when it is something nameable. Waiting on
+    /// the model is "Thinking"; waiting on a tool says which tool, because
+    /// "Thinking" over a two-minute command is a lie.
+    about: Option<String>,
 }
 
 impl Default for Waiting {
@@ -80,6 +102,15 @@ impl Waiting {
             // Whichever word the clock lands on; they all mean the same
             // thing, and the same one every time reads as a frozen screen.
             word: WORDS[Instant::now().elapsed().subsec_nanos() as usize % WORDS.len()],
+            about: None,
+        }
+    }
+
+    /// A wait with a name on it.
+    pub fn about(what: &str) -> Self {
+        Self {
+            about: Some(what.to_owned()),
+            ..Self::new()
         }
     }
 
@@ -88,7 +119,10 @@ impl Waiting {
         let elapsed = self.began.elapsed();
         let seconds = elapsed.as_secs();
         let frame = FRAMES[(elapsed.as_millis() / FRAME_MS) as usize % FRAMES.len()];
-        let (say, paint) = mood(self.word, seconds);
+        let (say, paint) = match &self.about {
+            Some(what) => mood_about(what, seconds),
+            None => mood(self.word, seconds),
+        };
         let since = if seconds > 0 {
             format!(" {}", spell(seconds))
         } else {

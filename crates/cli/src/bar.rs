@@ -46,6 +46,14 @@ pub const COMMANDS: &[Command] = &[
         blurb: "show or change the model",
     },
     Command {
+        name: "/jobs",
+        blurb: "commands still running in the background",
+    },
+    Command {
+        name: "/skills",
+        blurb: "saved instructions you can hand the model",
+    },
+    Command {
         name: "/resume",
         blurb: "pick up a session from before",
     },
@@ -325,9 +333,23 @@ impl Bar {
         }
     }
 
+    /// Put words in the box as though they had been typed, for a command
+    /// that hands the model something to work from.
+    pub fn say(&mut self, text: &str) {
+        self.line.clear();
+        self.line.insert_str(text);
+        self.settle();
+    }
+
     /// Show or take away the waiting line.
     pub fn wait_line(&mut self, on: bool) {
         self.waiting = on.then(crate::spinner::Waiting::new);
+        self.settle();
+    }
+
+    /// Show a waiting line that says what is being waited for.
+    pub fn wait_line_about(&mut self, what: &str) {
+        self.waiting = Some(crate::spinner::Waiting::about(what));
         self.settle();
     }
 
