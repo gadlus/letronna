@@ -111,13 +111,14 @@ pub fn red(text: &str) -> String {
 pub const MARGIN: &str = "  ";
 
 /// Where a mark -- the arrow on your line, the bullet on an answer -- sits.
-/// It lines up with the arrow inside the box, so the conversation and the
-/// thing you type into are one column and not two.
-pub const GUTTER: &str = "    ";
+/// It lines up with the left edge of the box rather than the arrow inside it:
+/// the conversation and the thing you type into start at the same column, so
+/// there is one edge down the page and not two.
+pub const GUTTER: &str = "  ";
 
 /// Where the words start, mark or no mark. `GUTTER` plus a mark and a space
 /// comes to the same place, which is what keeps the two sides level.
-pub const PAD: &str = "      ";
+pub const PAD: &str = "    ";
 
 /// The face on the tin, as characters. Twenty-eight columns wide, which
 /// leaves room for the startup details beside it on an eighty-column
