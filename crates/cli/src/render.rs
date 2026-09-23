@@ -155,6 +155,11 @@ pub const FACE: &[&str] = &[
 /// Width the face is padded to, so the column beside it lines up.
 pub const FACE_WIDTH: usize = 28;
 
+/// Room between the face and the details beside it. The face is drawn from a
+/// photograph, so its edge is ragged and a couple of spaces read as none at
+/// all; this is wide enough that the two are clearly separate things.
+pub const FACE_GAP: usize = 6;
+
 
 pub fn line(text: &str) {
     out(&format!("{PAD}{text}"), true);

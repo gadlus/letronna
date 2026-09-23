@@ -58,7 +58,7 @@ fn screen() -> &'static Mutex<Screen> {
             chrome: Vec::new(),
             status: None,
             open: false,
-            mouse: true,
+            mouse: false,
             painted: Instant::now(),
         })
     })
@@ -77,8 +77,13 @@ pub fn open() {
         return;
     }
     s.open = true;
-    // Alternate screen, cursor away, wheel and clicks reported to us.
-    print!("\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l\x1b[?1000h\x1b[?1006h");
+    s.mouse = false;
+    // Alternate screen and the cursor away. The mouse is deliberately left
+    // with the terminal: taking it would scroll the conversation with the
+    // wheel, at the price of never being able to select a line of it, and
+    // copying out of a conversation is worth more than a wheel. `/mouse`
+    // trades back for anyone who would rather have the scrolling.
+    print!("\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l");
     let _ = std::io::stdout().flush();
 }
 
@@ -427,33 +432,10 @@ fn words(line: &str) -> Vec<(String, usize)> {
     out
 }
 
-/// Cut text to `width` printed columns, keeping the escapes that colour it.
-pub fn clip(text: &str, width: usize) -> String {
-    if visible(text) <= width {
-        return text.to_owned();
-    }
-    let mut out = String::new();
-    let mut shown = 0;
-    let mut chars = text.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' {
-            out.push(ch);
-            for next in chars.by_ref() {
-                out.push(next);
-                if next.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-            continue;
-        }
-        if shown + 1 >= width {
-            out.push('…');
-            break;
-        }
-        out.push(ch);
-        shown += 1;
-    }
-    out
+/// Break text into rows that fit, for anything that has to lay itself out
+/// before handing the result over.
+pub fn fold_into(text: &str, width: usize) -> Vec<String> {
+    wrap(text, width)
 }
 
 /// Width of text as printed, ignoring the escapes that colour it.

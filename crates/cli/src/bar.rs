@@ -409,29 +409,46 @@ impl Bar {
                 render::dim("│")
             )
         };
-        let question = crate::screen::clip(&choice.question, room);
-        let width = crate::screen::visible(&question);
-        lines.push(row(render::bold(&question), width));
+        // A question is broken over as many lines as it needs. Cutting it
+        // short with an ellipsis hides the half that says what you would be
+        // agreeing to.
+        for part in crate::screen::fold_into(&choice.question, room) {
+            let width = crate::screen::visible(&part);
+            lines.push(row(render::bold(&part), width));
+        }
 
         for line in &choice.detail {
-            let text = crate::screen::clip(line, room);
-            let width = crate::screen::visible(&text);
-            lines.push(row(render::dim(&text), width));
+            for part in crate::screen::fold_into(line, room) {
+                let width = crate::screen::visible(&part);
+                lines.push(row(render::dim(&part), width));
+            }
         }
 
         lines.push(row(String::new(), 0));
         for (i, option) in choice.options.iter().enumerate() {
             let chosen = i == choice.picked;
-            let text = format!("{} {} {option}", if chosen { "›" } else { " " }, i + 1);
-            let width = crate::screen::visible(&text);
-            lines.push(row(
-                if chosen {
-                    render::blue(&text)
+            let head = format!("{} {} ", if chosen { "›" } else { " " }, i + 1);
+            // An answer that does not fit is wrapped under itself rather than
+            // cut, so a long one can still be read before it is taken.
+            for (line, part) in crate::screen::fold_into(option, room.saturating_sub(head.len()))
+                .into_iter()
+                .enumerate()
+            {
+                let text = if line == 0 {
+                    format!("{head}{part}")
                 } else {
-                    render::dim(&text)
-                },
-                width,
-            ));
+                    format!("{}{part}", " ".repeat(head.len()))
+                };
+                let width = crate::screen::visible(&text);
+                lines.push(row(
+                    if chosen {
+                        render::blue(&text)
+                    } else {
+                        render::dim(&text)
+                    },
+                    width,
+                ));
+            }
         }
         lines.push(format!(
             "{}{}",

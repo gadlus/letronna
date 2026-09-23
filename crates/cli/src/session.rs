@@ -203,7 +203,12 @@ impl Runner {
         match &outcome {
             Ok(text) => {
                 let lines = text.lines().count();
-                render::tool(&call.name, &summary, &format!("{lines} lines"), false);
+                let count = if lines == 1 {
+                    "1 line".to_owned()
+                } else {
+                    format!("{lines} lines")
+                };
+                render::tool(&call.name, &summary, &count, false);
                 if !text.trim().is_empty() {
                     render::detail(text, DETAIL_LINES);
                 }

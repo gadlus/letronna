@@ -204,9 +204,9 @@ fn command(
             screen::capture(taking);
             render::blank();
             render::line(&render::dim(if taking {
-                "The wheel scrolls the conversation again."
+                "The wheel scrolls the conversation; selecting text needs shift held."
             } else {
-                "The mouse is yours: drag to select, and PageUp still scrolls."
+                "The mouse is yours again: drag to select. PageUp and PageDown still scroll."
             }));
             Flow::Handled
         }
@@ -400,7 +400,7 @@ fn banner(runner: &Runner, folder: &str, session: usize) {
 
     // Side by side when the face fits; the details alone when it does not, so
     // a narrow window shows something readable rather than a wrapped mess.
-    if !render::colour() || render::width() < render::FACE_WIDTH + 40 {
+    if !render::colour() || render::width() < render::FACE_WIDTH + render::FACE_GAP + 40 {
         for fact in facts.into_iter().filter(|f| !f.is_empty()) {
             render::line(&fact);
         }
@@ -419,7 +419,10 @@ fn banner(runner: &Runner, folder: &str, session: usize) {
             &format!(
                 "{}{}{}",
                 render::MARGIN,
-                render::blue(&format!("{face:width$}", width = render::FACE_WIDTH)),
+                render::blue(&format!(
+                    "{face:width$}",
+                    width = render::FACE_WIDTH + render::FACE_GAP
+                )),
                 text
             ),
             true,
