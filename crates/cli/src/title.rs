@@ -18,7 +18,18 @@ const NAME: &str = "Letronna";
 /// are the wrong characters -- terminals hand those to an emoji font, which
 /// paints its own colour behind them and ignores the theme entirely. Braille
 /// is plain text and takes the colour of the tab it sits in.
-const MARKS: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠇"];
+const MARKS: [&str; 8] = [
+    "\u{2744}", "\u{2745}", "\u{2746}", "\u{2745}", "\u{2744}", "\u{2743}", "\u{2742}", "\u{2743}",
+];
+
+/// Spelled with the variation selector that asks for text rather than
+/// emoji. Without it a terminal hands the character to an emoji font, which
+/// paints its own colours -- that green block behind the mark -- and pays no
+/// attention to the theme. With it the glyph is ordinary text and takes the
+/// tab's own colours, which is as close to ours as a title can be: a tab
+/// title is plain text and the terminal, not the program, decides how it is
+/// drawn.
+const TEXT_PRESENTATION: char = '\u{FE0E}';
 
 /// Slower than the spinner on the screen. A title is read in passing, and
 /// redrawing it eleven times a second would be work nobody sees.
@@ -45,7 +56,10 @@ impl Busy {
         let handle = std::thread::spawn(move || {
             let mut at = 0usize;
             while !flag.load(Ordering::Relaxed) {
-                render::title(&format!("{} {NAME}", MARKS[at % MARKS.len()]));
+                render::title(&format!(
+                    "{}{TEXT_PRESENTATION} {NAME}",
+                    MARKS[at % MARKS.len()]
+                ));
                 at += 1;
                 std::thread::sleep(TICK);
             }
