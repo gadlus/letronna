@@ -111,7 +111,7 @@ fn main() {
 
     loop {
         render::blank();
-        let Some(line) = prompt::read(&format!("{} ", render::blue("›"))) else {
+        let Some(line) = prompt::read(&format!("{} ", render::blue("›")), &footer(&runner)) else {
             break;
         };
         let line = line.trim().to_owned();
@@ -286,6 +286,20 @@ fn banner(runner: &Runner, folder: &str, session: usize) {
             text
         );
     }
+}
+
+/// The standing note under the input box: who the question is going to, and
+/// anything about this session that changes what happens when you press
+/// enter.
+fn footer(runner: &Runner) -> String {
+    let settings = &runner.store.settings;
+    let mut parts = vec![settings.model.clone(), settings.gateway.clone()];
+    if runner.plan {
+        parts.push("plan mode".into());
+    } else if runner.yes {
+        parts.push("no approvals".into());
+    }
+    parts.join("  ·  ")
 }
 
 /// One `label  value` line of the startup details.

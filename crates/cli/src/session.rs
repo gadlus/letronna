@@ -65,11 +65,8 @@ impl Runner {
         self.persist();
 
         let mut turn = Turn::new(connection);
-        // The model says who it is once per question, not once per round: a
-        // turn that reaches for three tools is still one answer.
-        let mut named = false;
         loop {
-            let reply = self.stream_once(&mut turn, session, &mut named)?;
+            let reply = self.stream_once(&mut turn, session)?;
             let answer = reply.content.clone();
             let calls = reply.tool_calls.clone();
             self.store.conversations[session].updated = chat::now();
@@ -86,32 +83,25 @@ impl Runner {
     }
 
     /// One model call, printed as it streams.
-    fn stream_once(
-        &mut self,
-        turn: &mut Turn,
-        session: usize,
-        named: &mut bool,
-    ) -> Result<Message, String> {
+    fn stream_once(&mut self, turn: &mut Turn, session: usize) -> Result<Message, String> {
         let receiver = chat::start(
             turn.connection.clone(),
             self.store.conversations[session].messages.clone(),
         );
-        let mut out = Stream::default();
-        let mut printed_header = false;
+        // The model's name lives under the input box, so an answer only needs
+        // its bullet here.
+        let mut out = Stream::opening_with(render::bullet());
+        let mut opened = false;
         let mut waiting = Some(crate::spinner::Spinner::start());
         loop {
             let event = receiver
                 .recv_blocking()
                 .map_err(|_| "The model connection closed unexpectedly.".to_owned())?;
             if let Event::Delta(text) = &event {
-                if !printed_header {
+                if !opened {
                     waiting.take();
                     render::blank();
-                    if !*named {
-                        render::line(&render::blue(&self.store.settings.model));
-                        *named = true;
-                    }
-                    printed_header = true;
+                    opened = true;
                 }
                 out.push(text);
             }

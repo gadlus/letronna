@@ -120,6 +120,12 @@ pub fn flush() {
     let _ = std::io::stdout().flush();
 }
 
+/// The mark on the model's side of the conversation, the width of the indent
+/// so answers keep the column.
+pub fn bullet() -> String {
+    format!("{} ", blue("●"))
+}
+
 /// Print streamed text as it arrives, indenting each new line so a wrapped
 /// answer keeps the column.
 ///
@@ -129,6 +135,9 @@ pub fn flush() {
 /// them would cost the word-by-word arrival that makes a terminal feel alive.
 #[derive(Default)]
 pub struct Stream {
+    /// Printed in place of the indent on the first line, so an answer opens
+    /// with a bullet and its wrapped lines still sit in the same column.
+    lead: Option<String>,
     at_line_start: bool,
     bold: bool,
     code: bool,
@@ -138,13 +147,30 @@ pub struct Stream {
 }
 
 impl Stream {
+    /// A stream that opens with `lead` instead of the usual indent. It has to
+    /// be the width of the indent, or the first line will not line up with
+    /// the rest.
+    pub fn opening_with(lead: String) -> Self {
+        Self {
+            lead: Some(lead),
+            ..Default::default()
+        }
+    }
+
     fn emit(&mut self, out: &mut impl Write, ch: char) {
         if !self.started {
             self.at_line_start = true;
             self.started = true;
         }
         if self.at_line_start && ch != '\n' {
-            let _ = write!(out, "{PAD}");
+            match self.lead.take() {
+                Some(lead) => {
+                    let _ = write!(out, "{lead}");
+                }
+                None => {
+                    let _ = write!(out, "{PAD}");
+                }
+            }
             self.at_line_start = false;
         }
         let _ = write!(out, "{ch}");

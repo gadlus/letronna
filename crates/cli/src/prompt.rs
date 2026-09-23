@@ -1,13 +1,18 @@
-//! The input line.
+//! The input box.
 //!
-//! Typing `/` opens a list of commands under the prompt that filters as you
-//! type, so the commands are discoverable instead of something you have to
-//! already know. That needs keystrokes as they happen, which means raw mode --
-//! but only while a line is being edited. Everything else still prints into
-//! ordinary scrollback.
+//! What you type sits in a box under the conversation, with the model it will
+//! go to named underneath. Output is printed above the box, so the box stays
+//! where your eye already is. Typing `/` opens a list of commands under it
+//! that filters as you type, so the commands are discoverable instead of
+//! something you have to already know.
+//!
+//! That needs keystrokes as they happen, which means raw mode -- but only
+//! while a line is being edited. Everything else still prints into ordinary
+//! scrollback, so the conversation is still there after you quit and mouse
+//! selection keeps working.
 //!
 //! If raw mode is not available, because output is piped or redirected, this
-//! falls back to reading a whole line. The menu is a convenience, not the only
+//! falls back to reading a whole line. The box is a convenience, not the only
 //! way in: every command can still be typed out and entered.
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -52,6 +57,10 @@ pub const COMMANDS: &[Command] = &[
     },
 ];
 
+/// Commands the menu will show at once, so a long list cannot push the box
+/// off the top of a short window.
+const MENU_LIMIT: usize = 8;
+
 fn matches(text: &str) -> Vec<&'static Command> {
     if !text.starts_with('/') {
         return Vec::new();
@@ -62,23 +71,43 @@ fn matches(text: &str) -> Vec<&'static Command> {
         .collect()
 }
 
-/// Read one line. `None` means the user is done: Ctrl-C, Ctrl-D, or EOF.
-pub fn read(prompt: &str) -> Option<String> {
+/// Read one line. `footer` is the standing note under the box, which is where
+/// the model belongs: it answers "who am I talking to" without taking a line
+/// of the conversation every turn. `None` means the user is done: Ctrl-C,
+/// Ctrl-D, or EOF.
+pub fn read(prompt: &str, footer: &str) -> Option<String> {
     if !render::interactive() || terminal::enable_raw_mode().is_err() {
         return crate::input::read(prompt);
     }
-    let result = edit(prompt);
+    let result = edit(prompt, footer);
     let _ = terminal::disable_raw_mode();
     // The line was drawn by hand in raw mode; close it off properly.
     println!();
     result
 }
 
-fn edit(prompt: &str) -> Option<String> {
+/// Room inside the box for the prompt and what is typed after it.
+fn room() -> usize {
+    // Clamped at both ends: a hundred columns of empty box looks silly on a
+    // wide screen, and a very narrow one still needs somewhere to type.
+    render::width().clamp(28, 100) - render::PAD.len() * 2 - 4
+}
+
+/// The tail of `text` that fits. A long line keeps its end -- the part being
+/// typed -- in view, rather than its beginning.
+fn fit(text: &str, room: usize) -> String {
+    let count = text.chars().count();
+    if count <= room {
+        return text.to_owned();
+    }
+    text.chars().skip(count - room).collect()
+}
+
+fn edit(prompt: &str, footer: &str) -> Option<String> {
     let mut text = String::new();
     let mut picked = 0usize;
-    let mut drawn = 0u16;
-    draw(prompt, &text, picked, &mut drawn);
+    let mut drawn = false;
+    draw(prompt, footer, &text, picked, &mut drawn);
 
     loop {
         let Ok(Event::Key(KeyEvent {
@@ -97,11 +126,11 @@ fn edit(prompt: &str) -> Option<String> {
         let options = matches(&text);
         match (code, modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                clear_menu(drawn);
+                wipe();
                 return None;
             }
             (KeyCode::Char('d'), KeyModifiers::CONTROL) if text.is_empty() => {
-                clear_menu(drawn);
+                wipe();
                 return None;
             }
             (KeyCode::Enter, _) => {
@@ -109,10 +138,7 @@ fn edit(prompt: &str) -> Option<String> {
                 if let Some(choice) = options.get(picked).filter(|_| !options.is_empty()) {
                     text = choice.name.to_owned();
                 }
-                // Leave the line standing rather than wiping it: what you
-                // asked has to stay above the answer, or the transcript reads
-                // as the agent talking to itself.
-                keep(prompt, &text, drawn);
+                keep(prompt, &text);
                 return Some(text);
             }
             (KeyCode::Tab, _) => {
@@ -139,64 +165,92 @@ fn edit(prompt: &str) -> Option<String> {
             }
             _ => continue,
         }
-        draw(prompt, &text, picked, &mut drawn);
+        draw(prompt, footer, &text, picked, &mut drawn);
     }
 }
 
-/// Redraw the prompt and, when the text starts with `/`, the matching
-/// commands under it. `drawn` carries how many lines the menu took last time
-/// so they can be wiped before the next draw.
-fn draw(prompt: &str, text: &str, picked: usize, drawn: &mut u16) {
+/// Redraw the box, the matching commands when the text starts with `/`, and
+/// the footer under them.
+///
+/// The cursor rests on the line inside the box, so every redraw starts by
+/// going back up to the top edge and clearing to the bottom of the screen.
+/// Erasing wholesale rather than counting the lines the menu took last time
+/// is both shorter and harder to get wrong.
+fn draw(prompt: &str, footer: &str, text: &str, picked: usize, drawn: &mut bool) {
     let mut out = std::io::stdout().lock();
-    clear_menu_on(&mut out, *drawn);
-    let _ = write!(out, "\r\x1b[2K{prompt}{text}");
+    let room = room();
+    let shown = fit(text, room);
+    let typed = visible(prompt) + shown.chars().count();
+
+    to_top(&mut out, *drawn);
+
+    let edge = "─".repeat(room + 2);
+    let _ = write!(
+        out,
+        "{}{}\r\n",
+        render::PAD,
+        render::dim(&format!("╭{edge}╮"))
+    );
+    let _ = write!(
+        out,
+        "{}{} {prompt}{}{} {}\r\n",
+        render::PAD,
+        render::dim("│"),
+        shown,
+        " ".repeat(room.saturating_sub(typed)),
+        render::dim("│")
+    );
+    let _ = write!(out, "{}{}", render::PAD, render::dim(&format!("╰{edge}╯")));
 
     let options = matches(text);
-    let shown = options.len().min(8) as u16;
-    if shown > 0 {
-        for (i, option) in options.iter().take(shown as usize).enumerate() {
-            let marker = if i == picked { "›" } else { " " };
-            let name = if i == picked {
-                render::blue(option.name)
-            } else {
-                option.name.to_owned()
-            };
-            let _ = write!(
-                out,
-                "\r\n\x1b[2K  {marker} {name}  {}",
-                render::dim(option.blurb)
-            );
-        }
-        // Back up to the prompt line and put the cursor after the text.
-        let _ = write!(out, "\x1b[{shown}A\r\x1b[{}C", visible(prompt) + text.len());
+    let listed = options.len().min(MENU_LIMIT);
+    for (i, option) in options.iter().take(listed).enumerate() {
+        let marker = if i == picked { "›" } else { " " };
+        let name = if i == picked {
+            render::blue(option.name)
+        } else {
+            option.name.to_owned()
+        };
+        let _ = write!(
+            out,
+            "\r\n{}{marker} {name}  {}",
+            render::PAD,
+            render::dim(option.blurb)
+        );
     }
-    *drawn = shown;
+    let _ = write!(out, "\r\n{}  {}", render::PAD, render::dim(footer));
+
+    // Back up to the line inside the box and sit after what has been typed.
+    let up = 2 + listed as u16;
+    let column = render::PAD.len() + 2 + typed;
+    let _ = write!(out, "\x1b[{up}A\r\x1b[{column}C");
+    *drawn = true;
     let _ = out.flush();
 }
 
-/// Wipe the menu but keep the line as typed, marked as ours so it is easy to
-/// pick out when scrolling back.
-fn keep(prompt: &str, text: &str, drawn: u16) {
+/// Put the cursor at the start of the box's top edge and clear everything
+/// from there down.
+fn to_top(out: &mut impl Write, drawn: bool) {
+    if drawn {
+        let _ = write!(out, "\r\x1b[1A");
+    }
+    let _ = write!(out, "\r\x1b[0J");
+}
+
+/// Take the box away and leave the line as typed, marked as ours so it is
+/// easy to pick out when scrolling back.
+fn keep(prompt: &str, text: &str) {
     let mut out = std::io::stdout().lock();
-    clear_menu_on(&mut out, drawn);
-    let _ = write!(out, "\r\x1b[2K{prompt}{}", render::bold(text));
+    to_top(&mut out, true);
+    let _ = write!(out, "{}{prompt}{}", render::PAD, render::bold(text));
     let _ = out.flush();
 }
 
-fn clear_menu(drawn: u16) {
+/// Take the box away and leave nothing behind, for a line that was abandoned.
+fn wipe() {
     let mut out = std::io::stdout().lock();
-    clear_menu_on(&mut out, drawn);
+    to_top(&mut out, true);
     let _ = out.flush();
-}
-
-fn clear_menu_on(out: &mut impl Write, drawn: u16) {
-    for _ in 0..drawn {
-        let _ = write!(out, "\r\n\x1b[2K");
-    }
-    if drawn > 0 {
-        let _ = write!(out, "\x1b[{drawn}A");
-    }
-    let _ = write!(out, "\r\x1b[2K");
 }
 
 /// Width of the prompt as printed, ignoring the escape codes that colour it.
@@ -217,7 +271,7 @@ fn visible(text: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{matches, visible};
+    use super::{fit, matches, visible};
 
     #[test]
     fn the_menu_only_opens_for_a_slash() {
@@ -241,5 +295,15 @@ mod tests {
     fn prompt_width_ignores_colour() {
         assert_eq!(visible("> "), 2);
         assert_eq!(visible("\x1b[38;5;69m>\x1b[0m "), 2);
+    }
+
+    #[test]
+    fn a_long_line_keeps_the_end_in_view() {
+        assert_eq!(fit("hello", 10), "hello");
+        assert_eq!(fit("hello", 5), "hello");
+        // What was typed last is what you are looking at.
+        assert_eq!(fit("abcdefghij", 4), "ghij");
+        // Counted in characters, so the box does not split one in half.
+        assert_eq!(fit("héllo wörld", 5), "wörld");
     }
 }
