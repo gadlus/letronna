@@ -118,6 +118,9 @@ pub struct Bar {
     handled: usize,
     enter_at: Option<usize>,
     enters: usize,
+    /// Something to say in the footer instead of the model, until the next
+    /// thing you do. Long enough to be read, gone before it is in the way.
+    note: Option<String>,
     /// The waiting line, while nothing has come back yet. Drawn here rather
     /// than by a thread of its own, so there is only ever one writer to the
     /// terminal and a keystroke cannot land in the middle of a redraw.
@@ -139,6 +142,7 @@ impl Bar {
             answer: None,
             working: false,
             interrupt: false,
+            note: None,
             handled: 0,
             enter_at: None,
             enters: 0,
@@ -250,6 +254,7 @@ impl Bar {
         // event to send.
         let mark = self.line.at();
         let mut resized = false;
+        let noted = self.note.is_some();
         self.handled = 0;
         self.enter_at = None;
         self.enters = 0;
@@ -276,7 +281,13 @@ impl Bar {
                 // restoring one sends several at once. Note it and deal with
                 // the last shape rather than every shape on the way there.
                 Ok(Event::Resize(_, _)) => resized = true,
-                Ok(Event::Mouse(mouse)) => self.mouse(mouse),
+                Ok(Event::Mouse(mouse)) => {
+                    self.mouse(mouse);
+                    // The footer says how far back the view is and whether
+                    // something was just copied, so it has to be rebuilt when
+                    // the mouse is what changed those.
+                    self.settle();
+                }
                 _ => continue,
             }
         }
@@ -299,6 +310,10 @@ impl Bar {
         // repaints, and while we were busy with those the console's input
         // queue filled and threw the rest of the paste away -- which is how
         // words went missing out of the middle of pasted text.
+        // Anything the user does takes the footer back from a note.
+        if self.handled > 0 && noted {
+            self.note = None;
+        }
         if self.handled > 0 || resized {
             self.settle();
         }
@@ -348,6 +363,20 @@ impl Bar {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let options = matches(self.line.text());
         match key.code {
+            // With something marked, this is the copy key, which is what
+            // anybody pressing it over a selection meant by it. Leaving is
+            // what it does when there is nothing to copy.
+            KeyCode::Char('c') if control && crate::screen::selecting() => {
+                if let Some(text) = crate::screen::selected() {
+                    let lines = text.lines().count();
+                    crate::screen::copy(&text);
+                    crate::screen::unselect();
+                    self.note = Some(format!(
+                        "copied {lines} line{}",
+                        if lines == 1 { "" } else { "s" }
+                    ));
+                }
+            }
             KeyCode::Char('c') if control => {
                 // While an answer is running this stops it and leaves; the
                 // turn does not have to finish first, which is the whole
@@ -458,26 +487,24 @@ impl Bar {
                 crate::screen::select_to(mouse.column, mouse.row)
             }
             MouseEventKind::Up(MouseButton::Left) => {
+                // Where the button came up is the end of the selection. Not
+                // every terminal reports the movement in between -- a console
+                // may send the press and the release and nothing else -- so
+                // taking the end from the release is what makes a drag work
+                // at all there.
+                crate::screen::select_to(mouse.column, mouse.row);
                 if let Some(text) = crate::screen::select_done() {
                     let lines = text.lines().count();
                     crate::screen::copy(&text);
-                    self.footer_note(&format!(
-                        "copied {lines} line{}",
+                    self.note = Some(format!(
+                        "copied {lines} line{}  ·  ctrl-c copies again",
                         if lines == 1 { "" } else { "s" }
                     ));
+                    self.settle();
                 }
             }
             _ => {}
         }
-    }
-
-    /// Say something in the footer for a moment. It goes back to the model
-    /// and gateway on the next thing that redraws, which is the next
-    /// keystroke -- long enough to be read, short enough not to be in the way.
-    fn footer_note(&mut self, note: &str) {
-        let keep = std::mem::replace(&mut self.footer, note.to_owned());
-        self.settle();
-        self.footer = keep;
     }
 
     /// Steer a question. Enter takes what is highlighted, a digit takes that
@@ -605,7 +632,9 @@ impl Bar {
         }
 
         let back = crate::screen::scrolled();
-        let note = if self.choice.is_some() {
+        let note = if let Some(said) = &self.note {
+            said.clone()
+        } else if self.choice.is_some() {
             "↑↓ to choose  ·  enter to take it  ·  esc to decline".to_owned()
         } else if back > 0 {
             format!("scrolled back {back} lines  ·  end to follow again")

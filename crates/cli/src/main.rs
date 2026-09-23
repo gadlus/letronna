@@ -405,11 +405,9 @@ fn resume(runner: &mut Runner, session: &mut usize, workspace: Option<&std::path
     }
     runner.persist();
 
-    let conversation = &runner.store.conversations[index];
-    let title = conversation.title.clone();
-    let count = conversation.messages.len();
-    render::said(&render::blue("›"), &render::bold(&title));
-    render::line(&render::dim(&format!("{count} messages")));
+    // No title line here: the first thing replayed is the message the title
+    // was taken from, and saying it twice reads as the command having run
+    // twice.
     replay(runner, index);
 }
 

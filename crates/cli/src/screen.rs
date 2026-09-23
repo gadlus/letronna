@@ -77,9 +77,13 @@ pub fn open() {
         return;
     }
     s.open = true;
-    // 1000 is buttons, 1002 adds movement while one is held, 1006 makes the
-    // numbers big enough for a wide window.
-    print!("\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?2004h");
+    print!("\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l\x1b[?2004h");
+    // Asking for the mouse has to go through crossterm on Windows. The
+    // escape sequence alone tells the terminal to report mouse events, but a
+    // console only delivers them once ENABLE_MOUSE_INPUT is set on its input
+    // handle, which is an API call and not something that can be printed.
+    // Without it no mouse event ever arrives and selecting does nothing.
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
     let _ = std::io::stdout().flush();
 }
 
@@ -90,7 +94,8 @@ pub fn close() {
         return;
     }
     s.open = false;
-    print!("\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[?1049l");
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
+    print!("\x1b[?2004l\x1b[?25h\x1b[?1049l");
     let _ = std::io::stdout().flush();
 }
 
@@ -197,6 +202,11 @@ pub fn select_done() -> Option<String> {
     };
     now();
     text
+}
+
+/// What is marked, if anything.
+pub fn selected() -> Option<String> {
+    screen().lock().ok().and_then(|s| s.selected())
 }
 
 /// Whether anything is marked.
