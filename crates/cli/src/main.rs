@@ -107,7 +107,7 @@ fn main() {
     let folder = folder_name(workspace.as_deref());
     render::clear();
     render::title(&format!("letronna — {folder}"));
-    banner(&runner, &folder);
+    banner(&runner, &folder, session);
 
     loop {
         render::blank();
@@ -167,7 +167,7 @@ fn command(
         }
         "/clear" => {
             render::clear();
-            banner(runner, &folder_name(workspace));
+            banner(runner, &folder_name(workspace), *session);
             Flow::Handled
         }
         "/new" => {
@@ -225,27 +225,72 @@ fn folder_name(workspace: Option<&std::path::Path>) -> String {
         .unwrap_or_else(|| "no project".into())
 }
 
-fn banner(runner: &Runner, folder: &str) {
+fn banner(runner: &Runner, folder: &str, session: usize) {
     render::blank();
-    render::line(&format!(
-        "{}  {}  {}  {}  {}",
-        render::bold(letronna_core::BRAND),
-        render::dim("·"),
-        folder,
-        render::dim("·"),
-        runner.store.settings.model
-    ));
-    let mode = if runner.plan {
-        Some("plan mode: reads and searches only")
-    } else if runner.yes {
-        Some("running tools without asking")
-    } else {
-        None
-    };
-    if let Some(mode) = mode {
-        render::line(&render::dim(mode));
+
+    let settings = &runner.store.settings;
+    let conversation = &runner.store.conversations[session];
+    let mut facts = vec![
+        format!(
+            "{}  {}",
+            render::bold(letronna_core::BRAND),
+            render::dim(env!("CARGO_PKG_VERSION"))
+        ),
+        String::new(),
+        fact("project", folder),
+        fact("model", &settings.model),
+        fact("gateway", &settings.gateway),
+        fact(
+            "session",
+            &match conversation.messages.len() {
+                0 => "new".to_owned(),
+                1 => "carrying on, 1 message".to_owned(),
+                n => format!("carrying on, {n} messages"),
+            },
+        ),
+        fact(
+            "tools",
+            if runner.plan {
+                "plan mode: reads and searches only"
+            } else if runner.yes {
+                "running without asking"
+            } else {
+                "asking before writing or running"
+            },
+        ),
+        String::new(),
+        render::dim("type / for commands"),
+    ];
+
+    // Side by side when the face fits; the details alone when it does not, so
+    // a narrow window shows something readable rather than a wrapped mess.
+    if !render::colour() || render::width() < render::FACE_WIDTH + 40 {
+        for fact in facts.into_iter().filter(|f| !f.is_empty()) {
+            render::line(&fact);
+        }
+        return;
     }
-    render::line(&render::dim("type / for commands"));
+
+    // Sit the details against the middle of the face rather than its top.
+    let lead = (render::FACE.len().saturating_sub(facts.len())) / 2;
+    let mut column = vec![String::new(); lead];
+    column.append(&mut facts);
+
+    for row in 0..render::FACE.len().max(column.len()) {
+        let face = render::FACE.get(row).copied().unwrap_or("");
+        let text = column.get(row).cloned().unwrap_or_default();
+        println!(
+            "{}{}{}",
+            render::PAD,
+            render::blue(&format!("{face:width$}", width = render::FACE_WIDTH)),
+            text
+        );
+    }
+}
+
+/// One `label  value` line of the startup details.
+fn fact(label: &str, value: &str) -> String {
+    format!("{}  {value}", render::dim(&format!("{label:<8}")))
 }
 
 /// Start the window. It is a separate binary because a GUI-subsystem

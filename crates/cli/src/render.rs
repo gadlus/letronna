@@ -79,8 +79,37 @@ pub fn red(text: &str) -> String {
 /// as one column.
 pub const PAD: &str = "  ";
 
+/// The face on the tin, as characters. Twenty-eight columns wide, which
+/// leaves room for the startup details beside it on an eighty-column
+/// terminal.
+pub const FACE: &[&str] = &[
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀",
+    "⠀⠀⠀⠀⠀⠀⠀⢀⠄⣂⣴⣶⣿⡿⢚⣾⣴⣄⡀⡀",
+    "⠀⠀⠀⠀⠀⠀⢠⣰⣾⣾⣿⣿⢟⢥⣿⣿⣟⢌⣮⣾⣄",
+    "⠀⠀⠀⠀⠐⢨⣾⣿⣿⣿⣿⢥⣿⣾⣿⣿⡞⣿⣿⣿⣿⣗⠄",
+    "⠀⠀⠠⢐⡼⣿⣼⣿⣿⡫⢿⣻⠿⣿⣯⣿⣿⣿⢿⣿⣿⣿⣧⣂",
+    "⠀⠠⠊⠁⣺⢿⣿⣟⢿⡓⡬⠼⣽⠗⠹⣿⣿⠁⠆⢽⣿⣟⣿⣷⢅⠠",
+    "⠀⢀⢠⢼⢾⣿⣿⣷⡞⡎⠢⠀⡀⠂⢈⢿⣟⣈⣴⣿⣿⣿⣽⣾⣷⡑⡄",
+    "⠀⠋⣰⢃⣼⣿⣿⣿⣧⠂⠀⠀⠀⠀⠀⣺⢟⠨⣿⣿⣿⡿⣿⣿⡯⡧⢘",
+    "⠀⠘⠜⣱⢿⢟⣟⣿⣿⣷⣄⠀⠀⢀⣠⠃⠁⣰⣿⣿⣿⡿⡿⣟⠇⠃",
+    "⠀⠀⠐⡍⢸⡹⡽⣿⢽⢿⡿⣿⣾⣿⡇⠀⠀⢈⣉⣽⡪⠐⢁⢀",
+    "⠀⠀⠀⠀⠀⠁⠑⠩⠹⠈⢛⠱⡿⡻⣻⣴⣿⣿⣿⣿⡷⠋⠈⠠⣄⣀",
+    "⠀⠀⠀⠀⠀⠀⢀⠄⢔⠪⠨⡨⣢⣿⣿⣿⣿⣿⡿⠉⠀⠀⡀⠨⠟⠟⠋⠁",
+    "⠀⠀⠀⠀⣰⡌⠀⠀⡐⠥⢱⣵⣿⣿⣿⣿⣿⠏⣀⣤⠆⠀⠀⠀⠀⠀⠀⠊",
+    "⠀⠀⠀⠀⠈⢻⣄⠀⠀⣡⣿⣿⣿⣿⣿⡿⣧⡾⠟⢋⡡⠀⣠⣤⣴⣤⣤⣠",
+];
+
+/// Width the face is padded to, so the column beside it lines up.
+pub const FACE_WIDTH: usize = 28;
+
+
 pub fn line(text: &str) {
     println!("{PAD}{text}");
+}
+
+/// Terminal width, or a sane guess when it cannot be asked.
+pub fn width() -> usize {
+    crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80)
 }
 
 pub fn blank() {

@@ -65,8 +65,11 @@ impl Runner {
         self.persist();
 
         let mut turn = Turn::new(connection);
+        // The model says who it is once per question, not once per round: a
+        // turn that reaches for three tools is still one answer.
+        let mut named = false;
         loop {
-            let reply = self.stream_once(&mut turn, session)?;
+            let reply = self.stream_once(&mut turn, session, &mut named)?;
             let answer = reply.content.clone();
             let calls = reply.tool_calls.clone();
             self.store.conversations[session].updated = chat::now();
@@ -83,7 +86,12 @@ impl Runner {
     }
 
     /// One model call, printed as it streams.
-    fn stream_once(&mut self, turn: &mut Turn, session: usize) -> Result<Message, String> {
+    fn stream_once(
+        &mut self,
+        turn: &mut Turn,
+        session: usize,
+        named: &mut bool,
+    ) -> Result<Message, String> {
         let receiver = chat::start(
             turn.connection.clone(),
             self.store.conversations[session].messages.clone(),
@@ -99,7 +107,10 @@ impl Runner {
                 if !printed_header {
                     waiting.take();
                     render::blank();
-                    render::line(&render::blue(&self.store.settings.model));
+                    if !*named {
+                        render::line(&render::blue(&self.store.settings.model));
+                        *named = true;
+                    }
                     printed_header = true;
                 }
                 out.push(text);

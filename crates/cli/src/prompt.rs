@@ -109,7 +109,10 @@ fn edit(prompt: &str) -> Option<String> {
                 if let Some(choice) = options.get(picked).filter(|_| !options.is_empty()) {
                     text = choice.name.to_owned();
                 }
-                clear_menu(drawn);
+                // Leave the line standing rather than wiping it: what you
+                // asked has to stay above the answer, or the transcript reads
+                // as the agent talking to itself.
+                keep(prompt, &text, drawn);
                 return Some(text);
             }
             (KeyCode::Tab, _) => {
@@ -168,6 +171,15 @@ fn draw(prompt: &str, text: &str, picked: usize, drawn: &mut u16) {
         let _ = write!(out, "\x1b[{shown}A\r\x1b[{}C", visible(prompt) + text.len());
     }
     *drawn = shown;
+    let _ = out.flush();
+}
+
+/// Wipe the menu but keep the line as typed, marked as ours so it is easy to
+/// pick out when scrolling back.
+fn keep(prompt: &str, text: &str, drawn: u16) {
+    let mut out = std::io::stdout().lock();
+    clear_menu_on(&mut out, drawn);
+    let _ = write!(out, "\r\x1b[2K{prompt}{}", render::bold(text));
     let _ = out.flush();
 }
 
