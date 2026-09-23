@@ -48,6 +48,10 @@ pub const COMMANDS: &[Command] = &[
         blurb: "show the project folder and session file",
     },
     Command {
+        name: "/mouse",
+        blurb: "hand the mouse back so you can select text",
+    },
+    Command {
         name: "/clear",
         blurb: "clear the screen",
     },
@@ -269,9 +273,15 @@ impl Bar {
         let options = matches(&self.text);
         match (key.code, key.modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                // A first Ctrl-C clears what you were typing; a second, on an
-                // empty line, leaves. Nothing is thrown away without warning.
-                if self.text.is_empty() {
+                // While an answer is running, Ctrl-C stops it and leaves --
+                // the turn does not have to finish first, which is the whole
+                // reason anyone reaches for it. Otherwise it clears what you
+                // were typing, and on an empty line it leaves. Nothing is
+                // thrown away without warning.
+                if self.working {
+                    self.interrupt = true;
+                    self.done = true;
+                } else if self.text.is_empty() {
                     self.done = true;
                 } else {
                     self.text.clear();

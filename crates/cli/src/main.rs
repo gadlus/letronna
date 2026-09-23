@@ -69,6 +69,7 @@ fn parse(mut raw: impl Iterator<Item = String>) -> Args {
 }
 
 fn main() {
+    rescue_terminal();
     let args = parse(std::env::args().skip(1));
     if args.help {
         print!("{HELP}");
@@ -152,6 +153,21 @@ fn main() {
     render::blank();
 }
 
+/// Hand the terminal back if we panic. Without this a crash leaves the
+/// window in raw mode on an alternate screen: no echo, no prompt, and the
+/// conversation still on the screen over whatever was there before. The
+/// report itself is left to the usual hook, which runs straight after.
+fn rescue_terminal() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        screen::close();
+        let _ = crossterm::terminal::disable_raw_mode();
+        render::set_raw(false);
+        render::title("");
+        previous(info);
+    }));
+}
+
 enum Flow {
     Handled,
     Stop,
@@ -179,6 +195,19 @@ fn command(
                     render::dim(entry.blurb)
                 ));
             }
+            Flow::Handled
+        }
+        "/mouse" => {
+            // Selecting text and scrolling with the wheel cannot both be
+            // ours: a terminal gives the mouse to one or the other.
+            let taking = !screen::capturing();
+            screen::capture(taking);
+            render::blank();
+            render::line(&render::dim(if taking {
+                "The wheel scrolls the conversation again."
+            } else {
+                "The mouse is yours: drag to select, and PageUp still scrolls."
+            }));
             Flow::Handled
         }
         "/clear" => {

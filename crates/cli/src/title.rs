@@ -13,9 +13,12 @@ use crate::render;
 
 const NAME: &str = "Letronna";
 
-/// The turning mark. Four positions is enough to read as motion and few
-/// enough that a glance at a tab is not a flicker.
-const MARKS: [&str; 4] = ["✳", "✻", "✽", "✻"];
+/// The turning mark: the same braille wheel the waiting line uses, so the
+/// tab and the window agree. Stars and sparkles look like the right idea and
+/// are the wrong characters -- terminals hand those to an emoji font, which
+/// paints its own colour behind them and ignores the theme entirely. Braille
+/// is plain text and takes the colour of the tab it sits in.
+const MARKS: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠇"];
 
 /// Slower than the spinner on the screen. A title is read in passing, and
 /// redrawing it eleven times a second would be work nobody sees.

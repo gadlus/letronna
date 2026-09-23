@@ -40,6 +40,9 @@ struct Screen {
     /// The waiting line, while there is nothing to show yet.
     status: Option<String>,
     open: bool,
+    /// Whether the wheel is ours. When it is not, the terminal handles the
+    /// mouse again and text can be selected with it.
+    mouse: bool,
     painted: Instant,
 }
 
@@ -55,6 +58,7 @@ fn screen() -> &'static Mutex<Screen> {
             chrome: Vec::new(),
             status: None,
             open: false,
+            mouse: true,
             painted: Instant::now(),
         })
     })
@@ -87,6 +91,31 @@ pub fn close() {
     s.open = false;
     print!("\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l");
     let _ = std::io::stdout().flush();
+}
+
+/// Take the mouse, or give it back. Given back, the terminal's own selection
+/// works again and the wheel stops scrolling the conversation -- PageUp and
+/// PageDown still do.
+pub fn capture(on: bool) {
+    let Ok(mut s) = screen().lock() else { return };
+    if !s.open {
+        return;
+    }
+    s.mouse = on;
+    print!(
+        "{}",
+        if on {
+            "\x1b[?1000h\x1b[?1006h"
+        } else {
+            "\x1b[?1006l\x1b[?1000l"
+        }
+    );
+    let _ = std::io::stdout().flush();
+}
+
+/// Whether the wheel is currently ours.
+pub fn capturing() -> bool {
+    screen().lock().map(|s| s.mouse).unwrap_or(false)
 }
 
 /// Add text, which may run over several lines or stop mid-line.

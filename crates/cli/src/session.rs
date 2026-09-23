@@ -83,8 +83,12 @@ impl Runner {
     fn work(&mut self, turn: &mut Turn, session: usize) -> Result<String, String> {
         loop {
             let Some(reply) = self.stream_once(turn, session)? else {
-                render::blank();
-                render::said(&render::dim("●"), &render::dim("Stopped."));
+                // Ctrl-C stops the turn and leaves; escape only stops the
+                // turn, so say so in the one case where you stay.
+                if !self.bar.finished() {
+                    render::blank();
+                    render::said(&render::dim("●"), &render::dim("Stopped."));
+                }
                 return Ok(String::new());
             };
             let answer = reply.content.clone();
