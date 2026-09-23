@@ -120,6 +120,12 @@ pub const GUTTER: &str = "  ";
 /// comes to the same place, which is what keeps the two sides level.
 pub const PAD: &str = "    ";
 
+/// The arrow's column inside the box: past the margin, the border and the
+/// space after it. The waiting line belongs here rather than out in the
+/// conversation, because nothing has been said yet -- it is the box thinking,
+/// not Letronna talking.
+pub const INSIDE: &str = "    ";
+
 /// The face on the tin, as characters. Twenty-eight columns wide, which
 /// leaves room for the startup details beside it on an eighty-column
 /// terminal.

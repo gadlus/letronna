@@ -57,7 +57,7 @@ impl Spinner {
                 // should not have to scroll past the waiting.
                 crate::screen::status(Some(format!(
                     "{}{} {}{}",
-                    render::GUTTER,
+                    render::INSIDE,
                     render::blue(FRAMES[frame % FRAMES.len()]),
                     render::dim(word),
                     render::dim(&elapsed)
