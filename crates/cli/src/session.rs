@@ -329,7 +329,7 @@ impl Runner {
     pub fn open(&mut self, resume: bool, workspace: Option<std::path::PathBuf>) -> usize {
         if resume && !self.store.conversations.is_empty() {
             let last = self.store.conversations.len() - 1;
-            self.store.active = last;
+            self.enter(last);
             return last;
         }
         self.start(workspace)
@@ -338,8 +338,18 @@ impl Runner {
     /// Open the session with this id, or `None` if there is no such session.
     pub fn open_id(&mut self, id: u64) -> Option<usize> {
         let index = self.store.conversations.iter().position(|c| c.id == id)?;
-        self.store.active = index;
+        self.enter(index);
         Some(index)
+    }
+
+    /// Make a session the open one, reading what was said in it. Startup
+    /// lists the sessions without reading any of them, so this is where a
+    /// conversation actually comes off the disk.
+    pub fn enter(&mut self, index: usize) {
+        self.store.active = index;
+        if let Some(conversation) = self.store.conversations.get_mut(index) {
+            letronna_core::store::fill(conversation);
+        }
     }
 
     /// A session of its own.

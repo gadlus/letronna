@@ -27,6 +27,11 @@ pub struct Conversation {
     pub updated: u64,
     #[serde(default)]
     pub pinned: bool,
+    /// Messages the file holds, counted while listing the sessions and
+    /// before any of them are read. Only meaningful while `messages` is
+    /// empty; ask `length()` rather than reading this.
+    #[serde(skip)]
+    pub counted: usize,
     /// Project folder attached to this session, if any.
     #[serde(default)]
     pub workspace: Option<PathBuf>,
@@ -98,6 +103,19 @@ pub struct Store {
     pub settings: Settings,
 }
 
+impl Conversation {
+    /// How long the conversation is, whether or not it has been read off the
+    /// disk yet. Once it is in memory the messages are the truth; before
+    /// that, the count taken while listing is.
+    pub fn length(&self) -> usize {
+        if self.messages.is_empty() {
+            self.counted
+        } else {
+            self.messages.len()
+        }
+    }
+}
+
 impl Store {
     /// An id no existing session uses. Ids also name files, so a collision
     /// would merge two histories; the folder is checked as well as memory.
@@ -166,6 +184,7 @@ impl Conversation {
     /// fields if they have moved since the last write.
     fn flush(&mut self) -> std::io::Result<()> {
         let path = session_path(self.id);
+        let _lock = Lock::take(&path);
         let fresh = !path.exists();
         let meta = self.meta();
         let meta_changed = self.written.as_ref() != Some(&meta);
@@ -266,6 +285,14 @@ pub fn summaries() -> Vec<Summary> {
                 workspace: None,
             };
             for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                // Messages are most of the file and none of them are wanted
+                // here, so they are counted by their tag rather than parsed.
+                // The tag is written first, which is what makes this safe;
+                // anything that does not match still goes through serde.
+                if line.starts_with("{\"type\":\"message\"") {
+                    summary.messages += 1;
+                    continue;
+                }
                 match serde_json::from_str::<Record>(line) {
                     Ok(Record::Head { created, .. }) => summary.updated = created,
                     Ok(Record::Meta(meta)) => {
@@ -301,6 +328,53 @@ fn legacy_path() -> PathBuf {
     backend::data_dir().join("chats.json")
 }
 
+/// A lock held while a session file is being written.
+///
+/// The window and the terminal share these files and both append to them, so
+/// two of them can be part way through a line at the same time -- which is
+/// one corrupt record and, because a record is a whole message, one message
+/// lost. The lock is a file beside the session: made with create_new, which
+/// is atomic everywhere, and removed when the guard goes.
+pub struct Lock(PathBuf);
+
+impl Lock {
+    /// Wait for the lock, but not forever. A process that died holding one
+    /// would otherwise keep every other process out of that session for good,
+    /// so a lock nobody has touched for a while is taken anyway.
+    fn take(path: &std::path::Path) -> Self {
+        let lock = path.with_extension("lock");
+        for _ in 0..40 {
+            if std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock)
+                .is_ok()
+            {
+                return Self(lock);
+            }
+            let stale = std::fs::metadata(&lock)
+                .and_then(|m| m.modified())
+                .map(|t| t.elapsed().unwrap_or_default() > std::time::Duration::from_secs(10))
+                .unwrap_or(true);
+            if stale {
+                let _ = std::fs::remove_file(&lock);
+                continue;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        // A second of waiting is long enough that something is wrong. Writing
+        // without the lock risks a torn line; not writing loses the message
+        // for certain, so it writes.
+        Self(lock)
+    }
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 fn session_ids() -> Vec<u64> {
     let Ok(entries) = std::fs::read_dir(sessions_dir()) else {
         return Vec::new();
@@ -317,6 +391,56 @@ fn session_ids() -> Vec<u64> {
 }
 
 /// Load every session, newest last, plus the settings.
+/// The store with the sessions listed but not read.
+///
+/// Every session's messages are in memory after `load`, which is most of what
+/// it costs and almost none of what is used: one conversation is open and the
+/// rest are a list of titles. This reads the head and meta of each file and
+/// leaves the messages for `fill`, which is what the terminal wants -- it
+/// starts often and opens one session. The window keeps `load`, because its
+/// sidebar searches across all of them.
+pub fn load_listing() -> Store {
+    migrate();
+    let mut conversations: Vec<Conversation> = summaries()
+        .into_iter()
+        .map(|s| Conversation {
+            id: s.id,
+            title: s.title,
+            updated: s.updated,
+            workspace: s.workspace,
+            counted: s.messages,
+            ..Default::default()
+        })
+        .collect();
+    conversations.sort_by_key(|c| c.updated);
+    Store {
+        conversations,
+        active: 0,
+        settings: settings(),
+    }
+}
+
+/// Read a session's messages, if they are not already here.
+pub fn fill(conversation: &mut Conversation) {
+    if conversation.counted == 0 || !conversation.messages.is_empty() {
+        return;
+    }
+    if let Some(full) = replay(&session_path(conversation.id)) {
+        conversation.messages = full.messages;
+        // What has been written is what was just read, so a flush appends
+        // only what is said from here on rather than the whole history again.
+        conversation.flushed = conversation.messages.len();
+        conversation.written = Some(conversation.meta());
+    }
+}
+
+fn settings() -> Settings {
+    std::fs::read(settings_path())
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
 pub fn load() -> Store {
     migrate();
     let mut conversations: Vec<Conversation> = session_ids()

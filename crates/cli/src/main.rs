@@ -36,7 +36,7 @@ fn main() {
     }
 
     let mut runner = Runner {
-        store: store::load(),
+        store: store::load_listing(),
         allowed: Default::default(),
         yes: args.yes,
         plan: args.plan,
@@ -85,7 +85,7 @@ fn main() {
     banner(&runner, &folder, session);
     if args.start == Start::Choose {
         resume(&mut runner, &mut session, workspace.as_deref());
-    } else if !runner.store.conversations[session].messages.is_empty() {
+    } else if runner.store.conversations[session].length() > 0 {
         replay(&runner, session);
     }
 

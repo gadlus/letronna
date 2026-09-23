@@ -101,7 +101,7 @@ pub fn resume(runner: &mut Runner, session: &mut usize, workspace: Option<&std::
     // Newest first, skipping the one already open and any that never got a
     // word said in them.
     let mut recent: Vec<usize> = (0..runner.store.conversations.len())
-        .filter(|i| *i != *session && !runner.store.conversations[*i].messages.is_empty())
+        .filter(|i| *i != *session && runner.store.conversations[*i].length() > 0)
         .collect();
     recent.sort_by_key(|i| std::cmp::Reverse(runner.store.conversations[*i].updated));
     recent.truncate(SESSION_CHOICES);
@@ -146,7 +146,7 @@ pub fn resume(runner: &mut Runner, session: &mut usize, workspace: Option<&std::
     };
 
     *session = index;
-    runner.store.active = index;
+    runner.enter(index);
     // A session carries its own project folder; one that never had a folder
     // takes the one this window is standing in.
     if runner.store.conversations[index].workspace.is_none() {
