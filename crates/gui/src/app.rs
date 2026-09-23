@@ -110,6 +110,9 @@ pub(crate) struct Chat {
     pub(crate) scheduled: std::collections::HashSet<u64>,
     /// Sessions opened for a remote chat, so the reply goes back to it.
     pub(crate) remote: std::collections::HashMap<u64, i64>,
+    /// The session the paired chat is talking in, so a follow-up keeps its
+    /// context. `/new` from the chat starts another.
+    pub(crate) remote_session: Option<u64>,
     pub(crate) messaging_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub(crate) token_input: Entity<InputState>,
     pub(crate) webhook_input: Entity<InputState>,
@@ -269,6 +272,7 @@ impl Chat {
             pairing: None,
             scheduled: std::collections::HashSet::new(),
             remote: std::collections::HashMap::new(),
+            remote_session: None,
             messaging_stop: None,
             token_input,
             webhook_input,
@@ -720,18 +724,31 @@ impl Chat {
             );
             return;
         }
-        let workspace = self.store.conversations[self.store.active]
-            .workspace
-            .clone();
-        self.store.conversations.push(Conversation {
-            id: self.store.next_id(),
-            title: message.text.chars().take(40).collect(),
-            updated: backend::now(),
-            workspace,
-            ..Default::default()
-        });
-        self.store.active = self.store.conversations.len() - 1;
+        // Telegram sends /start when a chat first opens the bot.
+        if matches!(message.text.trim(), "/new" | "/start") {
+            self.remote_session = None;
+            self.tell_remote(message.chat, "Started a new session.", cx);
+            return;
+        }
+        // Carry on in the chat's session unless it has since been deleted.
+        match self.remote_session.and_then(|id| self.store.index_of(id)) {
+            Some(ix) => self.store.active = ix,
+            None => {
+                let workspace = self.store.conversations[self.store.active]
+                    .workspace
+                    .clone();
+                self.store.conversations.push(Conversation {
+                    id: self.store.next_id(),
+                    title: message.text.chars().take(40).collect(),
+                    updated: backend::now(),
+                    workspace,
+                    ..Default::default()
+                });
+                self.store.active = self.store.conversations.len() - 1;
+            }
+        }
         let id = self.store.conversations[self.store.active].id;
+        self.remote_session = Some(id);
         self.remote.insert(id, message.chat);
         // Nobody on the far end can answer an approval card, so unless the
         // user has said otherwise a remote message may look but not touch.
@@ -782,18 +799,24 @@ impl Chat {
         let Some(chat) = self.remote.remove(&id) else {
             return;
         };
-        let reply = self
-            .store
-            .index_of(id)
-            .and_then(|ix| {
-                self.store.conversations[ix]
-                    .messages
-                    .iter()
-                    .rev()
-                    .find(|m| m.role == "assistant" && !m.content.is_empty())
-            })
-            .map(|m| m.content.clone())
-            .unwrap_or_else(|| "That did not produce an answer.".to_owned());
+        // Only this turn's reply: the session carries on across messages, so
+        // an earlier answer is further up and must not be sent again.
+        let reply = match &self.error {
+            Some(error) => format!("Did not finish: {error}"),
+            None => self
+                .store
+                .index_of(id)
+                .and_then(|ix| {
+                    self.store.conversations[ix]
+                        .messages
+                        .iter()
+                        .rev()
+                        .take_while(|m| m.role != "user")
+                        .find(|m| m.role == "assistant" && !m.content.is_empty())
+                })
+                .map(|m| m.content.clone())
+                .unwrap_or_else(|| "That did not produce an answer.".to_owned()),
+        };
         self.tell_remote(chat, &reply, cx);
     }
 
