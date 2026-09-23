@@ -53,6 +53,10 @@ pub fn title(text: &str) {
 /// Start from a clean screen, so the shell's own banner is not the first
 /// thing in the transcript.
 pub fn clear() {
+    if crate::screen::held() {
+        crate::screen::wipe();
+        return;
+    }
     if colour() {
         print!("[2J[3J[H");
         flush();
@@ -171,6 +175,13 @@ pub fn said(mark: &str, text: &str) {
 /// Everything printed goes through here, so raw mode's need for a carriage
 /// return with every newline is dealt with once.
 pub fn out(text: &str, newline: bool) {
+    if crate::screen::held() {
+        crate::screen::push(text);
+        if newline {
+            crate::screen::push("\n");
+        }
+        return;
+    }
     if newline {
         print!("{text}{}", nl());
     } else {
@@ -377,7 +388,7 @@ pub fn fold(line: &str, width: usize) -> Vec<String> {
 /// arrow on a question and the dashes and numbers of a list all read as one
 /// column when what follows them lines up underneath.
 fn hanging(line: &str) -> usize {
-    let visible: Vec<char> = plain(line);
+    let visible: Vec<char> = printing(line);
     let mut at = 0;
     while visible.get(at) == Some(&' ') {
         at += 1;
@@ -404,7 +415,7 @@ fn hanging(line: &str) -> usize {
 }
 
 /// The characters of `text` that take up room, with the escapes dropped.
-fn plain(text: &str) -> Vec<char> {
+fn printing(text: &str) -> Vec<char> {
     let mut out = Vec::new();
     let mut chars = text.chars();
     while let Some(ch) = chars.next() {
@@ -467,6 +478,46 @@ fn words(line: &str) -> Vec<(String, usize)> {
 
 /// Break text into rows that fit, for anything that has to lay itself out
 /// before handing the result over.
+/// The text of a line with the escapes taken out, for putting on a
+/// clipboard, where colour is not wanted and would not survive anyway.
+pub fn plain(text: &str) -> String {
+    let mut out = String::new();
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            for next in chars.by_ref() {
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Turn a run of a line inside out, for showing what is selected.
+///
+/// The row is rewritten without its own colour first. Reverse video is just
+/// another attribute, so the first reset the line carries -- and a coloured
+/// line is full of them -- would switch the highlight off again halfway
+/// through. Losing the colour of a row while it is marked is a small price
+/// for the mark being visible at all.
+pub fn mark(text: &str, from: usize, to: Option<usize>) -> String {
+    let plain = plain(text);
+    let chars: Vec<char> = plain.chars().collect();
+    let to = to.unwrap_or(chars.len()).min(chars.len());
+    let from = from.min(to);
+    let before: String = chars[..from].iter().collect();
+    let span: String = chars[from..to].iter().collect();
+    let after: String = chars[to..].iter().collect();
+    if !colour() {
+        return plain;
+    }
+    format!("{before}\x1b[7m{span}\x1b[27m{after}")
+}
+
 /// Width of text as printed, ignoring the escapes that colour it.
 pub fn visible(text: &str) -> usize {
     let mut width = 0;
@@ -558,3 +609,4 @@ mod tests {
         assert_eq!(visible(&rows[0]), 7);
     }
 }
+

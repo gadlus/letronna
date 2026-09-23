@@ -9,6 +9,7 @@ mod diff;
 mod edit;
 mod input;
 mod render;
+mod screen;
 mod session;
 mod spinner;
 mod title;
@@ -111,13 +112,13 @@ fn main() {
 
     let folder = folder_name(workspace.as_deref());
     title::idle();
-    render::clear();
-    banner(&runner, &folder, session);
-    // The box takes the foot of the window last: clearing the screen would
-    // wipe it, and the banner is ordinary output that belongs above it.
+    // The window has to be ours before the banner, or the banner goes to the
+    // screen we are about to swap away from.
     let note = footer(&runner);
     runner.bar.set_footer(note);
     runner.bar.install();
+    render::clear();
+    banner(&runner, &folder, session);
 
     loop {
         let Some(line) = runner.bar.wait() else {

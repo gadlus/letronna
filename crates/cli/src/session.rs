@@ -155,6 +155,8 @@ impl Runner {
             if let Event::Finished(result) = event {
                 self.bar.wait_line(false);
                 out.end();
+                // Catch up on anything a throttled paint skipped.
+                crate::screen::settle();
                 result?;
                 break;
             }
