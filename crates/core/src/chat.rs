@@ -280,6 +280,24 @@ fn transient(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 502 | 503 | 504 | 520..=527)
 }
 
+/// Turn a provider's complaint into something worth reading.
+///
+/// Two of them mean the same thing and neither says it: the route cannot
+/// take a tool call back in the conversation. Google's adapter wants the
+/// opaque `thought_signature` it issued, which the OpenAI-shaped protocol
+/// has nowhere to carry, and then blames the id; the id is fine. It is not
+/// something the caller can fix by trying again, so the message says what to
+/// do instead.
+fn explain(message: &str) -> String {
+    let tool_history_unsupported = message.contains("thought_signature")
+        || (message.contains("tool_calls") && message.contains("to be populated"));
+    if tool_history_unsupported {
+        return "This model cannot carry tool calls back into the conversation, so it                 stops as soon as it uses one. That is the route, not the request. Pick                 another model with /model -- the deepseek and claude routes handle                 tools."
+            .to_owned();
+    }
+    message.chars().take(400).collect()
+}
+
 fn unwrap_response(value: &Value) -> Result<&Value, String> {
     if value.get("error").is_some() || value.get("success").is_some_and(|v| v != true) {
         let message = value
@@ -287,7 +305,7 @@ fn unwrap_response(value: &Value) -> Result<&Value, String> {
             .or_else(|| value.get("message"))
             .and_then(Value::as_str)
             .unwrap_or("The provider could not finish this response.");
-        return Err(message.chars().take(400).collect());
+        return Err(explain(&message));
     }
     Ok(if value.get("success") == Some(&Value::Bool(true)) {
         &value["data"]
@@ -895,6 +913,21 @@ mod tests {
         let sent = context[3]["content"].as_str().unwrap().chars().count();
         assert!(sent < MAX_TOOL_CHARS + 64, "{sent}");
     }
+    #[test]
+    fn the_two_ways_a_route_says_it_cannot_do_tools_read_the_same() {
+        let google = super::explain(
+            "Expected the 'id' of a(n) 'assistant' 'tool_calls' array element to be populated.",
+        );
+        let gemini = super::explain(
+            "Function call is missing a thought_signature in functionCall parts.",
+        );
+        assert!(google.contains("/model"));
+        assert_eq!(google, gemini);
+        // Anything else is passed through as the provider wrote it.
+        let other = super::explain("You have exceeded your quota.");
+        assert_eq!(other, "You have exceeded your quota.");
+    }
+
     #[test]
     fn a_call_without_an_id_is_given_one() {
         // Some providers stream the name and arguments but never an id.

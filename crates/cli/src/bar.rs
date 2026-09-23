@@ -256,6 +256,15 @@ impl Bar {
         while event::poll(TICK).unwrap_or(false) {
             match event::read() {
                 Ok(Event::Key(key)) => self.key(key),
+                // A paste is one event, so a paragraph is one message. Line
+                // endings are normalised because a pasted CRLF would
+                // otherwise leave a carriage return in the middle of it.
+                Ok(Event::Paste(text)) => {
+                    if self.choice.is_none() {
+                        self.text.push_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
+                        self.picked = 0;
+                    }
+                }
                 Ok(Event::Mouse(mouse)) => match mouse.kind {
                     MouseEventKind::ScrollUp => crate::screen::scroll(WHEEL),
                     MouseEventKind::ScrollDown => crate::screen::scroll(-WHEEL),
@@ -402,7 +411,16 @@ impl Bar {
     /// is in the scrollback where the answers are.
     fn echo(&self, line: &str) {
         render::blank();
-        render::said(&render::blue("›"), &render::bold(line));
+        let mut parts = line.lines();
+        render::said(
+            &render::blue("›"),
+            &render::bold(parts.next().unwrap_or_default()),
+        );
+        // The rest of a pasted block sits under the first line rather than
+        // behind another arrow: it is one thing you said, not several.
+        for part in parts {
+            render::line(&render::bold(part));
+        }
         // Room for the answer to start in, and for the spinner to sit in
         // while there is nothing to show yet.
         render::blank();
@@ -416,6 +434,18 @@ impl Bar {
             return;
         }
         crate::screen::chrome(self.chrome());
+    }
+
+    /// What the box shows. A pasted block is stood for by a count rather
+    /// than unrolled into a line that could never show it: the text is still
+    /// all there, and goes in full when it is sent.
+    fn summary(&self) -> String {
+        let lines = self.text.lines().count();
+        if lines < 2 {
+            return self.text.clone();
+        }
+        let tail = self.text.rsplit('\n').next().unwrap_or_default();
+        format!("[{lines} lines pasted]{}{tail}", if tail.is_empty() { "" } else { " " })
     }
 
     /// The box, while it is holding a question rather than a line. The
@@ -500,7 +530,7 @@ impl Bar {
             .max(8);
         // Two columns of that room belong to the arrow.
         let typing = room.saturating_sub(2);
-        let shown = fit(&self.text, typing);
+        let shown = fit(&self.summary(), typing);
 
         let edge = "─".repeat(room + 2);
         if let Some(choice) = &self.choice {

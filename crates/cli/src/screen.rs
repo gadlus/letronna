@@ -83,7 +83,8 @@ pub fn open() {
     // wheel, at the price of never being able to select a line of it, and
     // copying out of a conversation is worth more than a wheel. `/mouse`
     // trades back for anyone who would rather have the scrolling.
-    print!("\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l");
+    // The last of these asks for pasted text in one piece.
+    print!("\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l\x1b[?2004h");
     let _ = std::io::stdout().flush();
 }
 
@@ -94,7 +95,7 @@ pub fn close() {
         return;
     }
     s.open = false;
-    print!("\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l");
+    print!("\x1b[?2004l\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l");
     let _ = std::io::stdout().flush();
 }
 
