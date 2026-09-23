@@ -71,7 +71,11 @@ impl Runner {
 
         let mut turn = Turn::new(connection);
         self.bar.working(true);
+        // The tab says so too, for whoever has switched away to something
+        // else while this runs.
+        let busy = crate::title::Busy::start();
         let answer = self.work(&mut turn, session);
+        drop(busy);
         self.bar.working(false);
         answer
     }

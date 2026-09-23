@@ -11,6 +11,7 @@ mod screen;
 mod render;
 mod session;
 mod spinner;
+mod title;
 
 use letronna_core::store;
 use session::Runner;
@@ -108,7 +109,7 @@ fn main() {
     }
 
     let folder = folder_name(workspace.as_deref());
-    render::title(&format!("letronna — {folder}"));
+    title::idle();
     // The window has to be ours before the banner, or the banner is written
     // to the screen we are about to swap away from.
     let note = footer(&runner);
