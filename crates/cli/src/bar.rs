@@ -82,13 +82,6 @@ fn matches(text: &str) -> Vec<&'static Command> {
         .collect()
 }
 
-/// Whether more input is already waiting. The wait is long enough to cover
-/// the gap between two characters of a paste and far shorter than the gap
-/// between two keystrokes of a person typing.
-fn pending() -> bool {
-    event::poll(Duration::from_millis(15)).unwrap_or(false)
-}
-
 /// A question with a fixed set of answers, asked in the box instead of the
 /// line: approvals are the same three or four answers every time, and typing
 /// a letter for them is a small thing to get wrong in a hurry.
@@ -117,6 +110,13 @@ pub struct Bar {
     /// True while a turn is in flight, which is what makes escape mean stop.
     working: bool,
     interrupt: bool,
+    /// Keys and pastes handled in the drain now running, an enter's place
+    /// among them, and how many enters there were. Together these say whether
+    /// an enter ended what you were typing or sat in the middle of something
+    /// arriving, without guessing from the clock.
+    handled: usize,
+    enter_at: Option<usize>,
+    enters: usize,
     /// The waiting line, while nothing has come back yet. Drawn here rather
     /// than by a thread of its own, so there is only ever one writer to the
     /// terminal and a keystroke cannot land in the middle of a redraw.
@@ -140,6 +140,9 @@ impl Bar {
             answer: None,
             working: false,
             interrupt: false,
+            handled: 0,
+            enter_at: None,
+            enters: 0,
             waiting: None,
             ticked: std::time::Instant::now(),
         }
@@ -270,15 +273,24 @@ impl Bar {
         // burst of keys is how a paste looks on a console that has no paste
         // event to send.
         let mark = self.line.at();
-        let mut drained = 0usize;
         let mut resized = false;
+        self.handled = 0;
+        self.enter_at = None;
+        self.enters = 0;
         while event::poll(TICK).unwrap_or(false) {
-            drained += 1;
             match event::read() {
-                Ok(Event::Key(key)) => self.key(key),
+                // A key release is not something anybody did; counting it
+                // would make every key look like the middle of a burst,
+                // since a release always follows its press.
+                Ok(Event::Key(key)) if key.kind != KeyEventKind::Press => continue,
+                Ok(Event::Key(key)) => {
+                    self.handled += 1;
+                    self.key(key);
+                }
                 // Terminals that hand pasted text over in one piece. Windows
                 // consoles do not, which the enter key handles instead.
                 Ok(Event::Paste(text)) => {
+                    self.handled += 1;
                     if self.choice.is_none() {
                         self.line.paste(&text);
                         self.picked = 0;
@@ -298,7 +310,12 @@ impl Bar {
         // Nobody types eight characters inside one poll. If that many arrived
         // and they put several lines in the box, it was a paste, and it is
         // stood behind a placeholder now that it is all here.
-        if drained > 8 && self.choice.is_none() {
+        // An enter that was the last thing to arrive, and the only one, ended
+        // a line someone was typing. An enter with more behind it, or one of
+        // several, is a line ending inside text that was pasted.
+        if self.enters == 1 && self.enter_at == Some(self.handled) {
+            self.send();
+        } else if self.handled > 8 && self.choice.is_none() {
             self.line.fold_burst(mark);
             self.settle();
         }
@@ -365,20 +382,13 @@ impl Bar {
             KeyCode::Char('d') if control && self.line.is_empty() => self.done = true,
             // A newline on purpose, for writing a paragraph.
             KeyCode::Enter if shift || alt => self.line.insert('\n'),
-            // A paste arriving as keystrokes: nobody types the next character
-            // within a few milliseconds of pressing enter.
-            KeyCode::Enter if pending() => self.line.insert('\n'),
+            // Every enter puts a line ending in. Whether it also ends the
+            // message is decided once the drain is done, by where it fell
+            // among everything else that arrived.
             KeyCode::Enter => {
-                if let Some(choice) = options.get(self.picked) {
-                    self.line.set(choice.name);
-                }
-                self.picked = 0;
-                let line = self.line.take();
-                let line = line.trim().to_owned();
-                if !line.is_empty() {
-                    self.echo(&line);
-                    self.queued.push_back(line);
-                }
+                self.line.insert('\n');
+                self.enters += 1;
+                self.enter_at = Some(self.handled);
             }
             KeyCode::Tab => {
                 if let Some(choice) = options.get(self.picked) {
@@ -423,6 +433,26 @@ impl Bar {
             }
             _ => return,
         }
+        self.settle();
+    }
+
+    /// Send what is in the box: the line ending the enter put in comes off,
+    /// a highlighted command wins over what was typed, and what is left goes
+    /// into the conversation and the queue.
+    fn send(&mut self) {
+        let text = self.line.text().trim_end_matches('\n').to_owned();
+        self.line.set(&text);
+        if let Some(choice) = matches(self.line.text()).get(self.picked) {
+            self.line.set(choice.name);
+        }
+        self.picked = 0;
+        let line = self.line.take().trim().to_owned();
+        if line.is_empty() {
+            self.settle();
+            return;
+        }
+        self.echo(&line);
+        self.queued.push_back(line);
         self.settle();
     }
 
@@ -524,24 +554,35 @@ impl Bar {
 
     /// Settle the box into a window that has changed size.
     ///
-    /// The conversation belongs to the terminal, which reflows it for the new
-    /// width on its own; what it does not know is that the last few rows are
-    /// spoken for. If the conversation now ends inside them it is scrolled up
-    /// by exactly the overlap -- no more, because a restore is a resize too,
-    /// and scrolling on every one of those is what left a trail of gaps
-    /// behind a window being maximised and put back.
+    /// The box is painted at fixed rows outside the scrolling region, so
+    /// after a resize the old copy is simply text sitting where the box used
+    /// to be -- and where that was is no longer where it belongs. Remembering
+    /// the rows is no help either: restore a maximised window and those rows
+    /// are off the bottom of the screen.
+    ///
+    /// What can be trusted is the cursor, which sits at the end of the
+    /// conversation. Everything below it is ours: stale copies, fragments of
+    /// them, blank space. So that is what gets cleared, and then the box is
+    /// drawn once, in the one place it belongs.
     fn reframe(&mut self) {
         let (_, rows) = terminal::size().unwrap_or((80, 24));
         self.height = self.wanted();
-        let bottom = rows.saturating_sub(self.height).max(1);
-        // The region has to be off to see where the conversation really ends.
-        print!("[r");
+        // The region has to be off to see and reach the whole screen.
+        print!("\x1b[r");
         render::flush();
-        if let Ok((_, row)) = crossterm::cursor::position() {
-            let ends_at = row + 1;
-            if ends_at > bottom {
-                self.make_room(ends_at - bottom);
-            }
+
+        let ends_at = crossterm::cursor::position()
+            .map(|(_, row)| row + 1)
+            .unwrap_or(rows.saturating_sub(self.height));
+        for row in (ends_at + 1)..=rows {
+            print!("\x1b[{row};1H\x1b[2K");
+        }
+        // The conversation is scrolled up only by as much as the box would
+        // otherwise cover. A restore is a resize too, and scrolling on every
+        // one is what left a trail of gaps behind.
+        let bottom = rows.saturating_sub(self.height).max(1);
+        if ends_at > bottom {
+            self.make_room(ends_at - bottom);
         }
         self.painted = None;
         self.frame();
@@ -607,11 +648,18 @@ impl Bar {
         let room = self.room();
         let edge = "─".repeat(room + 2);
 
-        let mut lines = vec![format!(
+        // The waiting line sits above the box, where the answer it is
+        // waiting for will appear. Under the footer it was below the thing
+        // you type into, which is the wrong way round.
+        let mut lines = Vec::new();
+        if let Some(waiting) = &self.waiting {
+            lines.push(waiting.line());
+        }
+        lines.push(format!(
             "{}{}",
             render::MARGIN,
             render::dim(&format!("╭{edge}╮"))
-        )];
+        ));
         match &self.choice {
             Some(choice) => self.asking(choice, room, &mut lines),
             None => self.typing(room, &mut lines),
@@ -646,9 +694,6 @@ impl Bar {
             None => self.footer.clone(),
         };
         lines.push(format!("{}{}", render::PAD, render::dim(&note)));
-        if let Some(waiting) = &self.waiting {
-            lines.push(waiting.line());
-        }
 
         let top = rows.saturating_sub(self.height) + 1;
         let mut out = std::io::stdout().lock();
@@ -676,8 +721,10 @@ impl Bar {
             return;
         };
         let (_, rows) = terminal::size().unwrap_or((80, 24));
+        // First row of the rows we hold: the waiting line is above the box.
+        let row = rows.saturating_sub(self.height) + 1;
         let mut out = std::io::stdout().lock();
-        let _ = write!(out, "\x1b7\x1b[{rows};1H\x1b[2K{}\x1b8", waiting.line());
+        let _ = write!(out, "\x1b7\x1b[{row};1H\x1b[2K{}\x1b8", waiting.line());
         let _ = out.flush();
     }
 
