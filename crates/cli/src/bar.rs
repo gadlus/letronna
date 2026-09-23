@@ -270,7 +270,6 @@ impl Bar {
                     if self.choice.is_none() {
                         self.line.paste(&text);
                         self.picked = 0;
-                        self.settle();
                     }
                 }
                 // Dragging a window edge sends a burst of these, and
@@ -294,6 +293,13 @@ impl Bar {
             self.send();
         } else if self.handled > 8 && self.choice.is_none() {
             self.line.fold_burst(mark);
+        }
+        // One repaint for the whole drain. Painting after every keystroke
+        // meant a paste of a few thousand characters asked for a few thousand
+        // repaints, and while we were busy with those the console's input
+        // queue filled and threw the rest of the paste away -- which is how
+        // words went missing out of the middle of pasted text.
+        if self.handled > 0 || resized {
             self.settle();
         }
         // The waiting line turns on this loop, which runs every twenty
@@ -414,9 +420,8 @@ impl Bar {
                 self.line.insert(ch);
                 self.picked = 0;
             }
-            _ => return,
+            _ => {}
         }
-        self.settle();
     }
 
     /// Send what is in the box: the line ending the enter put in comes off,
@@ -496,9 +501,8 @@ impl Bar {
                     }
                 }
             }
-            _ => return,
+            _ => {}
         }
-        self.settle();
     }
 
     /// Put the line into the conversation above the box, so your side of it

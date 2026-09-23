@@ -335,6 +335,18 @@ impl Runner {
             self.store.active = last;
             return last;
         }
+        self.start(workspace)
+    }
+
+    /// Open the session with this id, or `None` if there is no such session.
+    pub fn open_id(&mut self, id: u64) -> Option<usize> {
+        let index = self.store.conversations.iter().position(|c| c.id == id)?;
+        self.store.active = index;
+        Some(index)
+    }
+
+    /// A session of its own.
+    pub fn start(&mut self, workspace: Option<std::path::PathBuf>) -> usize {
         self.store.conversations.push(Conversation {
             id: self.store.next_id(),
             title: String::new(),

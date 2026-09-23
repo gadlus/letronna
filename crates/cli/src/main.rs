@@ -23,19 +23,35 @@ Letronna — a small agent in your terminal
   letronna                 open a conversation
   letronna -p \"question\"    ask once and exit
   letronna --continue      pick up the most recent session
+  letronna --resume        choose from the recent sessions
+  letronna --resume <id>   open that session, by the id /where shows
   letronna gui             open the window instead
 
 Options
   -p, --print <prompt>     ask one question, print the answer, exit
   -c, --continue           resume the most recent session
+  -r, --resume [id]        choose a session, or open the one with this id
       --yes                run tools without asking (careful)
       --plan               read and search only; never write or run
   -h, --help               this
 ";
 
+/// What to open with.
+#[derive(Debug, PartialEq)]
+enum Start {
+    /// A session of its own.
+    Fresh,
+    /// The one used last, without being asked.
+    Last,
+    /// Pick from the recent ones.
+    Choose,
+    /// A named one, by the id in its file name.
+    Named(u64),
+}
+
 struct Args {
     prompt: Option<String>,
-    resume: bool,
+    start: Start,
     yes: bool,
     plan: bool,
     help: bool,
@@ -45,7 +61,7 @@ struct Args {
 fn parse(mut raw: impl Iterator<Item = String>) -> Args {
     let mut args = Args {
         prompt: None,
-        resume: false,
+        start: Start::Fresh,
         yes: false,
         plan: false,
         help: false,
@@ -55,7 +71,15 @@ fn parse(mut raw: impl Iterator<Item = String>) -> Args {
         match arg.as_str() {
             "gui" => args.gui = true,
             "-p" | "--print" => args.prompt = raw.next(),
-            "-c" | "--continue" | "--resume" => args.resume = true,
+            "-c" | "--continue" => args.start = Start::Last,
+            // `--resume` on its own offers the recent sessions; with an id it
+            // opens that one, which is what the id in `/where` is for.
+            "-r" | "--resume" => {
+                args.start = match raw.next().as_deref().map(str::parse::<u64>) {
+                    Some(Ok(id)) => Start::Named(id),
+                    _ => Start::Choose,
+                }
+            }
             "--yes" => args.yes = true,
             "--plan" => args.plan = true,
             "-h" | "--help" => args.help = true,
@@ -96,7 +120,17 @@ fn main() {
     }
 
     let workspace = std::env::current_dir().ok();
-    let mut session = runner.open(args.resume, workspace.clone());
+    let mut session = match args.start {
+        Start::Last => runner.open(true, workspace.clone()),
+        Start::Named(id) => match runner.open_id(id) {
+            Some(index) => index,
+            None => {
+                render::line(&render::red(&format!("No session with the id {id}.")));
+                std::process::exit(1);
+            }
+        },
+        _ => runner.open(false, workspace.clone()),
+    };
 
     // One question, one answer, no banner: this form gets piped.
     if let Some(prompt) = args.prompt {
@@ -119,6 +153,11 @@ fn main() {
     runner.bar.install();
     render::clear();
     banner(&runner, &folder, session);
+    if args.start == Start::Choose {
+        resume(&mut runner, &mut session, workspace.as_deref());
+    } else if !runner.store.conversations[session].messages.is_empty() {
+        replay(&runner, session);
+    }
 
     loop {
         let Some(line) = runner.bar.wait() else {
@@ -253,6 +292,59 @@ fn command(
     }
 }
 
+/// Messages shown when a session is picked up. Enough to remember where you
+/// were, not so many that the window fills with what you already read.
+const REPLAY: usize = 12;
+
+/// Put a session's conversation back on the screen. Resuming without this
+/// looks like nothing happened: the messages are all there and none of them
+/// are in front of you.
+fn replay(runner: &Runner, session: usize) {
+    let messages = &runner.store.conversations[session].messages;
+    let from = messages.len().saturating_sub(REPLAY);
+    render::blank();
+    if from > 0 {
+        render::line(&render::dim(&format!(
+            "… {from} earlier message{} not shown",
+            if from == 1 { "" } else { "s" }
+        )));
+    }
+    for message in &messages[from..] {
+        match message.role.as_str() {
+            "user" => said_over_lines(&render::blue("›"), &message.content, true),
+            "assistant" if !message.content.trim().is_empty() => {
+                said_over_lines(&render::blue("●"), &message.content, false)
+            }
+            // A tool's own output is not worth replaying, but that it ran is.
+            "tool" => render::tool(
+                &message.name,
+                "",
+                if message.is_error { "failed" } else { "ran" },
+                message.is_error,
+            ),
+            _ => {}
+        }
+    }
+}
+
+/// A message with its mark, its later lines under the first.
+fn said_over_lines(mark: &str, text: &str, bold: bool) {
+    render::blank();
+    let mut parts = text.lines();
+    let first = parts.next().unwrap_or_default();
+    render::said(
+        mark,
+        &if bold {
+            render::bold(first)
+        } else {
+            first.to_owned()
+        },
+    );
+    for part in parts {
+        render::line(part);
+    }
+}
+
 /// Sessions offered at once. Older ones are still on disk and still open in
 /// the window; this is the shortlist you would actually pick from.
 const SESSION_CHOICES: usize = 9;
@@ -317,9 +409,8 @@ fn resume(runner: &mut Runner, session: &mut usize, workspace: Option<&std::path
     let title = conversation.title.clone();
     let count = conversation.messages.len();
     render::said(&render::blue("›"), &render::bold(&title));
-    render::line(&render::dim(&format!(
-        "{count} messages. Ask something to carry on."
-    )));
+    render::line(&render::dim(&format!("{count} messages")));
+    replay(runner, index);
 }
 
 /// Models offered at once. Some gateways carry hundreds; a list longer than
@@ -550,7 +641,7 @@ mod tests {
     #[test]
     fn reads_the_forms_people_actually_type() {
         let bare = args(&[]);
-        assert!(bare.prompt.is_none() && !bare.resume && !bare.yes);
+        assert!(bare.prompt.is_none() && bare.start == super::Start::Fresh && !bare.yes);
 
         assert_eq!(args(&["-p", "hello"]).prompt.as_deref(), Some("hello"));
         assert_eq!(args(&["--print", "hello"]).prompt.as_deref(), Some("hello"));
@@ -564,8 +655,14 @@ mod tests {
         assert!(mixed.plan);
         assert_eq!(mixed.prompt.as_deref(), Some("look around"));
 
-        assert!(args(&["-c"]).resume);
-        assert!(args(&["--continue"]).resume);
+        assert_eq!(args(&["-c"]).start, super::Start::Last);
+        assert_eq!(args(&["--continue"]).start, super::Start::Last);
+        // Resume on its own asks which one; with an id it takes that one.
+        assert_eq!(args(&["--resume"]).start, super::Start::Choose);
+        assert_eq!(args(&["--resume", "137"]).start, super::Start::Named(137));
+        // A word that is not a number is a prompt, not a session.
+        let worded = args(&["--resume", "hello"]);
+        assert_eq!(worded.start, super::Start::Choose);
         assert!(args(&["gui"]).gui);
         assert!(args(&["--yes"]).yes);
         assert!(args(&["-h"]).help);
