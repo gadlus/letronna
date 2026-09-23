@@ -124,6 +124,7 @@ impl Runner {
             if let Event::Finished(result) = event {
                 waiting.take();
                 out.end();
+                crate::screen::settle();
                 result?;
                 break;
             }

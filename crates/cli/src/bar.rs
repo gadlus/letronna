@@ -12,10 +12,11 @@
 //! When the terminal cannot do any of this, because output is piped or
 //! redirected, the box quietly becomes a plain prompt and a read of one line.
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+};
 use crossterm::terminal;
 use std::collections::VecDeque;
-use std::io::Write;
 use std::time::Duration;
 
 use crate::render;
@@ -59,12 +60,13 @@ pub const COMMANDS: &[Command] = &[
 /// Commands the menu will show at once, so a long list cannot eat the window.
 const MENU_LIMIT: usize = 8;
 
-/// Lines the box always takes: three of border and text, one of footer.
-const FRAME: u16 = 4;
-
 /// How long a pump waits for a keystroke before handing the loop back. Short
 /// enough that typing feels immediate, long enough not to spin.
 const TICK: Duration = Duration::from_millis(20);
+
+/// Rows a turn of the wheel moves, and rows a page key moves.
+const WHEEL: isize = 3;
+const PAGE: isize = 10;
 
 fn matches(text: &str) -> Vec<&'static Command> {
     if !text.starts_with('/') {
@@ -92,13 +94,6 @@ pub struct Bar {
     footer: String,
     /// Lines entered but not yet answered, in the order they were typed.
     queued: VecDeque<String>,
-    /// Rows the box is holding at the bottom of the window.
-    height: u16,
-    /// The row the box was last painted on. After the window is resized that
-    /// is no longer where it belongs, and the old one has to be wiped: a
-    /// ghost box stranded in the middle of the conversation is exactly what
-    /// a maximise followed by a restore used to leave behind.
-    painted: Option<(u16, u16)>,
     /// False when the terminal cannot give us the bottom of the window, in
     /// which case this is a plain prompt.
     live: bool,
@@ -112,42 +107,28 @@ impl Bar {
             picked: 0,
             footer,
             queued: VecDeque::new(),
-            height: FRAME,
-            painted: None,
             live: false,
             done: false,
         }
     }
 
-    /// Take over the bottom of the window.
+    /// Take over the window.
     pub fn install(&mut self) {
         if !render::interactive() || terminal::enable_raw_mode().is_err() {
             return;
         }
         render::set_raw(true);
         self.live = true;
-        // The real cursor has to stay in the scrolling region so that output
-        // lands there; the caret in the box is drawn by hand instead.
-        print!("\x1b[?25l");
-        self.make_room(self.height);
-        self.frame();
-        self.draw();
+        crate::screen::open();
+        self.settle();
     }
 
-    /// Give the window back: full scrolling region, cursor returned, and the
-    /// box wiped so the shell prompt does not land on top of it.
+    /// Give the window back exactly as it was found.
     pub fn uninstall(&mut self) {
         if !self.live {
             return;
         }
-        let (_, rows) = terminal::size().unwrap_or((80, 24));
-        let top = rows.saturating_sub(self.height) + 1;
-        print!("\x1b[r");
-        for row in top..=rows {
-            print!("\x1b[{row};1H\x1b[2K");
-        }
-        print!("\x1b[{top};1H\x1b[?25h");
-        render::flush();
+        crate::screen::close();
         let _ = terminal::disable_raw_mode();
         render::set_raw(false);
         self.live = false;
@@ -155,7 +136,7 @@ impl Bar {
 
     pub fn set_footer(&mut self, footer: String) {
         self.footer = footer;
-        self.draw();
+        self.settle();
     }
 
     /// Wait for a whole line. `None` when the user is done.
@@ -187,16 +168,17 @@ impl Bar {
         while event::poll(TICK).unwrap_or(false) {
             match event::read() {
                 Ok(Event::Key(key)) => self.key(key),
-                Ok(Event::Resize(_, _)) => {
-                    // Only the frame moves. Scrolling the conversation here
-                    // as well is what made minimising and restoring the
-                    // window leave a trail of gaps behind it, because every
-                    // restore counts as a resize.
-                    self.frame();
-                    self.draw();
-                }
-                _ => {}
+                Ok(Event::Mouse(mouse)) => match mouse.kind {
+                    MouseEventKind::ScrollUp => crate::screen::scroll(WHEEL),
+                    MouseEventKind::ScrollDown => crate::screen::scroll(-WHEEL),
+                    _ => continue,
+                },
+                // A resize is just a repaint now; there is no frame held in
+                // the terminal that could be left behind by one.
+                Ok(Event::Resize(_, _)) => self.settle(),
+                _ => continue,
             }
+            self.settle();
         }
     }
 
@@ -250,6 +232,12 @@ impl Bar {
             (KeyCode::Down, _) if !options.is_empty() => {
                 self.picked = (self.picked + 1) % options.len();
             }
+            (KeyCode::PageUp, _) => crate::screen::scroll(PAGE),
+            (KeyCode::PageDown, _) => crate::screen::scroll(-PAGE),
+            // Scrolling back is for reading; End puts you back with the
+            // conversation, which is where typing belongs.
+            (KeyCode::End, _) => crate::screen::follow(),
+            (KeyCode::Esc, _) if crate::screen::scrolled() > 0 => crate::screen::follow(),
             (KeyCode::Esc, _) => {
                 self.text.clear();
                 self.picked = 0;
@@ -277,70 +265,23 @@ impl Bar {
         render::blank();
     }
 
-    /// Redraw, resizing the held area first when the menu has opened or shut.
+    /// Rebuild the box and hand it to the screen, which paints it under the
+    /// conversation. Nothing here touches the terminal directly, so there is
+    /// no frame that a resize could strand.
     fn settle(&mut self) {
-        let wanted = FRAME + matches(&self.text).len().min(MENU_LIMIT) as u16;
-        if wanted != self.height {
-            // A taller box would otherwise cover the last lines of the
-            // answer; give it the room before taking it.
-            if wanted > self.height {
-                self.make_room(wanted - self.height);
-            }
-            self.height = wanted;
-            self.frame();
-        }
-        self.draw();
-    }
-
-    /// Scroll the conversation up by `rows`, so nothing already printed ends
-    /// up underneath the box. Only ever called when the box is about to grow.
-    fn make_room(&self, rows: u16) {
-        print!("\x1b[r");
-        for _ in 0..rows {
-            print!("{}", render::nl());
-        }
-        render::flush();
-    }
-
-    /// Shrink the scrolling region to everything above the box and leave the
-    /// cursor at the bottom of it, which is where output will land. Safe to
-    /// call as often as you like: it moves the frame without touching what is
-    /// already on the screen.
-    fn frame(&mut self) {
-        let (_, rows) = terminal::size().unwrap_or((80, 24));
-        let bottom = rows.saturating_sub(self.height).max(1);
-        // The region has to be off to reach rows outside it.
-        print!("\x1b[r");
-        self.erase(rows);
-        print!("\x1b[1;{bottom}r");
-        // Wipe whatever the old frame left below the new one.
-        for row in (bottom + 1)..=rows {
-            print!("\x1b[{row};1H\x1b[2K");
-        }
-        // Setting the region homes the cursor, so put it back at the foot of
-        // the conversation, which is where output belongs.
-        print!("\x1b[{bottom};1H");
-        render::flush();
-    }
-
-    /// Clear the rows the box was last painted on, wherever they are now.
-    fn erase(&mut self, rows: u16) {
-        if let Some((top, held)) = self.painted.take() {
-            for row in top..=(top + held).min(rows) {
-                print!("\x1b[{row};1H\x1b[2K");
-            }
-        }
-    }
-
-    fn draw(&mut self) {
         if !self.live {
             return;
         }
-        let (columns, rows) = terminal::size().unwrap_or((80, 24));
+        crate::screen::chrome(self.chrome());
+    }
+
+    /// The box, the menu under it when one is open, and the footer.
+    fn chrome(&self) -> Vec<String> {
+        let (columns, _) = terminal::size().unwrap_or((80, 24));
         // Full width, less the indent the conversation sits in and the box's
         // own borders and padding.
         let room = (columns as usize)
-            .saturating_sub(render::PAD.len() * 2 + 4)
+            .saturating_sub(render::MARGIN.len() * 2 + 4)
             .max(8);
         // Two columns of that room belong to the arrow.
         let typing = room.saturating_sub(2);
@@ -348,20 +289,20 @@ impl Bar {
 
         let edge = "─".repeat(room + 2);
         let mut lines = vec![
-            format!("{}{}", render::PAD, render::dim(&format!("╭{edge}╮"))),
+            format!("{}{}", render::MARGIN, render::dim(&format!("╭{edge}╮"))),
             format!(
                 "{}{} {} {}{}{} {}",
-                render::PAD,
+                render::MARGIN,
                 render::dim("│"),
                 render::blue("›"),
                 shown,
-                // The caret, drawn rather than parked: the real cursor has to
-                // stay in the scrolling region for output to land there.
+                // The caret is drawn rather than parked: the real cursor is
+                // hidden, because there is nowhere useful for it to sit.
                 render::caret(),
                 " ".repeat(typing.saturating_sub(shown.chars().count() + 1)),
                 render::dim("│")
             ),
-            format!("{}{}", render::PAD, render::dim(&format!("╰{edge}╯"))),
+            format!("{}{}", render::MARGIN, render::dim(&format!("╰{edge}╯"))),
         ];
 
         let options = matches(&self.text);
@@ -374,28 +315,21 @@ impl Bar {
             };
             lines.push(format!(
                 "{}{marker} {name}  {}",
-                render::PAD,
+                render::GUTTER,
                 render::dim(option.blurb)
             ));
         }
-        lines.push(format!("{}  {}", render::PAD, render::dim(&self.footer)));
 
-        let top = rows.saturating_sub(self.height) + 1;
-        let mut out = std::io::stdout().lock();
-        // Save and restore, so whatever was streaming into the conversation
-        // carries on from where it was.
-        let _ = write!(out, "\x1b7");
-        // Say again where the conversation ends. Restoring a window does not
-        // always arrive as a resize, and some terminals forget the region
-        // over the top of it; repeating it here costs nothing and means the
-        // box rights itself on the next keystroke rather than staying wrong.
-        let _ = write!(out, "\x1b[1;{}r", top.saturating_sub(1).max(1));
-        for (i, text) in lines.iter().enumerate() {
-            let _ = write!(out, "\x1b[{};1H\x1b[2K{text}", top + i as u16);
-        }
-        let _ = write!(out, "\x1b8");
-        let _ = out.flush();
-        self.painted = Some((top, self.height.saturating_sub(1)));
+        // While you are reading back through the conversation, the footer
+        // says so and how to get back rather than repeating the model.
+        let back = crate::screen::scrolled();
+        let note = if back > 0 {
+            format!("scrolled back {back} lines  ·  End to follow again")
+        } else {
+            self.footer.clone()
+        };
+        lines.push(format!("{}{}", render::PAD, render::dim(&note)));
+        lines
     }
 }
 

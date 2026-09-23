@@ -53,6 +53,10 @@ pub fn title(text: &str) {
 /// Start from a clean screen, so the shell's own banner is not the first
 /// thing in the transcript.
 pub fn clear() {
+    if crate::screen::held() {
+        crate::screen::wipe();
+        return;
+    }
     if colour() {
         print!("[2J[3J[H");
         flush();
@@ -103,9 +107,17 @@ pub fn red(text: &str) -> String {
     wrap("38;5;167", text)
 }
 
-/// Two spaces, so everything the agent says sits in from the prompt and reads
-/// as one column.
-pub const PAD: &str = "  ";
+/// The left margin of the input box.
+pub const MARGIN: &str = "  ";
+
+/// Where a mark -- the arrow on your line, the bullet on an answer -- sits.
+/// It lines up with the arrow inside the box, so the conversation and the
+/// thing you type into are one column and not two.
+pub const GUTTER: &str = "    ";
+
+/// Where the words start, mark or no mark. `GUTTER` plus a mark and a space
+/// comes to the same place, which is what keeps the two sides level.
+pub const PAD: &str = "      ";
 
 /// The face on the tin, as characters. Twenty-eight columns wide, which
 /// leaves room for the startup details beside it on an eighty-column
@@ -132,7 +144,31 @@ pub const FACE_WIDTH: usize = 28;
 
 
 pub fn line(text: &str) {
-    print!("{PAD}{text}{}", nl());
+    out(&format!("{PAD}{text}"), true);
+}
+
+/// A line with a mark in front of it. The mark stands in the two columns the
+/// indent would otherwise occupy, so a marked line and an ordinary one put
+/// their text in the same place -- which is the whole point of the indent.
+pub fn said(mark: &str, text: &str) {
+    out(&format!("{GUTTER}{mark} {text}"), true);
+}
+
+/// Everything printed goes through here: into the screen when it is holding
+/// the conversation, straight to the terminal when it is not.
+pub fn out(text: &str, newline: bool) {
+    if crate::screen::held() {
+        crate::screen::push(text);
+        if newline {
+            crate::screen::push("\n");
+        }
+        return;
+    }
+    if newline {
+        print!("{text}{}", nl());
+    } else {
+        print!("{text}");
+    }
     flush();
 }
 
@@ -142,8 +178,7 @@ pub fn width() -> usize {
 }
 
 pub fn blank() {
-    print!("{}", nl());
-    flush();
+    out("", true);
 }
 
 pub fn flush() {
@@ -153,15 +188,7 @@ pub fn flush() {
 /// The mark on the model's side of the conversation, the width of the indent
 /// so answers keep the column.
 pub fn bullet() -> String {
-    format!("{} ", blue("●"))
-}
-
-/// A line with a mark in front of it. The mark stands in the two columns the
-/// indent would otherwise occupy, so a marked line and an ordinary one put
-/// their text in the same place -- which is the whole point of the indent.
-pub fn said(mark: &str, text: &str) {
-    print!("{mark} {text}{}", nl());
-    flush();
+    format!("{GUTTER}{} ", blue("●"))
 }
 
 /// Print streamed text as it arrives, indenting each new line so a wrapped
@@ -195,80 +222,75 @@ impl Stream {
         }
     }
 
-    fn emit(&mut self, out: &mut impl Write, ch: char) {
+    /// Text is built up and handed over in one piece rather than written a
+    /// character at a time: a frame is painted for each piece, and a frame
+    /// per character would be an answer spent repainting itself.
+    fn emit(&mut self, out: &mut String, ch: char) {
         if !self.started {
             self.at_line_start = true;
             self.started = true;
         }
         if self.at_line_start && ch != '\n' {
             match self.lead.take() {
-                Some(lead) => {
-                    let _ = write!(out, "{lead}");
-                }
-                None => {
-                    let _ = write!(out, "{PAD}");
-                }
+                Some(lead) => out.push_str(&lead),
+                None => out.push_str(PAD),
             }
             self.at_line_start = false;
         }
+        out.push(ch);
         if ch == '\n' {
-            let _ = write!(out, "{}", nl());
             self.at_line_start = true;
-        } else {
-            let _ = write!(out, "{ch}");
         }
     }
 
-    fn toggle(&mut self, out: &mut impl Write, on: bool, code: &str) {
+    fn toggle(&mut self, out: &mut String, on: bool, code: &str) {
         if colour() {
-            let _ = write!(out, "{}", if on { code } else { "\x1b[0m" });
+            out.push_str(if on { code } else { "\x1b[0m" });
         }
     }
 
     pub fn push(&mut self, text: &str) {
-        let mut out = std::io::stdout().lock();
+        let mut buffer = String::with_capacity(text.len() + 8);
         for ch in text.chars() {
             if self.star {
                 self.star = false;
                 if ch == '*' {
                     self.bold = !self.bold;
                     let bold = self.bold;
-                    self.toggle(&mut out, bold, "\x1b[1m");
+                    self.toggle(&mut buffer, bold, "\x1b[1m");
                     continue;
                 }
-                self.emit(&mut out, '*');
+                self.emit(&mut buffer, '*');
             }
             match ch {
                 '*' => self.star = true,
                 '`' => {
                     self.code = !self.code;
                     let code = self.code;
-                    self.toggle(&mut out, code, "\x1b[38;5;180m");
+                    self.toggle(&mut buffer, code, "\x1b[38;5;180m");
                 }
-                _ => self.emit(&mut out, ch),
+                _ => self.emit(&mut buffer, ch),
             }
         }
-        let _ = out.flush();
+        out(&buffer, false);
     }
 
     /// Finish the current line, if one is open, and drop any formatting still
-    /// hanging so the prompt after it is not tinted.
+    /// hanging so what comes after it is not tinted.
     pub fn end(&mut self) {
-        let mut out = std::io::stdout().lock();
+        let mut buffer = String::new();
         if self.star {
             self.star = false;
-            self.emit(&mut out, '*');
+            self.emit(&mut buffer, '*');
         }
         if (self.bold || self.code) && colour() {
-            let _ = write!(out, "\x1b[0m");
+            buffer.push_str("\x1b[0m");
         }
         self.bold = false;
         self.code = false;
-        if !self.at_line_start {
-            let _ = write!(out, "{}", nl());
-            self.at_line_start = true;
-        }
-        let _ = out.flush();
+        let close = !self.at_line_start;
+        self.at_line_start = true;
+        out(&buffer, close);
     }
 }
 
@@ -285,8 +307,7 @@ pub fn tool(name: &str, argument: &str, outcome: &str, failed: bool) {
     } else {
         dim(outcome)
     };
-    print!("{head}{arg}  {tail}{}", nl());
-    flush();
+    out(&format!("{head}{arg}  {tail}"), true);
 }
 
 /// The indented body of a tool result, clipped so a big file does not bury
@@ -294,14 +315,12 @@ pub fn tool(name: &str, argument: &str, outcome: &str, failed: bool) {
 pub fn detail(text: &str, max_lines: usize) {
     let total = text.lines().count();
     for line in text.lines().take(max_lines) {
-        print!("{PAD}  {}{}", dim(line), nl());
+        out(&format!("{PAD}  {}", dim(line)), true);
     }
     if total > max_lines {
-        print!(
-            "{PAD}  {}{}",
-            dim(&format!("… {} more lines", total - max_lines)),
-            nl()
+        out(
+            &format!("{PAD}  {}", dim(&format!("… {} more lines", total - max_lines))),
+            true,
         );
     }
-    flush();
 }

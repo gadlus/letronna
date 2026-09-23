@@ -6,6 +6,7 @@
 
 mod bar;
 mod input;
+mod screen;
 mod render;
 mod session;
 mod spinner;
@@ -106,13 +107,14 @@ fn main() {
     }
 
     let folder = folder_name(workspace.as_deref());
-    render::clear();
     render::title(&format!("letronna — {folder}"));
-    banner(&runner, &folder, session);
-
+    // The window has to be ours before the banner, or the banner is written
+    // to the screen we are about to swap away from.
     let note = footer(&runner);
     runner.bar.set_footer(note);
     runner.bar.install();
+    render::clear();
+    banner(&runner, &folder, session);
 
     loop {
         let Some(line) = runner.bar.wait() else {
@@ -289,11 +291,14 @@ fn banner(runner: &Runner, folder: &str, session: usize) {
     for row in 0..render::FACE.len().max(column.len()) {
         let face = render::FACE.get(row).copied().unwrap_or("");
         let text = column.get(row).cloned().unwrap_or_default();
-        println!(
-            "{}{}{}",
-            render::PAD,
-            render::blue(&format!("{face:width$}", width = render::FACE_WIDTH)),
-            text
+        render::out(
+            &format!(
+                "{}{}{}",
+                render::MARGIN,
+                render::blue(&format!("{face:width$}", width = render::FACE_WIDTH)),
+                text
+            ),
+            true,
         );
     }
 }
