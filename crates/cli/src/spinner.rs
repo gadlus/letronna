@@ -5,6 +5,7 @@
 //! the first word of the reply arrives, then wipes it so the answer starts on
 //! a clean line and the scrollback keeps no trace of it.
 
+use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -89,17 +90,23 @@ impl Spinner {
                 // A line of its own under the conversation rather than a line
                 // in it: nothing was said yet, and when it is, the answer
                 // should not have to scroll past the waiting.
-                crate::screen::status(Some(format!(
-                    "{}{} {}{}",
+                let mut out = std::io::stdout().lock();
+                let _ = write!(
+                    out,
+                    "\r\x1b[2K{}{} {}{}",
                     render::INSIDE,
                     paint(FRAMES[frame % FRAMES.len()]),
                     paint(&say),
                     render::dim(&elapsed)
-                )));
+                );
+                let _ = out.flush();
                 frame += 1;
                 std::thread::sleep(std::time::Duration::from_millis(90));
             }
-            crate::screen::status(None);
+            // Leave the line as it was found: the answer takes it over.
+            let mut out = std::io::stdout().lock();
+            let _ = write!(out, "\r\x1b[2K", );
+            let _ = out.flush();
         });
         Self {
             stop,

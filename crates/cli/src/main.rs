@@ -6,8 +6,8 @@
 
 mod bar;
 mod diff;
+mod edit;
 mod input;
-mod screen;
 mod render;
 mod session;
 mod spinner;
@@ -160,7 +160,8 @@ fn main() {
 fn rescue_terminal() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        screen::close();
+        // Full scrolling region, cursor back, raw mode off.
+        print!("\x1b[r\x1b[?2004l\x1b[?25h");
         let _ = crossterm::terminal::disable_raw_mode();
         render::set_raw(false);
         render::title("");
@@ -195,19 +196,6 @@ fn command(
                     render::dim(entry.blurb)
                 ));
             }
-            Flow::Handled
-        }
-        "/mouse" => {
-            // Selecting text and scrolling with the wheel cannot both be
-            // ours: a terminal gives the mouse to one or the other.
-            let taking = !screen::capturing();
-            screen::capture(taking);
-            render::blank();
-            render::line(&render::dim(if taking {
-                "The wheel scrolls the conversation; selecting text needs shift held."
-            } else {
-                "The mouse is yours again: drag to select. PageUp and PageDown still scroll."
-            }));
             Flow::Handled
         }
         "/clear" => {
@@ -279,17 +267,12 @@ fn switch_model(runner: &mut Runner, filter: &str) {
     render::blank();
     render::said(&render::blue("●"), &render::bold("Models"));
     // Fetching takes a moment over the network; say so rather than freezing.
-    screen::status(Some(format!(
-        "{}{}",
-        render::INSIDE,
-        render::dim(&format!("asking {gateway} what it has…"))
-    )));
+    render::line(&render::dim(&format!("asking {gateway} what it has…")));
     let found = if guest {
         letronna_core::chat::free_models()
     } else {
         letronna_core::chat::list_models(&endpoint, &key)
     };
-    screen::status(None);
 
     let mut models = match found {
         Ok(models) if !models.is_empty() => models,
@@ -396,7 +379,7 @@ fn banner(runner: &Runner, folder: &str, session: usize) {
         ),
         String::new(),
         render::dim("type / for commands"),
-        render::dim("wheel scrolls · shift+drag selects · /mouse swaps them"),
+        render::dim("shift+enter for a new line · ↑ for what you said before"),
     ];
 
     // Side by side when the face fits; the details alone when it does not, so

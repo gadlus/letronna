@@ -1,24 +1,24 @@
-//! The input box, pinned to the bottom of the window.
+//! The input box, held at the foot of the window.
 //!
-//! The terminal's scrolling region is shrunk to everything above the box, so
-//! answers scroll past while the box holds its place at the foot of the
-//! window. Keys are read on the same loop that pumps the model's reply, which
-//! means you can type the next question while the current one is still being
-//! answered; a line entered mid-answer waits its turn rather than cutting in.
+//! The conversation is printed into the terminal's own scrollback, not into a
+//! screen of our own. That is the design decision here: the wheel, the
+//! scrollbar, dragging to select and copying all belong to the terminal and
+//! keep working, because we never ask for them. What we take is the last few
+//! rows, by shrinking the scrolling region to everything above them, so the
+//! box stays put while answers scroll past it. Scroll back far enough and the
+//! box goes with everything else, which is the price and a fair one.
 //!
-//! Everything above the box is ordinary scrollback, so the conversation is
-//! still there after you quit and selection keeps working.
-//!
-//! When the terminal cannot do any of this, because output is piped or
-//! redirected, the box quietly becomes a plain prompt and a read of one line.
+//! Keys are read on the same loop that pumps the model's reply, so the next
+//! question can be typed while the current one is still being answered; a
+//! line entered mid-answer waits its turn rather than cutting in.
 
-use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
-};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal;
 use std::collections::VecDeque;
+use std::io::Write;
 use std::time::Duration;
 
+use crate::edit::Line;
 use crate::render;
 
 pub struct Command {
@@ -41,15 +41,11 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "/model",
-        blurb: "show the model and gateway in use",
+        blurb: "show or change the model",
     },
     Command {
         name: "/where",
         blurb: "show the project folder and session file",
-    },
-    Command {
-        name: "/mouse",
-        blurb: "hand the mouse back so you can select text",
     },
     Command {
         name: "/clear",
@@ -64,16 +60,16 @@ pub const COMMANDS: &[Command] = &[
 /// Commands the menu will show at once, so a long list cannot eat the window.
 const MENU_LIMIT: usize = 8;
 
+/// Rows the box will grow to before what is inside it starts to scroll.
+/// Enough for a paragraph, not so many that the conversation is squeezed out.
+const MAX_ROWS: usize = 8;
+
 /// How long a pump waits for a keystroke before handing the loop back. Short
 /// enough that typing feels immediate, long enough not to spin.
 const TICK: Duration = Duration::from_millis(20);
 
-/// Rows a turn of the wheel moves, and rows a page key moves.
-const WHEEL: isize = 3;
-const PAGE: isize = 10;
-
 fn matches(text: &str) -> Vec<&'static Command> {
-    if !text.starts_with('/') {
+    if !text.starts_with('/') || text.contains(char::is_whitespace) {
         return Vec::new();
     }
     COMMANDS
@@ -82,47 +78,11 @@ fn matches(text: &str) -> Vec<&'static Command> {
         .collect()
 }
 
-/// Put back the console's quick-edit flag, which is what dragging the mouse
-/// to select text uses on Windows.
-///
-/// Raw mode is a read-modify-write of the console's input mode, and Windows
-/// clears quick edit on any write that does not ask for it back by name. The
-/// terminal then has no selection and the program has no mouse reporting
-/// either, so the mouse does nothing at all -- which is how selecting a line
-/// of the conversation stopped working.
-#[cfg(windows)]
-fn allow_selection() {
-    use windows_sys::Win32::System::Console::{
-        GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_EXTENDED_FLAGS,
-        ENABLE_QUICK_EDIT_MODE, STD_INPUT_HANDLE,
-    };
-    unsafe {
-        let handle = GetStdHandle(STD_INPUT_HANDLE);
-        let mut mode = 0u32;
-        if GetConsoleMode(handle, &mut mode) != 0 {
-            SetConsoleMode(handle, mode | ENABLE_EXTENDED_FLAGS | ENABLE_QUICK_EDIT_MODE);
-        }
-    }
-}
-
-#[cfg(not(windows))]
-fn allow_selection() {}
-
 /// Whether more input is already waiting. The wait is long enough to cover
 /// the gap between two characters of a paste and far shorter than the gap
 /// between two keystrokes of a person typing.
 fn pending() -> bool {
     event::poll(Duration::from_millis(15)).unwrap_or(false)
-}
-
-/// The tail of `text` that fits. A long line keeps its end -- the part being
-/// typed -- in view, rather than its beginning.
-fn fit(text: &str, room: usize) -> String {
-    let count = text.chars().count();
-    if count <= room {
-        return text.to_owned();
-    }
-    text.chars().skip(count - room).collect()
 }
 
 /// A question with a fixed set of answers, asked in the box instead of the
@@ -136,20 +96,21 @@ struct Choice {
 }
 
 pub struct Bar {
-    text: String,
+    line: Line,
     picked: usize,
     footer: String,
     /// Lines entered but not yet answered, in the order they were typed.
     queued: VecDeque<String>,
-    /// False when the terminal cannot give us the bottom of the window, in
-    /// which case this is a plain prompt.
+    /// Rows the box is holding at the foot of the window.
+    height: u16,
+    /// Where the box was last painted, so a resize can wipe it from there
+    /// rather than leaving a copy stranded mid-conversation.
+    painted: Option<(u16, u16)>,
     live: bool,
     done: bool,
-    /// Set while a question is on the screen, and taken away by the answer.
     choice: Option<Choice>,
     answer: Option<usize>,
-    /// True while a turn is in flight, which is what makes Escape mean stop
-    /// rather than clear the line.
+    /// True while a turn is in flight, which is what makes escape mean stop.
     working: bool,
     interrupt: bool,
 }
@@ -157,10 +118,12 @@ pub struct Bar {
 impl Bar {
     pub fn new(footer: String) -> Self {
         Self {
-            text: String::new(),
+            line: Line::default(),
             picked: 0,
             footer,
             queued: VecDeque::new(),
+            height: 0,
+            painted: None,
             live: false,
             done: false,
             choice: None,
@@ -170,7 +133,7 @@ impl Bar {
         }
     }
 
-    /// Take over the window.
+    /// Take the last rows of the window.
     pub fn install(&mut self) {
         if !render::interactive() || terminal::enable_raw_mode().is_err() {
             return;
@@ -178,8 +141,15 @@ impl Bar {
         render::set_raw(true);
         allow_selection();
         self.live = true;
-        crate::screen::open();
-        self.settle();
+        // The real cursor stays where output lands; the one in the box is
+        // drawn, so a redraw cannot pull the conversation out of line.
+        print!("\x1b[?25l");
+        // Terminals that hand pasted text over in one piece are asked to.
+        print!("\x1b[?2004h");
+        self.height = self.wanted();
+        self.make_room(self.height);
+        self.frame();
+        self.draw();
     }
 
     /// Give the window back exactly as it was found.
@@ -187,10 +157,18 @@ impl Bar {
         if !self.live {
             return;
         }
-        crate::screen::close();
+        let (_, rows) = terminal::size().unwrap_or((80, 24));
+        let top = rows.saturating_sub(self.height) + 1;
+        print!("\x1b[r");
+        for row in top..=rows {
+            print!("\x1b[{row};1H\x1b[2K");
+        }
+        print!("\x1b[{top};1H\x1b[?2004l\x1b[?25h");
+        render::flush();
         let _ = terminal::disable_raw_mode();
         render::set_raw(false);
         self.live = false;
+        self.painted = None;
     }
 
     pub fn set_footer(&mut self, footer: String) {
@@ -219,9 +197,13 @@ impl Bar {
 
     /// Ask a question with a fixed set of answers. Returns the one picked, or
     /// `None` if the user left instead.
-    pub fn choose(&mut self, question: &str, detail: Vec<String>, options: &[&str]) -> Option<usize> {
+    pub fn choose(
+        &mut self,
+        question: &str,
+        detail: Vec<String>,
+        options: &[&str],
+    ) -> Option<usize> {
         if !self.live {
-            // Nothing to steer with, so fall back to typing the number.
             render::line(&render::bold(question));
             for (i, option) in options.iter().enumerate() {
                 render::line(&render::dim(&format!("  {}. {option}", i + 1)));
@@ -263,30 +245,26 @@ impl Bar {
         while event::poll(TICK).unwrap_or(false) {
             match event::read() {
                 Ok(Event::Key(key)) => self.key(key),
-                // A paste is one event, so a paragraph is one message. Line
-                // endings are normalised because a pasted CRLF would
-                // otherwise leave a carriage return in the middle of it.
+                // Terminals that hand pasted text over in one piece. Windows
+                // consoles do not, which the enter key handles instead.
                 Ok(Event::Paste(text)) => {
                     if self.choice.is_none() {
-                        self.text.push_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
+                        self.line.paste(&text);
                         self.picked = 0;
+                        self.settle();
                     }
                 }
-                Ok(Event::Mouse(mouse)) => match mouse.kind {
-                    MouseEventKind::ScrollUp => crate::screen::scroll(WHEEL),
-                    MouseEventKind::ScrollDown => crate::screen::scroll(-WHEEL),
-                    _ => continue,
-                },
-                // A resize is just a repaint now; there is no frame held in
-                // the terminal that could be left behind by one.
-                Ok(Event::Resize(_, _)) => self.settle(),
+                Ok(Event::Resize(_, _)) => {
+                    self.height = self.wanted();
+                    self.frame();
+                    self.draw();
+                }
                 _ => continue,
             }
-            self.settle();
         }
     }
 
-    /// Say whether a turn is running, so Escape knows what it means.
+    /// Say whether a turn is running, so escape knows what it means.
     pub fn working(&mut self, on: bool) {
         self.working = on;
         if !on {
@@ -313,83 +291,82 @@ impl Bar {
             self.pick(key);
             return;
         }
-        let options = matches(&self.text);
-        match (key.code, key.modifiers) {
-            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                // While an answer is running, Ctrl-C stops it and leaves --
-                // the turn does not have to finish first, which is the whole
-                // reason anyone reaches for it. Otherwise it clears what you
-                // were typing, and on an empty line it leaves. Nothing is
-                // thrown away without warning.
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let options = matches(self.line.text());
+        match key.code {
+            KeyCode::Char('c') if control => {
+                // While an answer is running this stops it and leaves; the
+                // turn does not have to finish first, which is the whole
+                // reason anyone reaches for it.
                 if self.working {
                     self.interrupt = true;
                     self.done = true;
-                } else if self.text.is_empty() {
+                } else if self.line.is_empty() {
                     self.done = true;
                 } else {
-                    self.text.clear();
+                    self.line.clear();
                     self.picked = 0;
                 }
             }
-            (KeyCode::Char('d'), KeyModifiers::CONTROL) if self.text.is_empty() => {
-                self.done = true;
-            }
-            // A paste is not always handed over as a paste. Only the unix
-            // side of crossterm parses bracketed paste; a Windows console
-            // delivers the text as ordinary keystrokes, so every newline in a
-            // pasted paragraph looks exactly like you pressing enter -- which
-            // is why a pasted block went a line at a time. The tell is that
-            // the keystrokes are already queued: nobody types the next
-            // character within a few milliseconds of pressing enter, so an
-            // enter with input waiting behind it is a newline, not a send.
-            (KeyCode::Enter, _) if pending() => self.text.push('\n'),
-            (KeyCode::Enter, _) => {
-                // A highlighted command wins; otherwise take the text as typed.
-                let mut line = std::mem::take(&mut self.text);
+            KeyCode::Char('d') if control && self.line.is_empty() => self.done = true,
+            // A newline on purpose, for writing a paragraph.
+            KeyCode::Enter if shift || alt => self.line.insert('\n'),
+            // A paste arriving as keystrokes: nobody types the next character
+            // within a few milliseconds of pressing enter.
+            KeyCode::Enter if pending() => self.line.insert('\n'),
+            KeyCode::Enter => {
                 if let Some(choice) = options.get(self.picked) {
-                    line = choice.name.to_owned();
+                    self.line.set(choice.name);
                 }
                 self.picked = 0;
+                let line = self.line.take();
                 let line = line.trim().to_owned();
                 if !line.is_empty() {
                     self.echo(&line);
                     self.queued.push_back(line);
                 }
             }
-            (KeyCode::Tab, _) => {
+            KeyCode::Tab => {
                 if let Some(choice) = options.get(self.picked) {
-                    self.text = choice.name.to_owned();
+                    self.line.set(choice.name);
                     self.picked = 0;
                 }
             }
-            (KeyCode::Up, _) if !options.is_empty() => {
-                self.picked = self.picked.checked_sub(1).unwrap_or(options.len() - 1);
+            KeyCode::Up if !options.is_empty() => {
+                self.picked = self.picked.checked_sub(1).unwrap_or(options.len() - 1)
             }
-            (KeyCode::Down, _) if !options.is_empty() => {
-                self.picked = (self.picked + 1) % options.len();
+            KeyCode::Down if !options.is_empty() => {
+                self.picked = (self.picked + 1) % options.len()
             }
-            // While an answer is coming, Escape stops waiting for it. There
-            // is nothing else it could usefully mean then, and a turn that
-            // has gone quiet needs a way out that is not killing the window.
-            (KeyCode::Esc, _) if self.working && self.text.is_empty() => {
-                self.interrupt = true;
-            }
-            (KeyCode::PageUp, _) => crate::screen::scroll(PAGE),
-            (KeyCode::PageDown, _) => crate::screen::scroll(-PAGE),
-            // Scrolling back is for reading; End puts you back with the
-            // conversation, which is where typing belongs.
-            (KeyCode::End, _) => crate::screen::follow(),
-            (KeyCode::Esc, _) if crate::screen::scrolled() > 0 => crate::screen::follow(),
-            (KeyCode::Esc, _) => {
-                self.text.clear();
+            KeyCode::Up => self.line.up(),
+            KeyCode::Down => self.line.down(),
+            KeyCode::Left if control => self.line.word_left(),
+            KeyCode::Right if control => self.line.word_right(),
+            KeyCode::Left => self.line.left(),
+            KeyCode::Right => self.line.right(),
+            KeyCode::Home => self.line.home(),
+            KeyCode::End => self.line.end(),
+            // Escape stops an answer when one is running, and is otherwise
+            // the quickest way to drop what you were typing.
+            KeyCode::Esc if self.working && self.line.is_empty() => self.interrupt = true,
+            KeyCode::Esc => {
+                self.line.clear();
                 self.picked = 0;
             }
-            (KeyCode::Backspace, _) => {
-                self.text.pop();
+            // Ctrl-Backspace reaches a good many terminals as Ctrl-H.
+            KeyCode::Backspace if control => self.line.backspace_word(),
+            KeyCode::Char('h') if control => self.line.backspace_word(),
+            KeyCode::Char('w') if control => self.line.backspace_word(),
+            KeyCode::Delete if control => self.line.delete_word(),
+            KeyCode::Backspace => {
+                self.line.backspace();
                 self.picked = 0;
             }
-            (KeyCode::Char(ch), _) => {
-                self.text.push(ch);
+            KeyCode::Delete => self.line.delete(),
+            KeyCode::Char(ch) if !control => {
+                self.line.insert(ch);
                 self.picked = 0;
             }
             _ => return,
@@ -398,7 +375,7 @@ impl Bar {
     }
 
     /// Steer a question. Enter takes what is highlighted, a digit takes that
-    /// one outright, and Escape is the same as picking the last answer, which
+    /// one outright, and escape is the same as picking the last answer, which
     /// is always the one that does nothing.
     fn pick(&mut self, key: KeyEvent) {
         let Some(choice) = self.choice.as_mut() else {
@@ -437,163 +414,246 @@ impl Bar {
         for part in parts {
             render::line(&render::bold(part));
         }
-        // Room for the answer to start in, and for the spinner to sit in
-        // while there is nothing to show yet.
         render::blank();
     }
 
-    /// Rebuild the box and hand it to the screen, which paints it under the
-    /// conversation. Nothing here touches the terminal directly, so there is
-    /// no frame that a resize could strand.
+    /// Rows the box wants, given what is in it.
+    fn wanted(&self) -> u16 {
+        let room = self.room();
+        let body = match &self.choice {
+            Some(choice) => {
+                let mut rows = render::fold(&choice.question, room).len();
+                rows += choice
+                    .detail
+                    .iter()
+                    .map(|d| render::fold(d, room).len())
+                    .sum::<usize>();
+                // The blank line before the answers, and the answers.
+                rows += 1 + choice.options.len();
+                rows
+            }
+            None => self.rows().len(),
+        };
+        let menu = match self.choice {
+            Some(_) => 0,
+            None => matches(self.line.text()).len().min(MENU_LIMIT),
+        };
+        // Two borders, the body, whatever the menu takes, and the footer.
+        (2 + body + menu + 1) as u16
+    }
+
+    /// Room inside the box for what is typed.
+    fn room(&self) -> usize {
+        render::width()
+            .saturating_sub(render::MARGIN.len() * 2 + 4)
+            .max(8)
+    }
+
+    /// The typed text, wrapped. Never more than `MAX_ROWS`: past that it
+    /// follows the cursor.
+    fn rows(&self) -> Vec<String> {
+        let room = self.room().saturating_sub(2).max(4);
+        let mut rows: Vec<String> = Vec::new();
+        for part in self.line.text().split('\n') {
+            rows.extend(render::fold(part, room));
+        }
+        if rows.is_empty() {
+            rows.push(String::new());
+        }
+        if rows.len() > MAX_ROWS {
+            let (row, _) = self.line.line_of_cursor();
+            let last = rows.len() - MAX_ROWS;
+            let first = row.saturating_sub(MAX_ROWS - 1).min(last);
+            rows = rows[first..first + MAX_ROWS].to_vec();
+        }
+        rows
+    }
+
+    /// Redraw, taking more or fewer rows first if what is in the box has
+    /// changed shape.
     fn settle(&mut self) {
         if !self.live {
             return;
         }
-        crate::screen::chrome(self.chrome());
-    }
-
-    /// What the box shows. A pasted block is stood for by a count rather
-    /// than unrolled into a line that could never show it: the text is still
-    /// all there, and goes in full when it is sent.
-    fn summary(&self) -> String {
-        let lines = self.text.lines().count();
-        if lines < 2 {
-            return self.text.clone();
+        let wanted = self.wanted();
+        if wanted != self.height {
+            if wanted > self.height {
+                self.make_room(wanted - self.height);
+            }
+            self.height = wanted;
+            self.frame();
         }
-        let tail = self.text.rsplit('\n').next().unwrap_or_default();
-        format!("[{lines} lines pasted]{}{tail}", if tail.is_empty() { "" } else { " " })
+        self.draw();
     }
 
-    /// The box, while it is holding a question rather than a line. The
-    /// answers are listed inside it and steered with the arrow keys, so
-    /// agreeing to something is one key and never the wrong letter.
-    fn asking(&self, choice: &Choice, edge: &str, room: usize) -> Vec<String> {
+    /// Scroll the conversation up by `rows`, so nothing already printed ends
+    /// up underneath the box.
+    fn make_room(&self, rows: u16) {
+        print!("\x1b[r");
+        for _ in 0..rows {
+            print!("{}", render::nl());
+        }
+        render::flush();
+    }
+
+    /// Shrink the scrolling region to everything above the box and leave the
+    /// cursor at the bottom of it, which is where output will land.
+    fn frame(&mut self) {
+        let (_, rows) = terminal::size().unwrap_or((80, 24));
+        let bottom = rows.saturating_sub(self.height).max(1);
+        print!("\x1b[r");
+        self.erase(rows);
+        print!("\x1b[1;{bottom}r");
+        for row in (bottom + 1)..=rows {
+            print!("\x1b[{row};1H\x1b[2K");
+        }
+        print!("\x1b[{bottom};1H");
+        render::flush();
+    }
+
+    /// Clear the rows the box was last painted on, wherever they are now.
+    fn erase(&mut self, rows: u16) {
+        if let Some((top, held)) = self.painted.take() {
+            for row in top..=(top + held).min(rows) {
+                print!("\x1b[{row};1H\x1b[2K");
+            }
+        }
+    }
+
+    fn draw(&mut self) {
+        if !self.live {
+            return;
+        }
+        let (_, rows) = terminal::size().unwrap_or((80, 24));
+        let room = self.room();
+        let edge = "─".repeat(room + 2);
+
         let mut lines = vec![format!(
             "{}{}",
             render::MARGIN,
             render::dim(&format!("╭{edge}╮"))
         )];
-        let row = |text: String, width: usize| {
-            format!(
-                "{}{} {text}{} {}",
-                render::MARGIN,
-                render::dim("│"),
-                " ".repeat(room.saturating_sub(width)),
-                render::dim("│")
-            )
-        };
-        // A question is broken over as many lines as it needs. Cutting it
-        // short with an ellipsis hides the half that says what you would be
-        // agreeing to.
-        for part in crate::screen::fold_into(&choice.question, room) {
-            let width = crate::screen::visible(&part);
-            lines.push(row(render::bold(&part), width));
-        }
-
-        for line in &choice.detail {
-            for part in crate::screen::fold_into(line, room) {
-                let width = crate::screen::visible(&part);
-                lines.push(row(render::dim(&part), width));
-            }
-        }
-
-        lines.push(row(String::new(), 0));
-        for (i, option) in choice.options.iter().enumerate() {
-            let chosen = i == choice.picked;
-            let head = format!("{} {} ", if chosen { "›" } else { " " }, i + 1);
-            // An answer that does not fit is wrapped under itself rather than
-            // cut, so a long one can still be read before it is taken.
-            for (line, part) in crate::screen::fold_into(option, room.saturating_sub(head.len()))
-                .into_iter()
-                .enumerate()
-            {
-                let text = if line == 0 {
-                    format!("{head}{part}")
-                } else {
-                    format!("{}{part}", " ".repeat(head.len()))
-                };
-                let width = crate::screen::visible(&text);
-                lines.push(row(
-                    if chosen {
-                        render::blue(&text)
-                    } else {
-                        render::dim(&text)
-                    },
-                    width,
-                ));
-            }
+        match &self.choice {
+            Some(choice) => self.asking(choice, room, &mut lines),
+            None => self.typing(room, &mut lines),
         }
         lines.push(format!(
             "{}{}",
             render::MARGIN,
             render::dim(&format!("╰{edge}╯"))
         ));
-        lines.push(format!(
-            "{}{}",
-            render::PAD,
-            render::dim("↑↓ to choose  ·  enter to take it  ·  esc to decline")
-        ));
-        lines
-    }
 
-    /// The box, the menu under it when one is open, and the footer.
-    fn chrome(&self) -> Vec<String> {
-        let (columns, _) = terminal::size().unwrap_or((80, 24));
-        // Full width, less the indent the conversation sits in and the box's
-        // own borders and padding.
-        let room = (columns as usize)
-            .saturating_sub(render::MARGIN.len() * 2 + 4)
-            .max(8);
-        // Two columns of that room belong to the arrow.
-        let typing = room.saturating_sub(2);
-        let shown = fit(&self.summary(), typing);
-
-        let edge = "─".repeat(room + 2);
-        if let Some(choice) = &self.choice {
-            return self.asking(choice, &edge, room);
+        if self.choice.is_none() {
+            for (i, option) in matches(self.line.text())
+                .iter()
+                .take(MENU_LIMIT)
+                .enumerate()
+            {
+                let marker = if i == self.picked { "›" } else { " " };
+                let name = if i == self.picked {
+                    render::blue(option.name)
+                } else {
+                    option.name.to_owned()
+                };
+                lines.push(format!(
+                    "{}{marker} {name}  {}",
+                    render::GUTTER,
+                    render::dim(option.blurb)
+                ));
+            }
         }
-        let mut lines = vec![
-            format!("{}{}", render::MARGIN, render::dim(&format!("╭{edge}╮"))),
-            format!(
-                "{}{} {} {}{}{} {}",
-                render::MARGIN,
-                render::dim("│"),
-                render::blue("›"),
-                shown,
-                // The caret is drawn rather than parked: the real cursor is
-                // hidden, because there is nowhere useful for it to sit.
-                render::caret(),
-                " ".repeat(typing.saturating_sub(shown.chars().count() + 1)),
-                render::dim("│")
-            ),
-            format!("{}{}", render::MARGIN, render::dim(&format!("╰{edge}╯"))),
-        ];
-
-        let options = matches(&self.text);
-        for (i, option) in options.iter().take(MENU_LIMIT).enumerate() {
-            let marker = if i == self.picked { "›" } else { " " };
-            let name = if i == self.picked {
-                render::blue(option.name)
-            } else {
-                option.name.to_owned()
-            };
-            lines.push(format!(
-                "{}{marker} {name}  {}",
-                render::GUTTER,
-                render::dim(option.blurb)
-            ));
-        }
-
-        // While you are reading back through the conversation, the footer
-        // says so and how to get back rather than repeating the model.
-        let back = crate::screen::scrolled();
-        let note = if back > 0 {
-            format!("scrolled back {back} lines  ·  End to follow again")
-        } else {
-            self.footer.clone()
+        let note = match &self.choice {
+            Some(_) => "↑↓ to choose  ·  enter to take it  ·  esc to decline".to_owned(),
+            None => self.footer.clone(),
         };
         lines.push(format!("{}{}", render::PAD, render::dim(&note)));
-        lines
+
+        let top = rows.saturating_sub(self.height) + 1;
+        let mut out = std::io::stdout().lock();
+        // Save and restore, so whatever was streaming into the conversation
+        // carries on from where it was. The region is repeated because some
+        // terminals forget it over a window restore, and a box that rights
+        // itself on the next keystroke beats one that stays wrong.
+        let _ = write!(out, "\x1b7\x1b[1;{}r", top.saturating_sub(1).max(1));
+        for (i, text) in lines.iter().enumerate() {
+            let _ = write!(out, "\x1b[{};1H\x1b[2K{text}", top + i as u16);
+        }
+        let _ = write!(out, "\x1b8");
+        let _ = out.flush();
+        self.painted = Some((top, self.height.saturating_sub(1)));
+    }
+
+    /// One row of the box, padded so its right edge lines up.
+    fn boxed(&self, text: &str, width: usize, room: usize) -> String {
+        format!(
+            "{}{} {text}{} {}",
+            render::MARGIN,
+            render::dim("│"),
+            " ".repeat(room.saturating_sub(width)),
+            render::dim("│")
+        )
+    }
+
+    /// The box while it holds a line being typed.
+    fn typing(&self, room: usize, lines: &mut Vec<String>) {
+        let rows = self.rows();
+        let (cursor_row, cursor_column) = self.line.line_of_cursor();
+        let on = cursor_row.min(rows.len() - 1);
+        for (i, text) in rows.iter().enumerate() {
+            let lead = if i == 0 {
+                format!("{} ", render::blue("›"))
+            } else {
+                "  ".to_owned()
+            };
+            // The caret is drawn rather than parked: the real cursor has to
+            // stay where output lands.
+            let (body, width) = if i == on {
+                let at = cursor_column.min(text.chars().count());
+                let before: String = text.chars().take(at).collect();
+                let under: String = text.chars().skip(at).take(1).collect();
+                let after: String = text.chars().skip(at + 1).collect();
+                let blank = under.is_empty();
+                let under = if blank { " ".to_owned() } else { under };
+                (
+                    format!("{before}{}{after}", render::caret_over(&under)),
+                    text.chars().count() + usize::from(blank),
+                )
+            } else {
+                (text.clone(), text.chars().count())
+            };
+            lines.push(self.boxed(&format!("{lead}{body}"), 2 + width, room));
+        }
+    }
+
+    /// The box while it holds a question. The answers are listed inside it
+    /// and steered with the arrow keys, so agreeing to something is one key
+    /// and never the wrong letter.
+    fn asking(&self, choice: &Choice, room: usize, lines: &mut Vec<String>) {
+        for part in render::fold(&choice.question, room) {
+            let width = render::visible(&part);
+            lines.push(self.boxed(&render::bold(&part), width, room));
+        }
+        for detail in &choice.detail {
+            for part in render::fold(detail, room) {
+                let width = render::visible(&part);
+                lines.push(self.boxed(&render::dim(&part), width, room));
+            }
+        }
+        lines.push(self.boxed("", 0, room));
+        for (i, option) in choice.options.iter().enumerate() {
+            let chosen = i == choice.picked;
+            let text = format!("{} {} {option}", if chosen { "›" } else { " " }, i + 1);
+            let width = render::visible(&text);
+            lines.push(self.boxed(
+                &if chosen {
+                    render::blue(&text)
+                } else {
+                    render::dim(&text)
+                },
+                width,
+                room,
+            ));
+        }
     }
 }
 
@@ -603,9 +663,32 @@ impl Drop for Bar {
     }
 }
 
+/// Put back the console's quick-edit flag, which is what dragging the mouse
+/// to select text uses on Windows.
+///
+/// Raw mode is a read-modify-write of the console's input mode, and Windows
+/// clears quick edit on any write that does not ask for it back by name.
+#[cfg(windows)]
+fn allow_selection() {
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_EXTENDED_FLAGS,
+        ENABLE_QUICK_EDIT_MODE, STD_INPUT_HANDLE,
+    };
+    unsafe {
+        let handle = GetStdHandle(STD_INPUT_HANDLE);
+        let mut mode = 0u32;
+        if GetConsoleMode(handle, &mut mode) != 0 {
+            SetConsoleMode(handle, mode | ENABLE_EXTENDED_FLAGS | ENABLE_QUICK_EDIT_MODE);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn allow_selection() {}
+
 #[cfg(test)]
 mod tests {
-    use super::{fit, matches, Bar};
+    use super::matches;
 
     #[test]
     fn the_menu_only_opens_for_a_slash() {
@@ -623,25 +706,7 @@ mod tests {
         assert_eq!(matches("/exit").len(), 1);
         // A command that does not exist offers nothing rather than guessing.
         assert!(matches("/nonsense").is_empty());
-    }
-
-    #[test]
-    fn a_long_line_keeps_the_end_in_view() {
-        assert_eq!(fit("hello", 10), "hello");
-        assert_eq!(fit("hello", 5), "hello");
-        // What was typed last is what you are looking at.
-        assert_eq!(fit("abcdefghij", 4), "ghij");
-        // Counted in characters, so the box does not split one in half.
-        assert_eq!(fit("héllo wörld", 5), "wörld");
-    }
-
-    #[test]
-    fn lines_typed_during_an_answer_wait_their_turn() {
-        let mut bar = Bar::new(String::new());
-        // Not live, so nothing is drawn; the queue is what matters here.
-        bar.queued.push_back("first".into());
-        bar.queued.push_back("second".into());
-        assert_eq!(bar.wait().as_deref(), Some("first"));
-        assert_eq!(bar.wait().as_deref(), Some("second"));
+        // Once it carries an argument it is no longer a name being typed.
+        assert!(matches("/model gpt").is_empty());
     }
 }

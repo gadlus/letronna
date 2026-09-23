@@ -24,14 +24,14 @@ pub fn nl() -> &'static str {
     }
 }
 
-/// The caret drawn inside the input box. The real cursor cannot sit there: it
-/// has to stay in the scrolling region so that output lands in the
-/// conversation rather than on top of the box.
-pub fn caret() -> String {
+/// The caret, drawn over whatever character it sits on. The real cursor
+/// cannot be parked there: it has to stay where output lands, or a redraw
+/// would pull the conversation out of line.
+pub fn caret_over(text: &str) -> String {
     if colour() {
-        "\x1b[7m \x1b[0m".to_owned()
+        format!("\x1b[7m{text}\x1b[0m", )
     } else {
-        "_".to_owned()
+        text.to_owned()
     }
 }
 
@@ -53,10 +53,6 @@ pub fn title(text: &str) {
 /// Start from a clean screen, so the shell's own banner is not the first
 /// thing in the transcript.
 pub fn clear() {
-    if crate::screen::held() {
-        crate::screen::wipe();
-        return;
-    }
     if colour() {
         print!("[2J[3J[H");
         flush();
@@ -172,16 +168,9 @@ pub fn said(mark: &str, text: &str) {
     out(&format!("{GUTTER}{mark} {text}"), true);
 }
 
-/// Everything printed goes through here: into the screen when it is holding
-/// the conversation, straight to the terminal when it is not.
+/// Everything printed goes through here, so raw mode's need for a carriage
+/// return with every newline is dealt with once.
 pub fn out(text: &str, newline: bool) {
-    if crate::screen::held() {
-        crate::screen::push(text);
-        if newline {
-            crate::screen::push("\n");
-        }
-        return;
-    }
     if newline {
         print!("{text}{}", nl());
     } else {
@@ -312,6 +301,190 @@ impl Stream {
     }
 }
 
+/// Break one line into rows that fit, keeping words whole where they will
+/// go whole. Escape sequences take no width and travel with the text they
+/// colour, so a run of colour still open at a break carries on to the next
+/// row rather than stopping there.
+pub fn fold(line: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+    // What the line is indented by, so the rest of it hangs under its own
+    // first word instead of falling back to the margin. Without this a poem
+    // or a block of code goes ragged at the left as soon as a line is too
+    // long for the window.
+    let indent = hanging(line).min(width / 2);
+    let carry = " ".repeat(indent);
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut filled = 0usize;
+
+    for (word, wide) in words(line) {
+        // A space at the head of a row is the one left behind by the break;
+        // dropping it keeps the text against the margin. The line's own
+        // leading spaces are not that, and are kept.
+        if word.trim().is_empty() && !rows.is_empty() && filled == indent {
+            continue;
+        }
+        if filled + wide <= width {
+            row.push_str(&word);
+            filled += wide;
+            continue;
+        }
+        if filled > indent {
+            // The space the break happened at would otherwise hang off the
+            // end of the row it was in.
+            let mut done = std::mem::take(&mut row);
+            while done.ends_with(' ') {
+                done.pop();
+            }
+            rows.push(done);
+            row.push_str(&carry);
+            filled = indent;
+            if word.trim().is_empty() {
+                continue;
+            }
+        }
+        // A word too long for any row is cut rather than left to overflow.
+        if wide > width {
+            for ch in word.chars() {
+                if ch == '\x1b' {
+                    row.push(ch);
+                    continue;
+                }
+                // Escapes already in the row do not count towards its width.
+                if filled == width {
+                    rows.push(std::mem::take(&mut row));
+                    row.push_str(&carry);
+                    filled = indent;
+                }
+                row.push(ch);
+                if !in_escape(&row) {
+                    filled += 1;
+                }
+            }
+            continue;
+        }
+        row.push_str(&word);
+        filled += wide;
+    }
+    rows.push(row);
+    rows
+}
+
+/// The column the rest of a line should hang from: whatever it is indented
+/// by, and past a marker where one opens it. The bullet on an answer, the
+/// arrow on a question and the dashes and numbers of a list all read as one
+/// column when what follows them lines up underneath.
+fn hanging(line: &str) -> usize {
+    let visible: Vec<char> = plain(line);
+    let mut at = 0;
+    while visible.get(at) == Some(&' ') {
+        at += 1;
+    }
+    let mark = match visible.get(at) {
+        Some('●') | Some('›') | Some('⏺') | Some('•') | Some('-') | Some('*') => 1,
+        Some(digit) if digit.is_ascii_digit() => {
+            let mut end = at;
+            while visible.get(end).is_some_and(|c| c.is_ascii_digit()) {
+                end += 1;
+            }
+            // "1." and "2)" open a list; a bare number is just a number.
+            match visible.get(end) {
+                Some('.') | Some(')') => end + 1 - at,
+                _ => 0,
+            }
+        }
+        _ => 0,
+    };
+    if mark > 0 && visible.get(at + mark) == Some(&' ') {
+        return at + mark + 1;
+    }
+    at
+}
+
+/// The characters of `text` that take up room, with the escapes dropped.
+fn plain(text: &str) -> Vec<char> {
+    let mut out = Vec::new();
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            for next in chars.by_ref() {
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Whether the tail of `text` is part of an escape sequence, so its
+/// characters are not counted as width.
+fn in_escape(text: &str) -> bool {
+    match text.rfind('\x1b') {
+        Some(at) => !text[at..].chars().skip(1).any(|c| c.is_ascii_alphabetic()),
+        None => false,
+    }
+}
+
+/// Split into words and the runs of spaces between them, each with the width
+/// it will take. Escape sequences ride along with whatever follows them.
+fn words(line: &str) -> Vec<(String, usize)> {
+    let mut out: Vec<(String, usize)> = Vec::new();
+    let mut current = String::new();
+    let mut wide = 0usize;
+    let mut space = false;
+    let mut chars = line.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            current.push(ch);
+            for next in chars.by_ref() {
+                current.push(next);
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        let is_space = ch == ' ';
+        if wide > 0 && is_space != space {
+            out.push((std::mem::take(&mut current), wide));
+            wide = 0;
+        }
+        space = is_space;
+        current.push(ch);
+        wide += 1;
+    }
+    if !current.is_empty() {
+        out.push((current, wide));
+    }
+    out
+}
+
+/// Break text into rows that fit, for anything that has to lay itself out
+/// before handing the result over.
+/// Width of text as printed, ignoring the escapes that colour it.
+pub fn visible(text: &str) -> usize {
+    let mut width = 0;
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            for next in chars.by_ref() {
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            width += 1;
+        }
+    }
+    width
+}
+
 /// A tool call: what ran and on what, then how it went on the line under it.
 /// Two lines rather than one because the second is where its output goes, and
 /// a result that hangs off the end of the first line is easy to miss.
@@ -339,5 +512,49 @@ pub fn detail(text: &str, max_lines: usize) {
             &format!("{PAD}  {}", dim(&format!("… {} more lines", total - max_lines))),
             true,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fold, visible};
+
+    #[test]
+    fn colour_takes_no_room() {
+        assert_eq!(visible("hello"), 5);
+        assert_eq!(visible("\x1b[1mhello\x1b[0m"), 5);
+    }
+
+    #[test]
+    fn lines_break_between_words() {
+        assert_eq!(fold("one two three", 7), vec!["one two", "three"]);
+        // Nothing to break on: the row is filled rather than left short.
+        assert_eq!(fold("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
+        assert_eq!(fold("short", 40), vec!["short"]);
+    }
+
+    #[test]
+    fn the_rest_of_a_line_hangs_under_its_first_word() {
+        // The bullet opens the line; what wraps sits under the words, not
+        // under the bullet.
+        assert_eq!(
+            fold("● one two three", 9),
+            vec!["● one two", "  three"]
+        );
+        // Indented text keeps its indent when it wraps.
+        assert_eq!(fold("    aaa bbb", 8), vec!["    aaa", "    bbb"]);
+        // A list marker hangs the same way.
+        assert_eq!(fold("- one two", 7), vec!["- one", "  two"]);
+        // A bare number is not a marker.
+        assert_eq!(fold("17 times 23", 8), vec!["17 times", "23"]);
+    }
+
+    #[test]
+    fn a_break_carries_the_colour_over() {
+        let rows = fold("\x1b[1mone two three", 7);
+        assert_eq!(rows.len(), 2);
+        // The escape stays with the first row and costs it no width.
+        assert!(rows[0].starts_with('\x1b'));
+        assert_eq!(visible(&rows[0]), 7);
     }
 }
