@@ -238,6 +238,52 @@ fn replay(path: &std::path::Path) -> Option<Conversation> {
     Some(conversation)
 }
 
+/// What a session looks like from the outside: enough to recognise it by,
+/// and nothing that was said in it.
+pub struct Summary {
+    pub id: u64,
+    pub title: String,
+    pub updated: u64,
+    pub messages: usize,
+    pub workspace: Option<PathBuf>,
+}
+
+/// The sessions on disk, newest first, without loading what is in them.
+///
+/// Only the head and meta records of each file are read, so this stays cheap
+/// with hundreds of sessions and -- more to the point -- a caller asking
+/// "which sessions are there" does not pull old conversations into a new one.
+pub fn summaries() -> Vec<Summary> {
+    let mut out: Vec<Summary> = session_ids()
+        .into_iter()
+        .filter_map(|id| {
+            let text = std::fs::read_to_string(session_path(id)).ok()?;
+            let mut summary = Summary {
+                id,
+                title: String::new(),
+                updated: 0,
+                messages: 0,
+                workspace: None,
+            };
+            for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                match serde_json::from_str::<Record>(line) {
+                    Ok(Record::Head { created, .. }) => summary.updated = created,
+                    Ok(Record::Meta(meta)) => {
+                        summary.title = meta.title;
+                        summary.updated = meta.updated;
+                        summary.workspace = meta.workspace;
+                    }
+                    Ok(Record::Message(_)) => summary.messages += 1,
+                    Err(_) => {}
+                }
+            }
+            Some(summary)
+        })
+        .collect();
+    out.sort_by_key(|s| std::cmp::Reverse(s.updated));
+    out
+}
+
 pub fn sessions_dir() -> PathBuf {
     backend::data_dir().join("sessions")
 }

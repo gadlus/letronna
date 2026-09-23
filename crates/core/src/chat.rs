@@ -44,6 +44,20 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
+/// How long ago, in the words a person would use. For listing sessions,
+/// where the exact second is never the point.
+pub fn ago(then: u64) -> String {
+    let seconds = now().saturating_sub(then);
+    match seconds {
+        0..=90 => "just now".to_owned(),
+        s if s < 3_600 => format!("{} minutes ago", s / 60),
+        s if s < 7_200 => "an hour ago".to_owned(),
+        s if s < 86_400 => format!("{} hours ago", s / 3_600),
+        s if s < 172_800 => "yesterday".to_owned(),
+        s => format!("{} days ago", s / 86_400),
+    }
+}
+
 pub fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -193,6 +207,7 @@ fn body(connection: &Connection, messages: &[Message]) -> Value {
     let mut system =
         String::from("You are Letronna, a personal assistant. Be clear, concise, and honest.");
     if connection.tools {
+        system.push_str(" You are Letronna, running in the user's terminal or desktop window; you are not any other assistant, and commands from other tools do not apply here. The user's earlier conversations are sessions: list_sessions shows them, and the user picks one up with the /resume command or `letronna --resume <id>`.");
         system.push_str(" You have tools to read, search, write and edit files and to run commands in the user's project; use them instead of guessing. Writes and commands are shown to the user for approval; a denial is final for that action. Ask with ask_user when a decision is the user's to make, such as a project name. After changing code, verify it (build, test, or run) before reporting done.");
         match &connection.workspace {
             Some(w) => system.push_str(&format!(" The project folder is `{}`.", w.display())),

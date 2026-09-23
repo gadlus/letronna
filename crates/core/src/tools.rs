@@ -78,6 +78,7 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(Wait),
         Arc::new(AskUser),
         Arc::new(Todo),
+        Arc::new(Sessions),
     ];
     if let Ok(extra) = plugin_tools().lock() {
         for tool in extra.iter() {
@@ -427,6 +428,69 @@ impl Tool for RunCommand {
             } else {
                 log.trim_end()
             }
+        ))
+    }
+}
+
+/// The user's own earlier conversations, by name and size only.
+///
+/// Asked "which sessions do I have", a model with only file tools either
+/// guesses -- and guesses some other agent's command, because that is what it
+/// has read most of -- or reads the session files, which pours an old
+/// conversation into the current one. This answers the question directly and
+/// carries nothing that was said.
+struct Sessions;
+impl Tool for Sessions {
+    fn name(&self) -> &'static str {
+        "list_sessions"
+    }
+    fn description(&self) -> &'static str {
+        "List the user's earlier Letronna sessions: id, title, when they were last used, how many messages, and which project folder. Use this when asked about past sessions or which one to pick up. It returns no conversation text. The user opens one with the /resume command, or `letronna --resume <id>`."
+    }
+    fn parameters(&self) -> Value {
+        json!({"type": "object", "properties": {
+            "limit": {"type": "integer", "description": "How many to list, newest first. Default 15."}
+        }})
+    }
+    fn run(&self, args: &Value, _: &ToolContext) -> Result<String, String> {
+        let limit = args["limit"].as_u64().unwrap_or(15).clamp(1, 60) as usize;
+        let all = crate::store::summaries();
+        let listed: Vec<String> = all
+            .iter()
+            // A session nobody said anything in is not worth offering.
+            .filter(|s| s.messages > 0)
+            .take(limit)
+            .map(|s| {
+                let title = match s.title.trim() {
+                    "" => "untitled",
+                    title => title,
+                };
+                let folder = s
+                    .workspace
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "no project".into());
+                format!(
+                    "{}  {}  ({} messages, {}, {})",
+                    s.id,
+                    title,
+                    s.messages,
+                    folder,
+                    crate::chat::ago(s.updated)
+                )
+            })
+            .collect();
+        if listed.is_empty() {
+            return Ok("No earlier sessions.".into());
+        }
+        Ok(format!(
+            "id  title  (messages, project, when)
+{}
+
+The user opens one with /resume, or `letronna --resume <id>`.",
+            listed.join("
+")
         ))
     }
 }
