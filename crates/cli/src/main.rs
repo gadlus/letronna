@@ -111,13 +111,13 @@ fn main() {
 
     let folder = folder_name(workspace.as_deref());
     title::idle();
-    // The window has to be ours before the banner, or the banner is written
-    // to the screen we are about to swap away from.
+    render::clear();
+    banner(&runner, &folder, session);
+    // The box takes the foot of the window last: clearing the screen would
+    // wipe it, and the banner is ordinary output that belongs above it.
     let note = footer(&runner);
     runner.bar.set_footer(note);
     runner.bar.install();
-    render::clear();
-    banner(&runner, &folder, session);
 
     loop {
         let Some(line) = runner.bar.wait() else {
@@ -201,6 +201,7 @@ fn command(
         "/clear" => {
             render::clear();
             banner(runner, &folder_name(workspace), *session);
+            runner.bar.redraw();
             Flow::Handled
         }
         "/new" => {
@@ -226,6 +227,10 @@ fn command(
             switch_model(runner, rest);
             Flow::Handled
         }
+        "/resume" => {
+            resume(runner, session, workspace);
+            Flow::Handled
+        }
         "/where" => {
             render::blank();
             render::line(&format!(
@@ -245,6 +250,75 @@ fn command(
         }
         _ => Flow::Unknown,
     }
+}
+
+/// Sessions offered at once. Older ones are still on disk and still open in
+/// the window; this is the shortlist you would actually pick from.
+const SESSION_CHOICES: usize = 9;
+
+/// Pick up a session from before. The same files the window uses, so a
+/// conversation started there can be carried on here.
+fn resume(runner: &mut Runner, session: &mut usize, workspace: Option<&std::path::Path>) {
+    // Newest first, skipping the one already open and any that never got a
+    // word said in them.
+    let mut recent: Vec<usize> = (0..runner.store.conversations.len())
+        .filter(|i| *i != *session && !runner.store.conversations[*i].messages.is_empty())
+        .collect();
+    recent.sort_by_key(|i| std::cmp::Reverse(runner.store.conversations[*i].updated));
+    recent.truncate(SESSION_CHOICES);
+
+    if recent.is_empty() {
+        render::blank();
+        render::line(&render::dim("No earlier sessions to pick up."));
+        return;
+    }
+
+    let labels: Vec<String> = recent
+        .iter()
+        .map(|i| {
+            let conversation = &runner.store.conversations[*i];
+            let title = match conversation.title.trim() {
+                "" => "untitled".to_owned(),
+                title => title.to_owned(),
+            };
+            let folder = conversation
+                .workspace
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "no project".into());
+            format!("{title}  ·  {folder}  ·  {} messages", conversation.messages.len())
+        })
+        .collect();
+
+    render::blank();
+    render::said(&render::blue("●"), &render::bold("Earlier sessions"));
+    let mut options: Vec<&str> = labels.iter().map(String::as_str).collect();
+    options.push("Stay where I am");
+    let Some(picked) = runner.bar.choose("Which one?", Vec::new(), &options) else {
+        return;
+    };
+    let Some(index) = recent.get(picked).copied() else {
+        render::line(&render::dim("Stayed put."));
+        return;
+    };
+
+    *session = index;
+    runner.store.active = index;
+    // A session carries its own project folder; one that never had a folder
+    // takes the one this window is standing in.
+    if runner.store.conversations[index].workspace.is_none() {
+        runner.store.conversations[index].workspace = workspace.map(|p| p.to_path_buf());
+    }
+    runner.persist();
+
+    let conversation = &runner.store.conversations[index];
+    let title = conversation.title.clone();
+    let count = conversation.messages.len();
+    render::said(&render::blue("›"), &render::bold(&title));
+    render::line(&render::dim(&format!(
+        "{count} messages. Ask something to carry on."
+    )));
 }
 
 /// Models offered at once. Some gateways carry hundreds; a list longer than

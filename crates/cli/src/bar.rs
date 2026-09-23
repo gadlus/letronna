@@ -44,6 +44,10 @@ pub const COMMANDS: &[Command] = &[
         blurb: "show or change the model",
     },
     Command {
+        name: "/resume",
+        blurb: "pick up a session from before",
+    },
+    Command {
         name: "/where",
         blurb: "show the project folder and session file",
     },
@@ -171,6 +175,18 @@ impl Bar {
         self.painted = None;
     }
 
+    /// Paint the box again, for whoever has just wiped the screen from
+    /// under it.
+    pub fn redraw(&mut self) {
+        if !self.live {
+            return;
+        }
+        self.painted = None;
+        self.make_room(self.height);
+        self.frame();
+        self.draw();
+    }
+
     pub fn set_footer(&mut self, footer: String) {
         self.footer = footer;
         self.settle();
@@ -242,7 +258,13 @@ impl Bar {
         if !self.live {
             return;
         }
+        // Where the line stood before this drain. A drain that swallows a
+        // burst of keys is how a paste looks on a console that has no paste
+        // event to send.
+        let mark = self.line.at();
+        let mut drained = 0usize;
         while event::poll(TICK).unwrap_or(false) {
+            drained += 1;
             match event::read() {
                 Ok(Event::Key(key)) => self.key(key),
                 // Terminals that hand pasted text over in one piece. Windows
@@ -261,6 +283,13 @@ impl Bar {
                 }
                 _ => continue,
             }
+        }
+        // Nobody types eight characters inside one poll. If that many arrived
+        // and they put several lines in the box, it was a paste, and it is
+        // stood behind a placeholder now that it is all here.
+        if drained > 8 && self.choice.is_none() {
+            self.line.fold_burst(mark);
+            self.settle();
         }
     }
 

@@ -79,6 +79,30 @@ impl Line {
         self.insert_str(&marker);
     }
 
+    /// Where the cursor is, for marking the start of something arriving.
+    pub fn at(&self) -> usize {
+        self.cursor
+    }
+
+    /// Take everything typed since `from` and stand a placeholder in its
+    /// place, if there is enough of it to be worth hiding.
+    ///
+    /// This is how a paste is caught on a Windows console, where pasted text
+    /// arrives as ordinary keystrokes and there is no paste event to listen
+    /// for: a burst that put several lines in was not typed by a person.
+    pub fn fold_burst(&mut self, from: usize) {
+        if from >= self.cursor {
+            return;
+        }
+        let chars = self.chars();
+        let burst: String = chars[from..self.cursor].iter().collect();
+        if burst.lines().count() < 2 {
+            return;
+        }
+        self.cut(from, self.cursor);
+        self.paste(&burst);
+    }
+
     /// The line as it should be sent: placeholders swapped back for what they
     /// stand for.
     pub fn expand(&self) -> String {
@@ -300,6 +324,35 @@ mod tests {
         assert_eq!(line.text(), "before [Pasted #1 +3 lines] after");
         // Whole when it goes.
         assert_eq!(line.expand(), "before one\ntwo\nthree after");
+    }
+
+    #[test]
+    fn a_burst_of_keystrokes_is_a_paste() {
+        // What a Windows console does with a paste: one character at a time.
+        let mut line = typed("note: ");
+        let mark = line.at();
+        for ch in "one
+two
+three".chars() {
+            line.insert(ch);
+        }
+        line.fold_burst(mark);
+        assert_eq!(line.text(), "note: [Pasted #1 +3 lines]");
+        assert_eq!(line.expand(), "note: one
+two
+three");
+    }
+
+    #[test]
+    fn a_burst_on_one_line_is_left_alone() {
+        // Typing quickly is not pasting.
+        let mut line = Line::default();
+        let mark = line.at();
+        for ch in "quick".chars() {
+            line.insert(ch);
+        }
+        line.fold_burst(mark);
+        assert_eq!(line.text(), "quick");
     }
 
     #[test]
