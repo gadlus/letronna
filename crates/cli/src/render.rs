@@ -35,9 +35,22 @@ pub fn clear() {
 pub fn colour() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::io::stdout().is_terminal()
-            && std::env::var_os("NO_COLOR").is_none()
-            && std::env::var("TERM").is_ok_and(|t| t != "dumb")
+        if !std::io::stdout().is_terminal() || std::env::var_os("NO_COLOR").is_some() {
+            return false;
+        }
+        // TERM is a Unix convention and cmd.exe does not set it, so asking for
+        // it on Windows turns everything off in the one shell most people start
+        // from. Ask the console itself instead: this also switches on virtual
+        // terminal processing, without which the escapes below would be printed
+        // literally.
+        #[cfg(windows)]
+        {
+            crossterm::ansi_support::supports_ansi()
+        }
+        #[cfg(not(windows))]
+        {
+            std::env::var("TERM").is_ok_and(|t| t != "dumb")
+        }
     })
 }
 
