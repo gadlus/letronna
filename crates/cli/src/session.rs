@@ -10,6 +10,8 @@ use letronna_core::store::{Conversation, Store};
 use letronna_core::tools;
 use std::collections::HashSet;
 
+use crate::bar::Bar;
+
 use crate::render::{self, Stream};
 
 /// Lines of a tool's output to show before clipping.
@@ -23,6 +25,9 @@ pub struct Runner {
     pub yes: bool,
     /// Read and search only; no writing, no running.
     pub plan: bool,
+    /// The box at the foot of the window, pumped while a reply streams so
+    /// that typing carries on through an answer.
+    pub bar: Bar,
 }
 
 impl Runner {
@@ -94,9 +99,17 @@ impl Runner {
         let mut opened = false;
         let mut waiting = Some(crate::spinner::Spinner::start());
         loop {
-            let event = receiver
-                .recv_blocking()
-                .map_err(|_| "The model connection closed unexpectedly.".to_owned())?;
+            // Keys first, then whatever the model has sent: the pump waits a
+            // few milliseconds for a keystroke, which is also what keeps this
+            // loop from spinning.
+            self.bar.pump();
+            let event = match receiver.try_recv() {
+                Ok(event) => event,
+                Err(async_channel::TryRecvError::Empty) => continue,
+                Err(async_channel::TryRecvError::Closed) => {
+                    return Err("The model connection closed unexpectedly.".to_owned())
+                }
+            };
             if let Event::Delta(text) = &event {
                 if !opened {
                     waiting.take();
@@ -181,8 +194,7 @@ impl Runner {
                     render::line(&render::dim(&format!("  {}. {option}", i + 1)));
                 }
             }
-            let reply = crate::input::read(&format!("{}  ", render::blue("›")))
-                .ok_or("No answer given.")?;
+            let reply = self.bar.wait().ok_or("No answer given.")?;
             turn.finish_call(Ok(reply));
             return Ok(true);
         }
@@ -198,7 +210,9 @@ impl Runner {
         ));
         render::detail(&tools::preview(&call.name, &call.arguments, &ctx), DETAIL_LINES);
         render::line(&render::dim("[y] once   [a] always   [n] no   [q] stop"));
-        let answer = crate::input::read(&format!("{}  ", render::blue("›")))
+        let answer = self
+            .bar
+            .wait()
             .unwrap_or_else(|| "n".into())
             .trim()
             .to_lowercase();

@@ -7,6 +7,34 @@
 
 use std::io::{IsTerminal, Write};
 
+/// Raw mode is on for as long as the input box holds the bottom of the
+/// window, and in raw mode a newline moves down without returning to the left
+/// margin. Everything that prints a line asks here for the right one.
+static RAW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_raw(on: bool) {
+    RAW.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn nl() -> &'static str {
+    if RAW.load(std::sync::atomic::Ordering::Relaxed) {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
+/// The caret drawn inside the input box. The real cursor cannot sit there: it
+/// has to stay in the scrolling region so that output lands in the
+/// conversation rather than on top of the box.
+pub fn caret() -> String {
+    if colour() {
+        "\x1b[7m \x1b[0m".to_owned()
+    } else {
+        "_".to_owned()
+    }
+}
+
 /// Whether stdin is a terminal, so the line editor can take over keystrokes.
 /// Piped input has to go through the plain reader instead.
 pub fn interactive() -> bool {
@@ -104,7 +132,8 @@ pub const FACE_WIDTH: usize = 28;
 
 
 pub fn line(text: &str) {
-    println!("{PAD}{text}");
+    print!("{PAD}{text}{}", nl());
+    flush();
 }
 
 /// Terminal width, or a sane guess when it cannot be asked.
@@ -113,7 +142,8 @@ pub fn width() -> usize {
 }
 
 pub fn blank() {
-    println!();
+    print!("{}", nl());
+    flush();
 }
 
 pub fn flush() {
@@ -173,9 +203,11 @@ impl Stream {
             }
             self.at_line_start = false;
         }
-        let _ = write!(out, "{ch}");
         if ch == '\n' {
+            let _ = write!(out, "{}", nl());
             self.at_line_start = true;
+        } else {
+            let _ = write!(out, "{ch}");
         }
     }
 
@@ -225,7 +257,7 @@ impl Stream {
         self.bold = false;
         self.code = false;
         if !self.at_line_start {
-            let _ = writeln!(out);
+            let _ = write!(out, "{}", nl());
             self.at_line_start = true;
         }
         let _ = out.flush();
@@ -245,7 +277,8 @@ pub fn tool(name: &str, argument: &str, outcome: &str, failed: bool) {
     } else {
         dim(outcome)
     };
-    println!("{head}{arg}  {tail}");
+    print!("{head}{arg}  {tail}{}", nl());
+    flush();
 }
 
 /// The indented body of a tool result, clipped so a big file does not bury
@@ -253,9 +286,14 @@ pub fn tool(name: &str, argument: &str, outcome: &str, failed: bool) {
 pub fn detail(text: &str, max_lines: usize) {
     let total = text.lines().count();
     for line in text.lines().take(max_lines) {
-        println!("{PAD}  {}", dim(line));
+        print!("{PAD}  {}{}", dim(line), nl());
     }
     if total > max_lines {
-        println!("{PAD}  {}", dim(&format!("… {} more lines", total - max_lines)));
+        print!(
+            "{PAD}  {}{}",
+            dim(&format!("… {} more lines", total - max_lines)),
+            nl()
+        );
     }
+    flush();
 }

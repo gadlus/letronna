@@ -4,8 +4,8 @@
 //! leaves. Sessions are the same files the window uses, so a conversation
 //! started here can be carried on there and the other way round.
 
+mod bar;
 mod input;
-mod prompt;
 mod render;
 mod session;
 mod spinner;
@@ -81,6 +81,7 @@ fn main() {
         allowed: Default::default(),
         yes: args.yes,
         plan: args.plan,
+        bar: bar::Bar::new(String::new()),
     };
     if runner.store.settings.model.is_empty() {
         render::line(&render::red(
@@ -109,9 +110,12 @@ fn main() {
     render::title(&format!("letronna — {folder}"));
     banner(&runner, &folder, session);
 
+    let note = footer(&runner);
+    runner.bar.set_footer(note);
+    runner.bar.install();
+
     loop {
-        render::blank();
-        let Some(line) = prompt::read(&format!("{} ", render::blue("›")), &footer(&runner)) else {
+        let Some(line) = runner.bar.wait() else {
             break;
         };
         let line = line.trim().to_owned();
@@ -135,7 +139,11 @@ fn main() {
             render::line(&render::red(&error));
         }
         runner.persist();
+        if runner.bar.finished() {
+            break;
+        }
     }
+    runner.bar.uninstall();
     render::title("");
     render::blank();
 }
@@ -156,7 +164,7 @@ fn command(
         "/exit" | "/quit" => Flow::Stop,
         "/help" => {
             render::blank();
-            for entry in prompt::COMMANDS {
+            for entry in bar::COMMANDS {
                 render::line(&format!(
                     "{}  {}",
                     render::bold(entry.name),
@@ -179,6 +187,8 @@ fn command(
         }
         "/plan" => {
             runner.plan = !runner.plan;
+            let note = footer(runner);
+            runner.bar.set_footer(note);
             render::blank();
             render::line(&render::dim(if runner.plan {
                 "Plan mode on: reads and searches, never writes or runs."
