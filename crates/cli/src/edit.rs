@@ -108,7 +108,10 @@ impl Line {
     pub fn expand(&self) -> String {
         let mut out = self.text.clone();
         for (i, paste) in self.pastes.iter().enumerate() {
-            out = out.replace(&format!("[Pasted #{} +{} lines]", i + 1, paste.lines), &paste.text);
+            out = out.replace(
+                &format!("[Pasted #{} +{} lines]", i + 1, paste.lines),
+                &paste.text,
+            );
         }
         out
     }
@@ -230,7 +233,12 @@ impl Line {
     pub fn line_of_cursor(&self) -> (usize, usize) {
         let before: String = self.chars()[..self.cursor].iter().collect();
         let row = before.matches('\n').count();
-        let column = before.rsplit('\n').next().unwrap_or_default().chars().count();
+        let column = before
+            .rsplit('\n')
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .count();
         (row, column)
     }
 
@@ -333,14 +341,19 @@ mod tests {
         let mark = line.at();
         for ch in "one
 two
-three".chars() {
+three"
+            .chars()
+        {
             line.insert(ch);
         }
         line.fold_burst(mark);
         assert_eq!(line.text(), "note: [Pasted #1 +3 lines]");
-        assert_eq!(line.expand(), "note: one
+        assert_eq!(
+            line.expand(),
+            "note: one
 two
-three");
+three"
+        );
     }
 
     #[test]

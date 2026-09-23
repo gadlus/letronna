@@ -489,8 +489,10 @@ impl Tool for Sessions {
 {}
 
 The user opens one with /resume, or `letronna --resume <id>`.",
-            listed.join("
-")
+            listed.join(
+                "
+"
+            )
         ))
     }
 }

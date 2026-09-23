@@ -320,7 +320,7 @@ fn unwrap_response(value: &Value) -> Result<&Value, String> {
             .or_else(|| value.get("message"))
             .and_then(Value::as_str)
             .unwrap_or("The provider could not finish this response.");
-        return Err(explain(&message));
+        return Err(explain(message));
     }
     Ok(if value.get("success") == Some(&Value::Bool(true)) {
         &value["data"]
@@ -865,8 +865,8 @@ mod tests {
             }
             for call in calls {
                 println!("tool {} {}", call.name, call.arguments);
-                let content = crate::tools::run(&call.name, &call.arguments, &ctx)
-                    .unwrap_or_else(|e| e);
+                let content =
+                    crate::tools::run(&call.name, &call.arguments, &ctx).unwrap_or_else(|e| e);
                 messages.push(Message {
                     role: "tool".into(),
                     content,
@@ -933,9 +933,8 @@ mod tests {
         let google = super::explain(
             "Expected the 'id' of a(n) 'assistant' 'tool_calls' array element to be populated.",
         );
-        let gemini = super::explain(
-            "Function call is missing a thought_signature in functionCall parts.",
-        );
+        let gemini =
+            super::explain("Function call is missing a thought_signature in functionCall parts.");
         assert!(google.contains("/model"));
         assert_eq!(google, gemini);
         // Anything else is passed through as the provider wrote it.

@@ -109,11 +109,7 @@ impl Runner {
     /// One model call, printed as it streams.
     /// One model call, printed as it streams. `None` when the user stopped
     /// waiting for it.
-    fn stream_once(
-        &mut self,
-        turn: &mut Turn,
-        session: usize,
-    ) -> Result<Option<Message>, String> {
+    fn stream_once(&mut self, turn: &mut Turn, session: usize) -> Result<Option<Message>, String> {
         let receiver = chat::start(
             turn.connection.clone(),
             self.store.conversations[session].messages.clone(),
@@ -139,7 +135,7 @@ impl Runner {
                 Ok(event) => event,
                 Err(async_channel::TryRecvError::Empty) => continue,
                 Err(async_channel::TryRecvError::Closed) => {
-                    return Err("The model connection closed unexpectedly.".to_owned())
+                    return Err("The model connection closed unexpectedly.".to_owned());
                 }
             };
             if let Event::Delta(text) = &event {
@@ -275,7 +271,10 @@ impl Runner {
         match crate::diff::of(&call.name, &call.arguments, &ctx) {
             Some(rows) => {
                 render::blank();
-                render::said(&render::blue("●"), &render::bold(&format!("{} {summary}", verb(&call.name))));
+                render::said(
+                    &render::blue("●"),
+                    &render::bold(&format!("{} {summary}", verb(&call.name))),
+                );
                 for row in rows {
                     render::out(&row, true);
                 }
@@ -319,8 +318,6 @@ impl Runner {
             }
         }
     }
-
-
 
     pub fn persist(&mut self) {
         if self.store.save().is_err() {

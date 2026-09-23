@@ -12,8 +12,8 @@
 
 use crate::chat::{self as backend, Message};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use std::io::Write;
+use std::path::PathBuf;
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct Conversation {

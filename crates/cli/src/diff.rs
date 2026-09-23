@@ -161,7 +161,10 @@ fn paint(rows: &[Row]) -> Vec<String> {
             let body = clip(&format!("{mark} {text}"), width);
             match colour {
                 Some((back, front)) if render::colour() => {
-                    format!("{}\x1b[48;5;{back}m\x1b[38;5;{front}m{body}\x1b[0m", render::PAD)
+                    format!(
+                        "{}\x1b[48;5;{back}m\x1b[38;5;{front}m{body}\x1b[0m",
+                        render::PAD
+                    )
                 }
                 _ => format!("{}{}", render::PAD, render::dim(&body)),
             }
@@ -194,7 +197,7 @@ fn clip(text: &str, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{compare, fold, Row};
+    use super::{Row, compare, fold};
 
     fn rows(text: &[&str]) -> Vec<String> {
         text.iter().map(|t| (*t).to_owned()).collect()
@@ -234,9 +237,10 @@ mod tests {
         // much was left out.
         assert!(folded.len() < 8);
         assert!(folded.iter().any(|r| *r == Row::New("here".into())));
-        assert!(folded
-            .iter()
-            .any(|r| matches!(r, Row::Same(text) if text.contains("unchanged"))));
+        assert!(
+            folded
+                .iter()
+                .any(|r| matches!(r, Row::Same(text) if text.contains("unchanged")))
+        );
     }
 }
-

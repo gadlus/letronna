@@ -1,7 +1,7 @@
 //! The Skills page: saved prompts, loaded into the composer on demand.
 
-use letronna_core::skills::{self, Skill};
 use crate::prelude::*;
+use letronna_core::skills::{self, Skill};
 
 impl Chat {
     fn save_skills(&mut self, cx: &mut Context<Self>) {

@@ -177,10 +177,9 @@ pub fn select_from(column: u16, row: u16) {
 /// Drag it to somewhere else.
 pub fn select_to(column: u16, row: u16) {
     if let Ok(mut s) = screen().lock() {
-        if s.from.is_some() {
-            if let Some(at) = s.buffer_at(column, row) {
-                s.to = Some(at);
-            }
+        // Nothing to drag to without an anchor; the press sets that.
+        if let Some(at) = s.buffer_at(column, row).filter(|_| s.from.is_some()) {
+            s.to = Some(at);
         }
     }
     now();
@@ -345,7 +344,10 @@ fn paint(s: &mut Screen) {
     s.scroll = s.scroll.min(view.len().saturating_sub(depth));
     let first = view.len().saturating_sub(depth + s.scroll);
 
-    let marked = s.from.zip(s.to).map(|(a, b)| if a <= b { (a, b) } else { (b, a) });
+    let marked = s
+        .from
+        .zip(s.to)
+        .map(|(a, b)| if a <= b { (a, b) } else { (b, a) });
 
     let mut frame = String::from("\x1b[?25l");
     for row in 0..depth {
@@ -361,10 +363,8 @@ fn paint(s: &mut Screen) {
         };
         frame.push_str(&format!("\x1b[{};1H\x1b[2K{text}\x1b[0m", row + 1));
     }
-    let mut at = depth + 1;
-    for line in &s.chrome {
+    for (at, line) in (depth + 1..).zip(s.chrome.iter()) {
         frame.push_str(&format!("\x1b[{at};1H\x1b[2K{line}\x1b[0m"));
-        at += 1;
     }
     print!("{frame}");
     let _ = std::io::stdout().flush();

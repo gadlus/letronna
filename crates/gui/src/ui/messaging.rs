@@ -1,7 +1,7 @@
 //! The Messaging page: a channel list beside the setup for the selected one.
 
-use letronna_core::messaging;
 use crate::prelude::*;
+use letronna_core::messaging;
 
 struct Channel {
     name: &'static str,

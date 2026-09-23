@@ -1,5 +1,5 @@
-use letronna_core::agent;
 use crate::prelude::*;
+use letronna_core::agent;
 
 pub(crate) const BRAND: &str = "Letronna";
 

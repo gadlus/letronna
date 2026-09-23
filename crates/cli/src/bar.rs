@@ -411,9 +411,7 @@ impl Bar {
             KeyCode::Up if !options.is_empty() => {
                 self.picked = self.picked.checked_sub(1).unwrap_or(options.len() - 1)
             }
-            KeyCode::Down if !options.is_empty() => {
-                self.picked = (self.picked + 1) % options.len()
-            }
+            KeyCode::Down if !options.is_empty() => self.picked = (self.picked + 1) % options.len(),
             KeyCode::Up => self.line.up(),
             KeyCode::Down => self.line.down(),
             KeyCode::Left if control => self.line.word_left(),
@@ -522,10 +520,10 @@ impl Bar {
             KeyCode::Esc => self.answer = Some(last),
             KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => self.done = true,
             KeyCode::Char(digit) if digit.is_ascii_digit() => {
-                if let Some(index) = digit.to_digit(10).and_then(|d| (d as usize).checked_sub(1)) {
-                    if index < choice.options.len() {
-                        self.answer = Some(index);
-                    }
+                if let Some(index) = digit.to_digit(10).and_then(|d| (d as usize).checked_sub(1))
+                    && index < choice.options.len()
+                {
+                    self.answer = Some(index);
                 }
             }
             _ => {}

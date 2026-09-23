@@ -5,8 +5,8 @@
 //! Idle it is just the name; working, a mark turns in front of it, which is
 //! enough to catch the eye from across a taskbar without being a notification.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::render;

@@ -106,7 +106,7 @@ impl Waiting {
 
 #[cfg(test)]
 mod tests {
-    use super::{spell, Waiting, LONG, TOO_LONG};
+    use super::{LONG, TOO_LONG, Waiting, spell};
 
     #[test]
     fn the_wait_is_spelled_the_way_people_say_it() {
@@ -119,7 +119,7 @@ mod tests {
 
     #[test]
     fn it_speaks_up_before_it_shouts() {
-        assert!(LONG < TOO_LONG);
+        const { assert!(LONG < TOO_LONG) };
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! The Scheduled jobs page: prompts that run on a timer.
 
-use letronna_core::schedule::{self, Schedule, Trigger};
 use crate::prelude::*;
+use letronna_core::schedule::{self, Schedule, Trigger};
 
 /// The intervals offered for "every so often". A free-form number would need
 /// validation and buys little; these are the ones people actually pick.

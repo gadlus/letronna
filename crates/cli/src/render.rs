@@ -29,7 +29,7 @@ pub fn nl() -> &'static str {
 /// would pull the conversation out of line.
 pub fn caret_over(text: &str) -> String {
     if colour() {
-        format!("\x1b[7m{text}\x1b[0m", )
+        format!("\x1b[7m{text}\x1b[0m",)
     } else {
         text.to_owned()
     }
@@ -160,7 +160,6 @@ pub const FACE_WIDTH: usize = 28;
 /// all; this is wide enough that the two are clearly separate things.
 pub const FACE_GAP: usize = 6;
 
-
 pub fn line(text: &str) {
     out(&format!("{PAD}{text}"), true);
 }
@@ -192,7 +191,9 @@ pub fn out(text: &str, newline: bool) {
 
 /// Terminal width, or a sane guess when it cannot be asked.
 pub fn width() -> usize {
-    crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80)
+    crossterm::terminal::size()
+        .map(|(w, _)| w as usize)
+        .unwrap_or(80)
 }
 
 pub fn blank() {
@@ -560,7 +561,10 @@ pub fn detail(text: &str, max_lines: usize) {
     }
     if total > max_lines {
         out(
-            &format!("{PAD}  {}", dim(&format!("… {} more lines", total - max_lines))),
+            &format!(
+                "{PAD}  {}",
+                dim(&format!("… {} more lines", total - max_lines))
+            ),
             true,
         );
     }
@@ -588,10 +592,7 @@ mod tests {
     fn the_rest_of_a_line_hangs_under_its_first_word() {
         // The bullet opens the line; what wraps sits under the words, not
         // under the bullet.
-        assert_eq!(
-            fold("● one two three", 9),
-            vec!["● one two", "  three"]
-        );
+        assert_eq!(fold("● one two three", 9), vec!["● one two", "  three"]);
         // Indented text keeps its indent when it wraps.
         assert_eq!(fold("    aaa bbb", 8), vec!["    aaa", "    bbb"]);
         // A list marker hangs the same way.
@@ -609,4 +610,3 @@ mod tests {
         assert_eq!(visible(&rows[0]), 7);
     }
 }
-
