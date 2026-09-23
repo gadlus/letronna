@@ -271,6 +271,7 @@ impl Bar {
         // event to send.
         let mark = self.line.at();
         let mut drained = 0usize;
+        let mut resized = false;
         while event::poll(TICK).unwrap_or(false) {
             drained += 1;
             match event::read() {
@@ -284,13 +285,15 @@ impl Bar {
                         self.settle();
                     }
                 }
-                Ok(Event::Resize(_, _)) => {
-                    self.height = self.wanted();
-                    self.frame();
-                    self.draw();
-                }
+                // Dragging a window edge sends a burst of these, and
+                // restoring one sends several at once. Note it and deal with
+                // the last shape rather than every shape on the way there.
+                Ok(Event::Resize(_, _)) => resized = true,
                 _ => continue,
             }
+        }
+        if resized {
+            self.reframe();
         }
         // Nobody types eight characters inside one poll. If that many arrived
         // and they put several lines in the box, it was a paste, and it is
@@ -303,7 +306,7 @@ impl Bar {
         // milliseconds whether or not anything was typed.
         if self.waiting.is_some() && self.ticked.elapsed() >= Duration::from_millis(90) {
             self.ticked = std::time::Instant::now();
-            self.draw();
+            self.tick();
         }
     }
 
@@ -519,6 +522,32 @@ impl Bar {
         rows
     }
 
+    /// Settle the box into a window that has changed size.
+    ///
+    /// The conversation belongs to the terminal, which reflows it for the new
+    /// width on its own; what it does not know is that the last few rows are
+    /// spoken for. If the conversation now ends inside them it is scrolled up
+    /// by exactly the overlap -- no more, because a restore is a resize too,
+    /// and scrolling on every one of those is what left a trail of gaps
+    /// behind a window being maximised and put back.
+    fn reframe(&mut self) {
+        let (_, rows) = terminal::size().unwrap_or((80, 24));
+        self.height = self.wanted();
+        let bottom = rows.saturating_sub(self.height).max(1);
+        // The region has to be off to see where the conversation really ends.
+        print!("[r");
+        render::flush();
+        if let Ok((_, row)) = crossterm::cursor::position() {
+            let ends_at = row + 1;
+            if ends_at > bottom {
+                self.make_room(ends_at - bottom);
+            }
+        }
+        self.painted = None;
+        self.frame();
+        self.draw();
+    }
+
     /// Redraw, taking more or fewer rows first if what is in the box has
     /// changed shape.
     fn settle(&mut self) {
@@ -624,16 +653,32 @@ impl Bar {
         let top = rows.saturating_sub(self.height) + 1;
         let mut out = std::io::stdout().lock();
         // Save and restore, so whatever was streaming into the conversation
-        // carries on from where it was. The region is repeated because some
-        // terminals forget it over a window restore, and a box that rights
-        // itself on the next keystroke beats one that stays wrong.
-        let _ = write!(out, "\x1b7\x1b[1;{}r", top.saturating_sub(1).max(1));
+        // carries on from where it was. The scrolling region is set by frame
+        // and left alone here: repeating it on every paint homes the cursor
+        // and buys a flicker for nothing.
+        let _ = write!(out, "\x1b7");
         for (i, text) in lines.iter().enumerate() {
             let _ = write!(out, "\x1b[{};1H\x1b[2K{text}", top + i as u16);
         }
         let _ = write!(out, "\x1b8");
         let _ = out.flush();
         self.painted = Some((top, self.height.saturating_sub(1)));
+    }
+
+    /// Move the waiting line on, and nothing else.
+    ///
+    /// Painting the whole box eleven times a second is what made it
+    /// flicker: every row cleared and written again to move one
+    /// character. Only the last row changes, so only the last row is
+    /// touched.
+    fn tick(&mut self) {
+        let Some(waiting) = &self.waiting else {
+            return;
+        };
+        let (_, rows) = terminal::size().unwrap_or((80, 24));
+        let mut out = std::io::stdout().lock();
+        let _ = write!(out, "\x1b7\x1b[{rows};1H\x1b[2K{}\x1b8", waiting.line());
+        let _ = out.flush();
     }
 
     /// One row of the box, padded so its right edge lines up.
