@@ -122,7 +122,7 @@ impl Runner {
         // its bullet here.
         let mut out = Stream::opening_with(render::bullet());
         let mut opened = false;
-        let mut waiting = Some(crate::spinner::Spinner::start());
+        self.bar.wait_line(true);
         loop {
             // Keys first, then whatever the model has sent: the pump waits a
             // few milliseconds for a keystroke, which is also what keeps this
@@ -131,7 +131,7 @@ impl Runner {
             if self.bar.interrupted() {
                 // Dropping the receiver is enough: the worker finishes into a
                 // channel nobody is listening to and goes away.
-                waiting.take();
+                self.bar.wait_line(false);
                 out.end();
                 return Ok(None);
             }
@@ -144,17 +144,16 @@ impl Runner {
             };
             if let Event::Delta(text) = &event {
                 if !opened {
-                    // The spinner was holding this line; the answer takes it
-                    // over. The gap above it was left when the question was
-                    // echoed, so nothing more is needed here.
-                    waiting.take();
+                    // Nothing more is needed above the answer: the gap was
+                    // left when the question was echoed.
+                    self.bar.wait_line(false);
                     opened = true;
                 }
                 out.push(text);
             }
             turn.absorb(&event);
             if let Event::Finished(result) = event {
-                waiting.take();
+                self.bar.wait_line(false);
                 out.end();
                 result?;
                 break;

@@ -1,18 +1,20 @@
 //! The "something is happening" line, shown while waiting on the model.
 //!
-//! A request can sit silent for several seconds before the first token, and
-//! an unexplained pause reads as a hang. This redraws one line in place until
-//! the first word of the reply arrives, then wipes it so the answer starts on
-//! a clean line and the scrollback keeps no trace of it.
+//! A request can sit silent for a long time before the first token, and an
+//! unexplained pause reads as a hang. This is only what the line should say;
+//! the box draws it, on the same thread as everything else it draws. It used
+//! to spin on a thread of its own, which meant two threads writing escape
+//! sequences to one terminal, and a keystroke landing between the two halves
+//! of a redraw left the window in pieces.
 
-use std::io::Write;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crate::render;
 
 const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// How long one frame is held.
+const FRAME_MS: u128 = 90;
 
 /// Words for the wait. Deliberately about thinking rather than about doing:
 /// the agent may be about to read a file or about to answer, and this line
@@ -59,79 +61,52 @@ fn mood(word: &'static str, seconds: u64) -> (String, fn(&str) -> String) {
     }
 }
 
-pub struct Spinner {
-    stop: Arc<AtomicBool>,
-    handle: Option<std::thread::JoinHandle<()>>,
+/// One wait, from the moment the question went.
+pub struct Waiting {
+    began: Instant,
+    word: &'static str,
 }
 
-impl Spinner {
-    /// Start spinning. Does nothing when output is not a terminal, so piped
-    /// output stays clean.
-    pub fn start() -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
-        if !render::colour() {
-            return Self { stop, handle: None };
-        }
-        let flag = stop.clone();
-        let word = WORDS[(Instant::now().elapsed().subsec_nanos() as usize
-            + std::process::id() as usize)
-            % WORDS.len()];
-        let handle = std::thread::spawn(move || {
-            let began = Instant::now();
-            let mut frame = 0usize;
-            while !flag.load(Ordering::Relaxed) {
-                let seconds = began.elapsed().as_secs();
-                let elapsed = if seconds > 0 {
-                    format!(" {}", spell(seconds))
-                } else {
-                    String::new()
-                };
-                let (say, paint) = mood(word, seconds);
-                // A line of its own under the conversation rather than a line
-                // in it: nothing was said yet, and when it is, the answer
-                // should not have to scroll past the waiting.
-                let mut out = std::io::stdout().lock();
-                let _ = write!(
-                    out,
-                    "\r\x1b[2K{}{} {}{}",
-                    render::INSIDE,
-                    paint(FRAMES[frame % FRAMES.len()]),
-                    paint(&say),
-                    render::dim(&elapsed)
-                );
-                let _ = out.flush();
-                frame += 1;
-                std::thread::sleep(std::time::Duration::from_millis(90));
-            }
-            // Leave the line as it was found: the answer takes it over.
-            let mut out = std::io::stdout().lock();
-            let _ = write!(out, "\r\x1b[2K", );
-            let _ = out.flush();
-        });
+impl Default for Waiting {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Waiting {
+    pub fn new() -> Self {
         Self {
-            stop,
-            handle: Some(handle),
+            began: Instant::now(),
+            // Whichever word the clock lands on; they all mean the same
+            // thing, and the same one every time reads as a frozen screen.
+            word: WORDS[Instant::now().elapsed().subsec_nanos() as usize % WORDS.len()],
         }
     }
 
-    /// Stop and clear. Safe to call more than once.
-    pub fn stop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-impl Drop for Spinner {
-    fn drop(&mut self) {
-        self.stop();
+    /// The line as it should look now.
+    pub fn line(&self) -> String {
+        let elapsed = self.began.elapsed();
+        let seconds = elapsed.as_secs();
+        let frame = FRAMES[(elapsed.as_millis() / FRAME_MS) as usize % FRAMES.len()];
+        let (say, paint) = mood(self.word, seconds);
+        let since = if seconds > 0 {
+            format!(" {}", spell(seconds))
+        } else {
+            String::new()
+        };
+        format!(
+            "{}{} {}{}",
+            render::INSIDE,
+            paint(frame),
+            paint(&say),
+            render::dim(&since)
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{spell, LONG, TOO_LONG};
+    use super::{spell, Waiting, LONG, TOO_LONG};
 
     #[test]
     fn the_wait_is_spelled_the_way_people_say_it() {
@@ -145,5 +120,10 @@ mod tests {
     #[test]
     fn it_speaks_up_before_it_shouts() {
         assert!(LONG < TOO_LONG);
+    }
+
+    #[test]
+    fn the_line_says_something_from_the_first_moment() {
+        assert!(!Waiting::new().line().trim().is_empty());
     }
 }

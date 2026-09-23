@@ -117,6 +117,12 @@ pub struct Bar {
     /// True while a turn is in flight, which is what makes escape mean stop.
     working: bool,
     interrupt: bool,
+    /// The waiting line, while nothing has come back yet. Drawn here rather
+    /// than by a thread of its own, so there is only ever one writer to the
+    /// terminal and a keystroke cannot land in the middle of a redraw.
+    waiting: Option<crate::spinner::Waiting>,
+    /// When the waiting line was last moved on.
+    ticked: std::time::Instant,
 }
 
 impl Bar {
@@ -134,6 +140,8 @@ impl Bar {
             answer: None,
             working: false,
             interrupt: false,
+            waiting: None,
+            ticked: std::time::Instant::now(),
         }
     }
 
@@ -291,6 +299,18 @@ impl Bar {
             self.line.fold_burst(mark);
             self.settle();
         }
+        // The waiting line turns on this loop, which runs every twenty
+        // milliseconds whether or not anything was typed.
+        if self.waiting.is_some() && self.ticked.elapsed() >= Duration::from_millis(90) {
+            self.ticked = std::time::Instant::now();
+            self.draw();
+        }
+    }
+
+    /// Show or take away the waiting line.
+    pub fn wait_line(&mut self, on: bool) {
+        self.waiting = on.then(crate::spinner::Waiting::new);
+        self.settle();
     }
 
     /// Say whether a turn is running, so escape knows what it means.
@@ -467,8 +487,9 @@ impl Bar {
             Some(_) => 0,
             None => matches(self.line.text()).len().min(MENU_LIMIT),
         };
-        // Two borders, the body, whatever the menu takes, and the footer.
-        (2 + body + menu + 1) as u16
+        // Two borders, the body, whatever the menu takes, the footer, and
+        // the waiting line when there is one.
+        (2 + body + menu + 1 + usize::from(self.waiting.is_some())) as u16
     }
 
     /// Room inside the box for what is typed.
@@ -596,6 +617,9 @@ impl Bar {
             None => self.footer.clone(),
         };
         lines.push(format!("{}{}", render::PAD, render::dim(&note)));
+        if let Some(waiting) = &self.waiting {
+            lines.push(waiting.line());
+        }
 
         let top = rows.saturating_sub(self.height) + 1;
         let mut out = std::io::stdout().lock();
