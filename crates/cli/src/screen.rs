@@ -210,16 +210,9 @@ fn paint(s: &mut Screen) {
     s.scroll = s.scroll.min(total.saturating_sub(view));
     let start = total.saturating_sub(view + s.scroll);
 
-    // A short conversation hangs from the box rather than floating at the top
-    // of the window with a field of nothing under it.
-    let offset = view.saturating_sub(total);
-
     let mut frame = String::from("\x1b[?25l");
-    for row in 0..offset {
-        frame.push_str(&format!("\x1b[{};1H\x1b[2K", row + 1));
-    }
-    for row in offset..view {
-        let index = start + row - offset;
+    for row in 0..view {
+        let index = start + row;
         let text = if index < s.rows.len() {
             s.rows.get(index).map(String::as_str).unwrap_or("")
         } else {
@@ -249,14 +242,21 @@ fn wrap(line: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![String::new()];
     }
+    // What the line is indented by, so the rest of it hangs under its own
+    // first word instead of falling back to the margin. Without this a poem
+    // or a block of code goes ragged at the left as soon as a line is too
+    // long for the window.
+    let indent = hanging(line).min(width / 2);
+    let carry = " ".repeat(indent);
     let mut rows = Vec::new();
     let mut row = String::new();
     let mut filled = 0usize;
 
     for (word, wide) in words(line) {
         // A space at the head of a row is the one left behind by the break;
-        // dropping it keeps the text against the margin.
-        if word.trim().is_empty() && filled == 0 {
+        // dropping it keeps the text against the margin. The line's own
+        // leading spaces are not that, and are kept.
+        if word.trim().is_empty() && !rows.is_empty() && filled == indent {
             continue;
         }
         if filled + wide <= width {
@@ -264,9 +264,16 @@ fn wrap(line: &str, width: usize) -> Vec<String> {
             filled += wide;
             continue;
         }
-        if filled > 0 {
-            rows.push(std::mem::take(&mut row));
-            filled = 0;
+        if filled > indent {
+            // The space the break happened at would otherwise hang off the
+            // end of the row it was in.
+            let mut done = std::mem::take(&mut row);
+            while done.ends_with(' ') {
+                done.pop();
+            }
+            rows.push(done);
+            row.push_str(&carry);
+            filled = indent;
             if word.trim().is_empty() {
                 continue;
             }
@@ -281,7 +288,8 @@ fn wrap(line: &str, width: usize) -> Vec<String> {
                 // Escapes already in the row do not count towards its width.
                 if filled == width {
                     rows.push(std::mem::take(&mut row));
-                    filled = 0;
+                    row.push_str(&carry);
+                    filled = indent;
                 }
                 row.push(ch);
                 if !in_escape(&row) {
@@ -291,10 +299,59 @@ fn wrap(line: &str, width: usize) -> Vec<String> {
             continue;
         }
         row.push_str(&word);
-        filled = wide;
+        filled += wide;
     }
     rows.push(row);
     rows
+}
+
+/// The column the rest of a line should hang from: whatever it is indented
+/// by, and past a marker where one opens it. The bullet on an answer, the
+/// arrow on a question and the dashes and numbers of a list all read as one
+/// column when what follows them lines up underneath.
+fn hanging(line: &str) -> usize {
+    let visible: Vec<char> = plain(line);
+    let mut at = 0;
+    while visible.get(at) == Some(&' ') {
+        at += 1;
+    }
+    let mark = match visible.get(at) {
+        Some('●') | Some('›') | Some('⏺') | Some('•') | Some('-') | Some('*') => 1,
+        Some(digit) if digit.is_ascii_digit() => {
+            let mut end = at;
+            while visible.get(end).is_some_and(|c| c.is_ascii_digit()) {
+                end += 1;
+            }
+            // "1." and "2)" open a list; a bare number is just a number.
+            match visible.get(end) {
+                Some('.') | Some(')') => end + 1 - at,
+                _ => 0,
+            }
+        }
+        _ => 0,
+    };
+    if mark > 0 && visible.get(at + mark) == Some(&' ') {
+        return at + mark + 1;
+    }
+    at
+}
+
+/// The characters of `text` that take up room, with the escapes dropped.
+fn plain(text: &str) -> Vec<char> {
+    let mut out = Vec::new();
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            for next in chars.by_ref() {
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// Whether the tail of `text` is part of an escape sequence, so its
@@ -375,6 +432,22 @@ mod tests {
         // Nothing to break on: the row is filled rather than left short.
         assert_eq!(wrap("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
         assert_eq!(wrap("short", 40), vec!["short"]);
+    }
+
+    #[test]
+    fn the_rest_of_a_line_hangs_under_its_first_word() {
+        // The bullet opens the line; what wraps sits under the words, not
+        // under the bullet.
+        assert_eq!(
+            wrap("● one two three", 9),
+            vec!["● one two", "  three"]
+        );
+        // Indented text keeps its indent when it wraps.
+        assert_eq!(wrap("    aaa bbb", 8), vec!["    aaa", "    bbb"]);
+        // A list marker hangs the same way.
+        assert_eq!(wrap("- one two", 7), vec!["- one", "  two"]);
+        // A bare number is not a marker.
+        assert_eq!(wrap("17 times 23", 8), vec!["17 times", "23"]);
     }
 
     #[test]
