@@ -96,6 +96,31 @@ pub fn save(config: &Config) {
     }
 }
 
+/// Tell every channel that can take it how a scheduled run ended. Nobody asked
+/// for this message, so Telegram gets it only once a chat is paired: that is
+/// the one chat the bot may talk to. Returns what failed to send.
+pub fn report(config: &Config, title: &str, body: &str) -> Vec<String> {
+    report_via(API, config, title, body)
+}
+
+fn report_via(api: &str, config: &Config, title: &str, body: &str) -> Vec<String> {
+    let mut failed = Vec::new();
+    if config.discord.ready() {
+        let text = format!("**{title}**\n{body}");
+        if let Err(error) = discord_send(&config.discord.webhook, &text) {
+            failed.push(error);
+        }
+    }
+    if let (true, Some(chat)) = (config.telegram.ready(), config.telegram.chat) {
+        // Sent as plain text, where Markdown asterisks would show literally.
+        let text = format!("{title}\n{body}");
+        if let Err(error) = send_via(api, &config.telegram.token, chat, &text) {
+            failed.push(error);
+        }
+    }
+    failed
+}
+
 /// Pull the text messages out of a `getUpdates` response, with the offset to
 /// ask for next. Pure, so the shape of the payload is pinned by a test rather
 /// than discovered in production.
@@ -138,10 +163,14 @@ fn client() -> Option<reqwest::blocking::Client> {
 /// Send a reply. Telegram caps message length, so long answers are trimmed
 /// rather than silently dropped.
 pub fn send(token: &str, chat: i64, text: &str) -> Result<(), String> {
+    send_via(API, token, chat, text)
+}
+
+fn send_via(api: &str, token: &str, chat: i64, text: &str) -> Result<(), String> {
     let client = client().ok_or("Cannot initialize connection.")?;
     let text = trim_reply(text);
     client
-        .post(format!("{API}/bot{}/sendMessage", token.trim()))
+        .post(format!("{api}/bot{}/sendMessage", token.trim()))
         .json(&serde_json::json!({"chat_id": chat, "text": text}))
         .send()
         .map_err(|_| "Cannot reach Telegram.".to_owned())?
@@ -226,8 +255,113 @@ pub fn poll(
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
-    use super::{MAX_REPLY, parse_updates, trim_reply};
-    use serde_json::json;
+    use super::{Config, MAX_REPLY, discord_send, parse_updates, report, report_via, trim_reply};
+    use serde_json::{Value, json};
+
+    /// Accept one request, answer it with `status`, and hand back its path and
+    /// JSON body.
+    fn one_request(status: &str) -> (String, std::thread::JoinHandle<(String, Value)>) {
+        use std::io::{Read, Write};
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.local_addr().unwrap());
+        let status = status.to_owned();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = server.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let mut block = [0; 4096];
+            let (head, body) = loop {
+                let n = socket.read(&mut block).unwrap();
+                assert_ne!(n, 0);
+                bytes.extend_from_slice(&block[..n]);
+                let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&bytes[..end]).to_string();
+                let len: usize = head
+                    .to_lowercase()
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length: ").map(str::to_owned))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                if bytes.len() >= end + 4 + len {
+                    break (head, bytes[end + 4..end + 4 + len].to_vec());
+                }
+            };
+            write!(
+                socket,
+                "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            let path = head.split_whitespace().nth(1).unwrap().to_owned();
+            (path, serde_json::from_slice(&body).unwrap())
+        });
+        (base, worker)
+    }
+
+    fn paired() -> Config {
+        let mut config = Config::default();
+        config.telegram.enabled = true;
+        config.telegram.token = "123:abc".into();
+        config.telegram.chat = Some(42);
+        config
+    }
+
+    #[test]
+    fn a_schedule_reports_to_the_paired_telegram_chat() {
+        let (api, worker) = one_request("200 OK");
+        let failed = report_via(&api, &paired(), "Nightly", "all green");
+        assert!(failed.is_empty(), "{failed:?}");
+        let (path, body) = worker.join().unwrap();
+        assert_eq!(path, "/bot123:abc/sendMessage");
+        assert_eq!(body["chat_id"], 42);
+        // Plain text: Telegram would print Markdown asterisks as they are.
+        assert_eq!(body["text"], "Nightly\nall green");
+    }
+
+    #[test]
+    fn a_schedule_does_not_message_a_bot_nobody_paired() {
+        let mut config = paired();
+        config.telegram.chat = None;
+        // An address that refuses connections: any attempt would fail loudly.
+        let failed = report_via("http://127.0.0.1:1", &config, "Nightly", "ok");
+        assert!(failed.is_empty());
+        // Nothing set up at all is equally quiet.
+        assert!(report(&Config::default(), "Nightly", "ok").is_empty());
+    }
+
+    #[test]
+    fn a_rejected_report_says_so() {
+        let (api, worker) = one_request("401 Unauthorized");
+        let failed = report_via(&api, &paired(), "Nightly", "ok");
+        worker.join().unwrap();
+        assert_eq!(failed, ["Telegram rejected the message."]);
+    }
+
+    #[test]
+    fn discord_gets_the_content_field() {
+        let (base, worker) = one_request("204 No Content");
+        discord_send(&format!("{base}/api/webhooks/1/t"), "**Nightly**\nok").unwrap();
+        let (path, body) = worker.join().unwrap();
+        assert_eq!(path, "/api/webhooks/1/t");
+        assert_eq!(body["content"], "**Nightly**\nok");
+    }
+
+    /// Posts for real. `LETRONNA_TEST_DISCORD=<webhook> cargo test -- --ignored`
+    #[test]
+    #[ignore]
+    fn live_discord_report() {
+        let webhook = std::env::var("LETRONNA_TEST_DISCORD").expect("LETRONNA_TEST_DISCORD");
+        super::discord_check(&webhook).unwrap();
+        let mut config = Config::default();
+        config.discord.enabled = true;
+        config.discord.webhook = webhook;
+        let failed = report(&config, "Letronna test", "A scheduled run would report here.");
+        assert!(failed.is_empty(), "{failed:?}");
+    }
 
     #[test]
     fn reads_messages_and_advances_the_offset() {

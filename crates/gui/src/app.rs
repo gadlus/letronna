@@ -520,7 +520,13 @@ impl Chat {
         if schedule.unattended {
             self.unattended.insert(session);
         }
-        let _ = self.dispatch(schedule.prompt.clone(), cx);
+        if self.dispatch(schedule.prompt.clone(), cx).is_err() {
+            // The gateway is not usable, so the run never started and
+            // `finish` will not come round to report it.
+            self.scheduled.remove(&session);
+            let error = self.error.clone().unwrap_or_default();
+            self.send_report(schedule.name.clone(), format!("Did not start: {error}"), cx);
+        }
     }
 
     /// One model call, streamed. The decisions all live in `core::agent`;
@@ -735,35 +741,37 @@ impl Chat {
         self.plan_mode = was_plan;
     }
 
-    /// A scheduled run has no one watching, so post what it concluded to
-    /// Discord if a webhook is set up. One-way is enough here: the point is
-    /// to find out what happened while away.
+    /// A scheduled run has no one watching, so post how it ended to every
+    /// channel set up to hear it. A failure is reported too: silence would
+    /// read as nothing having run at all.
     fn report_scheduled(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.streaming_id else { return };
-        if !self.scheduled.remove(&id) || !self.messaging.discord.ready() {
+        if !self.scheduled.remove(&id) {
             return;
         }
         let Some(ix) = self.store.index_of(id) else {
             return;
         };
         let conversation = &self.store.conversations[ix];
-        let Some(reply) = conversation
-            .messages
-            .iter()
-            .rev()
-            .find(|m| m.role == "assistant" && !m.content.is_empty())
-        else {
-            return;
+        let body = match &self.error {
+            Some(error) => format!("Did not finish: {error}"),
+            None => conversation
+                .messages
+                .iter()
+                .rev()
+                .find(|m| m.role == "assistant" && !m.content.is_empty())
+                .map(|m| m.content.clone())
+                .unwrap_or_else(|| "That did not produce an answer.".to_owned()),
         };
-        let text = format!(
-            "**{}**
-{}",
-            conversation.title, reply.content
-        );
-        let webhook = self.messaging.discord.webhook.clone();
+        let title = conversation.title.clone();
+        self.send_report(title, body, cx);
+    }
+
+    fn send_report(&self, title: String, body: String, cx: &mut Context<Self>) {
+        let config = self.messaging.clone();
         cx.background_executor()
             .spawn(async move {
-                let _ = letronna_core::messaging::discord_send(&webhook, &text);
+                let _ = letronna_core::messaging::report(&config, &title, &body);
             })
             .detach();
     }
