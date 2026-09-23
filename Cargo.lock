@@ -3517,6 +3517,7 @@ dependencies = [
  "gpui-component",
  "image",
  "letronna-core",
+ "objc",
  "raw-window-handle",
  "reqwest",
  "serde_json",
