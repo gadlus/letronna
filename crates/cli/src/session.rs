@@ -190,14 +190,33 @@ impl Runner {
         if call.name == tools::ASK_USER {
             let args = tools::parse_args(&call.arguments).unwrap_or_default();
             let question = args["question"].as_str().unwrap_or("").to_owned();
-            render::blank();
-            render::line(&bold_question(&question));
-            if let Some(options) = args["options"].as_array() {
-                for (i, option) in options.iter().filter_map(|o| o.as_str()).enumerate() {
-                    render::line(&render::dim(&format!("  {}. {option}", i + 1)));
-                }
-            }
-            let reply = self.bar.wait().ok_or("No answer given.")?;
+            let options: Vec<String> = args["options"]
+                .as_array()
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|o| o.as_str())
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // Offered answers are picked, not typed; an open question still
+            // wants the line.
+            let reply = if options.is_empty() {
+                render::blank();
+                render::said(&render::blue("●"), &bold_question(&question));
+                self.bar.wait().ok_or("No answer given.")?
+            } else {
+                let choices: Vec<&str> = options.iter().map(String::as_str).collect();
+                let picked = self
+                    .bar
+                    .choose(&question, Vec::new(), &choices)
+                    .ok_or("No answer given.")?;
+                render::blank();
+                render::said(&render::blue("●"), &bold_question(&question));
+                render::said(&render::blue("›"), &render::bold(&options[picked]));
+                options[picked].clone()
+            };
             turn.finish_call(Ok(reply));
             return Ok(true);
         }
@@ -205,39 +224,61 @@ impl Runner {
         let ctx = tools::ToolContext {
             workspace: turn.connection.workspace.clone(),
         };
-        render::blank();
-        render::line(&format!(
-            "{} {}",
-            render::bold("Letronna wants to"),
-            render::bold(&intent(&call.name, &tools::summary(&call.name, &call.arguments)))
-        ));
-        render::detail(&tools::preview(&call.name, &call.arguments, &ctx), DETAIL_LINES);
-        render::line(&render::dim("[y] once   [a] always   [n] no   [q] stop"));
-        let answer = self
-            .bar
-            .wait()
-            .unwrap_or_else(|| "n".into())
-            .trim()
-            .to_lowercase();
+        let summary = tools::summary(&call.name, &call.arguments);
 
-        match answer.chars().next().unwrap_or('n') {
-            'y' => {
+        // A change to a file is shown as a diff above the question, where
+        // there is room for it; anything else gets its preview inside the
+        // box, which is where the eye already is.
+        let mut detail = Vec::new();
+        match crate::diff::of(&call.name, &call.arguments, &ctx) {
+            Some(rows) => {
+                render::blank();
+                render::said(&render::blue("●"), &render::bold(&format!("{} {summary}", verb(&call.name))));
+                for row in rows {
+                    render::out(&row, true);
+                }
+            }
+            None => {
+                detail = tools::preview(&call.name, &call.arguments, &ctx)
+                    .lines()
+                    .take(DETAIL_LINES)
+                    .map(str::to_owned)
+                    .collect();
+            }
+        }
+
+        let question = format!("Letronna wants to {}", intent(&call.name, &summary));
+        let picked = self.bar.choose(
+            &question,
+            detail,
+            &[
+                "Yes",
+                "Yes, and stop asking for this",
+                "No, tell it why not",
+                "No, and stop here",
+            ],
+        );
+
+        match picked {
+            Some(0) => {
                 self.run_call(turn, call);
                 Ok(true)
             }
-            'a' => {
+            Some(1) => {
                 self.allowed.insert(call.name.clone());
                 self.run_call(turn, call);
                 Ok(true)
             }
-            'q' => Ok(false),
+            Some(3) | None => Ok(false),
             _ => {
-                render::tool(&call.name, "", "declined", true);
+                render::tool(&call.name, &summary, "declined", true);
                 turn.finish_call(Err(tools::DECLINED.into()));
                 Ok(true)
             }
         }
     }
+
+
 
     pub fn persist(&mut self) {
         if self.store.save().is_err() {
@@ -262,6 +303,14 @@ impl Runner {
         let index = self.store.conversations.len() - 1;
         self.store.active = index;
         index
+    }
+}
+
+/// What the line above a diff says is about to happen.
+fn verb(name: &str) -> &'static str {
+    match name {
+        "write_file" => "write",
+        _ => "edit",
     }
 }
 

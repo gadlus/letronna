@@ -5,6 +5,7 @@
 //! started here can be carried on there and the other way round.
 
 mod bar;
+mod diff;
 mod input;
 mod screen;
 mod render;

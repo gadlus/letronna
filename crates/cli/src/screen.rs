@@ -398,6 +398,35 @@ fn words(line: &str) -> Vec<(String, usize)> {
     out
 }
 
+/// Cut text to `width` printed columns, keeping the escapes that colour it.
+pub fn clip(text: &str, width: usize) -> String {
+    if visible(text) <= width {
+        return text.to_owned();
+    }
+    let mut out = String::new();
+    let mut shown = 0;
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            out.push(ch);
+            for next in chars.by_ref() {
+                out.push(next);
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        if shown + 1 >= width {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+        shown += 1;
+    }
+    out
+}
+
 /// Width of text as printed, ignoring the escapes that colour it.
 pub fn visible(text: &str) -> usize {
     let mut width = 0;

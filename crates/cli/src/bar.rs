@@ -88,6 +88,16 @@ fn fit(text: &str, room: usize) -> String {
     text.chars().skip(count - room).collect()
 }
 
+/// A question with a fixed set of answers, asked in the box instead of the
+/// line: approvals are the same three or four answers every time, and typing
+/// a letter for them is a small thing to get wrong in a hurry.
+struct Choice {
+    question: String,
+    detail: Vec<String>,
+    options: Vec<String>,
+    picked: usize,
+}
+
 pub struct Bar {
     text: String,
     picked: usize,
@@ -98,6 +108,9 @@ pub struct Bar {
     /// which case this is a plain prompt.
     live: bool,
     done: bool,
+    /// Set while a question is on the screen, and taken away by the answer.
+    choice: Option<Choice>,
+    answer: Option<usize>,
 }
 
 impl Bar {
@@ -109,6 +122,8 @@ impl Bar {
             queued: VecDeque::new(),
             live: false,
             done: false,
+            choice: None,
+            answer: None,
         }
     }
 
@@ -158,6 +173,42 @@ impl Bar {
         }
     }
 
+    /// Ask a question with a fixed set of answers. Returns the one picked, or
+    /// `None` if the user left instead.
+    pub fn choose(&mut self, question: &str, detail: Vec<String>, options: &[&str]) -> Option<usize> {
+        if !self.live {
+            // Nothing to steer with, so fall back to typing the number.
+            render::line(&render::bold(question));
+            for (i, option) in options.iter().enumerate() {
+                render::line(&render::dim(&format!("  {}. {option}", i + 1)));
+            }
+            let typed = crate::input::read(&format!("{} ", render::blue("›")))?;
+            return typed.trim().parse::<usize>().ok()?.checked_sub(1);
+        }
+
+        self.choice = Some(Choice {
+            question: question.to_owned(),
+            detail,
+            options: options.iter().map(|o| (*o).to_owned()).collect(),
+            picked: 0,
+        });
+        self.answer = None;
+        self.settle();
+        loop {
+            if self.done {
+                self.choice = None;
+                self.settle();
+                return None;
+            }
+            if let Some(answer) = self.answer.take() {
+                self.choice = None;
+                self.settle();
+                return Some(answer);
+            }
+            self.pump();
+        }
+    }
+
     /// Deal with whatever keys have arrived and hand the loop straight back.
     /// Called from inside a running turn, which is what lets you type while
     /// the model is still talking.
@@ -190,6 +241,10 @@ impl Bar {
     fn key(&mut self, key: KeyEvent) {
         // Windows reports press and release; act on one of them.
         if key.kind != KeyEventKind::Press {
+            return;
+        }
+        if self.choice.is_some() {
+            self.pick(key);
             return;
         }
         let options = matches(&self.text);
@@ -255,6 +310,32 @@ impl Bar {
         self.settle();
     }
 
+    /// Steer a question. Enter takes what is highlighted, a digit takes that
+    /// one outright, and Escape is the same as picking the last answer, which
+    /// is always the one that does nothing.
+    fn pick(&mut self, key: KeyEvent) {
+        let Some(choice) = self.choice.as_mut() else {
+            return;
+        };
+        let last = choice.options.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Up => choice.picked = choice.picked.checked_sub(1).unwrap_or(last),
+            KeyCode::Down => choice.picked = (choice.picked + 1) % choice.options.len(),
+            KeyCode::Enter => self.answer = Some(choice.picked),
+            KeyCode::Esc => self.answer = Some(last),
+            KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => self.done = true,
+            KeyCode::Char(digit) if digit.is_ascii_digit() => {
+                if let Some(index) = digit.to_digit(10).and_then(|d| (d as usize).checked_sub(1)) {
+                    if index < choice.options.len() {
+                        self.answer = Some(index);
+                    }
+                }
+            }
+            _ => return,
+        }
+        self.settle();
+    }
+
     /// Put the line into the conversation above the box, so your side of it
     /// is in the scrollback where the answers are.
     fn echo(&self, line: &str) {
@@ -275,6 +356,61 @@ impl Bar {
         crate::screen::chrome(self.chrome());
     }
 
+    /// The box, while it is holding a question rather than a line. The
+    /// answers are listed inside it and steered with the arrow keys, so
+    /// agreeing to something is one key and never the wrong letter.
+    fn asking(&self, choice: &Choice, edge: &str, room: usize) -> Vec<String> {
+        let mut lines = vec![format!(
+            "{}{}",
+            render::MARGIN,
+            render::dim(&format!("╭{edge}╮"))
+        )];
+        let row = |text: String, width: usize| {
+            format!(
+                "{}{} {text}{} {}",
+                render::MARGIN,
+                render::dim("│"),
+                " ".repeat(room.saturating_sub(width)),
+                render::dim("│")
+            )
+        };
+        let question = crate::screen::clip(&choice.question, room);
+        let width = crate::screen::visible(&question);
+        lines.push(row(render::bold(&question), width));
+
+        for line in &choice.detail {
+            let text = crate::screen::clip(line, room);
+            let width = crate::screen::visible(&text);
+            lines.push(row(render::dim(&text), width));
+        }
+
+        lines.push(row(String::new(), 0));
+        for (i, option) in choice.options.iter().enumerate() {
+            let chosen = i == choice.picked;
+            let text = format!("{} {} {option}", if chosen { "›" } else { " " }, i + 1);
+            let width = crate::screen::visible(&text);
+            lines.push(row(
+                if chosen {
+                    render::blue(&text)
+                } else {
+                    render::dim(&text)
+                },
+                width,
+            ));
+        }
+        lines.push(format!(
+            "{}{}",
+            render::MARGIN,
+            render::dim(&format!("╰{edge}╯"))
+        ));
+        lines.push(format!(
+            "{}{}",
+            render::PAD,
+            render::dim("↑↓ to choose  ·  enter to take it  ·  esc to decline")
+        ));
+        lines
+    }
+
     /// The box, the menu under it when one is open, and the footer.
     fn chrome(&self) -> Vec<String> {
         let (columns, _) = terminal::size().unwrap_or((80, 24));
@@ -288,6 +424,9 @@ impl Bar {
         let shown = fit(&self.text, typing);
 
         let edge = "─".repeat(room + 2);
+        if let Some(choice) = &self.choice {
+            return self.asking(choice, &edge, room);
+        }
         let mut lines = vec![
             format!("{}{}", render::MARGIN, render::dim(&format!("╭{edge}╮"))),
             format!(

@@ -106,6 +106,9 @@ pub fn blue(text: &str) -> String {
 pub fn red(text: &str) -> String {
     wrap("38;5;167", text)
 }
+pub fn green(text: &str) -> String {
+    wrap("38;5;114", text)
+}
 
 /// The left margin of the input box.
 pub const MARGIN: &str = "  ";
@@ -301,20 +304,19 @@ impl Stream {
     }
 }
 
-/// A tool call, as one dim line: what ran, on what, and how it went.
+/// A tool call: what ran and on what, then how it went on the line under it.
+/// Two lines rather than one because the second is where its output goes, and
+/// a result that hangs off the end of the first line is easy to miss.
 pub fn tool(name: &str, argument: &str, outcome: &str, failed: bool) {
-    let head = format!("{PAD}{} {}", dim("⏺"), bold(name));
-    let arg = if argument.is_empty() {
-        String::new()
+    let mark = if failed { red("●") } else { green("●") };
+    let call = if argument.is_empty() {
+        bold(name)
     } else {
-        format!(" {}", dim(argument))
+        format!("{}{}", bold(name), dim(&format!("({argument})")))
     };
-    let tail = if failed {
-        red(outcome)
-    } else {
-        dim(outcome)
-    };
-    out(&format!("{head}{arg}  {tail}"), true);
+    out(&format!("{GUTTER}{mark} {call}"), true);
+    let tail = if failed { red(outcome) } else { dim(outcome) };
+    out(&format!("{PAD}{} {tail}", dim("⎿")), true);
 }
 
 /// The indented body of a tool result, clipped so a big file does not bury
