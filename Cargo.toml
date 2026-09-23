@@ -1,41 +1,30 @@
-[package]
-name = "letronna"
+# The agent is split so the terminal frontend does not have to drag a GPU UI
+# framework in behind it: `core` is the whole agent with no idea what is
+# driving it, and the two binaries are the ways of driving it.
+[workspace]
+members = ["crates/core", "crates/gui", "crates/cli"]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0-alpha.1"
-description = "A small native desktop agent built with GPUI"
 license = "MIT"
 repository = "https://github.com/wweziza/letronna"
 edition = "2024"
 
-[dependencies]
-gpui = "=0.2.2"
-gpui-component = "=0.5.1"
-async-channel = "2"
+[workspace.dependencies]
+letronna-core = { path = "crates/core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+async-channel = "2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-
-# Already in the tree via gpui; used here for local wall-clock times.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-discord-rich-presence = "1"
-image = "0.25"
 
-[target.'cfg(windows)'.dependencies]
-tray-icon = "0.25"
-raw-window-handle = "0.6"
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Registry", "Win32_System_Threading", "Win32_Security", "Win32_Graphics_Gdi", "Win32_Storage_Xps"] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-# Command Line Tools ship no `xcrun metal`, so let the Metal driver compile the
-# shaders at startup rather than at build time.
-gpui = { version = "=0.2.2", features = ["runtime_shaders"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-# KSNI speaks StatusNotifierItem over D-Bus on a worker thread, so there is no
-# GTK main loop to reconcile with gpui's, and no appindicator/libxdo to install.
-tray-icon = { version = "0.25", default-features = false, features = ["ksni"] }
-
-[build-dependencies]
-embed-resource = "3"
+[patch.crates-io]
+# Fork of gpui-component 0.5.1 with two markdown fixes:
+# - configurable heading gap (upstream longbridge/gpui-kit#3129)
+# - list item content flexes instead of shrink-to-fit, so items are not
+#   clipped to one character and do not widen the chat column
+gpui-component = { git = "https://github.com/wweziza/gpui-kit", branch = "v0.5.1-heading-gap" }
 
 [profile.release]
 opt-level = 2
@@ -44,10 +33,3 @@ strip = true
 
 [profile.dev]
 debug = 0
-
-[patch.crates-io]
-# Fork of gpui-component 0.5.1 with two markdown fixes:
-# - configurable heading gap (upstream longbridge/gpui-kit#3129)
-# - list item content flexes instead of shrink-to-fit, so items are not
-#   clipped to one character and do not widen the chat column
-gpui-component = { git = "https://github.com/wweziza/gpui-kit", branch = "v0.5.1-heading-gap" }

@@ -1,0 +1,20 @@
+//! Letronna without a user interface.
+//!
+//! Everything here runs headless: the chat transport, the tools, background
+//! jobs, schedules, skills, the session store, and the agent loop that ties
+//! them together. Nothing in this crate knows whether a window or a terminal
+//! is driving it, which is the point -- the two frontends share one agent
+//! instead of growing two that slowly disagree.
+
+pub mod agent;
+pub mod chat;
+pub mod gateway;
+pub mod jobs;
+pub mod messaging;
+pub mod schedule;
+pub mod skills;
+pub mod store;
+pub mod tools;
+
+/// The name the app goes by, used in paths and on screen.
+pub const BRAND: &str = "Letronna";

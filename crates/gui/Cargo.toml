@@ -1,0 +1,40 @@
+[package]
+name = "letronna-gui"
+description = "A small native desktop agent built with GPUI"
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "letronna-gui"
+path = "src/main.rs"
+
+[dependencies]
+letronna-core.workspace = true
+serde_json.workspace = true
+async-channel.workspace = true
+reqwest.workspace = true
+chrono.workspace = true
+gpui = "=0.2.2"
+gpui-component = "=0.5.1"
+discord-rich-presence = "1"
+image = "0.25"
+
+[target.'cfg(windows)'.dependencies]
+tray-icon = "0.25"
+raw-window-handle = "0.6"
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Registry", "Win32_System_Threading", "Win32_Security", "Win32_Graphics_Gdi", "Win32_Storage_Xps"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Command Line Tools ship no `xcrun metal`, so let the Metal driver compile the
+# shaders at startup rather than at build time.
+gpui = { version = "=0.2.2", features = ["runtime_shaders"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# KSNI speaks StatusNotifierItem over D-Bus on a worker thread, so there is no
+# GTK main loop to reconcile with gpui's, and no appindicator/libxdo to install.
+tray-icon = { version = "0.25", default-features = false, features = ["ksni"] }
+
+[build-dependencies]
+embed-resource = "3"
