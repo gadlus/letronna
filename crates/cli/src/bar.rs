@@ -108,6 +108,13 @@ fn allow_selection() {
 #[cfg(not(windows))]
 fn allow_selection() {}
 
+/// Whether more input is already waiting. The wait is long enough to cover
+/// the gap between two characters of a paste and far shorter than the gap
+/// between two keystrokes of a person typing.
+fn pending() -> bool {
+    event::poll(Duration::from_millis(15)).unwrap_or(false)
+}
+
 /// The tail of `text` that fits. A long line keeps its end -- the part being
 /// typed -- in view, rather than its beginning.
 fn fit(text: &str, room: usize) -> String {
@@ -327,6 +334,15 @@ impl Bar {
             (KeyCode::Char('d'), KeyModifiers::CONTROL) if self.text.is_empty() => {
                 self.done = true;
             }
+            // A paste is not always handed over as a paste. Only the unix
+            // side of crossterm parses bracketed paste; a Windows console
+            // delivers the text as ordinary keystrokes, so every newline in a
+            // pasted paragraph looks exactly like you pressing enter -- which
+            // is why a pasted block went a line at a time. The tell is that
+            // the keystrokes are already queued: nobody types the next
+            // character within a few milliseconds of pressing enter, so an
+            // enter with input waiting behind it is a newline, not a send.
+            (KeyCode::Enter, _) if pending() => self.text.push('\n'),
             (KeyCode::Enter, _) => {
                 // A highlighted command wins; otherwise take the text as typed.
                 let mut line = std::mem::take(&mut self.text);

@@ -396,6 +396,7 @@ fn banner(runner: &Runner, folder: &str, session: usize) {
         ),
         String::new(),
         render::dim("type / for commands"),
+        render::dim("wheel scrolls · shift+drag selects · /mouse swaps them"),
     ];
 
     // Side by side when the face fits; the details alone when it does not, so

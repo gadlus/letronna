@@ -77,14 +77,17 @@ pub fn open() {
         return;
     }
     s.open = true;
-    s.mouse = false;
+    s.mouse = true;
     // Alternate screen and the cursor away. The mouse is deliberately left
     // with the terminal: taking it would scroll the conversation with the
     // wheel, at the price of never being able to select a line of it, and
     // copying out of a conversation is worth more than a wheel. `/mouse`
     // trades back for anyone who would rather have the scrolling.
-    // The last of these asks for pasted text in one piece.
-    print!("\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l\x1b[?2004h");
+    // Alternate screen, cursor away, the wheel ours so it can scroll the
+    // conversation, and pasted text in one piece where the terminal offers
+    // it that way. Holding shift still selects and copies, because a
+    // terminal keeps that for itself whatever the program asks for.
+    print!("\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l\x1b[?1000h\x1b[?1006h\x1b[?2004h");
     let _ = std::io::stdout().flush();
 }
 
