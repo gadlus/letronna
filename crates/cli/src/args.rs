@@ -9,6 +9,8 @@ Letronna — a small agent in your terminal
   letronna --resume        choose from the recent sessions
   letronna --resume <id>   open that session, by the id /where shows
   letronna gui             open the window instead
+  letronna --install       put Letronna on this machine
+  letronna --uninstall     take it off again
 
 Options
   -p, --print <prompt>     ask one question, print the answer, exit
@@ -39,6 +41,8 @@ pub struct Args {
     pub plan: bool,
     pub help: bool,
     pub gui: bool,
+    pub install: bool,
+    pub uninstall: bool,
 }
 
 pub fn parse(mut raw: impl Iterator<Item = String>) -> Args {
@@ -49,6 +53,8 @@ pub fn parse(mut raw: impl Iterator<Item = String>) -> Args {
         plan: false,
         help: false,
         gui: false,
+        install: false,
+        uninstall: false,
     };
     while let Some(arg) = raw.next() {
         match arg.as_str() {
@@ -65,6 +71,8 @@ pub fn parse(mut raw: impl Iterator<Item = String>) -> Args {
             }
             "--yes" => args.yes = true,
             "--plan" => args.plan = true,
+            "--install" => args.install = true,
+            "--uninstall" => args.uninstall = true,
             "-h" | "--help" => args.help = true,
             // A bare word is the prompt, so `letronna "what is this"` works.
             other if !other.starts_with('-') && args.prompt.is_none() => {

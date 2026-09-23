@@ -46,6 +46,18 @@ pub const COMMANDS: &[Command] = &[
         blurb: "show or change the model",
     },
     Command {
+        name: "/login",
+        blurb: "sign in to Letronna",
+    },
+    Command {
+        name: "/logout",
+        blurb: "sign out on this machine",
+    },
+    Command {
+        name: "/whoami",
+        blurb: "who is signed in",
+    },
+    Command {
         name: "/effort",
         blurb: "how hard the model should think",
     },

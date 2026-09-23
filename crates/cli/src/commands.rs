@@ -66,6 +66,41 @@ pub fn command(
             switch_model(runner, rest);
             Flow::Handled
         }
+        "/login" => {
+            sign_in(runner);
+            Flow::Handled
+        }
+        "/logout" => {
+            let who = letronna_core::auth::account();
+            letronna_core::auth::sign_out();
+            render::blank();
+            match who {
+                Some(account) => render::line(&render::dim(&format!(
+                    "Signed out {}. Your sessions and settings stay where they are.",
+                    account.name
+                ))),
+                None => render::line(&render::dim("Nobody was signed in.")),
+            }
+            Flow::Handled
+        }
+        "/whoami" => {
+            render::blank();
+            match letronna_core::auth::account() {
+                Some(account) => {
+                    render::said(&render::blue("●"), &render::bold(&account.name));
+                    if !account.email.is_empty() {
+                        render::line(&render::dim(&account.email));
+                    }
+                    if letronna_core::auth::is_stub(&account) {
+                        render::line(&render::dim(
+                            "Signed in against the stand-in, not a real account.",
+                        ));
+                    }
+                }
+                None => render::line(&render::dim("Not signed in. /login to fix that.")),
+            }
+            Flow::Handled
+        }
         "/effort" => {
             effort(runner, rest);
             Flow::Handled
@@ -126,6 +161,79 @@ pub fn command(
             Flow::Handled
         }
         _ => Flow::Unknown,
+    }
+}
+
+/// Sign in through the browser.
+///
+/// The page that answers is not up yet, so this offers the stand-in as well:
+/// the real flow is tried first and the stand-in writes the same file when
+/// the browser has nothing to talk to.
+pub fn sign_in(runner: &mut Runner) {
+    if let Some(account) = letronna_core::auth::account() {
+        render::blank();
+        render::line(&render::dim(&format!(
+            "Already signed in as {}. /logout first to change that.",
+            account.name
+        )));
+        return;
+    }
+
+    let pending = match letronna_core::auth::begin() {
+        Ok(pending) => pending,
+        Err(error) => {
+            render::blank();
+            render::line(&render::red(&error));
+            return;
+        }
+    };
+
+    render::blank();
+    render::said(&render::blue("●"), &render::bold("Sign in"));
+    render::line(&render::dim(
+        "Opening your browser. Come back when it is done.",
+    ));
+    render::line(&render::dim(&pending.url));
+    open_in_browser(&pending.url);
+
+    // The site does not exist yet, so waiting the full two minutes for a
+    // browser that will land on nothing is not worth anybody's time.
+    let picked = runner.bar.choose(
+        "Waiting for the browser",
+        vec!["The page is not up yet; the stand-in signs you in locally.".into()],
+        &["Use the stand-in", "Wait for the browser", "Cancel"],
+    );
+    match picked {
+        Some(0) => match letronna_core::auth::stub("Letronna user") {
+            Ok(account) => welcome(&account),
+            Err(error) => render::line(&render::red(&error)),
+        },
+        Some(1) => match pending.finish() {
+            Ok(account) => welcome(&account),
+            Err(error) => render::line(&render::red(&error)),
+        },
+        _ => render::line(&render::dim("Left it.")),
+    }
+}
+
+fn welcome(account: &letronna_core::auth::Account) {
+    render::said(&render::blue("›"), &render::bold(&account.name));
+    render::line(&render::dim("Signed in."));
+}
+
+/// Hand a URL to whatever opens links here.
+pub fn open_in_browser(url: &str) {
+    let opened = if cfg!(windows) {
+        std::process::Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", url])
+            .spawn()
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(url).spawn()
+    } else {
+        std::process::Command::new("xdg-open").arg(url).spawn()
+    };
+    if opened.is_err() {
+        render::line(&render::dim("Could not open a browser; the link is above."));
     }
 }
 

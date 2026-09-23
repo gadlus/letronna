@@ -141,8 +141,10 @@ impl Runner {
                     return Err("The model connection closed unexpectedly.".to_owned());
                 }
             };
-            if let Event::Reasoning(text) = &event {
-                if self.store.settings.thinking {
+            if let Event::Reasoning(text) = &event
+                && self.store.settings.thinking
+            {
+                {
                     if !thought {
                         self.bar.wait_line(false);
                         render::blank();

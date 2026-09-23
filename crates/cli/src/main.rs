@@ -11,6 +11,7 @@ mod commands;
 mod diff;
 mod edit;
 mod input;
+mod install;
 mod render;
 mod screen;
 mod session;
@@ -35,6 +36,15 @@ fn main() {
         launch_window();
         return;
     }
+    if args.uninstall {
+        match install::remove() {
+            Ok(done) => done
+                .iter()
+                .for_each(|line| render::line(&render::dim(line))),
+            Err(error) => render::line(&render::red(&error)),
+        }
+        return;
+    }
 
     let mut runner = Runner {
         store: store::load_listing(),
@@ -43,7 +53,9 @@ fn main() {
         plan: args.plan,
         bar: bar::Bar::new(String::new()),
     };
-    if runner.store.settings.model.is_empty() {
+    // Installing is the one thing that works before anything is set up,
+    // because it is what people do first.
+    if runner.store.settings.model.is_empty() && !args.install {
         render::line(&render::red(
             "No model configured yet. Open the window once to choose a gateway: letronna gui",
         ));
@@ -84,6 +96,13 @@ fn main() {
     runner.bar.install();
     render::clear();
     banner(&runner, &folder, session);
+    if args.install {
+        install::run(&mut runner);
+        runner.bar.uninstall();
+        render::title("");
+        render::blank();
+        return;
+    }
     if args.start == Start::Choose {
         resume(&mut runner, &mut session, workspace.as_deref());
     } else if runner.store.conversations[session].length() > 0 {
