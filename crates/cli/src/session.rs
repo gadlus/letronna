@@ -200,6 +200,10 @@ impl Runner {
         };
         let outcome = tools::run(&call.name, &call.arguments, &ctx);
         let summary = tools::summary(&call.name, &call.arguments);
+        // Every turn of the conversation opens with a blank line, whoever is
+        // speaking; a tool result that butts up against the question it came
+        // from reads as part of it.
+        render::blank();
         match &outcome {
             Ok(text) => {
                 let lines = text.lines().count();
@@ -252,6 +256,7 @@ impl Runner {
                 render::blank();
                 render::said(&render::blue("●"), &bold_question(&question));
                 render::said(&render::blue("›"), &render::bold(&options[picked]));
+                render::blank();
                 options[picked].clone()
             };
             turn.finish_call(Ok(reply));

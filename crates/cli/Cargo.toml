@@ -19,3 +19,12 @@ async-channel.workspace = true
 # terminal that speaks ANSI. Doing it by hand means SetConsoleMode on one and
 # termios on the other, plus decoding key sequences.
 crossterm = { version = "0.29", default-features = false, features = ["events", "windows"] }
+
+# Raw mode turns off the console's quick-edit flag, and quick edit is what
+# selecting text with the mouse uses on Windows. Putting it back needs the
+# console API directly; crossterm does not expose it.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+] }

@@ -320,6 +320,22 @@ fn merge_tool_calls(calls: &mut Vec<ToolCall>, chunk: &Chunk) {
     }
 }
 
+/// Give an id to any call that arrived without one.
+///
+/// The id is how a result is matched to its call, and most providers send it
+/// with the first fragment -- but not all do, and one that does not leaves us
+/// posting an empty string, which the next request is rejected for: "expected
+/// the id of an assistant tool_calls array element to be populated". The
+/// value only has to be unique within the turn and the same in both places,
+/// so its position will do.
+fn name_unnamed(calls: &mut [ToolCall]) {
+    for (index, call) in calls.iter_mut().enumerate() {
+        if call.id.trim().is_empty() {
+            call.id = format!("call_{index}");
+        }
+    }
+}
+
 fn parse_event(data: &str) -> Result<Chunk, String> {
     let value: Value = serde_json::from_str(data)
         .map_err(|_| "Provider returned an invalid stream event.".to_owned())?;
@@ -636,6 +652,7 @@ fn stream(
         );
     }
     calls.retain(|c| !c.name.is_empty());
+    name_unnamed(&mut calls);
     if !calls.is_empty() {
         received = true;
         sender
@@ -878,6 +895,35 @@ mod tests {
         let sent = context[3]["content"].as_str().unwrap().chars().count();
         assert!(sent < MAX_TOOL_CHARS + 64, "{sent}");
     }
+    #[test]
+    fn a_call_without_an_id_is_given_one() {
+        // Some providers stream the name and arguments but never an id.
+        let mut calls = vec![
+            ToolCall {
+                id: String::new(),
+                name: "ask_user".into(),
+                arguments: "{}".into(),
+            },
+            ToolCall {
+                id: "  ".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            },
+            ToolCall {
+                id: "given".into(),
+                name: "write_file".into(),
+                arguments: "{}".into(),
+            },
+        ];
+        super::name_unnamed(&mut calls);
+        assert_eq!(calls[0].id, "call_0");
+        assert_eq!(calls[1].id, "call_1");
+        // One the provider named keeps its own.
+        assert_eq!(calls[2].id, "given");
+        // Every call ends up with something to match a result against.
+        assert!(calls.iter().all(|c| !c.id.trim().is_empty()));
+    }
+
     #[test]
     fn assembles_streamed_tool_calls() {
         let mut calls = Vec::new();

@@ -82,6 +82,32 @@ fn matches(text: &str) -> Vec<&'static Command> {
         .collect()
 }
 
+/// Put back the console's quick-edit flag, which is what dragging the mouse
+/// to select text uses on Windows.
+///
+/// Raw mode is a read-modify-write of the console's input mode, and Windows
+/// clears quick edit on any write that does not ask for it back by name. The
+/// terminal then has no selection and the program has no mouse reporting
+/// either, so the mouse does nothing at all -- which is how selecting a line
+/// of the conversation stopped working.
+#[cfg(windows)]
+fn allow_selection() {
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_EXTENDED_FLAGS,
+        ENABLE_QUICK_EDIT_MODE, STD_INPUT_HANDLE,
+    };
+    unsafe {
+        let handle = GetStdHandle(STD_INPUT_HANDLE);
+        let mut mode = 0u32;
+        if GetConsoleMode(handle, &mut mode) != 0 {
+            SetConsoleMode(handle, mode | ENABLE_EXTENDED_FLAGS | ENABLE_QUICK_EDIT_MODE);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn allow_selection() {}
+
 /// The tail of `text` that fits. A long line keeps its end -- the part being
 /// typed -- in view, rather than its beginning.
 fn fit(text: &str, room: usize) -> String {
@@ -143,6 +169,7 @@ impl Bar {
             return;
         }
         render::set_raw(true);
+        allow_selection();
         self.live = true;
         crate::screen::open();
         self.settle();
