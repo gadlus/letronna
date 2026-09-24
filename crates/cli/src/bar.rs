@@ -265,11 +265,10 @@ impl Bar {
     ) -> Option<usize> {
         if !self.live {
             render::line(&render::bold(question));
-            for (i, option) in options.iter().enumerate() {
-                render::line(&render::dim(&format!("  {}. {option}", i + 1)));
+            for line in &detail {
+                render::line(&render::dim(line));
             }
-            let typed = crate::input::read(&format!("{} ", render::blue("›")))?;
-            return typed.trim().parse::<usize>().ok()?.checked_sub(1);
+            return crate::input::menu(options, 0);
         }
 
         self.choice = Some(Choice {
@@ -300,7 +299,13 @@ impl Bar {
     /// so a key does not end up in the scrollback for anyone to read.
     pub fn ask(&mut self, hint: &str, secret: bool) -> Option<String> {
         if !self.live {
-            return crate::input::read(&format!("{} ", render::blue("›")));
+            let prompt = format!("{}{} ", render::PAD, render::blue("›"));
+            let _ = hint;
+            return if secret {
+                crate::input::secret(&prompt)
+            } else {
+                crate::input::read(&prompt)
+            };
         }
         self.secret = secret;
         self.asking = true;
@@ -319,11 +324,7 @@ impl Bar {
     pub fn slide(&mut self, question: &str, stops: &[&str], start: usize) -> Option<usize> {
         if !self.live {
             render::line(&render::bold(question));
-            for (i, stop) in stops.iter().enumerate() {
-                render::line(&render::dim(&format!("  {}. {stop}", i + 1)));
-            }
-            let typed = crate::input::read(&format!("{} ", render::blue("›")))?;
-            return typed.trim().parse::<usize>().ok()?.checked_sub(1);
+            return crate::input::menu(stops, start);
         }
 
         self.slider = Some(Slider {

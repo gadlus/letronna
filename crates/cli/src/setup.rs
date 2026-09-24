@@ -19,9 +19,17 @@ use crate::session::Runner;
 const STEPS: usize = 5;
 
 /// Walk through it. True when a model is ready to talk to at the end.
-pub fn run(runner: &mut Runner) -> bool {
+/// `installer` is true for `letronna setup`, which ends here rather than
+/// going on into the conversation, so the last line says how to start it.
+pub fn run(runner: &mut Runner, installer: bool) -> bool {
     render::blank();
-    render::said(&render::blue("●"), &render::bold("Welcome to Letronna"));
+    render::line(&format!(
+        "{}  {}",
+        render::bold(&render::blue(letronna_core::BRAND)),
+        render::dim(concat!("setup  ·  ", env!("CARGO_PKG_VERSION")))
+    ));
+    render::blank();
+    render::said(&render::blue("●"), &render::bold("Welcome"));
     render::line(&render::dim(
         "A few questions, then you are talking to it. All of it can be changed later.",
     ));
@@ -38,9 +46,11 @@ pub fn run(runner: &mut Runner) -> bool {
     render::blank();
     if ready {
         render::said(&render::blue("●"), &render::bold("Ready"));
-        render::line(&render::dim(
-            "Ask it something. /model, /login and /effort change any of this later.",
-        ));
+        render::line(&render::dim(if installer {
+            "Start it with `letronna` in a new terminal. `letronna setup` asks all this again."
+        } else {
+            "Ask it something. /model, /login and /effort change any of this later."
+        }));
     } else {
         render::said(&render::blue("●"), &render::bold("Nearly"));
         render::line(&render::dim(

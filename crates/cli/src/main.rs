@@ -65,6 +65,19 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Setup is printed straight into the terminal, like an installer, not
+    // run inside the conversation screen: installing is not talking to it
+    // yet. `letronna setup` stops when it is done; a first run with nothing
+    // set up carries on into the conversation once there is a model.
+    if args.install || first_run {
+        render::title("Letronna setup");
+        let ready = setup::run(&mut runner, args.install);
+        render::title("");
+        if args.install || !ready {
+            return;
+        }
+    }
+
     let workspace = std::env::current_dir().ok();
     let mut session = match args.start {
         Start::Last => runner.open(true, workspace.clone()),
@@ -99,18 +112,6 @@ fn main() {
     runner.bar.install();
     render::clear();
     banner(&runner, &folder, session);
-    if args.install || first_run {
-        // Set up and ready means straight into the conversation, which is
-        // what everyone who just installed something wants to do next.
-        if !setup::run(&mut runner) {
-            runner.bar.uninstall();
-            render::title("");
-            render::blank();
-            return;
-        }
-        let note = footer(&runner);
-        runner.bar.set_footer(note);
-    }
     if args.start == Start::Choose {
         resume(&mut runner, &mut session, workspace.as_deref());
     } else if runner.store.conversations[session].length() > 0 {
