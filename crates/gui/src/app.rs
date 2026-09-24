@@ -78,6 +78,11 @@ pub(crate) struct Chat {
     pub(crate) sidebar_open: bool,
     pub(crate) greeting: &'static str,
     pub(crate) free_remaining: Option<u64>,
+    /// Who is signed in, as `account.json` last said; shared with the terminal.
+    pub(crate) account: Option<letronna_core::auth::Account>,
+    /// What the last sign-in, refresh or sign-out had to say.
+    pub(crate) account_note: Option<String>,
+    pub(crate) signing_in: bool,
     pub(crate) loading_models: bool,
     pub(crate) gateway_error: Option<String>,
     pub(crate) busy: bool,
@@ -234,6 +239,9 @@ impl Chat {
             sidebar_open: true,
             greeting,
             free_remaining: None,
+            account: letronna_core::auth::account(),
+            account_note: None,
+            signing_in: false,
             loading_models: false,
             gateway_error: None,
             store,

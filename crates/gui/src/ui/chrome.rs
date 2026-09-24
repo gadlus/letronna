@@ -27,9 +27,15 @@ impl Chat {
     }
 
     fn account_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        // No native sign-in yet: everyone is a guest. The menu is the shell that
-        // becomes Profile / Settings / Log out once accounts land.
-        let name = "Guest";
+        // The same account the terminal signs in to; nobody signed in is a guest.
+        let name: SharedString = self
+            .account
+            .as_ref()
+            .map(|a| a.name.split(' ').next().unwrap_or("").to_owned())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "Guest".into())
+            .into();
+        let signed_in = self.account.is_some();
         let chat = cx.entity();
         Button::new("account")
             .ghost()
@@ -57,12 +63,14 @@ impl Chat {
                     ),
             )
             .dropdown_menu_with_anchor(gpui::Corner::TopRight, move |menu, _, _| {
-                let settings = chat.clone();
+                let (settings, account, auth) = (chat.clone(), chat.clone(), chat.clone());
                 menu.min_w(px(180.))
                     .item(
-                        PopupMenuItem::new("Profile")
+                        PopupMenuItem::new("Account")
                             .icon(Icon::new(IconName::CircleUser))
-                            .disabled(true),
+                            .on_click(move |_, window, cx| {
+                                account.update(cx, |this, cx| this.open_account(window, cx))
+                            }),
                     )
                     .item(
                         PopupMenuItem::new("Settings")
@@ -73,9 +81,17 @@ impl Chat {
                     )
                     .separator()
                     .item(
-                        PopupMenuItem::new("Sign in")
+                        PopupMenuItem::new(if signed_in { "Sign out" } else { "Sign in" })
                             .icon(Icon::new(IconName::CircleUser))
-                            .on_click(|_, _, cx| cx.open_url("https://chat.pool.example")),
+                            .on_click(move |_, _, cx| {
+                                auth.update(cx, |this, cx| {
+                                    if signed_in {
+                                        this.sign_out(cx)
+                                    } else {
+                                        this.sign_in(cx)
+                                    }
+                                })
+                            }),
                     )
             })
     }

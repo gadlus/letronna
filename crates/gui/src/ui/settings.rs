@@ -3,6 +3,7 @@ use crate::prelude::*;
 type ApplyMode = std::rc::Rc<dyn Fn(plugins::PresenceMode, &mut App)>;
 
 const PAGES: &[(&str, AppIcon)] = &[
+    ("Account", AppIcon::User),
     ("Gateways", AppIcon::Plugs),
     ("Model", AppIcon::Robot),
     ("Appearance", AppIcon::Palette),
@@ -69,6 +70,8 @@ impl Chat {
         let _ = window;
         self.settings_open = true;
         self.settings_closing = false;
+        // The terminal may have signed in or out since this last looked.
+        self.refresh_account(cx);
         cx.notify();
     }
 
@@ -226,6 +229,7 @@ impl Chat {
             .into_any_element(),
             "Privacy" => privacy_page(&chat, &presence, self.store.settings.skip_approvals, cx)
                 .into_any_element(),
+            "Account" => super::account::account_page(&chat, cx).into_any_element(),
             "Thinking" => thinking_page(&chat, &self.store.settings, cx).into_any_element(),
             "Plugins" => plugins_page(&chat, cx).into_any_element(),
             "About" => about_page(cx).into_any_element(),
@@ -357,7 +361,7 @@ fn plugins_page(chat: &Entity<Chat>, cx: &App) -> Div {
         .child(list)
 }
 
-fn heading(title: &'static str, blurb: &'static str, cx: &App) -> Div {
+pub(crate) fn heading(title: &'static str, blurb: &'static str, cx: &App) -> Div {
     v_flex()
         .gap_1()
         .child(
@@ -375,7 +379,7 @@ fn heading(title: &'static str, blurb: &'static str, cx: &App) -> Div {
         )
 }
 
-fn label(text: &'static str, cx: &App) -> Div {
+pub(crate) fn label(text: &'static str, cx: &App) -> Div {
     div()
         .text_xs()
         .font_family(HEADING_FONT)

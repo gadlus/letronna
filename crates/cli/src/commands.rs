@@ -67,12 +67,14 @@ pub fn command(
             Flow::Handled
         }
         "/login" => {
-            sign_in(runner, "Letronna user");
+            sign_in(runner);
             Flow::Handled
         }
         "/logout" => {
             let who = letronna_core::auth::account();
-            letronna_core::auth::sign_out();
+            runner
+                .bar
+                .busy("signing this computer out", letronna_core::auth::sign_out);
             render::blank();
             match who {
                 Some(account) => render::line(&render::dim(&format!(
@@ -84,21 +86,7 @@ pub fn command(
             Flow::Handled
         }
         "/whoami" => {
-            render::blank();
-            match letronna_core::auth::account() {
-                Some(account) => {
-                    render::said(&render::blue("●"), &render::bold(&account.name));
-                    if !account.email.is_empty() {
-                        render::line(&render::dim(&account.email));
-                    }
-                    if letronna_core::auth::is_stub(&account) {
-                        render::line(&render::dim(
-                            "Signed in against the stand-in, not a real account.",
-                        ));
-                    }
-                }
-                None => render::line(&render::dim("Not signed in. /login to fix that.")),
-            }
+            whoami(runner);
             Flow::Handled
         }
         "/effort" => {
@@ -164,12 +152,49 @@ pub fn command(
     }
 }
 
-/// Sign in through the browser.
-///
-/// The page that answers is not up yet, so this offers the stand-in as well:
-/// the real flow is tried first and the stand-in writes the same file when
-/// the browser has nothing to talk to.
-pub fn sign_in(runner: &mut Runner, name: &str) {
+/// Who is signed in, checked with the API; what was known last is shown when
+/// it cannot be reached.
+fn whoami(runner: &mut Runner) {
+    if letronna_core::auth::account().is_none() {
+        render::blank();
+        render::line(&render::dim("Not signed in. /login to fix that."));
+        return;
+    }
+    let fresh = runner
+        .bar
+        .busy("checking your account", letronna_core::auth::refresh);
+    render::blank();
+    let account = match fresh {
+        Ok(account) => account,
+        Err(error) => match letronna_core::auth::account() {
+            Some(known) => {
+                render::line(&render::dim(&format!("{error} Showing what was known.")));
+                known
+            }
+            None => {
+                render::line(&render::dim(&error));
+                return;
+            }
+        },
+    };
+    render::said(&render::blue("●"), &render::bold(&account.name));
+    if !account.email.is_empty() {
+        render::line(&render::dim(&account.email));
+    }
+    if !account.plan.is_empty() {
+        render::line(&format!(
+            "{} {}   {} {}",
+            render::dim("plan   "),
+            account.plan_name(),
+            render::dim("credits"),
+            account.credit()
+        ));
+    }
+}
+
+/// Sign in through the browser: the page asks them to allow this computer,
+/// then hands a token back to a port only this machine can reach.
+pub fn sign_in(runner: &mut Runner) {
     if let Some(account) = letronna_core::auth::account() {
         render::blank();
         render::line(&render::dim(&format!(
@@ -196,29 +221,21 @@ pub fn sign_in(runner: &mut Runner, name: &str) {
     render::line(&render::dim(&pending.url));
     open_in_browser(&pending.url);
 
-    // The site does not exist yet, so waiting the full two minutes for a
-    // browser that will land on nothing is not worth anybody's time.
-    let picked = runner.bar.choose(
-        "Waiting for the browser",
-        vec!["The page is not up yet; the stand-in signs you in locally.".into()],
-        &["Use the stand-in", "Wait for the browser", "Cancel"],
-    );
-    match picked {
-        Some(0) => match letronna_core::auth::stub(name) {
-            Ok(account) => welcome(&account),
-            Err(error) => render::line(&render::red(&error)),
-        },
-        Some(1) => match pending.finish() {
-            Ok(account) => welcome(&account),
-            Err(error) => render::line(&render::red(&error)),
-        },
-        _ => render::line(&render::dim("Left it.")),
+    match runner
+        .bar
+        .busy("waiting for the browser", move || pending.finish())
+    {
+        Ok(account) => {
+            render::said(&render::blue("›"), &render::bold(&account.name));
+            let plan = account.plan_name();
+            render::line(&render::dim(&if plan.is_empty() {
+                "Signed in.".to_owned()
+            } else {
+                format!("Signed in · {plan} · {} credit", account.credit())
+            }));
+        }
+        Err(error) => render::line(&render::red(&error)),
     }
-}
-
-fn welcome(account: &letronna_core::auth::Account) {
-    render::said(&render::blue("›"), &render::bold(&account.name));
-    render::line(&render::dim("Signed in."));
 }
 
 /// Hand a URL to whatever opens links here.

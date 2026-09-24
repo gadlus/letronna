@@ -1,4 +1,4 @@
-//! The first thing anybody sees: who they are, who the model is, and where
+//! The first thing anybody sees: their account, who the model is, and where
 //! it all goes.
 //!
 //! The one-line installers fetch Letronna and hand straight over to this, so
@@ -16,7 +16,7 @@ use crate::session::Runner;
 
 /// Steps, for the heading over each one. Knowing how far there is to go is
 /// most of what makes a setup feel short.
-const STEPS: usize = 5;
+const STEPS: usize = 4;
 
 /// Walk through it. True when a model is ready to talk to at the end.
 /// `installer` is true for `letronna setup`, which ends here rather than
@@ -34,13 +34,12 @@ pub fn run(runner: &mut Runner, installer: bool) -> bool {
         "A few questions, then you are talking to it. All of it can be changed later.",
     ));
 
-    let name = ask_name(runner);
-    sign_in(runner, &name);
+    sign_in(runner);
     if !choose_provider(runner) {
         return false;
     }
     choose_model(runner);
-    crate::install::offer(runner, 5, STEPS);
+    crate::install::offer(runner, 4, STEPS);
 
     let ready = !runner.store.settings.model.is_empty();
     render::blank();
@@ -72,29 +71,8 @@ fn step(number: usize, title: &str) {
     );
 }
 
-fn ask_name(runner: &mut Runner) -> String {
-    step(1, "What should it call you?");
-    let known = auth::account().map(|a| a.name);
-    if let Some(name) = &known {
-        render::line(&render::dim(&format!("Enter to keep {name}.")));
-    }
-    let typed = runner
-        .bar
-        .ask("your name", false)
-        .unwrap_or_default()
-        .trim()
-        .to_owned();
-    let name = match (typed.is_empty(), known) {
-        (false, _) => typed,
-        (true, Some(known)) => known,
-        (true, None) => "Letronna user".to_owned(),
-    };
-    render::line(&format!("Hello, {}.", render::bold(&name)));
-    name
-}
-
-fn sign_in(runner: &mut Runner, name: &str) {
-    step(2, "Sign in");
+fn sign_in(runner: &mut Runner) {
+    step(1, "Sign in");
     if let Some(account) = auth::account() {
         render::line(&render::dim(&format!(
             "Already signed in as {}.",
@@ -105,23 +83,19 @@ fn sign_in(runner: &mut Runner, name: &str) {
     // Asked before anything is opened: a browser appearing unbidden is the
     // sort of thing that makes people close an installer.
     let picked = runner.bar.choose(
-        "How would you like to sign in?",
-        vec!["The sign-in page is not up yet, so the browser will find nothing.".into()],
-        &["Sign in locally for now", "Sign in in the browser", "Skip"],
+        "Sign in to a Letronna account?",
+        vec!["Hosted models and cloud runs need one. Your own keys do not.".into()],
+        &["Sign in in the browser", "Skip"],
     );
     match picked {
-        Some(0) => match auth::stub(name) {
-            Ok(account) => render::line(&render::dim(&format!("Signed in as {}.", account.name))),
-            Err(error) => render::line(&render::red(&error)),
-        },
-        Some(1) => crate::commands::sign_in(runner, name),
+        Some(0) => crate::commands::sign_in(runner),
         _ => render::line(&render::dim("Skipped. /login whenever you like.")),
     }
 }
 
 /// Pick where messages go, and the key for it if it wants one.
 fn choose_provider(runner: &mut Runner) -> bool {
-    step(3, "Who should answer?");
+    step(2, "Who should answer?");
     let labels: Vec<String> = GATEWAYS
         .iter()
         .map(|g| format!("{}  —  {}", g.name, g.blurb))
@@ -182,7 +156,7 @@ fn choose_provider(runner: &mut Runner) -> bool {
 }
 
 fn choose_model(runner: &mut Runner) {
-    step(4, "Which model?");
+    step(3, "Which model?");
     crate::commands::switch_model(runner, "");
     // A provider that would not list its models -- a local server, or a key
     // it did not like -- still needs something to talk to.
