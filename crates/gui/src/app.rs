@@ -314,8 +314,11 @@ impl Chat {
             return;
         }
         self.loading_models = true;
-        let base = self.endpoint.read(cx).value().to_string();
-        let key = self.key.read(cx).value().to_string();
+        let (base, key) = resolve(
+            &self.store.settings.gateway,
+            &self.endpoint.read(cx).value(),
+            &self.key.read(cx).value(),
+        );
         let guest = self.store.settings.gateway == GATEWAYS[0].name;
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
@@ -419,10 +422,15 @@ impl Chat {
         prompt: String,
         cx: &mut Context<Self>,
     ) -> std::result::Result<(), ()> {
+        let (endpoint, key) = resolve(
+            &self.store.settings.gateway,
+            &self.endpoint.read(cx).value(),
+            &self.key.read(cx).value(),
+        );
         let connection = Connection {
-            endpoint: self.endpoint.read(cx).value().to_string(),
+            endpoint,
             model: self.model.read(cx).value().to_string(),
-            key: self.key.read(cx).value().to_string(),
+            key,
             guest: self.store.settings.gateway == GATEWAYS[0].name,
             tools: self.store.settings.gateway != GATEWAYS[0].name,
             workspace: None,

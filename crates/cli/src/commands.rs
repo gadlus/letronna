@@ -466,11 +466,12 @@ const MODEL_CHOICES: usize = 10;
 pub fn switch_model(runner: &mut Runner, filter: &str) {
     let settings = &runner.store.settings;
     let guest = settings.gateway == letronna_core::gateway::GATEWAYS[0].name;
-    let key = store::load_keys()
+    let saved = store::load_keys()
         .get(letronna_core::gateway::key_slot(&settings.gateway))
         .cloned()
         .unwrap_or_default();
-    let endpoint = settings.endpoint.clone();
+    let (endpoint, key) =
+        letronna_core::gateway::resolve(&settings.gateway, &settings.endpoint, &saved);
     let current = settings.model.clone();
     let gateway = settings.gateway.clone();
 

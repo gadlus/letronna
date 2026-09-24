@@ -1,5 +1,8 @@
 pub const Upstream: &str = "https://pool.example/v1";
 
+/// The hosted pool on your Letronna account: no key, charged to your credit.
+pub const LETRONNA: &str = "Letronna";
+
 pub struct Gateway {
     pub name: &'static str,
     pub base: &'static str,
@@ -13,6 +16,12 @@ pub const GATEWAYS: &[Gateway] = &[
         base: Upstream,
         needs_key: false,
         blurb: "Guest access to the free catalog. No key, a few replies per session.",
+    },
+    Gateway {
+        name: LETRONNA,
+        base: "https://api.letronna.ai/v1",
+        needs_key: false,
+        blurb: "Your Letronna account. Hosted models, charged to your credit. No key.",
     },
     Gateway {
         name: "Upstream",
@@ -45,6 +54,18 @@ pub const GATEWAYS: &[Gateway] = &[
         blurb: "Any OpenAI-compatible server. Paste the base URL.",
     },
 ];
+
+/// Where to send requests and what to send with them. For most gateways
+/// that is the saved endpoint and key; the Letronna gateway uses the
+/// account API and the token this computer was signed in with, so there is
+/// nothing to paste and nothing to go stale.
+pub fn resolve(name: &str, endpoint: &str, key: &str) -> (String, String) {
+    if name == LETRONNA {
+        let token = crate::auth::account().map(|a| a.token).unwrap_or_default();
+        return (crate::auth::hosted_base(), token);
+    }
+    (endpoint.to_owned(), key.to_owned())
+}
 
 /// Both Upstream gateways share one saved key.
 pub fn key_slot(name: &str) -> &str {

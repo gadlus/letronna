@@ -39,6 +39,11 @@ fn api(path: &str) -> String {
     format!("{}{path}", base.trim_end_matches('/'))
 }
 
+/// The hosted pool's OpenAI-style base URL, on the same API as the account.
+pub fn hosted_base() -> String {
+    api("/v1")
+}
+
 /// The account page on the website.
 pub fn dashboard() -> String {
     let site = std::env::var("LETRONNA_WEB").unwrap_or_else(|_| WEBSITE.to_owned());
