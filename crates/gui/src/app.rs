@@ -109,17 +109,28 @@ pub(crate) struct Chat {
     /// Sessions a schedule opened, so their result can be reported onward.
     pub(crate) scheduled: std::collections::HashSet<u64>,
     /// Sessions opened for a remote chat, so the reply goes back to it.
-    pub(crate) remote: std::collections::HashMap<u64, i64>,
-    /// The session the paired chat is talking in, so a follow-up keeps its
+    pub(crate) remote: std::collections::HashMap<u64, letronna_core::messaging::Source>,
+    /// The session each remote chat is talking in, so a follow-up keeps its
     /// context. `/new` from the chat starts another.
-    pub(crate) remote_session: Option<u64>,
+    pub(crate) remote_session: std::collections::HashMap<letronna_core::messaging::Source, u64>,
+    /// A remote chat that has been sent the card the turn is waiting on, and
+    /// the call it is about. Its next message answers it.
+    pub(crate) remote_waiting: Option<(
+        letronna_core::messaging::Source,
+        letronna_core::chat::ToolCall,
+    )>,
     pub(crate) messaging_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub(crate) token_input: Entity<InputState>,
     pub(crate) webhook_input: Entity<InputState>,
+    pub(crate) discord_token_input: Entity<InputState>,
+    pub(crate) discord_owner_input: Entity<InputState>,
+    pub(crate) discord_servers_input: Entity<InputState>,
     /// The webhook's name, once it has been checked.
     pub(crate) hook_name: Option<String>,
     /// The connected bot's @name, once the token has been checked.
     pub(crate) bot_name: Option<String>,
+    /// The Discord bot's name, once its token has been checked.
+    pub(crate) discord_bot_name: Option<String>,
     /// Selected row on the Messaging page.
     pub(crate) channel: usize,
     pub(crate) skills: Vec<letronna_core::skills::Skill>,
@@ -202,6 +213,22 @@ impl Chat {
                 .placeholder("https://discord.com/api/webhooks/...")
                 .default_value(letronna_core::messaging::load().discord.webhook)
         });
+        let discord_token_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .masked(true)
+                .placeholder("Bot token from the Developer Portal")
+                .default_value(letronna_core::messaging::load().discord.bot_token)
+        });
+        let discord_owner_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Your Discord user ID")
+                .default_value(letronna_core::messaging::load().discord.owner)
+        });
+        let discord_servers_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Server IDs, separated by commas")
+                .default_value(letronna_core::messaging::load().discord.servers.join(", "))
+        });
         let skill_name =
             cx.new(|cx| InputState::new(window, cx).placeholder("Review these changes"));
         let skill_prompt = cx.new(|cx| {
@@ -272,12 +299,17 @@ impl Chat {
             pairing: None,
             scheduled: std::collections::HashSet::new(),
             remote: std::collections::HashMap::new(),
-            remote_session: None,
+            remote_session: std::collections::HashMap::new(),
+            remote_waiting: None,
             messaging_stop: None,
             token_input,
             webhook_input,
+            discord_token_input,
+            discord_owner_input,
+            discord_servers_input,
             hook_name: None,
             bot_name: None,
+            discord_bot_name: None,
             channel: 0,
             skills: letronna_core::skills::load(),
             editing_skill: None,
@@ -620,7 +652,10 @@ impl Chat {
         let gate = |name: &str| self.needs_user(name);
         match turn.next(gate) {
             agent::Next::Done => self.finish(cx),
-            agent::Next::AskUser(_) => cx.notify(),
+            agent::Next::AskUser(call) => {
+                self.ask_remote(call, cx);
+                cx.notify()
+            }
             agent::Next::Run(call) if call.name == letronna_core::tools::TODO => {
                 self.apply_todo(&call.arguments.clone(), cx)
             }
@@ -678,12 +713,19 @@ impl Chat {
         if let Some(stop) = self.messaging_stop.take() {
             stop.store(true, Ordering::Relaxed);
         }
-        if !self.messaging.telegram.ready() {
+        let telegram = &self.messaging.telegram;
+        let discord = &self.messaging.discord;
+        if !telegram.ready() && !discord.bot_ready() {
             return;
         }
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let (tx, rx) = async_channel::unbounded();
-        letronna_core::messaging::poll(self.messaging.telegram.token.clone(), stop.clone(), tx);
+        if telegram.ready() {
+            letronna_core::messaging::poll(telegram.token.clone(), stop.clone(), tx.clone());
+        }
+        if discord.bot_ready() {
+            letronna_core::messaging::discord_listen(discord.clone(), stop.clone(), tx);
+        }
         self.messaging_stop = Some(stop);
         cx.spawn(async move |this, cx| {
             while let Ok(message) = rx.recv().await {
@@ -698,40 +740,72 @@ impl Chat {
         .detach();
     }
 
-    fn tell_remote(&self, chat: i64, text: &str, cx: &mut Context<Self>) {
-        let token = self.messaging.telegram.token.clone();
+    fn tell_remote(
+        &self,
+        source: &letronna_core::messaging::Source,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) {
+        use letronna_core::messaging::{self, Source};
+        let source = source.clone();
         let text = text.to_owned();
+        let telegram = self.messaging.telegram.token.clone();
+        let discord = self.messaging.discord.bot_token.clone();
         cx.background_executor()
             .spawn(async move {
-                let _ = letronna_core::messaging::send(&token, chat, &text);
+                let _ = match source {
+                    Source::Telegram(chat) => messaging::send(&telegram, chat, &text),
+                    Source::Discord(channel) => messaging::discord_post(&discord, &channel, &text),
+                };
             })
             .detach();
     }
 
-    /// A message arrived from the bot. Anything from a chat the user has not
-    /// approved is held for approval rather than acted on.
+    /// A message arrived from a bot. A Telegram chat the user has not
+    /// approved is held for approval rather than acted on; Discord only ever
+    /// delivers the owner's DMs, so there is nothing to approve.
     fn on_remote(&mut self, message: letronna_core::messaging::Incoming, cx: &mut Context<Self>) {
-        if self.messaging.telegram.chat != Some(message.chat) {
-            self.pairing = Some((message.chat, message.from));
+        use letronna_core::messaging::Source;
+        let source = message.source;
+        if let Source::Telegram(chat) = source
+            && self.messaging.telegram.chat != Some(chat)
+        {
+            self.pairing = Some((chat, message.from));
             cx.notify();
+            return;
+        }
+        if let Some((waiting, call)) = self.remote_waiting.clone()
+            && waiting == source
+        {
+            use letronna_core::messaging::{CardAnswer, card_answer};
+            let verdict = match card_answer(&call.name, &call.arguments, &message.said) {
+                CardAnswer::Answer(text) => Verdict::Answer(text),
+                CardAnswer::Allow => Verdict::Allow { remember: false },
+                CardAnswer::Deny => Verdict::Deny,
+            };
+            self.resolve_call(verdict, cx);
             return;
         }
         if self.busy {
             self.tell_remote(
-                message.chat,
+                &source,
                 "Busy with something else right now. Send that again in a moment.",
                 cx,
             );
             return;
         }
         // Telegram sends /start when a chat first opens the bot.
-        if matches!(message.text.trim(), "/new" | "/start") {
-            self.remote_session = None;
-            self.tell_remote(message.chat, "Started a new session.", cx);
+        if matches!(message.said.trim(), "/new" | "/start") {
+            self.remote_session.remove(&source);
+            self.tell_remote(&source, "Started a new session.", cx);
             return;
         }
         // Carry on in the chat's session unless it has since been deleted.
-        match self.remote_session.and_then(|id| self.store.index_of(id)) {
+        match self
+            .remote_session
+            .get(&source)
+            .and_then(|id| self.store.index_of(*id))
+        {
             Some(ix) => self.store.active = ix,
             None => {
                 let workspace = self.store.conversations[self.store.active]
@@ -748,12 +822,16 @@ impl Chat {
             }
         }
         let id = self.store.conversations[self.store.active].id;
-        self.remote_session = Some(id);
-        self.remote.insert(id, message.chat);
+        self.remote_session.insert(source.clone(), id);
+        let allow_tools = match source {
+            Source::Telegram(_) => self.messaging.telegram.allow_tools,
+            Source::Discord(_) => self.messaging.discord.allow_tools,
+        };
+        self.remote.insert(id, source);
         // Nobody on the far end can answer an approval card, so unless the
         // user has said otherwise a remote message may look but not touch.
         let was_plan = self.plan_mode;
-        self.plan_mode = !self.messaging.telegram.allow_tools;
+        self.plan_mode = !allow_tools;
         let _ = self.dispatch(message.text, cx);
         self.plan_mode = was_plan;
     }
@@ -796,7 +874,7 @@ impl Chat {
     /// Send the finished reply back to the chat that asked for it.
     fn answer_remote(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.streaming_id else { return };
-        let Some(chat) = self.remote.remove(&id) else {
+        let Some(source) = self.remote.remove(&id) else {
             return;
         };
         // Only this turn's reply: the session carries on across messages, so
@@ -817,7 +895,7 @@ impl Chat {
                 .map(|m| m.content.clone())
                 .unwrap_or_else(|| "That did not produce an answer.".to_owned()),
         };
-        self.tell_remote(chat, &reply, cx);
+        self.tell_remote(&source, &reply, cx);
     }
 
     /// Whether this call has to wait for the user. `ask_user` always does:
@@ -865,8 +943,39 @@ impl Chat {
         self.record_result(message, cx);
     }
 
-    /// The user answered the approval card.
+    /// A remote session cannot see the card, so send it to the chat; the
+    /// chat's next message answers it. Without this the turn waits on a card
+    /// nobody is looking at, and every later message is turned away as busy.
+    fn ask_remote(&mut self, call: letronna_core::chat::ToolCall, cx: &mut Context<Self>) {
+        let Some(source) = self
+            .streaming_id
+            .and_then(|id| self.remote.get(&id))
+            .cloned()
+        else {
+            return;
+        };
+        if self
+            .remote_waiting
+            .as_ref()
+            .is_some_and(|(_, waiting)| waiting.id == call.id)
+        {
+            return;
+        }
+        let ctx = letronna_core::tools::ToolContext {
+            workspace: self
+                .turn
+                .as_ref()
+                .and_then(|turn| turn.connection.workspace.clone()),
+        };
+        let preview = letronna_core::tools::preview(&call.name, &call.arguments, &ctx);
+        let text = letronna_core::messaging::card_text(&call.name, &call.arguments, &preview);
+        self.tell_remote(&source, &text, cx);
+        self.remote_waiting = Some((source, call));
+    }
+
+    /// The user answered the approval card, here or from a chat.
     pub(crate) fn resolve_call(&mut self, verdict: Verdict, cx: &mut Context<Self>) {
+        self.remote_waiting = None;
         let Some(call) = self
             .turn
             .as_ref()

@@ -24,7 +24,7 @@ const CHANNELS: &[Channel] = &[
     },
     Channel {
         name: "Discord",
-        blurb: "Post results into a Discord channel through a webhook.",
+        blurb: "Talk to Letronna through your bot, in a DM or a server, or post results through a webhook.",
         icon: "icons/brands/discord.svg",
         colour: 0x5865f2,
         built: true,
@@ -421,7 +421,7 @@ impl Chat {
     fn live(&self, index: usize) -> bool {
         match CHANNELS[index].name {
             "Telegram" => self.messaging.telegram.ready(),
-            "Discord" => self.messaging.discord.ready(),
+            "Discord" => self.messaging.discord.ready() || self.messaging.discord.bot_ready(),
             _ => false,
         }
     }
@@ -499,11 +499,29 @@ fn field(label: &'static str, hint: &'static str, cx: &App) -> impl IntoElement 
 }
 
 impl Chat {
-    /// Check the webhook before keeping it, and say which one it is.
+    /// Check the webhook and the bot before keeping them: the bot token with
+    /// Discord, and the user ID by opening the DM it will read, which fails
+    /// if the two share no server. A typo is caught here rather than by
+    /// silence later.
     fn connect_discord(&mut self, cx: &mut Context<Self>) {
         let webhook = self.webhook_input.read(cx).value().trim().to_owned();
-        if webhook.is_empty() {
-            self.error = Some("Paste the webhook URL from the channel's settings.".into());
+        let token = self.discord_token_input.read(cx).value().trim().to_owned();
+        let owner = self.discord_owner_input.read(cx).value().trim().to_owned();
+        let servers: Vec<String> = self
+            .discord_servers_input
+            .read(cx)
+            .value()
+            .split(',')
+            .map(|id| id.trim().to_owned())
+            .filter(|id| !id.is_empty())
+            .collect();
+        if webhook.is_empty() && token.is_empty() {
+            self.error = Some("Add a bot token, a webhook URL, or both.".into());
+            cx.notify();
+            return;
+        }
+        if !token.is_empty() && owner.is_empty() {
+            self.error = Some("Add your Discord user ID, so the bot knows who to answer.".into());
             cx.notify();
             return;
         }
@@ -511,14 +529,33 @@ impl Chat {
         cx.spawn(async move |_, cx| {
             let check = cx
                 .background_executor()
-                .spawn(async move { messaging::discord_check(&webhook).map(|n| (n, webhook)) })
+                .spawn(async move {
+                    let hook = match webhook.is_empty() {
+                        true => None,
+                        false => Some(messaging::discord_check(&webhook)?),
+                    };
+                    let bot = match token.is_empty() {
+                        true => None,
+                        false => {
+                            let name = messaging::discord_bot_check(&token)?;
+                            messaging::discord_open_dm(&token, &owner)?;
+                            Some(name)
+                        }
+                    };
+                    Ok::<_, String>((hook, bot, webhook, token, owner))
+                })
                 .await;
             let _ = entity.update(cx, |this, cx| {
                 match check {
-                    Ok((name, webhook)) => {
-                        this.messaging.discord.webhook = webhook;
-                        this.messaging.discord.enabled = true;
-                        this.hook_name = Some(name);
+                    Ok((hook, bot, webhook, token, owner)) => {
+                        let discord = &mut this.messaging.discord;
+                        discord.webhook = webhook;
+                        discord.bot_token = token;
+                        discord.owner = owner;
+                        discord.servers = servers;
+                        discord.enabled = true;
+                        this.hook_name = hook;
+                        this.discord_bot_name = bot;
                         this.save_messaging(cx);
                     }
                     Err(error) => this.error = Some(error),
@@ -533,8 +570,10 @@ impl Chat {
         let channel = &CHANNELS[1];
         let config = &self.messaging.discord;
         let has_hook = !config.webhook.trim().is_empty();
+        let has_bot = !config.bot_token.trim().is_empty();
         let enabled = config.enabled;
-        let live = config.ready();
+        let live = config.ready() || config.bot_ready();
+        let allow_tools = config.allow_tools;
 
         let pills = h_flex()
             .gap_1p5()
@@ -548,15 +587,13 @@ impl Chat {
                 },
                 cx,
             ))
-            .child(pill(
-                if has_hook {
-                    "Sends only"
-                } else {
-                    "Needs setup"
-                },
-                cx.theme().muted_foreground,
-                cx,
-            ));
+            .child(if config.bot_ready() {
+                pill("Listening", cx.theme().green, cx)
+            } else if has_hook {
+                pill("Sends only", cx.theme().muted_foreground, cx)
+            } else {
+                pill("Needs setup", cx.theme().muted_foreground, cx)
+            });
 
         v_flex()
             .flex_1()
@@ -596,11 +633,12 @@ impl Chat {
                             )
                             .child(v_flex().gap_2().child(section("What this does", cx)).child(
                                 help(
-                                    "A webhook posts into one channel and cannot read \
-                                         anything back, so this is one-way: you will not be \
-                                         able to talk to Letronna from Discord. Scheduled jobs \
-                                         report what they concluded here, which is the point \
-                                         of it while you are away.",
+                                    "With a bot, you talk to Letronna in a direct message, or \
+                                         in a server you list by mentioning the bot or replying \
+                                         to it, and it answers in the same place. It only ever \
+                                         hears you: anyone else, and any server not listed, is \
+                                         ignored. A webhook only posts into a channel. Scheduled \
+                                         jobs report to both.",
                                     cx,
                                 ),
                             ))
@@ -609,16 +647,96 @@ impl Chat {
                                     .gap_2()
                                     .child(section("Get your credentials", cx))
                                     .child(help(
-                                        "In Discord, open the channel's settings, then \
-                                         Integrations, then Webhooks, and create one. Copy its \
-                                         URL.",
+                                        "Create an application in the Discord Developer Portal, \
+                                         add a bot, and copy its token. Invite the bot to a \
+                                         server you are in: Discord only lets a bot DM people it \
+                                         shares a server with. For your user ID, turn on \
+                                         Developer Mode, then right-click yourself and Copy User \
+                                         ID.",
                                         cx,
-                                    )),
+                                    ))
+                                    .child(
+                                        h_flex().child(
+                                            Button::new("discord-portal")
+                                                .outline()
+                                                .xsmall()
+                                                .label("Open the Developer Portal")
+                                                .on_click(|_, _, cx| {
+                                                    cx.open_url(
+                                                        "https://discord.com/developers/applications",
+                                                    )
+                                                }),
+                                        ),
+                                    ),
                             )
                             .child(
                                 v_flex()
                                     .gap_2()
-                                    .child(section("Required", cx))
+                                    .child(section("Bot", cx))
+                                    .child(field(
+                                        "Bot token",
+                                        "It is kept on this machine.",
+                                        cx,
+                                    ))
+                                    .child(Input::new(&self.discord_token_input).small().w_full())
+                                    .child(field(
+                                        "Your user ID",
+                                        "The only person the bot answers.",
+                                        cx,
+                                    ))
+                                    .child(Input::new(&self.discord_owner_input).small().w_full())
+                                    .child(field(
+                                        "Servers",
+                                        "Where a mention reaches Letronna. Right-click a server \
+                                         and Copy Server ID. Leave empty for DMs only.",
+                                        cx,
+                                    ))
+                                    .child(
+                                        Input::new(&self.discord_servers_input).small().w_full(),
+                                    )
+                                    .when_some(self.discord_bot_name.clone(), |this, name| {
+                                        this.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().green)
+                                                .child(format!("Connected as {name}")),
+                                        )
+                                    })
+                                    .child(
+                                        h_flex()
+                                            .w_full()
+                                            .min_w_0()
+                                            .items_center()
+                                            .justify_between()
+                                            .gap_4()
+                                            .child(field(
+                                                "Let messages use tools",
+                                                "Off, a message can read and search but not write \
+                                                 or run anything, because nobody on the other end \
+                                                 can answer an approval card.",
+                                                cx,
+                                            ))
+                                            .child(
+                                                div().cursor_pointer().child(
+                                                    gpui_component::switch::Switch::new(
+                                                        "discord-allow-tools",
+                                                    )
+                                                    .checked(allow_tools)
+                                                    .on_click(cx.listener(
+                                                        move |this, _, _, cx| {
+                                                            this.messaging.discord.allow_tools =
+                                                                !allow_tools;
+                                                            this.save_messaging(cx);
+                                                        },
+                                                    )),
+                                                ),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                v_flex()
+                                    .gap_2()
+                                    .child(section("Webhook, optional", cx))
                                     .child(field(
                                         "Webhook URL",
                                         "Anyone holding this URL can post to that channel, so \
@@ -654,7 +772,7 @@ impl Chat {
                                 div().cursor_pointer().child(
                                     gpui_component::switch::Switch::new("discord-enabled")
                                         .checked(enabled)
-                                        .disabled(!has_hook)
+                                        .disabled(!has_hook && !has_bot)
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.messaging.discord.enabled = !enabled;
                                             this.save_messaging(cx);
@@ -665,10 +783,12 @@ impl Chat {
                                 div()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(if has_hook {
+                                    .child(if has_bot {
+                                        "Listen for messages"
+                                    } else if has_hook {
                                         "Report scheduled jobs here"
                                     } else {
-                                        "Add a webhook to enable"
+                                        "Add a bot or a webhook to enable"
                                     }),
                             ),
                     )
@@ -682,13 +802,29 @@ impl Chat {
                                         .small()
                                         .label("Send a test")
                                         .on_click(cx.listener(|this, _, _, cx| {
-                                            let webhook = this.messaging.discord.webhook.clone();
+                                            let config = this.messaging.discord.clone();
                                             cx.background_executor()
                                                 .spawn(async move {
-                                                    let _ = messaging::discord_send(
-                                                        &webhook,
-                                                        "Letronna is connected.",
-                                                    );
+                                                    let text = "Letronna is connected.";
+                                                    if config.ready() {
+                                                        let _ = messaging::discord_send(
+                                                            &config.webhook,
+                                                            text,
+                                                        );
+                                                    }
+                                                    if config.bot_ready() {
+                                                        let _ = messaging::discord_open_dm(
+                                                            &config.bot_token,
+                                                            &config.owner,
+                                                        )
+                                                        .and_then(|(channel, _)| {
+                                                            messaging::discord_post(
+                                                                &config.bot_token,
+                                                                &channel,
+                                                                text,
+                                                            )
+                                                        });
+                                                    }
                                                 })
                                                 .detach();
                                         })),

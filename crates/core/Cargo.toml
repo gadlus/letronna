@@ -12,3 +12,6 @@ serde_json.workspace = true
 async-channel.workspace = true
 reqwest.workspace = true
 chrono.workspace = true
+# Discord's Gateway, for hearing server mentions as they happen. Blocking
+# like reqwest here, and on the same rustls.
+tungstenite = { version = "0.30", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
