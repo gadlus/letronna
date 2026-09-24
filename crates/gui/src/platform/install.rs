@@ -240,11 +240,16 @@ mod windows_impl {
         }
         if let Some(dir) = install_dir() {
             remove_from_path(&dir.join("bin"));
+            // The folder holds this program, so it can only go once this
+            // program has exited. `timeout` would be the obvious way to wait,
+            // but it refuses to run without a console and returns at once --
+            // which deleted nothing, because the folder was still in use.
+            // ping waits without needing one.
             let _ = Command::new("cmd")
                 .args([
                     "/C",
                     &format!(
-                        "timeout /t 2 /nobreak >nul & rmdir /s /q \"{}\"",
+                        "ping -n 3 127.0.0.1 >nul & rmdir /s /q \"{}\"",
                         dir.display()
                     ),
                 ])
