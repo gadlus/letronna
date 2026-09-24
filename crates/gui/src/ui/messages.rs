@@ -110,9 +110,13 @@ impl Chat {
                         }),
                 )
             })
-            .when(!is_user && (!message.reasoning.is_empty()), |this| {
-                this.child(self.thinking_block(index, message, streaming, window, cx))
-            })
+            // Thinking is shown when it was asked for, the same switch the
+            // terminal reads. Without this the window showed it whatever the
+            // setting said, and the two halves disagreed about the same file.
+            .when(
+                !is_user && !message.reasoning.is_empty() && self.store.settings.thinking,
+                |this| this.child(self.thinking_block(index, message, streaming, window, cx)),
+            )
             // The markdown renderer reports an intrinsic width wider than the
             // column for some documents (lists after a wrapped paragraph),
             // which pushes the whole chat past the composer. Clipping here
