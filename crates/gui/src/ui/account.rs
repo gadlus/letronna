@@ -35,7 +35,7 @@ impl Chat {
         if self.signing_in {
             return;
         }
-        let pending = match auth::begin() {
+        let pending = match auth::begin(auth::Client::App) {
             Ok(pending) => pending,
             Err(error) => {
                 self.account_note = Some(error);
@@ -93,8 +93,9 @@ impl Chat {
     }
 }
 
-pub(crate) fn account_page(chat: &Entity<Chat>, cx: &App) -> Div {
-    let this = chat.read(cx);
+/// Drawn while the window is itself being drawn, so it is handed what it
+/// shows rather than reading the chat, which is mid-update and would panic.
+pub(crate) fn account_page(chat: &Entity<Chat>, this: &Chat, cx: &App) -> Div {
     let busy = this.signing_in;
     let muted = cx.theme().muted_foreground;
     let note = this

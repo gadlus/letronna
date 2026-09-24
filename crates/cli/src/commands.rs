@@ -204,7 +204,7 @@ pub fn sign_in(runner: &mut Runner) {
         return;
     }
 
-    let pending = match letronna_core::auth::begin() {
+    let pending = match letronna_core::auth::begin(letronna_core::auth::Client::Cli) {
         Ok(pending) => pending,
         Err(error) => {
             render::blank();

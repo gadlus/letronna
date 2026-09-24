@@ -229,7 +229,7 @@ impl Chat {
             .into_any_element(),
             "Privacy" => privacy_page(&chat, &presence, self.store.settings.skip_approvals, cx)
                 .into_any_element(),
-            "Account" => super::account::account_page(&chat, cx).into_any_element(),
+            "Account" => super::account::account_page(&chat, self, cx).into_any_element(),
             "Thinking" => thinking_page(&chat, &self.store.settings, cx).into_any_element(),
             "Plugins" => plugins_page(&chat, cx).into_any_element(),
             "About" => about_page(cx).into_any_element(),

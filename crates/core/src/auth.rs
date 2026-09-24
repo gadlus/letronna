@@ -167,15 +167,30 @@ pub struct Pending {
     pub url: String,
 }
 
+/// Which Letronna is signing in, so the dashboard can tell the terminal and
+/// the window apart in its list of devices.
+#[derive(Clone, Copy)]
+pub enum Client {
+    Cli,
+    App,
+}
+
 /// Open the port and work out where to send the browser.
-pub fn begin() -> Result<Pending, String> {
+pub fn begin(client: Client) -> Result<Pending, String> {
     // Port zero asks the operating system for a free one, which avoids both
     // a clash and a fixed port for anything else to sit on.
     let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .map_err(|e| format!("Cannot listen for the sign-in: {e}"))?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     let state = token(16);
-    let url = format!("{}?callback=http://127.0.0.1:{port}/&state={state}", authorize());
+    let client = match client {
+        Client::Cli => "cli",
+        Client::App => "app",
+    };
+    let url = format!(
+        "{}?callback=http://127.0.0.1:{port}/&state={state}&client={client}",
+        authorize()
+    );
     Ok(Pending {
         listener,
         state,
