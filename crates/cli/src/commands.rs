@@ -67,7 +67,7 @@ pub fn command(
             Flow::Handled
         }
         "/login" => {
-            sign_in(runner);
+            sign_in(runner, "Letronna user");
             Flow::Handled
         }
         "/logout" => {
@@ -169,7 +169,7 @@ pub fn command(
 /// The page that answers is not up yet, so this offers the stand-in as well:
 /// the real flow is tried first and the stand-in writes the same file when
 /// the browser has nothing to talk to.
-pub fn sign_in(runner: &mut Runner) {
+pub fn sign_in(runner: &mut Runner, name: &str) {
     if let Some(account) = letronna_core::auth::account() {
         render::blank();
         render::line(&render::dim(&format!(
@@ -204,7 +204,7 @@ pub fn sign_in(runner: &mut Runner) {
         &["Use the stand-in", "Wait for the browser", "Cancel"],
     );
     match picked {
-        Some(0) => match letronna_core::auth::stub("Letronna user") {
+        Some(0) => match letronna_core::auth::stub(name) {
             Ok(account) => welcome(&account),
             Err(error) => render::line(&render::red(&error)),
         },
@@ -446,7 +446,7 @@ const MODEL_CHOICES: usize = 10;
 
 /// Change the model, picking from what the gateway actually offers. `filter`
 /// narrows the list, and an exact name skips the asking entirely.
-fn switch_model(runner: &mut Runner, filter: &str) {
+pub fn switch_model(runner: &mut Runner, filter: &str) {
     let settings = &runner.store.settings;
     let guest = settings.gateway == letronna_core::gateway::GATEWAYS[0].name;
     let key = store::load_keys()

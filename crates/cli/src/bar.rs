@@ -149,6 +149,11 @@ pub struct Bar {
     done: bool,
     choice: Option<Choice>,
     slider: Option<Slider>,
+    /// A line that must not be shown: typed as dots, and kept out of the
+    /// conversation when it is sent. For keys.
+    secret: bool,
+    /// A question from `ask` is open, so its hint stays in the footer.
+    asking: bool,
     /// What the slider settled on: a stop, or nothing when it was left.
     slid: Option<Option<usize>>,
     answer: Option<usize>,
@@ -184,6 +189,8 @@ impl Bar {
             done: false,
             choice: None,
             slider: None,
+            secret: false,
+            asking: false,
             slid: None,
             answer: None,
             working: false,
@@ -286,6 +293,25 @@ impl Bar {
             }
             self.pump();
         }
+    }
+
+    /// Ask for a line of text, with `hint` in the footer while it is asked.
+    /// A secret one is drawn as dots and never echoed into the conversation,
+    /// so a key does not end up in the scrollback for anyone to read.
+    pub fn ask(&mut self, hint: &str, secret: bool) -> Option<String> {
+        if !self.live {
+            return crate::input::read(&format!("{} ", render::blue("›")));
+        }
+        self.secret = secret;
+        self.asking = true;
+        self.note = Some(hint.to_owned());
+        self.settle();
+        let answer = self.wait();
+        self.secret = false;
+        self.asking = false;
+        self.note = None;
+        self.settle();
+        answer
     }
 
     /// Pick one of `stops` by sliding along a track, starting at `start`.
@@ -391,7 +417,7 @@ impl Bar {
         // queue filled and threw the rest of the paste away -- which is how
         // words went missing out of the middle of pasted text.
         // Anything the user does takes the footer back from a note.
-        if self.handled > 0 && noted {
+        if self.handled > 0 && noted && !self.asking {
             self.note = None;
         }
         if self.handled > 0 || resized {
@@ -564,7 +590,9 @@ impl Bar {
             self.settle();
             return;
         }
-        self.echo(&line);
+        if !self.secret {
+            self.echo(&line);
+        }
         self.queued.push_back(line);
         self.settle();
     }
@@ -687,7 +715,12 @@ impl Bar {
     fn rows(&self) -> Vec<String> {
         let room = self.room().saturating_sub(2).max(4);
         let mut rows: Vec<String> = Vec::new();
-        for part in self.line.text().split('\n') {
+        let text: String = if self.secret {
+            self.line.text().chars().map(|_| '•').collect()
+        } else {
+            self.line.text().to_owned()
+        };
+        for part in text.split('\n') {
             rows.extend(render::fold(part, room));
         }
         if rows.is_empty() {

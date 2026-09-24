@@ -50,7 +50,9 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory dist | Out-Null
-          Compress-Archive -Path target\release\letronna.exe, LICENSE, README.md `
+          # Both halves: the terminal, which runs setup, and the window it
+          # installs. The install scripts expect to find both in here.
+          Compress-Archive -Path target\release\letronna.exe, target\release\letronna-gui.exe, LICENSE, README.md `
             -DestinationPath dist\letronna-${{ matrix.target }}.zip
 
       - name: Package (Linux)
@@ -58,7 +60,7 @@ jobs:
         run: |
           mkdir -p dist
           tar -czf dist/letronna-${{ matrix.target }}.tar.gz \
-            -C target/release letronna -C ../.. LICENSE README.md
+            -C target/release letronna letronna-gui -C ../.. LICENSE README.md
 
       - uses: actions/upload-artifact@v4
         with:
@@ -70,12 +72,19 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
 
+      # The install scripts go up beside the archives, so the one-line
+      # commands can point at the release until letronna.ai serves them.
       - uses: softprops/action-gh-release@v2
         with:
           prerelease: true
-          files: dist/*
+          files: |
+            dist/*
+            scripts/install.ps1
+            scripts/install.sh

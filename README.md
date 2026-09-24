@@ -19,9 +19,35 @@ Letronna is a chat-first desktop app built on [GPUI](https://github.com/zed-indu
 - Searchable model picker fed by the gateway's model list
 - Single ~24 MB executable, no runtime, no Electron
 
+## Install
+
+One line, then a few questions.
+
+**Windows** (PowerShell):
+
+```powershell
+iex (irm https://letronna.ai/install.ps1)
+```
+
+**Linux**:
+
+```sh
+curl -fsSL https://letronna.ai/install.sh | sh
+```
+
+The script only delivers the program. It downloads the latest release and hands over to `letronna setup`, which asks what to call you, signs you in, picks a provider and a model (keys are typed as dots and never printed), and installs the window, the terminal or both. Nothing needs administrator rights and nothing goes outside your own account. Run `letronna setup` again any time to change the answers; it also runs by itself the first time Letronna starts with nothing set up.
+
+Until letronna.ai serves the scripts, the same ones are attached to each release:
+
+```powershell
+iex (irm https://github.com/gadlus/letronna/releases/latest/download/install.ps1)
+```
+
+Set `LETRONNA_DOWNLOAD` to install from a different archive (a URL or a local file), or `LETRONNA_NO_SETUP=1` to unpack without the questions.
+
 ## Run it
 
-Download or build it and run it.
+Or download or build it and run it.
 
 On **Windows**, first launch copies the executable to `%LOCALAPPDATA%\Programs\Letronna`, adds a Start Menu entry so it shows up in Windows search, and registers in Apps & features. Newer builds re-register on launch. Uninstall from Apps & features, or run `Letronna.exe --uninstall`.
 

@@ -15,6 +15,7 @@ mod install;
 mod render;
 mod screen;
 mod session;
+mod setup;
 mod spinner;
 mod syntax;
 mod title;
@@ -53,11 +54,13 @@ fn main() {
         plan: args.plan,
         bar: bar::Bar::new(String::new()),
     };
-    // Installing is the one thing that works before anything is set up,
-    // because it is what people do first.
-    if runner.store.settings.model.is_empty() && !args.install {
+    // With nothing set up there is nothing to talk to, so the first run is
+    // the setup -- the same one the installers hand over to. Asking a
+    // question from a pipe cannot wait for answers, so that one stops here.
+    let first_run = runner.store.settings.model.is_empty();
+    if first_run && args.prompt.is_some() {
         render::line(&render::red(
-            "No model configured yet. Open the window once to choose a gateway: letronna gui",
+            "Nothing is set up yet. Run `letronna setup` first.",
         ));
         std::process::exit(1);
     }
@@ -96,12 +99,17 @@ fn main() {
     runner.bar.install();
     render::clear();
     banner(&runner, &folder, session);
-    if args.install {
-        install::run(&mut runner);
-        runner.bar.uninstall();
-        render::title("");
-        render::blank();
-        return;
+    if args.install || first_run {
+        // Set up and ready means straight into the conversation, which is
+        // what everyone who just installed something wants to do next.
+        if !setup::run(&mut runner) {
+            runner.bar.uninstall();
+            render::title("");
+            render::blank();
+            return;
+        }
+        let note = footer(&runner);
+        runner.bar.set_footer(note);
     }
     if args.start == Start::Choose {
         resume(&mut runner, &mut session, workspace.as_deref());

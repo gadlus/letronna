@@ -528,6 +528,13 @@ pub fn keys_path() -> PathBuf {
     backend::data_dir().join("keys.json")
 }
 
+/// Write the keys file. Private to this user: the keys are the one thing
+/// here worth stealing.
+pub fn save_keys(keys: &std::collections::HashMap<String, String>) -> std::io::Result<()> {
+    std::fs::create_dir_all(backend::data_dir())?;
+    std::fs::write(keys_path(), serde_json::to_vec_pretty(keys)?)
+}
+
 pub fn load_keys() -> std::collections::HashMap<String, String> {
     std::fs::read(keys_path())
         .ok()
@@ -567,8 +574,9 @@ mod tests {
     use crate::chat::Message;
 
     fn scratch(name: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("letronna-store-{name}-{}", std::process::id()));
+        // One folder per test, reused and emptied each run. Naming it after
+        // the process as well left a new one behind on every run.
+        let dir = std::env::temp_dir().join(format!("letronna-store-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

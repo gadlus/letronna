@@ -808,7 +808,8 @@ mod tests {
     use super::*;
     #[test]
     fn reads_lists_searches_within_workspace() {
-        let dir = std::env::temp_dir().join(format!("letronna-tools-{}", std::process::id()));
+        let dir = std::env::temp_dir().join("letronna-tools");
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("src/a.txt"), "hello\nWorld").unwrap();
         let ctx = ToolContext {
