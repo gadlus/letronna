@@ -147,3 +147,41 @@ fn draw(out: &mut impl Write, options: &[&str], at: usize, again: bool) {
     }
     let _ = out.flush();
 }
+
+/// Do `work` on a thread of its own and turn a wheel beside `label` until it
+/// is done. A silent pause reads as a program that has stopped, and most of
+/// these waits are the network, which takes as long as it takes.
+pub fn busy<T: Send + 'static>(label: &str, work: impl FnOnce() -> T + Send + 'static) -> T {
+    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let handle = std::thread::spawn(work);
+    if !render::colour() {
+        return handle.join().expect("the work panicked");
+    }
+    let began = std::time::Instant::now();
+    let mut out = std::io::stdout();
+    let mut frame = 0usize;
+    let _ = write!(out, "\x1b[?25l");
+    while !handle.is_finished() {
+        let seconds = began.elapsed().as_secs();
+        let clock = if seconds > 0 {
+            format!(" {seconds}s")
+        } else {
+            String::new()
+        };
+        let _ = write!(
+            out,
+            "\r\x1b[2K{}{} {}{}",
+            render::PAD,
+            render::blue(FRAMES[frame % FRAMES.len()]),
+            render::dim(label),
+            render::dim(&clock)
+        );
+        let _ = out.flush();
+        frame += 1;
+        std::thread::sleep(std::time::Duration::from_millis(90));
+    }
+    // Wipe the line: what the work found is what gets said next.
+    let _ = write!(out, "\r\x1b[2K\x1b[?25h");
+    let _ = out.flush();
+    handle.join().expect("the work panicked")
+}

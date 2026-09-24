@@ -440,6 +440,25 @@ impl Bar {
         self.settle();
     }
 
+    /// Do `work` without the screen going quiet: the waiting line in the
+    /// box while it is up, a wheel printed in place when it is not.
+    pub fn busy<T: Send + 'static>(
+        &mut self,
+        label: &str,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        if !self.live {
+            return crate::input::busy(label, work);
+        }
+        let handle = std::thread::spawn(work);
+        self.wait_line_about(label);
+        while !handle.is_finished() {
+            self.pump();
+        }
+        self.wait_line(false);
+        handle.join().expect("the work panicked")
+    }
+
     /// Show or take away the waiting line.
     pub fn wait_line(&mut self, on: bool) {
         self.waiting = on.then(crate::spinner::Waiting::new);

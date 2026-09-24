@@ -74,7 +74,7 @@ pub fn offer(runner: &mut Runner, number: usize, of: usize) {
         return;
     };
 
-    match place(parts) {
+    match runner.bar.busy("putting it in place", move || place(parts)) {
         Ok(done) => {
             for line in done {
                 render::line(&render::dim(&line));

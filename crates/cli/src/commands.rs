@@ -460,12 +460,15 @@ pub fn switch_model(runner: &mut Runner, filter: &str) {
     render::blank();
     render::said(&render::blue("●"), &render::bold("Models"));
     // Fetching takes a moment over the network; say so rather than freezing.
-    render::line(&render::dim(&format!("asking {gateway} what it has…")));
-    let found = if guest {
-        letronna_core::chat::free_models()
-    } else {
-        letronna_core::chat::list_models(&endpoint, &key)
-    };
+    let found = runner
+        .bar
+        .busy(&format!("asking {gateway} what it has"), move || {
+            if guest {
+                letronna_core::chat::free_models()
+            } else {
+                letronna_core::chat::list_models(&endpoint, &key)
+            }
+        });
 
     let mut models = match found {
         Ok(models) if !models.is_empty() => models,
@@ -527,5 +530,9 @@ fn set_model(runner: &mut Runner, model: String) {
     runner.persist();
     let note = footer(runner);
     runner.bar.set_footer(note);
-    render::said(&render::blue("›"), &render::bold(&model));
+    render::line(&format!(
+        "{} {}",
+        render::dim("model   "),
+        render::bold(&model)
+    ));
 }
