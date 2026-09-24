@@ -113,6 +113,10 @@ pub(crate) struct Chat {
     /// The session each remote chat is talking in, so a follow-up keeps its
     /// context. `/new` from the chat starts another.
     pub(crate) remote_session: std::collections::HashMap<letronna_core::messaging::Source, u64>,
+    /// Bumped when a turn is stopped. The stream and tool threads of the
+    /// stopped turn cannot be interrupted, so they run on; what they send
+    /// back carries the old number and is dropped.
+    pub(crate) generation: u64,
     /// A remote chat that has been sent the card the turn is waiting on, and
     /// the call it is about. Its next message answers it.
     pub(crate) remote_waiting: Option<(
@@ -300,6 +304,7 @@ impl Chat {
             scheduled: std::collections::HashSet::new(),
             remote: std::collections::HashMap::new(),
             remote_session: std::collections::HashMap::new(),
+            generation: 0,
             remote_waiting: None,
             messaging_stop: None,
             token_input,
@@ -434,7 +439,7 @@ impl Chat {
         }
         self.composer
             .update(cx, |input, cx| input.set_value("", window, cx));
-        if self.dispatch(prompt, cx).is_err() {
+        if self.dispatch(prompt, None, cx).is_err() {
             self.open_settings(window, cx);
         }
     }
@@ -445,6 +450,7 @@ impl Chat {
     pub(crate) fn dispatch(
         &mut self,
         prompt: String,
+        remote: Option<letronna_core::chat::Remote>,
         cx: &mut Context<Self>,
     ) -> std::result::Result<(), ()> {
         let connection = Connection {
@@ -455,6 +461,7 @@ impl Chat {
             tools: self.store.settings.gateway != GATEWAYS[0].name,
             workspace: None,
             plan: self.plan_mode,
+            remote,
         };
         if let Err(error) = backend::validate(&connection) {
             self.error = Some(error);
@@ -556,7 +563,7 @@ impl Chat {
         if schedule.unattended {
             self.unattended.insert(session);
         }
-        if self.dispatch(schedule.prompt.clone(), cx).is_err() {
+        if self.dispatch(schedule.prompt.clone(), None, cx).is_err() {
             // The gateway is not usable, so the run never started and
             // `finish` will not come round to report it.
             self.scheduled.remove(&session);
@@ -584,14 +591,18 @@ impl Chat {
         turn.live = agent::Live::default();
         self.follow();
         cx.notify();
+        let generation = self.generation;
         cx.spawn(async move |this, cx| {
             while let Ok(event) = receiver.recv().await {
                 let finished = matches!(event, Event::Finished(_));
-                if this
-                    .update(cx, |this, cx| this.on_event(event, cx))
-                    .is_err()
-                    || finished
-                {
+                let current = this.update(cx, |this, cx| {
+                    let current = this.generation == generation;
+                    if current {
+                        this.on_event(event, cx);
+                    }
+                    current
+                });
+                if !matches!(current, Ok(true)) || finished {
                     break;
                 }
             }
@@ -679,19 +690,23 @@ impl Chat {
 
     /// Run one call off the UI thread and continue the queue when it returns.
     fn execute_call(&mut self, call: backend::ToolCall, cx: &mut Context<Self>) {
-        let ctx = letronna_core::tools::ToolContext {
-            workspace: self
-                .turn
-                .as_ref()
-                .and_then(|turn| turn.connection.workspace.clone()),
-        };
+        let ctx = self
+            .turn
+            .as_ref()
+            .map(|turn| letronna_core::tools::ToolContext::of(&turn.connection))
+            .unwrap_or_default();
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
             let _ = tx.send_blocking(letronna_core::tools::run(&call.name, &call.arguments, &ctx));
         });
+        let generation = self.generation;
         cx.spawn(async move |this, cx| {
             if let Ok(result) = rx.recv().await {
-                let _ = this.update(cx, |this, cx| this.record_result(result, cx));
+                let _ = this.update(cx, |this, cx| {
+                    if this.generation == generation {
+                        this.record_result(result, cx)
+                    }
+                });
             }
         })
         .detach();
@@ -774,6 +789,22 @@ impl Chat {
             cx.notify();
             return;
         }
+        if message.said.trim() == "/stop" {
+            if !self.busy {
+                self.tell_remote(&source, "Nothing is running.", cx);
+                return;
+            }
+            // `stop_turn` tells the chat that owns the turn; this one may not be it.
+            let owner = self
+                .streaming_id
+                .and_then(|id| self.remote.get(&id))
+                .cloned();
+            self.stop_turn(cx);
+            if owner.as_ref() != Some(&source) {
+                self.tell_remote(&source, "Stopped.", cx);
+            }
+            return;
+        }
         if let Some((waiting, call)) = self.remote_waiting.clone()
             && waiting == source
         {
@@ -789,7 +820,8 @@ impl Chat {
         if self.busy {
             self.tell_remote(
                 &source,
-                "Busy with something else right now. Send that again in a moment.",
+                "Still working on something. Send /stop to cancel it, or send this again \
+                 once it is done.",
                 cx,
             );
             return;
@@ -832,7 +864,7 @@ impl Chat {
         // user has said otherwise a remote message may look but not touch.
         let was_plan = self.plan_mode;
         self.plan_mode = !allow_tools;
-        let _ = self.dispatch(message.text, cx);
+        let _ = self.dispatch(message.text, Some(message.remote), cx);
         self.plan_mode = was_plan;
     }
 
@@ -961,12 +993,11 @@ impl Chat {
         {
             return;
         }
-        let ctx = letronna_core::tools::ToolContext {
-            workspace: self
-                .turn
-                .as_ref()
-                .and_then(|turn| turn.connection.workspace.clone()),
-        };
+        let ctx = self
+            .turn
+            .as_ref()
+            .map(|turn| letronna_core::tools::ToolContext::of(&turn.connection))
+            .unwrap_or_default();
         let preview = letronna_core::tools::preview(&call.name, &call.arguments, &ctx);
         let text = letronna_core::messaging::card_text(&call.name, &call.arguments, &preview);
         self.tell_remote(&source, &text, cx);
@@ -1006,6 +1037,32 @@ impl Chat {
         if gap <= slack {
             self.scroll.scroll_to_bottom();
         }
+    }
+
+    /// End the turn in flight, from the Stop button or `/stop` in a chat.
+    /// The chat or schedule that started it hears "Stopped." rather than an
+    /// error; any call left without a result is answered as interrupted when
+    /// the session next goes to the model.
+    pub(crate) fn stop_turn(&mut self, cx: &mut Context<Self>) {
+        if !self.busy {
+            return;
+        }
+        self.generation += 1;
+        self.remote_waiting = None;
+        if let Some(id) = self.streaming_id {
+            if let Some(source) = self.remote.remove(&id) {
+                self.tell_remote(&source, "Stopped.", cx);
+            }
+            if self.scheduled.remove(&id) {
+                let title = self
+                    .store
+                    .index_of(id)
+                    .map(|ix| self.store.conversations[ix].title.clone())
+                    .unwrap_or_default();
+                self.send_report(title, "Stopped.".into(), cx);
+            }
+        }
+        self.finish(cx);
     }
 
     fn finish(&mut self, cx: &mut Context<Self>) {

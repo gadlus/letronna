@@ -114,6 +114,8 @@ pub struct Incoming {
     /// The sender's own words alone, for commands and card answers, which a
     /// quoted reply would otherwise bury.
     pub said: String,
+    /// Where it came from, as the session is told it.
+    pub remote: backend::Remote,
 }
 
 /// A card the app would show -- a question, or a tool waiting to be
@@ -250,11 +252,22 @@ fn parse_updates(body: &serde_json::Value) -> (Vec<Incoming>, Option<u64>) {
             .or_else(|| message["from"]["username"].as_str())
             .unwrap_or("someone")
             .to_owned();
+        // Group chats have negative IDs. Everyone in one reads the replies,
+        // and the Bot API keeps no history for a bot to read back.
+        let group = chat < 0;
         messages.push(Incoming {
             source: Source::Telegram(chat),
             from,
             text: text.to_owned(),
             said: text.to_owned(),
+            remote: backend::Remote {
+                place: match group {
+                    true => "a Telegram group".into(),
+                    false => "a Telegram chat".into(),
+                },
+                shared: group,
+                history: None,
+            },
         });
     }
     (messages, highest.map(|id| id + 1))
@@ -505,6 +518,21 @@ mod tests {
     }
 
     #[test]
+    fn a_telegram_group_is_shared_and_has_no_history() {
+        let body = json!({"ok": true, "result": [
+            {"update_id": 1, "message": {
+                "chat": {"id": -100}, "from": {"first_name": "user_a"}, "text": "hi"}},
+            {"update_id": 2, "message": {
+                "chat": {"id": 42}, "from": {"first_name": "user_a"}, "text": "hi"}}
+        ]});
+        let (messages, _) = parse_updates(&body);
+        assert!(messages[0].remote.shared);
+        assert_eq!(messages[0].remote.place, "a Telegram group");
+        assert!(!messages[1].remote.shared);
+        assert!(messages.iter().all(|m| m.remote.history.is_none()));
+    }
+
+    #[test]
     fn long_replies_are_trimmed_not_dropped() {
         let short = "all good";
         assert_eq!(trim_reply(short), short);
@@ -622,7 +650,8 @@ fn gateway_message(
     if author["id"].as_str() != Some(config.owner.trim()) || author["bot"].as_bool() == Some(true) {
         return None;
     }
-    if let Some(server) = message["guild_id"].as_str() {
+    let server = message["guild_id"].as_str();
+    if let Some(server) = server {
         if !config.servers.iter().any(|s| s.trim() == server) {
             return None;
         }
@@ -636,28 +665,55 @@ fn gateway_message(
             return None;
         }
     }
+    let channel = message["channel_id"].as_str()?.to_owned();
     let mut message = message.clone();
-    message["content"] = serde_json::Value::String(readable(&message, bot_id));
+    message["content"] = serde_json::Value::String(readable(&message, bot_id, ""));
     Some(Incoming {
-        source: Source::Discord(message["channel_id"].as_str()?.to_owned()),
+        source: Source::Discord(channel.clone()),
         from: author["username"].as_str().unwrap_or("you").to_owned(),
         text: message_text(&message, bot_id)?,
         said: own_text(&message).unwrap_or_default(),
+        remote: backend::Remote {
+            // The listener names the channel once it has looked it up.
+            place: match server {
+                Some(_) => "a Discord server channel".into(),
+                None => "a Discord DM".into(),
+            },
+            shared: server.is_some(),
+            history: Some(backend::History {
+                token: config.bot_token.trim().to_owned(),
+                channel,
+                bot_id: bot_id.to_owned(),
+            }),
+        },
     })
 }
 
-/// Mentions arrive as `<@id>`. The bot's own is dropped -- it is how the
-/// message was addressed, not part of what it says -- and anyone else's
-/// becomes a name the model can read.
-fn readable(message: &serde_json::Value, bot_id: &str) -> String {
+/// A server channel's name, for telling the model where it is.
+fn channel_name(token: &str, channel: &str) -> Option<String> {
+    let body: serde_json::Value =
+        discord_bot(reqwest::Method::GET, token, &format!("/channels/{channel}"))
+            .ok()?
+            .send()
+            .ok()?
+            .json()
+            .ok()?;
+    body["name"].as_str().map(str::to_owned)
+}
+
+/// Mentions arrive as `<@id>`; each becomes a name the model can read. The
+/// bot's own becomes `bot_as`: nothing in a prompt, where it is only how the
+/// message was addressed, and a name in history, where it is part of what
+/// was said.
+fn readable(message: &serde_json::Value, bot_id: &str, bot_as: &str) -> String {
     let mut text = message["content"].as_str().unwrap_or_default().to_owned();
     for user in message["mentions"].as_array().into_iter().flatten() {
         let Some(id) = user["id"].as_str() else {
             continue;
         };
         let name = match id == bot_id {
-            true => String::new(),
-            false => format!("@{}", user["username"].as_str().unwrap_or("someone")),
+            true => bot_as.to_owned(),
+            false => format!("@{}", display_name(user, bot_id)),
         };
         text = text
             .replace(&format!("<@{id}>"), &name)
@@ -766,6 +822,7 @@ fn gateway_session(
     let mut next_beat = Instant::now();
     let mut acked = true;
     let mut bot_id = String::new();
+    let mut names = std::collections::HashMap::<String, String>::new();
     loop {
         if stop.load(Ordering::Relaxed) {
             let _ = socket.close(None);
@@ -842,9 +899,20 @@ fn gateway_session(
                         .to_owned();
                 }
                 Some("MESSAGE_CREATE") => {
-                    if let Some(message) = gateway_message(&payload["d"], config, &bot_id)
-                        && sender.send_blocking(message).is_err()
+                    let Some(mut message) = gateway_message(&payload["d"], config, &bot_id) else {
+                        continue;
+                    };
+                    if let (true, Source::Discord(channel)) =
+                        (message.remote.shared, &message.source)
                     {
+                        let name = names.entry(channel.clone()).or_insert_with(|| {
+                            channel_name(&config.bot_token, channel).unwrap_or_default()
+                        });
+                        if !name.is_empty() {
+                            message.remote.place = format!("#{name} in a Discord server");
+                        }
+                    }
+                    if sender.send_blocking(message).is_err() {
                         return Ended::Stopped;
                     }
                 }
@@ -853,6 +921,185 @@ fn gateway_session(
             _ => {}
         }
     }
+}
+
+pub const READ_CHAT: &str = "read_chat";
+/// Roughly what read_chat returns at most. It stays under the tool output
+/// cap on purpose: that cap cuts the end, which here is the newest part.
+const HISTORY_BUDGET: usize = 20_000;
+
+/// Reads the chat a remote session is happening in, including messages not
+/// addressed to the bot. Discord only, and only the channel the session came
+/// from: there is no argument to point it anywhere else.
+pub struct ReadChat;
+
+impl crate::tools::Tool for ReadChat {
+    fn name(&self) -> &'static str {
+        READ_CHAT
+    }
+    fn description(&self) -> &'static str {
+        "Read recent messages in the chat this conversation is happening in, including \
+         those not addressed to you. Oldest first, one per line: time, name, text."
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {
+            "limit": {"type": "integer", "description": "How many of the latest messages, 1 to 500. Defaults to 100."}
+        }})
+    }
+    fn machine(&self) -> bool {
+        false
+    }
+    fn needs_history(&self) -> bool {
+        true
+    }
+    fn run(
+        &self,
+        args: &serde_json::Value,
+        ctx: &crate::tools::ToolContext,
+    ) -> Result<String, String> {
+        let history = ctx
+            .remote
+            .as_ref()
+            .and_then(|r| r.history.as_ref())
+            .ok_or("There is no chat to read in this session.")?;
+        let limit = args["limit"].as_u64().unwrap_or(100).clamp(1, 500) as usize;
+        let mut messages = Vec::new();
+        let mut before: Option<String> = None;
+        while messages.len() < limit {
+            let want = (limit - messages.len()).min(100);
+            let mut path = format!("/channels/{}/messages?limit={want}", history.channel);
+            if let Some(id) = &before {
+                path.push_str(&format!("&before={id}"));
+            }
+            let page: serde_json::Value = discord_bot(reqwest::Method::GET, &history.token, &path)?
+                .send()
+                .map_err(|_| "Cannot reach Discord.".to_owned())?
+                .error_for_status()
+                .map_err(|_| "Discord would not share this chat's messages.".to_owned())?
+                .json()
+                .map_err(|_| "Discord sent an unreadable reply.".to_owned())?;
+            let page = page.as_array().cloned().unwrap_or_default();
+            // Pages come newest first, so the last is where the next begins.
+            before = page
+                .last()
+                .and_then(|m| m["id"].as_str())
+                .map(str::to_owned);
+            let done = page.len() < want;
+            messages.extend(page);
+            if done {
+                break;
+            }
+        }
+        Ok(render_history(
+            &messages,
+            &history.bot_id,
+            HISTORY_BUDGET,
+            &chrono::Local,
+        ))
+    }
+}
+
+/// Channel history as the model reads it: oldest first, one message per
+/// line, the date only where the day changes. Over `budget` the oldest lines
+/// go, since the recent end is what a question is usually about.
+fn render_history<Tz: chrono::TimeZone>(
+    messages: &[serde_json::Value],
+    bot_id: &str,
+    budget: usize,
+    zone: &Tz,
+) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    let mut ordered: Vec<&serde_json::Value> = messages.iter().collect();
+    ordered.sort_by_key(|m| m["id"].as_str().and_then(|id| id.parse::<u64>().ok()));
+    let lines: Vec<(String, String)> = ordered
+        .into_iter()
+        .filter_map(|m| history_line(m, bot_id, zone))
+        .collect();
+    if lines.is_empty() {
+        return "No messages in this chat yet.".into();
+    }
+    let mut used = 0;
+    let kept = lines
+        .iter()
+        .rev()
+        .take_while(|(_, line)| {
+            used += line.len() + 1;
+            used <= budget
+        })
+        .count();
+    let left_out = lines.len() - kept;
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    let mut out = match left_out {
+        0 => format!("{kept} message{}, oldest first.", plural(kept)),
+        n => format!(
+            "The last {kept} message{}, oldest first; {n} older one{} left out to fit.",
+            plural(kept),
+            plural(n)
+        ),
+    };
+    let mut day = String::new();
+    for (date, line) in &lines[left_out..] {
+        if *date != day {
+            out.push_str(&format!("\n-- {date} --"));
+            day = date.clone();
+        }
+        out.push('\n');
+        out.push_str(line);
+    }
+    out
+}
+
+/// One message as a line of history, with the day it was sent, or `None`
+/// for one with nothing to read, such as a member joining.
+fn history_line<Tz: chrono::TimeZone>(
+    message: &serde_json::Value,
+    bot_id: &str,
+    zone: &Tz,
+) -> Option<(String, String)>
+where
+    Tz::Offset: std::fmt::Display,
+{
+    let when = chrono::DateTime::parse_from_rfc3339(message["timestamp"].as_str()?)
+        .ok()?
+        .with_timezone(zone);
+    let mut text = readable(message, bot_id, "@Letronna");
+    if let Some(forwarded) = forwarded_text(message) {
+        text = format!("{text} [forwarded] {forwarded}").trim().to_owned();
+    }
+    for file in message["attachments"].as_array().into_iter().flatten() {
+        let name = file["filename"].as_str().unwrap_or("file");
+        text.push_str(&format!(" [attachment: {name}]"));
+    }
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let reference = &message["referenced_message"]["author"];
+    let reply = match reference.is_object() {
+        true => format!("(replying to {}) ", display_name(reference, bot_id)),
+        false => String::new(),
+    };
+    // Later lines are indented, so every message still starts a line.
+    let text = text.lines().collect::<Vec<_>>().join("\n    ");
+    let author = display_name(&message["author"], bot_id);
+    Some((
+        when.format("%Y-%m-%d").to_string(),
+        format!("{} {author}: {reply}{text}", when.format("%H:%M")),
+    ))
+}
+
+/// The name a person goes by in Discord, or the bot as itself.
+fn display_name(user: &serde_json::Value, bot_id: &str) -> String {
+    if user["id"].as_str() == Some(bot_id) {
+        return "Letronna (you)".into();
+    }
+    user["global_name"]
+        .as_str()
+        .or_else(|| user["username"].as_str())
+        .unwrap_or("someone")
+        .to_owned()
 }
 
 #[cfg(test)]
@@ -902,7 +1149,7 @@ mod card_tests {
 
 #[cfg(test)]
 mod discord_tests {
-    use super::{Discord, Source, gateway_message};
+    use super::{Discord, Source, gateway_message, render_history};
     use serde_json::{Value, json};
 
     const BOT: &str = "99";
@@ -1011,5 +1258,99 @@ mod discord_tests {
             heard(about_someone).as_deref(),
             Some("is this true?\n\nIn reply to other:\n> it ships friday")
         );
+    }
+
+    #[test]
+    fn the_session_is_told_where_it_is() {
+        let dm = json!({"channel_id": "dm1", "content": "hi", "author": {"id": "7"}});
+        let remote = gateway_message(&dm, &config(), BOT).unwrap().remote;
+        assert_eq!(remote.place, "a Discord DM");
+        assert!(!remote.shared);
+        let history = remote.history.unwrap();
+        assert_eq!(
+            (history.channel.as_str(), history.bot_id.as_str()),
+            ("dm1", BOT)
+        );
+
+        let mention = json!({
+            "channel_id": "c1", "guild_id": "500", "content": "<@99> hi",
+            "author": {"id": "7"}, "mentions": [{"id": "99"}]
+        });
+        let remote = gateway_message(&mention, &config(), BOT).unwrap().remote;
+        assert!(remote.shared);
+        assert_eq!(remote.history.unwrap().channel, "c1");
+    }
+
+    #[test]
+    fn history_reads_oldest_first_one_line_each() {
+        // Newest first, as Discord pages them.
+        let page = [
+            json!({"id": "13", "timestamp": "2026-09-24T00:07:00+00:00", "type": 7,
+                   "content": "", "author": {"id": "9", "username": "joiner"}}),
+            json!({"id": "12", "timestamp": "2026-09-24T00:06:00+00:00", "content": "",
+                   "author": {"id": "8", "username": "other"},
+                   "message_snapshots": [{"message": {"content": "shipped"}}],
+                   "attachments": [{"filename": "log.txt"}]}),
+            json!({"id": "11", "timestamp": "2026-09-24T00:05:00+00:00", "content": "hi there",
+                   "author": {"id": "99", "username": "bot", "bot": true},
+                   "referenced_message": {"author": {"id": "7", "global_name": "Me"}}}),
+            json!({"id": "10", "timestamp": "2026-09-23T23:50:00+00:00",
+                   "content": "<@99> hello\nsecond line",
+                   "author": {"id": "7", "username": "me", "global_name": "Me"},
+                   "mentions": [{"id": "99", "username": "bot"}]}),
+        ];
+        let all = render_history(&page, BOT, 10_000, &chrono::Utc);
+        assert_eq!(
+            all,
+            "3 messages, oldest first.\n\
+             -- 2026-09-23 --\n\
+             23:50 Me: @Letronna hello\n    second line\n\
+             -- 2026-09-24 --\n\
+             00:05 Letronna (you): (replying to Me) hi there\n\
+             00:06 other: [forwarded] shipped [attachment: log.txt]"
+        );
+        // Over budget, the newest survive and the rest are counted.
+        let cut = render_history(&page, BOT, 60, &chrono::Utc);
+        assert_eq!(
+            cut,
+            "The last 1 message, oldest first; 2 older ones left out to fit.\n\
+             -- 2026-09-24 --\n\
+             00:06 other: [forwarded] shipped [attachment: log.txt]"
+        );
+        assert_eq!(
+            render_history(&[], BOT, 100, &chrono::Utc),
+            "No messages in this chat yet."
+        );
+    }
+
+    /// Reads a real channel. `LETRONNA_TEST_DISCORD_BOT=<token>
+    /// LETRONNA_TEST_DISCORD_CHANNEL=<id> cargo test -- --ignored`
+    #[test]
+    #[ignore]
+    fn live_read_chat() {
+        use crate::chat::{History, Remote};
+        let env = |name| std::env::var(name).expect(name);
+        let ctx = crate::tools::ToolContext {
+            remote: Some(Remote {
+                shared: true,
+                history: Some(History {
+                    token: env("LETRONNA_TEST_DISCORD_BOT"),
+                    channel: env("LETRONNA_TEST_DISCORD_CHANNEL"),
+                    bot_id: String::new(),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let out = crate::tools::run("read_chat", r#"{"limit": 250}"#, &ctx).unwrap();
+        // Only the summary line: the rest is other people's conversation.
+        println!("{}", out.lines().next().unwrap());
+        assert!(out.lines().count() > 1);
+    }
+
+    #[test]
+    fn read_chat_needs_a_chat() {
+        let refused = crate::tools::run("read_chat", "{}", &Default::default()).unwrap_err();
+        assert_eq!(refused, "There is no chat to read in this session.");
     }
 }

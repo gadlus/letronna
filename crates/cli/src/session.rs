@@ -40,6 +40,7 @@ impl Runner {
             tools: !guest,
             workspace,
             plan: self.plan,
+            remote: None,
         }
     }
 
@@ -144,9 +145,7 @@ impl Runner {
     }
 
     fn run_call(&mut self, turn: &mut Turn, call: letronna_core::chat::ToolCall) {
-        let ctx = tools::ToolContext {
-            workspace: turn.connection.workspace.clone(),
-        };
+        let ctx = tools::ToolContext::of(&turn.connection);
         let outcome = tools::run(&call.name, &call.arguments, &ctx);
         let summary = tools::summary(&call.name, &call.arguments);
         match &outcome {
@@ -184,9 +183,7 @@ impl Runner {
             return Ok(true);
         }
 
-        let ctx = tools::ToolContext {
-            workspace: turn.connection.workspace.clone(),
-        };
+        let ctx = tools::ToolContext::of(&turn.connection);
         render::blank();
         render::line(&format!(
             "{} {}",

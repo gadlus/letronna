@@ -51,7 +51,7 @@ pub fn now() -> u64 {
         .unwrap_or(0)
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Connection {
     pub endpoint: String,
     pub model: String,
@@ -64,6 +64,30 @@ pub struct Connection {
     pub workspace: Option<std::path::PathBuf>,
     /// Plan mode: read and ask only, nothing that changes the project.
     pub plan: bool,
+    /// Set when a chat app is driving the session rather than this window.
+    pub remote: Option<Remote>,
+}
+
+/// Where a remote conversation is happening, and what that allows.
+#[derive(Clone, Default)]
+pub struct Remote {
+    /// As the model is told it: "a Discord DM", "#general in a Discord
+    /// server", "a Telegram chat".
+    pub place: String,
+    /// Other people can read the replies, so nothing on this computer may be
+    /// reached from here.
+    pub shared: bool,
+    /// Where `read_chat` reads. Discord only: the Telegram Bot API keeps no
+    /// history a bot can ask for.
+    pub history: Option<History>,
+}
+
+#[derive(Clone, Default)]
+pub struct History {
+    pub token: String,
+    pub channel: String,
+    /// The bot's own user ID, so its earlier messages read as its own.
+    pub bot_id: String,
 }
 
 pub enum Event {
@@ -192,17 +216,29 @@ fn body(connection: &Connection, messages: &[Message]) -> Value {
     let start = window_start(messages);
     let mut system =
         String::from("You are Letronna, a personal assistant. Be clear, concise, and honest.");
-    if connection.tools {
+    let shared = connection.remote.as_ref().is_some_and(|r| r.shared);
+    if connection.tools && !shared {
         system.push_str(" You have tools to read, search, write and edit files and to run commands in the user's project; use them instead of guessing. Writes and commands are shown to the user for approval; a denial is final for that action. Ask with ask_user when a decision is the user's to make, such as a project name. After changing code, verify it (build, test, or run) before reporting done.");
         match &connection.workspace {
             Some(w) => system.push_str(&format!(" The project folder is `{}`.", w.display())),
             None => system.push_str(" No project folder is attached: you can only read under the home folder. Ask the user to attach one before writing or running anything."),
         }
-    } else {
+    } else if !connection.tools {
         system.push_str(" You have no tools or filesystem access on this gateway.");
     }
-    if connection.plan {
+    if connection.plan && !shared {
         system.push_str(" Plan mode is on: you can read, search and ask, but you cannot write files or run commands, and those tools are unavailable. Work out what you would do and lay out the plan, then let the user turn plan mode off to carry it out.");
+    }
+    // Without this the model takes "the conversation" to mean something on
+    // disk, and goes looking for it there.
+    if let Some(remote) = &connection.remote {
+        system.push_str(&format!(" You are talking through {}, and your reply is posted there as a chat message, so keep it short and conversational.", remote.place));
+        if remote.history.is_some() && connection.tools {
+            system.push_str(" You only see the messages addressed to you. When the user refers to the conversation, asks what was said, or wants a summary, read it with read_chat before answering.");
+        }
+        if remote.shared {
+            system.push_str(" Other people in this chat can read your replies. Nothing on this computer is reachable from here: no files, folders or commands.");
+        }
     }
     let mut context = vec![json!({"role": "system", "content": system})];
     let window = &messages[start..];
@@ -231,7 +267,7 @@ fn body(connection: &Connection, messages: &[Message]) -> Value {
         "stream_options": {"include_usage": true}
     });
     if connection.tools {
-        body["tools"] = Value::Array(crate::tools::specs(connection.plan));
+        body["tools"] = Value::Array(crate::tools::specs(connection));
     }
     body
 }
@@ -668,6 +704,7 @@ mod tests {
             tools: false,
             workspace: None,
             plan: false,
+            remote: None,
         }
     }
     #[test]
@@ -734,6 +771,7 @@ mod tests {
             tools: false,
             workspace: None,
             plan: false,
+            remote: None,
         };
         assert_eq!(
             validate(&c).unwrap(),
@@ -762,6 +800,7 @@ mod tests {
                 tools: false,
                 workspace: None,
                 plan: false,
+                remote: None,
             },
             vec![Message {
                 role: "user".into(),
@@ -797,10 +836,9 @@ mod tests {
             tools: true,
             workspace: Some(std::env::current_dir().unwrap()),
             plan: false,
+            remote: None,
         };
-        let ctx = crate::tools::ToolContext {
-            workspace: connection.workspace.clone(),
-        };
+        let ctx = crate::tools::ToolContext::of(&connection);
         let mut messages = vec![Message {
             role: "user".into(),
             content: "What is the package name in Cargo.toml? Read the file, then answer with just the name.".into(),
@@ -940,6 +978,39 @@ mod tests {
                 "{blocked} in plan mode"
             );
         }
+    }
+    #[test]
+    fn a_remote_session_is_told_where_it_is() {
+        let system = |remote: Remote| -> String {
+            body(
+                &Connection {
+                    tools: true,
+                    remote: Some(remote),
+                    ..connection()
+                },
+                &[],
+            )["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let server = system(Remote {
+            place: "#general in a Discord server".into(),
+            shared: true,
+            history: Some(History::default()),
+        });
+        assert!(server.contains("talking through #general in a Discord server"));
+        assert!(server.contains("read_chat"));
+        assert!(server.contains("Nothing on this computer is reachable"));
+        // Nothing that invites a look around the disk.
+        assert!(!server.contains("home folder"), "{server}");
+
+        let telegram = system(Remote {
+            place: "a Telegram chat".into(),
+            ..Default::default()
+        });
+        assert!(telegram.contains("home folder"));
+        assert!(!telegram.contains("read_chat"));
     }
     #[test]
     fn window_holds_still_so_the_cache_prefix_survives() {

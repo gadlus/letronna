@@ -322,15 +322,23 @@ impl Chat {
                     .icon(Icon::new(AppIcon::Mic))
                     .tooltip("Voice input, coming soon"),
             )
-            .child(
+            .child(if self.busy {
+                // A turn can wait on a slow tool or a card nobody answers;
+                // this is the way out that does not need a restart.
+                Button::new("stop")
+                    .primary()
+                    .xsmall()
+                    .rounded_full()
+                    .icon(Icon::new(IconName::CircleX))
+                    .tooltip("Stop")
+                    .on_click(cx.listener(|this, _, _, cx| this.stop_turn(cx)))
+            } else {
                 Button::new("send")
                     .primary()
                     .xsmall()
                     .rounded_full()
                     .icon(Icon::new(IconName::ArrowUp))
-                    .loading(self.busy)
-                    .disabled(self.busy)
-                    .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
-            )
+                    .on_click(cx.listener(|this, _, window, cx| this.send(window, cx)))
+            })
     }
 }

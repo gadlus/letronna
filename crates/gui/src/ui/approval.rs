@@ -29,9 +29,7 @@ impl Chat {
             letronna_core::agent::Next::AskUser(call) => call,
             _ => return None,
         };
-        let ctx = tools::ToolContext {
-            workspace: turn.connection.workspace.clone(),
-        };
+        let ctx = tools::ToolContext::of(&turn.connection);
         let summary = tools::summary(&call.name, &call.arguments);
         if !self.needs_user(&call.name) {
             return Some(
