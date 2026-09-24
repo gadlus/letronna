@@ -7,7 +7,7 @@
 //!
 //! The site that answers does not exist yet, so `stub` fills in for it: the
 //! same shape, the same callback, the same file written at the end, with the
-//! token made up locally. When there is a real site to talk to, `AUTHORIZE`
+//! token made up locally. When there is a real site to talk to, `authorize()`
 //! and the exchange in `finish` are what change; everything either side of
 //! them is already what it will be.
 
@@ -20,9 +20,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::chat::{self as backend};
 
+/// The website the browser is sent to. `LETRONNA_WEB` points it elsewhere,
+/// such as `http://localhost:5173` while working on the site.
+const WEBSITE: &str = "https://letronna.ai";
+
 /// Where the browser is sent. The callback port is added as a query, the way
 /// every local-callback sign-in does it.
-const AUTHORIZE: &str = "https://letronna.app/cli/authorize";
+fn authorize() -> String {
+    let site = std::env::var("LETRONNA_WEB").unwrap_or_else(|_| WEBSITE.to_owned());
+    format!("{}/cli/authorize", site.trim_end_matches('/'))
+}
 
 /// How long to hold the port open before giving up on the browser.
 const PATIENCE: Duration = Duration::from_secs(120);
@@ -81,7 +88,7 @@ pub fn begin() -> Result<Pending, String> {
         .map_err(|e| format!("Cannot listen for the sign-in: {e}"))?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     let state = token(16);
-    let url = format!("{AUTHORIZE}?callback=http://127.0.0.1:{port}/&state={state}");
+    let url = format!("{}?callback=http://127.0.0.1:{port}/&state={state}", authorize());
     Ok(Pending {
         listener,
         state,
