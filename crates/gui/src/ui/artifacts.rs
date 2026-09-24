@@ -5,8 +5,8 @@
 //! history on the way in. That means it can never disagree with what actually
 //! happened, and deleting a session takes its artifacts with it.
 
-use letronna_core::tools;
 use crate::prelude::*;
+use letronna_core::tools;
 
 pub(crate) struct Artifact {
     pub(crate) path: PathBuf,

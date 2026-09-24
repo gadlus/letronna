@@ -15,3 +15,13 @@ path = "src/main.rs"
 letronna-core.workspace = true
 serde_json.workspace = true
 async-channel.workspace = true
+# Raw keyboard input and cursor control, on both a Windows console and a
+# terminal that speaks ANSI. Doing it by hand means SetConsoleMode on one and
+# termios on the other, plus decoding key sequences.
+crossterm = { version = "0.29", default-features = false, features = [
+    "events",
+    "windows",
+    # Pasted text arrives as one event rather than as a burst of keystrokes,
+    # so a pasted paragraph is one message and not one message per line.
+    "bracketed-paste",
+] }

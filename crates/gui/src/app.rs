@@ -1,5 +1,5 @@
-use letronna_core::agent;
 use crate::prelude::*;
+use letronna_core::agent;
 
 pub(crate) const BRAND: &str = "Letronna";
 
@@ -461,6 +461,8 @@ impl Chat {
             tools: self.store.settings.gateway != GATEWAYS[0].name,
             workspace: None,
             plan: self.plan_mode,
+            effort: self.store.settings.effort.clone(),
+            search: self.store.settings.search,
             remote,
         };
         if let Err(error) = backend::validate(&connection) {

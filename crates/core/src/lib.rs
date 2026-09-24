@@ -7,6 +7,7 @@
 //! instead of growing two that slowly disagree.
 
 pub mod agent;
+pub mod auth;
 pub mod chat;
 pub mod gateway;
 pub mod jobs;

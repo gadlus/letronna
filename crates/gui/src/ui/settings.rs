@@ -6,6 +6,7 @@ const PAGES: &[(&str, AppIcon)] = &[
     ("Gateways", AppIcon::Plugs),
     ("Model", AppIcon::Robot),
     ("Appearance", AppIcon::Palette),
+    ("Thinking", AppIcon::Sparkles),
     ("Privacy", AppIcon::Shield),
     ("Plugins", AppIcon::Puzzle),
     ("About", AppIcon::Info),
@@ -221,6 +222,7 @@ impl Chat {
             .into_any_element(),
             "Privacy" => privacy_page(&chat, &presence, self.store.settings.skip_approvals, cx)
                 .into_any_element(),
+            "Thinking" => thinking_page(&chat, &self.store.settings, cx).into_any_element(),
             "Plugins" => plugins_page(&chat, cx).into_any_element(),
             "About" => about_page(cx).into_any_element(),
             _ => gateway_page(&pick, &endpoint, &key, &chat, cx).into_any_element(),
@@ -607,6 +609,125 @@ fn model_page(model: &Entity<InputState>, chat: &Entity<Chat>, cx: &App) -> Div 
                     .label("Save")
                     .on_click(move |_, window, cx| {
                         save.update(cx, |this, cx| this.apply_settings(window, cx))
+                    }),
+            ),
+        )
+}
+
+/// How hard the model thinks, whether that thinking is shown, and whether it
+/// may look things up.
+///
+/// A model that cannot be told how hard to think ignores the setting, so
+/// there is nothing here that has to be matched against a capability list --
+/// and no list to match against, since the gateway does not publish one.
+fn thinking_page(chat: &Entity<Chat>, settings: &Settings, cx: &App) -> Div {
+    const LEVELS: [(&str, &str); 4] = [
+        ("", "Whatever the model likes"),
+        ("low", "Low — quick answers"),
+        ("medium", "Medium"),
+        ("high", "High — slower, and it shows"),
+    ];
+
+    let mut levels = v_flex().gap_2();
+    for (value, text) in LEVELS {
+        let active = settings.effort == value;
+        let chat = chat.clone();
+        levels = levels.child(
+            h_flex()
+                .id(if value.is_empty() { "auto" } else { value })
+                .cursor_pointer()
+                .items_center()
+                .gap_2p5()
+                .p_2p5()
+                .rounded(cx.theme().radius)
+                .border_1()
+                .border_color(if active {
+                    cx.theme().primary
+                } else {
+                    cx.theme().border
+                })
+                .child(div().text_sm().child(text))
+                .on_click(move |_, _, cx| {
+                    chat.update(cx, |this, cx| {
+                        this.store.settings.effort = value.to_string();
+                        this.save();
+                        cx.notify();
+                    })
+                }),
+        );
+    }
+
+    let showing = settings.thinking;
+    let show = toggle_row(
+        "show-thinking",
+        "Show the thinking",
+        "Print the model's reasoning as it arrives, not only the answer it settles on.",
+        showing,
+        chat,
+        cx,
+        std::rc::Rc::new(move |this: &mut Chat| this.store.settings.thinking = !showing),
+    );
+
+    let searching = settings.search;
+    let search = toggle_row(
+        "web-search",
+        "Search the web",
+        "Let the gateway look things up for an answer, and cite the pages it read.",
+        searching,
+        chat,
+        cx,
+        std::rc::Rc::new(move |this: &mut Chat| this.store.settings.search = !searching),
+    );
+
+    v_flex()
+        .gap_4()
+        .child(heading(
+            "Thinking",
+            "Models that can be told how hard to think will; the rest carry on as they are.",
+            cx,
+        ))
+        .child(v_flex().gap_1().child(label("Effort", cx)).child(levels))
+        .child(show)
+        .child(search)
+}
+
+/// A switch with a name and a line about what it does.
+fn toggle_row(
+    id: &'static str,
+    title: &'static str,
+    blurb: &'static str,
+    on: bool,
+    chat: &Entity<Chat>,
+    cx: &App,
+    set: std::rc::Rc<dyn Fn(&mut Chat)>,
+) -> Div {
+    let chat = chat.clone();
+    h_flex()
+        .justify_between()
+        .items_center()
+        .gap_4()
+        .child(
+            v_flex()
+                .gap_0p5()
+                .child(div().text_sm().child(title))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(blurb),
+                ),
+        )
+        .child(
+            div().cursor_pointer().child(
+                gpui_component::switch::Switch::new(id)
+                    .checked(on)
+                    .on_click(move |_, _, cx| {
+                        let set = set.clone();
+                        chat.update(cx, |this, cx| {
+                            set(this);
+                            this.save();
+                            cx.notify();
+                        })
                     }),
             ),
         )

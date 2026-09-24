@@ -5,3 +5,6 @@
 *.log
 .CLAUDE.MD
 CLAUDE.md
+
+# Files the agent wrote while being tested in this folder
+/hello.asm

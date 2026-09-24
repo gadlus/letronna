@@ -7,8 +7,8 @@
 //! into its UI closures, so nothing external is needed to wire it up.
 
 use super::{AppEvent, Plugin};
-use letronna_core::tools::{Tool, ToolContext};
 use crate::prelude::*;
+use letronna_core::tools::{Tool, ToolContext};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

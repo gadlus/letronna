@@ -314,6 +314,36 @@ impl Chat {
                         cx.notify();
                     })),
             )
+            // Searching is a setting, but it changes what an answer is made
+            // of, so it belongs where the answer is asked for rather than
+            // three clicks away in a dialog.
+            .child(
+                Button::new("web-search")
+                    .ghost()
+                    .xsmall()
+                    .tooltip(if self.store.settings.search {
+                        "Web search on: it may look things up and cite them. Click to stop."
+                    } else {
+                        "Web search off. Click to let it look things up."
+                    })
+                    .text_color(if self.store.settings.search {
+                        cx.theme().primary
+                    } else {
+                        cx.theme().muted_foreground
+                    })
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(Icon::new(AppIcon::Search).size_3())
+                            .child("Web"),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.store.settings.search = !this.store.settings.search;
+                        this.save();
+                        cx.notify();
+                    })),
+            )
             .child(self.model_picker(cx))
             .child(
                 Button::new("mic")

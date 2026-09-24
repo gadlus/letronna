@@ -10,9 +10,9 @@
 //! reads back to the user without a syntax lesson.
 
 use crate::chat::{self as backend};
+use chrono::{DateTime, Datelike, Local, TimeZone, Timelike};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use chrono::{DateTime, Datelike, Local, TimeZone, Timelike};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub enum Trigger {

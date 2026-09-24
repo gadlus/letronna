@@ -4,66 +4,29 @@
 //! leaves. Sessions are the same files the window uses, so a conversation
 //! started here can be carried on there and the other way round.
 
+mod args;
+mod banner;
+mod bar;
+mod commands;
+mod diff;
+mod edit;
 mod input;
+mod install;
 mod render;
+mod screen;
 mod session;
+mod spinner;
+mod syntax;
+mod title;
 
+use args::{HELP, Start, parse};
+use banner::{banner, folder_name, footer, replay};
+use commands::{Flow, command, resume};
 use letronna_core::store;
 use session::Runner;
 
-const HELP: &str = "\
-Letronna — a small agent in your terminal
-
-  letronna                 open a conversation
-  letronna -p \"question\"    ask once and exit
-  letronna --continue      pick up the most recent session
-  letronna gui             open the window instead
-
-Options
-  -p, --print <prompt>     ask one question, print the answer, exit
-  -c, --continue           resume the most recent session
-      --yes                run tools without asking (careful)
-      --plan               read and search only; never write or run
-  -h, --help               this
-";
-
-struct Args {
-    prompt: Option<String>,
-    resume: bool,
-    yes: bool,
-    plan: bool,
-    help: bool,
-    gui: bool,
-}
-
-fn parse(mut raw: impl Iterator<Item = String>) -> Args {
-    let mut args = Args {
-        prompt: None,
-        resume: false,
-        yes: false,
-        plan: false,
-        help: false,
-        gui: false,
-    };
-    while let Some(arg) = raw.next() {
-        match arg.as_str() {
-            "gui" => args.gui = true,
-            "-p" | "--print" => args.prompt = raw.next(),
-            "-c" | "--continue" | "--resume" => args.resume = true,
-            "--yes" => args.yes = true,
-            "--plan" => args.plan = true,
-            "-h" | "--help" => args.help = true,
-            // A bare word is the prompt, so `letronna "what is this"` works.
-            other if !other.starts_with('-') && args.prompt.is_none() => {
-                args.prompt = Some(other.to_owned())
-            }
-            _ => {}
-        }
-    }
-    args
-}
-
 fn main() {
+    rescue_terminal();
     let args = parse(std::env::args().skip(1));
     if args.help {
         print!("{HELP}");
@@ -73,14 +36,26 @@ fn main() {
         launch_window();
         return;
     }
+    if args.uninstall {
+        match install::remove() {
+            Ok(done) => done
+                .iter()
+                .for_each(|line| render::line(&render::dim(line))),
+            Err(error) => render::line(&render::red(&error)),
+        }
+        return;
+    }
 
     let mut runner = Runner {
-        store: store::load(),
+        store: store::load_listing(),
         allowed: Default::default(),
         yes: args.yes,
         plan: args.plan,
+        bar: bar::Bar::new(String::new()),
     };
-    if runner.store.settings.model.is_empty() {
+    // Installing is the one thing that works before anything is set up,
+    // because it is what people do first.
+    if runner.store.settings.model.is_empty() && !args.install {
         render::line(&render::red(
             "No model configured yet. Open the window once to choose a gateway: letronna gui",
         ));
@@ -88,7 +63,17 @@ fn main() {
     }
 
     let workspace = std::env::current_dir().ok();
-    let session = runner.open(args.resume, workspace.clone());
+    let mut session = match args.start {
+        Start::Last => runner.open(true, workspace.clone()),
+        Start::Named(id) => match runner.open_id(id) {
+            Some(index) => index,
+            None => {
+                render::line(&render::red(&format!("No session with the id {id}.")));
+                std::process::exit(1);
+            }
+        },
+        _ => runner.open(false, workspace.clone()),
+    };
 
     // One question, one answer, no banner: this form gets piped.
     if let Some(prompt) = args.prompt {
@@ -102,57 +87,77 @@ fn main() {
         return;
     }
 
-    banner(&runner, workspace.as_deref());
-    loop {
+    let folder = folder_name(workspace.as_deref());
+    title::idle();
+    // The window has to be ours before the banner, or the banner goes to the
+    // screen we are about to swap away from.
+    let note = footer(&runner);
+    runner.bar.set_footer(note);
+    runner.bar.install();
+    render::clear();
+    banner(&runner, &folder, session);
+    if args.install {
+        install::run(&mut runner);
+        runner.bar.uninstall();
+        render::title("");
         render::blank();
-        let Some(line) = input::read(&format!("{} ", render::blue("›"))) else {
-            break;
-        };
-        let line = line.trim();
+        return;
+    }
+    if args.start == Start::Choose {
+        resume(&mut runner, &mut session, workspace.as_deref());
+    } else if runner.store.conversations[session].length() > 0 {
+        replay(&runner, session);
+    }
+
+    while let Some(line) = runner.bar.wait() {
+        let line = line.trim().to_owned();
         if line.is_empty() {
             continue;
         }
-        if matches!(line, "/exit" | "/quit" | "exit" | "quit") {
-            break;
+        if line.starts_with('/') {
+            let flow = command(&mut runner, &line, &mut session, workspace.as_deref());
+            if let Flow::Unknown = flow {
+                render::line(&render::dim(&format!(
+                    "{line} is not a command. Type / to see what is."
+                )));
+            }
+            // Painting is throttled, so the last thing a command printed can
+            // still be sitting in the buffer with nothing coming after it to
+            // bring it out. Whatever it said, say it now.
+            screen::settle();
+            match flow {
+                Flow::Stop => break,
+                _ => continue,
+            }
         }
-        if line == "/help" {
-            print!("{HELP}");
-            continue;
-        }
-        if let Err(error) = runner.ask(session, line) {
+        if let Err(error) = runner.ask(session, &line) {
             render::blank();
             render::line(&render::red(&error));
         }
         runner.persist();
+        if runner.bar.finished() {
+            break;
+        }
     }
+    runner.bar.uninstall();
+    render::title("");
     render::blank();
 }
 
-fn banner(runner: &Runner, workspace: Option<&std::path::Path>) {
-    let folder = workspace
-        .and_then(|p| p.file_name())
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "no project".into());
-    render::blank();
-    render::line(&format!(
-        "{}  {}  {}  {}  {}",
-        render::bold(letronna_core::BRAND),
-        render::dim("·"),
-        folder,
-        render::dim("·"),
-        runner.store.settings.model
-    ));
-    let mode = if runner.plan {
-        Some("plan mode: reads and searches only")
-    } else if runner.yes {
-        Some("running tools without asking")
-    } else {
-        None
-    };
-    if let Some(mode) = mode {
-        render::line(&render::dim(mode));
-    }
-    render::line(&render::dim("/help for commands, /exit to leave"));
+/// Hand the terminal back if we panic. Without this a crash leaves the
+/// window in raw mode on an alternate screen: no echo, no prompt, and the
+/// conversation still on the screen over whatever was there before. The
+/// report itself is left to the usual hook, which runs straight after.
+fn rescue_terminal() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Full scrolling region, cursor back, raw mode off.
+        print!("\x1b[r\x1b[?2004l\x1b[?25h");
+        let _ = crossterm::terminal::disable_raw_mode();
+        render::set_raw(false);
+        render::title("");
+        previous(info);
+    }));
 }
 
 /// Start the window. It is a separate binary because a GUI-subsystem
@@ -161,8 +166,18 @@ fn launch_window() {
     let beside = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join(window_name())));
-    let candidates = [beside, Some(std::path::PathBuf::from(window_name()))];
-    for candidate in candidates.into_iter().flatten() {
+    // Installed, the window sits one level up from the bin folder holding
+    // this. It is named for the app there rather than for the binary, and on
+    // Linux that name has no extension and a lowercase first letter.
+    let above = std::env::current_exe().ok().and_then(|p| {
+        p.parent()
+            .and_then(|d| d.parent())
+            .map(|d| d.join(installed_name()))
+    });
+    for candidate in [beside, above, Some(std::path::PathBuf::from(window_name()))]
+        .into_iter()
+        .flatten()
+    {
         if std::process::Command::new(&candidate).spawn().is_ok() {
             return;
         }
@@ -178,35 +193,12 @@ fn window_name() -> &'static str {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::parse;
-
-    fn args(words: &[&str]) -> super::Args {
-        parse(words.iter().map(|w| w.to_string()))
-    }
-
-    #[test]
-    fn reads_the_forms_people_actually_type() {
-        let bare = args(&[]);
-        assert!(bare.prompt.is_none() && !bare.resume && !bare.yes);
-
-        assert_eq!(args(&["-p", "hello"]).prompt.as_deref(), Some("hello"));
-        assert_eq!(
-            args(&["--print", "hello"]).prompt.as_deref(),
-            Some("hello")
-        );
-        // A bare word is a prompt, so quoting alone is enough.
-        assert_eq!(args(&["what is this"]).prompt.as_deref(), Some("what is this"));
-        // A flag after it must not be swallowed as the prompt.
-        let mixed = args(&["--plan", "look around"]);
-        assert!(mixed.plan);
-        assert_eq!(mixed.prompt.as_deref(), Some("look around"));
-
-        assert!(args(&["-c"]).resume);
-        assert!(args(&["--continue"]).resume);
-        assert!(args(&["gui"]).gui);
-        assert!(args(&["--yes"]).yes);
-        assert!(args(&["-h"]).help);
+/// What the installed window is called, which is not what the binary is
+/// called in the build folder.
+fn installed_name() -> &'static str {
+    if cfg!(windows) {
+        "Letronna.exe"
+    } else {
+        "letronna-gui"
     }
 }

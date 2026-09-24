@@ -1,8 +1,8 @@
 //! The card the chat shows when a tool needs the user: approve a write or a
 //! command, or answer an `ask_user` question.
 
-use letronna_core::tools;
 use crate::prelude::*;
+use letronna_core::tools;
 
 impl Chat {
     pub(crate) fn submit_answer(&mut self, window: &mut Window, cx: &mut Context<Self>) {

@@ -195,6 +195,8 @@ mod tests {
             workspace: None,
             plan: false,
             remote: None,
+            effort: String::new(),
+            search: false,
         })
     }
 
