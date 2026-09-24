@@ -243,35 +243,40 @@ pub fn open_in_browser(url: &str) {
 /// why there is no capability check here: on a model that can, this is the
 /// difference between sixty-four reasoning tokens and seven hundred.
 fn effort(runner: &mut Runner, rest: &str) {
-    const LEVELS: [&str; 4] = ["low", "medium", "high", "whatever the model likes"];
+    const LEVELS: [&str; 4] = ["auto", "low", "medium", "high"];
+    let current = match runner.store.settings.effort.as_str() {
+        "" => "auto",
+        level => level,
+    };
     let chosen = match rest {
+        // Nothing named: slide to it. Effort is a point on one line from
+        // less to more, and a slider says so where a list would not.
         "" => {
-            let current = match runner.store.settings.effort.as_str() {
-                "" => "whatever the model likes".to_owned(),
-                level => level.to_owned(),
-            };
-            let picked =
-                runner
-                    .bar
-                    .choose(&format!("Thinking effort: {current}"), Vec::new(), &LEVELS);
-            match picked {
+            let start = LEVELS.iter().position(|l| *l == current).unwrap_or(0);
+            match runner
+                .bar
+                .slide("How hard should it think?", &LEVELS, start)
+            {
                 Some(index) => LEVELS[index].to_owned(),
-                None => return,
+                None => {
+                    render::blank();
+                    render::line(&render::dim(&format!("Left at {current}.")));
+                    return;
+                }
             }
         }
         asked => asked.to_lowercase(),
     };
-    let effort = match chosen.as_str() {
+    runner.store.settings.effort = match chosen.as_str() {
         "low" | "medium" | "high" => chosen,
         _ => String::new(),
     };
-    runner.store.settings.effort = effort;
     runner.persist();
     let note = footer(runner);
     runner.bar.set_footer(note);
     render::blank();
     render::line(&render::dim(&match runner.store.settings.effort.as_str() {
-        "" => "Left to the model.".to_owned(),
+        "" => "Thinking left to the model.".to_owned(),
         level => format!("Thinking {level}."),
     }));
 }
