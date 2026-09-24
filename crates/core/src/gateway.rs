@@ -1,6 +1,5 @@
-pub const Upstream: &str = "https://pool.example/v1";
-
 /// The hosted pool on your Letronna account: no key, charged to your credit.
+/// First in the list, and what a new install starts on.
 pub const LETRONNA: &str = "Letronna";
 
 pub struct Gateway {
@@ -12,22 +11,10 @@ pub struct Gateway {
 
 pub const GATEWAYS: &[Gateway] = &[
     Gateway {
-        name: "Upstream Free",
-        base: Upstream,
-        needs_key: false,
-        blurb: "Guest access to the free catalog. No key, a few replies per session.",
-    },
-    Gateway {
         name: LETRONNA,
         base: "https://api.letronna.ai/v1",
         needs_key: false,
         blurb: "Your Letronna account. Hosted models, charged to your credit. No key.",
-    },
-    Gateway {
-        name: "Upstream",
-        base: Upstream,
-        needs_key: true,
-        blurb: "Your Upstream account with an API key. Marketplace catalog and quota.",
     },
     Gateway {
         name: "OpenAI",
@@ -67,13 +54,9 @@ pub fn resolve(name: &str, endpoint: &str, key: &str) -> (String, String) {
     (endpoint.to_owned(), key.to_owned())
 }
 
-/// Both Upstream gateways share one saved key.
+/// Where a gateway's key is saved: under its own name.
 pub fn key_slot(name: &str) -> &str {
-    if gateway(name).base == Upstream {
-        "Upstream"
-    } else {
-        name
-    }
+    name
 }
 
 pub fn gateway(name: &str) -> &'static Gateway {

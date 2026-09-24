@@ -15,7 +15,7 @@ Letronna is a chat-first desktop app built on [GPUI](https://github.com/zed-indu
 
 - Sessions sidebar with search, pinning and date groups
 - Markdown replies, streaming, multi-line composer
-- Gateways: Upstream Free, Upstream, OpenAI, OpenRouter, Ollama, or a custom base URL
+- Gateways: Letronna (hosted models on your account), OpenAI, OpenRouter, Ollama, or a custom base URL
 - Searchable model picker fed by the gateway's model list
 - Single ~24 MB executable, no runtime, no Electron
 
@@ -67,20 +67,19 @@ If Discord is running, Letronna shows a rich presence (Idle, or Chatting with th
 
 Closing the window keeps Letronna in the notification area. Left-click the tray icon to bring it back; right-click for Check for updates and Quit.
 
-First launch uses the Upstream Free gateway, which needs no key and gives a few guest replies. Open **Settings** at the bottom of the sidebar to pick another gateway, paste an API key, and reload the model list.
+First launch uses the Letronna gateway: sign in (`/login` in the terminal, or **Account** in Settings) and the hosted models are charged to your account's credit, with no key to paste. Open **Settings** to pick another gateway and use your own API key instead.
 
 ## Gateways
 
 | Gateway     | Base URL                          | Key      |
 |-------------|-----------------------------------|----------|
-| Upstream Free   | `https://pool.example/v1`          | none     |
-| Upstream        | `https://pool.example/v1`          | required |
-
-Upstream Free talks to the guest chat API and lists the free catalog (`pool-free/…` ids). Upstream talks to the marketplace API with your key and lists its own catalog. The two catalogs are separate, so a model shown on one gateway is not necessarily served on the other.
+| Letronna    | `https://api.letronna.ai/v1`      | sign in  |
 | OpenAI      | `https://api.openai.com/v1`       | required |
 | OpenRouter  | `https://openrouter.ai/api/v1`    | required |
 | Ollama      | `http://localhost:11434/v1`       | none     |
 | Custom      | anything OpenAI-compatible        | optional |
+
+The Letronna gateway's address follows `LETRONNA_API`, for working against a local API.
 
 Model lists come from `GET {base}/models`. Streaming uses SSE chat completions.
 
@@ -90,7 +89,7 @@ Model lists come from `GET {base}/models`. Streaming uses SSE chat completions.
 
 - `chats.json` sessions and the selected gateway, endpoint and model
 - `keys.json` API keys per gateway, plain text on your disk only
-- `upstream-session.txt` the Upstream guest cookie
+- `account.json` the Letronna sign-in for this computer
 
 Chat text is sent to the gateway you selected and nowhere else.
 

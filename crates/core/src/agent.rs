@@ -44,8 +44,6 @@ pub struct Live {
     pub prompt_tokens: u64,
     pub cached_tokens: u64,
     pub calls: Vec<ToolCall>,
-    /// Set once the provider reports the free-tier allowance.
-    pub free_remaining: Option<u64>,
 }
 
 /// One user turn in flight.
@@ -85,7 +83,6 @@ impl Turn {
                 self.live.prompt_tokens = *prompt;
                 self.live.cached_tokens = *cached;
             }
-            Event::FreeRemaining(n) => self.live.free_remaining = Some(*n),
             Event::ToolCalls(calls) => self.live.calls = calls.clone(),
             Event::Finished(_) => {}
         }
@@ -187,10 +184,9 @@ mod tests {
 
     fn turn() -> Turn {
         Turn::new(Connection {
-            endpoint: "https://pool.example/v1".into(),
+            endpoint: "http://localhost:11434/v1".into(),
             model: "test".into(),
             key: "k".into(),
-            guest: false,
             tools: true,
             workspace: None,
             plan: false,

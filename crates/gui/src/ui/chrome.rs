@@ -206,9 +206,6 @@ impl Chat {
             .child(self.gateway_chip(cx))
             .child(self.workspace_chip(cx))
             .child(self.job_chips(cx))
-            .when_some(self.free_remaining, |this, n| {
-                this.child(format!("{n} free replies left"))
-            })
             .child(div().flex_1())
             .child(concat!("v", env!("CARGO_PKG_VERSION")))
             .child(

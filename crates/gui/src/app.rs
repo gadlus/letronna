@@ -77,7 +77,6 @@ pub(crate) struct Chat {
     pub(crate) page: Page,
     pub(crate) sidebar_open: bool,
     pub(crate) greeting: &'static str,
-    pub(crate) free_remaining: Option<u64>,
     /// Who is signed in, as `account.json` last said; shared with the terminal.
     pub(crate) account: Option<letronna_core::auth::Account>,
     /// What the last sign-in, refresh or sign-out had to say.
@@ -152,8 +151,8 @@ impl Chat {
             store.settings.gateway = GATEWAYS[0].name.into();
         }
         if store.settings.endpoint.is_empty() {
-            store.settings.endpoint =
-                std::env::var("AGENT_BASE_URL").unwrap_or_else(|_| Upstream.into());
+            store.settings.endpoint = std::env::var("AGENT_BASE_URL")
+                .unwrap_or_else(|_| gateway(&store.settings.gateway).base.into());
         }
         let keys = load_keys();
         let saved_key = keys
@@ -161,9 +160,9 @@ impl Chat {
             .cloned()
             .or_else(|| std::env::var("AGENT_API_KEY").ok())
             .unwrap_or_default();
+        // No model yet: the list is loaded from the gateway and one is picked there.
         if store.settings.model.is_empty() {
-            store.settings.model =
-                std::env::var("AGENT_MODEL").unwrap_or_else(|_| "pool-free/gpt-oss-20b".into());
+            store.settings.model = std::env::var("AGENT_MODEL").unwrap_or_default();
         }
         let greeting = GREETINGS[(backend::now() % GREETINGS.len() as u64) as usize];
         let composer = cx.new(|cx| {
@@ -238,7 +237,6 @@ impl Chat {
             page: Page::Chat,
             sidebar_open: true,
             greeting,
-            free_remaining: None,
             account: letronna_core::auth::account(),
             account_note: None,
             signing_in: false,
@@ -319,15 +317,9 @@ impl Chat {
             &self.endpoint.read(cx).value(),
             &self.key.read(cx).value(),
         );
-        let guest = self.store.settings.gateway == GATEWAYS[0].name;
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
-            let result = if guest {
-                backend::free_models()
-            } else {
-                backend::list_models(&base, &key)
-            };
-            let _ = tx.send_blocking(result);
+            let _ = tx.send_blocking(backend::list_models(&base, &key));
         });
         let _ = window;
         cx.spawn(async move |this, cx| {
@@ -354,10 +346,6 @@ impl Chat {
     pub(crate) fn choose_model(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         self.model
             .update(cx, |input, cx| input.set_value(id.clone(), window, cx));
-        if id.starts_with("pool-free/") {
-            self.endpoint
-                .update(cx, |input, cx| input.set_value(Upstream, window, cx));
-        }
         self.store.settings.model = id;
         self.model_open = false;
         self.save();
@@ -431,8 +419,7 @@ impl Chat {
             endpoint,
             model: self.model.read(cx).value().to_string(),
             key,
-            guest: self.store.settings.gateway == GATEWAYS[0].name,
-            tools: self.store.settings.gateway != GATEWAYS[0].name,
+            tools: true,
             workspace: None,
             plan: self.plan_mode,
             effort: self.store.settings.effort.clone(),
@@ -580,9 +567,6 @@ impl Chat {
             return;
         };
         turn.absorb(&event);
-        if let Some(n) = turn.live.free_remaining {
-            self.free_remaining = Some(n);
-        }
         match event {
             Event::Finished(Err(error)) => {
                 self.error = Some(error);

@@ -127,6 +127,12 @@ fn choose_provider(runner: &mut Runner) -> bool {
         render::bold(chosen.name)
     ));
 
+    // The hosted pool is paid for by the account, so it needs one.
+    if chosen.name == gateway::LETRONNA && auth::account().is_none() {
+        render::line(&render::dim("Letronna's models run on your account. Sign in to use them."));
+        crate::commands::sign_in(runner);
+    }
+
     if chosen.needs_key {
         let slot = gateway::key_slot(chosen.name).to_owned();
         let mut keys = store::load_keys();

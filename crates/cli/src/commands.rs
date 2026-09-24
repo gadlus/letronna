@@ -465,7 +465,6 @@ const MODEL_CHOICES: usize = 10;
 /// narrows the list, and an exact name skips the asking entirely.
 pub fn switch_model(runner: &mut Runner, filter: &str) {
     let settings = &runner.store.settings;
-    let guest = settings.gateway == letronna_core::gateway::GATEWAYS[0].name;
     let saved = store::load_keys()
         .get(letronna_core::gateway::key_slot(&settings.gateway))
         .cloned()
@@ -481,11 +480,7 @@ pub fn switch_model(runner: &mut Runner, filter: &str) {
     let found = runner
         .bar
         .busy(&format!("asking {gateway} what it has"), move || {
-            if guest {
-                letronna_core::chat::free_models()
-            } else {
-                letronna_core::chat::list_models(&endpoint, &key)
-            }
+            letronna_core::chat::list_models(&endpoint, &key)
         });
 
     let mut models = match found {

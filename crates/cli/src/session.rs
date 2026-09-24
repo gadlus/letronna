@@ -33,7 +33,6 @@ pub struct Runner {
 impl Runner {
     fn connection(&self, workspace: Option<std::path::PathBuf>) -> Connection {
         let settings = &self.store.settings;
-        let guest = settings.gateway == letronna_core::gateway::GATEWAYS[0].name;
         let saved = letronna_core::store::load_keys()
             .get(letronna_core::gateway::key_slot(&settings.gateway))
             .cloned()
@@ -44,8 +43,7 @@ impl Runner {
             endpoint,
             model: settings.model.clone(),
             key,
-            guest,
-            tools: !guest,
+            tools: true,
             workspace,
             plan: self.plan,
             effort: settings.effort.clone(),
