@@ -27,14 +27,7 @@ pub fn command(
     match line {
         "/exit" | "/quit" => Flow::Stop,
         "/help" => {
-            render::blank();
-            for entry in bar::COMMANDS {
-                render::line(&format!(
-                    "{}  {}",
-                    render::bold(entry.name),
-                    render::dim(entry.blurb)
-                ));
-            }
+            help();
             Flow::Handled
         }
         "/clear" => {
@@ -149,6 +142,44 @@ pub fn command(
             Flow::Handled
         }
         _ => Flow::Unknown,
+    }
+}
+
+/// Keys the box answers to. None of them are written down anywhere else but
+/// the opening screen, which has scrolled away by the time anyone wonders.
+const KEYS: &[(&str, &str)] = &[
+    ("enter", "send"),
+    ("shift+enter", "a new line"),
+    ("↑ ↓", "step through what you said before"),
+    ("esc", "stop an answer, or clear the line"),
+    ("ctrl+c", "copy what is selected, clear the line, or leave"),
+    ("page up/down", "scroll back through the conversation"),
+    ("drag", "select and copy"),
+];
+
+/// The commands, then the keys, each in one column so it reads straight down.
+fn help() {
+    render::blank();
+    let width = bar::name_width();
+    for entry in bar::COMMANDS {
+        render::line(&format!(
+            "{}  {}",
+            render::bold(&format!("{:<width$}", entry.name)),
+            render::dim(entry.blurb)
+        ));
+    }
+    render::blank();
+    let width = KEYS
+        .iter()
+        .map(|(key, _)| key.chars().count())
+        .max()
+        .unwrap_or(0);
+    for (key, what) in KEYS {
+        render::line(&format!(
+            "{}  {}",
+            render::bold(&format!("{key:<width$}")),
+            render::dim(what)
+        ));
     }
 }
 
