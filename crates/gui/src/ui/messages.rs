@@ -353,10 +353,11 @@ fn usage_line(message: &Message) -> String {
     if message.per_second > 0. {
         parts.push(format!("{:.1} tok/s", message.per_second));
     }
-    if message.prompt_tokens > 0 {
-        parts.push(format!("{} in", message.prompt_tokens));
+    let input = message.input_tokens();
+    if input > 0 {
+        parts.push(format!("{input} in"));
         if message.cached_tokens > 0 {
-            let share = 100 * message.cached_tokens / message.prompt_tokens;
+            let share = 100 * message.cached_tokens / input;
             parts.push(format!("{share}% cached"));
         }
     }

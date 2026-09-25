@@ -36,6 +36,19 @@ pub struct Message {
     pub is_error: bool,
 }
 
+impl Message {
+    /// All the input a reply was given. OpenAI counts cache hits inside
+    /// `prompt_tokens`, but some gateways count them beside it, which shows
+    /// as more cached than sent -- and as a cache rate over a hundred percent.
+    pub fn input_tokens(&self) -> u64 {
+        if self.cached_tokens > self.prompt_tokens {
+            self.prompt_tokens + self.cached_tokens
+        } else {
+            self.prompt_tokens
+        }
+    }
+}
+
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
@@ -1157,5 +1170,21 @@ mod tests {
             Event::Finished(Ok(()))
         ));
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn cached_input_counted_beside_the_prompt_is_added_to_it() {
+        let inside = Message {
+            prompt_tokens: 3291,
+            cached_tokens: 3200,
+            ..Default::default()
+        };
+        assert_eq!(inside.input_tokens(), 3291);
+        let beside = Message {
+            prompt_tokens: 100,
+            cached_tokens: 1833,
+            ..Default::default()
+        };
+        assert_eq!(beside.input_tokens(), 1933);
     }
 }
