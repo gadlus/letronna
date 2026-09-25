@@ -31,6 +31,12 @@ fn main() {
         cx.bind_keys([
             // "secondary" is cmd on macOS and ctrl everywhere else.
             KeyBinding::new("secondary-n", NewSession, None),
+            KeyBinding::new("secondary-b", ToggleSidebar, None),
+            KeyBinding::new("secondary-,", OpenSettings, None),
+            // Scoped to the chat rather than global: gpui ranks a binding
+            // with no context above every other, which took escape away
+            // from dialogs and menus. Inside the chat, theirs go first.
+            KeyBinding::new("escape", Dismiss, Some("Chat")),
             KeyBinding::new(
                 "shift-enter",
                 gpui_component::input::Enter { secondary: true },

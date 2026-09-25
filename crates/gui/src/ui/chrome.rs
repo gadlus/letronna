@@ -26,6 +26,7 @@ impl Chat {
                             })
                             .size_4(),
                         )
+                        .tooltip_with_action("Toggle sidebar", &ToggleSidebar, None)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.sidebar_open = !this.sidebar_open;
                             cx.notify();

@@ -122,14 +122,27 @@ impl Chat {
             // which pushes the whole chat past the composer. Clipping here
             // clamps it; min_w_0 would instead collapse list layout.
             .child(div().w_full().overflow_hidden().pb_1().child(body))
+            // A reply is often wanted whole, and selecting it across
+            // paragraphs and code blocks is fiddly.
             .when(
-                !is_user && message.tokens > 0 && !message.content.is_empty(),
+                !is_user && !message.content.is_empty() && (!streaming || message.tokens > 0),
                 |this| {
                     this.child(
-                        div()
+                        h_flex()
+                            .gap_2()
+                            .items_center()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(usage_line(message)),
+                            .when(!streaming, |row| {
+                                row.child(
+                                    gpui_component::clipboard::Clipboard::new((
+                                        "copy-reply",
+                                        index,
+                                    ))
+                                    .value(message.content.clone()),
+                                )
+                            })
+                            .when(message.tokens > 0, |row| row.child(usage_line(message))),
                     )
                 },
             )
@@ -303,6 +316,11 @@ impl Chat {
     }
 
     pub(crate) fn empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // Without a project folder the tools have nowhere to read or write,
+        // and the only other place that says so is a chip in the status bar.
+        let no_project = self.store.conversations[self.store.active]
+            .workspace
+            .is_none();
         v_flex()
             .flex_1()
             .items_center()
@@ -321,6 +339,26 @@ impl Chat {
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
                     .child(self.greeting),
+            )
+            .when(no_project, |this| {
+                this.child(
+                    Button::new("choose-project")
+                        .outline()
+                        .small()
+                        .mt_4()
+                        .icon(Icon::new(AppIcon::Folder))
+                        .label("Choose a project folder")
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.attach_workspace(window, cx)),
+                        ),
+                )
+            })
+            .child(
+                div()
+                    .mt_4()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground.opacity(0.7))
+                    .child("Enter to send  ·  Shift+Enter for a new line  ·  Esc to stop"),
             )
     }
 

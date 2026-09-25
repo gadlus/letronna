@@ -1,10 +1,29 @@
 use crate::prelude::*;
 
 impl Chat {
+    /// The (gateway, model) pairs the picker shows for what is typed in its
+    /// search box.
+    pub(crate) fn model_matches(&self, cx: &App) -> Vec<(String, String)> {
+        let current = self.model.read(cx).value().to_string();
+        let query = self.model_search.read(cx).value().to_lowercase();
+        let on = &self.store.settings.gateway;
+        let mut ids = self.models.clone();
+        // The model in use stays on the list even when its gateway did not
+        // offer it, or the picker could not show what is picked.
+        if !current.is_empty() && !ids.iter().any(|(g, m)| g == on && *m == current) {
+            ids.insert(0, (on.clone(), current));
+        }
+        ids.retain(|(gw, id)| {
+            query.is_empty()
+                || id.to_lowercase().contains(&query)
+                || gw.to_lowercase().contains(&query)
+        });
+        ids
+    }
+
     pub(crate) fn model_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let current = self.model.read(cx).value().to_string();
         let short = current.rsplit('/').next().unwrap_or(&current).to_string();
-        let query = self.model_search.read(cx).value().to_lowercase();
         let mut list = v_flex()
             .id("model-list")
             .max_h(px(320.))
@@ -12,17 +31,24 @@ impl Chat {
             .p_1()
             .gap_0p5();
         let on = self.store.settings.gateway.clone();
-        let mut ids: Vec<(String, String)> = self.models.clone();
-        if !ids.iter().any(|(g, m)| *g == on && *m == current) {
-            ids.insert(0, (on.clone(), current.clone()));
+        let matches = self.model_matches(cx);
+        if matches.is_empty() {
+            list = list.child(
+                div()
+                    .px_2()
+                    .py_1p5()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(if self.loading_models {
+                        "Loading models…"
+                    } else if self.models.is_empty() {
+                        "No models yet. Set up a gateway in Settings."
+                    } else {
+                        "No models match"
+                    }),
+            );
         }
-        for (i, (gw, id)) in ids.into_iter().enumerate() {
-            if !query.is_empty()
-                && !id.to_lowercase().contains(&query)
-                && !gw.to_lowercase().contains(&query)
-            {
-                continue;
-            }
+        for (i, (gw, id)) in matches.into_iter().enumerate() {
             let active = gw == on && id == current;
             let (pick_gw, pick) = (gw.clone(), id.clone());
             list = list.child(
@@ -181,6 +207,16 @@ impl Chat {
         .detach();
     }
 
+    /// Put the cursor in the composer, so the next thing typed is a message.
+    /// Not while a dialog is up: the keys are its until it closes.
+    pub(crate) fn focus_composer(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        self.composer
+            .update(cx, |input, cx| input.focus(window, cx));
+    }
+
     pub(crate) fn insert(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.composer.update(cx, |input, cx| {
             let mut value = input.value().to_string();
@@ -301,13 +337,13 @@ impl Chat {
             .px_2()
             .py_1()
             .child(attach)
+            // Open while a reply streams, so the next message can be written
+            // in the meantime; `send` holds it until the reply is done.
             .child(
-                div().flex_1().min_w_0().child(
-                    Input::new(&self.composer)
-                        .w_full()
-                        .appearance(false)
-                        .disabled(self.busy),
-                ),
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Input::new(&self.composer).w_full().appearance(false)),
             )
             .child(
                 Button::new("plan-mode")
@@ -381,7 +417,7 @@ impl Chat {
                     .xsmall()
                     .rounded_full()
                     .icon(Icon::new(IconName::CircleX))
-                    .tooltip("Stop")
+                    .tooltip_with_action("Stop", &Dismiss, None)
                     .on_click(cx.listener(|this, _, _, cx| this.stop_turn(cx)))
             } else {
                 Button::new("send")
@@ -389,6 +425,7 @@ impl Chat {
                     .xsmall()
                     .rounded_full()
                     .icon(Icon::new(IconName::ArrowUp))
+                    .tooltip("Send (Enter)")
                     .on_click(cx.listener(|this, _, window, cx| this.send(window, cx)))
             })
     }

@@ -65,7 +65,7 @@ impl Chat {
         }
         self.save();
         self.load_models(window, cx);
-        self.close_settings(cx);
+        self.close_settings(window, cx);
     }
 
     pub(crate) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -74,16 +74,20 @@ impl Chat {
         self.settings_backdrop = crate::platform::backdrop::capture(window);
         self.settings_open = true;
         self.settings_closing = false;
+        // Somewhere inside the chat has to hold focus for escape to reach
+        // it; opened from a menu, nothing does.
+        self.settings_focus.focus(window);
         // The terminal may have signed in or out since this last looked.
         self.refresh_account(cx);
         cx.notify();
     }
 
-    pub(crate) fn close_settings(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.settings_closing {
             return;
         }
         self.settings_closing = true;
+        self.focus_composer(window, cx);
         cx.notify();
         cx.spawn(async move |this, cx| {
             cx.background_executor()
@@ -131,7 +135,7 @@ impl Chat {
             .bg(gpui::black())
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.close_settings(cx)),
+                cx.listener(|this, _, window, cx| this.close_settings(window, cx)),
             )
             .with_animation(
                 if closing { "scrim-out" } else { "scrim-in" },
@@ -237,9 +241,18 @@ impl Chat {
             "Thinking" => thinking_page(&chat, &self.store.settings, cx).into_any_element(),
             "Plugins" => plugins_page(&chat, cx).into_any_element(),
             "About" => about_page(cx).into_any_element(),
-            _ => gateway_page(&pick, &endpoint, &key, &chat, cx).into_any_element(),
+            _ => {
+                // Counted here and handed over, as the account page is: the
+                // page is drawn while the chat is mid-update.
+                let mut offered = std::collections::HashMap::new();
+                for (gateway, _) in &self.models {
+                    *offered.entry(gateway.clone()).or_insert(0usize) += 1;
+                }
+                gateway_page(&pick, &endpoint, &key, &chat, &offered, cx).into_any_element()
+            }
         };
         div()
+            .track_focus(&self.settings_focus)
             .w(vp.width - gap * 2.)
             .bg(cx.theme().background)
             .border_1()
@@ -281,9 +294,9 @@ impl Chat {
                                         .ghost()
                                         .xsmall()
                                         .icon(Icon::new(IconName::Close))
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| this.close_settings(cx)),
-                                        ),
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.close_settings(window, cx)
+                                        })),
                                 ),
                             ),
                     ),
@@ -750,6 +763,7 @@ fn gateway_page(
     endpoint: &Entity<InputState>,
     key: &Entity<InputState>,
     chat: &Entity<Chat>,
+    offered: &std::collections::HashMap<String, usize>,
     cx: &App,
 ) -> Div {
     let current = pick.read(cx).clone();
@@ -807,6 +821,22 @@ fn gateway_page(
                             .text_color(cx.theme().muted_foreground)
                             .child(gw.blurb),
                     )
+                    // Which cards are working, without opening each one.
+                    .when_some(offered.get(gw.name), |this, count| {
+                        this.child(
+                            h_flex()
+                                .mt_auto()
+                                .gap_1p5()
+                                .items_center()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(div().size(px(6.)).rounded_full().bg(cx.theme().green))
+                                .child(match count {
+                                    1 => "1 model".to_owned(),
+                                    n => format!("{n} models"),
+                                }),
+                        )
+                    })
                     .on_click(move |_, window, cx| {
                         chat.update(cx, |this, cx| this.select_gateway(gw.name, window, cx))
                     }),
@@ -848,7 +878,7 @@ fn gateway_page(
                     },
                     cx,
                 ))
-                .child(Input::new(key)),
+                .child(Input::new(key).mask_toggle()),
         ))
         .child(
             h_flex().justify_end().child(

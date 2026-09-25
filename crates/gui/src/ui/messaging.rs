@@ -68,6 +68,8 @@ impl Chat {
             cx.notify();
             return;
         }
+        self.connecting = true;
+        cx.notify();
         let entity = cx.entity();
         cx.spawn(async move |_, cx| {
             let check = cx
@@ -75,6 +77,7 @@ impl Chat {
                 .spawn(async move { messaging::check(&token).map(|name| (name, token)) })
                 .await;
             let _ = entity.update(cx, |this, cx| {
+                this.connecting = false;
                 match check {
                     Ok((name, token)) => {
                         this.messaging.telegram.token = token;
@@ -313,7 +316,12 @@ impl Chat {
                                     .gap_2()
                                     .child(section("Required", cx))
                                     .child(field("Bot token", "The token @BotFather gave you. It is kept on this machine.", cx))
-                                    .child(Input::new(&self.token_input).small().w_full())
+                                    .child(
+                                        Input::new(&self.token_input)
+                                            .small()
+                                            .w_full()
+                                            .mask_toggle(),
+                                    )
                                     .when_some(self.bot_name.clone(), |this, name| {
                                         this.child(
                                             div()
@@ -412,6 +420,8 @@ impl Chat {
                             .primary()
                             .small()
                             .label("Save changes")
+                            .loading(self.connecting)
+                            .disabled(self.connecting)
                             .on_click(cx.listener(|this, _, _, cx| this.connect_messaging(cx))),
                     ),
             )
@@ -525,6 +535,8 @@ impl Chat {
             cx.notify();
             return;
         }
+        self.connecting = true;
+        cx.notify();
         let entity = cx.entity();
         cx.spawn(async move |_, cx| {
             let check = cx
@@ -546,6 +558,7 @@ impl Chat {
                 })
                 .await;
             let _ = entity.update(cx, |this, cx| {
+                this.connecting = false;
                 match check {
                     Ok((hook, bot, webhook, token, owner)) => {
                         let discord = &mut this.messaging.discord;
@@ -678,7 +691,12 @@ impl Chat {
                                         "It is kept on this machine.",
                                         cx,
                                     ))
-                                    .child(Input::new(&self.discord_token_input).small().w_full())
+                                    .child(
+                                        Input::new(&self.discord_token_input)
+                                            .small()
+                                            .w_full()
+                                            .mask_toggle(),
+                                    )
                                     .child(field(
                                         "Your user ID",
                                         "The only person the bot answers.",
@@ -835,6 +853,8 @@ impl Chat {
                                     .primary()
                                     .small()
                                     .label("Save changes")
+                                    .loading(self.connecting)
+                                    .disabled(self.connecting)
                                     .on_click(
                                         cx.listener(|this, _, _, cx| this.connect_discord(cx)),
                                     ),

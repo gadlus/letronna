@@ -11,7 +11,11 @@ pub(crate) const GREETINGS: &[&str] = &[
     "Ready when you are.",
 ];
 
-actions!(letronna, [NewSession]);
+actions!(letronna, [NewSession, Dismiss, ToggleSidebar, OpenSettings]);
+
+/// How near the bottom still counts as at it: a line or two, so a reply
+/// that grew a little since the last look is still followed.
+const FOLLOW_SLACK: Pixels = px(48.);
 
 pub(crate) enum Verdict {
     Allow {
@@ -72,6 +76,8 @@ pub(crate) struct Chat {
     pub(crate) presence_pick: Entity<String>,
     pub(crate) settings_page: Entity<&'static str>,
     pub(crate) settings_open: bool,
+    /// Held by the settings panel while it is open, so escape reaches it.
+    pub(crate) settings_focus: FocusHandle,
     pub(crate) settings_backdrop: Option<std::sync::Arc<RenderImage>>,
     pub(crate) settings_closing: bool,
     pub(crate) rename: Entity<InputState>,
@@ -83,6 +89,8 @@ pub(crate) struct Chat {
     /// What the last sign-in, refresh or sign-out had to say.
     pub(crate) account_note: Option<String>,
     pub(crate) signing_in: bool,
+    /// A messaging token is being checked with its service.
+    pub(crate) connecting: bool,
     pub(crate) loading_models: bool,
     pub(crate) gateway_error: Option<String>,
     pub(crate) busy: bool,
@@ -149,6 +157,11 @@ pub(crate) struct Chat {
     pub(crate) thinking_open: std::collections::HashSet<usize>,
     pub(crate) error: Option<String>,
     pub(crate) scroll: ScrollHandle,
+    /// Whether the chat keeps to its newest message as more arrives.
+    pub(crate) following: bool,
+    /// Where the chat was scrolled to at the last draw, to tell which way
+    /// it has moved since.
+    pub(crate) followed_offset: Pixels,
     pub(crate) _subscriptions: Vec<Subscription>,
 }
 
@@ -253,7 +266,14 @@ impl Chat {
                 .placeholder("Run the tests and tell me what broke.")
         });
         let subscriptions = vec![
-            cx.subscribe_in(&model_search, window, |_, _, _: &InputEvent, _, cx| {
+            cx.subscribe_in(&model_search, window, |this, _, event, window, cx| {
+                // Enter takes the first match, so a model can be picked by
+                // typing a few letters of it.
+                if matches!(event, InputEvent::PressEnter { .. })
+                    && let Some((gateway, id)) = this.model_matches(cx).into_iter().next()
+                {
+                    this.choose_model(gateway, id, window, cx);
+                }
                 cx.notify()
             }),
             cx.subscribe_in(&composer, window, |this, _, event, window, cx| {
@@ -275,6 +295,7 @@ impl Chat {
             account: letronna_core::auth::account(),
             account_note: None,
             signing_in: false,
+            connecting: false,
             loading_models: false,
             gateway_error: None,
             store,
@@ -291,6 +312,7 @@ impl Chat {
             presence_pick,
             settings_page,
             settings_open: false,
+            settings_focus: cx.focus_handle(),
             settings_backdrop: None,
             settings_closing: false,
             rename,
@@ -330,9 +352,15 @@ impl Chat {
             thinking_open: std::collections::HashSet::new(),
             error,
             scroll: ScrollHandle::new(),
+            following: true,
+            followed_offset: px(0.),
             _subscriptions: subscriptions,
         };
         this.load_models(window, cx);
+        // Directly, not through `focus_composer`: the window's root does
+        // not exist yet to ask about dialogs, and there can be none.
+        this.composer
+            .update(cx, |input, cx| input.focus(window, cx));
         Self::watch_schedules(cx);
         this.restart_messaging(cx);
         if this.store.settings.presence == "off" {
@@ -395,6 +423,7 @@ impl Chat {
         self.store.settings.gateway = gateway;
         self.store.settings.model = id;
         self.model_open = false;
+        self.focus_composer(window, cx);
         self.save();
         cx.notify();
     }
@@ -423,6 +452,7 @@ impl Chat {
         self.page = Page::Chat;
         self.composer
             .update(cx, |input, cx| input.set_value("", window, cx));
+        self.focus_composer(window, cx);
         self.save();
         cx.notify();
     }
@@ -515,7 +545,7 @@ impl Chat {
         );
         self.error = None;
         self.save();
-        self.scroll.scroll_to_bottom();
+        self.follow();
         self.run_turn(cx);
         Ok(())
     }
@@ -605,7 +635,6 @@ impl Chat {
             self.store.conversations[ix].messages.clone(),
         );
         turn.live = agent::Live::default();
-        self.follow();
         cx.notify();
         let generation = self.generation;
         cx.spawn(async move |this, cx| {
@@ -639,7 +668,6 @@ impl Chat {
             Event::Finished(Ok(())) => self.on_reply(cx),
             _ => {}
         }
-        self.follow();
         cx.notify();
     }
 
@@ -730,7 +758,6 @@ impl Chat {
         if let Some(turn) = self.turn.as_mut() {
             turn.finish_call(result);
         }
-        self.follow();
         self.advance_tools(cx);
     }
 
@@ -1042,14 +1069,69 @@ impl Chat {
         }
     }
 
-    /// Follow the stream only while the user is already at the bottom, so
-    /// scrolling up to reread does not snap back on every token.
-    pub(crate) fn follow(&self) {
-        let slack = px(48.);
-        let gap = self.scroll.max_offset().height + self.scroll.offset().y;
-        if gap <= slack {
+    /// How far above the bottom of the chat, in pixels.
+    fn distance_from_bottom(&self) -> Pixels {
+        self.scroll.max_offset().height + self.scroll.offset().y
+    }
+
+    /// Go to the newest message and stay with it as more arrives.
+    pub(crate) fn follow(&mut self) {
+        self.following = true;
+        self.scroll.scroll_to_bottom();
+    }
+
+    /// Stay at the bottom while following, and stop following once the user
+    /// scrolls up to reread. Distance from the bottom alone cannot say which
+    /// happened: a reply's markdown is laid out a moment after it arrives, so
+    /// the bottom runs ahead of the view on its own. What the user does is
+    /// move the view up and away from the bottom. Content that shrinks also
+    /// moves it up, but pinned to the bottom, and that must not count.
+    fn keep_following(&mut self) {
+        let offset = self.scroll.offset().y;
+        let near_bottom = self.distance_from_bottom() <= FOLLOW_SLACK;
+        // The offset grows towards zero going up.
+        if offset > self.followed_offset && !near_bottom {
+            self.following = false;
+        } else if offset < self.followed_offset && near_bottom {
+            self.following = true;
+        }
+        self.followed_offset = offset;
+        if self.following {
             self.scroll.scroll_to_bottom();
         }
+    }
+
+    /// A way back down once the chat has been scrolled up. Following stops
+    /// there on purpose, so without this the only way back to a reply still
+    /// arriving is to wheel down to it.
+    fn jump_to_latest(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if self.following || self.distance_from_bottom() <= FOLLOW_SLACK {
+            return None;
+        }
+        Some(
+            h_flex()
+                .absolute()
+                .bottom_3()
+                .left_0()
+                .right_0()
+                .justify_center()
+                .child(
+                    Button::new("jump-to-latest")
+                        .icon(Icon::new(IconName::ArrowDown))
+                        .small()
+                        .rounded_full()
+                        // It sits over the text, so it needs an edge to be
+                        // told apart from it.
+                        .border_1()
+                        .border_color(cx.theme().primary.opacity(0.5))
+                        .shadow_md()
+                        .tooltip("Jump to latest")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.follow();
+                            cx.notify();
+                        })),
+                ),
+        )
     }
 
     /// End the turn in flight, from the Stop button or `/stop` in a chat.
@@ -1078,6 +1160,19 @@ impl Chat {
         self.finish(cx);
     }
 
+    /// Escape that nothing nearer took: close what is open over the chat,
+    /// or else stop the reply, which is what escape does in the terminal.
+    fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_open {
+            self.close_settings(window, cx);
+        } else if self.model_open {
+            self.model_open = false;
+            cx.notify();
+        } else {
+            self.stop_turn(cx);
+        }
+    }
+
     fn finish(&mut self, cx: &mut Context<Self>) {
         self.answer_remote(cx);
         self.report_scheduled(cx);
@@ -1091,6 +1186,7 @@ impl Chat {
 
 impl Render for Chat {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.keep_following();
         // A job starting or exiting happens off the UI thread, so the footer
         // chips need a poll while any of them is alive. It stops on its own.
         if !self.job_tick && letronna_core::jobs::list().iter().any(|job| job.running) {
@@ -1257,6 +1353,7 @@ impl Render for Chat {
                         .child(v_flex().w_full().px_6().py_6().gap_6().children(rows)),
                 )
                 .vertical_scrollbar(&self.scroll)
+                .children(self.jump_to_latest(cx))
                 .into_any_element()
         };
 
@@ -1288,7 +1385,18 @@ impl Render for Chat {
             .font_family(BODY_FONT)
             .text_sm()
             .relative()
+            .key_context("Chat")
             .on_action(cx.listener(|this, _: &NewSession, window, cx| this.new_chat(window, cx)))
+            .on_action(cx.listener(|this, _: &Dismiss, window, cx| this.dismiss(window, cx)))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
+                this.sidebar_open = !this.sidebar_open;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
+                if !this.settings_open {
+                    this.open_settings(window, cx)
+                }
+            }))
             .child(self.title_bar(window, cx))
             .child(
                 h_flex()

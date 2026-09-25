@@ -97,7 +97,7 @@ impl Chat {
                     .text_color(cx.theme().muted_foreground)
                     .child(age_label(c.updated, now)),
             )
-            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 if event.modifiers().shift {
                     this.store.conversations[index].pinned ^= true;
                 } else {
@@ -105,7 +105,8 @@ impl Chat {
                     this.error = None;
                     this.page = Page::Chat;
                     // The handle is shared across sessions; start at the latest message.
-                    this.scroll.scroll_to_bottom();
+                    this.follow();
+                    this.focus_composer(window, cx);
                 }
                 this.save();
                 cx.notify();
@@ -156,6 +157,16 @@ impl Chat {
             }
             sessions = sessions.child(self.session_row(i, now, cx));
         }
+        if visible.is_empty() {
+            sessions = sessions.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("No sessions match"),
+            );
+        }
 
         v_flex()
             .w(px(250.))
@@ -182,13 +193,26 @@ impl Chat {
                         Some(Page::Skills),
                         cx,
                     ))
-                    .child(self.nav_item(
-                        "messaging",
-                        AppIcon::MessageSquare,
-                        "Messaging",
-                        Some(Page::Messaging),
-                        cx,
-                    ))
+                    .child(
+                        self.nav_item(
+                            "messaging",
+                            AppIcon::MessageSquare,
+                            "Messaging",
+                            Some(Page::Messaging),
+                            cx,
+                        )
+                        // A chat asking to be allowed waits on that page,
+                        // which nobody has reason to open; this is the knock.
+                        .when(self.pairing.is_some(), |this| {
+                            this.child(div().size(px(6.)).rounded_full().bg(cx.theme().primary))
+                                .tooltip(|window, cx| {
+                                    gpui_component::tooltip::Tooltip::new(
+                                        "A Telegram chat is asking to be allowed",
+                                    )
+                                    .build(window, cx)
+                                })
+                        }),
+                    )
                     .child(self.nav_item(
                         "artifacts",
                         AppIcon::File,
