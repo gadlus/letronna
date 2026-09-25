@@ -52,6 +52,9 @@ impl Chat {
         } else {
             self.keys.insert(slot, key);
         }
+        // Cleared before the writes, not after: clearing last threw away the
+        // very error that says the key was not kept.
+        self.error = None;
         if std::fs::create_dir_all(backend::data_dir())
             .and_then(|_| {
                 std::fs::write(keys_path(), serde_json::to_vec_pretty(&self.keys).unwrap())
@@ -61,7 +64,6 @@ impl Chat {
             self.error = Some("Could not save the API key.".into());
         }
         self.save();
-        self.error = None;
         self.load_models(window, cx);
         self.close_settings(cx);
     }

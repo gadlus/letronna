@@ -74,6 +74,9 @@ impl Chat {
                     true
                 })
         });
+        // After opening, which takes focus for the dialog itself; the name
+        // is what is being edited, so the cursor belongs there.
+        self.rename.update(cx, |input, cx| input.focus(window, cx));
     }
 
     pub(crate) fn delete_session(
@@ -84,40 +87,37 @@ impl Chat {
     ) {
         let title = self.store.conversations[index].title.clone();
         let chat = cx.entity();
-        window.open_dialog(cx, move |dialog, _, cx| {
-            let chat = chat.clone();
-            dialog
-                .title(div().font_family(HEADING_FONT).child("Delete session"))
-                .w(px(420.))
-                .confirm()
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(format!(
-                            "\"{title}\" and its messages will be removed from this device."
-                        )),
-                )
-                .on_ok(move |_, window, cx| {
-                    chat.update(cx, |this, cx| {
-                        if this.busy || this.store.conversations.len() <= index {
-                            return;
-                        }
-                        // Through the store, so the session's file goes too.
-                        this.store.remove(index);
-                        if this.store.conversations.is_empty() {
-                            this.new_chat(window, cx);
-                            return;
-                        }
-                        if this.store.active >= index && this.store.active > 0 {
-                            this.store.active -= 1;
-                        }
-                        this.save();
+        super::confirm_delete(
+            "Delete session",
+            format!("\"{title}\" and its messages will be removed from this device."),
+            window,
+            cx,
+            move |window, cx| {
+                chat.update(cx, |this, cx| {
+                    if this.store.conversations.len() <= index {
+                        return;
+                    }
+                    // Said out loud: the dialog closes either way, and closing
+                    // it on nothing looked like the delete had been lost.
+                    if this.busy {
+                        this.error = Some("Stop the reply before deleting a session.".into());
                         cx.notify();
-                    });
-                    true
-                })
-        });
+                        return;
+                    }
+                    // Through the store, so the session's file goes too.
+                    this.store.remove(index);
+                    if this.store.conversations.is_empty() {
+                        this.new_chat(window, cx);
+                        return;
+                    }
+                    if this.store.active >= index && this.store.active > 0 {
+                        this.store.active -= 1;
+                    }
+                    this.save();
+                    cx.notify();
+                });
+            },
+        );
     }
 
     pub(crate) fn export_session(
