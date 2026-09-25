@@ -156,8 +156,8 @@ pub struct Bar {
     /// A line that must not be shown: typed as dots, and kept out of the
     /// conversation when it is sent. For keys.
     secret: bool,
-    /// A question from `ask` is open, so its hint stays in the footer.
-    asking: bool,
+    /// The question `ask` has open, shown in the box above what is typed.
+    asking: Option<String>,
     /// What the slider settled on: a stop, or nothing when it was left.
     slid: Option<Option<usize>>,
     answer: Option<usize>,
@@ -194,7 +194,7 @@ impl Bar {
             choice: None,
             slider: None,
             secret: false,
-            asking: false,
+            asking: None,
             slid: None,
             answer: None,
             working: false,
@@ -298,7 +298,7 @@ impl Bar {
         }
     }
 
-    /// Ask for a line of text, with `hint` in the footer while it is asked.
+    /// Ask for a line of text, with `hint` as the question at the top of the box.
     /// A secret one is drawn as dots and never echoed into the conversation,
     /// so a key does not end up in the scrollback for anyone to read.
     pub fn ask(&mut self, hint: &str, secret: bool) -> Option<String> {
@@ -312,12 +312,12 @@ impl Bar {
             };
         }
         self.secret = secret;
-        self.asking = true;
-        self.note = Some(hint.to_owned());
+        self.asking = Some(hint.to_owned());
+        self.note = Some("enter to save  ·  esc to skip".to_owned());
         self.settle();
         let answer = self.wait();
         self.secret = false;
-        self.asking = false;
+        self.asking = None;
         self.note = None;
         self.settle();
         answer
@@ -422,7 +422,7 @@ impl Bar {
         // queue filled and threw the rest of the paste away -- which is how
         // words went missing out of the middle of pasted text.
         // Anything the user does takes the footer back from a note.
-        if self.handled > 0 && noted && !self.asking {
+        if self.handled > 0 && noted && self.asking.is_none() {
             self.note = None;
         }
         if self.handled > 0 || resized {
@@ -577,6 +577,10 @@ impl Bar {
             // the quickest way to drop what you were typing.
             KeyCode::Esc if crate::screen::selecting() => crate::screen::unselect(),
             KeyCode::Esc if self.working && self.line.is_empty() => self.interrupt = true,
+            // Escape on an empty answer skips the question.
+            KeyCode::Esc if self.asking.is_some() && self.line.is_empty() => {
+                self.queued.push_back(String::new())
+            }
             KeyCode::Esc => {
                 self.line.clear();
                 self.picked = 0;
@@ -844,6 +848,12 @@ impl Bar {
 
     /// The box while it holds a line being typed.
     fn typing(&self, room: usize, lines: &mut Vec<String>) {
+        if let Some(question) = &self.asking {
+            for part in render::fold(question, room) {
+                let width = render::visible(&part);
+                lines.push(self.boxed(&render::bold(&part), width, room));
+            }
+        }
         let rows = self.rows();
         let (cursor_row, cursor_column) = self.line.line_of_cursor();
         let on = cursor_row.min(rows.len() - 1);

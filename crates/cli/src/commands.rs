@@ -562,17 +562,18 @@ pub fn gateways(runner: &mut Runner) {
         .bar
         .busy("asking every gateway what it has", move || gateway::all_models(&k, &c));
 
-    render::blank();
-    render::said(&render::blue("●"), &render::bold("Gateways"));
+    // The list sits in the box with its choices, not in the conversation.
+    // Letronna is the account, not a gateway to add or remove: /login and
+    // /logout look after it, so it has a status here and no choice.
+    let mut rows = Vec::new();
     let mut choices: Vec<(String, &'static str, &'static str)> = Vec::new();
     for g in GATEWAYS {
         let count = models.iter().filter(|(n, _)| n == g.name).count();
         let (status, good, set_up) = gateway::status(g.name, &keys, &custom, count);
-        let dot = if good { render::green("●") } else { render::dim("○") };
-        render::line(&format!("{dot} {:<11} {}", g.name, if good { status } else { render::dim(&status) }));
+        let status = if g.name == LETRONNA && !set_up { format!("{status} · /login") } else { status };
+        rows.push(format!("{} {:<11} {status}", if good { "●" } else { "○" }, g.name));
         match (g.name, set_up) {
-            (LETRONNA, false) => choices.push((format!("Sign in to {}", g.name), g.name, "signin")),
-            (LETRONNA, true) | ("Ollama", _) => {}
+            (LETRONNA, _) | ("Ollama", _) => {}
             (_, false) => choices.push((format!("Set up {}", g.name), g.name, "set")),
             (_, true) => {
                 choices.push((format!("Change {}", g.name), g.name, "set"));
@@ -582,7 +583,7 @@ pub fn gateways(runner: &mut Runner) {
     }
     let mut options: Vec<&str> = choices.iter().map(|c| c.0.as_str()).collect();
     options.push("Done");
-    let Some(picked) = runner.bar.choose("Set one up or change it", Vec::new(), &options) else {
+    let Some(picked) = runner.bar.choose("Gateways", rows, &options) else {
         return;
     };
     let Some((_, name, what)) = choices.get(picked).cloned() else {
@@ -590,26 +591,27 @@ pub fn gateways(runner: &mut Runner) {
     };
     let mut keys = keys;
     match what {
-        "signin" => return sign_in(runner),
         "remove" => {
             keys.remove(gateway::key_slot(name));
             if gateway::gateway(name).base.is_empty() {
                 runner.store.settings.custom_endpoint.clear();
             }
+            render::blank();
             render::line(&render::dim(&format!("{name} removed. Its models leave /model.")));
         }
         _ => {
             if gateway::gateway(name).base.is_empty() {
-                let url = runner.bar.ask("base URL, like http://localhost:8000/v1", false).unwrap_or_default();
+                let url = runner.bar.ask(&format!("{name} base URL, like http://localhost:8000/v1"), false).unwrap_or_default();
                 if !url.trim().is_empty() {
                     runner.store.settings.custom_endpoint = url.trim().trim_end_matches('/').to_owned();
                 }
             }
-            let hint = if gateway::gateway(name).needs_key { "API key" } else { "API key, or enter for none" };
-            let key = runner.bar.ask(hint, true).unwrap_or_default();
+            let hint = if gateway::gateway(name).needs_key { format!("{name} API key") } else { format!("{name} API key (optional)") };
+            let key = runner.bar.ask(&hint, true).unwrap_or_default();
             if !key.trim().is_empty() {
                 keys.insert(gateway::key_slot(name).to_owned(), key.trim().to_owned());
             }
+            render::blank();
             render::line(&render::dim(&format!("{name} saved. /model now lists its models too.")));
         }
     }
