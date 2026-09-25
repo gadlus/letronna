@@ -142,6 +142,9 @@ fn main() {
         if let Err(error) = runner.ask(session, &line) {
             render::blank();
             render::line(&render::red(&error));
+            // Nothing is painted after this until the next key, so without
+            // it a failed turn looks like one that ended with no answer.
+            screen::settle();
         }
         runner.persist();
         if runner.bar.finished() {

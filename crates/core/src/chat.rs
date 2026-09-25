@@ -316,8 +316,16 @@ fn wire_message(m: &Message) -> Value {
             .tool_calls
             .iter()
             .map(|c| {
+                // A call with no arguments streams none, but a gateway that
+                // turns this into Anthropic's tool_use rejects "" as input:
+                // it has to be an object.
+                let arguments = if c.arguments.trim().is_empty() {
+                    "{}"
+                } else {
+                    &c.arguments
+                };
                 json!({"id": c.id, "type": "function",
-                    "function": {"name": c.name, "arguments": c.arguments}})
+                    "function": {"name": c.name, "arguments": arguments}})
             })
             .collect();
     }
@@ -401,6 +409,21 @@ fn name_unnamed(calls: &mut [ToolCall]) {
     for (index, call) in calls.iter_mut().enumerate() {
         if call.id.trim().is_empty() {
             call.id = format!("call_{index}");
+        }
+    }
+}
+
+/// Call each tool by the name it was offered under.
+///
+/// Some gateways hand the name back in a case of their own -- `ListDir` for
+/// `list_dir` -- and a call that cannot be found by name fails. Only case and
+/// underscores are forgiven, so a tool the model made up still fails.
+fn name_as_offered(calls: &mut [ToolCall]) {
+    let loose = |name: &str| name.replace('_', "").to_lowercase();
+    let tools = crate::tools::all();
+    for call in calls {
+        if let Some(tool) = tools.iter().find(|t| loose(t.name()) == loose(&call.name)) {
+            call.name = tool.name().to_owned();
         }
     }
 }
@@ -647,6 +670,7 @@ fn stream(
     }
     calls.retain(|c| !c.name.is_empty());
     name_unnamed(&mut calls);
+    name_as_offered(&mut calls);
     if !calls.is_empty() {
         received = true;
         sender
@@ -875,6 +899,35 @@ mod tests {
         assert_eq!(calls[2].id, "given");
         // Every call ends up with something to match a result against.
         assert!(calls.iter().all(|c| !c.id.trim().is_empty()));
+    }
+
+    #[test]
+    fn a_tool_the_gateway_renamed_is_called_by_its_own_name() {
+        let call = |name: &str| ToolCall {
+            name: name.into(),
+            ..Default::default()
+        };
+        let mut calls = vec![call("ListDir"), call("read_file"), call("ListEverything")];
+        super::name_as_offered(&mut calls);
+        assert_eq!(calls[0].name, "list_dir");
+        assert_eq!(calls[1].name, "read_file");
+        // Not one of ours under any case, so it still fails as unknown.
+        assert_eq!(calls[2].name, "ListEverything");
+    }
+
+    #[test]
+    fn a_call_with_no_arguments_goes_back_as_an_object() {
+        let reply = Message {
+            role: "assistant".into(),
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "list_dir".into(),
+                arguments: String::new(),
+            }],
+            ..Default::default()
+        };
+        let wired = wire_message(&reply);
+        assert_eq!(wired["tool_calls"][0]["function"]["arguments"], "{}");
     }
 
     #[test]
