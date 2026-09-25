@@ -121,6 +121,9 @@ fn choose_provider(runner: &mut Runner) -> bool {
     }
     runner.store.settings.gateway = chosen.name.to_owned();
     runner.store.settings.endpoint = base.trim_end_matches('/').to_owned();
+    if chosen.base.is_empty() {
+        runner.store.settings.custom_endpoint = runner.store.settings.endpoint.clone();
+    }
     render::line(&format!(
         "{} {}",
         render::dim("provider"),

@@ -20,16 +20,19 @@ impl Chat {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Only which card is being set up; the model decides which one is used.
         let g = gateway(name);
-        self.store.settings.gateway = name.into();
         self.gateway_pick.update(cx, |g, cx| {
             *g = name.into();
             cx.notify();
         });
-        if !g.base.is_empty() {
-            self.endpoint
-                .update(cx, |input, cx| input.set_value(g.base, window, cx));
-        }
+        let base = if g.base.is_empty() {
+            self.store.settings.custom_endpoint.clone()
+        } else {
+            g.base.to_owned()
+        };
+        self.endpoint
+            .update(cx, |input, cx| input.set_value(base, window, cx));
         let key = self.keys.get(key_slot(name)).cloned().unwrap_or_default();
         self.key
             .update(cx, |input, cx| input.set_value(key, window, cx));
@@ -37,10 +40,13 @@ impl Chat {
     }
 
     pub(crate) fn apply_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.store.settings.endpoint = self.endpoint.read(cx).value().to_string();
-        self.store.settings.model = self.model.read(cx).value().to_string();
+        // The card being edited, which may not be the one the model is on.
+        let editing = self.gateway_pick.read(cx).clone();
+        if gateway(&editing).base.is_empty() {
+            self.store.settings.custom_endpoint = self.endpoint.read(cx).value().trim().to_string();
+        }
         let key = self.key.read(cx).value().to_string();
-        let slot = key_slot(&self.store.settings.gateway).to_string();
+        let slot = key_slot(&editing).to_string();
         if key.is_empty() {
             self.keys.remove(&slot);
         } else {
@@ -804,17 +810,25 @@ fn gateway_page(
         .gap_5()
         .child(heading(
             "Gateway Connection",
-            "Where messages are sent. Every gateway speaks the OpenAI chat format. Keys are stored per gateway in keys.json on this machine.",
+            "Set up as many as you like: the model list shows every model from each one, and a message goes to the gateway of the model you pick. Keys are stored per gateway in keys.json on this machine.",
             cx,
         ))
         .child(v_flex().gap_2().child(label("Gateway", cx)).child(cards))
-        .child(
+        .when(current == LETRONNA, |this| {
+            this.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Uses the Letronna account this computer is signed in with. Nothing to paste."),
+            )
+        })
+        .when(g.base.is_empty(), |this| this.child(
             v_flex()
                 .gap_1()
                 .child(label("Base URL", cx))
                 .child(Input::new(endpoint)),
-        )
-        .child(
+        ))
+        .when(current != LETRONNA, |this| this.child(
             v_flex()
                 .gap_1()
                 .child(label(
@@ -826,7 +840,7 @@ fn gateway_page(
                     cx,
                 ))
                 .child(Input::new(key)),
-        )
+        ))
         .child(
             h_flex().justify_end().child(
                 Button::new("save-gateway")

@@ -461,52 +461,45 @@ pub fn resume(runner: &mut Runner, session: &mut usize, workspace: Option<&std::
 /// this is narrowed with a word rather than scrolled.
 const MODEL_CHOICES: usize = 10;
 
-/// Change the model, picking from what the gateway actually offers. `filter`
-/// narrows the list, and an exact name skips the asking entirely.
+/// Change the model, picking from what every set-up gateway actually offers.
+/// `filter` narrows the list (by model or gateway name), and an exact model
+/// name skips the asking entirely.
 pub fn switch_model(runner: &mut Runner, filter: &str) {
     let settings = &runner.store.settings;
-    let saved = store::load_keys()
-        .get(letronna_core::gateway::key_slot(&settings.gateway))
-        .cloned()
-        .unwrap_or_default();
-    let (endpoint, key) =
-        letronna_core::gateway::resolve(&settings.gateway, &settings.endpoint, &saved);
-    let current = settings.model.clone();
-    let gateway = settings.gateway.clone();
+    let keys = store::load_keys();
+    let custom = settings.custom_endpoint.clone();
+    let current = format!("{} · {}", settings.model, settings.gateway);
 
     render::blank();
     render::said(&render::blue("●"), &render::bold("Models"));
     // Fetching takes a moment over the network; say so rather than freezing.
-    let found = runner
-        .bar
-        .busy(&format!("asking {gateway} what it has"), move || {
-            letronna_core::chat::list_models(&endpoint, &key)
-        });
-
-    let mut models = match found {
-        Ok(models) if !models.is_empty() => models,
-        Ok(_) => {
-            render::line(&render::dim("That gateway offered no models."));
-            return;
+    let (mut models, errors) = runner.bar.busy("asking every gateway what it has", move || {
+        letronna_core::gateway::all_models(&keys, &custom)
+    });
+    for error in &errors {
+        render::line(&render::red(error));
+    }
+    if models.is_empty() {
+        if errors.is_empty() {
+            render::line(&render::dim("No gateway offered any models. Sign in with /login, or add a provider with `letronna setup`."));
         }
-        Err(error) => {
-            render::line(&render::red(&error));
-            return;
-        }
-    };
-    models.sort();
+        return;
+    }
+    models.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
 
     // An exact name is an instruction, not a search.
-    if let Some(exact) = models.iter().find(|m| m.eq_ignore_ascii_case(filter)) {
-        let exact = exact.clone();
-        set_model(runner, exact);
+    if let Some(exact) = models.iter().find(|(_, m)| m.eq_ignore_ascii_case(filter)) {
+        let (gateway, model) = exact.clone();
+        set_model(runner, gateway, model);
         return;
     }
 
     let needle = filter.to_lowercase();
-    let matching: Vec<String> = models
+    let matching: Vec<(String, String)> = models
         .iter()
-        .filter(|m| needle.is_empty() || m.to_lowercase().contains(&needle))
+        .filter(|(g, m)| {
+            needle.is_empty() || m.to_lowercase().contains(&needle) || g.to_lowercase() == needle
+        })
         .cloned()
         .collect();
     if matching.is_empty() {
@@ -517,7 +510,7 @@ pub fn switch_model(runner: &mut Runner, filter: &str) {
         return;
     }
 
-    let shown: Vec<String> = matching.iter().take(MODEL_CHOICES).cloned().collect();
+    let shown: Vec<(String, String)> = matching.iter().take(MODEL_CHOICES).cloned().collect();
     if matching.len() > shown.len() {
         render::line(&render::dim(&format!(
             "{} of {} shown — type /model <word> to narrow it.",
@@ -525,7 +518,8 @@ pub fn switch_model(runner: &mut Runner, filter: &str) {
             matching.len()
         )));
     }
-    let mut options: Vec<&str> = shown.iter().map(String::as_str).collect();
+    let labels: Vec<String> = shown.iter().map(|(g, m)| format!("{m} · {g}")).collect();
+    let mut options: Vec<&str> = labels.iter().map(String::as_str).collect();
     options.push("Keep the one I have");
 
     let question = format!("In use: {current}");
@@ -533,19 +527,22 @@ pub fn switch_model(runner: &mut Runner, filter: &str) {
         return;
     };
     match shown.get(picked) {
-        Some(model) => set_model(runner, model.clone()),
+        Some((gateway, model)) => set_model(runner, gateway.clone(), model.clone()),
         None => render::line(&render::dim("Left as it was.")),
     }
 }
 
-fn set_model(runner: &mut Runner, model: String) {
+/// A model and the gateway it is on, chosen together.
+fn set_model(runner: &mut Runner, gateway: String, model: String) {
+    runner.store.settings.gateway = gateway.clone();
     runner.store.settings.model = model.clone();
     runner.persist();
     let note = footer(runner);
     runner.bar.set_footer(note);
     render::line(&format!(
-        "{} {}",
+        "{} {} {}",
         render::dim("model   "),
-        render::bold(&model)
+        render::bold(&model),
+        render::dim(&format!("· {gateway}"))
     ));
 }

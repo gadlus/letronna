@@ -101,23 +101,23 @@ impl Chat {
             (
                 cx.theme().muted_foreground,
                 "checking",
-                format!("{}: loading model list", self.store.settings.gateway),
+                "Loading every gateway's models".to_string(),
             )
         } else if let Some(e) = &self.gateway_error {
             (
                 cx.theme().danger,
                 "error",
-                format!("{}: {e}", self.store.settings.gateway),
+                e.clone(),
             )
         } else {
             (
                 cx.theme().green,
                 "ready",
-                format!(
-                    "{}: {} models",
-                    self.store.settings.gateway,
-                    self.models.len()
-                ),
+                {
+                    let mut gateways: Vec<&str> = self.models.iter().map(|(g, _)| g.as_str()).collect();
+                    gateways.dedup();
+                    format!("{} models from {}", self.models.len(), gateways.join(", "))
+                },
             )
         };
         Button::new("gateway")

@@ -11,25 +11,46 @@ impl Chat {
             .overflow_y_scroll()
             .p_1()
             .gap_0p5();
-        let mut ids: Vec<&String> = self.models.iter().collect();
-        if !self.models.contains(&current) {
-            ids.insert(0, &current);
+        let on = self.store.settings.gateway.clone();
+        let mut ids: Vec<(String, String)> = self.models.clone();
+        if !ids.iter().any(|(g, m)| *g == on && *m == current) {
+            ids.insert(0, (on.clone(), current.clone()));
         }
-        for (i, id) in ids.into_iter().enumerate() {
-            if !query.is_empty() && !id.to_lowercase().contains(&query) {
+        for (i, (gw, id)) in ids.into_iter().enumerate() {
+            if !query.is_empty()
+                && !id.to_lowercase().contains(&query)
+                && !gw.to_lowercase().contains(&query)
+            {
                 continue;
             }
-            let pick = id.clone();
+            let active = gw == on && id == current;
+            let (pick_gw, pick) = (gw.clone(), id.clone());
             list = list.child(
                 Button::new(("model", i))
                     .ghost()
                     .xsmall()
                     .w_full()
                     .justify_start()
-                    .label(id.clone())
-                    .when(*id == current, |b| b.text_color(cx.theme().primary))
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .gap_2()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .when(active, |d| d.text_color(cx.theme().primary))
+                                    .child(id),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(gw),
+                            ),
+                    )
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.choose_model(pick.clone(), window, cx)
+                        this.choose_model(pick_gw.clone(), pick.clone(), window, cx)
                     })),
             );
         }

@@ -63,7 +63,8 @@ pub(crate) struct Chat {
     pub(crate) endpoint: Entity<InputState>,
     pub(crate) model: Entity<InputState>,
     pub(crate) key: Entity<InputState>,
-    pub(crate) models: Vec<String>,
+    /// Every model on every set-up gateway, as (gateway, model).
+    pub(crate) models: Vec<(String, String)>,
     pub(crate) model_open: bool,
     pub(crate) model_search: Entity<InputState>,
     pub(crate) keys: std::collections::HashMap<String, String>,
@@ -312,29 +313,22 @@ impl Chat {
             return;
         }
         self.loading_models = true;
-        let (base, key) = resolve(
-            &self.store.settings.gateway,
-            &self.endpoint.read(cx).value(),
-            &self.key.read(cx).value(),
-        );
+        let keys = self.keys.clone();
+        let custom = self.store.settings.custom_endpoint.clone();
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
-            let _ = tx.send_blocking(backend::list_models(&base, &key));
+            let _ = tx.send_blocking(all_models(&keys, &custom));
         });
         let _ = window;
         cx.spawn(async move |this, cx| {
-            if let Ok(result) = rx.recv().await {
+            if let Ok((models, errors)) = rx.recv().await {
                 let _ = this.update(cx, |this, cx| {
                     this.loading_models = false;
-                    match result {
-                        Ok(models) => {
-                            this.models = models;
-                            this.gateway_error = None;
-                        }
-                        Err(error) => {
-                            this.gateway_error = Some(error.clone());
-                            this.error = Some(error);
-                        }
+                    this.models = models;
+                    // One gateway failing still leaves the others usable.
+                    this.gateway_error = (!errors.is_empty()).then(|| errors.join(" · "));
+                    if this.models.is_empty() {
+                        this.error = this.gateway_error.clone();
                     }
                     cx.notify();
                 });
@@ -343,9 +337,21 @@ impl Chat {
         .detach();
     }
 
-    pub(crate) fn choose_model(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+    /// A model and the gateway it is on, chosen together.
+    pub(crate) fn choose_model(
+        &mut self,
+        gateway: String,
+        id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.model
             .update(cx, |input, cx| input.set_value(id.clone(), window, cx));
+        self.gateway_pick.update(cx, |g, cx| {
+            *g = gateway.clone();
+            cx.notify();
+        });
+        self.store.settings.gateway = gateway;
         self.store.settings.model = id;
         self.model_open = false;
         self.save();
@@ -410,10 +416,15 @@ impl Chat {
         prompt: String,
         cx: &mut Context<Self>,
     ) -> std::result::Result<(), ()> {
+        let saved = self
+            .keys
+            .get(key_slot(&self.store.settings.gateway))
+            .cloned()
+            .unwrap_or_default();
         let (endpoint, key) = resolve(
             &self.store.settings.gateway,
-            &self.endpoint.read(cx).value(),
-            &self.key.read(cx).value(),
+            &self.store.settings.custom_endpoint,
+            &saved,
         );
         let connection = Connection {
             endpoint,

@@ -86,6 +86,10 @@ pub struct Settings {
     pub model: String,
     #[serde(default)]
     pub gateway: String,
+    /// The URL pasted for the Custom gateway. Kept apart from `endpoint`,
+    /// which follows whichever gateway the current model is on.
+    #[serde(default)]
+    pub custom_endpoint: String,
     #[serde(default)]
     pub presence: String,
     /// Run write and command tools without asking.
@@ -444,10 +448,47 @@ pub fn fill(conversation: &mut Conversation) {
 }
 
 fn settings() -> Settings {
-    std::fs::read(settings_path())
+    let mut s: Settings = std::fs::read(settings_path())
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    retire_gateway(&mut s);
+    s
+}
+
+/// A gateway that is no longer offered moves to the Letronna account. Its
+/// model is dropped too, since that id belonged to the old gateway; an empty
+/// model is picked again from the new list.
+fn retire_gateway(s: &mut Settings) {
+    use crate::gateway::{GATEWAYS, LETRONNA};
+    // Saves from before Custom had its own field kept its URL in `endpoint`.
+    if s.gateway == "Custom" && s.custom_endpoint.is_empty() {
+        s.custom_endpoint = s.endpoint.clone();
+    }
+    if s.gateway.is_empty() || GATEWAYS.iter().any(|g| g.name == s.gateway) {
+        return;
+    }
+    s.gateway = LETRONNA.into();
+    s.endpoint = GATEWAYS[0].base.into();
+    s.model.clear();
+}
+
+#[cfg(test)]
+mod retire_tests {
+    use super::*;
+
+    #[test]
+    fn old_gateways_move_to_letronna_and_known_ones_stay() {
+        let mut s = Settings { gateway: "Retired".into(), model: "retired/some-model".into(), ..Default::default() };
+        retire_gateway(&mut s);
+        assert_eq!(s.gateway, "Letronna");
+        assert_eq!(s.endpoint, "https://api.letronna.ai/v1");
+        assert!(s.model.is_empty());
+
+        let mut s = Settings { gateway: "OpenRouter".into(), model: "x/y".into(), ..Default::default() };
+        retire_gateway(&mut s);
+        assert_eq!((s.gateway.as_str(), s.model.as_str()), ("OpenRouter", "x/y"));
+    }
 }
 
 pub fn load() -> Store {

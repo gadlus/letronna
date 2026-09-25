@@ -38,7 +38,7 @@ impl Runner {
             .cloned()
             .unwrap_or_default();
         let (endpoint, key) =
-            letronna_core::gateway::resolve(&settings.gateway, &settings.endpoint, &saved);
+            letronna_core::gateway::resolve(&settings.gateway, &settings.custom_endpoint, &saved);
         Connection {
             endpoint,
             model: settings.model.clone(),
