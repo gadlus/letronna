@@ -81,6 +81,28 @@ pub fn ready(keys: &HashMap<String, String>, custom: &str) -> Vec<(&'static str,
         .collect()
 }
 
+/// Where a gateway stands, for the settings list and `/gateways`:
+/// (status line, working, set up). `models` is how many it answered with.
+pub fn status(name: &str, keys: &HashMap<String, String>, custom: &str, models: usize) -> (String, bool, bool) {
+    let g = gateway(name);
+    let count = |n: usize| format!("{n} model{}", if n == 1 { "" } else { "s" });
+    let key = keys.get(key_slot(name)).is_some_and(|k| !k.trim().is_empty());
+    match name {
+        LETRONNA if crate::auth::account().is_some() => (
+            if models > 0 { format!("Signed in · {}", count(models)) } else { "Signed in".into() },
+            true,
+            true,
+        ),
+        LETRONNA => ("Not signed in".into(), false, false),
+        "Ollama" if models > 0 => (format!("Running · {}", count(models)), true, true),
+        "Ollama" => ("Not running".into(), false, false),
+        "Custom" if custom.trim().is_empty() => ("Not set up".into(), false, false),
+        _ if g.needs_key && !key => ("Not set up".into(), false, false),
+        _ if models > 0 => (format!("Connected · {}", count(models)), true, true),
+        _ => ("Set up · no models answered".into(), false, true),
+    }
+}
+
 /// The models of every ready gateway, asked all at once, as (gateway, model).
 /// A gateway that does not answer is left out and its error returned, except
 /// Ollama, which is only there when it is running.
@@ -130,5 +152,17 @@ mod tests {
         let names: Vec<_> = ready(&keys, "").into_iter().map(|r| r.0).collect();
         assert!(names.contains(&"OpenAI") && names.contains(&"Ollama"));
         assert!(!names.contains(&"OpenRouter") && !names.contains(&"Custom"));
+    }
+
+    #[test]
+    fn status_says_what_is_set_up_and_working() {
+        let none = HashMap::new();
+        let keyed = HashMap::from([("OpenAI".to_string(), "sk".to_string())]);
+        assert_eq!(status("OpenAI", &none, "", 0), ("Not set up".into(), false, false));
+        assert_eq!(status("OpenAI", &keyed, "", 0), ("Set up · no models answered".into(), false, true));
+        assert_eq!(status("OpenAI", &keyed, "", 3), ("Connected · 3 models".into(), true, true));
+        assert_eq!(status("Ollama", &none, "", 1), ("Running · 1 model".into(), true, true));
+        assert_eq!(status("Custom", &none, "", 0).2, false);
+        assert_eq!(status("Custom", &none, "http://x/v1", 2).0, "Connected · 2 models");
     }
 }

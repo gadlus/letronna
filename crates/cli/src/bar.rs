@@ -43,7 +43,11 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "/model",
-        blurb: "show or change the model",
+        blurb: "show or change the model, from every gateway",
+    },
+    Command {
+        name: "/gateways",
+        blurb: "see, add or remove gateways",
     },
     Command {
         name: "/login",
