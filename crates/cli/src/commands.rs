@@ -72,7 +72,9 @@ pub fn command(
         }
         "/logout" => {
             let who = letronna_core::auth::account();
-            letronna_core::auth::sign_out();
+            runner
+                .bar
+                .busy("signing this computer out", letronna_core::auth::sign_out);
             render::blank();
             match who {
                 Some(account) => render::line(&render::dim(&format!(
@@ -84,21 +86,7 @@ pub fn command(
             Flow::Handled
         }
         "/whoami" => {
-            render::blank();
-            match letronna_core::auth::account() {
-                Some(account) => {
-                    render::said(&render::blue("●"), &render::bold(&account.name));
-                    if !account.email.is_empty() {
-                        render::line(&render::dim(&account.email));
-                    }
-                    if letronna_core::auth::is_stub(&account) {
-                        render::line(&render::dim(
-                            "Signed in against the stand-in, not a real account.",
-                        ));
-                    }
-                }
-                None => render::line(&render::dim("Not signed in. /login to fix that.")),
-            }
+            whoami(runner);
             Flow::Handled
         }
         "/effort" => {
@@ -164,11 +152,48 @@ pub fn command(
     }
 }
 
-/// Sign in through the browser.
-///
-/// The page that answers is not up yet, so this offers the stand-in as well:
-/// the real flow is tried first and the stand-in writes the same file when
-/// the browser has nothing to talk to.
+/// Who is signed in, checked with the API; what was known last is shown when
+/// it cannot be reached.
+fn whoami(runner: &mut Runner) {
+    if letronna_core::auth::account().is_none() {
+        render::blank();
+        render::line(&render::dim("Not signed in. /login to fix that."));
+        return;
+    }
+    let fresh = runner
+        .bar
+        .busy("checking your account", letronna_core::auth::refresh);
+    render::blank();
+    let account = match fresh {
+        Ok(account) => account,
+        Err(error) => match letronna_core::auth::account() {
+            Some(known) => {
+                render::line(&render::dim(&format!("{error} Showing what was known.")));
+                known
+            }
+            None => {
+                render::line(&render::dim(&error));
+                return;
+            }
+        },
+    };
+    render::said(&render::blue("●"), &render::bold(&account.name));
+    if !account.email.is_empty() {
+        render::line(&render::dim(&account.email));
+    }
+    if !account.plan.is_empty() {
+        render::line(&format!(
+            "{} {}   {} {}",
+            render::dim("plan   "),
+            account.plan_name(),
+            render::dim("credits"),
+            account.credit()
+        ));
+    }
+}
+
+/// Sign in through the browser: the page asks them to allow this computer,
+/// then hands a token back to a port only this machine can reach.
 pub fn sign_in(runner: &mut Runner) {
     if let Some(account) = letronna_core::auth::account() {
         render::blank();
@@ -179,7 +204,7 @@ pub fn sign_in(runner: &mut Runner) {
         return;
     }
 
-    let pending = match letronna_core::auth::begin() {
+    let pending = match letronna_core::auth::begin(letronna_core::auth::Client::Cli) {
         Ok(pending) => pending,
         Err(error) => {
             render::blank();
@@ -196,29 +221,21 @@ pub fn sign_in(runner: &mut Runner) {
     render::line(&render::dim(&pending.url));
     open_in_browser(&pending.url);
 
-    // The site does not exist yet, so waiting the full two minutes for a
-    // browser that will land on nothing is not worth anybody's time.
-    let picked = runner.bar.choose(
-        "Waiting for the browser",
-        vec!["The page is not up yet; the stand-in signs you in locally.".into()],
-        &["Use the stand-in", "Wait for the browser", "Cancel"],
-    );
-    match picked {
-        Some(0) => match letronna_core::auth::stub("Letronna user") {
-            Ok(account) => welcome(&account),
-            Err(error) => render::line(&render::red(&error)),
-        },
-        Some(1) => match pending.finish() {
-            Ok(account) => welcome(&account),
-            Err(error) => render::line(&render::red(&error)),
-        },
-        _ => render::line(&render::dim("Left it.")),
+    match runner
+        .bar
+        .busy("waiting for the browser", move || pending.finish())
+    {
+        Ok(account) => {
+            render::said(&render::blue("›"), &render::bold(&account.name));
+            let plan = account.plan_name();
+            render::line(&render::dim(&if plan.is_empty() {
+                "Signed in.".to_owned()
+            } else {
+                format!("Signed in · {plan} · {} credit", account.credit())
+            }));
+        }
+        Err(error) => render::line(&render::red(&error)),
     }
-}
-
-fn welcome(account: &letronna_core::auth::Account) {
-    render::said(&render::blue("›"), &render::bold(&account.name));
-    render::line(&render::dim("Signed in."));
 }
 
 /// Hand a URL to whatever opens links here.
@@ -243,35 +260,40 @@ pub fn open_in_browser(url: &str) {
 /// why there is no capability check here: on a model that can, this is the
 /// difference between sixty-four reasoning tokens and seven hundred.
 fn effort(runner: &mut Runner, rest: &str) {
-    const LEVELS: [&str; 4] = ["low", "medium", "high", "whatever the model likes"];
+    const LEVELS: [&str; 4] = ["auto", "low", "medium", "high"];
+    let current = match runner.store.settings.effort.as_str() {
+        "" => "auto",
+        level => level,
+    };
     let chosen = match rest {
+        // Nothing named: slide to it. Effort is a point on one line from
+        // less to more, and a slider says so where a list would not.
         "" => {
-            let current = match runner.store.settings.effort.as_str() {
-                "" => "whatever the model likes".to_owned(),
-                level => level.to_owned(),
-            };
-            let picked =
-                runner
-                    .bar
-                    .choose(&format!("Thinking effort: {current}"), Vec::new(), &LEVELS);
-            match picked {
+            let start = LEVELS.iter().position(|l| *l == current).unwrap_or(0);
+            match runner
+                .bar
+                .slide("How hard should it think?", &LEVELS, start)
+            {
                 Some(index) => LEVELS[index].to_owned(),
-                None => return,
+                None => {
+                    render::blank();
+                    render::line(&render::dim(&format!("Left at {current}.")));
+                    return;
+                }
             }
         }
         asked => asked.to_lowercase(),
     };
-    let effort = match chosen.as_str() {
+    runner.store.settings.effort = match chosen.as_str() {
         "low" | "medium" | "high" => chosen,
         _ => String::new(),
     };
-    runner.store.settings.effort = effort;
     runner.persist();
     let note = footer(runner);
     runner.bar.set_footer(note);
     render::blank();
     render::line(&render::dim(&match runner.store.settings.effort.as_str() {
-        "" => "Left to the model.".to_owned(),
+        "" => "Thinking left to the model.".to_owned(),
         level => format!("Thinking {level}."),
     }));
 }
@@ -439,53 +461,45 @@ pub fn resume(runner: &mut Runner, session: &mut usize, workspace: Option<&std::
 /// this is narrowed with a word rather than scrolled.
 const MODEL_CHOICES: usize = 10;
 
-/// Change the model, picking from what the gateway actually offers. `filter`
-/// narrows the list, and an exact name skips the asking entirely.
-fn switch_model(runner: &mut Runner, filter: &str) {
+/// Change the model, picking from what every set-up gateway actually offers.
+/// `filter` narrows the list (by model or gateway name), and an exact model
+/// name skips the asking entirely.
+pub fn switch_model(runner: &mut Runner, filter: &str) {
     let settings = &runner.store.settings;
-    let guest = settings.gateway == letronna_core::gateway::GATEWAYS[0].name;
-    let key = store::load_keys()
-        .get(letronna_core::gateway::key_slot(&settings.gateway))
-        .cloned()
-        .unwrap_or_default();
-    let endpoint = settings.endpoint.clone();
-    let current = settings.model.clone();
-    let gateway = settings.gateway.clone();
+    let keys = store::load_keys();
+    let custom = settings.custom_endpoint.clone();
+    let current = format!("{} · {}", settings.model, settings.gateway);
 
     render::blank();
     render::said(&render::blue("●"), &render::bold("Models"));
     // Fetching takes a moment over the network; say so rather than freezing.
-    render::line(&render::dim(&format!("asking {gateway} what it has…")));
-    let found = if guest {
-        letronna_core::chat::free_models()
-    } else {
-        letronna_core::chat::list_models(&endpoint, &key)
-    };
-
-    let mut models = match found {
-        Ok(models) if !models.is_empty() => models,
-        Ok(_) => {
-            render::line(&render::dim("That gateway offered no models."));
-            return;
+    let (mut models, errors) = runner.bar.busy("asking every gateway what it has", move || {
+        letronna_core::gateway::all_models(&keys, &custom)
+    });
+    for error in &errors {
+        render::line(&render::red(error));
+    }
+    if models.is_empty() {
+        if errors.is_empty() {
+            render::line(&render::dim("No gateway offered any models. Sign in with /login, or add a provider with `letronna setup`."));
         }
-        Err(error) => {
-            render::line(&render::red(&error));
-            return;
-        }
-    };
-    models.sort();
+        return;
+    }
+    models.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
 
     // An exact name is an instruction, not a search.
-    if let Some(exact) = models.iter().find(|m| m.eq_ignore_ascii_case(filter)) {
-        let exact = exact.clone();
-        set_model(runner, exact);
+    if let Some(exact) = models.iter().find(|(_, m)| m.eq_ignore_ascii_case(filter)) {
+        let (gateway, model) = exact.clone();
+        set_model(runner, gateway, model);
         return;
     }
 
     let needle = filter.to_lowercase();
-    let matching: Vec<String> = models
+    let matching: Vec<(String, String)> = models
         .iter()
-        .filter(|m| needle.is_empty() || m.to_lowercase().contains(&needle))
+        .filter(|(g, m)| {
+            needle.is_empty() || m.to_lowercase().contains(&needle) || g.to_lowercase() == needle
+        })
         .cloned()
         .collect();
     if matching.is_empty() {
@@ -496,7 +510,7 @@ fn switch_model(runner: &mut Runner, filter: &str) {
         return;
     }
 
-    let shown: Vec<String> = matching.iter().take(MODEL_CHOICES).cloned().collect();
+    let shown: Vec<(String, String)> = matching.iter().take(MODEL_CHOICES).cloned().collect();
     if matching.len() > shown.len() {
         render::line(&render::dim(&format!(
             "{} of {} shown — type /model <word> to narrow it.",
@@ -504,7 +518,8 @@ fn switch_model(runner: &mut Runner, filter: &str) {
             matching.len()
         )));
     }
-    let mut options: Vec<&str> = shown.iter().map(String::as_str).collect();
+    let labels: Vec<String> = shown.iter().map(|(g, m)| format!("{m} · {g}")).collect();
+    let mut options: Vec<&str> = labels.iter().map(String::as_str).collect();
     options.push("Keep the one I have");
 
     let question = format!("In use: {current}");
@@ -512,15 +527,22 @@ fn switch_model(runner: &mut Runner, filter: &str) {
         return;
     };
     match shown.get(picked) {
-        Some(model) => set_model(runner, model.clone()),
+        Some((gateway, model)) => set_model(runner, gateway.clone(), model.clone()),
         None => render::line(&render::dim("Left as it was.")),
     }
 }
 
-fn set_model(runner: &mut Runner, model: String) {
+/// A model and the gateway it is on, chosen together.
+fn set_model(runner: &mut Runner, gateway: String, model: String) {
+    runner.store.settings.gateway = gateway.clone();
     runner.store.settings.model = model.clone();
     runner.persist();
     let note = footer(runner);
     runner.bar.set_footer(note);
-    render::said(&render::blue("›"), &render::bold(&model));
+    render::line(&format!(
+        "{} {} {}",
+        render::dim("model   "),
+        render::bold(&model),
+        render::dim(&format!("· {gateway}"))
+    ));
 }

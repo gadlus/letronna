@@ -1,0 +1,185 @@
+//! The Letronna account, in the window.
+//!
+//! The terminal and the window share `account.json`, so this only ever reads
+//! that file and asks the API about it: sign in with `/login` in one and the
+//! other shows it the next time it looks. The network work runs on a thread
+//! of its own and reports back, the way the model list does.
+
+use letronna_core::auth::{self, Account};
+
+use crate::prelude::*;
+
+impl Chat {
+    /// Re-read the file, then check it with the API. Called when the page is
+    /// opened, so a sign-in or sign-out from the terminal shows up here.
+    pub(crate) fn refresh_account(&mut self, cx: &mut Context<Self>) {
+        self.account = auth::account();
+        if self.account.is_none() {
+            cx.notify();
+            return;
+        }
+        self.off_thread(auth::refresh, cx);
+    }
+
+    /// Settings, open on this page.
+    pub(crate) fn open_account(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_page.update(cx, |page, cx| {
+            *page = "Account";
+            cx.notify();
+        });
+        self.open_settings(window, cx);
+    }
+
+    /// Open the browser and wait for it to hand a token back.
+    pub(crate) fn sign_in(&mut self, cx: &mut Context<Self>) {
+        if self.signing_in {
+            return;
+        }
+        let pending = match auth::begin(auth::Client::App) {
+            Ok(pending) => pending,
+            Err(error) => {
+                self.account_note = Some(error);
+                cx.notify();
+                return;
+            }
+        };
+        cx.open_url(&pending.url);
+        self.signing_in = true;
+        self.account_note = Some("Waiting for the browser. Allow Letronna there.".into());
+        self.off_thread(move || pending.finish(), cx);
+    }
+
+    pub(crate) fn sign_out(&mut self, cx: &mut Context<Self>) {
+        self.signing_in = true;
+        self.off_thread(
+            || {
+                auth::sign_out();
+                Err("Signed out. Your chats and settings stay where they are.".into())
+            },
+            cx,
+        );
+    }
+
+    /// Do account work off the window's thread and take in what it found.
+    fn off_thread(
+        &mut self,
+        work: impl FnOnce() -> Result<Account, String> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let _ = tx.send_blocking(work());
+        });
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            if let Ok(result) = rx.recv().await {
+                let _ = this.update(cx, |this, cx| {
+                    this.signing_in = false;
+                    // Whatever happened, the file says who is signed in now.
+                    this.account = auth::account();
+                    this.account_note = match result {
+                        Ok(account) if this.account.is_some() => {
+                            this.account = Some(account);
+                            None
+                        }
+                        Ok(_) => None,
+                        Err(note) => Some(note),
+                    };
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+}
+
+/// Drawn while the window is itself being drawn, so it is handed what it
+/// shows rather than reading the chat, which is mid-update and would panic.
+pub(crate) fn account_page(chat: &Entity<Chat>, this: &Chat, cx: &App) -> Div {
+    let busy = this.signing_in;
+    let muted = cx.theme().muted_foreground;
+    let note = this
+        .account_note
+        .clone()
+        .map(|note| div().text_sm().text_color(muted).child(note));
+
+    let Some(account) = this.account.clone() else {
+        let chat = chat.clone();
+        return v_flex()
+            .gap_4()
+            .child(super::settings::heading(
+                "Account",
+                "Hosted models and cloud runs need a Letronna account. Your own keys do not.",
+                cx,
+            ))
+            .child(
+                h_flex().child(
+                    Button::new("sign-in")
+                        .primary()
+                        .small()
+                        .loading(busy)
+                        .disabled(busy)
+                        .label("Sign in in the browser")
+                        .on_click(move |_, _, cx| chat.update(cx, |this, cx| this.sign_in(cx))),
+                ),
+            )
+            .children(note);
+    };
+
+    let row = |name: &'static str, value: String| {
+        h_flex()
+            .justify_between()
+            .py_2()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(super::settings::label(name, cx))
+            .child(div().text_sm().child(value))
+    };
+    let plan = match account.plan_name() {
+        "" => "Not checked yet".to_owned(),
+        plan => plan.to_owned(),
+    };
+    let (refresh, out) = (chat.clone(), chat.clone());
+    v_flex()
+        .gap_4()
+        .child(super::settings::heading(
+            "Account",
+            "Signed in here and in the terminal alike; sign out in either and both are.",
+            cx,
+        ))
+        .child(
+            v_flex()
+                .child(row("Name", account.name.clone()))
+                .child(row("Email", account.email.clone()))
+                .child(row("Plan", plan))
+                .child(row("Credits", account.credit())),
+        )
+        .child(
+            h_flex()
+                .gap_2()
+                .child(
+                    Button::new("dashboard")
+                        .small()
+                        .label("Open dashboard")
+                        .on_click(|_, _, cx| cx.open_url(&auth::dashboard())),
+                )
+                .child(
+                    Button::new("refresh-account")
+                        .small()
+                        .loading(busy)
+                        .disabled(busy)
+                        .label("Refresh")
+                        .on_click(move |_, _, cx| {
+                            refresh.update(cx, |this, cx| this.refresh_account(cx))
+                        }),
+                )
+                .child(
+                    Button::new("sign-out")
+                        .small()
+                        .disabled(busy)
+                        .label("Sign out")
+                        .on_click(move |_, _, cx| out.update(cx, |this, cx| this.sign_out(cx))),
+                ),
+        )
+        .children(note)
+}

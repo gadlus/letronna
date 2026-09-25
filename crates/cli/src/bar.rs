@@ -130,6 +130,15 @@ struct Choice {
     picked: usize,
 }
 
+/// A setting with a natural order, picked by sliding along a track rather
+/// than from a list: effort goes from less to more, and a list hides that
+/// the options are points on one line.
+struct Slider {
+    question: String,
+    stops: Vec<String>,
+    at: usize,
+}
+
 pub struct Bar {
     line: Line,
     picked: usize,
@@ -139,6 +148,14 @@ pub struct Bar {
     live: bool,
     done: bool,
     choice: Option<Choice>,
+    slider: Option<Slider>,
+    /// A line that must not be shown: typed as dots, and kept out of the
+    /// conversation when it is sent. For keys.
+    secret: bool,
+    /// A question from `ask` is open, so its hint stays in the footer.
+    asking: bool,
+    /// What the slider settled on: a stop, or nothing when it was left.
+    slid: Option<Option<usize>>,
     answer: Option<usize>,
     /// True while a turn is in flight, which is what makes escape mean stop.
     working: bool,
@@ -171,6 +188,10 @@ impl Bar {
             live: false,
             done: false,
             choice: None,
+            slider: None,
+            secret: false,
+            asking: false,
+            slid: None,
             answer: None,
             working: false,
             interrupt: false,
@@ -244,11 +265,10 @@ impl Bar {
     ) -> Option<usize> {
         if !self.live {
             render::line(&render::bold(question));
-            for (i, option) in options.iter().enumerate() {
-                render::line(&render::dim(&format!("  {}. {option}", i + 1)));
+            for line in &detail {
+                render::line(&render::dim(line));
             }
-            let typed = crate::input::read(&format!("{} ", render::blue("›")))?;
-            return typed.trim().parse::<usize>().ok()?.checked_sub(1);
+            return crate::input::menu(options, 0);
         }
 
         self.choice = Some(Choice {
@@ -269,6 +289,61 @@ impl Bar {
                 self.choice = None;
                 self.settle();
                 return Some(answer);
+            }
+            self.pump();
+        }
+    }
+
+    /// Ask for a line of text, with `hint` in the footer while it is asked.
+    /// A secret one is drawn as dots and never echoed into the conversation,
+    /// so a key does not end up in the scrollback for anyone to read.
+    pub fn ask(&mut self, hint: &str, secret: bool) -> Option<String> {
+        if !self.live {
+            let prompt = format!("{}{} ", render::PAD, render::blue("›"));
+            let _ = hint;
+            return if secret {
+                crate::input::secret(&prompt)
+            } else {
+                crate::input::read(&prompt)
+            };
+        }
+        self.secret = secret;
+        self.asking = true;
+        self.note = Some(hint.to_owned());
+        self.settle();
+        let answer = self.wait();
+        self.secret = false;
+        self.asking = false;
+        self.note = None;
+        self.settle();
+        answer
+    }
+
+    /// Pick one of `stops` by sliding along a track, starting at `start`.
+    /// `None` when it was left where it was.
+    pub fn slide(&mut self, question: &str, stops: &[&str], start: usize) -> Option<usize> {
+        if !self.live {
+            render::line(&render::bold(question));
+            return crate::input::menu(stops, start);
+        }
+
+        self.slider = Some(Slider {
+            question: question.to_owned(),
+            stops: stops.iter().map(|s| (*s).to_owned()).collect(),
+            at: start.min(stops.len().saturating_sub(1)),
+        });
+        self.slid = None;
+        self.settle();
+        loop {
+            if self.done {
+                self.slider = None;
+                self.settle();
+                return None;
+            }
+            if let Some(settled) = self.slid.take() {
+                self.slider = None;
+                self.settle();
+                return settled;
             }
             self.pump();
         }
@@ -343,7 +418,7 @@ impl Bar {
         // queue filled and threw the rest of the paste away -- which is how
         // words went missing out of the middle of pasted text.
         // Anything the user does takes the footer back from a note.
-        if self.handled > 0 && noted {
+        if self.handled > 0 && noted && !self.asking {
             self.note = None;
         }
         if self.handled > 0 || resized {
@@ -363,6 +438,25 @@ impl Bar {
         self.line.clear();
         self.line.insert_str(text);
         self.settle();
+    }
+
+    /// Do `work` without the screen going quiet: the waiting line in the
+    /// box while it is up, a wheel printed in place when it is not.
+    pub fn busy<T: Send + 'static>(
+        &mut self,
+        label: &str,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        if !self.live {
+            return crate::input::busy(label, work);
+        }
+        let handle = std::thread::spawn(work);
+        self.wait_line_about(label);
+        while !handle.is_finished() {
+            self.pump();
+        }
+        self.wait_line(false);
+        handle.join().expect("the work panicked")
     }
 
     /// Show or take away the waiting line.
@@ -398,6 +492,10 @@ impl Bar {
     fn key(&mut self, key: KeyEvent) {
         // Windows reports press and release; act on one of them.
         if key.kind != KeyEventKind::Press {
+            return;
+        }
+        if self.slider.is_some() {
+            self.nudge(key);
             return;
         }
         if self.choice.is_some() {
@@ -512,7 +610,9 @@ impl Bar {
             self.settle();
             return;
         }
-        self.echo(&line);
+        if !self.secret {
+            self.echo(&line);
+        }
         self.queued.push_back(line);
         self.settle();
     }
@@ -545,6 +645,36 @@ impl Bar {
                         if lines == 1 { "" } else { "s" }
                     ));
                     self.settle();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Move along the track. It stops at each end rather than wrapping:
+    /// sliding off the top and landing on the bottom is not what a slider is.
+    fn nudge(&mut self, key: KeyEvent) {
+        let Some(slider) = self.slider.as_mut() else {
+            return;
+        };
+        let last = slider.stops.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::Down => {
+                slider.at = slider.at.saturating_sub(1)
+            }
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Up => {
+                slider.at = (slider.at + 1).min(last)
+            }
+            KeyCode::Home => slider.at = 0,
+            KeyCode::End => slider.at = last,
+            KeyCode::Enter => self.slid = Some(Some(slider.at)),
+            KeyCode::Esc => self.slid = Some(None),
+            KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => self.done = true,
+            KeyCode::Char(digit) if digit.is_ascii_digit() => {
+                if let Some(index) = digit.to_digit(10).and_then(|d| (d as usize).checked_sub(1))
+                    && index <= last
+                {
+                    slider.at = index;
                 }
             }
             _ => {}
@@ -605,7 +735,12 @@ impl Bar {
     fn rows(&self) -> Vec<String> {
         let room = self.room().saturating_sub(2).max(4);
         let mut rows: Vec<String> = Vec::new();
-        for part in self.line.text().split('\n') {
+        let text: String = if self.secret {
+            self.line.text().chars().map(|_| '•').collect()
+        } else {
+            self.line.text().to_owned()
+        };
+        for part in text.split('\n') {
             rows.extend(render::fold(part, room));
         }
         if rows.is_empty() {
@@ -645,9 +780,10 @@ impl Bar {
             render::MARGIN,
             render::dim(&format!("╭{edge}╮"))
         ));
-        match &self.choice {
-            Some(choice) => self.asking(choice, room, &mut lines),
-            None => self.typing(room, &mut lines),
+        match (&self.slider, &self.choice) {
+            (Some(slider), _) => self.sliding(slider, room, &mut lines),
+            (None, Some(choice)) => self.asking(choice, room, &mut lines),
+            (None, None) => self.typing(room, &mut lines),
         }
         lines.push(format!(
             "{}{}",
@@ -678,6 +814,8 @@ impl Bar {
         let back = crate::screen::scrolled();
         let note = if let Some(said) = &self.note {
             said.clone()
+        } else if self.slider.is_some() {
+            "← → to slide  ·  enter to keep it  ·  esc to leave it as it was".to_owned()
         } else if self.choice.is_some() {
             "↑↓ to choose  ·  enter to take it  ·  esc to decline".to_owned()
         } else if back > 0 {
@@ -731,6 +869,21 @@ impl Bar {
         }
     }
 
+    /// The box while it holds a slider: the question, the names of the stops
+    /// spread along the track, and the track with a knob on it. The stretch
+    /// up to the knob is drawn filled, so which way is "more" is plain
+    /// without reading a label.
+    fn sliding(&self, slider: &Slider, room: usize, lines: &mut Vec<String>) {
+        let question = render::bold(&slider.question);
+        lines.push(self.boxed(&question, render::visible(&question), room));
+        lines.push(self.boxed("", 0, room));
+
+        let (labels, track, width) = track(&slider.stops, slider.at, room);
+        lines.push(self.boxed(&labels, width, room));
+        lines.push(self.boxed(&track, width, room));
+        lines.push(self.boxed("", 0, room));
+    }
+
     /// The box while it holds a question. The answers are listed inside it
     /// and steered with the arrow keys, so agreeing to something is one key
     /// and never the wrong letter.
@@ -769,9 +922,140 @@ impl Drop for Bar {
     }
 }
 
+/// Where each stop sits on a track `width` columns wide: spread evenly, the
+/// first at the left end and the last at the right.
+fn stops_at(count: usize, width: usize) -> Vec<usize> {
+    match count {
+        0 => Vec::new(),
+        1 => vec![width / 2],
+        n => (0..n).map(|i| i * (width - 1) / (n - 1)).collect(),
+    }
+}
+
+/// The two rows of a slider -- the names over the track, and the track --
+/// and how many columns they take. Names are centred over their stop but
+/// kept inside the ends, so the first and last do not hang off the track.
+fn track(stops: &[String], at: usize, room: usize) -> (String, String, usize) {
+    let pad = 2;
+    let width = room.saturating_sub(pad * 2).max(stops.len() * 2 + 1);
+    let places = stops_at(stops.len(), width);
+
+    let mut labels = String::new();
+    let mut used = 0usize;
+    for (i, (stop, place)) in stops.iter().zip(&places).enumerate() {
+        let len = stop.chars().count();
+        let start = place
+            .saturating_sub(len / 2)
+            .min(width.saturating_sub(len))
+            .max(used);
+        labels.push_str(&" ".repeat(start - used));
+        labels.push_str(&if i == at {
+            render::bold(&render::blue(stop))
+        } else {
+            render::dim(stop)
+        });
+        used = start + len;
+    }
+
+    let knob = places.get(at).copied().unwrap_or(0);
+    let track = format!(
+        "{}{}{}",
+        render::blue(&"━".repeat(knob)),
+        render::blue("●"),
+        render::dim(&"─".repeat(width.saturating_sub(knob + 1)))
+    );
+
+    let indent = " ".repeat(pad);
+    (
+        format!("{indent}{labels}"),
+        format!("{indent}{track}"),
+        pad + width.max(used),
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::matches;
+    use super::{Bar, Slider, matches, stops_at, track};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn press(bar: &mut Bar, code: KeyCode) {
+        bar.nudge(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn the_slider_stops_at_its_ends_and_enter_keeps_where_it_is() {
+        let mut bar = Bar::new(String::new());
+        bar.slider = Some(Slider {
+            question: "How hard?".into(),
+            stops: vec!["auto".into(), "low".into(), "medium".into(), "high".into()],
+            at: 0,
+        });
+        // Left at the first stop stays there rather than wrapping to the last.
+        press(&mut bar, KeyCode::Left);
+        assert_eq!(bar.slider.as_ref().unwrap().at, 0);
+        // Right walks along, and stops at the far end.
+        for _ in 0..6 {
+            press(&mut bar, KeyCode::Right);
+        }
+        assert_eq!(bar.slider.as_ref().unwrap().at, 3);
+        press(&mut bar, KeyCode::Left);
+        press(&mut bar, KeyCode::Enter);
+        assert_eq!(bar.slid, Some(Some(2)));
+    }
+
+    #[test]
+    fn escape_leaves_it_as_it_was() {
+        let mut bar = Bar::new(String::new());
+        bar.slider = Some(Slider {
+            question: "How hard?".into(),
+            stops: vec!["auto".into(), "low".into()],
+            at: 1,
+        });
+        press(&mut bar, KeyCode::Left);
+        press(&mut bar, KeyCode::Esc);
+        // Moved, then left: nothing is taken.
+        assert_eq!(bar.slid, Some(None));
+    }
+
+    #[test]
+    fn a_digit_jumps_straight_to_its_stop() {
+        let mut bar = Bar::new(String::new());
+        bar.slider = Some(Slider {
+            question: "How hard?".into(),
+            stops: vec!["auto".into(), "low".into(), "medium".into(), "high".into()],
+            at: 0,
+        });
+        press(&mut bar, KeyCode::Char('4'));
+        assert_eq!(bar.slider.as_ref().unwrap().at, 3);
+        // A digit past the last stop is ignored rather than clamped.
+        press(&mut bar, KeyCode::Char('9'));
+        assert_eq!(bar.slider.as_ref().unwrap().at, 3);
+    }
+
+    #[test]
+    fn the_stops_reach_both_ends_of_the_track() {
+        assert_eq!(stops_at(4, 31), vec![0, 10, 20, 30]);
+        assert_eq!(stops_at(2, 10), vec![0, 9]);
+        assert_eq!(stops_at(1, 10), vec![5]);
+        assert!(stops_at(0, 10).is_empty());
+    }
+
+    #[test]
+    fn the_knob_sits_on_its_stop() {
+        let stops: Vec<String> = ["auto", "low", "medium", "high"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // No colour in a test, so this is the bare track.
+        let (labels, track, width) = track(&stops, 2, 40);
+        let knob = track.chars().position(|c| c == '●').unwrap();
+        let places = stops_at(4, 36);
+        assert_eq!(knob, 2 + places[2]);
+        assert!(labels.contains("auto") && labels.contains("high"));
+        // Every row fits inside the box.
+        assert!(width <= 40);
+        assert!(track.chars().count() <= 40);
+    }
 
     #[test]
     fn the_menu_only_opens_for_a_slash() {

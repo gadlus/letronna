@@ -93,6 +93,7 @@ pub(crate) enum AppIcon {
     Palette,
     Checklist,
     Circle,
+    User,
 }
 impl IconNamed for AppIcon {
     fn path(self) -> SharedString {
@@ -115,6 +116,7 @@ impl IconNamed for AppIcon {
             AppIcon::Shield => "icons/shield.svg",
             AppIcon::Puzzle => "icons/puzzle.svg",
             AppIcon::Robot => "icons/bot.svg",
+            AppIcon::User => "icons/circle-user.svg",
             AppIcon::Plugs => "icons/plugs.svg",
             AppIcon::Palette => "icons/palette.svg",
             AppIcon::Checklist => "icons/list-checks.svg",

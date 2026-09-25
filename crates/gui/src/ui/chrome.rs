@@ -37,9 +37,15 @@ impl Chat {
     }
 
     fn account_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        // No native sign-in yet: everyone is a guest. The menu is the shell that
-        // becomes Profile / Settings / Log out once accounts land.
-        let name = "Guest";
+        // The same account the terminal signs in to; nobody signed in is a guest.
+        let name: SharedString = self
+            .account
+            .as_ref()
+            .map(|a| a.name.split(' ').next().unwrap_or("").to_owned())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "Guest".into())
+            .into();
+        let signed_in = self.account.is_some();
         let chat = cx.entity();
         Button::new("account")
             .ghost()
@@ -67,12 +73,14 @@ impl Chat {
                     ),
             )
             .dropdown_menu_with_anchor(gpui::Corner::TopRight, move |menu, _, _| {
-                let settings = chat.clone();
+                let (settings, account, auth) = (chat.clone(), chat.clone(), chat.clone());
                 menu.min_w(px(180.))
                     .item(
-                        PopupMenuItem::new("Profile")
+                        PopupMenuItem::new("Account")
                             .icon(Icon::new(IconName::CircleUser))
-                            .disabled(true),
+                            .on_click(move |_, window, cx| {
+                                account.update(cx, |this, cx| this.open_account(window, cx))
+                            }),
                     )
                     .item(
                         PopupMenuItem::new("Settings")
@@ -83,9 +91,17 @@ impl Chat {
                     )
                     .separator()
                     .item(
-                        PopupMenuItem::new("Sign in")
+                        PopupMenuItem::new(if signed_in { "Sign out" } else { "Sign in" })
                             .icon(Icon::new(IconName::CircleUser))
-                            .on_click(|_, _, cx| cx.open_url("https://chat.pool.example")),
+                            .on_click(move |_, _, cx| {
+                                auth.update(cx, |this, cx| {
+                                    if signed_in {
+                                        this.sign_out(cx)
+                                    } else {
+                                        this.sign_in(cx)
+                                    }
+                                })
+                            }),
                     )
             })
     }
@@ -95,23 +111,23 @@ impl Chat {
             (
                 cx.theme().muted_foreground,
                 "checking",
-                format!("{}: loading model list", self.store.settings.gateway),
+                "Loading every gateway's models".to_string(),
             )
         } else if let Some(e) = &self.gateway_error {
             (
                 cx.theme().danger,
                 "error",
-                format!("{}: {e}", self.store.settings.gateway),
+                e.clone(),
             )
         } else {
             (
                 cx.theme().green,
                 "ready",
-                format!(
-                    "{}: {} models",
-                    self.store.settings.gateway,
-                    self.models.len()
-                ),
+                {
+                    let mut gateways: Vec<&str> = self.models.iter().map(|(g, _)| g.as_str()).collect();
+                    gateways.dedup();
+                    format!("{} models from {}", self.models.len(), gateways.join(", "))
+                },
             )
         };
         Button::new("gateway")
@@ -200,9 +216,6 @@ impl Chat {
             .child(self.gateway_chip(cx))
             .child(self.workspace_chip(cx))
             .child(self.job_chips(cx))
-            .when_some(self.free_remaining, |this, n| {
-                this.child(format!("{n} free replies left"))
-            })
             .child(div().flex_1())
             .child(concat!("v", env!("CARGO_PKG_VERSION")))
             .child(

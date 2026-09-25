@@ -10,6 +10,11 @@
 /// Copy the app to its installed location and relaunch from there. Returns
 /// true when this process should exit because the installed copy took over.
 pub(crate) fn ensure_installed() -> bool {
+    // A development build runs where it was built: `cargo run` must not copy
+    // itself over the Letronna someone has installed.
+    if cfg!(debug_assertions) {
+        return false;
+    }
     #[cfg(any(windows, target_os = "linux"))]
     return imp::ensure_installed();
     #[cfg(not(any(windows, target_os = "linux")))]
@@ -27,6 +32,10 @@ pub(crate) fn uninstall() -> ! {
 /// True when this is the only running copy. A second launch hands over to the
 /// window that is already open and returns false.
 pub(crate) fn single_instance() -> bool {
+    // And it can run beside the installed one, to compare the two.
+    if cfg!(debug_assertions) {
+        return true;
+    }
     #[cfg(any(windows, target_os = "linux"))]
     return imp::single_instance();
     #[cfg(not(any(windows, target_os = "linux")))]
@@ -240,11 +249,16 @@ mod windows_impl {
         }
         if let Some(dir) = install_dir() {
             remove_from_path(&dir.join("bin"));
+            // The folder holds this program, so it can only go once this
+            // program has exited. `timeout` would be the obvious way to wait,
+            // but it refuses to run without a console and returns at once --
+            // which deleted nothing, because the folder was still in use.
+            // ping waits without needing one.
             let _ = Command::new("cmd")
                 .args([
                     "/C",
                     &format!(
-                        "timeout /t 2 /nobreak >nul & rmdir /s /q \"{}\"",
+                        "ping -n 3 127.0.0.1 >nul & rmdir /s /q \"{}\"",
                         dir.display()
                     ),
                 ])

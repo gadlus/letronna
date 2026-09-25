@@ -63,7 +63,8 @@ pub(crate) struct Chat {
     pub(crate) endpoint: Entity<InputState>,
     pub(crate) model: Entity<InputState>,
     pub(crate) key: Entity<InputState>,
-    pub(crate) models: Vec<String>,
+    /// Every model on every set-up gateway, as (gateway, model).
+    pub(crate) models: Vec<(String, String)>,
     pub(crate) model_open: bool,
     pub(crate) model_search: Entity<InputState>,
     pub(crate) keys: std::collections::HashMap<String, String>,
@@ -77,7 +78,11 @@ pub(crate) struct Chat {
     pub(crate) page: Page,
     pub(crate) sidebar_open: bool,
     pub(crate) greeting: &'static str,
-    pub(crate) free_remaining: Option<u64>,
+    /// Who is signed in, as `account.json` last said; shared with the terminal.
+    pub(crate) account: Option<letronna_core::auth::Account>,
+    /// What the last sign-in, refresh or sign-out had to say.
+    pub(crate) account_note: Option<String>,
+    pub(crate) signing_in: bool,
     pub(crate) loading_models: bool,
     pub(crate) gateway_error: Option<String>,
     pub(crate) busy: bool,
@@ -165,8 +170,8 @@ impl Chat {
             store.settings.gateway = GATEWAYS[0].name.into();
         }
         if store.settings.endpoint.is_empty() {
-            store.settings.endpoint =
-                std::env::var("AGENT_BASE_URL").unwrap_or_else(|_| Upstream.into());
+            store.settings.endpoint = std::env::var("AGENT_BASE_URL")
+                .unwrap_or_else(|_| gateway(&store.settings.gateway).base.into());
         }
         let keys = load_keys();
         let saved_key = keys
@@ -174,9 +179,9 @@ impl Chat {
             .cloned()
             .or_else(|| std::env::var("AGENT_API_KEY").ok())
             .unwrap_or_default();
+        // No model yet: the list is loaded from the gateway and one is picked there.
         if store.settings.model.is_empty() {
-            store.settings.model =
-                std::env::var("AGENT_MODEL").unwrap_or_else(|_| "pool-free/gpt-oss-20b".into());
+            store.settings.model = std::env::var("AGENT_MODEL").unwrap_or_default();
         }
         let greeting = GREETINGS[(backend::now() % GREETINGS.len() as u64) as usize];
         let composer = cx.new(|cx| {
@@ -267,7 +272,9 @@ impl Chat {
             page: Page::Chat,
             sidebar_open: true,
             greeting,
-            free_remaining: None,
+            account: letronna_core::auth::account(),
+            account_note: None,
+            signing_in: false,
             loading_models: false,
             gateway_error: None,
             store,
@@ -347,32 +354,22 @@ impl Chat {
             return;
         }
         self.loading_models = true;
-        let base = self.endpoint.read(cx).value().to_string();
-        let key = self.key.read(cx).value().to_string();
-        let guest = self.store.settings.gateway == GATEWAYS[0].name;
+        let keys = self.keys.clone();
+        let custom = self.store.settings.custom_endpoint.clone();
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
-            let result = if guest {
-                backend::free_models()
-            } else {
-                backend::list_models(&base, &key)
-            };
-            let _ = tx.send_blocking(result);
+            let _ = tx.send_blocking(all_models(&keys, &custom));
         });
         let _ = window;
         cx.spawn(async move |this, cx| {
-            if let Ok(result) = rx.recv().await {
+            if let Ok((models, errors)) = rx.recv().await {
                 let _ = this.update(cx, |this, cx| {
                     this.loading_models = false;
-                    match result {
-                        Ok(models) => {
-                            this.models = models;
-                            this.gateway_error = None;
-                        }
-                        Err(error) => {
-                            this.gateway_error = Some(error.clone());
-                            this.error = Some(error);
-                        }
+                    this.models = models;
+                    // One gateway failing still leaves the others usable.
+                    this.gateway_error = (!errors.is_empty()).then(|| errors.join(" · "));
+                    if this.models.is_empty() {
+                        this.error = this.gateway_error.clone();
                     }
                     cx.notify();
                 });
@@ -381,13 +378,21 @@ impl Chat {
         .detach();
     }
 
-    pub(crate) fn choose_model(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+    /// A model and the gateway it is on, chosen together.
+    pub(crate) fn choose_model(
+        &mut self,
+        gateway: String,
+        id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.model
             .update(cx, |input, cx| input.set_value(id.clone(), window, cx));
-        if id.starts_with("pool-free/") {
-            self.endpoint
-                .update(cx, |input, cx| input.set_value(Upstream, window, cx));
-        }
+        self.gateway_pick.update(cx, |g, cx| {
+            *g = gateway.clone();
+            cx.notify();
+        });
+        self.store.settings.gateway = gateway;
         self.store.settings.model = id;
         self.model_open = false;
         self.save();
@@ -453,12 +458,21 @@ impl Chat {
         remote: Option<letronna_core::chat::Remote>,
         cx: &mut Context<Self>,
     ) -> std::result::Result<(), ()> {
+        let saved = self
+            .keys
+            .get(key_slot(&self.store.settings.gateway))
+            .cloned()
+            .unwrap_or_default();
+        let (endpoint, key) = resolve(
+            &self.store.settings.gateway,
+            &self.store.settings.custom_endpoint,
+            &saved,
+        );
         let connection = Connection {
-            endpoint: self.endpoint.read(cx).value().to_string(),
+            endpoint,
             model: self.model.read(cx).value().to_string(),
-            key: self.key.read(cx).value().to_string(),
-            guest: self.store.settings.gateway == GATEWAYS[0].name,
-            tools: self.store.settings.gateway != GATEWAYS[0].name,
+            key,
+            tools: true,
             workspace: None,
             plan: self.plan_mode,
             effort: self.store.settings.effort.clone(),
@@ -617,9 +631,6 @@ impl Chat {
             return;
         };
         turn.absorb(&event);
-        if let Some(n) = turn.live.free_remaining {
-            self.free_remaining = Some(n);
-        }
         match event {
             Event::Finished(Err(error)) => {
                 self.error = Some(error);

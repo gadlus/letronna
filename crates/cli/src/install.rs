@@ -12,7 +12,7 @@
 
 use letronna_core::auth;
 
-use crate::commands::{open_in_browser, sign_in};
+use crate::commands::open_in_browser;
 use crate::render;
 use crate::session::Runner;
 
@@ -51,30 +51,31 @@ pub fn home() -> std::path::PathBuf {
     }
 }
 
-/// Run the whole thing: ask who, ask what, then do it.
-pub fn run(runner: &mut Runner) {
+/// Ask which parts to put on the machine, and put them there.
+pub fn offer(runner: &mut Runner, number: usize, of: usize) {
     render::blank();
-    render::said(&render::blue("●"), &render::bold("Install Letronna"));
+    render::said(
+        &render::blue("●"),
+        &format!(
+            "{}  {}",
+            render::bold("Where should it live?"),
+            render::dim(&format!("{number} of {of}"))
+        ),
+    );
     render::line(&render::dim(&format!(
         "Everything goes in {}",
         home().display()
     )));
 
-    if !signed_in(runner) {
-        render::blank();
-        render::line(&render::dim("Install stopped: nobody signed in."));
-        return;
-    }
-
     let Some(parts) = choose_parts(runner) else {
-        render::line(&render::dim("Left it."));
+        render::line(&render::dim(
+            "Nothing installed. `letronna setup` offers it again.",
+        ));
         return;
     };
 
-    render::blank();
-    match place(parts) {
+    match runner.bar.busy("putting it in place", move || place(parts)) {
         Ok(done) => {
-            render::said(&render::blue("●"), &render::bold("Installed"));
             for line in done {
                 render::line(&render::dim(&line));
             }
@@ -86,25 +87,6 @@ pub fn run(runner: &mut Runner) {
         }
         Err(error) => render::line(&render::red(&error)),
     }
-}
-
-/// Make sure somebody is signed in, asking if not.
-fn signed_in(runner: &mut Runner) -> bool {
-    if let Some(account) = auth::account() {
-        render::line(&render::dim(&format!("Signed in as {}.", account.name)));
-        return true;
-    }
-    render::blank();
-    let picked = runner.bar.choose(
-        "Sign in to install",
-        vec!["Letronna is installed against an account.".into()],
-        &["Sign in", "Not now"],
-    );
-    if picked != Some(0) {
-        return false;
-    }
-    sign_in(runner);
-    auth::signed_in()
 }
 
 fn choose_parts(runner: &mut Runner) -> Option<Parts> {

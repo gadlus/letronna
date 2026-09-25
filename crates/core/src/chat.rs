@@ -70,9 +70,7 @@ pub struct Connection {
     pub endpoint: String,
     pub model: String,
     pub key: String,
-    /// Use the Upstream guest route (free catalog, cookie session) instead of the keyed API.
-    pub guest: bool,
-    /// Advertise tools. Off for the guest route, which does not forward them.
+    /// Advertise tools to the model.
     pub tools: bool,
     /// Folder the session works in, shown to the model.
     pub workspace: Option<std::path::PathBuf>,
@@ -121,24 +119,9 @@ pub enum Event {
         prompt: u64,
         cached: u64,
     },
-    FreeRemaining(u64),
     /// Sent once, before `Finished`, when the model asked for tools.
     ToolCalls(Vec<ToolCall>),
     Finished(Result<(), String>),
-}
-
-pub fn uses_guest_route(connection: &Connection) -> bool {
-    connection.guest
-}
-
-/// The marketplace API does not know the `pool-free/` prefix; with a key, send the bare id
-/// so the router picks a provider. The guest route keeps the full id.
-pub fn wire_model(connection: &Connection) -> &str {
-    let model = connection.model.trim();
-    if uses_guest_route(connection) {
-        return model;
-    }
-    model.strip_prefix("pool-free/").unwrap_or(model)
 }
 
 pub fn validate(connection: &Connection) -> Result<String, String> {
@@ -163,14 +146,9 @@ pub fn validate(connection: &Connection) -> Result<String, String> {
         return Err("Enter the model ID served by your provider in Connection settings.".into());
     }
     let base = connection.endpoint.trim().trim_end_matches('/');
-    if uses_guest_route(connection) {
-        if base != "https://pool.example/v1" {
-            return Err("Upstream Free uses the Upstream base URL: https://pool.example/v1".into());
-        }
-        if !connection.model.starts_with("pool-free/") {
-            return Err("Upstream Free only serves models from the free catalog. Switch to the Upstream gateway for marketplace models.".into());
-        }
-        return Ok("https://chat.pool.example/api/free/chat/completions".into());
+    // The Letronna gateway signs requests with this computer's account token.
+    if connection.key.trim().is_empty() && base == crate::auth::hosted_base() {
+        return Err("Sign in with /login to use Letronna's hosted models, or pick another provider.".into());
     }
     Ok(if base.ends_with("/chat/completions") {
         base.into()
@@ -282,7 +260,7 @@ fn body(connection: &Connection, messages: &[Message]) -> Value {
         }
     }
     let mut body = json!({
-        "model": wire_model(connection),
+        "model": connection.model.trim(),
         "messages": context,
         "stream": true,
         // Writing a file puts the whole body in one tool call, so a small cap
@@ -533,75 +511,6 @@ pub fn list_models(base: &str, key: &str) -> Result<Vec<String>, String> {
     Ok(models)
 }
 
-pub fn free_models() -> Result<Vec<String>, String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|_| "Cannot initialize connection.".to_owned())?;
-    let response = client
-        .get("https://chat.pool.example/api/free/models")
-        .send()
-        .and_then(|r| r.error_for_status())
-        .map_err(|_| "Cannot load the Upstream free model catalog.".to_owned())?;
-    let value: Value = response
-        .json()
-        .map_err(|_| "Invalid model catalog.".to_owned())?;
-    let models = value["data"]
-        .as_array()
-        .ok_or("Invalid model catalog.")?
-        .iter()
-        .filter_map(|m| m["key"].as_str())
-        .filter(|id| id.starts_with("pool-free/"))
-        .map(str::to_owned)
-        .collect();
-    Ok(models)
-}
-
-fn free_session(client: &reqwest::blocking::Client) -> Result<(String, u64), String> {
-    let path = data_dir().join("upstream-session.txt");
-    let stored = match std::fs::read_to_string(&path) {
-        Ok(value) => value,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(_) => return Err("Cannot read the saved Upstream session.".into()),
-    };
-    let mut request = client.get("https://chat.pool.example/api/free/session");
-    if !stored.is_empty() {
-        request = request.header(reqwest::header::COOKIE, stored.trim());
-    }
-    let response = request
-        .send()
-        .and_then(|r| r.error_for_status())
-        .map_err(|_| "Cannot open an Upstream free session.".to_owned())?;
-    let cookie = response
-        .headers()
-        .get_all(reqwest::header::SET_COOKIE)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .filter_map(|v| v.split(';').next())
-        .find(|v| v.starts_with("pool_private_guest="))
-        .map(str::to_owned)
-        .unwrap_or(stored);
-    let value: Value = response
-        .json()
-        .map_err(|_| "Invalid Upstream session response.".to_owned())?;
-    let remaining = value["remaining"]
-        .as_u64()
-        .ok_or("Upstream returned no guest allowance.")?;
-    if cookie.is_empty() {
-        return Err("Upstream did not issue a guest session.".into());
-    }
-    std::fs::create_dir_all(data_dir())
-        .and_then(|_| std::fs::write(path, &cookie))
-        .map_err(|_| {
-            "Cannot save the Upstream session. Check your data-folder permissions.".to_owned()
-        })?;
-    if remaining == 0 {
-        return Err("Upstream guest replies are used up. Open Settings, pick the Upstream gateway and add your API key to keep going.".into());
-    }
-    Ok((cookie, remaining))
-}
-
 pub fn start(connection: Connection, messages: Vec<Message>) -> async_channel::Receiver<Event> {
     let (sender, receiver) = async_channel::bounded(64);
     std::thread::spawn(move || {
@@ -624,17 +533,9 @@ fn stream(
         .build()
         .map_err(|_| "Could not initialize the HTTP client.".to_owned())?;
     let mut request = client.post(endpoint).json(&body(connection, messages));
-    let free_remaining = if uses_guest_route(connection) {
-        let (cookie, remaining) = free_session(&client)?;
-        request = request.header(reqwest::header::COOKIE, cookie);
-        let _ = sender.send_blocking(Event::FreeRemaining(remaining));
-        Some(remaining)
-    } else {
-        if !connection.key.trim().is_empty() {
-            request = request.bearer_auth(connection.key.trim());
-        }
-        None
-    };
+    if !connection.key.trim().is_empty() {
+        request = request.bearer_auth(connection.key.trim());
+    }
     // A transient edge failure part way through an agent loop would otherwise
     // lose the whole task, so give it one more go before giving up.
     let mut attempt = 0;
@@ -688,9 +589,6 @@ fn stream(
         sender
             .send_blocking(Event::Delta(content))
             .map_err(|_| "Chat closed.".to_owned())?;
-        if let Some(n) = free_remaining {
-            let _ = sender.send_blocking(Event::FreeRemaining(n.saturating_sub(1)));
-        }
         return Ok(());
     }
     let mut received = false;
@@ -758,9 +656,6 @@ fn stream(
     if !received {
         return Err("The model returned no text. Check model compatibility.".into());
     }
-    if let Some(n) = free_remaining {
-        let _ = sender.send_blocking(Event::FreeRemaining(n.saturating_sub(1)));
-    }
     Ok(())
 }
 
@@ -772,7 +667,6 @@ mod tests {
             endpoint: "http://localhost:11434/v1/".into(),
             model: "test-model".into(),
             key: String::new(),
-            guest: false,
             tools: false,
             workspace: None,
             plan: false,
@@ -827,90 +721,13 @@ mod tests {
         );
     }
     #[test]
-    fn pool_free_contract() {
-        assert_eq!(
-            parse_event(
-                r#"{"success":true,"data":{"choices":[{"delta":{"content":"Upstream reply"}}]}}"#
-            )
-            .unwrap()
-            .content,
-            Some("Upstream reply".into())
-        );
-        assert!(parse_event(r#"{"success":false,"message":"Quota exhausted"}"#).is_err());
-        let c = Connection {
-            endpoint: "https://pool.example/v1".into(),
-            model: "pool-free/gpt-oss-20b".into(),
-            key: String::new(),
-            guest: true,
-            tools: false,
-            workspace: None,
-            plan: false,
-            remote: None,
-            effort: String::new(),
-            search: false,
-        };
-        assert_eq!(
-            validate(&c).unwrap(),
-            "https://chat.pool.example/api/free/chat/completions"
-        );
-        let with_key = Connection {
-            key: "sk-test".into(),
-            guest: false,
-            ..c
-        };
-        assert_eq!(
-            validate(&with_key).unwrap(),
-            "https://pool.example/v1/chat/completions"
-        );
-        assert_eq!(wire_model(&with_key), "gpt-oss-20b");
-    }
-    #[test]
-    #[ignore = "Uses one real Upstream guest prompt; run explicitly"]
-    fn live_pool_free_chat() {
-        let rx = start(
-            Connection {
-                endpoint: "https://pool.example/v1".into(),
-                model: "pool-free/gpt-oss-20b".into(),
-                key: String::new(),
-                guest: true,
-                tools: false,
-                workspace: None,
-                plan: false,
-                remote: None,
-                effort: String::new(),
-                search: false,
-            },
-            vec![Message {
-                role: "user".into(),
-                content: "Reply with exactly: Native chat works.".into(),
-                ..Default::default()
-            }],
-        );
-        let mut text = String::new();
-        loop {
-            match rx.recv_blocking().unwrap() {
-                Event::Delta(chunk) => text.push_str(&chunk),
-                Event::Reasoning(_) | Event::Usage { .. } => {}
-                Event::FreeRemaining(_) | Event::ToolCalls(_) => {}
-                Event::Finished(result) => {
-                    result.unwrap();
-                    break;
-                }
-            }
-        }
-        assert!(!text.trim().is_empty());
-        println!("Upstream live reply: {text}");
-    }
-    #[test]
-    #[ignore = "Uses the saved Upstream key and one marketplace model; run explicitly"]
+    #[ignore = "Talks to a real provider: set AGENT_BASE_URL, AGENT_API_KEY and AGENT_MODEL"]
     fn live_tool_loop() {
-        let keys: Value =
-            serde_json::from_slice(&std::fs::read(data_dir().join("keys.json")).unwrap()).unwrap();
+        let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("set {name}"));
         let connection = Connection {
-            endpoint: "https://pool.example/v1".into(),
-            model: std::env::var("AGENT_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into()),
-            key: keys["Upstream"].as_str().unwrap().into(),
-            guest: false,
+            endpoint: var("AGENT_BASE_URL"),
+            model: var("AGENT_MODEL"),
+            key: var("AGENT_API_KEY"),
             tools: true,
             workspace: Some(std::env::current_dir().unwrap()),
             plan: false,

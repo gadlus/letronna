@@ -35,6 +35,8 @@ crates/cli    the terminal (binary `letronna`)
   main.rs     start up, then the loop: read a line, answer it
   args.rs     what was asked for on the command line
   commands.rs the slash commands
+  setup.rs    the first-run questions the install scripts hand over to
+  install.rs  putting the binaries in place and on PATH
   bar.rs      the input box: keys, the menu, questions, what it looks like
   edit.rs     the line being typed, with no terminal attached
   screen.rs   the window we draw in, scrolling, selecting, copying
@@ -83,6 +85,14 @@ For the window, `scripts/verify-ui.ps1 -Action capture|click|send`.
 Some things cannot be checked with injected input: a synthetic mouse sends no
 drag events, so a live highlight has to be looked at by hand. Say plainly in
 the pull request what you did not verify.
+
+## Testing the installer
+
+`scripts/install.ps1` and `letronna setup` can be driven without a keyboard:
+pipe the answers in, and point `LETRONNA_DOWNLOAD` at a local zip and
+`AGENT_DATA_DIR` / `LOCALAPPDATA` at a scratch folder. One thing a scratch
+folder does not isolate: the PATH step writes your real user PATH. Take the
+scratch entry back out afterwards.
 
 ## Reporting bugs
 

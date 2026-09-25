@@ -9,7 +9,7 @@ Letronna — a small agent in your terminal
   letronna --resume        choose from the recent sessions
   letronna --resume <id>   open that session, by the id /where shows
   letronna gui             open the window instead
-  letronna --install       put Letronna on this machine
+  letronna setup           name, sign in, provider, model, install
   letronna --uninstall     take it off again
 
 Options
@@ -71,7 +71,7 @@ pub fn parse(mut raw: impl Iterator<Item = String>) -> Args {
             }
             "--yes" => args.yes = true,
             "--plan" => args.plan = true,
-            "--install" => args.install = true,
+            "setup" | "--install" => args.install = true,
             "--uninstall" => args.uninstall = true,
             "-h" | "--help" => args.help = true,
             // A bare word is the prompt, so `letronna "what is this"` works.
