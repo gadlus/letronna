@@ -120,6 +120,7 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(crate::messaging::ReadChat),
         Arc::new(Sessions),
         Arc::new(crate::memory::Remember),
+        Arc::new(SearchSessions),
     ];
     if let Ok(extra) = plugin_tools().lock() {
         for tool in extra.iter() {
@@ -224,7 +225,7 @@ pub fn clamp_lines(text: &str, max: usize) -> String {
 pub fn summary(name: &str, args: &str) -> String {
     let v: Value = serde_json::from_str(args).unwrap_or(Value::Null);
     let text = match name {
-        "search" => v["query"]
+        "search" | "search_sessions" => v["query"]
             .as_str()
             .map(|q| format!("\"{q}\""))
             .unwrap_or_default(),
@@ -556,6 +557,54 @@ The user opens one with /resume, or `letronna --resume <id>`.",
                 "
 "
             )
+        ))
+    }
+}
+
+/// Finds where earlier sessions talked about something. `list_sessions`
+/// gives titles only, so "what did we decide about X" had no answer short of
+/// the user opening sessions one by one.
+struct SearchSessions;
+impl Tool for SearchSessions {
+    fn name(&self) -> &'static str {
+        "search_sessions"
+    }
+    fn description(&self) -> &'static str {
+        "Search what was said in the user's earlier Letronna sessions for a word or phrase, ignoring case. Returns the matching lines with each session's id, title and age, newest sessions first. Use it when the user refers to something from an earlier conversation, or when an earlier session may already hold the answer."
+    }
+    fn parameters(&self) -> Value {
+        json!({"type": "object", "properties": {
+            "query": {"type": "string"},
+            "limit": {"type": "integer", "description": "How many matches at most. Default 20."}
+        }, "required": ["query"]})
+    }
+    fn run(&self, args: &Value, _: &ToolContext) -> Result<String, String> {
+        let query = args["query"].as_str().unwrap_or_default().trim();
+        if query.is_empty() {
+            return Err("Query is empty.".into());
+        }
+        let limit = args["limit"].as_u64().unwrap_or(20).clamp(1, 50) as usize;
+        let hits = crate::store::search(query, limit);
+        if hits.is_empty() {
+            return Ok(format!("No earlier session mentions \"{query}\"."));
+        }
+        let lines: Vec<String> = hits
+            .iter()
+            .map(|hit| {
+                let title = match hit.title.trim() {
+                    "" => "untitled",
+                    title => title,
+                };
+                let when = crate::chat::ago(hit.updated);
+                format!(
+                    "{}  {title}  ({when}) {}: {}",
+                    hit.id, hit.role, hit.snippet
+                )
+            })
+            .collect();
+        Ok(format!(
+            "id  title  (when) who: what was said\n{}\n\nThe user opens one with /resume, or `letronna --resume <id>`.",
+            lines.join("\n")
         ))
     }
 }
