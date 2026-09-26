@@ -14,6 +14,11 @@ This file is also the App tab of https://letronna.ai/changelog.
 ## [Unreleased]
 
 ### Added
+- **All** — Letronna makes images, speech and video, and turns speech into text; pick which model makes each.
+- **All** — Letronna remembers: `SOUL.md` says who it is, `USER.md` and `MEMORY.md` hold what it knows about you and its own notes, and a project's `AGENTS.md` is read as its instructions.
+- **All** — Tools from MCP servers, set up in `mcp.json`.
+- **All** — Read a web page.
+- **All** — Search past sessions.
 - **Terminal** — `letronna`, the agent in a terminal: the conversation, tools, diffs, `/resume` by name, `/model`, `/effort`, `/thinking`, `/search`, `/plan`, `/jobs` and `/skills`.
 - **All** — One Letronna account for the app and the terminal: `/login`, `/whoami`, `/logout`, and an Account page in the app. Signing in happens on letronna.ai.
 - **All** — Letronna's hosted models on your account, paid from your credit, with no key to paste.
@@ -29,6 +34,8 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — Install in one line, then a few questions.
 
 ### Changed
+- **All** — Old turns are summarized instead of forgotten when a conversation outgrows the model's window.
+- **All** — Model calls reuse one connection, and search skips files without a match before reading them.
 - **All** — Letronna is the default gateway, and the only hosted one.
 - **All** — Each session is its own file, so two copies of Letronna can run at once.
 - **All** — Settings saved on a gateway that is no longer offered move to your Letronna account.
@@ -36,6 +43,8 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — A turn that fails says why; tools work on gateways that rename them.
 
 ### Fixed
+- **All** — Your keys and sign-in stay out of the model's reach.
+- **Terminal** — Sessions keep their pins and todos when the terminal saves them.
 - **Windows** — Pastes arrive as one paste, commands run without flashing a console window, and the wheel scrolls.
 - **All** — Context no longer lost on large tool results; dangling tool calls are repaired.
 - **App** — Asking the Discord bot to read the chat no longer hangs the app.
