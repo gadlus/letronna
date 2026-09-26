@@ -25,6 +25,9 @@ crates/core   the agent, and everything both front ends need
   jobs.rs     commands left running in the background
   skills.rs   saved instructions the model can be given
   gateway.rs  the providers and which of them need a key
+  browser.rs  the browse and use_page tools, and what each action does
+  page.rs     a page as the model reads it: lines with refs to act on
+  cdp.rs      starting the installed browser and talking DevTools to it
 
 crates/gui    the window (binary `letronna-gui`)
   app.rs      state and actions on `Chat`

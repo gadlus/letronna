@@ -45,8 +45,10 @@ fn main() {
         })
         .detach();
         // Background jobs are children of this process; do not outlive it.
+        // Nor does a browser with no window, which nobody could close.
         cx.on_app_quit(|_| {
             letronna_core::jobs::stop_all();
+            letronna_core::browser::close_hidden();
             async {}
         })
         .detach();

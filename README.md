@@ -96,6 +96,19 @@ Signed in, the agent can also make things on Letronna's hosted models, whichever
 
 Each one asks first, since it spends your credit, and none is offered in plan mode or in a shared chat. Unless a model is named, the cheapest one working is used; the prices are on the dashboard's models page. What is made is saved in `media/` in the project folder, or in the data folder when no project is attached. The window shows a made image in the chat, and opens any made file.
 
+## Browser
+
+The agent can use a real web browser: the Chrome, Edge or Brave already installed (Edge comes with Windows), driven over the DevTools protocol. Nothing is downloaded and no Node or Python is needed.
+
+| Tool       | Does                                                                            |
+|------------|---------------------------------------------------------------------------------|
+| `browse`   | opens a page and lists it, scrolls, goes back, switches tabs, reads the console, takes a screenshot |
+| `use_page` | clicks, types, presses keys, picks from dropdowns, runs JavaScript              |
+
+A page reaches the model as its accessibility tree, one element a line with a ref such as `e12` to click or type into; screenshots show in the chat, and a model that takes images sees the newest one. The browser opens in a window of its own, on its own profile in the data folder, never your usual one: sign in to a site there once and it stays signed in. `LETRONNA_BROWSER_HEADLESS=1` runs it with no window, and closes it when Letronna exits; `LETRONNA_BROWSER` picks the browser by its path.
+
+Both tools ask first, as a web address can carry things out as well as bring them in. Looking is allowed in plan mode and acting is not; neither is offered in a shared chat. An address carrying one of your own keys or tokens is never opened, nor a cloud machine's metadata service.
+
 ## Local data
 
 `%LOCALAPPDATA%\Letronna\` on Windows, `~/Library/Application Support/Letronna/` on macOS, `~/.local/share/Letronna/` on Linux. `AGENT_DATA_DIR` overrides all three.
@@ -103,7 +116,8 @@ Each one asks first, since it spends your credit, and none is offered in plan mo
 - `chats.json` sessions and the selected gateway, endpoint and model
 - `keys.json` API keys per gateway, plain text on your disk only
 - `account.json` the Letronna sign-in for this computer
-- `media/` images, speech and video made with no project attached
+- `media/` images, speech and video made with no project attached, and browser screenshots
+- `browser/` the browser's own profile: delete it to sign out of everything there
 
 Chat text is sent to the gateway you selected and nowhere else.
 

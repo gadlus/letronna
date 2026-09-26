@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    collections::HashSet,
     io::{BufRead, BufReader},
+    path::PathBuf,
+    sync::{Mutex, OnceLock},
     time::Duration,
 };
 
@@ -244,8 +247,21 @@ fn body(connection: &Connection, messages: &[Message]) -> Value {
     }
     let mut context = vec![json!({"role": "system", "content": system})];
     let window = &messages[start..];
+    let shot = screenshot(window)
+        .filter(|_| sees_images(&connection.model))
+        .and_then(|(after, path)| Some((after, crate::media::data_url(&path)?)));
     for (i, m) in window.iter().enumerate() {
         context.push(wire_message(m));
+        // A tool result carries text only, so the picture follows as the
+        // user's: the one shape of it every provider takes.
+        if let Some((after, picture)) = &shot
+            && *after == i
+        {
+            context.push(json!({"role": "user", "content": [
+                {"type": "text", "text": "The screenshot browse took:"},
+                {"type": "image_url", "image_url": {"url": picture}}
+            ]}));
+        }
         // Every tool call must be answered or providers reject the whole
         // request. A call can be left dangling if the app closed on the card.
         for call in &m.tool_calls {
@@ -285,6 +301,48 @@ fn body(connection: &Connection, messages: &[Message]) -> Value {
         body["reasoning_effort"] = connection.effort.clone().into();
     }
     body
+}
+
+/// The newest screenshot `browse` took in `window`: where it goes -- after
+/// the last result of its batch of calls -- and its file. The model is shown
+/// that one only: the page has moved on since any older one, and a picture
+/// is paid for again on every request it is in.
+fn screenshot(window: &[Message]) -> Option<(usize, PathBuf)> {
+    let at = window.iter().rposition(|m| {
+        m.role == "tool"
+            && m.name == crate::browser::BROWSE
+            && !m.is_error
+            && crate::media::saved(&m.content).is_some()
+    })?;
+    let path = crate::media::saved(&window[at].content)?;
+    let batch = window[at..].iter().take_while(|m| m.role == "tool").count();
+    Some((at + batch - 1, path))
+}
+
+/// Models that turned a picture down, which are sent none for the rest of
+/// this run.
+fn sightless() -> &'static Mutex<HashSet<String>> {
+    static SIGHTLESS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    SIGHTLESS.get_or_init(Default::default)
+}
+
+fn sees_images(model: &str) -> bool {
+    sightless()
+        .lock()
+        .map(|models| !models.contains(model))
+        .unwrap_or(true)
+}
+
+fn forget_images(model: &str) {
+    if let Ok(mut models) = sightless().lock() {
+        models.insert(model.to_owned());
+    }
+}
+
+/// Whether a request for this conversation carries a picture.
+fn shows_picture(connection: &Connection, messages: &[Message]) -> bool {
+    sees_images(&connection.model)
+        && screenshot(&messages[window_start(messages)..]).is_some_and(|(_, path)| path.is_file())
 }
 
 /// Keep both ends of an oversized tool result; the middle is rarely the point.
@@ -579,6 +637,13 @@ fn stream(
     };
     let status = response.status();
     if !status.is_success() {
+        // A model that cannot take pictures turns the whole request down,
+        // each provider in words of its own. Send it again without the
+        // screenshot, which that model is spared from then on.
+        if status.is_client_error() && shows_picture(connection, messages) {
+            forget_images(&connection.model);
+            return stream(connection, messages, sender);
+        }
         let detail = response
             .json::<Value>()
             .ok()
@@ -1157,5 +1222,155 @@ mod tests {
             Event::Finished(Ok(()))
         ));
         worker.join().unwrap();
+    }
+
+    /// A conversation in which browse took two screenshots, the second in a
+    /// batch with another call.
+    fn screenshots(dir: &std::path::Path) -> Vec<Message> {
+        std::fs::create_dir_all(dir).unwrap();
+        let (old, new) = (dir.join("old.jpg"), dir.join("new.jpg"));
+        std::fs::write(&old, [0xFF, 0xD8, 0xFF, 1]).unwrap();
+        std::fs::write(&new, [0xFF, 0xD8, 0xFF, 2]).unwrap();
+        let call = |id: &str, name: &str| ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: "{}".into(),
+        };
+        let result = |id: &str, name: &str, content: String| Message {
+            role: "tool".into(),
+            tool_call_id: id.into(),
+            name: name.into(),
+            content,
+            ..Default::default()
+        };
+        vec![
+            Message {
+                role: "user".into(),
+                content: "look at it".into(),
+                ..Default::default()
+            },
+            Message {
+                role: "assistant".into(),
+                tool_calls: vec![call("a", "browse")],
+                ..Default::default()
+            },
+            result(
+                "a",
+                "browse",
+                format!("Saved to {}\nA screenshot.", old.display()),
+            ),
+            Message {
+                role: "assistant".into(),
+                tool_calls: vec![call("b", "browse"), call("c", "read_file")],
+                ..Default::default()
+            },
+            result(
+                "b",
+                "browse",
+                format!("Saved to {}\nA screenshot.", new.display()),
+            ),
+            result("c", "read_file", "notes".into()),
+        ]
+    }
+
+    #[test]
+    fn the_newest_screenshot_is_shown_to_the_model() {
+        let dir = std::env::temp_dir().join(format!("letronna-shots-{}", std::process::id()));
+        let messages = screenshots(&dir);
+        let sent = |model: &str| -> Vec<Value> {
+            let c = Connection {
+                model: model.into(),
+                ..connection()
+            };
+            body(&c, &messages)["messages"].as_array().unwrap().clone()
+        };
+        let context = sent("sees-images");
+        let pictures: Vec<usize> = (0..context.len())
+            .filter(|at| context[*at]["content"].is_array())
+            .collect();
+        // One picture, the newer, after the last result of its batch: a
+        // call's result has to come straight after the call.
+        assert_eq!(pictures, [context.len() - 1]);
+        assert_eq!(context[context.len() - 2]["tool_call_id"], "c");
+        let picture = &context[context.len() - 1]["content"][1]["image_url"]["url"];
+        assert_eq!(picture, "data:image/jpeg;base64,/9j/Ag==");
+        // A model that turned an image down is sent none.
+        forget_images("cannot-see");
+        assert!(sent("cannot-see").iter().all(|m| !m["content"].is_array()));
+        // Nor is one sent for a file that has since been deleted.
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(sent("sees-images").iter().all(|m| !m["content"].is_array()));
+    }
+
+    /// The body of the next request to `socket`.
+    fn request_body(socket: &mut std::net::TcpStream) -> String {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        let mut block = [0; 65536];
+        loop {
+            let n = socket.read(&mut block).unwrap();
+            assert_ne!(n, 0);
+            bytes.extend_from_slice(&block[..n]);
+            let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&bytes[..end]).to_lowercase();
+            let length: usize = headers
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length: "))
+                .unwrap()
+                .parse()
+                .unwrap();
+            if bytes.len() >= end + 4 + length {
+                return String::from_utf8_lossy(&bytes[end + 4..]).into_owned();
+            }
+        }
+    }
+
+    #[test]
+    fn a_request_an_image_spoilt_is_sent_again_without_it() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("letronna-spoilt-{}", std::process::id()));
+        let messages = screenshots(&dir);
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1", server.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            // What DeepSeek says to a picture, then an answer.
+            let replies = [
+                (
+                    "400 Bad Request",
+                    "application/json",
+                    r#"{"error":{"message":"unknown variant `image_url`, expected `text`"}}"#,
+                ),
+                (
+                    "200 OK",
+                    "text/event-stream",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"A form\"}}]}\n\ndata: [DONE]\n\n",
+                ),
+            ];
+            let mut bodies = Vec::new();
+            for (status, kind, reply) in replies {
+                let (mut socket, _) = server.accept().unwrap();
+                bodies.push(request_body(&mut socket));
+                write!(socket, "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+            }
+            bodies
+        });
+        let c = Connection {
+            endpoint,
+            model: "turns-images-down".into(),
+            ..connection()
+        };
+        let rx = start(c, messages);
+        assert!(matches!(rx.recv_blocking().unwrap(), Event::Delta(s) if s == "A form"));
+        assert!(matches!(
+            rx.recv_blocking().unwrap(),
+            Event::Finished(Ok(()))
+        ));
+        let bodies = worker.join().unwrap();
+        assert!(bodies[0].contains("image_url"));
+        assert!(!bodies[1].contains("image_url"));
+        assert!(!sees_images("turns-images-down"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

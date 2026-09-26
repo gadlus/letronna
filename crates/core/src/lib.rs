@@ -8,11 +8,14 @@
 
 pub mod agent;
 pub mod auth;
+pub mod browser;
+mod cdp;
 pub mod chat;
 pub mod gateway;
 pub mod jobs;
 pub mod media;
 pub mod messaging;
+mod page;
 pub mod schedule;
 pub mod skills;
 pub mod store;

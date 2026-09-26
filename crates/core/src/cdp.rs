@@ -1,0 +1,780 @@
+//! Talking to a Chromium browser over the DevTools protocol.
+//!
+//! Letronna drives the Chrome, Edge or Brave already on the computer rather
+//! than shipping a browser: the protocol is JSON over a WebSocket, which core
+//! already speaks for Discord, so nothing is downloaded and no Node or Python
+//! is needed. The browser runs on a profile of its own in the data folder, so
+//! the user's own browser is never touched -- Chrome 136 refuses to be driven
+//! on its default profile anyway -- and a site signed in to there stays signed
+//! in for next time.
+//!
+//! Nothing here runs between calls. A call writes its request and reads until
+//! the answer comes back, dealing on the way with whatever else the page said;
+//! anything the page says while nobody is asking waits in the socket for the
+//! next call. No thread, no timer, nothing to wake up for.
+
+use serde::Deserialize;
+use serde::de::DeserializeOwned;
+use serde_json::{Value, json};
+use std::collections::VecDeque;
+use std::net::{TcpStream, ToSocketAddrs};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+use tungstenite::{Message as Frame, WebSocket};
+
+/// How long one request may take before the browser is taken to be stuck.
+const CALL_TIME: Duration = Duration::from_secs(20);
+/// How long a browser has to start and open its debugging port. The first
+/// start makes the profile, which is the slow part.
+const START_TIME: Duration = Duration::from_secs(20);
+/// How long the debugging port gets to answer a look at whether it is up.
+const PROBE_TIME: Duration = Duration::from_secs(2);
+/// The largest message taken from the browser. A long page's accessibility
+/// tree runs to megabytes -- Wikipedia's article on Rust is 8.5 MB -- and one
+/// past this is refused rather than held in memory.
+const MAX_MESSAGE: usize = 64 << 20;
+/// Events kept for the action in progress. A page that reloads in a loop
+/// cannot grow this without bound.
+const MAX_EVENTS: usize = 500;
+/// The file a browser writes its debugging port into, in its profile.
+const PORT_FILE: &str = "DevToolsActivePort";
+/// What the browser is started with, besides its port and profile.
+///
+/// The first two keep a fresh profile from opening on welcome and "make me
+/// your default" pages. The three `backgrounding` switches stop Chromium
+/// from pausing a page whose window is behind Letronna's: without them a
+/// screenshot waits for a frame that never comes, and a page's own timers
+/// stall mid-task.
+///
+/// The last two keep the profile small. Left to itself Edge fills a new
+/// profile with downloaded components -- shopping, wallet and language
+/// models, 443 MB within ten seconds of one test run -- where the browsing
+/// itself took 13 MB; what is lost is DRM video and certificate-list
+/// updates, which a browser for an agent does without. The disk cache is
+/// capped at 64 MB, which Chromium would otherwise size to the free disk.
+///
+/// There is deliberately no `--enable-automation` (it tells every site the
+/// browser is automated) and no `--remote-allow-origins` (it would let any
+/// page the browser opens drive the debugging port).
+const SWITCHES: &[&str] = &[
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--hide-crash-restore-bubble",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+    "--disable-background-timer-throttling",
+    "--disable-component-update",
+    "--disk-cache-size=67108864",
+];
+/// A window size for a browser with no window, which otherwise draws pages
+/// at 800 by 600 and gets the phone layout of many sites.
+const HIDDEN_WINDOW: &str = "--window-size=1280,900";
+
+/// Where the Chromium browsers install themselves, as a path under a
+/// Windows program folder, most wanted first: Chrome is what sites are
+/// tested against, and Edge is on every Windows computer.
+const WINDOWS: &[&str] = &[
+    r"Google\Chrome\Application\chrome.exe",
+    r"Microsoft\Edge\Application\msedge.exe",
+    r"BraveSoftware\Brave-Browser\Application\brave.exe",
+    r"Chromium\Application\chrome.exe",
+];
+const MAC: &[&str] = &[
+    "Google Chrome.app/Contents/MacOS/Google Chrome",
+    "Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    "Brave Browser.app/Contents/MacOS/Brave Browser",
+    "Chromium.app/Contents/MacOS/Chromium",
+];
+const LINUX: &[&str] = &[
+    "google-chrome",
+    "google-chrome-stable",
+    "microsoft-edge",
+    "microsoft-edge-stable",
+    "brave-browser",
+    "brave",
+    "chromium",
+    "chromium-browser",
+];
+
+/// The browser to drive: the one `LETRONNA_BROWSER` names, else the first
+/// installed one.
+fn installed() -> Option<PathBuf> {
+    first_existing(&candidates())
+}
+
+fn first_existing(paths: &[PathBuf]) -> Option<PathBuf> {
+    paths.iter().find(|path| path.is_file()).cloned()
+}
+
+/// Every place a browser might be, most wanted first.
+fn candidates() -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = std::env::var_os("LETRONNA_BROWSER")
+        .map(PathBuf::from)
+        .into_iter()
+        .collect();
+    let env = |name: &str| std::env::var_os(name).map(PathBuf::from);
+    if cfg!(windows) {
+        let roots: Vec<PathBuf> = ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"]
+            .into_iter()
+            .filter_map(env)
+            .collect();
+        for path in WINDOWS {
+            paths.extend(roots.iter().map(|root| root.join(path)));
+        }
+    } else if cfg!(target_os = "macos") {
+        let roots: Vec<PathBuf> = [
+            Some(PathBuf::from("/Applications")),
+            env("HOME").map(|h| h.join("Applications")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        for path in MAC {
+            paths.extend(roots.iter().map(|root| root.join(path)));
+        }
+    } else {
+        let dirs: Vec<PathBuf> = std::env::var_os("PATH")
+            .map(|path| std::env::split_paths(&path).collect())
+            .unwrap_or_default();
+        for name in LINUX {
+            paths.extend(dirs.iter().map(|dir| dir.join(name)));
+        }
+    }
+    paths
+}
+
+/// The debugging port written in a profile's port file.
+fn port_in(text: &str) -> Option<u16> {
+    text.lines()
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+        .filter(|port| *port > 0)
+}
+
+fn read_port(profile: &Path) -> Option<u16> {
+    port_in(&std::fs::read_to_string(profile.join(PORT_FILE)).ok()?)
+}
+
+/// One HTTP client for the debugging port, kept rather than built per call:
+/// each one starts a thread of its own.
+fn http() -> Result<&'static reqwest::blocking::Client, String> {
+    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client);
+    }
+    let client = reqwest::blocking::Client::builder()
+        .timeout(PROBE_TIME)
+        .no_proxy()
+        .build()
+        .map_err(|e| format!("Could not set up a connection to the browser: {e}"))?;
+    Ok(CLIENT.get_or_init(|| client))
+}
+
+/// Whether a browser's debugging port is up, and if it is, whether that
+/// browser has no window. One found running may not be in the mode asked
+/// for, and a window someone may be using must not be closed as a hidden one.
+fn running(port: u16) -> Option<bool> {
+    let version: Value = http()
+        .ok()?
+        .get(format!("http://127.0.0.1:{port}/json/version"))
+        .send()
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .ok()?;
+    let agent = version["User-Agent"].as_str().unwrap_or_default();
+    Some(agent.contains("HeadlessChrome"))
+}
+
+/// A running browser: one Letronna started, or one it found still running on
+/// its profile from an earlier run.
+pub struct Browser {
+    port: u16,
+    /// The process, when this run of Letronna started it.
+    child: Option<Child>,
+    /// Running with no window, where nobody can see it or close it.
+    pub headless: bool,
+}
+
+/// One tab, as the browser lists it.
+#[derive(Clone, Debug, Deserialize)]
+pub struct Target {
+    pub id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(rename = "webSocketDebuggerUrl", default)]
+    socket: String,
+}
+
+impl Browser {
+    /// The browser on `profile`: the one already running there, or a new one.
+    pub fn start(profile: &Path, headless: bool) -> Result<Browser, String> {
+        let found = read_port(profile).and_then(|port| Some((port, running(port)?)));
+        if let Some((port, headless)) = found {
+            return Ok(Browser {
+                port,
+                child: None,
+                headless,
+            });
+        }
+        let exe = installed().ok_or(
+            "No Chromium browser was found: install Chrome, Edge or Brave, or set \
+             LETRONNA_BROWSER to the path of one.",
+        )?;
+        std::fs::create_dir_all(profile)
+            .map_err(|e| format!("Could not make the browser's profile folder: {e}"))?;
+        // Left over from a browser that has since gone; the new one writes
+        // its own, and until it has, this one would point nowhere.
+        let _ = std::fs::remove_file(profile.join(PORT_FILE));
+        let mut command = Command::new(&exe);
+        command
+            .arg("--remote-debugging-port=0")
+            .arg(format!("--user-data-dir={}", profile.display()))
+            .args(SWITCHES)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if headless {
+            command.args(["--headless=new", HIDDEN_WINDOW]);
+        }
+        command.arg("about:blank");
+        // Its own process group, so ctrl-c in the terminal that started
+        // Letronna does not take the browser with it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let name = exe
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "The browser".into());
+        let mut child = command
+            .spawn()
+            .map_err(|e| format!("Could not start {name}: {e}"))?;
+        let started = Instant::now();
+        loop {
+            if let Some(port) = read_port(profile).filter(|port| running(*port).is_some()) {
+                return Ok(Browser {
+                    port,
+                    child: Some(child),
+                    headless,
+                });
+            }
+            if started.elapsed() > START_TIME {
+                let _ = child.kill();
+                return Err(format!(
+                    "{name} did not open its debugging port within {} seconds.",
+                    START_TIME.as_secs()
+                ));
+            }
+            // A second browser on the same profile hands over to the first
+            // and exits; give that one a moment to write its port before
+            // giving up on it.
+            if let Ok(Some(_)) = child.try_wait()
+                && started.elapsed() > Duration::from_secs(3)
+            {
+                return Err(format!(
+                    "{name} closed as soon as it started. If it is already open on \
+                     Letronna's profile, close that window and try again."
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// The browser's tabs, the one used most recently first.
+    pub fn tabs(&self) -> Result<Vec<Target>, String> {
+        let targets: Vec<Target> = http()?
+            .get(format!("http://127.0.0.1:{}/json/list", self.port))
+            .send()
+            .and_then(|reply| reply.json())
+            .map_err(|_| "The browser did not list its tabs.".to_owned())?;
+        Ok(targets
+            .into_iter()
+            .filter(|target| target.kind == "page" && !target.socket.is_empty())
+            .collect())
+    }
+
+    /// A new blank tab.
+    pub fn new_tab(&self) -> Result<Target, String> {
+        http()?
+            .put(format!(
+                "http://127.0.0.1:{}/json/new?about:blank",
+                self.port
+            ))
+            .send()
+            .and_then(|reply| reply.json())
+            .map_err(|_| "The browser did not open a new tab.".to_owned())
+    }
+
+    /// Connect to a tab, ready to be driven.
+    pub fn attach(&self, target: &Target) -> Result<Tab, String> {
+        let mut tab = Tab::connect(&target.socket, &target.id)?;
+        tab.call::<Ignored>("Page.enable", json!({}))?;
+        tab.call::<Ignored>("Page.setLifecycleEventsEnabled", json!({"enabled": true}))?;
+        Ok(tab)
+    }
+
+    /// Bring a tab to the front of its window.
+    pub fn show(&self, target: &Target) {
+        if let Ok(client) = http() {
+            let _ = client
+                .get(format!(
+                    "http://127.0.0.1:{}/json/activate/{}",
+                    self.port, target.id
+                ))
+                .send();
+        }
+    }
+
+    /// Close the whole browser, every tab of it.
+    pub fn close(&mut self) {
+        let socket = http().ok().and_then(|client| {
+            let version: Value = client
+                .get(format!("http://127.0.0.1:{}/json/version", self.port))
+                .send()
+                .and_then(|reply| reply.json())
+                .ok()?;
+            version["webSocketDebuggerUrl"].as_str().map(str::to_owned)
+        });
+        if let Some(mut browser) = socket.and_then(|socket| Tab::connect(&socket, "browser").ok()) {
+            let _ = browser.call::<Ignored>("Browser.close", json!({}));
+        }
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        let asked = Instant::now();
+        while asked.elapsed() < PROBE_TIME {
+            if let Ok(Some(_)) = child.try_wait() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+/// A result nobody reads.
+pub type Ignored = serde::de::IgnoredAny;
+
+/// Something the page said without being asked.
+#[derive(Debug)]
+pub struct Event {
+    pub method: String,
+    pub params: Value,
+}
+
+/// A frame from the browser, read far enough to know what it is.
+#[derive(Deserialize)]
+struct Envelope {
+    id: Option<u64>,
+    method: Option<String>,
+    #[serde(default)]
+    params: Value,
+}
+
+#[derive(Deserialize)]
+struct Answer<T> {
+    result: Option<T>,
+    error: Option<Refusal>,
+}
+
+#[derive(Deserialize)]
+struct Refusal {
+    message: String,
+}
+
+/// A connection to one tab.
+pub struct Tab {
+    pub id: String,
+    socket: WebSocket<TcpStream>,
+    next: u64,
+    /// Set once the connection has failed. The tab is no use after that: it
+    /// was closed, or the browser was.
+    pub broken: bool,
+    /// What the page said while calls waited, oldest first.
+    pub events: VecDeque<Event>,
+    /// Whether a confirm or prompt the page opens is answered OK.
+    pub agree: bool,
+    /// Dialogs answered since these were last taken, as the model is told.
+    pub dialogs: Vec<String>,
+}
+
+impl Tab {
+    /// Connect to a debugging socket, such as a tab's `webSocketDebuggerUrl`.
+    pub fn connect(address: &str, id: &str) -> Result<Tab, String> {
+        let unreachable = || "Could not connect to the browser.".to_owned();
+        let url = reqwest::Url::parse(address).map_err(|_| unreachable())?;
+        let host = url.host_str().ok_or_else(unreachable)?;
+        let port = url.port_or_known_default().ok_or_else(unreachable)?;
+        let place = (host, port)
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut places| places.next())
+            .ok_or_else(unreachable)?;
+        let stream = TcpStream::connect_timeout(&place, PROBE_TIME).map_err(|_| unreachable())?;
+        let _ = stream.set_nodelay(true);
+        let _ = stream.set_read_timeout(Some(CALL_TIME));
+        let config = tungstenite::protocol::WebSocketConfig::default()
+            .max_message_size(Some(MAX_MESSAGE))
+            .max_frame_size(Some(MAX_MESSAGE));
+        let (socket, _) = tungstenite::client::client_with_config(address, stream, Some(config))
+            .map_err(|_| unreachable())?;
+        Ok(Tab {
+            id: id.to_owned(),
+            socket,
+            next: 0,
+            broken: false,
+            events: VecDeque::new(),
+            agree: false,
+            dialogs: Vec::new(),
+        })
+    }
+
+    /// Ask the browser something and wait for its answer.
+    pub fn call<T: DeserializeOwned>(&mut self, method: &str, params: Value) -> Result<T, String> {
+        self.call_within(method, params, CALL_TIME)
+    }
+
+    /// `call`, with its own time limit.
+    pub fn call_within<T: DeserializeOwned>(
+        &mut self,
+        method: &str,
+        params: Value,
+        limit: Duration,
+    ) -> Result<T, String> {
+        let id = self.send(method, params)?;
+        let deadline = Instant::now() + limit;
+        loop {
+            let Some(text) = self.read(deadline)? else {
+                return Err(format!("The browser did not answer in time ({method})."));
+            };
+            let envelope: Envelope = serde_json::from_str(&text)
+                .map_err(|_| "The browser sent something unreadable.".to_owned())?;
+            if envelope.id != Some(id) {
+                self.heard(envelope);
+                continue;
+            }
+            // Read a second time, into the shape asked for: a page's whole
+            // accessibility tree comes this way, and going through a `Value`
+            // first would hold it in memory twice over.
+            let answer: Answer<T> = serde_json::from_str(&text)
+                .map_err(|e| format!("The browser's answer to {method} could not be read: {e}"))?;
+            return match (answer.result, answer.error) {
+                (_, Some(refusal)) => Err(refusal.message),
+                (Some(result), None) => Ok(result),
+                (None, None) => Err(format!("The browser sent no answer to {method}.")),
+            };
+        }
+    }
+
+    /// Read until an event `until` accepts has come, or `limit` has passed.
+    /// Events already read count. True when it came.
+    pub fn wait(
+        &mut self,
+        limit: Duration,
+        until: impl Fn(&Event) -> bool,
+    ) -> Result<bool, String> {
+        if self.events.iter().any(&until) {
+            return Ok(true);
+        }
+        let deadline = Instant::now() + limit;
+        while let Some(text) = self.read(deadline)? {
+            let Ok(envelope) = serde_json::from_str::<Envelope>(&text) else {
+                continue;
+            };
+            let seen = self.heard(envelope);
+            if seen.is_some_and(|at| self.events.get(at).is_some_and(&until)) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn send(&mut self, method: &str, params: Value) -> Result<u64, String> {
+        self.next += 1;
+        let request = json!({"id": self.next, "method": method, "params": params});
+        if self.socket.send(Frame::text(request.to_string())).is_err() {
+            self.broken = true;
+            return Err(GONE.into());
+        }
+        Ok(self.next)
+    }
+
+    /// The next frame's text, or `None` once `deadline` has passed.
+    fn read(&mut self, deadline: Instant) -> Result<Option<tungstenite::Utf8Bytes>, String> {
+        loop {
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                return Ok(None);
+            };
+            // A zero timeout means none at all, which would wait forever.
+            let left = left.max(Duration::from_millis(1));
+            let _ = self.socket.get_ref().set_read_timeout(Some(left));
+            match self.socket.read() {
+                Ok(Frame::Text(text)) => return Ok(Some(text)),
+                Ok(Frame::Close(_)) => break,
+                Ok(_) => continue,
+                // A timed-out read keeps what it had of the frame, so the
+                // next one carries on from there.
+                Err(tungstenite::Error::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue;
+                }
+                Err(_) => break,
+            }
+        }
+        self.broken = true;
+        Err(GONE.into())
+    }
+
+    /// Deal with a frame nobody asked for. A dialog is answered at once --
+    /// the page stands still until it is -- and anything else is kept for
+    /// the action in progress to look at. Where it was kept, if it was.
+    fn heard(&mut self, envelope: Envelope) -> Option<usize> {
+        let method = envelope.method?;
+        if method == "Page.javascriptDialogOpening" {
+            let kind = envelope.params["type"].as_str().unwrap_or_default();
+            let message = envelope.params["message"].as_str().unwrap_or_default();
+            let (accept, note) = answer(kind, message, self.agree);
+            let reply = json!({
+                "accept": accept,
+                "promptText": envelope.params["defaultPrompt"].as_str().unwrap_or_default(),
+            });
+            // Its answer is not waited for: the call that was waiting when
+            // the dialog opened gets its own once the page moves again.
+            let _ = self.send("Page.handleJavaScriptDialog", reply);
+            self.dialogs.push(note);
+            return None;
+        }
+        if self.events.len() >= MAX_EVENTS {
+            self.events.pop_front();
+        }
+        self.events.push_back(Event {
+            method,
+            params: envelope.params,
+        });
+        Some(self.events.len() - 1)
+    }
+}
+
+const GONE: &str = "The browser tab was closed.";
+
+/// How a dialog is answered, and what the model is told of it. Leaving a
+/// page and closing a message are what the action was for; anything asking
+/// for agreement is refused unless the action said to agree.
+fn answer(kind: &str, message: &str, agree: bool) -> (bool, String) {
+    let message: String = message.chars().take(200).collect();
+    match kind {
+        "beforeunload" => (
+            true,
+            "The page asked to confirm leaving it; it was left.".into(),
+        ),
+        "alert" => (true, format!("The page showed a message: \"{message}\".")),
+        _ if agree => (
+            true,
+            format!("The page asked \"{message}\" and was answered OK."),
+        ),
+        _ => (
+            false,
+            format!(
+                "The page asked \"{message}\" and was answered Cancel; use_page with \
+                 confirm: true answers OK."
+            ),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn the_debugging_port_is_read_from_the_profile() {
+        assert_eq!(port_in("54340\n/devtools/browser/b4f24c57\n"), Some(54340));
+        assert_eq!(port_in("9222"), Some(9222));
+        // Half written, or from something else entirely.
+        assert_eq!(port_in(""), None);
+        assert_eq!(port_in("0\n"), None);
+        assert_eq!(port_in("ws://127.0.0.1\n"), None);
+    }
+
+    #[test]
+    fn the_first_browser_installed_is_the_one_used() {
+        let dir = std::env::temp_dir().join(format!("letronna-find-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (chrome, edge) = (dir.join("chrome.exe"), dir.join("msedge.exe"));
+        std::fs::write(&edge, "").unwrap();
+        assert_eq!(
+            first_existing(&[chrome.clone(), edge.clone()]),
+            Some(edge.clone())
+        );
+        std::fs::write(&chrome, "").unwrap();
+        assert_eq!(first_existing(&[chrome.clone(), edge]), Some(chrome));
+        // A folder where a browser should be is not one.
+        assert_eq!(first_existing(std::slice::from_ref(&dir)), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_dialog_is_answered_as_the_action_said() {
+        assert!(answer("alert", "Saved", false).0);
+        assert!(answer("beforeunload", "", false).0);
+        let (ok, note) = answer("confirm", "Delete this?", false);
+        assert!(
+            !ok && note.contains("Delete this?") && note.contains("confirm: true"),
+            "{note}"
+        );
+        let (ok, note) = answer("confirm", "Delete this?", true);
+        assert!(ok && note.contains("answered OK"), "{note}");
+        assert!(!answer("prompt", "Your name?", false).0);
+    }
+
+    /// A stand-in for a browser's debugging socket: answers each request
+    /// with `reply(method, params)`, after sending the events it returns.
+    fn fake_browser(
+        reply: impl Fn(&str, &Value) -> (Vec<Value>, Value) + Send + 'static,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("ws://{}/devtools/page/T1", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            let mut heard = Vec::new();
+            while let Ok(Frame::Text(text)) = socket.read() {
+                let request: Value = serde_json::from_str(text.as_str()).unwrap();
+                let method = request["method"].as_str().unwrap().to_owned();
+                heard.push(method.clone());
+                let (events, result) = reply(&method, &request["params"]);
+                for event in events {
+                    socket.send(Frame::text(event.to_string())).unwrap();
+                }
+                let answer = if result.get("error").is_some() {
+                    json!({"id": request["id"], "error": result["error"]})
+                } else {
+                    json!({"id": request["id"], "result": result})
+                };
+                socket.send(Frame::text(answer.to_string())).unwrap();
+            }
+            heard
+        });
+        (address, server)
+    }
+
+    #[test]
+    fn a_call_gets_its_answer_past_what_the_page_says_meanwhile() {
+        let (address, server) = fake_browser(|method, _| match method {
+            "Page.navigate" => (
+                vec![
+                    json!({"method": "Page.frameStartedLoading", "params": {"frameId": "T1"}}),
+                    json!({"method": "Page.javascriptDialogOpening",
+                           "params": {"type": "confirm", "message": "Leave?"}}),
+                ],
+                json!({"frameId": "T1", "loaderId": "L2"}),
+            ),
+            "Page.handleJavaScriptDialog" => (Vec::new(), json!({})),
+            "Broken.method" => (
+                Vec::new(),
+                json!({"error": {"message": "'Broken.method' wasn't found"}}),
+            ),
+            _ => (
+                vec![json!({"method": "Page.frameStoppedLoading", "params": {"frameId": "T1"}})],
+                json!({}),
+            ),
+        });
+        let mut tab = Tab::connect(&address, "T1").unwrap();
+        let navigated: Value = tab
+            .call("Page.navigate", json!({"url": "https://example.com"}))
+            .unwrap();
+        assert_eq!(navigated["loaderId"], "L2");
+        // The dialog was answered on the spot, and No, since nothing agreed.
+        assert_eq!(tab.dialogs.len(), 1);
+        assert!(tab.dialogs[0].contains("Leave?"), "{:?}", tab.dialogs);
+        assert_eq!(tab.events.len(), 1);
+        assert_eq!(tab.events[0].method, "Page.frameStartedLoading");
+        // An event already read counts; a new one is read for.
+        assert!(
+            tab.wait(Duration::from_millis(50), |e| e.method
+                == "Page.frameStartedLoading")
+                .unwrap()
+        );
+        tab.call::<Ignored>("Page.stopLoading", json!({})).unwrap();
+        assert!(
+            tab.wait(Duration::from_secs(2), |e| e.method
+                == "Page.frameStoppedLoading")
+                .unwrap()
+        );
+        assert!(
+            !tab.wait(Duration::from_millis(50), |e| e.method
+                == "Page.loadEventFired")
+                .unwrap()
+        );
+        // The browser's own refusal comes back as the error.
+        let refused = tab.call::<Ignored>("Broken.method", json!({})).unwrap_err();
+        assert!(refused.contains("wasn't found"), "{refused}");
+        assert!(!tab.broken);
+        drop(tab);
+        let heard = server.join().unwrap();
+        assert_eq!(
+            heard,
+            [
+                "Page.navigate",
+                "Page.handleJavaScriptDialog",
+                "Page.stopLoading",
+                "Broken.method"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_tab_that_goes_away_says_so_and_stays_gone() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("ws://{}/devtools/page/T1", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            let _ = socket.read();
+            let _ = socket.close(None);
+            let _ = socket.flush();
+        });
+        let mut tab = Tab::connect(&address, "T1").unwrap();
+        let error = tab.call::<Ignored>("Page.reload", json!({})).unwrap_err();
+        assert_eq!(error, GONE);
+        assert!(tab.broken);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_browser_that_does_not_answer_is_given_up_on() {
+        let (address, _server) = fake_browser(|_, _| {
+            std::thread::sleep(Duration::from_millis(400));
+            (Vec::new(), json!({}))
+        });
+        let mut tab = Tab::connect(&address, "T1").unwrap();
+        let started = Instant::now();
+        let error = tab
+            .call_within::<Ignored>("Page.reload", json!({}), Duration::from_millis(100))
+            .unwrap_err();
+        assert!(error.contains("did not answer"), "{error}");
+        assert!(started.elapsed() < Duration::from_millis(350));
+        // Slow is not gone: the late answer is skipped, and the next call
+        // still gets its own.
+        assert!(!tab.broken);
+        tab.call::<Ignored>("Page.reload", json!({})).unwrap();
+    }
+}
