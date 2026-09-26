@@ -68,6 +68,20 @@ pub struct Account {
     /// Hosted-model credit left, in cents, as of the last check.
     #[serde(default)]
     pub credits: i64,
+    /// The team this computer bills hosted models to, if one was picked.
+    #[serde(default)]
+    pub team: Option<Team>,
+}
+
+/// A team: its id, its name, and (for the one in use) the pool left, in cents.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct Team {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub credits: i64,
+    #[serde(default)]
+    pub role: String,
 }
 
 impl Account {
@@ -136,6 +150,8 @@ pub fn refresh() -> Result<Account, String> {
         email: String,
         plan: String,
         credits: i64,
+        #[serde(default)]
+        team: Option<Team>,
     }
     let me: Me = response
         .error_for_status()
@@ -146,8 +162,41 @@ pub fn refresh() -> Result<Account, String> {
     account.email = me.email;
     account.plan = me.plan;
     account.credits = me.credits;
+    account.team = me.team;
     remember(&account)?;
     Ok(account)
+}
+
+/// The teams the signed-in person is in.
+pub fn teams() -> Result<Vec<Team>, String> {
+    let account = account().ok_or("Not signed in.")?;
+    client(Duration::from_secs(15))?
+        .get(api("/teams"))
+        .bearer_auth(&account.token)
+        .send()
+        .and_then(|r| r.error_for_status())
+        .map_err(|_| "Could not load your teams.".to_owned())?
+        .json()
+        .map_err(|_| "The account service sent something unexpected.".to_owned())
+}
+
+/// Bill this computer's hosted models to a team (`Some(id)`) or to the
+/// person's own credit (`None`), then keep the answer.
+pub fn use_team(id: Option<&str>) -> Result<Account, String> {
+    let account = account().ok_or("Not signed in.")?;
+    let response = client(Duration::from_secs(20))?
+        .post(api("/devices/team"))
+        .bearer_auth(&account.token)
+        .json(&serde_json::json!({ "org_id": id.unwrap_or("") }))
+        .send()
+        .map_err(|_| "Could not reach the Letronna account service.".to_owned())?;
+    if !response.status().is_success() {
+        #[derive(Deserialize)]
+        struct Refused { error: String }
+        let why = response.json::<Refused>().map(|r| r.error).unwrap_or_else(|_| "That team could not be picked.".into());
+        return Err(why);
+    }
+    refresh()
 }
 
 fn client(timeout: Duration) -> Result<reqwest::blocking::Client, String> {

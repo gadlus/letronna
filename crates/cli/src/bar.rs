@@ -50,6 +50,10 @@ pub const COMMANDS: &[Command] = &[
         blurb: "see, add or remove gateways",
     },
     Command {
+        name: "/team",
+        blurb: "bill hosted models to a team or to yourself",
+    },
+    Command {
         name: "/login",
         blurb: "sign in to Letronna",
     },

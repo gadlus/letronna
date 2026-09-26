@@ -70,6 +70,10 @@ pub fn command(
             gateways(runner);
             Flow::Handled
         }
+        "/team" => {
+            team(runner);
+            Flow::Handled
+        }
         "/login" => {
             sign_in(runner);
             Flow::Handled
@@ -193,6 +197,62 @@ fn whoami(runner: &mut Runner) {
             render::dim("credits"),
             account.credit()
         ));
+    }
+    match &account.team {
+        Some(team) => render::line(&format!(
+            "{} {}   {} {}",
+            render::dim("team   "),
+            team.name,
+            render::dim("pool   "),
+            format!("${}.{:02}", team.credits / 100, team.credits.rem_euclid(100))
+        )),
+        None => render::line(&render::dim("team    none · hosted models use your own credit · /team to pick one")),
+    }
+}
+
+/// Pick what hosted models are billed to on this computer: your own credit,
+/// or one of your teams' shared pools.
+fn team(runner: &mut Runner) {
+    if letronna_core::auth::account().is_none() {
+        render::blank();
+        render::line(&render::dim("Not signed in. /login first."));
+        return;
+    }
+    let found = runner.bar.busy("loading your teams", letronna_core::auth::teams);
+    let teams = match found {
+        Ok(teams) => teams,
+        Err(error) => {
+            render::blank();
+            render::line(&render::red(&error));
+            return;
+        }
+    };
+    let current = letronna_core::auth::account().and_then(|a| a.team).map(|t| t.id);
+    let mark = |on: bool| if on { "● " } else { "  " };
+    let mut labels = vec![format!("{}Personal — your own credit", mark(current.is_none()))];
+    labels.extend(teams.iter().map(|t| format!("{}{} — team pool", mark(current.as_deref() == Some(t.id.as_str())), t.name)));
+    let options: Vec<&str> = labels.iter().map(String::as_str).collect();
+    let detail = if teams.is_empty() {
+        vec!["You are not in a team yet. Create or join one at letronna.ai/dashboard/team.".to_owned()]
+    } else {
+        Vec::new()
+    };
+    let Some(picked) = runner.bar.choose("Bill hosted models to", detail, &options) else {
+        return;
+    };
+    let id = picked.checked_sub(1).and_then(|i| teams.get(i)).map(|t| t.id.clone());
+    let done = runner.bar.busy("switching", move || letronna_core::auth::use_team(id.as_deref()));
+    render::blank();
+    match done {
+        Ok(account) => {
+            match &account.team {
+                Some(team) => render::line(&format!("Hosted models now bill {}.", render::bold(&team.name))),
+                None => render::line("Hosted models now use your own credit."),
+            }
+            let note = footer(runner);
+            runner.bar.set_footer(note);
+        }
+        Err(error) => render::line(&render::red(&error)),
     }
 }
 
