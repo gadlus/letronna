@@ -159,6 +159,11 @@ impl Refs {
         self.labels.get(&number).map(String::as_str)
     }
 
+    /// How the line of an element reads, found by its node.
+    pub(crate) fn label_for(&self, node: i64) -> Option<&str> {
+        self.label(*self.by_node.get(&node)?)
+    }
+
     /// A new page: its nodes are new, even where their numbers are not.
     pub(crate) fn forget(&mut self) {
         self.by_node.clear();
@@ -272,7 +277,7 @@ struct Run {
 /// parent is, to find a line from a point on the page.
 pub(crate) struct Page {
     pub(crate) title: String,
-    url: String,
+    pub(crate) url: String,
     pub(crate) lines: Vec<Line>,
     parents: HashMap<i64, i64>,
     /// The line where the page's main content starts, when it marks one.

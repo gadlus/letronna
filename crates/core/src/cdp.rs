@@ -241,6 +241,13 @@ pub struct Target {
     socket: String,
 }
 
+impl Target {
+    /// The tab's own debugging socket, for a second connection to it.
+    pub(crate) fn socket(&self) -> &str {
+        &self.socket
+    }
+}
+
 impl Browser {
     /// The browser on `profile`: the one already running there, or a new one.
     pub fn start(profile: &Path, headless: bool) -> Result<Browser, String> {

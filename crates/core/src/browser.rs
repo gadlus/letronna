@@ -15,6 +15,7 @@
 use crate::cdp::{self, Event, Ignored, Tab};
 use crate::page::{PAGE_CHARS, Page, Refs, Tree, cut, matching, page, ref_number, window};
 use crate::tools::{Tool, ToolContext};
+use crate::watch::{self, Sight};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -559,6 +560,7 @@ impl Session {
             None => browser.new_tab()?,
         };
         let tab = browser.attach(&target)?;
+        watch::follow(target.socket(), &target.id);
         let mut known: Vec<String> = tabs.into_iter().map(|t| t.id).collect();
         known.push(target.id);
         Ok(Session {
@@ -694,6 +696,7 @@ impl Session {
             std::thread::sleep(Duration::from_millis(100));
         };
         self.tab = self.browser.attach(&fresh)?;
+        watch::follow(fresh.socket(), &fresh.id);
         self.refs.forget();
         // Joined part way through its loading, so its events from before
         // were never heard: ask the page instead.
@@ -717,6 +720,12 @@ impl Session {
         let tree: Tree = self.tab.call("Accessibility.getFullAXTree", json!({}))?;
         let page = page(&tree, full, &mut self.refs);
         self.page = page.named();
+        if watch::watched() {
+            watch::show(Sight::Page {
+                title: page.title.clone(),
+                url: page.url.clone(),
+            });
+        }
         if !full {
             self.last = page.text();
         }
@@ -860,6 +869,7 @@ impl Session {
             .clone();
         if target.id != self.tab.id {
             self.tab = self.browser.attach(&target)?;
+            watch::follow(target.socket(), &target.id);
             self.refs.forget();
         }
         self.browser.show(&target);
@@ -991,6 +1001,7 @@ impl Session {
                  out of the way first."
             ));
         }
+        self.point(node, "Clicking", Some(&quads["quads"]));
         for (kind, buttons) in [("mouseMoved", 0), ("mousePressed", 1), ("mouseReleased", 0)] {
             let button = if kind == "mouseMoved" { "none" } else { "left" };
             self.tab.call::<Ignored>(
@@ -999,6 +1010,43 @@ impl Session {
             )?;
         }
         Ok(())
+    }
+
+    /// Show the window where the agent is about to act, and give its pointer
+    /// time to get there first. Nothing is shown, and nothing waits, while
+    /// the window is not watching.
+    fn point(&mut self, node: i64, doing: &str, quads: Option<&Value>) {
+        if !watch::watched() {
+            return;
+        }
+        let fetched;
+        let quads = match quads {
+            Some(quads) => quads,
+            None => {
+                let _ = self
+                    .tab
+                    .call::<Ignored>("DOM.scrollIntoViewIfNeeded", json!({"backendNodeId": node}));
+                let Ok(found) = self
+                    .tab
+                    .call::<Value>("DOM.getContentQuads", json!({"backendNodeId": node}))
+                else {
+                    return;
+                };
+                fetched = found["quads"].clone();
+                &fetched
+            }
+        };
+        let (Some((x, y)), Some(area)) = (centre(quads), area(quads)) else {
+            return;
+        };
+        let what = self.refs.label_for(node).unwrap_or("the page");
+        watch::show(Sight::Pointer {
+            x,
+            y,
+            area,
+            doing: format!("{doing} {what}"),
+        });
+        std::thread::sleep(watch::POINTER_TIME);
     }
 
     /// What is drawn over `node` at a point, if anything is.
@@ -1026,6 +1074,7 @@ impl Session {
     }
 
     fn type_into(&mut self, node: i64, text: &str, submit: bool) -> Result<(), String> {
+        self.point(node, "Typing into", None);
         self.focus(node)?;
         for kind in ["keyDown", "keyUp"] {
             let mut event = json!({"type": kind, "key": "a", "code": "KeyA",
@@ -1072,6 +1121,7 @@ impl Session {
     }
 
     fn choose(&mut self, node: i64, choice: &str) -> Result<(), String> {
+        self.point(node, "Choosing in", None);
         let object = self.object(node)?;
         let answer: Value = self.tab.call(
             "Runtime.callFunctionOn",
@@ -1097,6 +1147,24 @@ fn centre(quads: &Value) -> Option<(f64, f64)> {
         let area =
             (x1 * y2 - x2 * y1) + (x2 * y3 - x3 * y2) + (x3 * y4 - x4 * y3) + (x4 * y1 - x1 * y4);
         (area.abs() / 2. > 1.).then(|| ((x1 + x2 + x3 + x4) / 4., (y1 + y2 + y3 + y4) / 4.))
+    })
+}
+
+/// The box around the first quad big enough to click: left, top, width,
+/// height.
+fn area(quads: &Value) -> Option<[f64; 4]> {
+    quads.as_array()?.iter().find_map(|quad| {
+        let points: Vec<f64> = quad.as_array()?.iter().filter_map(Value::as_f64).collect();
+        let xs = points.iter().step_by(2);
+        let ys = points.iter().skip(1).step_by(2);
+        let (left, right) = xs.fold((f64::MAX, f64::MIN), |(l, r), x| (l.min(*x), r.max(*x)));
+        let (top, bottom) = ys.fold((f64::MAX, f64::MIN), |(t, b), y| (t.min(*y), b.max(*y)));
+        (points.len() == 8 && right - left > 1. && bottom - top > 1.).then_some([
+            left,
+            top,
+            right - left,
+            bottom - top,
+        ])
     })
 }
 
@@ -1474,8 +1542,30 @@ mod tests {
             let page = use_page(json!({"action": "click", "ref": behind})).unwrap();
             assert!(page.contains("\"clicked behind\""), "{page}");
 
-            // Typing replaces what is there, and Enter sends the form.
+            // Watched, an action shows where it acts, and pictures come.
+            let watching = crate::watch::watch();
+            std::thread::sleep(Duration::from_millis(300));
+            let started = Instant::now();
             let name = ref_of(&page, "textbox \"Name\"");
+            use_page(json!({"action": "type", "ref": name, "text": "Grace"})).unwrap();
+            assert!(started.elapsed() >= crate::watch::POINTER_TIME);
+            let frame = watching.frames.recv_blocking().unwrap();
+            assert!(frame.jpeg.starts_with(&[0xFF, 0xD8]) && frame.width > 100.);
+            let (mut pointed, mut titled) = (None, None);
+            while pointed.is_none() || titled.is_none() {
+                match watching.sights.recv_blocking().unwrap() {
+                    Sight::Pointer { doing, area, .. } => pointed = Some((doing, area)),
+                    Sight::Page { title, .. } => titled = Some(title),
+                    Sight::Closed => panic!("the browser closed while it was watched"),
+                }
+            }
+            let (doing, area) = pointed.unwrap();
+            assert_eq!(doing, "Typing into textbox \"Name\" = \"old\"");
+            assert!(area[2] > 50. && area[3] > 10., "{area:?}");
+            assert_eq!(titled.as_deref(), Some("Letronna test page"));
+            drop(watching);
+
+            // Typing replaces what is there, and Enter sends the form.
             let page = timed("type and submit", || {
                 use_page(json!({"action": "type", "ref": name, "text": "Ada", "submit": true}))
             })

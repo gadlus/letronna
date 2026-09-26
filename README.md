@@ -109,6 +109,8 @@ A page reaches the model as its accessibility tree, one element a line with a re
 
 Both tools ask first, as a web address can carry things out as well as bring them in. Looking is allowed in plan mode and acting is not; neither is offered in a shared chat. An address carrying one of your own keys or tokens is never opened, nor a cloud machine's metadata service.
 
+While the agent uses the browser, the window shows it beside the chat, live: a pointer goes to what the agent is about to click or type into, outlines it, and lands as the action happens, with a line saying what it is doing. These are the browser's own pictures of the page, sent only when it changes, so a page standing still costs nothing, and none are sent once the panel is closed. A narrow window floats the panel in a corner instead of docking it. The terminal shows none of this and waits for no pointer.
+
 ## Local data
 
 `%LOCALAPPDATA%\Letronna\` on Windows, `~/Library/Application Support/Letronna/` on macOS, `~/.local/share/Letronna/` on Linux. `AGENT_DATA_DIR` overrides all three.
