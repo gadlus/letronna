@@ -525,10 +525,73 @@ pub fn resume(runner: &mut Runner, session: &mut usize, workspace: Option<&std::
 /// this is narrowed with a word rather than scrolled.
 const MODEL_CHOICES: usize = 10;
 
+/// The media kind a `/model` word names, if it names one: `image` or `images`.
+fn media_kind(word: &str) -> Option<(&'static str, &'static str)> {
+    let word = word.trim().to_lowercase();
+    letronna_core::media::KINDS
+        .into_iter()
+        .find(|(kind, _)| word == *kind || word == format!("{kind}s"))
+}
+
+/// Pick the model that makes images, speech, transcripts or video: the one
+/// its tool uses when a call names none.
+fn switch_media(runner: &mut Runner, kind: &'static str, label: &str) {
+    render::blank();
+    render::said(
+        &render::blue("●"),
+        &render::bold(&format!("{label} models")),
+    );
+    let offers = match runner.bar.busy(
+        "asking what each one costs",
+        letronna_core::media::catalogue,
+    ) {
+        Ok(all) => all
+            .into_iter()
+            .filter(|o| o.kind == kind)
+            .collect::<Vec<_>>(),
+        Err(why) => {
+            render::line(&render::red(&why));
+            return;
+        }
+    };
+    if offers.is_empty() {
+        render::line(&render::dim("None are offered right now."));
+        return;
+    }
+    let chosen = letronna_core::media::choices().remove(kind);
+    let shown = &offers[..offers.len().min(MODEL_CHOICES)];
+    let mut labels = vec!["Auto · the cheapest working".to_owned()];
+    labels.extend(shown.iter().map(|o| format!("{} · {}", o.id, o.price())));
+    let mut options: Vec<&str> = labels.iter().map(String::as_str).collect();
+    options.push("Keep the one I have");
+    let question = format!("In use: {}", chosen.as_deref().unwrap_or("Auto"));
+    let Some(picked) = runner.bar.choose(&question, Vec::new(), &options) else {
+        return;
+    };
+    let model = match picked {
+        0 => None,
+        n if n <= shown.len() => Some(shown[n - 1].id.as_str()),
+        _ => return,
+    };
+    render::blank();
+    match letronna_core::media::choose(kind, model) {
+        Ok(()) => render::line(&render::dim(&format!(
+            "{label} is made by {} now.",
+            model.unwrap_or("the cheapest hosted model working")
+        ))),
+        Err(why) => render::line(&render::red(&why)),
+    }
+}
+
 /// Change the model, picking from what every set-up gateway actually offers.
 /// `filter` narrows the list (by model or gateway name), and an exact model
 /// name skips the asking entirely.
 pub fn switch_model(runner: &mut Runner, filter: &str) {
+    // `/model image`, `/model video`: what makes those, not the chat model.
+    if let Some((kind, label)) = media_kind(filter) {
+        switch_media(runner, kind, label);
+        return;
+    }
     let settings = &runner.store.settings;
     let keys = store::load_keys();
     let custom = settings.custom_endpoint.clone();

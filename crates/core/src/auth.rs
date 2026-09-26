@@ -34,7 +34,7 @@ fn authorize() -> String {
 /// `http://localhost:8787` while working on it.
 const API: &str = "https://api.letronna.ai";
 
-fn api(path: &str) -> String {
+pub(crate) fn api(path: &str) -> String {
     let base = std::env::var("LETRONNA_API").unwrap_or_else(|_| API.to_owned());
     format!("{}{path}", base.trim_end_matches('/'))
 }

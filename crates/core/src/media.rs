@@ -11,6 +11,7 @@
 
 use crate::tools::{Tool, ToolContext};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -39,7 +40,7 @@ impl Tool for MakeImage {
         json!({"type": "object", "properties": {
             "prompt": {"type": "string", "description": "What the image should show, in detail."},
             "size": {"type": "string", "description": "Width x height in pixels, such as 1024x1024 or 1536x1024. Left out, the model's own."},
-            "model": {"type": "string", "description": "A hosted image model's id. Left out, the cheapest one working."}
+            "model": {"type": "string", "description": "A hosted image model's id. Left out, the one the user picked, or the cheapest working."}
         }, "required": ["prompt"]})
     }
     fn needs_approval(&self) -> bool {
@@ -56,13 +57,13 @@ impl Tool for MakeImage {
         if let Some(size) = args["size"].as_str() {
             what.push_str(&format!("\nSize: {size}"));
         }
-        card(what, args)
+        card(what, args, "image")
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         let prompt = required(args, "prompt")?;
         let token = token()?;
         let mut body = json!({"prompt": prompt, "n": 1});
-        pass(args, &mut body, &["size", "model"]);
+        pass(args, &mut body, &["size"], "image");
         let reply: Value = send(
             client(MAKE_TIME)?
                 .post(endpoint("/images/generations"))
@@ -101,7 +102,7 @@ impl Tool for Speak {
         json!({"type": "object", "properties": {
             "text": {"type": "string", "description": "What to say, exactly as it should be read."},
             "voice": {"type": "string", "description": "A voice the model knows, such as alloy. Left out, the model picks one."},
-            "model": {"type": "string", "description": "A hosted speech model's id. Left out, the cheapest one working."}
+            "model": {"type": "string", "description": "A hosted speech model's id. Left out, the one the user picked, or the cheapest working."}
         }, "required": ["text"]})
     }
     fn needs_approval(&self) -> bool {
@@ -115,13 +116,13 @@ impl Tool for Speak {
         if let Some(voice) = args["voice"].as_str() {
             what.push_str(&format!("\nVoice: {voice}"));
         }
-        card(what, args)
+        card(what, args, "speech")
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         let text = required(args, "text")?;
         let token = token()?;
         let mut body = json!({"input": text});
-        pass(args, &mut body, &["voice", "model"]);
+        pass(args, &mut body, &["voice"], "speech");
         let reply = send(
             client(MAKE_TIME)?
                 .post(endpoint("/audio/speech"))
@@ -158,7 +159,7 @@ impl Tool for Transcribe {
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
             "path": {"type": "string", "description": "The file, relative to the workspace."},
-            "model": {"type": "string", "description": "A hosted transcription model's id. Left out, the cheapest one working."}
+            "model": {"type": "string", "description": "A hosted transcription model's id. Left out, the one the user picked, or the cheapest working."}
         }, "required": ["path"]})
     }
     fn needs_approval(&self) -> bool {
@@ -173,6 +174,7 @@ impl Tool for Transcribe {
         card(
             format!("Transcribe {}", args["path"].as_str().unwrap_or_default()),
             args,
+            "transcription",
         )
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
@@ -187,7 +189,7 @@ impl Tool for Transcribe {
         }
         let audio = std::fs::read(&path).map_err(|e| e.to_string())?;
         let token = token()?;
-        let (boundary, form) = form(&path, &audio, args["model"].as_str());
+        let (boundary, form) = form(&path, &audio, model_for(args, "transcription").as_deref());
         let reply: Value = send(
             client(MAKE_TIME)?
                 .post(endpoint("/audio/transcriptions"))
@@ -220,7 +222,7 @@ impl Tool for MakeVideo {
         json!({"type": "object", "properties": {
             "prompt": {"type": "string", "description": "What the video should show, in detail."},
             "seconds": {"type": "integer", "description": "How long, such as 4 or 8. Each model makes only certain lengths; left out, the model's own."},
-            "model": {"type": "string", "description": "A hosted video model's id. Left out, the cheapest one working."},
+            "model": {"type": "string", "description": "A hosted video model's id. Left out, the one the user picked, or the cheapest working."},
             "job": {"type": "string", "description": "The id of a video an earlier call left still being made: wait for that one and save it, instead of starting another."}
         }})
     }
@@ -241,6 +243,7 @@ impl Tool for MakeVideo {
         card(
             format!("{long} of: {}", args["prompt"].as_str().unwrap_or_default()),
             args,
+            "video",
         )
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
@@ -249,7 +252,7 @@ impl Tool for MakeVideo {
             Some(job) => job.to_owned(),
             None => {
                 let mut body = json!({"prompt": required(args, "prompt")?});
-                pass(args, &mut body, &["seconds", "model"]);
+                pass(args, &mut body, &["seconds"], "video");
                 let job: Value = send(
                     client(MAKE_TIME)?
                         .post(endpoint("/videos"))
@@ -315,6 +318,106 @@ pub fn saved(result: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// What the hosted models make besides text, as the model menus name each
+/// kind, in the order they list them.
+pub const KINDS: [(&str, &str); 4] = [
+    ("image", "Image"),
+    ("speech", "Speech"),
+    ("transcription", "Transcription"),
+    ("video", "Video"),
+];
+
+/// A hosted model that makes something, and what it costs.
+#[derive(Clone, Debug, Default)]
+pub struct Offer {
+    pub id: String,
+    /// One of `KINDS`.
+    pub kind: String,
+    pub maker: String,
+    /// Dollars per `unit`, our markup included, as the models page shows it.
+    pub usd: f64,
+    pub unit: String,
+}
+
+impl Offer {
+    /// The price as a menu shows it: "$0.022 / image".
+    pub fn price(&self) -> String {
+        let per = match self.unit.as_str() {
+            "kchar" => "1K chars",
+            other => other,
+        };
+        format!("{} / {per}", dollars(self.usd))
+    }
+}
+
+/// Two figures under ten cents, cents above: $0.022, $0.0002, $0.26.
+fn dollars(usd: f64) -> String {
+    if usd >= 0.1 {
+        return format!("${usd:.2}");
+    }
+    let places = (1. - usd.log10().floor()).clamp(2., 8.) as usize;
+    let text = format!("{usd:.places$}");
+    format!("${}", text.trim_end_matches('0'))
+}
+
+/// Every hosted model that makes images, speech, transcripts or video, with
+/// what it costs, cheapest first. The list is public: no sign-in needed.
+pub fn catalogue() -> Result<Vec<Offer>, String> {
+    let list: Vec<Value> = client(Duration::from_secs(20))?
+        .get(crate::auth::api("/models?kind=all"))
+        .send()
+        .and_then(|r| r.error_for_status())
+        .map_err(|_| "Could not load the hosted models.".to_owned())?
+        .json()
+        .map_err(|_| "The model list came back in a form Letronna could not read.".to_owned())?;
+    Ok(offers(&list))
+}
+
+/// The media models in a `/models?kind=all` list, cheapest first.
+fn offers(list: &[Value]) -> Vec<Offer> {
+    let mut offers: Vec<Offer> = list
+        .iter()
+        .filter_map(|m| {
+            let kind = m["kind"].as_str()?;
+            KINDS.iter().any(|(k, _)| *k == kind).then(|| Offer {
+                id: m["id"].as_str().unwrap_or_default().to_owned(),
+                kind: kind.to_owned(),
+                maker: m["maker"].as_str().unwrap_or_default().to_owned(),
+                usd: m["price"]["usd"].as_f64().unwrap_or_default(),
+                unit: m["price"]["unit"].as_str().unwrap_or_default().to_owned(),
+            })
+        })
+        .filter(|o| !o.id.is_empty() && o.usd > 0.)
+        .collect();
+    offers.sort_by(|a, b| a.usd.total_cmp(&b.usd));
+    offers
+}
+
+/// The model picked in the model menu for each kind: what its tool uses when
+/// a call names none. A kind with no pick uses the cheapest working.
+pub fn choices() -> BTreeMap<String, String> {
+    std::fs::read(choices_path())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// Pick `model` for `kind`, or with `None` go back to the cheapest working.
+pub fn choose(kind: &str, model: Option<&str>) -> Result<(), String> {
+    let mut all = choices();
+    match model {
+        Some(model) => all.insert(kind.to_owned(), model.to_owned()),
+        None => all.remove(kind),
+    };
+    let _ = std::fs::create_dir_all(crate::chat::data_dir());
+    let bytes = serde_json::to_vec_pretty(&all).map_err(|e| e.to_string())?;
+    std::fs::write(choices_path(), bytes).map_err(|e| format!("Cannot save the pick: {e}"))
+}
+
+fn choices_path() -> PathBuf {
+    crate::chat::data_dir().join("media.json")
+}
+
 /// The signed-in account's token, or what to do about there being none.
 fn token() -> Result<String, String> {
     crate::auth::account().map(|a| a.token).ok_or_else(|| {
@@ -369,20 +472,32 @@ fn required<'a>(args: &'a Value, name: &str) -> Result<&'a str, String> {
         .ok_or_else(|| format!("`{name}` is required."))
 }
 
-/// Copy the optional arguments that were given into the request body.
-fn pass(args: &Value, body: &mut Value, names: &[&str]) {
+/// Copy the optional arguments that were given into the request body, and
+/// the model: the one named, else the one picked for `kind`.
+fn pass(args: &Value, body: &mut Value, names: &[&str], kind: &str) {
     for name in names {
         if !args[*name].is_null() {
             body[*name] = args[*name].clone();
         }
     }
+    if let Some(model) = model_for(args, kind) {
+        body["model"] = model.into();
+    }
+}
+
+/// The model a call goes to: the one it names, else the one picked for
+/// `kind` in the model menu. None leaves the choice to the API.
+fn model_for(args: &Value, kind: &str) -> Option<String> {
+    args["model"]
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| choices().remove(kind))
 }
 
 /// The approval card: what will be made, by which model, and who pays.
-fn card(what: String, args: &Value) -> String {
-    let model = args["model"]
-        .as_str()
-        .unwrap_or("the cheapest hosted model working");
+fn card(what: String, args: &Value, kind: &str) -> String {
+    let model =
+        model_for(args, kind).unwrap_or_else(|| "the cheapest hosted model working".to_owned());
     format!("{what}\n\nMade by {model}, paid from your Letronna credit.")
 }
 
@@ -654,6 +769,46 @@ mod tests {
         assert!(
             card.contains("a cat") && card.contains("Letronna credit"),
             "{card}"
+        );
+    }
+
+    #[test]
+    fn the_menu_lists_media_models_cheapest_first_and_priced_plainly() {
+        let list = json!([
+            {"id": "claude-sonnet-5", "maker": "Anthropic", "kind": "chat"},
+            {"id": "flux.2-pro", "maker": "Black Forest Labs", "kind": "image",
+             "price": {"unit": "image", "usd": 0.032351}},
+            {"id": "gemini-3.1-flash-lite-image", "maker": "Google", "kind": "image",
+             "price": {"unit": "image", "usd": 0.02184}},
+            {"id": "kokoro-82m", "maker": "Hexgrad", "kind": "speech",
+             "price": {"unit": "kchar", "usd": 0.004108}},
+            {"id": "whisper-large-v3-turbo", "kind": "transcription",
+             "price": {"unit": "minute", "usd": 0.000205}},
+            {"id": "veo-3.1", "kind": "video", "price": {"unit": "second", "usd": 0.4108}},
+            {"id": "unpriced", "kind": "video"}
+        ]);
+        let offers = offers(list.as_array().unwrap());
+        let ids: Vec<&str> = offers.iter().map(|o| o.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "whisper-large-v3-turbo",
+                "kokoro-82m",
+                "gemini-3.1-flash-lite-image",
+                "flux.2-pro",
+                "veo-3.1"
+            ]
+        );
+        let prices: Vec<String> = offers.iter().map(Offer::price).collect();
+        assert_eq!(
+            prices,
+            [
+                "$0.0002 / minute",
+                "$0.0041 / 1K chars",
+                "$0.022 / image",
+                "$0.032 / image",
+                "$0.41 / second"
+            ]
         );
     }
 

@@ -65,6 +65,12 @@ pub(crate) struct Chat {
     pub(crate) key: Entity<InputState>,
     /// Every model on every set-up gateway, as (gateway, model).
     pub(crate) models: Vec<(String, String)>,
+    /// Which list the model menu shows: `chat`, or one of the media kinds.
+    pub(crate) model_kind: &'static str,
+    /// The hosted models that make images, speech and video, with prices.
+    pub(crate) media_models: Vec<letronna_core::media::Offer>,
+    /// The model picked for each media kind, as `media.json` keeps it.
+    pub(crate) media_choices: std::collections::BTreeMap<String, String>,
     pub(crate) model_open: bool,
     pub(crate) model_search: Entity<InputState>,
     pub(crate) keys: std::collections::HashMap<String, String>,
@@ -290,6 +296,9 @@ impl Chat {
             model,
             key,
             models: Vec::new(),
+            model_kind: "chat",
+            media_models: Vec::new(),
+            media_choices: letronna_core::media::choices(),
             model_open: false,
             model_search,
             keys,
@@ -366,14 +375,18 @@ impl Chat {
         let custom = self.store.settings.custom_endpoint.clone();
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
-            let _ = tx.send_blocking(all_models(&keys, &custom));
+            // The media models come from Letronna whatever the gateway, and
+            // a list that will not load only leaves their tabs out.
+            let media = letronna_core::media::catalogue().unwrap_or_default();
+            let _ = tx.send_blocking((all_models(&keys, &custom), media));
         });
         let _ = window;
         cx.spawn(async move |this, cx| {
-            if let Ok((models, errors)) = rx.recv().await {
+            if let Ok(((models, errors), media)) = rx.recv().await {
                 let _ = this.update(cx, |this, cx| {
                     this.loading_models = false;
                     this.models = models;
+                    this.media_models = media;
                     // One gateway failing still leaves the others usable.
                     this.gateway_error = (!errors.is_empty()).then(|| errors.join(" · "));
                     if this.models.is_empty() {
@@ -400,6 +413,21 @@ impl Chat {
         self.store.settings.model = id;
         self.model_open = false;
         self.save();
+        cx.notify();
+    }
+
+    /// The model a media kind's tool uses, or `None` for the cheapest working.
+    pub(crate) fn choose_media(
+        &mut self,
+        kind: &'static str,
+        model: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        match letronna_core::media::choose(kind, model.as_deref()) {
+            Ok(()) => self.media_choices = letronna_core::media::choices(),
+            Err(why) => self.error = Some(why),
+        }
+        self.model_open = false;
         cx.notify();
     }
 
