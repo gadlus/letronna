@@ -196,11 +196,17 @@ impl Conversation {
     /// Append the head (first time), any new messages, and the descriptive
     /// fields if they have moved since the last write.
     fn flush(&mut self) -> std::io::Result<()> {
+        let meta = self.meta();
+        let meta_changed = self.written.as_ref() != Some(&meta);
+        // Every session is flushed on every save, and most have nothing new.
+        // Those are known without the file system: taking the lock and
+        // checking the file first made each save touch every session on disk.
+        if self.written.is_some() && self.flushed == self.messages.len() && !meta_changed {
+            return Ok(());
+        }
         let path = session_path(self.id);
         let _lock = Lock::take(&path);
         let fresh = !path.exists();
-        let meta = self.meta();
-        let meta_changed = self.written.as_ref() != Some(&meta);
         if !fresh && self.flushed == self.messages.len() && !meta_changed {
             return Ok(());
         }
@@ -278,6 +284,8 @@ pub struct Summary {
     pub updated: u64,
     pub messages: usize,
     pub workspace: Option<PathBuf>,
+    pub pinned: bool,
+    pub todos: Vec<Todo>,
 }
 
 /// The sessions on disk, newest first, without loading what is in them.
@@ -296,6 +304,8 @@ pub fn summaries() -> Vec<Summary> {
                 updated: 0,
                 messages: 0,
                 workspace: None,
+                pinned: false,
+                todos: Vec::new(),
             };
             for line in text.lines().filter(|l| !l.trim().is_empty()) {
                 // Messages are most of the file and none of them are wanted
@@ -312,6 +322,8 @@ pub fn summaries() -> Vec<Summary> {
                         summary.title = meta.title;
                         summary.updated = meta.updated;
                         summary.workspace = meta.workspace;
+                        summary.pinned = meta.pinned;
+                        summary.todos = meta.todos;
                     }
                     Ok(Record::Message(_)) => summary.messages += 1,
                     Err(_) => {}
@@ -416,13 +428,22 @@ pub fn load_listing() -> Store {
     migrate();
     let mut conversations: Vec<Conversation> = summaries()
         .into_iter()
-        .map(|s| Conversation {
-            id: s.id,
-            title: s.title,
-            updated: s.updated,
-            workspace: s.workspace,
-            counted: s.messages,
-            ..Default::default()
+        .map(|s| {
+            let mut conversation = Conversation {
+                id: s.id,
+                title: s.title,
+                updated: s.updated,
+                workspace: s.workspace,
+                pinned: s.pinned,
+                todos: s.todos,
+                counted: s.messages,
+                ..Default::default()
+            };
+            // Record what the file already says. Left empty, the first save
+            // wrote a fresh meta line into every session -- one saying
+            // unpinned, no todos, whatever the window had set there.
+            conversation.written = Some(conversation.meta());
+            conversation
         })
         .collect();
     conversations.sort_by_key(|c| c.updated);
@@ -611,8 +632,12 @@ pub fn age_label(updated: u64, now: u64) -> String {
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
-    use super::{Conversation, Store, Todo, replay};
+    use super::{Conversation, Store, Todo, fill, load_listing, replay};
     use crate::chat::Message;
+
+    /// Held by every test that points `AGENT_DATA_DIR` somewhere: it is one
+    /// variable for the whole process, and tests run side by side.
+    static DATA_DIR: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn scratch(name: &str) -> std::path::PathBuf {
         // One folder per test, reused and emptied each run. Naming it after
@@ -633,6 +658,7 @@ mod tests {
 
     #[test]
     fn appends_only_what_is_new_and_replays_to_the_same_thing() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
         let dir = scratch("append");
         unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
 
@@ -682,6 +708,43 @@ mod tests {
         assert_eq!(back.todos.len(), 1);
         assert_eq!(back.messages.len(), 2);
         assert_eq!(back.messages[1].content, "hi");
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn listing_then_saving_leaves_every_session_as_it_was() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("listing");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        store.conversations.push(Conversation {
+            id: 1,
+            title: "pinned in the window".into(),
+            updated: 100,
+            pinned: true,
+            todos: vec![Todo {
+                text: "step".into(),
+                status: "doing".into(),
+            }],
+            messages: vec![said("user", "hello")],
+            ..Default::default()
+        });
+        store.save().unwrap();
+        let path = dir.join("sessions/1.jsonl");
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        // What the terminal does every time it starts: list, then save.
+        let mut listed = load_listing();
+        assert!(listed.conversations[0].pinned);
+        assert_eq!(listed.conversations[0].todos.len(), 1);
+        listed.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        // Opening the session and saving with nothing said adds nothing too.
+        fill(&mut listed.conversations[0]);
+        listed.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 
