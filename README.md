@@ -90,8 +90,27 @@ Model lists come from `GET {base}/models`. Streaming uses SSE chat completions.
 - `chats.json` sessions and the selected gateway, endpoint and model
 - `keys.json` API keys per gateway, plain text on your disk only
 - `account.json` the Letronna sign-in for this computer
+- `mcp.json` MCP servers whose tools Letronna may use (optional, see below)
 
 Chat text is sent to the gateway you selected and nowhere else.
+
+## MCP servers
+
+Letronna can use the tools of any [MCP](https://modelcontextprotocol.io) server that runs as a local command. List them in `mcp.json` in the data folder, in the same shape Claude Desktop and Cursor use, so an existing config can be copied over:
+
+```json
+{
+  "mcpServers": {
+    "everything": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-everything"],
+      "autoApprove": ["echo"]
+    }
+  }
+}
+```
+
+Servers start when Letronna does, and their tools appear as `mcp__<server>__<tool>` once they answer. Every call asks first unless the tool is listed in `autoApprove`; `"disabled": true` leaves a server off. Servers reached by URL rather than a command are not supported yet.
 
 ## Build
 

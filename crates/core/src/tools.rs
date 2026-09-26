@@ -128,6 +128,9 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
             }
         }
     }
+    // MCP servers' tools, once they have answered. Their names all start
+    // with `mcp__`, so they cannot shadow one of the above either.
+    tools.extend(crate::mcp::tools());
     tools
 }
 
