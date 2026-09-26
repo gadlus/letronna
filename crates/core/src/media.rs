@@ -1,0 +1,676 @@
+//! Images, speech, transcription and video, made on Letronna's hosted models.
+//!
+//! These always go to the account API, whichever gateway the chat itself
+//! uses: only Letronna sells them, and they are paid from the signed-in
+//! account's credit. So every one of them asks first -- it spends money --
+//! and its card says so.
+//!
+//! What is made is saved as a file: in `media/` in the project folder, or in
+//! Letronna's own data folder when no project is attached. The result starts
+//! with `Saved to <path>`, which is how the window finds the file to show.
+
+use crate::tools::{Tool, ToolContext};
+use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// How a result names the file it saved; see `saved`.
+const SAVED: &str = "Saved to ";
+/// An image or a long reading can take minutes, and the API holds the reply
+/// open until it is done.
+const MAKE_TIME: Duration = Duration::from_secs(300);
+/// A video renders for a few minutes; it is looked at this often while it does.
+const VIDEO_POLL: Duration = Duration::from_secs(5);
+/// Past this the tool stops waiting and says how to pick the video up later,
+/// rather than holding the turn for however long the renderer takes.
+const VIDEO_WAIT: Duration = Duration::from_secs(600);
+/// The largest file the API takes for transcription.
+const UPLOAD_BYTES: u64 = 25 * 1024 * 1024;
+
+pub struct MakeImage;
+impl Tool for MakeImage {
+    fn name(&self) -> &'static str {
+        "make_image"
+    }
+    fn description(&self) -> &'static str {
+        "Make an image from a description on Letronna's hosted image models, and save it as a file. It is paid from the user's Letronna credit, a few cents an image, so use it only when the user asks for an image."
+    }
+    fn parameters(&self) -> Value {
+        json!({"type": "object", "properties": {
+            "prompt": {"type": "string", "description": "What the image should show, in detail."},
+            "size": {"type": "string", "description": "Width x height in pixels, such as 1024x1024 or 1536x1024. Left out, the model's own."},
+            "model": {"type": "string", "description": "A hosted image model's id. Left out, the cheapest one working."}
+        }, "required": ["prompt"]})
+    }
+    fn needs_approval(&self) -> bool {
+        true
+    }
+    fn mutates(&self) -> bool {
+        true
+    }
+    fn preview(&self, args: &Value, _: &ToolContext) -> String {
+        let mut what = format!(
+            "An image of: {}",
+            args["prompt"].as_str().unwrap_or_default()
+        );
+        if let Some(size) = args["size"].as_str() {
+            what.push_str(&format!("\nSize: {size}"));
+        }
+        card(what, args)
+    }
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
+        let prompt = required(args, "prompt")?;
+        let token = token()?;
+        let mut body = json!({"prompt": prompt, "n": 1});
+        pass(args, &mut body, &["size", "model"]);
+        let reply: Value = send(
+            client(MAKE_TIME)?
+                .post(endpoint("/images/generations"))
+                .bearer_auth(&token)
+                .json(&body),
+        )?
+        .json()
+        .map_err(|_| "The image came back in a form Letronna could not read.".to_owned())?;
+        // The reply is held open while the image is made, so a refusal can
+        // arrive inside a success.
+        if let Some(why) = refusal(&reply) {
+            return Err(why);
+        }
+        let encoded = reply["data"][0]["b64_json"]
+            .as_str()
+            .ok_or("No image came back.")?;
+        let bytes = base64(encoded).ok_or("The image came back damaged.")?;
+        let path = save(ctx, prompt, image_extension(&bytes), &bytes)?;
+        Ok(format!(
+            "{SAVED}{}\nA {} image.",
+            path.display(),
+            size(bytes.len())
+        ))
+    }
+}
+
+pub struct Speak;
+impl Tool for Speak {
+    fn name(&self) -> &'static str {
+        "speak"
+    }
+    fn description(&self) -> &'static str {
+        "Read text aloud with a hosted voice model and save the audio as a file. It is paid from the user's Letronna credit by the character, so use it only when the user asks for speech or a voice-over."
+    }
+    fn parameters(&self) -> Value {
+        json!({"type": "object", "properties": {
+            "text": {"type": "string", "description": "What to say, exactly as it should be read."},
+            "voice": {"type": "string", "description": "A voice the model knows, such as alloy. Left out, the model picks one."},
+            "model": {"type": "string", "description": "A hosted speech model's id. Left out, the cheapest one working."}
+        }, "required": ["text"]})
+    }
+    fn needs_approval(&self) -> bool {
+        true
+    }
+    fn mutates(&self) -> bool {
+        true
+    }
+    fn preview(&self, args: &Value, _: &ToolContext) -> String {
+        let mut what = format!("Read aloud: {}", args["text"].as_str().unwrap_or_default());
+        if let Some(voice) = args["voice"].as_str() {
+            what.push_str(&format!("\nVoice: {voice}"));
+        }
+        card(what, args)
+    }
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
+        let text = required(args, "text")?;
+        let token = token()?;
+        let mut body = json!({"input": text});
+        pass(args, &mut body, &["voice", "model"]);
+        let reply = send(
+            client(MAKE_TIME)?
+                .post(endpoint("/audio/speech"))
+                .bearer_auth(&token)
+                .json(&body),
+        )?;
+        let kind = reply
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        let bytes = reply
+            .bytes()
+            .map_err(|_| "The audio was cut off on its way here.".to_owned())?;
+        let path = save(ctx, text, audio_extension(&kind), &bytes)?;
+        Ok(format!(
+            "{SAVED}{}\n{} characters read aloud, {}.",
+            path.display(),
+            text.chars().count(),
+            size(bytes.len())
+        ))
+    }
+}
+
+pub struct Transcribe;
+impl Tool for Transcribe {
+    fn name(&self) -> &'static str {
+        "transcribe"
+    }
+    fn description(&self) -> &'static str {
+        "Turn the speech in an audio or video file into text, on Letronna's hosted models. Files up to 25 MB. It is paid from the user's Letronna credit by the minute of audio."
+    }
+    fn parameters(&self) -> Value {
+        json!({"type": "object", "properties": {
+            "path": {"type": "string", "description": "The file, relative to the workspace."},
+            "model": {"type": "string", "description": "A hosted transcription model's id. Left out, the cheapest one working."}
+        }, "required": ["path"]})
+    }
+    fn needs_approval(&self) -> bool {
+        true
+    }
+    // It changes nothing on disk, but it spends credit, which plan mode is
+    // not for.
+    fn mutates(&self) -> bool {
+        true
+    }
+    fn preview(&self, args: &Value, _: &ToolContext) -> String {
+        card(
+            format!("Transcribe {}", args["path"].as_str().unwrap_or_default()),
+            args,
+        )
+    }
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
+        let raw = required(args, "path")?;
+        let path = crate::tools::resolve(raw, ctx)?;
+        let length = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
+        if length > UPLOAD_BYTES {
+            return Err(format!(
+                "`{raw}` is {}; files up to 25 MB can be transcribed. Cut it into parts first.",
+                size(length as usize)
+            ));
+        }
+        let audio = std::fs::read(&path).map_err(|e| e.to_string())?;
+        let token = token()?;
+        let (boundary, form) = form(&path, &audio, args["model"].as_str());
+        let reply: Value = send(
+            client(MAKE_TIME)?
+                .post(endpoint("/audio/transcriptions"))
+                .bearer_auth(&token)
+                .header(
+                    reqwest::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(form),
+        )?
+        .json()
+        .map_err(|_| "The transcript came back in a form Letronna could not read.".to_owned())?;
+        let text = reply["text"].as_str().unwrap_or_default().trim();
+        if text.is_empty() {
+            return Ok(format!("No speech was heard in `{raw}`."));
+        }
+        Ok(format!("Transcript of `{raw}`:\n\n{text}"))
+    }
+}
+
+pub struct MakeVideo;
+impl Tool for MakeVideo {
+    fn name(&self) -> &'static str {
+        "make_video"
+    }
+    fn description(&self) -> &'static str {
+        "Make a short video from a description on Letronna's hosted video models, and save it as an MP4 file. It takes a few minutes. It is paid from the user's Letronna credit by the second of video, several cents a second, so use it only when the user asks for a video."
+    }
+    fn parameters(&self) -> Value {
+        json!({"type": "object", "properties": {
+            "prompt": {"type": "string", "description": "What the video should show, in detail."},
+            "seconds": {"type": "integer", "description": "How long, such as 4 or 8. Each model makes only certain lengths; left out, the model's own."},
+            "model": {"type": "string", "description": "A hosted video model's id. Left out, the cheapest one working."},
+            "job": {"type": "string", "description": "The id of a video an earlier call left still being made: wait for that one and save it, instead of starting another."}
+        }})
+    }
+    fn needs_approval(&self) -> bool {
+        true
+    }
+    fn mutates(&self) -> bool {
+        true
+    }
+    fn preview(&self, args: &Value, _: &ToolContext) -> String {
+        if let Some(job) = args["job"].as_str() {
+            return format!("Wait for video {job}, already paid for, and save it.");
+        }
+        let long = match args["seconds"].as_u64() {
+            Some(seconds) => format!("A {seconds}-second video"),
+            None => "A video".to_owned(),
+        };
+        card(
+            format!("{long} of: {}", args["prompt"].as_str().unwrap_or_default()),
+            args,
+        )
+    }
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
+        let token = token()?;
+        let id = match args["job"].as_str() {
+            Some(job) => job.to_owned(),
+            None => {
+                let mut body = json!({"prompt": required(args, "prompt")?});
+                pass(args, &mut body, &["seconds", "model"]);
+                let job: Value = send(
+                    client(MAKE_TIME)?
+                        .post(endpoint("/videos"))
+                        .bearer_auth(&token)
+                        .json(&body),
+                )?
+                .json()
+                .map_err(|_| "The video was started, but its id could not be read.".to_owned())?;
+                job["id"]
+                    .as_str()
+                    .ok_or("The video could not be started.")?
+                    .to_owned()
+            }
+        };
+        let look = client(Duration::from_secs(30))?;
+        let started = Instant::now();
+        let seconds = loop {
+            let job: Value = send(
+                look.get(endpoint(&format!("/videos/{id}")))
+                    .bearer_auth(&token),
+            )?
+            .json()
+            .map_err(|_| "The video's progress could not be read.".to_owned())?;
+            match job["status"].as_str() {
+                Some("completed") => break job["seconds"].as_u64(),
+                Some("failed") => {
+                    return Err("The video could not be made. It is not charged.".into());
+                }
+                _ => {}
+            }
+            if started.elapsed() >= VIDEO_WAIT {
+                return Ok(format!(
+                    "The video is still being made. Call make_video again with job \"{id}\" to \
+                     wait for it and save it; it is charged once, when it is done."
+                ));
+            }
+            std::thread::sleep(VIDEO_POLL);
+        };
+        let bytes = send(
+            client(MAKE_TIME)?
+                .get(endpoint(&format!("/videos/{id}/content")))
+                .bearer_auth(&token),
+        )?
+        .bytes()
+        .map_err(|_| "The video was cut off on its way here.".to_owned())?;
+        let about = args["prompt"].as_str().unwrap_or("video");
+        let path = save(ctx, about, "mp4", &bytes)?;
+        let long = seconds.map(|s| format!("{s}-second ")).unwrap_or_default();
+        Ok(format!(
+            "{SAVED}{}\nA {long}video, {}.",
+            path.display(),
+            size(bytes.len())
+        ))
+    }
+}
+
+/// The file a media tool's result says it saved, for the window to show.
+pub fn saved(result: &str) -> Option<PathBuf> {
+    result
+        .lines()
+        .next()?
+        .strip_prefix(SAVED)
+        .map(PathBuf::from)
+}
+
+/// The signed-in account's token, or what to do about there being none.
+fn token() -> Result<String, String> {
+    crate::auth::account().map(|a| a.token).ok_or_else(|| {
+        "Images, speech and video are made on Letronna's hosted models, which need \
+         a Letronna account: sign in with /login first."
+            .to_owned()
+    })
+}
+
+fn endpoint(path: &str) -> String {
+    format!("{}{path}", crate::auth::hosted_base())
+}
+
+fn client(timeout: Duration) -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+/// Send a request, and hand back the reply or the API's own reason for
+/// refusing it: out of credit, signed out, no such model.
+fn send(request: reqwest::blocking::RequestBuilder) -> Result<reqwest::blocking::Response, String> {
+    let reply = request.send().map_err(|e| {
+        if e.is_timeout() {
+            "Letronna's hosted models took too long to answer.".to_owned()
+        } else {
+            "Could not reach Letronna's hosted models.".to_owned()
+        }
+    })?;
+    if reply.status().is_success() {
+        return Ok(reply);
+    }
+    let status = reply.status().as_u16();
+    let body: Value = reply.json().unwrap_or_default();
+    Err(refusal(&body).unwrap_or_else(|| format!("Letronna's hosted models answered {status}.")))
+}
+
+/// The error an API reply carries, in either of the shapes it comes in.
+fn refusal(body: &Value) -> Option<String> {
+    body["error"]["message"]
+        .as_str()
+        .or(body["error"].as_str())
+        .map(str::to_owned)
+}
+
+fn required<'a>(args: &'a Value, name: &str) -> Result<&'a str, String> {
+    args[name]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("`{name}` is required."))
+}
+
+/// Copy the optional arguments that were given into the request body.
+fn pass(args: &Value, body: &mut Value, names: &[&str]) {
+    for name in names {
+        if !args[*name].is_null() {
+            body[*name] = args[*name].clone();
+        }
+    }
+}
+
+/// The approval card: what will be made, by which model, and who pays.
+fn card(what: String, args: &Value) -> String {
+    let model = args["model"]
+        .as_str()
+        .unwrap_or("the cheapest hosted model working");
+    format!("{what}\n\nMade by {model}, paid from your Letronna credit.")
+}
+
+/// Save what was made under `media/`, named after what it shows and when.
+fn save(ctx: &ToolContext, about: &str, extension: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    let dir = ctx
+        .workspace
+        .clone()
+        .unwrap_or_else(crate::chat::data_dir)
+        .join("media");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Cannot make {}: {e}", dir.display()))?;
+    let name = format!(
+        "{}-{}",
+        slug(about),
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    );
+    let mut path = dir.join(format!("{name}.{extension}"));
+    // Two made in the same second must not overwrite each other.
+    let mut n = 2;
+    while path.exists() {
+        path = dir.join(format!("{name}-{n}.{extension}"));
+        n += 1;
+    }
+    std::fs::write(&path, bytes).map_err(|e| format!("Cannot save {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// The first words of a description, as a file name carries them anywhere.
+fn slug(text: &str) -> String {
+    let mut slug = String::new();
+    for word in text
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .take(6)
+    {
+        if slug.len() + word.len() >= 40 {
+            break;
+        }
+        if !slug.is_empty() {
+            slug.push('-');
+        }
+        slug.push_str(&word.to_ascii_lowercase());
+    }
+    if slug.is_empty() {
+        "media".to_owned()
+    } else {
+        slug
+    }
+}
+
+/// The multipart form the transcription route takes, and its boundary.
+/// Written out here because reqwest's own needs a feature built into nothing
+/// else.
+fn form(path: &Path, audio: &[u8], model: Option<&str>) -> (String, Vec<u8>) {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let boundary = format!("letronna-{stamp:x}");
+    // A quote or line break would end the header early.
+    let name: String = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "audio".into())
+        .chars()
+        .map(|c| if c == '"' || c.is_control() { '_' } else { c })
+        .collect();
+    let mut body = Vec::with_capacity(audio.len() + 512);
+    if let Some(model) = model {
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model}\r\n"
+            )
+            .as_bytes(),
+        );
+    }
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\n\
+             Content-Type: {}\r\n\r\n",
+            audio_type(path)
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(audio);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    (boundary, body)
+}
+
+/// What kind of audio a file is, from its name; some models refuse a file
+/// they are not told the kind of.
+fn audio_type(path: &Path) -> &'static str {
+    let extension = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    match extension.as_str() {
+        "mp3" | "mpga" | "mpeg" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "m4a" | "mp4" => "audio/mp4",
+        "ogg" | "oga" | "opus" => "audio/ogg",
+        "webm" => "audio/webm",
+        "flac" => "audio/flac",
+        _ => "application/octet-stream",
+    }
+}
+
+/// The file type an image's first bytes say it is.
+fn image_extension(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "jpg"
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(&b"WEBP"[..]) {
+        "webp"
+    } else {
+        "png"
+    }
+}
+
+/// The file type audio came back as, from its content type.
+fn audio_extension(content_type: &str) -> &'static str {
+    match content_type.split(';').next().unwrap_or_default().trim() {
+        "audio/wav" | "audio/x-wav" | "audio/wave" => "wav",
+        "audio/ogg" | "audio/opus" => "ogg",
+        "audio/flac" => "flac",
+        "audio/aac" => "aac",
+        _ => "mp3",
+    }
+}
+
+fn size(bytes: usize) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024. * 1024.))
+    } else {
+        format!("{} KB", bytes.div_ceil(1024))
+    }
+}
+
+/// Standard base64, as images come back from the API. Decoding it is a dozen
+/// lines, and it would be the only use of a crate for it.
+fn base64(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    let (mut buffer, mut bits) = (0u32, 0);
+    for byte in text.bytes() {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' => break,
+            b' ' | b'\t' | b'\r' | b'\n' => continue,
+            _ => return None,
+        };
+        buffer = (buffer << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buffer >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64_decodes_what_the_api_sends() {
+        assert_eq!(base64("aGVsbG8=").unwrap(), b"hello");
+        assert_eq!(base64("aGVsbG8gd29ybGQ=").unwrap(), b"hello world");
+        assert_eq!(base64("YQ==").unwrap(), b"a");
+        assert_eq!(base64("").unwrap(), b"");
+        // Wrapped lines, as some encoders write them.
+        assert_eq!(base64("aGVs\nbG8=").unwrap(), b"hello");
+        // Every byte value survives, so an image does too.
+        let all: Vec<u8> = (0..=255).collect();
+        let encoded = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w==";
+        assert_eq!(base64(encoded).unwrap(), all);
+        assert!(base64("not base64!").is_none());
+    }
+
+    #[test]
+    fn files_are_named_after_what_they_show() {
+        assert_eq!(
+            slug("A small red lighthouse, at dusk!"),
+            "a-small-red-lighthouse-at-dusk"
+        );
+        assert_eq!(slug("¿Qué?"), "qu");
+        assert_eq!(slug("…"), "media");
+        let long = slug("supercalifragilistic expialidocious antidisestablishmentarianism");
+        assert!(long.len() < 40, "{long}");
+        assert_eq!(image_extension(&[0xFF, 0xD8, 0xFF, 0xE0]), "jpg");
+        assert_eq!(image_extension(b"RIFF\0\0\0\0WEBPVP8 "), "webp");
+        assert_eq!(image_extension(b"\x89PNG\r\n"), "png");
+        assert_eq!(audio_extension("audio/wav; codecs=1"), "wav");
+        assert_eq!(audio_extension("audio/mpeg"), "mp3");
+    }
+
+    #[test]
+    fn made_files_land_in_media_and_never_overwrite() {
+        let dir = std::env::temp_dir().join(format!("letronna-media-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let first = save(&ctx, "a cat", "png", b"one").unwrap();
+        let second = save(&ctx, "a cat", "png", b"two").unwrap();
+        assert_ne!(first, second);
+        assert_eq!(first.parent().unwrap(), dir.join("media"));
+        assert_eq!(std::fs::read(&first).unwrap(), b"one");
+        assert_eq!(std::fs::read(&second).unwrap(), b"two");
+        // The window finds the file from the result the model is given.
+        let result = format!("{SAVED}{}\nA 1 KB image.", first.display());
+        assert_eq!(saved(&result), Some(first));
+        assert_eq!(saved("Transcript of `a.mp3`:"), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_transcription_form_carries_the_file_and_the_model() {
+        let (boundary, body) = form(
+            Path::new("clips/say \"hi\".mp3"),
+            b"ID3audio",
+            Some("whisper-1"),
+        );
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.starts_with(&format!("--{boundary}\r\n")), "{text}");
+        assert!(
+            text.contains("name=\"model\"\r\n\r\nwhisper-1\r\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "filename=\"say _hi_.mp3\"\r\nContent-Type: audio/mpeg\r\n\r\nID3audio\r\n"
+            ),
+            "{text}"
+        );
+        assert!(text.ends_with(&format!("--{boundary}--\r\n")), "{text}");
+        let (_, bare) = form(Path::new("a.wav"), b"", None);
+        assert!(!String::from_utf8_lossy(&bare).contains("name=\"model\""));
+    }
+
+    #[test]
+    fn refusals_are_read_in_either_shape() {
+        assert_eq!(
+            refusal(&json!({"error": {"message": "Not enough credit."}})).as_deref(),
+            Some("Not enough credit.")
+        );
+        assert_eq!(
+            refusal(&json!({"error": "this device was signed out, run /login"})).as_deref(),
+            Some("this device was signed out, run /login")
+        );
+        assert_eq!(refusal(&json!({"data": []})), None);
+    }
+
+    #[test]
+    fn every_media_tool_asks_first_and_stays_out_of_plan_mode() {
+        for name in ["make_image", "speak", "transcribe", "make_video"] {
+            let tool = crate::tools::find(name).unwrap_or_else(|| panic!("{name} missing"));
+            assert!(
+                tool.needs_approval() && tool.mutates() && tool.machine(),
+                "{name}"
+            );
+        }
+        let card = MakeImage.preview(&json!({"prompt": "a cat"}), &ToolContext::default());
+        assert!(
+            card.contains("a cat") && card.contains("Letronna credit"),
+            "{card}"
+        );
+    }
+
+    #[test]
+    #[ignore = "spends a few cents of real credit: sign in, then run with --ignored"]
+    fn an_image_is_made_and_saved() {
+        let dir = std::env::temp_dir().join(format!("letronna-media-live-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let out = MakeImage
+            .run(&json!({"prompt": "a small red lighthouse at dusk"}), &ctx)
+            .unwrap();
+        let path = saved(&out).unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() > 1000, "{out}");
+        println!("{out}");
+    }
+}

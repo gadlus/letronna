@@ -122,6 +122,10 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(crate::memory::Remember),
         Arc::new(SearchSessions),
         Arc::new(crate::web::WebFetch),
+        Arc::new(crate::media::MakeImage),
+        Arc::new(crate::media::Speak),
+        Arc::new(crate::media::Transcribe),
+        Arc::new(crate::media::MakeVideo),
     ];
     if let Ok(extra) = plugin_tools().lock() {
         for tool in extra.iter() {
@@ -242,6 +246,13 @@ pub fn summary(name: &str, args: &str) -> String {
             _ => format!("{}s", v["seconds"].as_f64().unwrap_or(10.)),
         },
         ASK_USER => v["question"].as_str().unwrap_or_default().to_owned(),
+        "make_image" => v["prompt"].as_str().unwrap_or_default().to_owned(),
+        "make_video" => v["prompt"]
+            .as_str()
+            .or(v["job"].as_str())
+            .unwrap_or_default()
+            .to_owned(),
+        "speak" => v["text"].as_str().unwrap_or_default().to_owned(),
         TODO => {
             let items = v["items"].as_array().map(Vec::len).unwrap_or(0);
             format!("{items} items")
@@ -793,7 +804,7 @@ fn home() -> Option<PathBuf> {
 
 /// Resolve a user-supplied path and refuse anything outside the workspace or
 /// the home folder. Canonicalising also defeats `..` and symlink escapes.
-fn resolve(raw: &str, ctx: &ToolContext) -> Result<PathBuf, String> {
+pub(crate) fn resolve(raw: &str, ctx: &ToolContext) -> Result<PathBuf, String> {
     let base = ctx.workspace.clone().or_else(home).unwrap_or_default();
     let joined = base.join(raw);
     let path = std::fs::canonicalize(&joined).map_err(|_| format!("`{raw}` does not exist."))?;

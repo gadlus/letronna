@@ -149,6 +149,9 @@ pub(crate) struct Chat {
     pub(crate) skill_name: Entity<InputState>,
     pub(crate) skill_prompt: Entity<InputState>,
     pub(crate) thinking_open: std::collections::HashSet<usize>,
+    /// The video playing in the chat, if one is, and its newest frame.
+    pub(crate) video: Option<crate::platform::video::Playing>,
+    pub(crate) video_frame: Option<std::sync::Arc<RenderImage>>,
     pub(crate) error: Option<String>,
     pub(crate) scroll: ScrollHandle,
     pub(crate) _subscriptions: Vec<Subscription>,
@@ -331,6 +334,8 @@ impl Chat {
             skill_name,
             skill_prompt,
             thinking_open: std::collections::HashSet::new(),
+            video: None,
+            video_frame: None,
             error,
             scroll: ScrollHandle::new(),
             _subscriptions: subscriptions,
