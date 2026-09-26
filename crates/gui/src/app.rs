@@ -82,6 +82,8 @@ pub(crate) struct Chat {
     pub(crate) account: Option<letronna_core::auth::Account>,
     /// What the last sign-in, refresh or sign-out had to say.
     pub(crate) account_note: Option<String>,
+    /// The teams the account is in, for the Account page's billing choice.
+    pub(crate) teams: Vec<letronna_core::auth::Team>,
     pub(crate) signing_in: bool,
     pub(crate) loading_models: bool,
     pub(crate) gateway_error: Option<String>,
@@ -274,6 +276,7 @@ impl Chat {
             greeting,
             account: letronna_core::auth::account(),
             account_note: None,
+            teams: Vec::new(),
             signing_in: false,
             loading_models: false,
             gateway_error: None,
