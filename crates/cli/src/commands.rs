@@ -59,6 +59,10 @@ pub fn command(
             switch_model(runner, rest);
             Flow::Handled
         }
+        "/gateways" => {
+            gateways(runner);
+            Flow::Handled
+        }
         "/login" => {
             sign_in(runner);
             Flow::Handled
@@ -576,4 +580,74 @@ fn set_model(runner: &mut Runner, gateway: String, model: String) {
         render::bold(&model),
         render::dim(&format!("· {gateway}"))
     ));
+}
+
+/// Every gateway and where it stands, then set one up, change it or remove it.
+/// Everything set up is used at once; `/model` picks among all their models.
+pub fn gateways(runner: &mut Runner) {
+    use letronna_core::gateway::{self, GATEWAYS, LETRONNA};
+    let keys = store::load_keys();
+    let custom = runner.store.settings.custom_endpoint.clone();
+    let (k, c) = (keys.clone(), custom.clone());
+    let (models, _) = runner
+        .bar
+        .busy("asking every gateway what it has", move || gateway::all_models(&k, &c));
+
+    // The list sits in the box with its choices, not in the conversation.
+    // Letronna is the account, not a gateway to add or remove: /login and
+    // /logout look after it, so it has a status here and no choice.
+    let mut rows = Vec::new();
+    let mut choices: Vec<(String, &'static str, &'static str)> = Vec::new();
+    for g in GATEWAYS {
+        let count = models.iter().filter(|(n, _)| n == g.name).count();
+        let (status, good, set_up) = gateway::status(g.name, &keys, &custom, count);
+        let status = if g.name == LETRONNA && !set_up { format!("{status} · /login") } else { status };
+        rows.push(format!("{} {:<11} {status}", if good { "●" } else { "○" }, g.name));
+        match (g.name, set_up) {
+            (LETRONNA, _) | ("Ollama", _) => {}
+            (_, false) => choices.push((format!("Set up {}", g.name), g.name, "set")),
+            (_, true) => {
+                choices.push((format!("Change {}", g.name), g.name, "set"));
+                choices.push((format!("Remove {}", g.name), g.name, "remove"));
+            }
+        }
+    }
+    let mut options: Vec<&str> = choices.iter().map(|c| c.0.as_str()).collect();
+    options.push("Done");
+    let Some(picked) = runner.bar.choose("Gateways", rows, &options) else {
+        return;
+    };
+    let Some((_, name, what)) = choices.get(picked).cloned() else {
+        return;
+    };
+    let mut keys = keys;
+    match what {
+        "remove" => {
+            keys.remove(gateway::key_slot(name));
+            if gateway::gateway(name).base.is_empty() {
+                runner.store.settings.custom_endpoint.clear();
+            }
+            render::blank();
+            render::line(&render::dim(&format!("{name} removed. Its models leave /model.")));
+        }
+        _ => {
+            if gateway::gateway(name).base.is_empty() {
+                let url = runner.bar.ask(&format!("{name} base URL, like http://localhost:8000/v1"), false).unwrap_or_default();
+                if !url.trim().is_empty() {
+                    runner.store.settings.custom_endpoint = url.trim().trim_end_matches('/').to_owned();
+                }
+            }
+            let hint = if gateway::gateway(name).needs_key { format!("{name} API key") } else { format!("{name} API key (optional)") };
+            let key = runner.bar.ask(&hint, true).unwrap_or_default();
+            if !key.trim().is_empty() {
+                keys.insert(gateway::key_slot(name).to_owned(), key.trim().to_owned());
+            }
+            render::blank();
+            render::line(&render::dim(&format!("{name} saved. /model now lists its models too.")));
+        }
+    }
+    if let Err(error) = store::save_keys(&keys) {
+        render::line(&render::red(&format!("Could not save the key: {error}")));
+    }
+    runner.persist();
 }

@@ -416,10 +416,6 @@ impl Chat {
     ) {
         self.model
             .update(cx, |input, cx| input.set_value(id.clone(), window, cx));
-        self.gateway_pick.update(cx, |g, cx| {
-            *g = gateway.clone();
-            cx.notify();
-        });
         self.store.settings.gateway = gateway;
         self.store.settings.model = id;
         self.model_open = false;

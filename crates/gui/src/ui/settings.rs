@@ -14,47 +14,31 @@ const PAGES: &[(&str, AppIcon)] = &[
 ];
 
 impl Chat {
+    /// Open a gateway's row to set it up, or close it if it is already open.
     pub(crate) fn select_gateway(
         &mut self,
         name: &'static str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Only which card is being set up; the model decides which one is used.
-        let g = gateway(name);
+        let open = *self.gateway_pick.read(cx) == name;
         self.gateway_pick.update(cx, |g, cx| {
-            *g = name.into();
+            *g = if open { String::new() } else { name.into() };
             cx.notify();
         });
-        let base = if g.base.is_empty() {
-            self.store.settings.custom_endpoint.clone()
-        } else {
-            g.base.to_owned()
-        };
-        self.endpoint
-            .update(cx, |input, cx| input.set_value(base, window, cx));
+        if open {
+            return;
+        }
+        self.endpoint.update(cx, |input, cx| {
+            input.set_value(self.store.settings.custom_endpoint.clone(), window, cx)
+        });
         let key = self.keys.get(key_slot(name)).cloned().unwrap_or_default();
         self.key
             .update(cx, |input, cx| input.set_value(key, window, cx));
         cx.notify();
     }
 
-    pub(crate) fn apply_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // The card being edited, which may not be the one the model is on.
-        let editing = self.gateway_pick.read(cx).clone();
-        if gateway(&editing).base.is_empty() {
-            self.store.settings.custom_endpoint = self.endpoint.read(cx).value().trim().to_string();
-        }
-        let key = self.key.read(cx).value().to_string();
-        let slot = key_slot(&editing).to_string();
-        if key.is_empty() {
-            self.keys.remove(&slot);
-        } else {
-            self.keys.insert(slot, key);
-        }
-        // Cleared before the writes, not after: clearing last threw away the
-        // very error that says the key was not kept.
-        self.error = None;
+    fn write_keys(&mut self) {
         if std::fs::create_dir_all(backend::data_dir())
             .and_then(|_| {
                 std::fs::write(keys_path(), serde_json::to_vec_pretty(&self.keys).unwrap())
@@ -63,6 +47,55 @@ impl Chat {
         {
             self.error = Some("Could not save the API key.".into());
         }
+    }
+
+    /// Save the open row's key (and URL, for Custom), close it, and reload
+    /// every gateway's models.
+    pub(crate) fn save_gateway(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let editing = self.gateway_pick.read(cx).clone();
+        if editing.is_empty() {
+            return;
+        }
+        if gateway(&editing).base.is_empty() {
+            self.store.settings.custom_endpoint = self.endpoint.read(cx).value().trim().to_string();
+        }
+        let key = self.key.read(cx).value().trim().to_string();
+        let slot = key_slot(&editing).to_string();
+        if key.is_empty() {
+            self.keys.remove(&slot);
+        } else {
+            self.keys.insert(slot, key);
+        }
+        self.write_keys();
+        self.save();
+        self.gateway_pick.update(cx, |g, cx| {
+            g.clear();
+            cx.notify();
+        });
+        self.load_models(window, cx);
+    }
+
+    /// Forget a gateway's key (and URL, for Custom); its models leave the list.
+    pub(crate) fn remove_gateway(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.keys.remove(key_slot(name));
+        if gateway(name).base.is_empty() {
+            self.store.settings.custom_endpoint.clear();
+        }
+        self.write_keys();
+        self.save();
+        self.gateway_pick.update(cx, |g, cx| {
+            g.clear();
+            cx.notify();
+        });
+        self.load_models(window, cx);
+    }
+
+    /// The Model page's Save: the default model.
+    pub(crate) fn apply_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.store.settings.model = self.model.read(cx).value().to_string();
+        // Cleared before saving, not after: clearing last threw away the very
+        // error that says the save failed.
+        self.error = None;
         self.save();
         self.load_models(window, cx);
         self.close_settings(window, cx);
@@ -73,6 +106,7 @@ impl Chat {
         // cannot sample it return None, which falls back to the plain scrim.
         self.settings_backdrop = crate::platform::backdrop::capture(window);
         self.settings_open = true;
+        self.gateway_pick.update(cx, |g, _| g.clear());
         self.settings_closing = false;
         // Somewhere inside the chat has to hold focus for escape to reach
         // it; opened from a menu, nothing does.
@@ -241,15 +275,7 @@ impl Chat {
             "Thinking" => thinking_page(&chat, &self.store.settings, cx).into_any_element(),
             "Plugins" => plugins_page(&chat, cx).into_any_element(),
             "About" => about_page(cx).into_any_element(),
-            _ => {
-                // Counted here and handed over, as the account page is: the
-                // page is drawn while the chat is mid-update.
-                let mut offered = std::collections::HashMap::new();
-                for (gateway, _) in &self.models {
-                    *offered.entry(gateway.clone()).or_insert(0usize) += 1;
-                }
-                gateway_page(&pick, &endpoint, &key, &chat, &offered, cx).into_any_element()
-            }
+            _ => gateway_page(self.gateway_rows(), &pick, &endpoint, &key, &page, &chat, cx).into_any_element(),
         };
         div()
             .track_focus(&self.settings_focus)
@@ -758,137 +784,158 @@ fn toggle_row(
         )
 }
 
+/// One gateway as the settings list shows it.
+pub(crate) struct GatewayRow {
+    name: &'static str,
+    blurb: &'static str,
+    status: String,
+    good: bool,
+    /// The row's button: "Add key", "Add URL", "Edit", "Sign in", or none.
+    action: Option<&'static str>,
+    set_up: bool,
+}
+
+impl Chat {
+    /// Every gateway with where it stands now, taken before the dialog is
+    /// built so the dialog never has to read this entity.
+    pub(crate) fn gateway_rows(&self) -> Vec<GatewayRow> {
+        GATEWAYS
+            .iter()
+            .map(|g| {
+                let count = self.models.iter().filter(|(n, _)| n == g.name).count();
+                let (status, good, set_up) =
+                    status(g.name, &self.keys, &self.store.settings.custom_endpoint, count);
+                let action = match g.name {
+                    LETRONNA if !set_up => Some("Sign in"),
+                    LETRONNA | "Ollama" => None,
+                    "Custom" if !set_up => Some("Add URL"),
+                    _ if !set_up => Some("Add key"),
+                    _ => Some("Edit"),
+                };
+                let status = if self.loading_models && set_up { "Checking…".into() } else { status };
+                GatewayRow { name: g.name, blurb: g.blurb, status, good, action, set_up }
+            })
+            .collect()
+    }
+}
+
 fn gateway_page(
+    rows: Vec<GatewayRow>,
     pick: &Entity<String>,
     endpoint: &Entity<InputState>,
     key: &Entity<InputState>,
+    page: &Entity<&'static str>,
     chat: &Entity<Chat>,
-    offered: &std::collections::HashMap<String, usize>,
     cx: &App,
 ) -> Div {
-    let current = pick.read(cx).clone();
-    let g = gateway(&current);
-    let mut cards = v_flex().gap_3();
-    for row in GATEWAYS.chunks(3) {
-        // A plain row, not h_flex: that centres its children, and these
-        // cards should stretch to the tallest one in the row.
-        let mut line = div().flex().flex_row().gap_3();
-        for gw in row {
+    let open = pick.read(cx).clone();
+    let mut list = v_flex()
+        .border_1()
+        .border_color(cx.theme().border)
+        .rounded(cx.theme().radius);
+    for (i, row) in rows.into_iter().enumerate() {
+        let name = row.name;
+        let editing = open == name;
+        let dot = if row.good { cx.theme().green } else { cx.theme().muted_foreground.opacity(0.5) };
+        let button = row.action.map(|action| {
             let chat = chat.clone();
-            let active = gw.name == current;
-            line = line.child(
-                v_flex()
-                    .id(gw.name)
-                    .flex_1()
-                    .w_0()
-                    // A floor, not a fixed height: narrow cards wrap their
-                    // blurb onto more lines and the row stretches to match.
-                    .min_h(px(120.))
-                    .p_3()
-                    .gap_1p5()
-                    .rounded(cx.theme().radius)
-                    .border_1()
-                    .border_color(if active {
-                        cx.theme().primary
+            let page = page.clone();
+            Button::new(("gw-action", i))
+                .small()
+                .when(!row.set_up, |b| b.primary())
+                .when(row.set_up, |b| b.ghost())
+                .label(if editing { "Close" } else { action })
+                .on_click(move |_, window, cx| {
+                    if action == "Sign in" {
+                        page.update(cx, |p, cx| {
+                            *p = "Account";
+                            cx.notify();
+                        });
                     } else {
-                        cx.theme().border
-                    })
-                    .bg(cx.theme().secondary.opacity(0.3))
-                    .cursor_pointer()
-                    .hover(|s| s.border_color(cx.theme().primary.opacity(0.6)))
+                        chat.update(cx, |this, cx| this.select_gateway(name, window, cx));
+                    }
+                })
+        });
+        let head = h_flex()
+            .px_4()
+            .py_3()
+            .gap_4()
+            .items_center()
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_0p5()
                     .child(
-                        h_flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_family(HEADING_FONT)
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(gw.name),
-                            )
-                            .when(active, |this| {
-                                this.child(
-                                    Icon::new(IconName::Check)
-                                        .size_4()
-                                        .text_color(cx.theme().primary),
-                                )
-                            }),
+                        div()
+                            .text_sm()
+                            .font_family(HEADING_FONT)
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(name),
                     )
+                    .child(div().text_xs().text_color(cx.theme().muted_foreground).child(row.blurb)),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .flex_shrink_0()
+                    .child(div().size(px(7.)).rounded_full().bg(dot))
                     .child(
                         div()
                             .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(gw.blurb),
-                    )
-                    // Which cards are working, without opening each one.
-                    .when_some(offered.get(gw.name), |this, count| {
-                        this.child(
-                            h_flex()
-                                .mt_auto()
-                                .gap_1p5()
-                                .items_center()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(div().size(px(6.)).rounded_full().bg(cx.theme().green))
-                                .child(match count {
-                                    1 => "1 model".to_owned(),
-                                    n => format!("{n} models"),
-                                }),
-                        )
+                            .text_color(if row.good { cx.theme().foreground } else { cx.theme().muted_foreground })
+                            .child(row.status),
+                    ),
+            )
+            .child(div().w(px(84.)).flex().justify_end().children(button));
+        let mut item = v_flex()
+            .when(i > 0, |d| d.border_t_1().border_color(cx.theme().border))
+            .child(head);
+        if editing {
+            let custom = gateway(name).base.is_empty();
+            let needs_key = gateway(name).needs_key;
+            let save = chat.clone();
+            let remove = chat.clone();
+            item = item.child(
+                v_flex()
+                    .px_4()
+                    .pb_4()
+                    .gap_3()
+                    .when(custom, |d| {
+                        d.child(v_flex().gap_1().child(label("Base URL", cx)).child(Input::new(endpoint)))
                     })
-                    .on_click(move |_, window, cx| {
-                        chat.update(cx, |this, cx| this.select_gateway(gw.name, window, cx))
-                    }),
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(label(if needs_key { "API key" } else { "API key (optional)" }, cx))
+                            .child(Input::new(key).mask_toggle()),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .when(row.set_up, |d| {
+                                d.child(Button::new("gw-remove").ghost().small().label("Remove").on_click(
+                                    move |_, window, cx| {
+                                        remove.update(cx, |this, cx| this.remove_gateway(name, window, cx))
+                                    },
+                                ))
+                            })
+                            .child(Button::new("gw-save").primary().small().label("Save").on_click(
+                                move |_, window, cx| save.update(cx, |this, cx| this.save_gateway(window, cx)),
+                            )),
+                    ),
             );
         }
-        cards = cards.child(line);
+        list = list.child(item);
     }
-    let save = chat.clone();
     v_flex()
         .gap_5()
         .child(heading(
-            "Gateway Connection",
-            "Set up as many as you like: the model list shows every model from each one, and a message goes to the gateway of the model you pick. Keys are stored per gateway in keys.json on this machine.",
+            "Gateways",
+            "Every gateway you set up is used at once: its models join the model list, and each message goes to the gateway of the model you pick. Keys stay in keys.json on this machine.",
             cx,
         ))
-        .child(v_flex().gap_2().child(label("Gateway", cx)).child(cards))
-        .when(current == LETRONNA, |this| {
-            this.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("Uses the Letronna account this computer is signed in with. Nothing to paste."),
-            )
-        })
-        .when(g.base.is_empty(), |this| this.child(
-            v_flex()
-                .gap_1()
-                .child(label("Base URL", cx))
-                .child(Input::new(endpoint)),
-        ))
-        .when(current != LETRONNA, |this| this.child(
-            v_flex()
-                .gap_1()
-                .child(label(
-                    if g.needs_key {
-                        "API key (required)"
-                    } else {
-                        "API key (optional)"
-                    },
-                    cx,
-                ))
-                .child(Input::new(key).mask_toggle()),
-        ))
-        .child(
-            h_flex().justify_end().child(
-                Button::new("save-gateway")
-                    .primary()
-                    .small()
-                    .label("Save and reconnect")
-                    .on_click(move |_, window, cx| {
-                        save.update(cx, |this, cx| this.apply_settings(window, cx))
-                    }),
-            ),
-        )
+        .child(list)
 }
