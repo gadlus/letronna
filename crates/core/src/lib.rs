@@ -9,6 +9,7 @@
 pub mod agent;
 pub mod auth;
 pub mod chat;
+pub mod compact;
 pub mod gateway;
 pub mod jobs;
 pub mod messaging;

@@ -210,7 +210,7 @@ fn window_start(messages: &[Message]) -> usize {
     start
 }
 
-fn body(connection: &Connection, messages: &[Message]) -> Value {
+fn body(connection: &Connection, messages: &[Message], summary: Option<&str>) -> Value {
     let start = window_start(messages);
     let mut system =
         String::from("You are Letronna, a personal assistant. Be clear, concise, and honest.");
@@ -242,6 +242,11 @@ fn body(connection: &Connection, messages: &[Message]) -> Value {
         if remote.shared {
             system.push_str(" Other people in this chat can read your replies. Nothing on this computer is reachable from here: no files, folders or commands.");
         }
+    }
+    if let Some(summary) = summary {
+        system.push_str(&format!(
+            "\n\nEarlier in this conversation, summarized because it no longer fits:\n{summary}"
+        ));
     }
     let mut context = vec![json!({"role": "system", "content": system})];
     let window = &messages[start..];
@@ -358,7 +363,7 @@ fn explain(message: &str) -> String {
     message.chars().take(400).collect()
 }
 
-fn unwrap_response(value: &Value) -> Result<&Value, String> {
+pub(crate) fn unwrap_response(value: &Value) -> Result<&Value, String> {
     if value.get("error").is_some() || value.get("success").is_some_and(|v| v != true) {
         let message = value
             .pointer("/error/message")
@@ -567,10 +572,14 @@ fn stream(
     sender: &async_channel::Sender<Event>,
 ) -> Result<(), String> {
     let endpoint = validate(connection)?;
+    // What the window no longer holds goes in as a summary rather than not at
+    // all. It is made here, on the worker, so the wait is part of the reply's.
+    let dropped = &messages[..window_start(messages)];
+    let summary = crate::compact::summary(connection, dropped);
     let mut request = client()?
         .post(endpoint)
         .timeout(Duration::from_secs(120))
-        .json(&body(connection, messages));
+        .json(&body(connection, messages, summary.as_deref()));
     if !connection.key.trim().is_empty() {
         request = request.bearer_auth(connection.key.trim());
     }
@@ -832,7 +841,7 @@ mod tests {
                 ..Default::default()
             })
             .collect();
-        let payload = body(&connection(), &messages);
+        let payload = body(&connection(), &messages, None);
         let context = payload["messages"].as_array().unwrap();
         assert_eq!(context.len(), 31);
         assert_eq!(context[1]["role"], "user");
@@ -865,13 +874,30 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let payload = body(&connection(), &messages);
+        let payload = body(&connection(), &messages, None);
         let context = payload["messages"].as_array().unwrap();
         assert_eq!(context.len(), 4);
         assert_eq!(context[1]["content"], "what is in the file?");
         // The oversized result is trimmed rather than dropped.
         let sent = context[3]["content"].as_str().unwrap().chars().count();
         assert!(sent < MAX_TOOL_CHARS + 64, "{sent}");
+    }
+    #[test]
+    fn a_summary_of_what_fell_out_rides_at_the_end_of_the_system_prompt() {
+        let messages = [Message {
+            role: "user".into(),
+            content: "and now?".into(),
+            ..Default::default()
+        }];
+        let payload = body(&connection(), &messages, Some("They chose Postgres."));
+        let system = payload["messages"][0]["content"].as_str().unwrap();
+        assert!(
+            system.ends_with("no longer fits:\nThey chose Postgres."),
+            "{system}"
+        );
+        let without = body(&connection(), &messages, None);
+        let plain = without["messages"][0]["content"].as_str().unwrap();
+        assert!(!plain.contains("summarized"));
     }
     #[test]
     fn the_two_ways_a_route_says_it_cannot_do_tools_read_the_same() {
@@ -974,6 +1000,7 @@ mod tests {
                     ..connection()
                 },
                 &[],
+                None,
             )["tools"]
                 .as_array()
                 .unwrap()
@@ -1004,6 +1031,7 @@ mod tests {
                     ..connection()
                 },
                 &[],
+                None,
             )["messages"][0]["content"]
                 .as_str()
                 .unwrap()
@@ -1115,7 +1143,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let payload = body(&connection(), &messages);
+        let payload = body(&connection(), &messages, None);
         let context = payload["messages"].as_array().unwrap();
         let tools: Vec<&str> = context
             .iter()
