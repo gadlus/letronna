@@ -5,15 +5,35 @@
 //! run a command return `needs_approval`, and the chat shows a card first.
 //! `ask_user` is answered by the user, never run here.
 
+use crate::chat::{Connection, Remote};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// Where a session is allowed to look.
 #[derive(Clone, Default)]
 pub struct ToolContext {
     /// The folder attached to the session. Relative paths resolve here.
     pub workspace: Option<PathBuf>,
+    /// Set when a chat app is driving the session: where `read_chat` reads,
+    /// and whether other people can see the replies.
+    pub remote: Option<Remote>,
+}
+
+impl ToolContext {
+    pub fn of(connection: &Connection) -> Self {
+        Self {
+            workspace: connection.workspace.clone(),
+            remote: connection.remote.clone(),
+        }
+    }
+
+    /// Other people can read the replies, so nothing on this computer is in
+    /// reach: what a tool finds would be posted to all of them.
+    fn shared(&self) -> bool {
+        self.remote.as_ref().is_some_and(|r| r.shared)
+    }
 }
 
 pub trait Tool: Send + Sync {
@@ -31,6 +51,16 @@ pub trait Tool: Send + Sync {
     fn mutates(&self) -> bool {
         false
     }
+    /// Whether the tool reads or changes this computer. Withheld where other
+    /// people can read the replies; a tool has to opt out to be offered there,
+    /// so a plugin's tool stays out unless it says otherwise.
+    fn machine(&self) -> bool {
+        true
+    }
+    /// Only offered when the session has a chat history to read.
+    fn needs_history(&self) -> bool {
+        false
+    }
     /// What the approval card shows: a diff, the file body, the command line.
     fn preview(&self, args: &Value, ctx: &ToolContext) -> String {
         let _ = ctx;
@@ -43,6 +73,15 @@ pub const TODO: &str = "todo";
 /// The tool result the model gets when the user denies a call.
 pub const DECLINED: &str = "The user declined this action. Ask before trying a different approach.";
 const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// A search stops after this long or this many files, and says so, rather
+/// than walking a whole home folder while the session waits on it.
+const SEARCH_TIME: Duration = Duration::from_secs(15);
+const SEARCH_FILES: usize = 20_000;
+/// Bigger files are skipped by search and cut short by read_file: neither
+/// can show more than `MAX_OUTPUT`, and reading gigabytes to find that out
+/// is how a tool hangs.
+const SEARCH_FILE_BYTES: u64 = 1_000_000;
+const READ_BYTES: u64 = 256 * 1024;
 /// How long a background command gets to print something before the tool
 /// replies, so the first message can carry a port or an early crash.
 const SETTLE: std::time::Duration = std::time::Duration::from_millis(1200);
@@ -78,6 +117,7 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(Wait),
         Arc::new(AskUser),
         Arc::new(Todo),
+        Arc::new(crate::messaging::ReadChat),
         Arc::new(Sessions),
     ];
     if let Ok(extra) = plugin_tools().lock() {
@@ -123,11 +163,20 @@ pub fn preview(name: &str, args: &str, ctx: &ToolContext) -> String {
 }
 
 /// The `tools` array for a chat completion request. In plan mode the tools
-/// that change things are left out entirely, so the model cannot try them.
-pub fn specs(plan: bool) -> Vec<Value> {
+/// that change things are left out entirely, so the model cannot try them;
+/// where other people read the replies, so is everything that touches this
+/// computer; and `read_chat` exists only where there is a chat to read.
+pub fn specs(connection: &Connection) -> Vec<Value> {
+    let shared = connection.remote.as_ref().is_some_and(|r| r.shared);
+    let history = connection
+        .remote
+        .as_ref()
+        .is_some_and(|r| r.history.is_some());
     all()
         .iter()
-        .filter(|t| !plan || !t.mutates())
+        .filter(|t| !connection.plan || !t.mutates())
+        .filter(|t| !shared || !t.machine())
+        .filter(|t| history || !t.needs_history())
         .map(|t| {
             json!({"type": "function", "function": {
                 "name": t.name(),
@@ -140,6 +189,14 @@ pub fn specs(plan: bool) -> Vec<Value> {
 
 pub fn run(name: &str, args: &str, ctx: &ToolContext) -> Result<String, String> {
     let tool = find(name).ok_or_else(|| format!("Unknown tool `{name}`."))?;
+    // Only fitting tools are offered, but the model can name any of them;
+    // refuse here too rather than trust the offer.
+    if ctx.shared() && tool.machine() {
+        return Err(format!(
+            "`{name}` is not available here: other people can read this chat, so \
+             nothing on this computer is in reach."
+        ));
+    }
     let args = parse_args(args)?;
     let mut out = tool.run(&args, ctx)?;
     if out.len() > MAX_OUTPUT {
@@ -633,6 +690,9 @@ impl Tool for AskUser {
     fn needs_approval(&self) -> bool {
         true
     }
+    fn machine(&self) -> bool {
+        false
+    }
     fn run(&self, _: &Value, _: &ToolContext) -> Result<String, String> {
         Err("ask_user is answered by the user.".into())
     }
@@ -655,6 +715,9 @@ impl Tool for Todo {
                 "status": {"type": "string", "enum": ["pending", "doing", "done"]}
             }, "required": ["text", "status"]}}
         }, "required": ["items"]})
+    }
+    fn machine(&self) -> bool {
+        false
     }
     fn run(&self, args: &Value, _: &ToolContext) -> Result<String, String> {
         let items = args["items"].as_array().ok_or("`items` is required.")?;
@@ -703,9 +766,25 @@ impl Tool for ReadFile {
         }, "required": ["path"]})
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
+        use std::io::Read;
         let path = resolve(path_arg(args), ctx)?;
-        let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
-        String::from_utf8(bytes).map_err(|_| "Not a text file.".into())
+        let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+        let mut bytes = Vec::new();
+        file.take(READ_BYTES)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        let cut = bytes.len() as u64 == READ_BYTES;
+        match String::from_utf8(bytes) {
+            Ok(text) => Ok(text),
+            // A cut can split the last character; anything else is binary.
+            Err(e) if cut && e.utf8_error().error_len().is_none() => {
+                let valid = e.utf8_error().valid_up_to();
+                let mut bytes = e.into_bytes();
+                bytes.truncate(valid);
+                String::from_utf8(bytes).map_err(|_| "Not a text file.".into())
+            }
+            Err(_) => Err("Not a text file.".into()),
+        }
     }
 }
 
@@ -757,46 +836,92 @@ impl Tool for Search {
             return Err("Query is empty.".into());
         }
         let root = resolve(path_arg(args), ctx)?;
-        let mut hits = Vec::new();
-        walk(&root, &mut |file| {
-            let Ok(text) = std::fs::read_to_string(file) else {
-                return true;
-            };
-            for (n, line) in text.lines().enumerate() {
-                if line.to_lowercase().contains(&query) {
-                    let rel = file.strip_prefix(&root).unwrap_or(file).display();
-                    hits.push(format!("{rel}:{}: {}", n + 1, line.trim()));
-                    if hits.len() >= 200 {
-                        return false;
-                    }
-                }
-            }
-            true
-        });
-        if hits.is_empty() {
-            Ok("No matches.".into())
-        } else {
-            Ok(hits.join("\n"))
-        }
+        Ok(search(&root, &query, SEARCH_TIME, SEARCH_FILES))
     }
 }
 
-/// Depth-first walk skipping build and VCS folders. The callback returns false to stop.
-fn walk(dir: &Path, f: &mut dyn FnMut(&Path) -> bool) -> bool {
+/// The search itself, with its budget passed in so a test can use a tiny one.
+fn search(root: &Path, query: &str, time: Duration, files: usize) -> String {
+    let started = Instant::now();
+    let mut scanned = 0;
+    let mut stopped = false;
+    let mut hits = Vec::new();
+    walk(root, &mut |path, is_dir| {
+        // Checked on folders too, or a deep tree of them runs unbounded.
+        if scanned >= files || started.elapsed() >= time {
+            stopped = true;
+            return false;
+        }
+        if is_dir {
+            return true;
+        }
+        scanned += 1;
+        let Some(text) = searchable(path) else {
+            return true;
+        };
+        for (n, line) in text.lines().enumerate() {
+            if line.to_lowercase().contains(query) {
+                let rel = path.strip_prefix(root).unwrap_or(path).display();
+                hits.push(format!("{rel}:{}: {}", n + 1, line.trim()));
+                if hits.len() >= 200 {
+                    return false;
+                }
+            }
+        }
+        true
+    });
+    let mut out = match hits.is_empty() {
+        true => "No matches.".to_owned(),
+        false => hits.join("\n"),
+    };
+    if stopped {
+        out.push_str(&format!(
+            "\n… Stopped early after {scanned} files; search a narrower folder for \
+             complete results."
+        ));
+    }
+    out
+}
+
+/// A file worth searching: small enough, and text. The size comes from the
+/// metadata so a huge file is never opened; a NUL byte marks a binary one.
+fn searchable(path: &Path) -> Option<String> {
+    if std::fs::metadata(path).ok()?.len() > SEARCH_FILE_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    if bytes[..bytes.len().min(8192)].contains(&0) {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// Depth-first walk skipping build, VCS and hidden folders. A symlink is
+/// never followed, so a link back up the tree cannot loop it. The callback
+/// sees each folder before it is entered and each file, and returns false to
+/// stop.
+fn walk(dir: &Path, f: &mut dyn FnMut(&Path, bool) -> bool) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return true;
     };
     for entry in entries.filter_map(Result::ok) {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_symlink() {
+            continue;
+        }
         let path = entry.path();
-        if path.is_dir() {
+        if kind.is_dir() {
             let name = entry.file_name();
-            if SKIP_DIRS.iter().any(|s| name == *s) {
+            let hidden = name.to_string_lossy().starts_with('.');
+            if hidden || SKIP_DIRS.iter().any(|s| name == *s) {
                 continue;
             }
-            if !walk(&path, f) {
+            if !f(&path, true) || !walk(&path, f) {
                 return false;
             }
-        } else if !f(&path) {
+        } else if !f(&path, false) {
             return false;
         }
     }
@@ -814,6 +939,7 @@ mod tests {
         std::fs::write(dir.join("src/a.txt"), "hello\nWorld").unwrap();
         let ctx = ToolContext {
             workspace: Some(dir.clone()),
+            ..Default::default()
         };
         assert_eq!(
             run("read_file", r#"{"path":"src/a.txt"}"#, &ctx).unwrap(),
@@ -905,5 +1031,113 @@ World"
         set_plugin_tools(Vec::new());
         assert!(run("extra", "{}", &ctx).is_err());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn search_stays_bounded() {
+        let dir = std::env::temp_dir().join(format!("letronna-search-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".hidden")).unwrap();
+        std::fs::write(dir.join("ok.txt"), "a needle here").unwrap();
+        std::fs::write(dir.join(".hidden/a.txt"), "needle").unwrap();
+        std::fs::write(dir.join("bin.dat"), b"needle\0binary").unwrap();
+        let big = format!("needle\n{}", "x".repeat(SEARCH_FILE_BYTES as usize));
+        std::fs::write(dir.join("big.txt"), big).unwrap();
+        // A link back up the tree would recurse until paths ran out.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&dir, dir.join("loop")).unwrap();
+
+        assert_eq!(
+            search(&dir, "needle", SEARCH_TIME, SEARCH_FILES),
+            "ok.txt:1: a needle here"
+        );
+        // Out of budget: stops at once and says why, rather than wandering on.
+        for out in [
+            search(&dir, "needle", SEARCH_TIME, 0),
+            search(&dir, "needle", Duration::ZERO, SEARCH_FILES),
+        ] {
+            assert!(out.starts_with("No matches."), "{out}");
+            assert!(out.contains("Stopped early after 0 files"), "{out}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn read_file_stops_at_its_limit() {
+        let dir = std::env::temp_dir().join(format!("letronna-read-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A two-byte character straddles the cut, which must not read as binary.
+        let text = format!("{}é{}", "a".repeat(READ_BYTES as usize - 1), "b".repeat(10));
+        std::fs::write(dir.join("long.txt"), text).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let out = ReadFile.run(&json!({"path": "long.txt"}), &ctx).unwrap();
+        assert_eq!(out.len(), READ_BYTES as usize - 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_shared_chat_reaches_nothing_on_this_computer() {
+        use crate::chat::History;
+        let names = |remote: Option<Remote>| -> Vec<String> {
+            specs(&Connection {
+                tools: true,
+                remote,
+                ..Default::default()
+            })
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap().to_owned())
+            .collect()
+        };
+        let history = Some(History::default());
+        let local = names(None);
+        assert!(local.contains(&"read_file".to_owned()));
+        assert!(!local.contains(&"read_chat".to_owned()));
+
+        let dm = names(Some(Remote {
+            history: history.clone(),
+            ..Default::default()
+        }));
+        assert!(dm.contains(&"read_file".to_owned()) && dm.contains(&"read_chat".to_owned()));
+
+        let server = names(Some(Remote {
+            shared: true,
+            history,
+            ..Default::default()
+        }));
+        for kept in ["read_chat", "ask_user", "todo"] {
+            assert!(server.contains(&kept.to_owned()), "{kept} missing");
+        }
+        for gone in [
+            "read_file",
+            "list_dir",
+            "search",
+            "write_file",
+            "run_command",
+        ] {
+            assert!(
+                !server.contains(&gone.to_owned()),
+                "{gone} offered in a shared chat"
+            );
+        }
+        // A Telegram group: shared, and no history to read.
+        let group = names(Some(Remote {
+            shared: true,
+            ..Default::default()
+        }));
+        assert!(!group.contains(&"read_chat".to_owned()));
+
+        // Named anyway, it is refused rather than run.
+        let shared = ToolContext {
+            remote: Some(Remote {
+                shared: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let refused = run("read_file", r#"{"path": "x"}"#, &shared).unwrap_err();
+        assert!(refused.contains("not available here"), "{refused}");
     }
 }

@@ -151,8 +151,11 @@ impl Chat {
                 h_flex()
                     .items_center()
                     .justify_between()
+                    .gap_3()
                     .child(
                         v_flex()
+                            .flex_1()
+                            .min_w_0()
                             .gap_0p5()
                             .child(div().text_sm().child("Run without asking"))
                             .child(
@@ -166,7 +169,7 @@ impl Chat {
                             ),
                     )
                     .child(
-                        div().cursor_pointer().child(
+                        div().flex_shrink_0().cursor_pointer().child(
                             gpui_component::switch::Switch::new("unattended")
                                 .checked(unattended)
                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -275,6 +278,7 @@ impl Chat {
             .bg(cx.theme().secondary.opacity(0.3))
             .child(
                 v_flex()
+                    .flex_1()
                     .min_w_0()
                     .gap_0p5()
                     .child(
@@ -374,8 +378,11 @@ impl Chat {
                 h_flex()
                     .items_center()
                     .justify_between()
+                    .gap_4()
                     .child(
                         v_flex()
+                            .flex_1()
+                            .min_w_0()
                             .gap_1()
                             .child(
                                 div()
@@ -401,6 +408,7 @@ impl Chat {
                         Button::new("add-job")
                             .primary()
                             .small()
+                            .flex_shrink_0()
                             .icon(Icon::new(IconName::Plus))
                             .label("New job")
                             .on_click(cx.listener(|this, _, _, cx| this.new_schedule(cx))),

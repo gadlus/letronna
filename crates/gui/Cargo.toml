@@ -26,6 +26,15 @@ tray-icon = "0.25"
 raw-window-handle = "0.6"
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Registry", "Win32_System_Threading", "Win32_Security", "Win32_Graphics_Gdi", "Win32_Storage_Xps"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# Command Line Tools ship no `xcrun metal`, so let the Metal driver compile the
+# shaders at startup rather than at build time.
+gpui = { version = "=0.2.2", features = ["runtime_shaders"] }
+# Both already in the tree via gpui; used to reach the NSWindow behind a gpui
+# window and give it the dark appearance.
+raw-window-handle = "0.6"
+objc = "0.2"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 # KSNI speaks StatusNotifierItem over D-Bus on a worker thread, so there is no
 # GTK main loop to reconcile with gpui's, and no appindicator/libxdo to install.

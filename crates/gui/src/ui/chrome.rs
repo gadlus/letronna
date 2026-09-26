@@ -1,21 +1,31 @@
 use crate::prelude::*;
 
 impl Chat {
-    pub(crate) fn title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        TitleBar::new().child(
+    pub(crate) fn title_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // On macOS the bar starts after the traffic lights: three 12px buttons
+        // 20px apart from x=12 end at 64, so leave the same 12px gap after them
+        // that the other platforms have at the edge. Fullscreen hides the lights
+        // and the bar adds that 12px by itself.
+        let inset = if window.is_fullscreen() { px(0.) } else { px(76.) };
+        TitleBar::new().when(cfg!(target_os = "macos"), |bar| bar.pl(inset)).child(
             h_flex()
                 .flex_1()
                 .items_center()
                 .gap_2()
+                // Nothing follows the chip on macOS, so keep it off the edge.
+                .when(cfg!(target_os = "macos"), |bar| bar.pr_3())
                 .child(
                     Button::new("toggle-sidebar")
                         .ghost()
-                        .xsmall()
-                        .icon(Icon::new(if self.sidebar_open {
-                            IconName::PanelLeftClose
-                        } else {
-                            IconName::PanelLeftOpen
-                        }))
+                        .small()
+                        .icon(
+                            Icon::new(if self.sidebar_open {
+                                IconName::PanelLeftClose
+                            } else {
+                                IconName::PanelLeftOpen
+                            })
+                            .size_4(),
+                        )
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.sidebar_open = !this.sidebar_open;
                             cx.notify();
@@ -39,7 +49,7 @@ impl Chat {
         let chat = cx.entity();
         Button::new("account")
             .ghost()
-            .xsmall()
+            .small()
             .compact()
             .child(
                 h_flex()

@@ -46,6 +46,7 @@ impl Runner {
             tools: true,
             workspace,
             plan: self.plan,
+            remote: None,
             effort: settings.effort.clone(),
             search: settings.search,
         }
@@ -214,9 +215,7 @@ impl Runner {
     }
 
     fn run_call(&mut self, turn: &mut Turn, call: letronna_core::chat::ToolCall) {
-        let ctx = tools::ToolContext {
-            workspace: turn.connection.workspace.clone(),
-        };
+        let ctx = tools::ToolContext::of(&turn.connection);
         let summary = tools::summary(&call.name, &call.arguments);
         let outcome = self.run_off_the_loop(&call, ctx, &summary);
         // Every turn of the conversation opens with a blank line, whoever is
@@ -329,9 +328,7 @@ impl Runner {
             return Ok(true);
         }
 
-        let ctx = tools::ToolContext {
-            workspace: turn.connection.workspace.clone(),
-        };
+        let ctx = tools::ToolContext::of(&turn.connection);
         let summary = tools::summary(&call.name, &call.arguments);
 
         // A change to a file is shown as a diff above the question, where

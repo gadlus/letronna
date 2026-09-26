@@ -65,7 +65,7 @@ pub fn now() -> u64 {
         .unwrap_or(0)
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Connection {
     pub endpoint: String,
     pub model: String,
@@ -81,6 +81,30 @@ pub struct Connection {
     pub effort: String,
     /// Let the gateway search the web for this turn.
     pub search: bool,
+    /// Set when a chat app is driving the session rather than this window.
+    pub remote: Option<Remote>,
+}
+
+/// Where a remote conversation is happening, and what that allows.
+#[derive(Clone, Default)]
+pub struct Remote {
+    /// As the model is told it: "a Discord DM", "#general in a Discord
+    /// server", "a Telegram chat".
+    pub place: String,
+    /// Other people can read the replies, so nothing on this computer may be
+    /// reached from here.
+    pub shared: bool,
+    /// Where `read_chat` reads. Discord only: the Telegram Bot API keeps no
+    /// history a bot can ask for.
+    pub history: Option<History>,
+}
+
+#[derive(Clone, Default)]
+pub struct History {
+    pub token: String,
+    pub channel: String,
+    /// The bot's own user ID, so its earlier messages read as its own.
+    pub bot_id: String,
 }
 
 pub enum Event {
@@ -189,18 +213,34 @@ fn body(connection: &Connection, messages: &[Message]) -> Value {
     let start = window_start(messages);
     let mut system =
         String::from("You are Letronna, a personal assistant. Be clear, concise, and honest.");
-    if connection.tools {
-        system.push_str(" You are Letronna, running in the user's terminal or desktop window; you are not any other assistant, and commands from other tools do not apply here. The user's earlier conversations are sessions: list_sessions shows them, and the user picks one up with the /resume command or `letronna --resume <id>`.");
+    let shared = connection.remote.as_ref().is_some_and(|r| r.shared);
+    if connection.tools && !shared {
+        // A chat app is not the terminal or the window, and /resume means
+        // nothing there; the remote text below says where the session is.
+        if connection.remote.is_none() {
+            system.push_str(" You are Letronna, running in the user's terminal or desktop window; you are not any other assistant, and commands from other tools do not apply here. The user's earlier conversations are sessions: list_sessions shows them, and the user picks one up with the /resume command or `letronna --resume <id>`.");
+        }
         system.push_str(" You have tools to read, search, write and edit files and to run commands in the user's project; use them instead of guessing. Writes and commands are shown to the user for approval; a denial is final for that action. Ask with ask_user when a decision is the user's to make, such as a project name. After changing code, verify it (build, test, or run) before reporting done.");
         match &connection.workspace {
             Some(w) => system.push_str(&format!(" The project folder is `{}`.", w.display())),
             None => system.push_str(" No project folder is attached: you can only read under the home folder. Ask the user to attach one before writing or running anything."),
         }
-    } else {
+    } else if !connection.tools {
         system.push_str(" You have no tools or filesystem access on this gateway.");
     }
-    if connection.plan {
+    if connection.plan && !shared {
         system.push_str(" Plan mode is on: you can read, search and ask, but you cannot write files or run commands, and those tools are unavailable. Work out what you would do and lay out the plan, then let the user turn plan mode off to carry it out.");
+    }
+    // Without this the model takes "the conversation" to mean something on
+    // disk, and goes looking for it there.
+    if let Some(remote) = &connection.remote {
+        system.push_str(&format!(" You are talking through {}, and your reply is posted there as a chat message, so keep it short and conversational.", remote.place));
+        if remote.history.is_some() && connection.tools {
+            system.push_str(" You only see the messages addressed to you. When the user refers to the conversation, asks what was said, or wants a summary, read it with read_chat before answering.");
+        }
+        if remote.shared {
+            system.push_str(" Other people in this chat can read your replies. Nothing on this computer is reachable from here: no files, folders or commands.");
+        }
     }
     let mut context = vec![json!({"role": "system", "content": system})];
     let window = &messages[start..];
@@ -229,7 +269,7 @@ fn body(connection: &Connection, messages: &[Message]) -> Value {
         "stream_options": {"include_usage": true}
     });
     if connection.tools {
-        let mut tools = crate::tools::specs(connection.plan);
+        let mut tools = crate::tools::specs(connection);
         if connection.search {
             // The gateway's own search, alongside our functions rather than
             // instead of them: the model picks whichever it needs, and the
@@ -276,8 +316,16 @@ fn wire_message(m: &Message) -> Value {
             .tool_calls
             .iter()
             .map(|c| {
+                // A call with no arguments streams none, but a gateway that
+                // turns this into Anthropic's tool_use rejects "" as input:
+                // it has to be an object.
+                let arguments = if c.arguments.trim().is_empty() {
+                    "{}"
+                } else {
+                    &c.arguments
+                };
                 json!({"id": c.id, "type": "function",
-                    "function": {"name": c.name, "arguments": c.arguments}})
+                    "function": {"name": c.name, "arguments": arguments}})
             })
             .collect();
     }
@@ -365,6 +413,21 @@ fn name_unnamed(calls: &mut [ToolCall]) {
     }
 }
 
+/// Call each tool by the name it was offered under.
+///
+/// Some gateways hand the name back in a case of their own -- `ListDir` for
+/// `list_dir` -- and a call that cannot be found by name fails. Only case and
+/// underscores are forgiven, so a tool the model made up still fails.
+fn name_as_offered(calls: &mut [ToolCall]) {
+    let loose = |name: &str| name.replace('_', "").to_lowercase();
+    let tools = crate::tools::all();
+    for call in calls {
+        if let Some(tool) = tools.iter().find(|t| loose(t.name()) == loose(&call.name)) {
+            call.name = tool.name().to_owned();
+        }
+    }
+}
+
 fn parse_event(data: &str) -> Result<Chunk, String> {
     let value: Value = serde_json::from_str(data)
         .map_err(|_| "Provider returned an invalid stream event.".to_owned())?;
@@ -427,7 +490,12 @@ pub fn data_dir() -> std::path::PathBuf {
     std::env::var_os("LOCALAPPDATA")
         .map(std::path::PathBuf::from)
         .or_else(|| {
-            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share"))
+            let under_home = if cfg!(target_os = "macos") {
+                "Library/Application Support"
+            } else {
+                ".local/share"
+            };
+            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(under_home))
         })
         .unwrap_or_else(std::env::temp_dir)
         .join("Letronna")
@@ -602,6 +670,7 @@ fn stream(
     }
     calls.retain(|c| !c.name.is_empty());
     name_unnamed(&mut calls);
+    name_as_offered(&mut calls);
     if !calls.is_empty() {
         received = true;
         sender
@@ -625,9 +694,26 @@ mod tests {
             tools: false,
             workspace: None,
             plan: false,
+            remote: None,
             effort: String::new(),
             search: false,
         }
+    }
+    #[test]
+    fn data_dir_is_the_platform_convention() {
+        // Both overrides win over HOME, so there is nothing to assert under them.
+        if std::env::var_os("AGENT_DATA_DIR").is_some()
+            || std::env::var_os("LOCALAPPDATA").is_some()
+        {
+            return;
+        }
+        let dir = data_dir();
+        let expected = if cfg!(target_os = "macos") {
+            "Library/Application Support/Letronna"
+        } else {
+            ".local/share/Letronna"
+        };
+        assert!(dir.ends_with(expected), "{dir:?}");
     }
     #[test]
     fn endpoint_validation() {
@@ -669,12 +755,11 @@ mod tests {
             tools: true,
             workspace: Some(std::env::current_dir().unwrap()),
             plan: false,
+            remote: None,
             effort: String::new(),
             search: false,
         };
-        let ctx = crate::tools::ToolContext {
-            workspace: connection.workspace.clone(),
-        };
+        let ctx = crate::tools::ToolContext::of(&connection);
         let mut messages = vec![Message {
             role: "user".into(),
             content: "What is the package name in Cargo.toml? Read the file, then answer with just the name.".into(),
@@ -817,6 +902,35 @@ mod tests {
     }
 
     #[test]
+    fn a_tool_the_gateway_renamed_is_called_by_its_own_name() {
+        let call = |name: &str| ToolCall {
+            name: name.into(),
+            ..Default::default()
+        };
+        let mut calls = vec![call("ListDir"), call("read_file"), call("ListEverything")];
+        super::name_as_offered(&mut calls);
+        assert_eq!(calls[0].name, "list_dir");
+        assert_eq!(calls[1].name, "read_file");
+        // Not one of ours under any case, so it still fails as unknown.
+        assert_eq!(calls[2].name, "ListEverything");
+    }
+
+    #[test]
+    fn a_call_with_no_arguments_goes_back_as_an_object() {
+        let reply = Message {
+            role: "assistant".into(),
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "list_dir".into(),
+                arguments: String::new(),
+            }],
+            ..Default::default()
+        };
+        let wired = wire_message(&reply);
+        assert_eq!(wired["tool_calls"][0]["function"]["arguments"], "{}");
+    }
+
+    #[test]
     fn assembles_streamed_tool_calls() {
         let mut calls = Vec::new();
         for data in [
@@ -857,6 +971,39 @@ mod tests {
                 "{blocked} in plan mode"
             );
         }
+    }
+    #[test]
+    fn a_remote_session_is_told_where_it_is() {
+        let system = |remote: Remote| -> String {
+            body(
+                &Connection {
+                    tools: true,
+                    remote: Some(remote),
+                    ..connection()
+                },
+                &[],
+            )["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let server = system(Remote {
+            place: "#general in a Discord server".into(),
+            shared: true,
+            history: Some(History::default()),
+        });
+        assert!(server.contains("talking through #general in a Discord server"));
+        assert!(server.contains("read_chat"));
+        assert!(server.contains("Nothing on this computer is reachable"));
+        // Nothing that invites a look around the disk.
+        assert!(!server.contains("home folder"), "{server}");
+
+        let telegram = system(Remote {
+            place: "a Telegram chat".into(),
+            ..Default::default()
+        });
+        assert!(telegram.contains("home folder"));
+        assert!(!telegram.contains("read_chat"));
     }
     #[test]
     fn window_holds_still_so_the_cache_prefix_survives() {

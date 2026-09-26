@@ -190,6 +190,7 @@ mod tests {
             tools: true,
             workspace: None,
             plan: false,
+            remote: None,
             effort: String::new(),
             search: false,
         })

@@ -21,16 +21,19 @@ pub(crate) fn available() -> bool {
     cfg!(any(windows, target_os = "linux"))
 }
 
+#[cfg(any(windows, target_os = "linux"))]
 fn main_window(cx: &App) -> Option<AnyWindowHandle> {
     cx.windows().into_iter().next()
 }
 
+#[cfg(any(windows, target_os = "linux"))]
 fn show_main_window(cx: &mut App) {
     if let Some(handle) = main_window(cx) {
         let _ = handle.update(cx, |_, window, _| super::window::show(window));
     }
 }
 
+#[cfg(any(windows, target_os = "linux"))]
 const RELEASES: &str = "https://github.com/wweziza/letronna/releases";
 
 #[cfg(windows)]

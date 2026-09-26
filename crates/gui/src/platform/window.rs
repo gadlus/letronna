@@ -3,6 +3,9 @@
 use crate::prelude::*;
 
 /// Put the window back in front of the user, from the tray or a second launch.
+/// Kept everywhere per this module's contract, though only the tray and the
+/// single-instance check ever call it.
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 pub(crate) fn show(window: &mut Window) {
     #[cfg(windows)]
     win::set_visible(window, true);
@@ -23,8 +26,52 @@ pub(crate) fn hide(window: &mut Window) {
     }
 }
 
+/// Match the native window chrome to the app's dark theme. On macOS the traffic
+/// lights follow the window's appearance, not the content under them: a light
+/// window draws them inactive as dark discs, which vanish on the dark title bar
+/// whenever another app has focus. Other platforms draw their own controls.
+pub(crate) fn use_dark_chrome(window: &Window) {
+    #[cfg(target_os = "macos")]
+    mac::use_dark_appearance(window);
+    #[cfg(not(target_os = "macos"))]
+    let _ = window;
+}
+
 #[cfg(windows)]
 pub(crate) use win::{hwnd, make_topmost};
+
+// objc 0.2's msg_send! checks a `cargo-clippy` feature this crate never declares.
+#[cfg(target_os = "macos")]
+#[allow(unexpected_cfgs)]
+mod mac {
+    use crate::prelude::*;
+    use objc::{class, msg_send, runtime::Object, sel, sel_impl};
+
+    pub(crate) fn use_dark_appearance(window: &Window) {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        let Ok(handle) = HasWindowHandle::window_handle(window) else {
+            return;
+        };
+        let RawWindowHandle::AppKit(h) = handle.as_raw() else {
+            return;
+        };
+        let view = h.ns_view.as_ptr() as *mut Object;
+        unsafe {
+            let ns_window: *mut Object = msg_send![view, window];
+            if ns_window.is_null() {
+                return;
+            }
+            let name: *mut Object = msg_send![
+                class!(NSString),
+                stringWithUTF8String: c"NSAppearanceNameDarkAqua".as_ptr()
+            ];
+            let appearance: *mut Object = msg_send![class!(NSAppearance), appearanceNamed: name];
+            if !appearance.is_null() {
+                let _: () = msg_send![ns_window, setAppearance: appearance];
+            }
+        }
+    }
+}
 
 #[cfg(windows)]
 mod win {

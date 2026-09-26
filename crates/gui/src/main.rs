@@ -29,7 +29,8 @@ fn main() {
             ],
         );
         cx.bind_keys([
-            KeyBinding::new("ctrl-n", NewSession, None),
+            // "secondary" is cmd on macOS and ctrl everywhere else.
+            KeyBinding::new("secondary-n", NewSession, None),
             KeyBinding::new(
                 "shift-enter",
                 gpui_component::input::Enter { secondary: true },
@@ -60,6 +61,9 @@ fn main() {
                     window_min_size: Some(size(px(720.), px(520.))),
                     titlebar: Some(TitlebarOptions {
                         title: Some(BRAND.into()),
+                        // Centre the 12px traffic lights in the 34px bar, at
+                        // the inset a stock macOS window gives them.
+                        traffic_light_position: Some(point(px(12.), px(11.))),
                         ..TitleBar::title_bar_options()
                     }),
                     ..Default::default()
@@ -70,6 +74,7 @@ fn main() {
                 },
             )
             .expect("Could not open native application window");
+        let _ = window.update(cx, |_, window, _| platform::window::use_dark_chrome(window));
         // With a tray to bring it back, closing the window tucks the app
         // away; without one that would strand it, so let it close.
         if platform::tray::available() {

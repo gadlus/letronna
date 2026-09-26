@@ -55,7 +55,7 @@ pub(crate) fn collect(store: &Store) -> Vec<Artifact> {
             }
         }
     }
-    found.sort_by(|a, b| b.written.cmp(&a.written));
+    found.sort_by_key(|a| std::cmp::Reverse(a.written));
     found
 }
 
@@ -92,6 +92,7 @@ impl Chat {
                     .bg(cx.theme().secondary.opacity(0.3))
                     .child(
                         v_flex()
+                            .flex_1()
                             .min_w_0()
                             .gap_0p5()
                             .child(
