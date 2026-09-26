@@ -859,6 +859,12 @@ fn search(root: &Path, query: &str, time: Duration, files: usize) -> String {
         let Some(text) = searchable(path) else {
             return true;
         };
+        // Most files hold no match at all, and lowercasing the whole file once
+        // says so; lowercasing it line by line made a new string for every
+        // line of every file searched.
+        if !text.to_lowercase().contains(query) {
+            return true;
+        }
         for (n, line) in text.lines().enumerate() {
             if line.to_lowercase().contains(query) {
                 let rel = path.strip_prefix(root).unwrap_or(path).display();
@@ -1059,6 +1065,24 @@ World"
             assert!(out.starts_with("No matches."), "{out}");
             assert!(out.contains("Stopped early after 0 files"), "{out}");
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn search_passes_over_files_without_a_match_and_numbers_the_rest() {
+        let dir = std::env::temp_dir().join(format!("letronna-lines-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("none.txt"), "nothing\nto see\nhere").unwrap();
+        std::fs::write(
+            dir.join("some.txt"),
+            "one\ntwo\nThe Needle\nfour\nneedle again",
+        )
+        .unwrap();
+        assert_eq!(
+            search(&dir, "needle", SEARCH_TIME, SEARCH_FILES),
+            "some.txt:3: The Needle\nsome.txt:5: needle again"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
