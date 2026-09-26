@@ -821,30 +821,29 @@ fn gateway_page(
     chat: &Entity<Chat>,
     cx: &App,
 ) -> Div {
-    let current = pick.read(cx).clone();
-    let g = gateway(&current);
-    let mut cards = v_flex().gap_3();
-    for row in GATEWAYS.chunks(3) {
-        // A plain row, not h_flex: that centres its children, and these
-        // cards should stretch to the tallest one in the row.
-        let mut line = div().flex().flex_row().gap_3();
-        for gw in row {
+    let open = pick.read(cx).clone();
+    let mut list = v_flex()
+        .border_1()
+        .border_color(cx.theme().border)
+        .rounded(cx.theme().radius);
+    for (i, row) in rows.into_iter().enumerate() {
+        let name = row.name;
+        let editing = open == name;
+        let dot = if row.good { cx.theme().green } else { cx.theme().muted_foreground.opacity(0.5) };
+        let button = row.action.map(|action| {
             let chat = chat.clone();
-            let active = gw.name == current;
-            line = line.child(
-                v_flex()
-                    .id(gw.name)
-                    .flex_1()
-                    .w_0()
-                    // A floor, not a fixed height: narrow cards wrap their
-                    // blurb onto more lines and the row stretches to match.
-                    .min_h(px(120.))
-                    .p_3()
-                    .gap_1p5()
-                    .rounded(cx.theme().radius)
-                    .border_1()
-                    .border_color(if active {
-                        cx.theme().primary
+            let page = page.clone();
+            Button::new(("gw-action", i))
+                .small()
+                .when(!row.set_up, |b| b.primary())
+                .when(row.set_up, |b| b.ghost())
+                .label(if editing { "Close" } else { action })
+                .on_click(move |_, window, cx| {
+                    if action == "Sign in" {
+                        page.update(cx, |p, cx| {
+                            *p = "Account";
+                            cx.notify();
+                        });
                     } else {
                         chat.update(cx, |this, cx| this.select_gateway(name, window, cx));
                     }
