@@ -145,6 +145,32 @@ fn candidates() -> Vec<PathBuf> {
     paths
 }
 
+/// Keep a browser from holding on to this process's output. Windows gives a
+/// new process every handle marked to be inherited, and a pipe from the
+/// shell is: after `letronna -p ... | more`, a browser left open would hold
+/// the pipe open, and whatever reads it would wait for the browser to be
+/// closed. Children that need this process's output are handed it
+/// explicitly, so none of them loses anything.
+#[cfg(windows)]
+fn keep_output_to_self() {
+    use std::os::windows::io::AsRawHandle;
+    unsafe extern "system" {
+        fn SetHandleInformation(handle: *mut std::ffi::c_void, mask: u32, flags: u32) -> i32;
+    }
+    const HANDLE_FLAG_INHERIT: u32 = 1;
+    let handles = [
+        std::io::stdin().as_raw_handle(),
+        std::io::stdout().as_raw_handle(),
+        std::io::stderr().as_raw_handle(),
+    ];
+    for handle in handles {
+        // SAFETY: these are this process's own standard handles, and only
+        // whether a child inherits them changes. A window has none, and
+        // the call then fails, which is fine.
+        unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+    }
+}
+
 /// The debugging port written in a profile's port file.
 fn port_in(text: &str) -> Option<u16> {
     text.lines()
@@ -235,6 +261,8 @@ impl Browser {
         // Left over from a browser that has since gone; the new one writes
         // its own, and until it has, this one would point nowhere.
         let _ = std::fs::remove_file(profile.join(PORT_FILE));
+        #[cfg(windows)]
+        keep_output_to_self();
         let mut command = Command::new(&exe);
         command
             .arg("--remote-debugging-port=0")
