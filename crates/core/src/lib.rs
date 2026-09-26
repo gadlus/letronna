@@ -12,6 +12,7 @@ pub mod chat;
 pub mod compact;
 pub mod gateway;
 pub mod jobs;
+pub mod mcp;
 pub mod memory;
 pub mod messaging;
 pub mod schedule;
