@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     io::{BufRead, BufReader},
+    sync::OnceLock,
     time::Duration,
 };
 
@@ -501,14 +502,31 @@ pub fn data_dir() -> std::path::PathBuf {
         .join("Letronna")
 }
 
+/// The one HTTP client every model call goes through.
+///
+/// A client per call meant a new runtime thread and a fresh TCP and TLS
+/// handshake for each round of a turn -- up to `MAX_ROUNDS` of them, all to
+/// the same gateway. This one keeps the connection open between rounds.
+/// Timeouts are set per request, since a model list and a reply differ.
+fn client() -> Result<&'static reqwest::blocking::Client, String> {
+    static CLIENT: OnceLock<Result<reqwest::blocking::Client, String>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|_| "Could not initialize the HTTP client.".to_owned())
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
 pub fn list_models(base: &str, key: &str) -> Result<Vec<String>, String> {
     let base = base.trim().trim_end_matches('/');
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|_| "Cannot initialize connection.".to_owned())?;
-    let mut request = client.get(format!("{base}/models"));
+    let mut request = client()?
+        .get(format!("{base}/models"))
+        .timeout(Duration::from_secs(20));
     if !key.trim().is_empty() {
         request = request.bearer_auth(key.trim());
     }
@@ -549,13 +567,10 @@ fn stream(
     sender: &async_channel::Sender<Event>,
 ) -> Result<(), String> {
     let endpoint = validate(connection)?;
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
+    let mut request = client()?
+        .post(endpoint)
         .timeout(Duration::from_secs(120))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|_| "Could not initialize the HTTP client.".to_owned())?;
-    let mut request = client.post(endpoint).json(&body(connection, messages));
+        .json(&body(connection, messages));
     if !connection.key.trim().is_empty() {
         request = request.bearer_auth(connection.key.trim());
     }
@@ -913,6 +928,13 @@ mod tests {
         assert_eq!(calls[1].name, "read_file");
         // Not one of ours under any case, so it still fails as unknown.
         assert_eq!(calls[2].name, "ListEverything");
+    }
+
+    #[test]
+    fn every_call_shares_one_client() {
+        let first = super::client().unwrap();
+        let again = super::client().unwrap();
+        assert!(std::ptr::eq(first, again));
     }
 
     #[test]
