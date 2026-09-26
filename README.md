@@ -83,6 +83,19 @@ The Letronna gateway's address follows `LETRONNA_API`, for working against a loc
 
 Model lists come from `GET {base}/models`. Streaming uses SSE chat completions.
 
+## Images, speech and video
+
+Signed in, the agent can also make things on Letronna's hosted models, whichever gateway the chat itself uses:
+
+| Tool         | Makes                                                     | Paid by       |
+|--------------|-----------------------------------------------------------|---------------|
+| `make_image` | an image from a description                               | the image     |
+| `speak`      | text read aloud                                           | the character |
+| `transcribe` | the words in an audio or video file, up to 25 MB          | the minute    |
+| `make_video` | a short MP4 from a description, in a few minutes          | the second    |
+
+Each one asks first, since it spends your credit, and none is offered in plan mode or in a shared chat. Unless a model is named, the cheapest one working is used; the prices are on the dashboard's models page. What is made is saved in `media/` in the project folder, or in the data folder when no project is attached. The window shows a made image in the chat, and opens any made file.
+
 ## Local data
 
 `%LOCALAPPDATA%\Letronna\` on Windows, `~/Library/Application Support/Letronna/` on macOS, `~/.local/share/Letronna/` on Linux. `AGENT_DATA_DIR` overrides all three.
@@ -90,6 +103,7 @@ Model lists come from `GET {base}/models`. Streaming uses SSE chat completions.
 - `chats.json` sessions and the selected gateway, endpoint and model
 - `keys.json` API keys per gateway, plain text on your disk only
 - `account.json` the Letronna sign-in for this computer
+- `media/` images, speech and video made with no project attached
 
 Chat text is sent to the gateway you selected and nowhere else.
 

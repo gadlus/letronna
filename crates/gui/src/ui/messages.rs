@@ -155,12 +155,22 @@ impl Chat {
         let lines = message.content.lines().count();
         let content = message.content.clone();
         let one_line = letronna_core::tools::one_line;
+        // A file a media tool made, while it is still where it was saved.
+        let made = (!message.is_error)
+            .then(|| letronna_core::media::saved(&message.content))
+            .flatten()
+            .filter(|path| path.exists());
         let (status, color) = if message.is_error {
             (one_line(&message.content), cx.theme().danger)
         } else if message.name == letronna_core::tools::ASK_USER {
             (
                 format!("→ {}", one_line(&message.content)),
                 cx.theme().foreground,
+            )
+        } else if let Some(name) = made.as_ref().and_then(|path| path.file_name()) {
+            (
+                name.to_string_lossy().into_owned(),
+                cx.theme().muted_foreground,
             )
         } else {
             (format!("{lines} lines"), cx.theme().muted_foreground)
@@ -216,6 +226,7 @@ impl Chat {
                         cx.notify();
                     })),
             )
+            .when_some(made, |this, path| this.child(made_file(index, path, cx)))
             .when(open, |this| {
                 this.child(
                     div()
@@ -361,6 +372,57 @@ fn usage_line(message: &Message) -> String {
         }
     }
     parts.join(" · ")
+}
+
+/// What a media tool made: the picture itself when it is one, and buttons to
+/// open the file or find it.
+fn made_file(index: usize, path: PathBuf, cx: &App) -> impl IntoElement {
+    let picture = path.extension().is_some_and(|extension| {
+        ["png", "jpg", "jpeg", "webp"]
+            .iter()
+            .any(|known| extension.eq_ignore_ascii_case(known))
+    });
+    let (open, reveal) = (path.clone(), path.clone());
+    v_flex()
+        .ml_2()
+        .pl_3()
+        .gap_1()
+        .items_start()
+        .when(picture, |this| {
+            let open = path.clone();
+            this.child(
+                div()
+                    .id(("made-picture", index))
+                    .cursor_pointer()
+                    .child(
+                        img(path)
+                            .h(px(220.))
+                            .max_w(px(360.))
+                            .object_fit(ObjectFit::Contain)
+                            .rounded(cx.theme().radius),
+                    )
+                    .on_click(move |_, _, cx| cx.open_with_system(&open)),
+            )
+        })
+        .child(
+            h_flex()
+                .gap_1()
+                .child(
+                    Button::new(("open-made", index))
+                        .ghost()
+                        .xsmall()
+                        .label("Open")
+                        .on_click(move |_, _, cx| cx.open_with_system(&open)),
+                )
+                .child(
+                    Button::new(("reveal-made", index))
+                        .ghost()
+                        .xsmall()
+                        .icon(Icon::new(AppIcon::Folder))
+                        .tooltip("Show in folder")
+                        .on_click(move |_, _, cx| cx.reveal_path(&reveal)),
+                ),
+        )
 }
 
 #[cfg(test)]
