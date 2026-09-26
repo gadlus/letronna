@@ -43,7 +43,7 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "/model",
-        blurb: "show or change the model, from every gateway",
+        blurb: "show or change the model; add image, speech or video for those",
     },
     Command {
         name: "/gateways",
