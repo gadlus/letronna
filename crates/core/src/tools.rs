@@ -800,7 +800,20 @@ fn resolve(raw: &str, ctx: &ToolContext) -> Result<PathBuf, String> {
     if !allowed {
         return Err(format!("`{raw}` is outside the workspace and home folder."));
     }
+    if private(&path, &crate::chat::data_dir()) {
+        return Err(format!(
+            "`{raw}` is in Letronna's own folder, with the keys and sign-in; it stays out of reach."
+        ));
+    }
     Ok(path)
+}
+
+/// Whether `path` lies in Letronna's own folder, `data`, which holds the API
+/// keys, the sign-in token and the bot tokens. It sits under the home folder,
+/// and reading there needs no approval, so a chat or a file that talked the
+/// model into it would have had them read out.
+fn private(path: &Path, data: &Path) -> bool {
+    std::fs::canonicalize(data).is_ok_and(|data| path.starts_with(data))
 }
 
 fn path_arg(args: &Value) -> &str {
@@ -976,7 +989,10 @@ fn walk(dir: &Path, f: &mut dyn FnMut(&Path, bool) -> bool) -> bool {
         if kind.is_dir() {
             let name = entry.file_name();
             let hidden = name.to_string_lossy().starts_with('.');
-            if hidden || SKIP_DIRS.iter().any(|s| name == *s) {
+            if hidden
+                || SKIP_DIRS.iter().any(|s| name == *s)
+                || private(&path, &crate::chat::data_dir())
+            {
                 continue;
             }
             if !f(&path, true) || !walk(&path, f) {
@@ -1138,6 +1154,21 @@ World"
             search(&dir, "needle", SEARCH_TIME, SEARCH_FILES),
             "some.txt:3: The Needle\nsome.txt:5: needle again"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn letronnas_own_folder_is_out_of_reach() {
+        let dir = std::env::temp_dir().join(format!("letronna-private-{}", std::process::id()));
+        let data = dir.join("Letronna");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("keys.json"), "{}").unwrap();
+        let keys = std::fs::canonicalize(data.join("keys.json")).unwrap();
+        let beside = std::fs::canonicalize(&dir).unwrap();
+        assert!(private(&keys, &data));
+        assert!(!private(&beside, &data));
+        // No such folder makes nothing private, rather than everything.
+        assert!(!private(&keys, &dir.join("missing")));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
