@@ -119,6 +119,7 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(Todo),
         Arc::new(crate::messaging::ReadChat),
         Arc::new(Sessions),
+        Arc::new(crate::web::WebFetch),
     ];
     if let Ok(extra) = plugin_tools().lock() {
         for tool in extra.iter() {
@@ -228,6 +229,7 @@ pub fn summary(name: &str, args: &str) -> String {
             .map(|q| format!("\"{q}\""))
             .unwrap_or_default(),
         "run_command" => v["command"].as_str().unwrap_or_default().to_owned(),
+        "web_fetch" => v["url"].as_str().unwrap_or_default().to_owned(),
         "read_job" | "stop_job" => format!("#{}", v["id"].as_u64().unwrap_or(0)),
         "wait" => match (v["job"].as_u64(), v["until"].as_str()) {
             (Some(id), Some(until)) => format!("job #{id} until \"{until}\""),
