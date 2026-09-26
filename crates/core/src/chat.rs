@@ -212,8 +212,10 @@ fn window_start(messages: &[Message]) -> usize {
 
 fn body(connection: &Connection, messages: &[Message], summary: Option<&str>) -> Value {
     let start = window_start(messages);
-    let mut system =
-        String::from("You are Letronna, a personal assistant. Be clear, concise, and honest.");
+    // The user's SOUL.md, when there is one, says who Letronna is instead.
+    let mut system = crate::memory::soul().unwrap_or_else(|| {
+        String::from("You are Letronna, a personal assistant. Be clear, concise, and honest.")
+    });
     let shared = connection.remote.as_ref().is_some_and(|r| r.shared);
     if connection.tools && !shared {
         // A chat app is not the terminal or the window, and /resume means
@@ -243,6 +245,9 @@ fn body(connection: &Connection, messages: &[Message], summary: Option<&str>) ->
             system.push_str(" Other people in this chat can read your replies. Nothing on this computer is reachable from here: no files, folders or commands.");
         }
     }
+    // Memory first: it changes rarely, so the prompt's start stays cacheable;
+    // the summary of dropped turns changes as the conversation grows.
+    system.push_str(&crate::memory::context(connection));
     if let Some(summary) = summary {
         system.push_str(&format!(
             "\n\nEarlier in this conversation, summarized because it no longer fits:\n{summary}"
