@@ -496,9 +496,10 @@ fn with_session(act: impl Fn(&mut Session) -> Result<String, String>) -> Result<
     for _ in 0..2 {
         match slot.as_ref() {
             None => *slot = Some(Session::start()?),
+            // Started again on the same profile, in the mode asked for: the
+            // mode it was in may have been a leftover browser's.
             Some(session) if session.tab.broken => {
-                let (profile, headless) = (session.profile.clone(), session.browser.headless);
-                *slot = Some(Session::on(profile, headless)?);
+                *slot = Some(Session::on(session.profile.clone(), headless())?);
             }
             Some(_) => {}
         }
@@ -511,6 +512,12 @@ fn with_session(act: impl Fn(&mut Session) -> Result<String, String>) -> Result<
         }
     }
     outcome
+}
+
+/// Whether the browser is to run with no window: `LETRONNA_BROWSER_HEADLESS`
+/// is 1.
+fn headless() -> bool {
+    std::env::var_os("LETRONNA_BROWSER_HEADLESS").is_some_and(|v| v == "1")
 }
 
 /// The page shown on approval cards, if the browser is free to say.
@@ -539,11 +546,9 @@ pub fn close_hidden() {
 }
 
 impl Session {
-    /// The browser Letronna uses, with its window unless
-    /// `LETRONNA_BROWSER_HEADLESS` is 1.
+    /// The browser Letronna uses, on its profile in the data folder.
     fn start() -> Result<Session, String> {
-        let headless = std::env::var_os("LETRONNA_BROWSER_HEADLESS").is_some_and(|v| v == "1");
-        Session::on(crate::chat::data_dir().join("browser"), headless)
+        Session::on(crate::chat::data_dir().join("browser"), headless())
     }
 
     fn on(profile: PathBuf, headless: bool) -> Result<Session, String> {
