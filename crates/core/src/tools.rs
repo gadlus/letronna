@@ -119,6 +119,7 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(Todo),
         Arc::new(crate::messaging::ReadChat),
         Arc::new(Sessions),
+        Arc::new(crate::memory::Remember),
     ];
     if let Ok(extra) = plugin_tools().lock() {
         for tool in extra.iter() {
@@ -239,6 +240,11 @@ pub fn summary(name: &str, args: &str) -> String {
             let items = v["items"].as_array().map(Vec::len).unwrap_or(0);
             format!("{items} items")
         }
+        "memory" => format!(
+            "{} {}",
+            v["action"].as_str().unwrap_or_default(),
+            v["target"].as_str().unwrap_or_default()
+        ),
         _ => v["path"].as_str().unwrap_or(".").to_owned(),
     };
     one_line(&text)

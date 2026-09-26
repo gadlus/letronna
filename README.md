@@ -90,6 +90,10 @@ Model lists come from `GET {base}/models`. Streaming uses SSE chat completions.
 - `chats.json` sessions and the selected gateway, endpoint and model
 - `keys.json` API keys per gateway, plain text on your disk only
 - `account.json` the Letronna sign-in for this computer
+- `SOUL.md` who Letronna is, in your words; replaces the built-in first line of the prompt (optional, yours to write)
+- `USER.md` what Letronna knows about you, and `MEMORY.md` its own notes; it keeps both with its `memory` tool, and you can edit them. Both go into every conversation except chats other people can read, so they stay small (1,375 and 2,200 characters)
+
+With a project folder attached, its `AGENTS.md` (or `CLAUDE.md`) is read as the project's instructions.
 
 Chat text is sent to the gateway you selected and nowhere else.
 

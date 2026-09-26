@@ -11,6 +11,7 @@ pub mod auth;
 pub mod chat;
 pub mod gateway;
 pub mod jobs;
+pub mod memory;
 pub mod messaging;
 pub mod schedule;
 pub mod skills;
