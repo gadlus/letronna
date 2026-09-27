@@ -36,6 +36,17 @@ pub(crate) fn single_instance() -> bool {
     if cfg!(debug_assertions) {
         return true;
     }
+    // Started again by an update, the copy it replaces is still on its way
+    // out: wait for it rather than hand over to it.
+    #[cfg(any(windows, target_os = "linux"))]
+    if std::env::args().any(|a| a == "--relaunch") {
+        for _ in 0..50 {
+            if imp::alone() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
     #[cfg(any(windows, target_os = "linux"))]
     return imp::single_instance();
     #[cfg(not(any(windows, target_os = "linux")))]
@@ -155,6 +166,26 @@ mod windows_impl {
             let len = (size as usize / 2).saturating_sub(1);
             String::from_utf16_lossy(&buf[..len])
         })
+    }
+
+    /// Whether no other Letronna holds the name. Unlike `single_instance`, a
+    /// miss lets go of the name again, so asking again can succeed once the
+    /// other copy has exited.
+    pub(super) fn alone() -> bool {
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError},
+            System::Threading::CreateMutexW,
+        };
+        let name = wide(r"Local\LetronnaSingleInstance");
+        unsafe {
+            let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+            if handle.is_null() || GetLastError() != ERROR_ALREADY_EXISTS {
+                // Kept open: it holds the name for as long as this runs.
+                return true;
+            }
+            CloseHandle(handle);
+        }
+        false
     }
 
     /// Returns false if another Letronna is already running, after bringing its window forward.
@@ -337,6 +368,11 @@ mod linux_impl {
     fn ours(pid: u32) -> bool {
         std::fs::read_to_string(format!("/proc/{pid}/comm"))
             .is_ok_and(|name| name.trim().eq_ignore_ascii_case("letronna"))
+    }
+
+    /// The lock file only names a process, so asking again is harmless.
+    pub(super) fn alone() -> bool {
+        single_instance()
     }
 
     pub(super) fn single_instance() -> bool {

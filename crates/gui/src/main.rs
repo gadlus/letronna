@@ -23,6 +23,14 @@ fn main() {
     if platform::install::ensure_installed() || !platform::install::single_instance() {
         return;
     }
+    // An update downloaded last time goes in now, before anything is running,
+    // and so does the old version when a new one keeps failing to start.
+    if let Some(program) = letronna_core::update::on_start() {
+        let _ = std::process::Command::new(program)
+            .arg("--relaunch")
+            .spawn();
+        return;
+    }
     Application::new().with_assets(Assets).run(|cx| {
         gpui_component::init(cx);
         theme::apply(cx);

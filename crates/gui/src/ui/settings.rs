@@ -268,7 +268,7 @@ impl Chat {
             "Account" => super::account::account_page(&chat, self, cx).into_any_element(),
             "Thinking" => thinking_page(&chat, &self.store.settings, cx).into_any_element(),
             "Plugins" => plugins_page(&chat, cx).into_any_element(),
-            "About" => about_page(cx).into_any_element(),
+            "About" => about_page(&chat, self, cx).into_any_element(),
             _ => gateway_page(self.gateway_rows(), &pick, &endpoint, &key, &page, &chat, cx).into_any_element(),
         };
         div()
@@ -571,7 +571,7 @@ fn privacy_page(chat: &Entity<Chat>, presence: &Entity<String>, skip: bool, cx: 
         })
 }
 
-fn about_page(cx: &App) -> Div {
+fn about_page(chat: &Entity<Chat>, this: &Chat, cx: &App) -> Div {
     let muted = cx.theme().muted_foreground;
     let line =
         |text: &'static str, size: f32| div().text_size(px(size)).text_color(muted).child(text);
@@ -603,6 +603,7 @@ fn about_page(cx: &App) -> Div {
             ),
             13.,
         ))
+        .child(updates(chat, this, cx))
         .child(
             div()
                 .text_sm()
@@ -624,6 +625,69 @@ fn about_page(cx: &App) -> Div {
                     12.,
                 )),
         )
+}
+
+/// Where updating stands, the button to look now, and whether to look alone.
+fn updates(chat: &Entity<Chat>, this: &Chat, cx: &App) -> Div {
+    use crate::ui::update::Updating;
+    let looking = matches!(this.updating, Updating::Checking | Updating::Downloading(_));
+    let (check, next) = (chat.clone(), chat.clone());
+    let manual = this.store.settings.manual_updates;
+    v_flex()
+        .w(px(420.))
+        .pt_3()
+        .gap_3()
+        .items_center()
+        .child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(this.update_status()),
+        )
+        .child(
+            h_flex()
+                .gap_2()
+                .child(
+                    Button::new("check-updates")
+                        .small()
+                        .label("Check for updates")
+                        .disabled(looking)
+                        .on_click(move |_, _, cx| {
+                            check.update(cx, |this, cx| this.check_for_updates(true, cx))
+                        }),
+                )
+                .when(
+                    matches!(this.updating, Updating::Ready(_) | Updating::Out(_)),
+                    |row| {
+                        let out = matches!(this.updating, Updating::Out(_));
+                        row.child(
+                            Button::new("apply-update")
+                                .primary()
+                                .small()
+                                .label(if out { "Download" } else { "Restart now" })
+                                .disabled(this.busy)
+                                .on_click(move |_, _, cx| {
+                                    next.update(cx, |this, cx| {
+                                        if out {
+                                            this.download_update(cx)
+                                        } else {
+                                            this.restart_to_update(cx)
+                                        }
+                                    })
+                                }),
+                        )
+                    },
+                ),
+        )
+        .child(div().w_full().text_left().child(toggle_row(
+            "auto-update",
+            "Update automatically",
+            "Download new versions in the background; they install when Letronna restarts.",
+            !manual,
+            chat,
+            cx,
+            std::rc::Rc::new(move |this: &mut Chat| this.store.settings.manual_updates = !manual),
+        )))
 }
 
 fn text_page(title: &'static str, blurb: &'static str, cx: &App) -> Div {

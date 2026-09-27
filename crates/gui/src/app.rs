@@ -161,6 +161,10 @@ pub(crate) struct Chat {
     /// The browser the agent uses, shown beside the chat while it does.
     pub(crate) browser: Entity<crate::ui::browser::BrowserView>,
     pub(crate) error: Option<String>,
+    /// Where updating stands, for the About page and the status bar.
+    pub(crate) updating: crate::ui::update::Updating,
+    /// A new version to announce, the next time the window draws.
+    pub(crate) update_note: Option<String>,
     pub(crate) scroll: ScrollHandle,
     pub(crate) _subscriptions: Vec<Subscription>,
 }
@@ -349,11 +353,14 @@ impl Chat {
             video_frame: None,
             browser: cx.new(|cx| crate::ui::browser::BrowserView::new(window, cx)),
             error,
+            updating: Default::default(),
+            update_note: None,
             scroll: ScrollHandle::new(),
             _subscriptions: subscriptions,
         };
         this.load_models(window, cx);
         Self::watch_schedules(cx);
+        Self::watch_updates(cx);
         this.restart_messaging(cx);
         if this.store.settings.presence == "off" {
             plugins::set_enabled(cx, plugins::DISCORD, false);
@@ -1152,6 +1159,9 @@ impl Render for Chat {
                 }
             })
             .detach();
+        }
+        if let Some(note) = self.update_note.take() {
+            window.push_notification(gpui_component::notification::Notification::info(note), cx);
         }
         if let Some(error) = self.error.take() {
             let text = error.clone();
