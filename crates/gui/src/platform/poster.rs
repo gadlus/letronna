@@ -128,7 +128,7 @@ unsafe fn pixels(bitmap: windows::Win32::Graphics::Gdi::HBITMAP) -> Option<Rende
         return None;
     }
     // GDI leaves the alpha byte at zero, which gpui would draw as nothing.
-    for pixel in data.chunks_exact_mut(4) {
+    for pixel in data.as_chunks_mut::<4>().0 {
         pixel[3] = 255;
     }
     let image = image::RgbaImage::from_raw(width as u32, height as u32, data)?;

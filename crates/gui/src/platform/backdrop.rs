@@ -114,7 +114,7 @@ mod windows_impl {
                 return None;
             }
             // BitBlt leaves alpha at zero; the backdrop must be opaque.
-            for chunk in pixels.chunks_exact_mut(4) {
+            for chunk in pixels.as_chunks_mut::<4>().0 {
                 chunk[3] = 255;
             }
             Some((w as u32, h as u32, pixels))
@@ -124,7 +124,7 @@ mod windows_impl {
     /// A blurred near-black UI is just black. Lift it so the backdrop reads as
     /// frosted glass rather than a void, leaving alpha alone.
     fn lift(pixels: &mut [u8]) {
-        for chunk in pixels.chunks_exact_mut(4) {
+        for chunk in pixels.as_chunks_mut::<4>().0 {
             for c in chunk.iter_mut().take(3) {
                 *c = ((*c as f32 * 1.18) + 6.).min(255.) as u8;
             }

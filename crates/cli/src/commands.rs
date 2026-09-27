@@ -204,7 +204,7 @@ fn whoami(runner: &mut Runner) {
             render::dim("team   "),
             team.name,
             render::dim("pool   "),
-            format!("${}.{:02}", team.credits / 100, team.credits.rem_euclid(100))
+            format_args!("${}.{:02}", team.credits / 100, team.credits.rem_euclid(100))
         )),
         None => render::line(&render::dim("team    none · hosted models use your own credit · /team to pick one")),
     }
