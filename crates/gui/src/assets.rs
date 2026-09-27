@@ -22,6 +22,9 @@ impl AssetSource for Assets {
                 "arrow-up",
                 "arrow-down",
                 "copy",
+                "redo",
+                "undo",
+                "git-branch",
                 "panel-left-close",
                 "panel-left-open",
                 "chevron-down",
@@ -100,6 +103,7 @@ pub(crate) enum AppIcon {
     User,
     Play,
     Stop,
+    Branch,
 }
 impl IconNamed for AppIcon {
     fn path(self) -> SharedString {
@@ -129,6 +133,7 @@ impl IconNamed for AppIcon {
             AppIcon::Circle => "icons/circle.svg",
             AppIcon::Play => "icons/play.svg",
             AppIcon::Stop => "icons/stop.svg",
+            AppIcon::Branch => "icons/git-branch.svg",
         }
         .into()
     }

@@ -15,19 +15,41 @@ impl Chat {
         (self.store.conversations[self.store.active].id, index)
     }
 
+    /// One message. `bar` is its turn's action buttons, when this message
+    /// is the one that ends the turn.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn message_row(
         &self,
         index: usize,
         message: &Message,
         labeled: bool,
         streaming: bool,
+        bar: Option<AnyElement>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if message.role == "tool" {
-            return self.tool_row(index, message, window, cx).into_any_element();
+            // A turn stopped part way ends on a tool; its buttons go under it.
+            return v_flex()
+                .w_full()
+                .gap_1()
+                .child(self.tool_row(index, message, window, cx))
+                .children(bar)
+                .into_any_element();
         }
         let is_user = message.role == "user";
+        let session = self.store.conversations[self.store.active].id;
+        let editing = is_user && self.editing_message == Some((session, index));
+        // Where the turn's buttons go: over your card's corner, in a reply's
+        // copy-and-usage line, or under a reply that has neither. Over and
+        // in, they take no room of their own while hidden.
+        let usage_row =
+            !is_user && !message.content.is_empty() && (!streaming || message.tokens > 0);
+        let (on_card, in_usage, under) = match (is_user, usage_row) {
+            (true, _) => (bar.filter(|_| !editing), None, None),
+            (false, true) => (None, bar, None),
+            (false, false) => (None, None, bar),
+        };
         // A reply that only asked for tools: its tool rows say what happened.
         let tool_only = !is_user && message.content.is_empty() && !message.tool_calls.is_empty();
         let label: String = if message.model.is_empty() {
@@ -38,9 +60,41 @@ impl Chat {
         let leading = px(26.);
         let cx_muted = cx.theme().muted_foreground;
         let md = self.row_id("md", index);
-        let body: AnyElement = if is_user {
+        // Not while a dialog is up: the text view starts a selection on any
+        // press inside it, even one on a dialog drawn over it, and that press
+        // never ends -- confirming a rewind left the reply half selected.
+        let selectable = !window.has_active_dialog(cx);
+        let body: AnyElement = if editing {
+            v_flex()
+                .gap_2()
+                .child(Input::new(&self.edit_message).appearance(false))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .justify_end()
+                        .child(
+                            Button::new("edit-cancel")
+                                .ghost()
+                                .small()
+                                .label("Cancel")
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.cancel_edit(window, cx)),
+                                ),
+                        )
+                        .child(
+                            Button::new("edit-send")
+                                .primary()
+                                .small()
+                                .label("Send")
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.send_edit(window, cx)),
+                                ),
+                        ),
+                )
+                .into_any_element()
+        } else if is_user {
             TextView::markdown(md, message.content.clone(), window, cx)
-                .selectable(true)
+                .selectable(selectable)
                 .line_height(leading)
                 .into_any_element()
         } else if message.content.is_empty() {
@@ -57,7 +111,7 @@ impl Chat {
                 .into_any_element()
         } else {
             TextView::markdown(md, message.content.clone(), window, cx)
-                .selectable(true)
+                .selectable(selectable)
                 .line_height(leading)
                 .style(gpui_component::text::TextViewStyle::default().heading_gap(gpui::rems(1.)))
                 .code_block_actions(move |block, _, _| {
@@ -138,40 +192,40 @@ impl Chat {
                         // Your prompt sits in a card, so a long exchange
                         // reads as turns rather than one run of text.
                         .when(is_user, |card| {
-                            card.px_4()
+                            card.relative()
+                                .px_4()
                                 .py_3()
                                 .rounded(cx.theme().radius_lg)
                                 .bg(cx.theme().secondary.opacity(0.5))
                                 .border_1()
                                 .border_color(cx.theme().border)
                         })
-                        .child(body),
+                        .child(body)
+                        .when_some(on_card, |card, bar| {
+                            card.child(div().absolute().top_1().right_1().child(bar))
+                        }),
                 )
             })
             // A reply is often wanted whole, and selecting it across
             // paragraphs and code blocks is fiddly.
-            .when(
-                !is_user && !message.content.is_empty() && (!streaming || message.tokens > 0),
-                |this| {
-                    this.child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .when(!streaming, |row| {
-                                row.child(
-                                    gpui_component::clipboard::Clipboard::new((
-                                        "copy-reply",
-                                        index,
-                                    ))
+            .when(usage_row, |this| {
+                this.child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .when(!streaming, |row| {
+                            row.child(
+                                gpui_component::clipboard::Clipboard::new(("copy-reply", index))
                                     .value(message.content.clone()),
-                                )
-                            })
-                            .when(message.tokens > 0, |row| row.child(usage_line(message))),
-                    )
-                },
-            )
+                            )
+                        })
+                        .when(message.tokens > 0, |row| row.child(usage_line(message)))
+                        .children(in_usage),
+                )
+            })
+            .children(under)
             .with_animation(
                 self.row_id("appear", index),
                 Animation::new(std::time::Duration::from_millis(260))
@@ -354,7 +408,7 @@ impl Chat {
                         .text_color(cx.theme().muted_foreground)
                         .child(
                             TextView::markdown(self.row_id("reason", index), reasoning, window, cx)
-                                .selectable(true)
+                                .selectable(!window.has_active_dialog(cx))
                                 .line_height(px(21.)),
                         ),
                 )

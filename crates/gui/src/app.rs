@@ -167,6 +167,10 @@ pub(crate) struct Chat {
     pub(crate) editing_skill: Option<u64>,
     pub(crate) skill_name: Entity<InputState>,
     pub(crate) skill_prompt: Entity<InputState>,
+    /// Your message being changed in place, by session id and place.
+    pub(crate) editing_message: Option<(u64, usize)>,
+    /// The box a message is changed in.
+    pub(crate) edit_message: Entity<InputState>,
     /// Thoughts and tool outputs shown open, by session id and place.
     pub(crate) thinking_open: std::collections::HashSet<(u64, usize)>,
     /// The video playing in the chat, if one is, and its newest frame.
@@ -282,6 +286,11 @@ impl Chat {
                 .auto_grow(2, 6)
                 .placeholder("Run the tests and tell me what broke.")
         });
+        let edit_message = cx.new(|cx| {
+            InputState::new(window, cx)
+                .multi_line(true)
+                .auto_grow(1, 12)
+        });
         let subscriptions = vec![
             cx.subscribe_in(&model_search, window, |this, _, event, window, cx| {
                 // Enter takes the first match, so a model can be picked by
@@ -301,6 +310,11 @@ impl Chat {
                 }
             }),
             cx.subscribe_in(&search, window, |_, _, _: &InputEvent, _, cx| cx.notify()),
+            cx.subscribe_in(&edit_message, window, |this, _, event, window, cx| {
+                if matches!(event, InputEvent::PressEnter { secondary: false }) {
+                    this.send_edit(window, cx);
+                }
+            }),
             cx.subscribe_in(&answer, window, |this, _, event, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
                     this.submit_answer(window, cx);
@@ -372,6 +386,8 @@ impl Chat {
             editing_skill: None,
             skill_name,
             skill_prompt,
+            editing_message: None,
+            edit_message,
             thinking_open: std::collections::HashSet::new(),
             video: None,
             video_frame: None,
@@ -1026,20 +1042,9 @@ impl Chat {
 
     /// Store the model's checklist on the session so the composer can show it.
     fn apply_todo(&mut self, arguments: &str, cx: &mut Context<Self>) {
-        let result = letronna_core::tools::parse_args(arguments).and_then(|args| {
-            let items = args["items"]
-                .as_array()
-                .ok_or_else(|| "`items` is required.".to_owned())?;
-            let todos: Vec<Todo> = items
-                .iter()
-                .map(|item| Todo {
-                    text: item["text"].as_str().unwrap_or_default().to_owned(),
-                    status: item["status"].as_str().unwrap_or("pending").to_owned(),
-                })
-                .filter(|todo| !todo.text.is_empty())
-                .collect();
+        let result = parse_todos(arguments).map(|todos| {
             let done = todos.iter().filter(|t| t.status == "done").count();
-            Ok((todos, done))
+            (todos, done)
         });
         let message = match result {
             Ok((todos, done)) => {
@@ -1203,7 +1208,9 @@ impl Chat {
     /// Escape that nothing nearer took: close what is open over the chat,
     /// or else stop the reply, which is what escape does in the terminal.
     fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings_open {
+        if self.editing_message.is_some() {
+            self.cancel_edit(window, cx);
+        } else if self.settings_open {
             self.close_settings(window, cx);
         } else if self.model_open {
             // Back to the box, as picking a model does; the search field
@@ -1322,16 +1329,26 @@ impl Render for Chat {
             self.empty_state(cx).into_any_element()
         } else {
             // One turn per prompt, like Claude Code: the user's message, then
-            // everything the model did in reply under a single label.
-            let mut turns: Vec<Vec<AnyElement>> = Vec::new();
+            // everything the model did in reply under a single label. Each
+            // turn knows its place, which its buttons and menu work from.
+            use crate::ui::actions::Span;
+            let messages = &conversation.messages;
+            let mut turns: Vec<(Vec<AnyElement>, Span)> = Vec::new();
             let mut assistant_turn = false;
-            for (i, m) in conversation.messages.iter().enumerate() {
+            for (i, m) in messages.iter().enumerate() {
                 let is_user = m.role == "user";
                 if is_user || !assistant_turn {
-                    turns.push(Vec::new());
+                    let span = Span {
+                        first: i,
+                        last: i,
+                        yours: is_user,
+                    };
+                    turns.push((Vec::new(), span));
                 }
                 let labeled = is_user || !assistant_turn;
                 assistant_turn = !is_user;
+                let (rows, span) = turns.last_mut().unwrap();
+                span.last = i;
                 // A reply that only asked for tools has nothing to show of
                 // its own; the tool rows speak for it. Kept only when it
                 // carries the turn's label or visible thinking, so it adds
@@ -1345,16 +1362,35 @@ impl Render for Chat {
                 {
                     continue;
                 }
-                turns
-                    .last_mut()
-                    .unwrap()
-                    .push(self.message_row(i, m, labeled, false, window, cx));
+                // A turn is finished at its last message, unless the reply
+                // to it is still coming in.
+                let ends = messages.get(i + 1).is_none_or(|next| next.role == "user")
+                    && !(streaming_here && i + 1 == messages.len());
+                let bar = (is_user || ends).then(|| {
+                    // The newest reply keeps its buttons in view; the rest
+                    // show them on hover.
+                    let newest = !is_user && i + 1 == messages.len();
+                    self.turn_bar(*span, newest, cx)
+                });
+                rows.push(self.message_row(i, m, labeled, false, bar, window, cx));
             }
-            if streaming_here {
+            // The turn a reply is still coming in to has no buttons or menu:
+            // it is not finished, and it owns the session until it is.
+            let live_turn = streaming_here.then(|| {
                 if !assistant_turn {
-                    turns.push(Vec::new());
+                    turns.push((
+                        Vec::new(),
+                        Span {
+                            first: messages.len(),
+                            last: messages.len(),
+                            yours: false,
+                        },
+                    ));
                 }
-                let rows_here = turns.last_mut().unwrap();
+                turns.len() - 1
+            });
+            if streaming_here {
+                let (rows_here, _) = turns.last_mut().unwrap();
                 // While tools are queued the card below speaks for the turn;
                 // showing a half-built reply as well would be two spinners.
                 let idle = self
@@ -1380,6 +1416,7 @@ impl Render for Chat {
                         &live,
                         !assistant_turn,
                         true,
+                        None,
                         window,
                         cx,
                     ));
@@ -1390,10 +1427,22 @@ impl Render for Chat {
             }
             let rows: Vec<AnyElement> = turns
                 .into_iter()
+                .enumerate()
                 // No min_w_0 or clipping here: both break list layout in the
                 // markdown renderer, which sizes items against this width.
                 // Long lines are held in by the row and code-block widths.
-                .map(|turn| v_flex().w_full().gap_3().children(turn).into_any_element())
+                .map(|(n, (turn, span))| {
+                    let group = v_flex().w_full().gap_3().group("turn").children(turn);
+                    if live_turn == Some(n) {
+                        return group.into_any_element();
+                    }
+                    // Its own id, so each turn's menu keeps its own state.
+                    div()
+                        .id(self.row_id("turn", span.first))
+                        .w_full()
+                        .child(group.context_menu(self.turn_menu(span, cx)))
+                        .into_any_element()
+                })
                 .collect();
             // The scrollbar must sit outside the scrolling element, or it
             // scrolls away with the content. The scrolling box spans the
@@ -1478,4 +1527,20 @@ impl Render for Chat {
             .children(self.settings_overlay(window, cx))
             .children(Root::render_dialog_layer(window, cx))
     }
+}
+
+/// The checklist a `todo` call sets, from its arguments.
+pub(crate) fn parse_todos(arguments: &str) -> std::result::Result<Vec<Todo>, String> {
+    let args = letronna_core::tools::parse_args(arguments)?;
+    let items = args["items"]
+        .as_array()
+        .ok_or_else(|| "`items` is required.".to_owned())?;
+    Ok(items
+        .iter()
+        .map(|item| Todo {
+            text: item["text"].as_str().unwrap_or_default().to_owned(),
+            status: item["status"].as_str().unwrap_or("pending").to_owned(),
+        })
+        .filter(|todo| !todo.text.is_empty())
+        .collect())
 }
