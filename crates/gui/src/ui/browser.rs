@@ -838,16 +838,23 @@ impl BrowserView {
                     ),
             ),
             _ => screen.child(
-                div().size_full().flex().items_center().justify_center().px_6().child(
-                    div()
-                        .w_full()
-                        .text_xs()
-                        .text_center()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(
-                            "The page shows here while the agent uses the browser, or type an                              address above.",
-                        ),
-                ),
+                div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .px_6()
+                    .child(
+                        div()
+                            .w_full()
+                            .text_xs()
+                            .text_center()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(
+                                "The page shows here while the agent uses the browser, or type an \
+                             address above.",
+                            ),
+                    ),
             ),
         };
         screen
