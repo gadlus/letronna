@@ -33,8 +33,23 @@ fn show_main_window(cx: &mut App) {
     }
 }
 
+/// Bring the window forward on the About page and look for a new version.
 #[cfg(any(windows, target_os = "linux"))]
-const RELEASES: &str = "https://github.com/wweziza/letronna/releases";
+fn check_for_updates(cx: &mut App) {
+    show_main_window(cx);
+    let Some(handle) = main_window(cx) else {
+        return;
+    };
+    let _ = handle.update(cx, |_, window, cx| {
+        let view = Root::read(window, cx).view().clone();
+        if let Ok(chat) = view.downcast::<Chat>() {
+            chat.update(cx, |this, cx| {
+                this.open_about(window, cx);
+                this.check_for_updates(true, cx);
+            });
+        }
+    });
+}
 
 #[cfg(windows)]
 use windows_impl as imp;
@@ -44,7 +59,7 @@ use linux_impl as imp;
 
 #[cfg(target_os = "linux")]
 mod linux_impl {
-    use super::{RELEASES, show_main_window};
+    use super::{check_for_updates, show_main_window};
     use crate::prelude::*;
     use std::time::Duration;
     use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
@@ -101,7 +116,7 @@ mod linux_impl {
                 while let Ok(event) = MenuEvent::receiver().try_recv() {
                     let _ = cx.update(|cx| match event.id.0.as_str() {
                         SHOW => show_main_window(cx),
-                        UPDATES => cx.open_url(RELEASES),
+                        UPDATES => check_for_updates(cx),
                         QUIT => cx.quit(),
                         _ => {}
                     });
@@ -120,7 +135,7 @@ mod windows_impl {
         Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
     };
 
-    use super::{RELEASES, main_window, show_main_window};
+    use super::{check_for_updates, main_window, show_main_window};
     const MENU_SIZE: Size<Pixels> = size(px(208.), px(112.));
 
     struct Tray(#[allow(dead_code)] TrayIcon);
@@ -265,7 +280,7 @@ mod windows_impl {
                 )
                 .child(rule())
                 .child(self.item("updates", "Check for updates", cx, |_, cx| {
-                    cx.open_url(RELEASES)
+                    check_for_updates(cx)
                 }))
                 .child(rule())
                 .child(self.item("quit", format!("Quit {BRAND}"), cx, |_, cx| cx.quit()))

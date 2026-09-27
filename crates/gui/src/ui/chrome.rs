@@ -217,6 +217,7 @@ impl Chat {
             .child(self.workspace_chip(cx))
             .child(self.job_chips(cx))
             .child(div().flex_1())
+            .children(self.update_chip(cx))
             .child(concat!("v", env!("CARGO_PKG_VERSION")))
             .child(
                 div()

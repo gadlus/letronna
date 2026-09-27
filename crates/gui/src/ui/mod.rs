@@ -10,6 +10,7 @@ pub(crate) mod sessions;
 pub(crate) mod settings;
 pub(crate) mod sidebar;
 pub(crate) mod skills;
+pub(crate) mod update;
 
 use crate::prelude::*;
 
