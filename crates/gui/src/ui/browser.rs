@@ -256,8 +256,34 @@ impl BrowserView {
         self.open(cx);
         if self.url.is_empty() {
             window.focus(&self.focus);
-            self.open_address(HOME.to_owned(), cx);
         }
+        if !letronna_core::browser::has_page() {
+            self.resume(cx);
+        }
+    }
+
+    /// Open the session's page again, closed with its browser while nothing
+    /// used it, or Google if it has none, showing it load meanwhile.
+    fn resume(&mut self, cx: &mut Context<Self>) {
+        self.note = None;
+        self.start_loading(cx);
+        cx.spawn(async move |view, cx| {
+            let resumed = cx
+                .background_executor()
+                .spawn(async { letronna_core::browser::resume(HOME) })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                match resumed {
+                    Ok(()) => view.finish_loading(cx),
+                    Err(why) => {
+                        view.note = Some(why);
+                        view.loading = None;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub(crate) fn is_open(&self) -> bool {
@@ -1206,9 +1232,10 @@ impl Chat {
     }
 
     /// Show the browser when a call is about to use it: before it runs, or
-    /// while it waits to be allowed, so the page can be seen first.
+    /// while it waits to be allowed, so the page can be seen first -- unless
+    /// the agent is to browse unseen.
     pub(crate) fn show_browser(&mut self, tool: &str, cx: &mut Context<Self>) {
-        if matches!(tool, "browse" | "use_page") {
+        if matches!(tool, "browse" | "use_page") && !self.store.settings.browse_unseen {
             self.browser.update(cx, |view, cx| view.open(cx));
         }
     }

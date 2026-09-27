@@ -48,12 +48,17 @@ const PORT_FILE: &str = "DevToolsActivePort";
 /// screenshot waits for a frame that never comes, and a page's own timers
 /// stall mid-task.
 ///
-/// The last two keep the profile small. Left to itself Edge fills a new
+/// The next two keep the profile small. Left to itself Edge fills a new
 /// profile with downloaded components -- shopping, wallet and language
 /// models, 443 MB within ten seconds of one test run -- where the browsing
 /// itself took 13 MB; what is lost is DRM video and certificate-list
 /// updates, which a browser for an agent does without. The disk cache is
 /// capped at 64 MB, which Chromium would otherwise size to the free disk.
+///
+/// The last keeps it light while it runs: the built-in extensions that run
+/// in the background took six processes and about 135 MB of Edge's 324 MB
+/// with Google open, for nothing an agent uses -- pages, screenshots and
+/// PDFs all work without them.
 ///
 /// There is deliberately no `--enable-automation` (it tells every site the
 /// browser is automated) and no `--remote-allow-origins` (it would let any
@@ -67,6 +72,7 @@ const SWITCHES: &[&str] = &[
     "--disable-background-timer-throttling",
     "--disable-component-update",
     "--disk-cache-size=67108864",
+    "--disable-component-extensions-with-background-pages",
 ];
 /// A window size for a browser with no window, which otherwise draws pages
 /// at 800 by 600 and gets the phone layout of many sites.
@@ -77,6 +83,9 @@ const HIDDEN_WINDOW: &str = "--window-size=1280,900";
 /// 418 MB and 46% of a core while scrolling, against 605 MB and 59% with
 /// the GPU. What goes is WebGL, which pages an agent reads seldom need.
 const NO_GPU: &str = "--disable-gpu";
+/// With no GPU, what it would draw is drawn in the browser's own process
+/// rather than one of its own: a process and 10 MB fewer.
+const GPU_INSIDE: &str = "--in-process-gpu";
 /// What a browser with no window calls itself in its user agent, where a
 /// browser with one says "Chrome".
 const HEADLESS: &str = "HeadlessChrome";
@@ -209,6 +218,14 @@ fn http() -> Result<&'static reqwest::blocking::Client, String> {
     Ok(CLIENT.get_or_init(|| client))
 }
 
+/// A call's parameters, in a browser context if one is named.
+fn in_context(mut params: Value, context: Option<&str>) -> Value {
+    if let Some(context) = context {
+        params["browserContextId"] = json!(context);
+    }
+    params
+}
+
 /// The user agent of the browser whose debugging port this is, if it is up.
 /// It says whether that browser has no window: one found running may not be
 /// in the mode asked for, and a window someone may be using must not be
@@ -292,7 +309,7 @@ impl Browser {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         if headless {
-            command.args(["--headless=new", HIDDEN_WINDOW, NO_GPU]);
+            command.args(["--headless=new", HIDDEN_WINDOW, NO_GPU, GPU_INSIDE]);
             if let Some(scale) = scale.filter(|scale| *scale > 1.) {
                 command.arg(format!("--force-device-scale-factor={scale:.2}"));
             }
@@ -485,6 +502,39 @@ impl Reach {
                 json!({"browserContextId": context}),
             );
         }
+    }
+
+    /// Every cookie a browser context holds -- with `None`, the browser's
+    /// own -- sign-ins among them.
+    pub fn cookies(&self, context: Option<&str>) -> Result<Vec<Value>, String> {
+        let mut got: Value = self
+            .connect()?
+            .call("Storage.getCookies", in_context(json!({}), context))?;
+        Ok(match got["cookies"].take() {
+            Value::Array(cookies) => cookies,
+            _ => Vec::new(),
+        })
+    }
+
+    /// Give a browser context back cookies it held.
+    pub fn set_cookies(
+        &self,
+        context: Option<&str>,
+        mut cookies: Vec<Value>,
+    ) -> Result<(), String> {
+        for cookie in &mut cookies {
+            // One kept only while the browser runs ends at -1, which given
+            // back would end it long ago.
+            if cookie["session"] == true
+                && let Some(fields) = cookie.as_object_mut()
+            {
+                fields.remove("expires");
+            }
+        }
+        let params = in_context(json!({"cookies": cookies}), context);
+        self.connect()?
+            .call::<Ignored>("Storage.setCookies", params)
+            .map(drop)
     }
 
     /// Connect to a tab, ready to be driven.

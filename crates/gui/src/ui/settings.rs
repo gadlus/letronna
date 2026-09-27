@@ -434,6 +434,7 @@ fn privacy_page(
     cx: &App,
 ) -> Div {
     let (skip, shared) = (settings.skip_approvals, settings.browser_shared);
+    let unseen = settings.browse_unseen;
     let current = plugins::PresenceMode::from_str(presence.read(cx));
     let enabled = plugins::list(cx)
         .iter()
@@ -594,6 +595,48 @@ fn privacy_page(
             ),
         );
 
+    let seen = h_flex()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .px_3()
+        .py_2p5()
+        .rounded(cx.theme().radius)
+        .bg(cx.theme().secondary.opacity(0.3))
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_0p5()
+                .child(div().text_sm().child("Show the page as the agent browses"))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(
+                            "The browser opens beside the chat when the agent uses it. Off, the \
+                             agent browses unseen, lighter on memory; open the browser from the \
+                             menu to look.",
+                        ),
+                ),
+        )
+        .child(
+            div().flex_shrink_0().cursor_pointer().child(
+                gpui_component::switch::Switch::new("browser-seen")
+                    .checked(!unseen)
+                    .on_click({
+                        let chat = chat.clone();
+                        move |_, _, cx| {
+                            chat.update(cx, |this, cx| {
+                                this.store.settings.browse_unseen = !unseen;
+                                this.save();
+                                cx.notify();
+                            })
+                        }
+                    }),
+            ),
+        );
+
     v_flex()
         .gap_4()
         .child(heading(
@@ -608,6 +651,7 @@ fn privacy_page(
             cx,
         ))
         .child(browser)
+        .child(seen)
         .child(heading(
             "Discord Rich Presence",
             "What Letronna shares with Discord. The integration is turned on or off in the Plugins tab.",

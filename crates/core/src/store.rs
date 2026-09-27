@@ -111,6 +111,10 @@ pub struct Settings {
     /// than each having a private one, forgotten when Letronna quits.
     #[serde(default)]
     pub browser_shared: bool,
+    /// The agent browses unseen: the browser panel does not open by itself
+    /// when it uses the browser, though it can still be opened to look.
+    #[serde(default)]
+    pub browse_unseen: bool,
 }
 
 #[derive(Default)]

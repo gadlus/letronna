@@ -19,6 +19,7 @@ use crate::page::{PAGE_CHARS, Page, Refs, Tree, cut, matching, page, ref_number,
 use crate::tools::{Tool, ToolContext};
 use crate::watch::{self, Sight};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -139,6 +140,7 @@ impl Tool for Browse {
         }
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
+        mark_agent_use();
         let view = View {
             full: args["full"].as_bool().unwrap_or(false),
             find: args["find"].as_str().map(str::to_owned),
@@ -228,6 +230,7 @@ impl Tool for UsePage {
         text
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
+        mark_agent_use();
         let agree = args["confirm"].as_bool().unwrap_or(false);
         let target = |session: &Session| -> Result<i64, String> {
             let raw = args["ref"]
@@ -522,9 +525,22 @@ struct Browsers {
     /// The profile the browser runs on: the data folder's.
     profile: PathBuf,
     browser: Option<cdp::Browser>,
+    /// How many browsers have been started, so a watch for idleness knows
+    /// its own from one started after it.
+    started: u64,
     /// A session per conversation using the browser, the one used most
     /// recently last.
     sessions: Vec<Session>,
+    /// What each conversation had open when its browser was closed for
+    /// being idle, given back when it is next used.
+    remembered: HashMap<u64, Rested>,
+}
+
+/// A conversation's page, and its cookies with the sign-ins among them, kept
+/// while its browser is closed for being idle.
+struct Rested {
+    url: String,
+    cookies: Vec<Value>,
 }
 
 /// The session every conversation uses when the browser is shared, and one
@@ -533,6 +549,14 @@ const SHARED: u64 = 0;
 /// At most this many conversations keep a private browser at once: past
 /// that, the one used longest ago lets its go.
 const MAX_PRIVATE: usize = 4;
+/// How long a browser with no window is kept once the panel is closed, if
+/// nothing else uses it: long enough to open the panel again at once.
+const KEEP_AFTER_PANEL: Duration = Duration::from_secs(15);
+/// How long it is kept after the agent last used it: long enough for a
+/// model to think between the steps of one task.
+const KEEP_FOR_AGENT: Duration = Duration::from_secs(180);
+/// How often a browser is looked at for being idle.
+const IDLE_CHECK: Duration = Duration::from_secs(5);
 
 fn state() -> &'static Mutex<Browsers> {
     static BROWSERS: OnceLock<Mutex<Browsers>> = OnceLock::new();
@@ -540,7 +564,9 @@ fn state() -> &'static Mutex<Browsers> {
         Mutex::new(Browsers {
             profile: crate::chat::data_dir().join("browser"),
             browser: None,
+            started: 0,
             sessions: Vec::new(),
+            remembered: HashMap::new(),
         })
     })
 }
@@ -626,6 +652,77 @@ pub fn show_conversation(conversation: u64) {
     });
 }
 
+/// Whether the conversation the window shows surely has a page open in a
+/// running browser, so `resume` would have nothing to do. A browser busy
+/// with an action, or with being closed, cannot say.
+pub fn has_page() -> bool {
+    let owner = owner_of(shown().load(Ordering::Relaxed));
+    state()
+        .try_lock()
+        .is_ok_and(|all| all.sessions.iter().any(|session| session.owner == owner))
+}
+
+/// Open the page of the conversation the window shows: as it was, if its
+/// browser was closed for being idle, or `home` if it has none. For the
+/// panel, opened; it returns once the page has loaded.
+pub fn resume(home: &str) -> Result<(), String> {
+    with_session(shown().load(Ordering::Relaxed), |session| {
+        let url = session.url();
+        if url.is_empty() || url == "about:blank" {
+            session.load_at(home)?;
+        }
+        Ok(String::new())
+    })
+    .map(drop)
+}
+
+/// When the agent last used the browser, if it has.
+fn agent_used() -> &'static Mutex<Option<Instant>> {
+    static USED: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+    USED.get_or_init(|| Mutex::new(None))
+}
+
+/// Note that the agent is using the browser now.
+fn mark_agent_use() {
+    if let Ok(mut used) = agent_used().lock() {
+        *used = Some(Instant::now());
+    }
+}
+
+/// Whether a browser nobody watches is idle: the panel closed a moment ago
+/// or longer, and the agent not browsing for a while, or ever.
+fn idle(panel_closed: Duration, agent_quiet: Option<Duration>) -> bool {
+    panel_closed >= KEEP_AFTER_PANEL && agent_quiet.is_none_or(|quiet| quiet >= KEEP_FOR_AGENT)
+}
+
+/// Close a browser with no window once it is idle, so it holds no memory
+/// while nothing uses it. Never in the middle of an action: one holds the
+/// browser, and it is looked at again later.
+fn close_when_idle(started: u64) {
+    let mut watched = Instant::now();
+    loop {
+        std::thread::sleep(IDLE_CHECK);
+        if watch::watched() {
+            watched = Instant::now();
+            continue;
+        }
+        let agent_quiet = agent_used()
+            .lock()
+            .ok()
+            .and_then(|used| used.map(|at| at.elapsed()));
+        let Ok(mut all) = state().try_lock() else {
+            continue;
+        };
+        if all.started != started || all.browser.is_none() {
+            return;
+        }
+        if idle(watched.elapsed(), agent_quiet) {
+            all.rest();
+            return;
+        }
+    }
+}
+
 /// Let go of a conversation's private browser, as when it is deleted.
 pub fn forget(conversation: u64) {
     std::thread::spawn(move || {
@@ -645,7 +742,31 @@ impl Browsers {
         let reach = browser.reach.clone();
         self.browser = Some(browser);
         self.sessions.clear();
+        self.started += 1;
+        // One with a window is the user's to close.
+        if reach.headless {
+            let started = self.started;
+            std::thread::spawn(move || close_when_idle(started));
+        }
         Ok(reach)
+    }
+
+    /// Close the browser while nothing uses it, remembering what each
+    /// conversation had open to give back when it is next used.
+    fn rest(&mut self) {
+        for session in &mut self.sessions {
+            let context = session.context.as_deref();
+            let rested = Rested {
+                cookies: session.reach.cookies(context).unwrap_or_default(),
+                url: session.url(),
+            };
+            self.remembered.insert(session.owner, rested);
+        }
+        self.sessions.clear();
+        if let Some(mut browser) = self.browser.take() {
+            browser.close();
+        }
+        watch::unfollow();
     }
 
     /// An owner's session, opened if it has none, and the most recently used
@@ -662,7 +783,18 @@ impl Browsers {
                 self.sessions.push(session);
             }
             None => {
-                self.sessions.push(Session::begin(reach, owner)?);
+                let mut session = Session::begin(reach, owner)?;
+                // As it was when its browser was closed for being idle,
+                // loaded before anything is done to it.
+                if let Some(Rested { url, cookies }) = self.remembered.remove(&owner) {
+                    let _ = session
+                        .reach
+                        .set_cookies(session.context.as_deref(), cookies);
+                    if !url.is_empty() && url != "about:blank" {
+                        let _ = session.load_at(&url);
+                    }
+                }
+                self.sessions.push(session);
                 self.make_room();
             }
         }
@@ -702,6 +834,7 @@ impl Browsers {
     }
 
     fn forget(&mut self, conversation: u64) {
+        self.remembered.remove(&conversation);
         let private =
             |session: &Session| session.owner == conversation && session.context.is_some();
         if let Some(at) = self.sessions.iter().position(private) {
@@ -710,6 +843,7 @@ impl Browsers {
     }
 
     fn forget_all(&mut self) {
+        self.remembered.clear();
         for session in std::mem::take(&mut self.sessions) {
             session.close();
         }
@@ -960,6 +1094,15 @@ impl Session {
             Some(error) => Err(format!("Could not open {url}: {error}.")),
             None => Ok(()),
         }
+    }
+
+    /// Open an address and wait for it to load, without reading the page:
+    /// as when one is given back.
+    fn load_at(&mut self, url: &str) -> Result<(), String> {
+        // What the blank tab said of itself as it opened is not this load.
+        self.tab.events.clear();
+        self.go_to(url)?;
+        self.load().map(drop)
     }
 
     fn open(&mut self, url: &str) -> Result<String, String> {
@@ -1661,6 +1804,16 @@ mod tests {
     }
 
     #[test]
+    fn a_browser_rests_once_nothing_has_used_it_for_a_while() {
+        let (moment, while_) = (Duration::from_secs(1), KEEP_AFTER_PANEL);
+        assert!(!idle(moment, None), "the panel only just closed");
+        assert!(idle(while_, None), "closed a while ago, and no agent");
+        let thinking = Some(Duration::from_secs(30));
+        assert!(!idle(while_, thinking), "the agent is between steps");
+        assert!(idle(while_, Some(KEEP_FOR_AGENT)), "the agent is done");
+    }
+
+    #[test]
     fn keys_are_pressed_as_a_keyboard_sends_them() {
         let enter = key("enter").unwrap();
         assert_eq!(
@@ -2309,6 +2462,23 @@ mod tests {
             Browse.run(&open, &second).unwrap();
             assert_eq!(UsePage.run(&get, &second).unwrap(), "signed=in");
             share_browser(false);
+            std::thread::sleep(Duration::from_millis(500));
+
+            // Idle, the browser is closed, and a session's page and sign-in
+            // come back when it is next used: here by the panel, opened.
+            Browse.run(&open, &first).unwrap();
+            UsePage.run(&set, &first).unwrap();
+            state().lock().unwrap().rest();
+            assert!(state().lock().unwrap().browser.is_none());
+            show_conversation(1);
+            assert!(!has_page());
+            resume(&format!("{site}/form")).unwrap();
+            let look = json!({"action": "look"});
+            let page = Browse.run(&look, &first).unwrap();
+            assert!(page.contains("Page two"), "{page}");
+            assert_eq!(UsePage.run(&get, &first).unwrap(), "signed=in");
+            Browse.run(&open, &second).unwrap();
+            assert_eq!(UsePage.run(&get, &second).unwrap(), "");
         }
     }
 }
