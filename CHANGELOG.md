@@ -14,6 +14,8 @@ This file is also the App tab of https://letronna.ai/changelog.
 ## [Unreleased]
 
 ### Added
+- **App** — Right-click or hover a turn to copy, edit, retry, rewind or fork it.
+- **Terminal** — Take back or retry the last exchange, or branch a session.
 - **All** — A real browser: Letronna reads pages, clicks, types and takes screenshots. In the app it sits beside the chat, where you can watch it and use it yourself.
 - **App** — Each session has a browser of its own, or one shared by all, and it can be a cloud browser or Chrome on another machine.
 - **All** — Letronna updates itself: the app finds, checks and installs new versions, and `letronna update` does it in the terminal.
