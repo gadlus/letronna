@@ -1,7 +1,7 @@
 pub(crate) mod account;
 pub(crate) mod approval;
-pub(crate) mod browser;
 pub(crate) mod artifacts;
+pub(crate) mod browser;
 pub(crate) mod chrome;
 pub(crate) mod composer;
 pub(crate) mod messages;

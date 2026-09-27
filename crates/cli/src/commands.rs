@@ -241,9 +241,15 @@ fn whoami(runner: &mut Runner) {
             render::dim("team   "),
             team.name,
             render::dim("pool   "),
-            format_args!("${}.{:02}", team.credits / 100, team.credits.rem_euclid(100))
+            format_args!(
+                "${}.{:02}",
+                team.credits / 100,
+                team.credits.rem_euclid(100)
+            )
         )),
-        None => render::line(&render::dim("team    none · hosted models use your own credit · /team to pick one")),
+        None => render::line(&render::dim(
+            "team    none · hosted models use your own credit · /team to pick one",
+        )),
     }
 }
 
@@ -255,7 +261,9 @@ fn team(runner: &mut Runner) {
         render::line(&render::dim("Not signed in. /login first."));
         return;
     }
-    let found = runner.bar.busy("loading your teams", letronna_core::auth::teams);
+    let found = runner
+        .bar
+        .busy("loading your teams", letronna_core::auth::teams);
     let teams = match found {
         Ok(teams) => teams,
         Err(error) => {
@@ -264,26 +272,48 @@ fn team(runner: &mut Runner) {
             return;
         }
     };
-    let current = letronna_core::auth::account().and_then(|a| a.team).map(|t| t.id);
+    let current = letronna_core::auth::account()
+        .and_then(|a| a.team)
+        .map(|t| t.id);
     let mark = |on: bool| if on { "● " } else { "  " };
-    let mut labels = vec![format!("{}Personal — your own credit", mark(current.is_none()))];
-    labels.extend(teams.iter().map(|t| format!("{}{} — team pool", mark(current.as_deref() == Some(t.id.as_str())), t.name)));
+    let mut labels = vec![format!(
+        "{}Personal — your own credit",
+        mark(current.is_none())
+    )];
+    labels.extend(teams.iter().map(|t| {
+        format!(
+            "{}{} — team pool",
+            mark(current.as_deref() == Some(t.id.as_str())),
+            t.name
+        )
+    }));
     let options: Vec<&str> = labels.iter().map(String::as_str).collect();
     let detail = if teams.is_empty() {
-        vec!["You are not in a team yet. Create or join one at letronna.ai/dashboard/team.".to_owned()]
+        vec![
+            "You are not in a team yet. Create or join one at letronna.ai/dashboard/team."
+                .to_owned(),
+        ]
     } else {
         Vec::new()
     };
     let Some(picked) = runner.bar.choose("Bill hosted models to", detail, &options) else {
         return;
     };
-    let id = picked.checked_sub(1).and_then(|i| teams.get(i)).map(|t| t.id.clone());
-    let done = runner.bar.busy("switching", move || letronna_core::auth::use_team(id.as_deref()));
+    let id = picked
+        .checked_sub(1)
+        .and_then(|i| teams.get(i))
+        .map(|t| t.id.clone());
+    let done = runner.bar.busy("switching", move || {
+        letronna_core::auth::use_team(id.as_deref())
+    });
     render::blank();
     match done {
         Ok(account) => {
             match &account.team {
-                Some(team) => render::line(&format!("Hosted models now bill {}.", render::bold(&team.name))),
+                Some(team) => render::line(&format!(
+                    "Hosted models now bill {}.",
+                    render::bold(&team.name)
+                )),
                 None => render::line("Hosted models now use your own credit."),
             }
             let note = footer(runner);
@@ -646,15 +676,19 @@ pub fn switch_model(runner: &mut Runner, filter: &str) {
     render::blank();
     render::said(&render::blue("●"), &render::bold("Models"));
     // Fetching takes a moment over the network; say so rather than freezing.
-    let (mut models, errors) = runner.bar.busy("asking every gateway what it has", move || {
-        letronna_core::gateway::all_models(&keys, &custom)
-    });
+    let (mut models, errors) = runner
+        .bar
+        .busy("asking every gateway what it has", move || {
+            letronna_core::gateway::all_models(&keys, &custom)
+        });
     for error in &errors {
         render::line(&render::red(error));
     }
     if models.is_empty() {
         if errors.is_empty() {
-            render::line(&render::dim("No gateway offered any models. Sign in with /login, or add a provider with `letronna setup`."));
+            render::line(&render::dim(
+                "No gateway offered any models. Sign in with /login, or add a provider with `letronna setup`.",
+            ));
         }
         return;
     }
@@ -809,7 +843,9 @@ pub fn gateways(runner: &mut Runner) {
     let (k, c) = (keys.clone(), custom.clone());
     let (models, _) = runner
         .bar
-        .busy("asking every gateway what it has", move || gateway::all_models(&k, &c));
+        .busy("asking every gateway what it has", move || {
+            gateway::all_models(&k, &c)
+        });
 
     // The list sits in the box with its choices, not in the conversation.
     // Letronna is the account, not a gateway to add or remove: /login and
@@ -819,8 +855,16 @@ pub fn gateways(runner: &mut Runner) {
     for g in GATEWAYS {
         let count = models.iter().filter(|(n, _)| n == g.name).count();
         let (status, good, set_up) = gateway::status(g.name, &keys, &custom, count);
-        let status = if g.name == LETRONNA && !set_up { format!("{status} · /login") } else { status };
-        rows.push(format!("{} {:<11} {status}", if good { "●" } else { "○" }, g.name));
+        let status = if g.name == LETRONNA && !set_up {
+            format!("{status} · /login")
+        } else {
+            status
+        };
+        rows.push(format!(
+            "{} {:<11} {status}",
+            if good { "●" } else { "○" },
+            g.name
+        ));
         match (g.name, set_up) {
             (LETRONNA, _) | ("Ollama", _) => {}
             (_, false) => choices.push((format!("Set up {}", g.name), g.name, "set")),
@@ -846,22 +890,37 @@ pub fn gateways(runner: &mut Runner) {
                 runner.store.settings.custom_endpoint.clear();
             }
             render::blank();
-            render::line(&render::dim(&format!("{name} removed. Its models leave /model.")));
+            render::line(&render::dim(&format!(
+                "{name} removed. Its models leave /model."
+            )));
         }
         _ => {
             if gateway::gateway(name).base.is_empty() {
-                let url = runner.bar.ask(&format!("{name} base URL, like http://localhost:8000/v1"), false).unwrap_or_default();
+                let url = runner
+                    .bar
+                    .ask(
+                        &format!("{name} base URL, like http://localhost:8000/v1"),
+                        false,
+                    )
+                    .unwrap_or_default();
                 if !url.trim().is_empty() {
-                    runner.store.settings.custom_endpoint = url.trim().trim_end_matches('/').to_owned();
+                    runner.store.settings.custom_endpoint =
+                        url.trim().trim_end_matches('/').to_owned();
                 }
             }
-            let hint = if gateway::gateway(name).needs_key { format!("{name} API key") } else { format!("{name} API key (optional)") };
+            let hint = if gateway::gateway(name).needs_key {
+                format!("{name} API key")
+            } else {
+                format!("{name} API key (optional)")
+            };
             let key = runner.bar.ask(&hint, true).unwrap_or_default();
             if !key.trim().is_empty() {
                 keys.insert(gateway::key_slot(name).to_owned(), key.trim().to_owned());
             }
             render::blank();
-            render::line(&render::dim(&format!("{name} saved. /model now lists its models too.")));
+            render::line(&render::dim(&format!(
+                "{name} saved. /model now lists its models too."
+            )));
         }
     }
     if let Err(error) = store::save_keys(&keys) {

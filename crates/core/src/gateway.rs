@@ -83,13 +83,24 @@ pub fn ready(keys: &HashMap<String, String>, custom: &str) -> Vec<(&'static str,
 
 /// Where a gateway stands, for the settings list and `/gateways`:
 /// (status line, working, set up). `models` is how many it answered with.
-pub fn status(name: &str, keys: &HashMap<String, String>, custom: &str, models: usize) -> (String, bool, bool) {
+pub fn status(
+    name: &str,
+    keys: &HashMap<String, String>,
+    custom: &str,
+    models: usize,
+) -> (String, bool, bool) {
     let g = gateway(name);
     let count = |n: usize| format!("{n} model{}", if n == 1 { "" } else { "s" });
-    let key = keys.get(key_slot(name)).is_some_and(|k| !k.trim().is_empty());
+    let key = keys
+        .get(key_slot(name))
+        .is_some_and(|k| !k.trim().is_empty());
     match name {
         LETRONNA if crate::auth::account().is_some() => (
-            if models > 0 { format!("Signed in · {}", count(models)) } else { "Signed in".into() },
+            if models > 0 {
+                format!("Signed in · {}", count(models))
+            } else {
+                "Signed in".into()
+            },
             true,
             true,
         ),
@@ -113,7 +124,10 @@ pub fn all_models(
     let asks: Vec<_> = ready(keys, custom)
         .into_iter()
         .map(|(name, base, key)| {
-            (name, std::thread::spawn(move || crate::chat::list_models(&base, &key)))
+            (
+                name,
+                std::thread::spawn(move || crate::chat::list_models(&base, &key)),
+            )
         })
         .collect();
     let (mut models, mut errors) = (Vec::new(), Vec::new());
@@ -145,8 +159,14 @@ mod tests {
 
     #[test]
     fn a_model_goes_to_its_own_gateway_and_custom_keeps_its_url() {
-        assert_eq!(resolve("OpenRouter", "http://x/v1", "k").0, "https://openrouter.ai/api/v1");
-        assert_eq!(resolve("Custom", "http://x/v1", "k"), ("http://x/v1".into(), "k".into()));
+        assert_eq!(
+            resolve("OpenRouter", "http://x/v1", "k").0,
+            "https://openrouter.ai/api/v1"
+        );
+        assert_eq!(
+            resolve("Custom", "http://x/v1", "k"),
+            ("http://x/v1".into(), "k".into())
+        );
 
         let keys = HashMap::from([("OpenAI".to_string(), "sk".to_string())]);
         let names: Vec<_> = ready(&keys, "").into_iter().map(|r| r.0).collect();
@@ -158,11 +178,26 @@ mod tests {
     fn status_says_what_is_set_up_and_working() {
         let none = HashMap::new();
         let keyed = HashMap::from([("OpenAI".to_string(), "sk".to_string())]);
-        assert_eq!(status("OpenAI", &none, "", 0), ("Not set up".into(), false, false));
-        assert_eq!(status("OpenAI", &keyed, "", 0), ("Set up · no models answered".into(), false, true));
-        assert_eq!(status("OpenAI", &keyed, "", 3), ("Connected · 3 models".into(), true, true));
-        assert_eq!(status("Ollama", &none, "", 1), ("Running · 1 model".into(), true, true));
+        assert_eq!(
+            status("OpenAI", &none, "", 0),
+            ("Not set up".into(), false, false)
+        );
+        assert_eq!(
+            status("OpenAI", &keyed, "", 0),
+            ("Set up · no models answered".into(), false, true)
+        );
+        assert_eq!(
+            status("OpenAI", &keyed, "", 3),
+            ("Connected · 3 models".into(), true, true)
+        );
+        assert_eq!(
+            status("Ollama", &none, "", 1),
+            ("Running · 1 model".into(), true, true)
+        );
         assert!(!status("Custom", &none, "", 0).2);
-        assert_eq!(status("Custom", &none, "http://x/v1", 2).0, "Connected · 2 models");
+        assert_eq!(
+            status("Custom", &none, "http://x/v1", 2).0,
+            "Connected · 2 models"
+        );
     }
 }

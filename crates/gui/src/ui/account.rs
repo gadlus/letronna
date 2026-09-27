@@ -210,7 +210,12 @@ pub(crate) fn account_page(chat: &Entity<Chat>, this: &Chat, cx: &App) -> Div {
                 .child(row(
                     "Team",
                     match &account.team {
-                        Some(t) => format!("{} · pool ${}.{:02}", t.name, t.credits / 100, t.credits.rem_euclid(100)),
+                        Some(t) => format!(
+                            "{} · pool ${}.{:02}",
+                            t.name,
+                            t.credits / 100,
+                            t.credits.rem_euclid(100)
+                        ),
                         None => "None · your own credit".to_owned(),
                     },
                 )),
@@ -264,7 +269,10 @@ fn billing(chat: &Entity<Chat>, this: &Chat, account: &Account, cx: &App) -> Div
                 chat.update(cx, |this, cx| this.pick_team(id, cx))
             })
     };
-    let mut row = h_flex().gap_2().flex_wrap().child(choice(0, "Personal".into(), None));
+    let mut row = h_flex()
+        .gap_2()
+        .flex_wrap()
+        .child(choice(0, "Personal".into(), None));
     for (i, t) in this.teams.iter().enumerate() {
         row = row.child(choice(i + 1, t.name.clone(), Some(t.id.clone())));
     }

@@ -101,7 +101,11 @@ impl Account {
 
     /// Credit left, as dollars.
     pub fn credit(&self) -> String {
-        format!("${}.{:02}", self.credits / 100, self.credits.rem_euclid(100))
+        format!(
+            "${}.{:02}",
+            self.credits / 100,
+            self.credits.rem_euclid(100)
+        )
     }
 }
 
@@ -159,7 +163,12 @@ pub fn refresh() -> Result<Account, String> {
     }
     let me: Me = response
         .error_for_status()
-        .map_err(|e| format!("The account service answered {}.", e.status().map_or(0, |s| s.as_u16())))?
+        .map_err(|e| {
+            format!(
+                "The account service answered {}.",
+                e.status().map_or(0, |s| s.as_u16())
+            )
+        })?
         .json()
         .map_err(|_| "The account service sent something unexpected.".to_owned())?;
     account.name = me.name;
@@ -196,8 +205,13 @@ pub fn use_team(id: Option<&str>) -> Result<Account, String> {
         .map_err(|_| "Could not reach the Letronna account service.".to_owned())?;
     if !response.status().is_success() {
         #[derive(Deserialize)]
-        struct Refused { error: String }
-        let why = response.json::<Refused>().map(|r| r.error).unwrap_or_else(|_| "That team could not be picked.".into());
+        struct Refused {
+            error: String,
+        }
+        let why = response
+            .json::<Refused>()
+            .map(|r| r.error)
+            .unwrap_or_else(|_| "That team could not be picked.".into());
         return Err(why);
     }
     refresh()

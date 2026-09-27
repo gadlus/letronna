@@ -166,7 +166,9 @@ pub fn validate(connection: &Connection) -> Result<String, String> {
     let base = connection.endpoint.trim().trim_end_matches('/');
     // The Letronna gateway signs requests with this computer's account token.
     if connection.key.trim().is_empty() && base == crate::auth::hosted_base() {
-        return Err("Sign in with /login to use Letronna's hosted models, or pick another provider.".into());
+        return Err(
+            "Sign in with /login to use Letronna's hosted models, or pick another provider.".into(),
+        );
     }
     Ok(if base.ends_with("/chat/completions") {
         base.into()
@@ -1353,7 +1355,10 @@ mod tests {
                 model: model.into(),
                 ..connection()
             };
-            body(&c, &messages, None)["messages"].as_array().unwrap().clone()
+            body(&c, &messages, None)["messages"]
+                .as_array()
+                .unwrap()
+                .clone()
         };
         let context = sent("sees-images");
         let pictures: Vec<usize> = (0..context.len())

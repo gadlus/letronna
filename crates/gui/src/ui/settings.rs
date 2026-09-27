@@ -99,7 +99,12 @@ impl Chat {
     }
 
     /// Forget a gateway's key (and URL, for Custom); its models leave the list.
-    pub(crate) fn remove_gateway(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn remove_gateway(
+        &mut self,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.keys.remove(key_slot(name));
         if gateway(name).base.is_empty() {
             self.store.settings.custom_endpoint.clear();
@@ -401,7 +406,16 @@ impl Chat {
             "About" => about_page(&chat, self, cx).into_any_element(),
             "Search" => search_page(self.search_rows(), &pick, &endpoint, &key, &chat, cx)
                 .into_any_element(),
-            _ => gateway_page(self.gateway_rows(), &pick, &endpoint, &key, &page, &chat, cx).into_any_element(),
+            _ => gateway_page(
+                self.gateway_rows(),
+                &pick,
+                &endpoint,
+                &key,
+                &page,
+                &chat,
+                cx,
+            )
+            .into_any_element(),
         };
         div()
             .track_focus(&self.settings_focus)
@@ -1149,8 +1163,12 @@ impl Chat {
             .iter()
             .map(|g| {
                 let count = self.models.iter().filter(|(n, _)| n == g.name).count();
-                let (status, good, set_up) =
-                    status(g.name, &self.keys, &self.store.settings.custom_endpoint, count);
+                let (status, good, set_up) = status(
+                    g.name,
+                    &self.keys,
+                    &self.store.settings.custom_endpoint,
+                    count,
+                );
                 let action = match g.name {
                     LETRONNA if !set_up => Some("Sign in"),
                     LETRONNA | "Ollama" => None,
@@ -1158,8 +1176,19 @@ impl Chat {
                     _ if !set_up => Some("Add key"),
                     _ => Some("Edit"),
                 };
-                let status = if self.loading_models && set_up { "Checking…".into() } else { status };
-                GatewayRow { name: g.name, blurb: g.blurb, status, good, action, set_up }
+                let status = if self.loading_models && set_up {
+                    "Checking…".into()
+                } else {
+                    status
+                };
+                GatewayRow {
+                    name: g.name,
+                    blurb: g.blurb,
+                    status,
+                    good,
+                    action,
+                    set_up,
+                }
             })
             .collect()
     }
@@ -1376,7 +1405,11 @@ fn gateway_page(
     for (i, row) in rows.into_iter().enumerate() {
         let name = row.name;
         let editing = open == name;
-        let dot = if row.good { cx.theme().green } else { cx.theme().muted_foreground.opacity(0.5) };
+        let dot = if row.good {
+            cx.theme().green
+        } else {
+            cx.theme().muted_foreground.opacity(0.5)
+        };
         let button = row.action.map(|action| {
             let chat = chat.clone();
             let page = page.clone();
@@ -1413,7 +1446,12 @@ fn gateway_page(
                             .font_weight(FontWeight::MEDIUM)
                             .child(name),
                     )
-                    .child(div().text_xs().text_color(cx.theme().muted_foreground).child(row.blurb)),
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(row.blurb),
+                    ),
             )
             .child(
                 h_flex()
@@ -1424,7 +1462,11 @@ fn gateway_page(
                     .child(
                         div()
                             .text_xs()
-                            .text_color(if row.good { cx.theme().foreground } else { cx.theme().muted_foreground })
+                            .text_color(if row.good {
+                                cx.theme().foreground
+                            } else {
+                                cx.theme().muted_foreground
+                            })
                             .child(row.status),
                     ),
             )
@@ -1443,12 +1485,24 @@ fn gateway_page(
                     .pb_4()
                     .gap_3()
                     .when(custom, |d| {
-                        d.child(v_flex().gap_1().child(label("Base URL", cx)).child(Input::new(endpoint)))
+                        d.child(
+                            v_flex()
+                                .gap_1()
+                                .child(label("Base URL", cx))
+                                .child(Input::new(endpoint)),
+                        )
                     })
                     .child(
                         v_flex()
                             .gap_1()
-                            .child(label(if needs_key { "API key" } else { "API key (optional)" }, cx))
+                            .child(label(
+                                if needs_key {
+                                    "API key"
+                                } else {
+                                    "API key (optional)"
+                                },
+                                cx,
+                            ))
                             .child(Input::new(key).mask_toggle()),
                     )
                     .child(
@@ -1456,15 +1510,27 @@ fn gateway_page(
                             .gap_2()
                             .justify_end()
                             .when(row.set_up, |d| {
-                                d.child(Button::new("gw-remove").ghost().small().label("Remove").on_click(
-                                    move |_, window, cx| {
-                                        remove.update(cx, |this, cx| this.remove_gateway(name, window, cx))
-                                    },
-                                ))
+                                d.child(
+                                    Button::new("gw-remove")
+                                        .ghost()
+                                        .small()
+                                        .label("Remove")
+                                        .on_click(move |_, window, cx| {
+                                            remove.update(cx, |this, cx| {
+                                                this.remove_gateway(name, window, cx)
+                                            })
+                                        }),
+                                )
                             })
-                            .child(Button::new("gw-save").primary().small().label("Save").on_click(
-                                move |_, window, cx| save.update(cx, |this, cx| this.save_gateway(window, cx)),
-                            )),
+                            .child(
+                                Button::new("gw-save")
+                                    .primary()
+                                    .small()
+                                    .label("Save")
+                                    .on_click(move |_, window, cx| {
+                                        save.update(cx, |this, cx| this.save_gateway(window, cx))
+                                    }),
+                            ),
                     ),
             );
         }

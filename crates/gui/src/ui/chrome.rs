@@ -9,43 +9,49 @@ impl Chat {
         // 20px apart from x=12 end at 64, so leave the same 12px gap after them
         // that the other platforms have at the edge. Fullscreen hides the lights
         // and the bar adds that 12px by itself.
-        let inset = if window.is_fullscreen() { px(0.) } else { px(76.) };
-        TitleBar::new().when(cfg!(target_os = "macos"), |bar| bar.pl(inset)).child(
-            h_flex()
-                .flex_1()
-                .items_center()
-                .gap_2()
-                // Nothing follows the chip on macOS, so keep it off the edge.
-                .when(cfg!(target_os = "macos"), |bar| bar.pr_3())
-                .child(
-                    Button::new("toggle-sidebar")
-                        .ghost()
-                        .small()
-                        .icon(
-                            Icon::new(if self.sidebar_open {
-                                IconName::PanelLeftClose
-                            } else {
-                                IconName::PanelLeftOpen
-                            })
-                            .size_4(),
-                        )
-                        .tooltip_with_action("Toggle sidebar", &ToggleSidebar, None)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.sidebar_open = !this.sidebar_open;
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    h_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .justify_center()
-                        .when(self.page == Page::Chat, |this| {
-                            this.child(self.session_title(cx))
-                        }),
-                )
-                .child(self.account_chip(cx)),
-        )
+        let inset = if window.is_fullscreen() {
+            px(0.)
+        } else {
+            px(76.)
+        };
+        TitleBar::new()
+            .when(cfg!(target_os = "macos"), |bar| bar.pl(inset))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .items_center()
+                    .gap_2()
+                    // Nothing follows the chip on macOS, so keep it off the edge.
+                    .when(cfg!(target_os = "macos"), |bar| bar.pr_3())
+                    .child(
+                        Button::new("toggle-sidebar")
+                            .ghost()
+                            .small()
+                            .icon(
+                                Icon::new(if self.sidebar_open {
+                                    IconName::PanelLeftClose
+                                } else {
+                                    IconName::PanelLeftOpen
+                                })
+                                .size_4(),
+                            )
+                            .tooltip_with_action("Toggle sidebar", &ToggleSidebar, None)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.sidebar_open = !this.sidebar_open;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .justify_center()
+                            .when(self.page == Page::Chat, |this| {
+                                this.child(self.session_title(cx))
+                            }),
+                    )
+                    .child(self.account_chip(cx)),
+            )
     }
 
     /// The open session's name, so it is clear which one this is; click
@@ -164,21 +170,13 @@ impl Chat {
                 "Loading every gateway's models".to_string(),
             )
         } else if let Some(e) = &self.gateway_error {
-            (
-                cx.theme().danger,
-                "error",
-                e.clone(),
-            )
+            (cx.theme().danger, "error", e.clone())
         } else {
-            (
-                cx.theme().green,
-                "ready",
-                {
-                    let mut gateways: Vec<&str> = self.models.iter().map(|(g, _)| g.as_str()).collect();
-                    gateways.dedup();
-                    format!("{} models from {}", self.models.len(), gateways.join(", "))
-                },
-            )
+            (cx.theme().green, "ready", {
+                let mut gateways: Vec<&str> = self.models.iter().map(|(g, _)| g.as_str()).collect();
+                gateways.dedup();
+                format!("{} models from {}", self.models.len(), gateways.join(", "))
+            })
         };
         Button::new("gateway")
             .ghost()

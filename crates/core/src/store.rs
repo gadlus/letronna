@@ -663,15 +663,26 @@ mod retire_tests {
 
     #[test]
     fn old_gateways_move_to_letronna_and_known_ones_stay() {
-        let mut s = Settings { gateway: "Retired".into(), model: "retired/some-model".into(), ..Default::default() };
+        let mut s = Settings {
+            gateway: "Retired".into(),
+            model: "retired/some-model".into(),
+            ..Default::default()
+        };
         retire_gateway(&mut s);
         assert_eq!(s.gateway, "Letronna");
         assert_eq!(s.endpoint, "https://api.letronna.ai/v1");
         assert!(s.model.is_empty());
 
-        let mut s = Settings { gateway: "OpenRouter".into(), model: "x/y".into(), ..Default::default() };
+        let mut s = Settings {
+            gateway: "OpenRouter".into(),
+            model: "x/y".into(),
+            ..Default::default()
+        };
         retire_gateway(&mut s);
-        assert_eq!((s.gateway.as_str(), s.model.as_str()), ("OpenRouter", "x/y"));
+        assert_eq!(
+            (s.gateway.as_str(), s.model.as_str()),
+            ("OpenRouter", "x/y")
+        );
     }
 }
 
