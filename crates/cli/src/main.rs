@@ -23,8 +23,11 @@ mod title;
 use args::{HELP, Start, parse};
 use banner::{banner, folder_name, footer, replay};
 use commands::{Flow, command, resume};
-use letronna_core::store;
+use letronna_core::{store, update};
 use session::Runner;
+
+/// How often a session start quietly asks whether there is a newer version.
+const LOOK_FOR_UPDATES: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 fn main() {
     rescue_terminal();
@@ -44,6 +47,10 @@ fn main() {
                 .for_each(|line| render::line(&render::dim(line))),
             Err(error) => render::line(&render::red(&error)),
         }
+        return;
+    }
+    if args.update {
+        update_now();
         return;
     }
     // MCP servers can take seconds to start; started now, their tools are
@@ -115,6 +122,18 @@ fn main() {
     runner.bar.install();
     render::clear();
     banner(&runner, &folder, session);
+    if let Some(version) = update::seen() {
+        render::line(&render::dim(&format!(
+            "Letronna {version} is out · letronna update"
+        )));
+    }
+    // Asked in the background and only said next time, so a start never
+    // waits on the network for it.
+    if update::enabled() && !runner.store.settings.manual_updates && update::due(LOOK_FOR_UPDATES) {
+        std::thread::spawn(|| {
+            let _ = update::check();
+        });
+    }
     if args.start == Start::Choose {
         resume(&mut runner, &mut session, workspace.as_deref());
     } else if runner.store.conversations[session].length() > 0 {
@@ -173,6 +192,48 @@ fn rescue_terminal() {
         render::title("");
         previous(info);
     }));
+}
+
+/// `letronna update`: download the newest version, check it, and put it in
+/// place of this one. The window, when it is installed, is replaced with it.
+fn update_now() {
+    let release = match input::busy("looking for a newer version", update::check) {
+        Ok(Some(release)) => release,
+        Ok(None) => {
+            render::line(&render::dim(&format!(
+                "This is the newest version, {}.",
+                update::VERSION
+            )));
+            return;
+        }
+        Err(error) => {
+            render::line(&render::red(&error));
+            std::process::exit(1);
+        }
+    };
+    render::line(&format!(
+        "Letronna {} is out {}",
+        release.version,
+        render::dim(&format!("(this is {})", update::VERSION))
+    ));
+    let version = release.version.clone();
+    // The window may have downloaded it already.
+    if update::staged().as_ref() != Some(&version) {
+        let label = format!("downloading {version}");
+        if let Err(error) = input::busy(&label, move || update::download(&release)) {
+            render::line(&render::red(&error));
+            std::process::exit(1);
+        }
+    }
+    match update::install() {
+        Ok(_) => render::line(&render::dim(&format!(
+            "Updated to {version}. Start letronna again to use it."
+        ))),
+        Err(error) => {
+            render::line(&render::red(&error));
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Start the window. It is a separate binary because a GUI-subsystem
