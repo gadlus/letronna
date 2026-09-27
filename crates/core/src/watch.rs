@@ -19,7 +19,7 @@
 //! connection without waiting for answers, looked for every `INPUT_GAP`.
 
 use crate::browser::{follow_opened_tab, follow_remaining_tab, key, key_events};
-use crate::cdp::{Event, Ignored, Tab};
+use crate::cdp::{Event, Ignored, Reach, Tab};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -244,13 +244,19 @@ pub enum Control {
 }
 
 /// The tab being watched.
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 struct Followed {
-    /// Its debugging socket.
-    socket: String,
+    /// How to reach the browser it is in.
+    reach: Reach,
     id: String,
-    /// In a browser with no window of its own.
-    headless: bool,
+}
+
+impl PartialEq for Followed {
+    /// The same tab: a tab's id is its browser's own random one, and one
+    /// browser is followed at a time.
+    fn eq(&self, other: &Followed) -> bool {
+        self.id == other.id
+    }
 }
 
 #[derive(Default)]
@@ -341,13 +347,12 @@ pub(crate) fn watched() -> bool {
 }
 
 /// The tab the agent now uses, which the pictures follow.
-pub(crate) fn follow(socket: &str, id: &str, headless: bool) {
+pub(crate) fn follow(reach: &Reach, id: &str) {
     let (lock, wake) = state();
     if let Ok(mut watch) = lock.lock() {
         watch.tab = Some(Followed {
-            socket: socket.to_owned(),
+            reach: reach.clone(),
             id: id.to_owned(),
-            headless,
         });
         wake.notify_all();
     }
@@ -464,17 +469,18 @@ fn run() {
 }
 
 /// Whether the window still wants pictures from this tab.
-fn still(socket: &str) -> bool {
-    state().0.lock().is_ok_and(|watch| {
-        watch.watched() && watch.tab.as_ref().is_some_and(|tab| tab.socket == socket)
-    })
+fn still(id: &str) -> bool {
+    state()
+        .0
+        .lock()
+        .is_ok_and(|watch| watch.watched() && watch.tab.as_ref().is_some_and(|tab| tab.id == id))
 }
 
 /// Hand on pictures from one tab, and what the user does to it, until the
 /// window stops watching it.
 fn stream(followed: &Followed) -> Result<(), String> {
     let mut stream = Stream::start(followed)?;
-    while still(&followed.socket) {
+    while still(&followed.id) {
         stream.turn()?;
     }
     // The page open now keeps the size it was zoomed to otherwise.
@@ -540,7 +546,7 @@ struct Stream {
 
 impl Stream {
     fn start(followed: &Followed) -> Result<Stream, String> {
-        let mut tab = Tab::connect(&followed.socket, &followed.id)?;
+        let mut tab = followed.reach.open(&followed.id)?;
         // Dialogs, loads and new tabs are heard here too, and a dialog
         // waits for the user.
         tab.leaves_dialogs = true;
@@ -549,7 +555,7 @@ impl Stream {
         drop(take_controls());
         let mut stream = Stream {
             tab,
-            headless: followed.headless,
+            headless: followed.reach.headless,
             room: None,
             fitted: Instant::now() - FIT_GAP,
             laid_out: false,
@@ -1123,7 +1129,7 @@ mod tests {
     #[test]
     fn the_window_sees_the_newest_picture_and_the_page_does_what_the_user_does() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let socket = format!("ws://{}/devtools/page/W1", listener.local_addr().unwrap());
+        let reach = Reach::on_port(listener.local_addr().unwrap().port(), true);
         let (heard_to, heard) = std::sync::mpsc::channel();
         std::thread::spawn(move || fake_tab(listener, heard_to));
         let wait_for = |method: &str| -> Value {
@@ -1135,7 +1141,7 @@ mod tests {
             }
         };
         let watching = watch();
-        follow(&socket, "W1", true);
+        follow(&reach, "W1");
         let seen = |frame: Frame| (String::from_utf8(frame.image).unwrap(), frame.width);
         // A burst gives the newest, and nothing after it: never one out of
         // date.

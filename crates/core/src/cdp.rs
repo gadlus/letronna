@@ -12,15 +12,22 @@
 //! the answer comes back, dealing on the way with whatever else the page said;
 //! anything the page says while nobody is asking waits in the socket for the
 //! next call. No thread, no timer, nothing to wake up for.
+//!
+//! A browser elsewhere -- a cloud one, or Chrome on another machine -- is
+//! reached by one address instead, and gives one socket for the whole
+//! browser rather than one per tab. Every tab driven on it is then a session
+//! on that socket, and a `Link` thread reads it, handing each answer to
+//! whoever asked and each event to the session it is about.
 
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 use tungstenite::{Message as Frame, WebSocket};
 
@@ -31,6 +38,12 @@ const CALL_TIME: Duration = Duration::from_secs(20);
 const START_TIME: Duration = Duration::from_secs(20);
 /// How long the debugging port gets to answer a look at whether it is up.
 const PROBE_TIME: Duration = Duration::from_secs(2);
+/// How long a browser elsewhere gets to take the connection: it may be
+/// across the world, and a cloud one starts a browser for it.
+const REMOTE_TIME: Duration = Duration::from_secs(15);
+/// How often the one socket to a browser elsewhere stops reading to send
+/// what its tabs have asked: the most a request waits to go.
+const LINK_POLL: Duration = Duration::from_millis(10);
 /// The largest message taken from the browser. A long page's accessibility
 /// tree runs to megabytes -- Wikipedia's article on Rust is 8.5 MB -- and one
 /// past this is refused rather than held in memory.
@@ -265,6 +278,8 @@ pub struct Reach {
     pub headless: bool,
     /// What it calls itself to sites.
     agent: String,
+    /// The one socket to a browser elsewhere, for one reached by address.
+    link: Option<Arc<Link>>,
 }
 
 /// One tab, as the browser lists it.
@@ -363,8 +378,53 @@ impl Browser {
             port,
             headless: agent.contains(HEADLESS),
             agent,
+            link: None,
         };
         Browser { reach, child }
+    }
+
+    /// A browser elsewhere, at `address`: a cloud browser's connect address,
+    /// its key in it as the service gives it, or the DevTools address of
+    /// Chrome on another machine (`http://host:9222`), which says where its
+    /// socket is.
+    pub fn remote(address: &str) -> Result<Browser, String> {
+        let address = address.trim();
+        let socket = match address.starts_with("http://") || address.starts_with("https://") {
+            true => {
+                // Not the quick look used on this computer: it may be far.
+                let far = reqwest::blocking::Client::builder()
+                    .timeout(REMOTE_TIME)
+                    .no_proxy()
+                    .build()
+                    .map_err(|e| format!("Could not set up a connection to the browser: {e}"))?;
+                let version: Value = far
+                    .get(format!("{}/json/version", address.trim_end_matches('/')))
+                    .send()
+                    .and_then(|reply| reply.json())
+                    .map_err(|_| format!("Nothing at {} answered as a browser.", shown(address)))?;
+                version["webSocketDebuggerUrl"]
+                    .as_str()
+                    .ok_or_else(|| {
+                        format!(
+                            "The browser at {} did not say where to reach it.",
+                            shown(address)
+                        )
+                    })?
+                    .to_owned()
+            }
+            false => address.to_owned(),
+        };
+        let link = Link::open(&socket)?;
+        let version: Value =
+            Tab::over(&link, None, "browser").call("Browser.getVersion", json!({}))?;
+        let agent = version["userAgent"].as_str().unwrap_or_default().to_owned();
+        let reach = Reach {
+            port: 0,
+            headless: agent.contains(HEADLESS),
+            agent,
+            link: Some(link),
+        };
+        Ok(Browser { reach, child: None })
     }
 
     /// A browser with no window that an earlier run left on the profile --
@@ -389,8 +449,13 @@ impl Browser {
         (!driven).then_some(browser)
     }
 
-    /// Close the whole browser, every tab of it.
+    /// Close the whole browser, every tab of it. One elsewhere is somebody
+    /// else's and outlives Letronna: it is only let go of, with the private
+    /// contexts made on it.
     pub fn close(&mut self) {
+        if let Some(link) = &self.reach.link {
+            return link.let_go();
+        }
         if let Ok(mut browser) = self.reach.connect() {
             let _ = browser.call::<Ignored>("Browser.close", json!({}));
         }
@@ -417,11 +482,17 @@ impl Browser {
 impl Reach {
     /// Whether the browser still answers.
     pub fn alive(&self) -> bool {
-        running(self.port).is_some()
+        match &self.link {
+            Some(link) => link.open.load(Ordering::Relaxed),
+            None => running(self.port).is_some(),
+        }
     }
 
     /// A connection to the browser itself, rather than to one of its tabs.
     fn connect(&self) -> Result<Tab, String> {
+        if let Some(link) = &self.link {
+            return Ok(Tab::over(link, None, "browser"));
+        }
         let version: Value = http()?
             .get(format!("http://127.0.0.1:{}/json/version", self.port))
             .send()
@@ -433,14 +504,44 @@ impl Reach {
         Tab::connect(socket, "browser")
     }
 
+    /// A browser on this computer at `port`, for tests to stand in for.
+    #[cfg(test)]
+    pub(crate) fn on_port(port: u16, headless: bool) -> Reach {
+        Reach {
+            port,
+            headless,
+            agent: String::new(),
+            link: None,
+        }
+    }
+
     /// A tab's own debugging socket.
-    pub fn socket_of(&self, id: &str) -> String {
+    fn socket_of(&self, id: &str) -> String {
         format!("ws://127.0.0.1:{}/devtools/page/{id}", self.port)
+    }
+
+    /// A connection to one tab: its own socket, or a session on the one
+    /// socket to a browser elsewhere.
+    pub fn open(&self, id: &str) -> Result<Tab, String> {
+        let Some(link) = &self.link else {
+            return Tab::connect(&self.socket_of(id), id);
+        };
+        let attached: Value = self.connect()?.call(
+            "Target.attachToTarget",
+            json!({"targetId": id, "flatten": true}),
+        )?;
+        let session = attached["sessionId"]
+            .as_str()
+            .ok_or("The browser did not let the tab be driven.")?;
+        Ok(Tab::over(link, Some(session.to_owned()), id))
     }
 
     /// The tabs in a browser context -- a private one, or with `None` the
     /// browser's own -- the one used most recently first.
     pub fn tabs(&self, context: Option<&str>) -> Result<Vec<Target>, String> {
+        if self.link.is_some() {
+            return self.tabs_elsewhere(context);
+        }
         let listed: Vec<Target> = http()?
             .get(format!("http://127.0.0.1:{}/json/list", self.port))
             .send()
@@ -475,9 +576,42 @@ impl Reach {
             .collect())
     }
 
+    /// The tabs in a browser context of a browser elsewhere, which lists
+    /// them only as targets, in no order of use.
+    fn tabs_elsewhere(&self, context: Option<&str>) -> Result<Vec<Target>, String> {
+        let mut browser = self.connect()?;
+        let targets: Value = browser.call("Target.getTargets", json!({}))?;
+        let private: Value = browser.call("Target.getBrowserContexts", json!({}))?;
+        let private: Vec<&str> = private["browserContextIds"]
+            .as_array()
+            .map(|ids| ids.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        Ok(targets["targetInfos"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter(|info| info["type"] == "page")
+            .filter(|info| {
+                let own = info["browserContextId"].as_str().unwrap_or_default();
+                match context {
+                    Some(context) => own == context,
+                    None => !private.contains(&own),
+                }
+            })
+            .map(|info| Target {
+                id: info["targetId"].as_str().unwrap_or_default().to_owned(),
+                title: info["title"].as_str().unwrap_or_default().to_owned(),
+                url: info["url"].as_str().unwrap_or_default().to_owned(),
+                kind: "page".into(),
+                socket: String::new(),
+            })
+            .collect())
+    }
+
     /// A new blank tab in a browser context.
     pub fn new_tab(&self, context: Option<&str>) -> Result<Target, String> {
-        let Some(context) = context else {
+        let Some(context) = context.or(self.link.as_ref().map(|_| "")) else {
             return http()?
                 .put(format!(
                     "http://127.0.0.1:{}/json/new?about:blank",
@@ -487,9 +621,14 @@ impl Reach {
                 .and_then(|reply| reply.json())
                 .map_err(|_| "The browser did not open a new tab.".to_owned());
         };
+        // A browser elsewhere makes its own tabs too; an empty context is
+        // its own.
         let made: Value = self.connect()?.call(
             "Target.createTarget",
-            json!({"url": "about:blank", "browserContextId": context}),
+            in_context(
+                json!({"url": "about:blank"}),
+                Some(context).filter(|c| !c.is_empty()),
+            ),
         )?;
         let id = made["targetId"]
             .as_str()
@@ -510,14 +649,25 @@ impl Reach {
             "Target.createBrowserContext",
             json!({"disposeOnDetach": false}),
         )?;
-        made["browserContextId"]
+        let context = made["browserContextId"]
             .as_str()
             .map(str::to_owned)
-            .ok_or_else(|| "The browser did not make a private context.".to_owned())
+            .ok_or_else(|| "The browser did not make a private context.".to_owned())?;
+        if let Some(link) = &self.link
+            && let Ok(mut made) = link.contexts.lock()
+        {
+            made.push(context.clone());
+        }
+        Ok(context)
     }
 
     /// Close a private browser context, every tab of it, and forget it.
     pub fn drop_context(&self, context: &str) {
+        if let Some(link) = &self.link
+            && let Ok(mut made) = link.contexts.lock()
+        {
+            made.retain(|made| made != context);
+        }
         if let Ok(mut browser) = self.connect() {
             let _ = browser.call::<Ignored>(
                 "Target.disposeBrowserContext",
@@ -561,7 +711,10 @@ impl Reach {
 
     /// Connect to a tab, ready to be driven.
     pub fn attach(&self, target: &Target) -> Result<Tab, String> {
-        let mut tab = Tab::connect(&target.socket, &target.id)?;
+        let mut tab = match self.link {
+            Some(_) => self.open(&target.id)?,
+            None => Tab::connect(&target.socket, &target.id)?,
+        };
         tab.call::<Ignored>("Page.enable", json!({}))?;
         tab.call::<Ignored>("Page.setLifecycleEventsEnabled", json!({"enabled": true}))?;
         // Some sites turn away a browser that says it has no window. This
@@ -578,6 +731,13 @@ impl Reach {
 
     /// Bring a tab to the front of its window.
     pub fn show(&self, target: &Target) {
+        if self.link.is_some() {
+            if let Ok(mut browser) = self.connect() {
+                let _ = browser
+                    .call::<Ignored>("Target.activateTarget", json!({"targetId": target.id}));
+            }
+            return;
+        }
         if let Ok(client) = http() {
             let _ = client
                 .get(format!(
@@ -622,7 +782,7 @@ struct Refusal {
 /// A connection to one tab.
 pub struct Tab {
     pub id: String,
-    socket: WebSocket<TcpStream>,
+    wire: Wire,
     next: u64,
     /// Set once the connection has failed. The tab is no use after that: it
     /// was closed, or the browser was.
@@ -640,7 +800,55 @@ pub struct Tab {
     pub leaves_dialogs: bool,
 }
 
+/// How a tab is talked to.
+enum Wire {
+    /// A socket of its own, as a browser on this computer gives each tab.
+    Socket(WebSocket<TcpStream>),
+    /// A session on the one socket to a browser elsewhere -- or none, for
+    /// the browser itself -- with the answers and events meant for it.
+    Session {
+        link: Arc<Link>,
+        session: Option<String>,
+        inbox: mpsc::Receiver<String>,
+        to_inbox: mpsc::Sender<String>,
+    },
+}
+
 impl Tab {
+    /// A tab, or with no session the browser itself, on the one socket to a
+    /// browser elsewhere.
+    fn over(link: &Arc<Link>, session: Option<String>, id: &str) -> Tab {
+        let (to_inbox, inbox) = mpsc::channel();
+        if let Some(session) = &session
+            && let Ok(mut sessions) = link.sessions.lock()
+        {
+            sessions.insert(session.clone(), to_inbox.clone());
+        }
+        Tab::on(
+            id,
+            Wire::Session {
+                link: link.clone(),
+                session,
+                inbox,
+                to_inbox,
+            },
+        )
+    }
+
+    fn on(id: &str, wire: Wire) -> Tab {
+        Tab {
+            id: id.to_owned(),
+            wire,
+            next: 0,
+            broken: false,
+            events: VecDeque::new(),
+            agree: false,
+            dialogs: Vec::new(),
+            open_dialog: None,
+            leaves_dialogs: false,
+        }
+    }
+
     /// Connect to a debugging socket, such as a tab's `webSocketDebuggerUrl`.
     pub fn connect(address: &str, id: &str) -> Result<Tab, String> {
         let unreachable = || "Could not connect to the browser.".to_owned();
@@ -660,17 +868,7 @@ impl Tab {
             .max_frame_size(Some(MAX_MESSAGE));
         let (socket, _) = tungstenite::client::client_with_config(address, stream, Some(config))
             .map_err(|_| unreachable())?;
-        Ok(Tab {
-            id: id.to_owned(),
-            socket,
-            next: 0,
-            broken: false,
-            events: VecDeque::new(),
-            agree: false,
-            dialogs: Vec::new(),
-            open_dialog: None,
-            leaves_dialogs: false,
-        })
+        Ok(Tab::on(id, Wire::Socket(socket)))
     }
 
     /// Ask the browser something and wait for its answer.
@@ -741,25 +939,70 @@ impl Tab {
     }
 
     fn send(&mut self, method: &str, params: Value) -> Result<u64, String> {
-        self.next += 1;
-        let request = json!({"id": self.next, "method": method, "params": params});
-        if self.socket.send(Frame::text(request.to_string())).is_err() {
+        let sent = match &mut self.wire {
+            Wire::Socket(socket) => {
+                self.next += 1;
+                let request = json!({"id": self.next, "method": method, "params": params});
+                socket
+                    .send(Frame::text(request.to_string()))
+                    .map(|_| self.next)
+                    .map_err(drop)
+            }
+            // Ids are the socket's, not the tab's: every tab on it shares them.
+            Wire::Session {
+                link,
+                session,
+                to_inbox,
+                ..
+            } => {
+                let id = link.next.fetch_add(1, Ordering::Relaxed) + 1;
+                let mut request = json!({"id": id, "method": method, "params": params});
+                if let Some(session) = session {
+                    request["sessionId"] = json!(session);
+                }
+                if let Ok(mut waiting) = link.waiting.lock() {
+                    waiting.insert(id, to_inbox.clone());
+                }
+                link.send(request.to_string()).map(|_| id)
+            }
+        };
+        sent.map_err(|_| {
             self.broken = true;
-            return Err(GONE.into());
-        }
-        Ok(self.next)
+            GONE.to_owned()
+        })
     }
 
     /// The next frame's text, or `None` once `deadline` has passed.
     fn read(&mut self, deadline: Instant) -> Result<Option<tungstenite::Utf8Bytes>, String> {
+        let socket = match &mut self.wire {
+            Wire::Socket(socket) => socket,
+            Wire::Session { link, inbox, .. } => loop {
+                let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                    return Ok(None);
+                };
+                // Looked at again now and then: the socket may have gone.
+                match inbox.recv_timeout(left.clamp(Duration::from_millis(1), PROBE_TIME)) {
+                    Ok(text) if text == DETACHED => {
+                        self.broken = true;
+                        return Err(GONE.into());
+                    }
+                    Ok(text) => return Ok(Some(text.into())),
+                    Err(mpsc::RecvTimeoutError::Timeout) if link.open.load(Ordering::Relaxed) => {}
+                    Err(_) => {
+                        self.broken = true;
+                        return Err(GONE.into());
+                    }
+                }
+            },
+        };
         loop {
             let Some(left) = deadline.checked_duration_since(Instant::now()) else {
                 return Ok(None);
             };
             // A zero timeout means none at all, which would wait forever.
             let left = left.max(Duration::from_millis(1));
-            let _ = self.socket.get_ref().set_read_timeout(Some(left));
-            match self.socket.read() {
+            let _ = socket.get_ref().set_read_timeout(Some(left));
+            match socket.read() {
                 Ok(Frame::Text(text)) => return Ok(Some(text)),
                 Ok(Frame::Close(_)) => break,
                 Ok(_) => continue,
@@ -818,7 +1061,235 @@ impl Tab {
     }
 }
 
+impl Drop for Tab {
+    /// A session on a browser elsewhere is let go of there too.
+    fn drop(&mut self) {
+        if let Wire::Session {
+            link,
+            session: Some(session),
+            ..
+        } = &self.wire
+        {
+            if let Ok(mut sessions) = link.sessions.lock() {
+                sessions.remove(session);
+            }
+            let id = link.next.fetch_add(1, Ordering::Relaxed) + 1;
+            let detach = json!({"id": id, "method": "Target.detachFromTarget",
+                "params": {"sessionId": session}});
+            let _ = link.send(detach.to_string());
+        }
+    }
+}
+
 const GONE: &str = "The browser tab was closed.";
+
+/// Handed to a session's tab when the browser lets the session go. Not
+/// JSON, so nothing takes it for the browser's word.
+const DETACHED: &str = "detached";
+
+/// The one socket to a browser elsewhere, shared by every tab driven on it.
+pub struct Link {
+    /// What the tabs ask, for the thread to send.
+    outgoing: Mutex<mpsc::Sender<String>>,
+    /// Who waits for the answer to each request, by its id.
+    waiting: Mutex<HashMap<u64, mpsc::Sender<String>>>,
+    /// Where each session's events go.
+    sessions: Mutex<HashMap<String, mpsc::Sender<String>>>,
+    next: AtomicU64,
+    open: AtomicBool,
+    /// Private contexts made on it, closed when it is let go of: the browser
+    /// is somebody else's, and they would stay there.
+    contexts: Mutex<Vec<String>>,
+}
+
+impl Link {
+    fn open(address: &str) -> Result<Arc<Link>, String> {
+        let unreachable =
+            |why: String| format!("Could not reach the browser at {}: {why}", shown(address));
+        // Parsed, it gains the `/` a service's `wss://host?token=…` leaves out,
+        // which the handshake needs.
+        let url = reqwest::Url::parse(address).map_err(|_| unreachable("not an address".into()))?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| unreachable("no host".into()))?;
+        let port = url
+            .port_or_known_default()
+            .ok_or_else(|| unreachable("no port".into()))?;
+        let place = (host, port)
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut places| places.next())
+            .ok_or_else(|| unreachable("the name did not resolve".into()))?;
+        let stream = TcpStream::connect_timeout(&place, REMOTE_TIME)
+            .map_err(|e| unreachable(e.to_string()))?;
+        let _ = stream.set_nodelay(true);
+        let _ = stream.set_read_timeout(Some(REMOTE_TIME));
+        let config = tungstenite::protocol::WebSocketConfig::default()
+            .max_message_size(Some(MAX_MESSAGE))
+            .max_frame_size(Some(MAX_MESSAGE));
+        let (socket, _) =
+            tungstenite::client_tls_with_config(url.as_str(), stream, Some(config), None).map_err(
+                |e| match e {
+                    tungstenite::HandshakeError::Failure(tungstenite::Error::Http(reply))
+                        if matches!(reply.status().as_u16(), 401 | 403) =>
+                    {
+                        format!(
+                            "The browser at {} refused the key in its address (HTTP {}).",
+                            shown(address),
+                            reply.status().as_u16()
+                        )
+                    }
+                    e => unreachable(e.to_string()),
+                },
+            )?;
+        let (outgoing, queue) = mpsc::channel();
+        let link = Arc::new(Link {
+            outgoing: Mutex::new(outgoing),
+            waiting: Mutex::default(),
+            sessions: Mutex::default(),
+            next: AtomicU64::new(0),
+            open: AtomicBool::new(true),
+            contexts: Mutex::default(),
+        });
+        let reader = link.clone();
+        std::thread::spawn(move || reader.run(socket, queue));
+        Ok(link)
+    }
+
+    fn send(&self, text: String) -> Result<(), ()> {
+        if !self.open.load(Ordering::Relaxed) {
+            return Err(());
+        }
+        let outgoing = self.outgoing.lock().map_err(drop)?;
+        outgoing.send(text).map_err(drop)
+    }
+
+    /// Send what is asked and read what comes, until the socket closes or
+    /// is let go of.
+    fn run(
+        &self,
+        mut socket: WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+        queue: mpsc::Receiver<String>,
+    ) {
+        use tungstenite::stream::MaybeTlsStream;
+        let stream = match socket.get_ref() {
+            MaybeTlsStream::Plain(stream) => Some(stream),
+            MaybeTlsStream::Rustls(tls) => Some(tls.get_ref()),
+            _ => None,
+        };
+        if let Some(stream) = stream {
+            let _ = stream.set_read_timeout(Some(LINK_POLL));
+        }
+        'running: loop {
+            while let Ok(text) = queue.try_recv() {
+                if socket.send(Frame::text(text)).is_err() {
+                    break 'running;
+                }
+            }
+            if !self.open.load(Ordering::Relaxed) {
+                break;
+            }
+            match socket.read() {
+                Ok(Frame::Text(text)) => self.hand_on(text.as_str().to_owned()),
+                Ok(Frame::Close(_)) => break,
+                Ok(_) => {}
+                // Nothing yet: a timed-out read keeps what it had of a frame.
+                Err(tungstenite::Error::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(_) => break,
+            }
+        }
+        self.open.store(false, Ordering::Relaxed);
+        let _ = socket.close(None);
+        let _ = socket.flush();
+        // Whoever still waits hears it is gone now, not at their time limit.
+        if let Ok(mut waiting) = self.waiting.lock() {
+            waiting.clear();
+        }
+        if let Ok(mut sessions) = self.sessions.lock() {
+            sessions.clear();
+        }
+    }
+
+    /// Hand an answer to whoever asked, and an event to its session.
+    fn hand_on(&self, text: String) {
+        #[derive(Deserialize)]
+        struct Routing {
+            id: Option<u64>,
+            #[serde(rename = "sessionId")]
+            session: Option<String>,
+            method: Option<String>,
+        }
+        let Ok(routing) = serde_json::from_str::<Routing>(&text) else {
+            return;
+        };
+        // A session let go of by the browser, as when its tab closed: a tab
+        // with a socket of its own sees it close, and this one is told.
+        if routing.method.as_deref() == Some("Target.detachedFromTarget") {
+            #[derive(Deserialize)]
+            struct Detached {
+                params: Session,
+            }
+            #[derive(Deserialize)]
+            struct Session {
+                #[serde(rename = "sessionId")]
+                session: String,
+            }
+            let gone = serde_json::from_str::<Detached>(&text)
+                .ok()
+                .and_then(|detached| self.sessions.lock().ok()?.remove(&detached.params.session));
+            if let Some(to) = gone {
+                let _ = to.send(DETACHED.to_owned());
+            }
+            return;
+        }
+        let to = match (routing.id, routing.session) {
+            (Some(id), _) => self.waiting.lock().ok().and_then(|mut w| w.remove(&id)),
+            (None, Some(session)) => self
+                .sessions
+                .lock()
+                .ok()
+                .and_then(|s| s.get(&session).cloned()),
+            (None, None) => None,
+        };
+        if let Some(to) = to {
+            let _ = to.send(text);
+        }
+    }
+
+    /// Close the private contexts made on it, and the socket.
+    fn let_go(&self) {
+        let contexts = self
+            .contexts
+            .lock()
+            .map(|mut c| std::mem::take(&mut *c))
+            .unwrap_or_default();
+        for context in contexts {
+            let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
+            let dispose = json!({"id": id, "method": "Target.disposeBrowserContext",
+                "params": {"browserContextId": context}});
+            let _ = self.send(dispose.to_string());
+        }
+        // The thread sends what is queued before it sees this and stops.
+        self.open.store(false, Ordering::Relaxed);
+    }
+}
+
+/// An address as it may be shown: without what follows the host, where a
+/// service puts its key.
+pub(crate) fn shown(address: &str) -> String {
+    match reqwest::Url::parse(address) {
+        Ok(url) => match (url.host_str(), url.port()) {
+            (Some(host), Some(port)) => format!("{}://{host}:{port}", url.scheme()),
+            (Some(host), None) => format!("{}://{host}", url.scheme()),
+            _ => "that address".into(),
+        },
+        Err(_) => "that address".into(),
+    }
+}
 
 /// Whether a dialog is answered OK. Leaving a page and closing a message
 /// are what the action was for; anything asking for agreement is refused

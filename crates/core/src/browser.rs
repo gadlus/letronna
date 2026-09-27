@@ -13,6 +13,11 @@
 //! profile to remember, or get past a check a site puts up.
 //! `LETRONNA_BROWSER_HEADLESS=0` gives it a window of its own, for a site
 //! that turns away a browser without one.
+//!
+//! It can be elsewhere instead: a cloud browser, or Chrome on another
+//! machine, at the address saved in Settings (kept in keys.json, as a cloud
+//! browser's has its key in it) or in `LETRONNA_BROWSER_URL`. Everything
+//! works the same there, the panel too, but it has no window here.
 
 use crate::cdp::{self, Event, Ignored, Tab};
 use crate::page::{PAGE_CHARS, Page, Refs, Tree, cut, matching, page, ref_number, window};
@@ -742,7 +747,10 @@ impl Browsers {
         {
             return Ok(browser.reach.clone());
         }
-        let browser = cdp::Browser::start(&self.profile, headless(), watch::scale())?;
+        let browser = match remote_address() {
+            Some(address) => cdp::Browser::remote(&address)?,
+            None => cdp::Browser::start(&self.profile, headless(), watch::scale())?,
+        };
         let reach = browser.reach.clone();
         self.browser = Some(browser);
         self.sessions.clear();
@@ -859,6 +867,35 @@ impl Browsers {
     }
 }
 
+/// Where the browser's address is kept among the keys.
+pub const ELSEWHERE: &str = "Browser";
+
+/// Where the browser is when it is not on this computer: the address in
+/// `LETRONNA_BROWSER_URL`, else the one saved in Settings.
+pub fn remote_address() -> Option<String> {
+    std::env::var("LETRONNA_BROWSER_URL")
+        .ok()
+        .or_else(|| crate::store::load_keys().remove(ELSEWHERE))
+        .map(|address| address.trim().to_owned())
+        .filter(|address| !address.is_empty())
+}
+
+/// Where the browser is when it is not on this computer, as it may be
+/// shown: without the key its address may carry.
+pub fn remote_place() -> Option<String> {
+    remote_address().map(|address| cdp::shown(&address))
+}
+
+/// Let go of the running browser, keeping each conversation's page and
+/// sign-ins, so the next use starts one where the settings now say.
+pub fn restart() {
+    std::thread::spawn(|| {
+        if let Ok(mut all) = state().lock() {
+            all.rest();
+        }
+    });
+}
+
 /// Whether the browser has a window of its own: as the user last chose in
 /// Letronna's window, else as `LETRONNA_BROWSER_HEADLESS=0` asks, else not.
 fn own_window() -> &'static AtomicBool {
@@ -884,6 +921,9 @@ pub fn has_window() -> bool {
 /// started again on its profile, which keeps every sign-in made there;
 /// private browsers are kept in memory only, and are not kept.
 pub fn give_window(window: bool) -> Result<(), String> {
+    if window && remote_address().is_some() {
+        return Err("The browser is elsewhere, so it has no window here.".into());
+    }
     own_window().store(window, Ordering::Relaxed);
     let mut all = lock()?;
     // Not running, or already so: it starts as asked when next needed.
@@ -1079,8 +1119,7 @@ impl Session {
     /// Have the window follow this session's tab, if it shows this session.
     fn follow(&self) {
         if self.on_screen() {
-            let socket = self.reach.socket_of(&self.tab.id);
-            watch::follow(&socket, &self.tab.id, self.reach.headless);
+            watch::follow(&self.reach, &self.tab.id);
         }
     }
 
@@ -1268,7 +1307,11 @@ impl Session {
     /// The page as it is now.
     fn read(&mut self, full: bool) -> Result<Page, String> {
         let tree: Tree = self.tab.call("Accessibility.getFullAXTree", json!({}))?;
-        let page = page(&tree, full, &mut self.refs);
+        let mut page = page(&tree, full, &mut self.refs);
+        // An older browser leaves the address out of the tree.
+        if page.url.is_empty() {
+            page.url = self.url();
+        }
         self.page = page.named();
         if watch::watched() && self.on_screen() {
             watch::show(Sight::Page {
@@ -2500,7 +2543,11 @@ mod tests {
             assert_eq!(UsePage.run(&get, &second).unwrap(), "");
 
             // One left running with nothing driving it, as a crash leaves
-            // one, is closed as Letronna starts; one in use is not.
+            // one, is closed as Letronna starts; one in use is not. Only one
+            // on this computer can be left over.
+            if remote_address().is_some() {
+                return;
+            }
             let profile = state().lock().unwrap().profile.clone();
             assert!(cdp::Browser::left_over(&profile).is_none(), "in use");
             let reach = {
