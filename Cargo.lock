@@ -3681,6 +3681,8 @@ dependencies = [
  "async-channel 2.5.0",
  "chrono",
  "reqwest",
+ "ring",
+ "semver",
  "serde",
  "serde_json",
  "tungstenite",

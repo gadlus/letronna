@@ -12,6 +12,10 @@ serde_json.workspace = true
 async-channel.workspace = true
 reqwest.workspace = true
 chrono.workspace = true
+# Checking that an update is signed and whole: ring is already here under
+# rustls, and semver already in the lock file.
+ring = "0.17"
+semver = "1"
 # Discord's Gateway, for hearing server mentions as they happen. Blocking
 # like reqwest here, and on the same rustls.
 tungstenite = { version = "0.30", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
