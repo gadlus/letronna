@@ -193,7 +193,7 @@ pub fn load() -> Config {
 pub fn save(config: &Config) {
     let _ = std::fs::create_dir_all(backend::data_dir());
     if let Ok(bytes) = serde_json::to_vec_pretty(config) {
-        let _ = std::fs::write(path(), bytes);
+        let _ = crate::store::write_private(&path(), &bytes);
     }
 }
 

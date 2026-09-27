@@ -209,7 +209,7 @@ fn client(timeout: Duration) -> Result<reqwest::blocking::Client, String> {
 fn remember(account: &Account) -> Result<(), String> {
     let _ = std::fs::create_dir_all(backend::data_dir());
     let bytes = serde_json::to_vec_pretty(account).map_err(|e| e.to_string())?;
-    std::fs::write(path(), bytes).map_err(|e| e.to_string())
+    crate::store::write_private(&path(), &bytes).map_err(|e| e.to_string())
 }
 
 /// A sign-in waiting for the browser to come back.
