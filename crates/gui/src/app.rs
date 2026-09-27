@@ -210,6 +210,7 @@ impl Chat {
         std::thread::spawn(letronna_core::browser::close_left_over);
         if store.conversations.is_empty() {
             store.conversations.push(Conversation {
+                id: store.reserve_id(),
                 title: "New session".into(),
                 updated: backend::now(),
                 ..Default::default()
@@ -532,7 +533,7 @@ impl Chat {
             .workspace
             .clone();
         self.store.conversations.push(Conversation {
-            id: self.store.next_id(),
+            id: self.store.reserve_id(),
             title: "New session".into(),
             updated: backend::now(),
             workspace,
@@ -687,7 +688,7 @@ impl Chat {
         cx: &mut Context<Self>,
     ) {
         self.store.conversations.push(Conversation {
-            id: self.store.next_id(),
+            id: self.store.reserve_id(),
             title: schedule.name.clone(),
             updated: backend::now(),
             workspace: schedule.workspace.clone(),
@@ -982,7 +983,7 @@ impl Chat {
                     .workspace
                     .clone();
                 self.store.conversations.push(Conversation {
-                    id: self.store.next_id(),
+                    id: self.store.reserve_id(),
                     title: message.text.chars().take(40).collect(),
                     updated: backend::now(),
                     workspace,

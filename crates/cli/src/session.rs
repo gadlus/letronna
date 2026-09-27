@@ -423,7 +423,7 @@ impl Runner {
     /// A session of its own.
     pub fn start(&mut self, workspace: Option<std::path::PathBuf>) -> usize {
         self.store.conversations.push(Conversation {
-            id: self.store.next_id(),
+            id: self.store.reserve_id(),
             title: String::new(),
             updated: chat::now(),
             workspace,
