@@ -335,7 +335,7 @@ impl Chat {
             thinking_open: std::collections::HashSet::new(),
             video: None,
             video_frame: None,
-            browser: cx.new(|_| crate::ui::browser::BrowserView::new()),
+            browser: cx.new(|cx| crate::ui::browser::BrowserView::new(window, cx)),
             error,
             scroll: ScrollHandle::new(),
             _subscriptions: subscriptions,

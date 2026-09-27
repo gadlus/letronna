@@ -71,6 +71,15 @@ const SWITCHES: &[&str] = &[
 /// A window size for a browser with no window, which otherwise draws pages
 /// at 800 by 600 and gets the phone layout of many sites.
 const HIDDEN_WINDOW: &str = "--window-size=1280,900";
+/// A browser with no window draws without the GPU. It is only ever seen as
+/// screencast pictures, which the GPU would have to copy back out of its
+/// own memory: with Wikipedia's Rust article open in the window's panel,
+/// 418 MB and 46% of a core while scrolling, against 605 MB and 59% with
+/// the GPU. What goes is WebGL, which pages an agent reads seldom need.
+const NO_GPU: &str = "--disable-gpu";
+/// What a browser with no window calls itself in its user agent, where a
+/// browser with one says "Chrome".
+const HEADLESS: &str = "HeadlessChrome";
 
 /// Where the Chromium browsers install themselves, as a path under a
 /// Windows program folder, most wanted first: Chrome is what sites are
@@ -200,10 +209,11 @@ fn http() -> Result<&'static reqwest::blocking::Client, String> {
     Ok(CLIENT.get_or_init(|| client))
 }
 
-/// Whether a browser's debugging port is up, and if it is, whether that
-/// browser has no window. One found running may not be in the mode asked
-/// for, and a window someone may be using must not be closed as a hidden one.
-fn running(port: u16) -> Option<bool> {
+/// The user agent of the browser whose debugging port this is, if it is up.
+/// It says whether that browser has no window: one found running may not be
+/// in the mode asked for, and a window someone may be using must not be
+/// closed as a hidden one.
+fn running(port: u16) -> Option<String> {
     let version: Value = http()
         .ok()?
         .get(format!("http://127.0.0.1:{port}/json/version"))
@@ -213,8 +223,12 @@ fn running(port: u16) -> Option<bool> {
         .ok()?
         .json()
         .ok()?;
-    let agent = version["User-Agent"].as_str().unwrap_or_default();
-    Some(agent.contains("HeadlessChrome"))
+    Some(
+        version["User-Agent"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+    )
 }
 
 /// A running browser: one Letronna started, or one it found still running on
@@ -225,6 +239,8 @@ pub struct Browser {
     child: Option<Child>,
     /// Running with no window, where nobody can see it or close it.
     pub headless: bool,
+    /// What it calls itself to sites.
+    agent: String,
 }
 
 /// One tab, as the browser lists it.
@@ -250,14 +266,11 @@ impl Target {
 
 impl Browser {
     /// The browser on `profile`: the one already running there, or a new one.
-    pub fn start(profile: &Path, headless: bool) -> Result<Browser, String> {
+    /// One with no window draws at `scale`, the screen's that shows it.
+    pub fn start(profile: &Path, headless: bool, scale: Option<f64>) -> Result<Browser, String> {
         let found = read_port(profile).and_then(|port| Some((port, running(port)?)));
-        if let Some((port, headless)) = found {
-            return Ok(Browser {
-                port,
-                child: None,
-                headless,
-            });
+        if let Some((port, agent)) = found {
+            return Ok(Browser::on(port, None, agent));
         }
         let exe = installed().ok_or(
             "No Chromium browser was found: install Chrome, Edge or Brave, or set \
@@ -279,7 +292,10 @@ impl Browser {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         if headless {
-            command.args(["--headless=new", HIDDEN_WINDOW]);
+            command.args(["--headless=new", HIDDEN_WINDOW, NO_GPU]);
+            if let Some(scale) = scale.filter(|scale| *scale > 1.) {
+                command.arg(format!("--force-device-scale-factor={scale:.2}"));
+            }
         }
         command.arg("about:blank");
         // Its own process group, so ctrl-c in the terminal that started
@@ -298,12 +314,10 @@ impl Browser {
             .map_err(|e| format!("Could not start {name}: {e}"))?;
         let started = Instant::now();
         loop {
-            if let Some(port) = read_port(profile).filter(|port| running(*port).is_some()) {
-                return Ok(Browser {
-                    port,
-                    child: Some(child),
-                    headless,
-                });
+            if let Some((port, agent)) =
+                read_port(profile).and_then(|port| Some((port, running(port)?)))
+            {
+                return Ok(Browser::on(port, Some(child), agent));
             }
             if started.elapsed() > START_TIME {
                 let _ = child.kill();
@@ -324,6 +338,15 @@ impl Browser {
                 ));
             }
             std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn on(port: u16, child: Option<Child>, agent: String) -> Browser {
+        Browser {
+            port,
+            child,
+            headless: agent.contains(HEADLESS),
+            agent,
         }
     }
 
@@ -357,6 +380,15 @@ impl Browser {
         let mut tab = Tab::connect(&target.socket, &target.id)?;
         tab.call::<Ignored>("Page.enable", json!({}))?;
         tab.call::<Ignored>("Page.setLifecycleEventsEnabled", json!({"enabled": true}))?;
+        // Some sites turn away a browser that says it has no window. This
+        // holds while the connection does, which is while the tab is in use.
+        if self.headless {
+            let agent = self.agent.replace(HEADLESS, "Chrome");
+            tab.call::<Ignored>(
+                "Emulation.setUserAgentOverride",
+                json!({"userAgent": agent}),
+            )?;
+        }
         Ok(tab)
     }
 
@@ -385,10 +417,15 @@ impl Browser {
         if let Some(mut browser) = socket.and_then(|socket| Tab::connect(&socket, "browser").ok()) {
             let _ = browser.call::<Ignored>("Browser.close", json!({}));
         }
+        let asked = Instant::now();
+        // One this run did not start is not its child to wait on: it has
+        // gone once its port stops answering, and its profile is free.
         let Some(child) = self.child.as_mut() else {
+            while asked.elapsed() < PROBE_TIME && running(self.port).is_some() {
+                std::thread::sleep(Duration::from_millis(50));
+            }
             return;
         };
-        let asked = Instant::now();
         while asked.elapsed() < PROBE_TIME {
             if let Ok(Some(_)) = child.try_wait() {
                 return;
@@ -444,6 +481,11 @@ pub struct Tab {
     pub agree: bool,
     /// Dialogs answered since these were last taken, as the model is told.
     pub dialogs: Vec<String>,
+    /// The dialog open now: its kind and what it asks.
+    open_dialog: Option<(String, String)>,
+    /// Leave a dialog the page opens for someone to answer, and keep it
+    /// with the other events, rather than answer it at once.
+    pub leaves_dialogs: bool,
 }
 
 impl Tab {
@@ -474,6 +516,8 @@ impl Tab {
             events: VecDeque::new(),
             agree: false,
             dialogs: Vec::new(),
+            open_dialog: None,
+            leaves_dialogs: false,
         })
     }
 
@@ -512,6 +556,13 @@ impl Tab {
                 (None, None) => Err(format!("The browser sent no answer to {method}.")),
             };
         }
+    }
+
+    /// Ask the browser something without waiting for the answer, which is
+    /// let go of when it comes. For input: a click that opens a dialog is
+    /// not answered until the dialog is.
+    pub fn tell(&mut self, method: &str, params: Value) -> Result<(), String> {
+        self.send(method, params).map(drop)
     }
 
     /// Read until an event `until` accepts has come, or `limit` has passed.
@@ -582,18 +633,26 @@ impl Tab {
     /// the action in progress to look at. Where it was kept, if it was.
     fn heard(&mut self, envelope: Envelope) -> Option<usize> {
         let method = envelope.method?;
-        if method == "Page.javascriptDialogOpening" {
-            let kind = envelope.params["type"].as_str().unwrap_or_default();
-            let message = envelope.params["message"].as_str().unwrap_or_default();
-            let (accept, note) = answer(kind, message, self.agree);
+        let text = |key: &str| envelope.params[key].as_str().unwrap_or_default().to_owned();
+        if method == "Page.javascriptDialogOpening" && !self.leaves_dialogs {
+            let (kind, message) = (text("type"), text("message"));
             let reply = json!({
-                "accept": accept,
-                "promptText": envelope.params["defaultPrompt"].as_str().unwrap_or_default(),
+                "accept": agrees(&kind, self.agree),
+                "promptText": text("defaultPrompt"),
             });
             // Its answer is not waited for: the call that was waiting when
             // the dialog opened gets its own once the page moves again.
             let _ = self.send("Page.handleJavaScriptDialog", reply);
-            self.dialogs.push(note);
+            self.open_dialog = Some((kind, message));
+            return None;
+        }
+        // Told once it is closed, and how: the user may have answered it
+        // first, from the window.
+        if method == "Page.javascriptDialogClosed" && !self.leaves_dialogs {
+            if let Some((kind, message)) = self.open_dialog.take() {
+                let agreed = envelope.params["result"].as_bool().unwrap_or(false);
+                self.dialogs.push(note(&kind, &message, agreed));
+            }
             return None;
         }
         if self.events.len() >= MAX_EVENTS {
@@ -609,27 +668,24 @@ impl Tab {
 
 const GONE: &str = "The browser tab was closed.";
 
-/// How a dialog is answered, and what the model is told of it. Leaving a
-/// page and closing a message are what the action was for; anything asking
-/// for agreement is refused unless the action said to agree.
-fn answer(kind: &str, message: &str, agree: bool) -> (bool, String) {
+/// Whether a dialog is answered OK. Leaving a page and closing a message
+/// are what the action was for; anything asking for agreement is refused
+/// unless the action said to agree.
+fn agrees(kind: &str, agree: bool) -> bool {
+    matches!(kind, "beforeunload" | "alert") || agree
+}
+
+/// What the model is told of a dialog, answered OK or not.
+fn note(kind: &str, message: &str, agreed: bool) -> String {
     let message: String = message.chars().take(200).collect();
-    match kind {
-        "beforeunload" => (
-            true,
-            "The page asked to confirm leaving it; it was left.".into(),
-        ),
-        "alert" => (true, format!("The page showed a message: \"{message}\".")),
-        _ if agree => (
-            true,
-            format!("The page asked \"{message}\" and was answered OK."),
-        ),
-        _ => (
-            false,
-            format!(
-                "The page asked \"{message}\" and was answered Cancel; use_page with \
-                 confirm: true answers OK."
-            ),
+    match (kind, agreed) {
+        ("beforeunload", true) => "The page asked to confirm leaving it; it was left.".into(),
+        ("beforeunload", false) => "The page asked to confirm leaving it; it stayed.".into(),
+        ("alert", _) => format!("The page showed a message: \"{message}\"."),
+        (_, true) => format!("The page asked \"{message}\" and was answered OK."),
+        (_, false) => format!(
+            "The page asked \"{message}\" and was answered Cancel; use_page with confirm: \
+             true answers OK."
         ),
     }
 }
@@ -668,16 +724,16 @@ mod tests {
 
     #[test]
     fn a_dialog_is_answered_as_the_action_said() {
-        assert!(answer("alert", "Saved", false).0);
-        assert!(answer("beforeunload", "", false).0);
-        let (ok, note) = answer("confirm", "Delete this?", false);
+        assert!(agrees("alert", false) && agrees("beforeunload", false));
+        assert!(!agrees("confirm", false) && agrees("confirm", true));
+        assert!(!agrees("prompt", false));
+        let refused = note("confirm", "Delete this?", false);
         assert!(
-            !ok && note.contains("Delete this?") && note.contains("confirm: true"),
-            "{note}"
+            refused.contains("Delete this?") && refused.contains("confirm: true"),
+            "{refused}"
         );
-        let (ok, note) = answer("confirm", "Delete this?", true);
-        assert!(ok && note.contains("answered OK"), "{note}");
-        assert!(!answer("prompt", "Your name?", false).0);
+        assert!(note("confirm", "Delete this?", true).contains("answered OK"));
+        assert!(note("beforeunload", "", false).contains("stayed"));
     }
 
     /// A stand-in for a browser's debugging socket: answers each request
@@ -713,7 +769,7 @@ mod tests {
 
     #[test]
     fn a_call_gets_its_answer_past_what_the_page_says_meanwhile() {
-        let (address, server) = fake_browser(|method, _| match method {
+        let (address, server) = fake_browser(|method, params| match method {
             "Page.navigate" => (
                 vec![
                     json!({"method": "Page.frameStartedLoading", "params": {"frameId": "T1"}}),
@@ -722,7 +778,11 @@ mod tests {
                 ],
                 json!({"frameId": "T1", "loaderId": "L2"}),
             ),
-            "Page.handleJavaScriptDialog" => (Vec::new(), json!({})),
+            "Page.handleJavaScriptDialog" => (
+                vec![json!({"method": "Page.javascriptDialogClosed",
+                            "params": {"result": params["accept"]}})],
+                json!({}),
+            ),
             "Broken.method" => (
                 Vec::new(),
                 json!({"error": {"message": "'Broken.method' wasn't found"}}),
@@ -737,9 +797,6 @@ mod tests {
             .call("Page.navigate", json!({"url": "https://example.com"}))
             .unwrap();
         assert_eq!(navigated["loaderId"], "L2");
-        // The dialog was answered on the spot, and No, since nothing agreed.
-        assert_eq!(tab.dialogs.len(), 1);
-        assert!(tab.dialogs[0].contains("Leave?"), "{:?}", tab.dialogs);
         assert_eq!(tab.events.len(), 1);
         assert_eq!(tab.events[0].method, "Page.frameStartedLoading");
         // An event already read counts; a new one is read for.
@@ -749,6 +806,14 @@ mod tests {
                 .unwrap()
         );
         tab.call::<Ignored>("Page.stopLoading", json!({})).unwrap();
+        // The dialog was answered on the spot, and No, since nothing agreed;
+        // the model is told once the page says it closed.
+        assert_eq!(tab.dialogs.len(), 1);
+        assert!(
+            tab.dialogs[0].contains("Leave?") && tab.dialogs[0].contains("Cancel"),
+            "{:?}",
+            tab.dialogs
+        );
         assert!(
             tab.wait(Duration::from_secs(2), |e| e.method
                 == "Page.frameStoppedLoading")

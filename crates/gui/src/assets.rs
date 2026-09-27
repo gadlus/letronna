@@ -58,6 +58,13 @@ impl AssetSource for Assets {
                 "circle-user",
                 "plugs",
                 "palette",
+                "globe",
+                "arrow-left",
+                "arrow-right",
+                "rotate-cw",
+                "pop-out",
+                "pop-in",
+                "view",
                 "list-checks",
                 "circle",
                 "list-filter",
@@ -98,6 +105,11 @@ pub(crate) enum AppIcon {
     User,
     Play,
     Stop,
+    Globe,
+    Reload,
+    PopOut,
+    PopIn,
+    View,
 }
 impl IconNamed for AppIcon {
     fn path(self) -> SharedString {
@@ -127,6 +139,11 @@ impl IconNamed for AppIcon {
             AppIcon::Circle => "icons/circle.svg",
             AppIcon::Play => "icons/play.svg",
             AppIcon::Stop => "icons/stop.svg",
+            AppIcon::Globe => "icons/globe.svg",
+            AppIcon::Reload => "icons/rotate-cw.svg",
+            AppIcon::PopOut => "icons/pop-out.svg",
+            AppIcon::PopIn => "icons/pop-in.svg",
+            AppIcon::View => "icons/view.svg",
         }
         .into()
     }

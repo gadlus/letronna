@@ -28,7 +28,7 @@ crates/core   the agent, and everything both front ends need
   browser.rs  the browse and use_page tools, and what each action does
   page.rs     a page as the model reads it: lines with refs to act on
   cdp.rs      starting the installed browser and talking DevTools to it
-  watch.rs    the browser's pictures and the agent's pointer, for the window
+  watch.rs    the browser in the window: its pictures, the pointer, the user's input
 
 crates/gui    the window (binary `letronna-gui`)
   app.rs      state and actions on `Chat`
