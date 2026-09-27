@@ -245,6 +245,21 @@ impl BrowserView {
         self.watching.is_some() && window.viewport_size().width >= DOCK_WIDTH
     }
 
+    /// How wide the docked panel is, by the same rule its layout uses; zero
+    /// when it is not docked. The chat's column is sized from what is left.
+    pub(crate) fn docked_width(&self, window: &Window) -> Pixels {
+        if !self.docked(window) {
+            return px(0.);
+        }
+        let whole = window.viewport_size().width;
+        let most = (whole - CHAT_ROOM).max(DOCK_MIN);
+        let (width, most) = match self.width {
+            Some(width) => (width, most),
+            None => (whole * DOCK_SHARE, most.min(DOCK_MAX)),
+        };
+        width.max(DOCK_MIN).min(most)
+    }
+
     /// Show the panel, or hide it, as the menu asks. Shown with no page
     /// yet, it is ready for an address.
     pub(crate) fn toggle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
