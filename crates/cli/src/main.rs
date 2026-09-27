@@ -46,6 +46,9 @@ fn main() {
         }
         return;
     }
+    // MCP servers can take seconds to start; started now, their tools are
+    // there by the first question.
+    letronna_core::mcp::start();
 
     let mut runner = Runner {
         store: store::load_listing(),

@@ -28,6 +28,9 @@ fn main() {
                 Box::new(plugins::hello::Hello::new()),
             ],
         );
+        // MCP servers can take seconds to start; started with the window,
+        // their tools are there by the first message.
+        letronna_core::mcp::start();
         cx.bind_keys([
             // "secondary" is cmd on macOS and ctrl everywhere else.
             KeyBinding::new("secondary-n", NewSession, None),

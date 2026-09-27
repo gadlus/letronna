@@ -1,4 +1,5 @@
 use crate::prelude::*;
+use gpui_component::Selectable;
 
 impl Chat {
     /// The (gateway, model) pairs the picker shows for what is typed in its
@@ -31,8 +32,14 @@ impl Chat {
             .p_1()
             .gap_0p5();
         let on = self.store.settings.gateway.clone();
-        let matches = self.model_matches(cx);
-        if matches.is_empty() {
+        // The chat models, unless a media tab is showing instead.
+        let chat = self.model_kind == "chat";
+        let matches = if chat {
+            self.model_matches(cx)
+        } else {
+            Vec::new()
+        };
+        if chat && matches.is_empty() {
             list = list.child(
                 div()
                     .px_2()
@@ -79,6 +86,10 @@ impl Chat {
                         this.choose_model(pick_gw.clone(), pick.clone(), window, cx)
                     })),
             );
+        }
+        if !chat {
+            let query = self.model_search.read(cx).value().to_lowercase();
+            list = self.media_list(list, &query, cx);
         }
         div()
             .relative()
@@ -144,6 +155,9 @@ impl Chat {
                                                                 ),
                                                         ),
                                                 )
+                                                .when(!self.media_models.is_empty(), |this| {
+                                                    this.child(self.kind_tabs(cx))
+                                                })
                                                 .child(list),
                                         )
                                         .on_mouse_down_out(cx.listener(|this, _, _, cx| {
@@ -156,6 +170,93 @@ impl Chat {
                     ),
                 )
             })
+    }
+
+    /// Text, and each kind of media model there is, as tabs over the list.
+    fn kind_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let there = |kind: &str| self.media_models.iter().any(|o| o.kind == kind);
+        let kinds = std::iter::once(("chat", "Text")).chain(
+            letronna_core::media::KINDS
+                .into_iter()
+                .filter(|(k, _)| there(k)),
+        );
+        let mut tabs = h_flex()
+            .p_1()
+            .gap_0p5()
+            .flex_wrap()
+            .border_b_1()
+            .border_color(cx.theme().border);
+        for (i, (kind, label)) in kinds.enumerate() {
+            tabs = tabs.child(
+                Button::new(("model-kind", i))
+                    .ghost()
+                    .xsmall()
+                    .label(label)
+                    .selected(self.model_kind == kind)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.model_kind = kind;
+                        cx.notify();
+                    })),
+            );
+        }
+        tabs
+    }
+
+    /// The models of the media kind the menu shows, cheapest first, under a
+    /// row that leaves the choice to Letronna. Picking one makes it the model
+    /// that kind's tool uses.
+    fn media_list(
+        &self,
+        mut list: Stateful<Div>,
+        query: &str,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let kind = self.model_kind;
+        let chosen = self.media_choices.get(kind);
+        let auto = std::iter::once((None, "Auto".to_owned(), "the cheapest working".to_owned()));
+        let offers = self
+            .media_models
+            .iter()
+            .filter(|o| o.kind == kind)
+            .filter(|o| {
+                query.is_empty()
+                    || o.id.to_lowercase().contains(query)
+                    || o.maker.to_lowercase().contains(query)
+            })
+            .map(|o| (Some(o.id.clone()), o.id.clone(), o.price()));
+        for (i, (pick, name, note)) in auto.chain(offers).enumerate() {
+            let active = pick.as_ref() == chosen;
+            list =
+                list.child(
+                    Button::new(("media-model", i))
+                        .ghost()
+                        .xsmall()
+                        .w_full()
+                        .justify_start()
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .gap_2()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .when(active, |d| d.text_color(cx.theme().primary))
+                                        .child(name),
+                                )
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(note),
+                                ),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.choose_media(kind, pick.clone(), cx)
+                        })),
+                );
+        }
+        list
     }
 
     pub(crate) fn attach(

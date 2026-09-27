@@ -168,12 +168,22 @@ impl Chat {
         let lines = message.content.lines().count();
         let content = message.content.clone();
         let one_line = letronna_core::tools::one_line;
+        // A file a media tool made, while it is still where it was saved.
+        let made = (!message.is_error)
+            .then(|| letronna_core::media::saved(&message.content))
+            .flatten()
+            .filter(|path| path.exists());
         let (status, color) = if message.is_error {
             (one_line(&message.content), cx.theme().danger)
         } else if message.name == letronna_core::tools::ASK_USER {
             (
                 format!("→ {}", one_line(&message.content)),
                 cx.theme().foreground,
+            )
+        } else if let Some(name) = made.as_ref().and_then(|path| path.file_name()) {
+            (
+                name.to_string_lossy().into_owned(),
+                cx.theme().muted_foreground,
             )
         } else {
             (format!("{lines} lines"), cx.theme().muted_foreground)
@@ -229,6 +239,11 @@ impl Chat {
                         cx.notify();
                     })),
             )
+            .when_some(made, |this, path| {
+                let playing = self.video.as_ref().is_some_and(|v| v.path == path);
+                let frame = self.video_frame.clone().filter(|_| playing);
+                this.child(made_file(index, path, playing, frame, cx))
+            })
             .when(open, |this| {
                 this.child(
                     div()
@@ -382,6 +397,59 @@ impl Chat {
                     .child(page.blurb()),
             )
     }
+
+    /// Play a video a tool made, in the chat; where it cannot play here, in
+    /// the system player. One plays at a time, and it stops speech playing.
+    fn play_video(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::platform::video::Event;
+        self.stop_video(window);
+        let playing = match crate::platform::video::play(&path) {
+            Ok(playing) => playing,
+            Err(_) => return cx.open_with_system(&path),
+        };
+        crate::platform::audio::stop();
+        let (id, events) = (playing.id, playing.events.clone());
+        self.video = Some(playing);
+        cx.spawn_in(window, async move |this, cx| {
+            while let Ok(event) = events.recv().await {
+                let ended = matches!(event, Event::Ended(_));
+                let current = this.update_in(cx, |this, window, cx| {
+                    // What a stopped video still sends is dropped unseen.
+                    if this.video.as_ref().is_none_or(|v| v.id != id) {
+                        return false;
+                    }
+                    match event {
+                        Event::Frame(image) => {
+                            if let Some(old) = this.video_frame.replace(image) {
+                                let _ = window.drop_image(old);
+                            }
+                        }
+                        Event::Ended(why) => {
+                            this.stop_video(window);
+                            if why.is_some() {
+                                this.error = why;
+                            }
+                        }
+                    }
+                    cx.notify();
+                    true
+                });
+                if ended || !matches!(current, Ok(true)) {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Stop the video playing, and give its last frame back to the GPU.
+    fn stop_video(&mut self, window: &mut Window) {
+        self.video = None;
+        if let Some(frame) = self.video_frame.take() {
+            let _ = window.drop_image(frame);
+        }
+    }
 }
 
 /// The line under a reply. Cached input is a fraction of the price of fresh
@@ -400,6 +468,189 @@ fn usage_line(message: &Message) -> String {
         }
     }
     parts.join(" · ")
+}
+
+/// What a media tool made, shown as itself: a picture, a video by its first
+/// frame until it plays here, a sound with a button to play it. Each gets
+/// buttons to open the file or find it. `frame` is the video's newest frame
+/// while `playing`.
+fn made_file(
+    index: usize,
+    path: PathBuf,
+    playing: bool,
+    frame: Option<std::sync::Arc<RenderImage>>,
+    cx: &mut Context<Chat>,
+) -> impl IntoElement {
+    let kind = |known: &[&str]| {
+        path.extension()
+            .is_some_and(|extension| known.iter().any(|k| extension.eq_ignore_ascii_case(k)))
+    };
+    let picture = kind(&["png", "jpg", "jpeg", "webp"]);
+    let video = kind(&["mp4", "webm", "mov"]);
+    let sound = kind(&["mp3", "wav", "ogg", "flac"]);
+    let (open, reveal) = (path.clone(), path.clone());
+    let theme = cx.theme();
+    let (radius, tile, mark, on_mark) = (
+        theme.radius,
+        theme.secondary,
+        theme.background.opacity(0.75),
+        theme.foreground,
+    );
+    let still: ImageSource = if let Some(frame) = frame {
+        frame.into()
+    } else if video {
+        let source = path.clone();
+        ImageSource::from(move |window: &mut Window, cx: &mut App| {
+            window.use_asset::<crate::platform::poster::Poster>(&source, cx)
+        })
+    } else {
+        path.clone().into()
+    };
+    // Without a still, or until it comes, a video is a plain frame.
+    let blank = move || {
+        div()
+            .w(px(320.))
+            .h(px(180.))
+            .rounded(radius)
+            .bg(tile)
+            .into_any_element()
+    };
+    v_flex()
+        .ml_2()
+        .pl_3()
+        .gap_1()
+        .items_start()
+        .when(picture || video, |this| {
+            let (open, play) = (path.clone(), path.clone());
+            this.child(
+                div()
+                    .id(("made-picture", index))
+                    .relative()
+                    .cursor_pointer()
+                    .child(
+                        img(still)
+                            .h(px(220.))
+                            .max_w(px(360.))
+                            .object_fit(ObjectFit::Contain)
+                            .rounded(radius)
+                            .when(video, |img| img.with_loading(blank).with_fallback(blank)),
+                    )
+                    .when(video, |this| {
+                        // Big in the middle to start it; small in the corner
+                        // while it plays, out of the picture's way.
+                        this.child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .flex()
+                                .map(|place| {
+                                    if playing {
+                                        place.items_end().justify_start().p_2()
+                                    } else {
+                                        place.items_center().justify_center()
+                                    }
+                                })
+                                .child(
+                                    div()
+                                        .size(px(if playing { 28. } else { 44. }))
+                                        .rounded_full()
+                                        .bg(mark)
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(
+                                            Icon::new(if playing {
+                                                AppIcon::Stop
+                                            } else {
+                                                AppIcon::Play
+                                            })
+                                            .map(|icon| {
+                                                if playing {
+                                                    icon.size_3p5()
+                                                } else {
+                                                    icon.size_5()
+                                                }
+                                            })
+                                            .text_color(on_mark),
+                                        ),
+                                ),
+                        )
+                    })
+                    .map(|this| {
+                        if !video {
+                            return this.on_click(move |_, _, cx| cx.open_with_system(&open));
+                        }
+                        this.on_click(cx.listener(move |chat, _, window, cx| {
+                            if playing {
+                                chat.stop_video(window);
+                                cx.notify();
+                            } else {
+                                chat.play_video(play.clone(), window, cx);
+                            }
+                        }))
+                    }),
+            )
+        })
+        .child(
+            h_flex()
+                .gap_1()
+                .when(sound, |this| {
+                    this.child(sound_button(index, path.clone(), cx))
+                })
+                .child(
+                    Button::new(("open-made", index))
+                        .ghost()
+                        .xsmall()
+                        .label("Open")
+                        .on_click(move |_, _, cx| cx.open_with_system(&open)),
+                )
+                .child(
+                    Button::new(("reveal-made", index))
+                        .ghost()
+                        .xsmall()
+                        .icon(Icon::new(AppIcon::Folder))
+                        .tooltip("Show in folder")
+                        .on_click(move |_, _, cx| cx.reveal_path(&reveal)),
+                ),
+        )
+}
+
+/// Play a sound a tool made, or stop it. While it plays, the chat looks every
+/// quarter second whether it has ended, to turn the button back to Play.
+fn sound_button(index: usize, path: PathBuf, cx: &mut Context<Chat>) -> Button {
+    let playing = crate::platform::audio::playing(&path);
+    Button::new(("play-made", index))
+        .ghost()
+        .xsmall()
+        .icon(Icon::new(if playing {
+            AppIcon::Stop
+        } else {
+            AppIcon::Play
+        }))
+        .label(if playing { "Stop" } else { "Play" })
+        .on_click(cx.listener(move |this, _, window, cx| {
+            if crate::platform::audio::playing(&path) {
+                crate::platform::audio::stop();
+            } else if let Err(why) = crate::platform::audio::play(&path) {
+                this.error = Some(why);
+            } else {
+                this.stop_video(window);
+                let sound = path.clone();
+                cx.spawn(async move |this, cx| {
+                    let quarter = std::time::Duration::from_millis(250);
+                    loop {
+                        cx.background_executor().timer(quarter).await;
+                        let on = cx.update(|_| crate::platform::audio::playing(&sound));
+                        if !on.unwrap_or(false) {
+                            break;
+                        }
+                    }
+                    let _ = this.update(cx, |_, cx| cx.notify());
+                })
+                .detach();
+            }
+            cx.notify();
+        }))
 }
 
 #[cfg(test)]

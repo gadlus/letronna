@@ -19,6 +19,31 @@ impl Chat {
             return;
         }
         self.off_thread(auth::refresh, cx);
+        self.load_teams(cx);
+    }
+
+    /// The teams this account is in, fetched off the window's thread.
+    fn load_teams(&mut self, cx: &mut Context<Self>) {
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let _ = tx.send_blocking(auth::teams());
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(teams)) = rx.recv().await {
+                let _ = this.update(cx, |this, cx| {
+                    this.teams = teams;
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Bill hosted models to a team's pool, or (`None`) to your own credit.
+    /// Shared with the terminal: `/team` there and this are the same choice.
+    pub(crate) fn pick_team(&mut self, id: Option<String>, cx: &mut Context<Self>) {
+        self.signing_in = true;
+        self.off_thread(move || auth::use_team(id.as_deref()), cx);
     }
 
     /// Settings, open on this page.
@@ -152,8 +177,16 @@ pub(crate) fn account_page(chat: &Entity<Chat>, this: &Chat, cx: &App) -> Div {
                 .child(row("Name", account.name.clone()))
                 .child(row("Email", account.email.clone()))
                 .child(row("Plan", plan))
-                .child(row("Credits", account.credit())),
+                .child(row("Credits", account.credit()))
+                .child(row(
+                    "Team",
+                    match &account.team {
+                        Some(t) => format!("{} · pool ${}.{:02}", t.name, t.credits / 100, t.credits.rem_euclid(100)),
+                        None => "None · your own credit".to_owned(),
+                    },
+                )),
         )
+        .child(billing(chat, this, &account, cx))
         .child(
             h_flex()
                 .gap_2()
@@ -182,4 +215,42 @@ pub(crate) fn account_page(chat: &Entity<Chat>, this: &Chat, cx: &App) -> Div {
                 ),
         )
         .children(note)
+}
+
+/// Who hosted models bill: your own credit, or one of your teams' pools. One
+/// pays for a call, never both; the stake allowance, if any, is spent first.
+fn billing(chat: &Entity<Chat>, this: &Chat, account: &Account, cx: &App) -> Div {
+    let busy = this.signing_in;
+    let current = account.team.as_ref().map(|t| t.id.clone());
+    let choice = |key: usize, label: String, id: Option<String>| {
+        let chat = chat.clone();
+        let on = current == id;
+        Button::new(("bill", key))
+            .small()
+            .when(on, |b| b.primary())
+            .disabled(busy || on)
+            .label(label)
+            .on_click(move |_, _, cx| {
+                let id = id.clone();
+                chat.update(cx, |this, cx| this.pick_team(id, cx))
+            })
+    };
+    let mut row = h_flex().gap_2().flex_wrap().child(choice(0, "Personal".into(), None));
+    for (i, t) in this.teams.iter().enumerate() {
+        row = row.child(choice(i + 1, t.name.clone(), Some(t.id.clone())));
+    }
+    v_flex()
+        .gap_2()
+        .child(super::settings::label("Bill hosted models to", cx))
+        .child(row)
+        .child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(if this.teams.is_empty() {
+                    "Not in a team. Create or join one at letronna.ai/dashboard/team."
+                } else {
+                    "One pays for each call, never both. Same choice as /team in the terminal."
+                }),
+        )
 }

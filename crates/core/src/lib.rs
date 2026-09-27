@@ -9,13 +9,18 @@
 pub mod agent;
 pub mod auth;
 pub mod chat;
+pub mod compact;
 pub mod gateway;
 pub mod jobs;
+pub mod mcp;
+pub mod media;
+pub mod memory;
 pub mod messaging;
 pub mod schedule;
 pub mod skills;
 pub mod store;
 pub mod tools;
+pub mod web;
 
 /// The name the app goes by, used in paths and on screen.
 pub const BRAND: &str = "Letronna";

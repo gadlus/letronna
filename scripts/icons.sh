@@ -14,7 +14,7 @@ minus:minus settings:gear arrow-up:arrow-up arrow-down:arrow-down copy:copy pane
 chevron-down:caret-down chevron-right:caret-right check:check loader-circle:circle-notch loader:circle-notch bot:robot mic:microphone chevrons-up-down:caret-up-down
 inbox:tray send:paper-plane-tilt sparkles:sparkle message-square:chat-teardrop file:file file-text:file-text clock:clock
 search:magnifying-glass pin:push-pin folder:folder image:image square-pen:note-pencil list-filter:funnel-simple
-info:info plugs:plugs palette:palette trash:trash export:export pencil:pencil-simple envelope:envelope-simple
+info:info plugs:plugs palette:palette trash:trash export:export pencil:pencil-simple envelope:envelope-simple play:play stop:stop
 circle:circle list-checks:list-checks eye:eye
 circle-x:x-circle circle-check:check-circle triangle-alert:warning shield:shield-check puzzle:puzzle-piece circle-user:user-circle"
 for pair in $map; do

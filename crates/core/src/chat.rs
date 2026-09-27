@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     io::{BufRead, BufReader},
+    sync::OnceLock,
     time::Duration,
 };
 
@@ -222,10 +223,12 @@ fn window_start(messages: &[Message]) -> usize {
     start
 }
 
-fn body(connection: &Connection, messages: &[Message]) -> Value {
+fn body(connection: &Connection, messages: &[Message], summary: Option<&str>) -> Value {
     let start = window_start(messages);
-    let mut system =
-        String::from("You are Letronna, a personal assistant. Be clear, concise, and honest.");
+    // The user's SOUL.md, when there is one, says who Letronna is instead.
+    let mut system = crate::memory::soul().unwrap_or_else(|| {
+        String::from("You are Letronna, a personal assistant. Be clear, concise, and honest.")
+    });
     let shared = connection.remote.as_ref().is_some_and(|r| r.shared);
     if connection.tools && !shared {
         // A chat app is not the terminal or the window, and /resume means
@@ -254,6 +257,14 @@ fn body(connection: &Connection, messages: &[Message]) -> Value {
         if remote.shared {
             system.push_str(" Other people in this chat can read your replies. Nothing on this computer is reachable from here: no files, folders or commands.");
         }
+    }
+    // Memory first: it changes rarely, so the prompt's start stays cacheable;
+    // the summary of dropped turns changes as the conversation grows.
+    system.push_str(&crate::memory::context(connection));
+    if let Some(summary) = summary {
+        system.push_str(&format!(
+            "\n\nEarlier in this conversation, summarized because it no longer fits:\n{summary}"
+        ));
     }
     let mut context = vec![json!({"role": "system", "content": system})];
     let window = &messages[start..];
@@ -370,7 +381,7 @@ fn explain(message: &str) -> String {
     message.chars().take(400).collect()
 }
 
-fn unwrap_response(value: &Value) -> Result<&Value, String> {
+pub(crate) fn unwrap_response(value: &Value) -> Result<&Value, String> {
     if value.get("error").is_some() || value.get("success").is_some_and(|v| v != true) {
         let message = value
             .pointer("/error/message")
@@ -514,14 +525,31 @@ pub fn data_dir() -> std::path::PathBuf {
         .join("Letronna")
 }
 
+/// The one HTTP client every model call goes through.
+///
+/// A client per call meant a new runtime thread and a fresh TCP and TLS
+/// handshake for each round of a turn -- up to `MAX_ROUNDS` of them, all to
+/// the same gateway. This one keeps the connection open between rounds.
+/// Timeouts are set per request, since a model list and a reply differ.
+fn client() -> Result<&'static reqwest::blocking::Client, String> {
+    static CLIENT: OnceLock<Result<reqwest::blocking::Client, String>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|_| "Could not initialize the HTTP client.".to_owned())
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
 pub fn list_models(base: &str, key: &str) -> Result<Vec<String>, String> {
     let base = base.trim().trim_end_matches('/');
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|_| "Cannot initialize connection.".to_owned())?;
-    let mut request = client.get(format!("{base}/models"));
+    let mut request = client()?
+        .get(format!("{base}/models"))
+        .timeout(Duration::from_secs(20));
     if !key.trim().is_empty() {
         request = request.bearer_auth(key.trim());
     }
@@ -562,13 +590,14 @@ fn stream(
     sender: &async_channel::Sender<Event>,
 ) -> Result<(), String> {
     let endpoint = validate(connection)?;
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
+    // What the window no longer holds goes in as a summary rather than not at
+    // all. It is made here, on the worker, so the wait is part of the reply's.
+    let dropped = &messages[..window_start(messages)];
+    let summary = crate::compact::summary(connection, dropped);
+    let mut request = client()?
+        .post(endpoint)
         .timeout(Duration::from_secs(120))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|_| "Could not initialize the HTTP client.".to_owned())?;
-    let mut request = client.post(endpoint).json(&body(connection, messages));
+        .json(&body(connection, messages, summary.as_deref()));
     if !connection.key.trim().is_empty() {
         request = request.bearer_auth(connection.key.trim());
     }
@@ -830,7 +859,7 @@ mod tests {
                 ..Default::default()
             })
             .collect();
-        let payload = body(&connection(), &messages);
+        let payload = body(&connection(), &messages, None);
         let context = payload["messages"].as_array().unwrap();
         assert_eq!(context.len(), 31);
         assert_eq!(context[1]["role"], "user");
@@ -863,13 +892,30 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let payload = body(&connection(), &messages);
+        let payload = body(&connection(), &messages, None);
         let context = payload["messages"].as_array().unwrap();
         assert_eq!(context.len(), 4);
         assert_eq!(context[1]["content"], "what is in the file?");
         // The oversized result is trimmed rather than dropped.
         let sent = context[3]["content"].as_str().unwrap().chars().count();
         assert!(sent < MAX_TOOL_CHARS + 64, "{sent}");
+    }
+    #[test]
+    fn a_summary_of_what_fell_out_rides_at_the_end_of_the_system_prompt() {
+        let messages = [Message {
+            role: "user".into(),
+            content: "and now?".into(),
+            ..Default::default()
+        }];
+        let payload = body(&connection(), &messages, Some("They chose Postgres."));
+        let system = payload["messages"][0]["content"].as_str().unwrap();
+        assert!(
+            system.ends_with("no longer fits:\nThey chose Postgres."),
+            "{system}"
+        );
+        let without = body(&connection(), &messages, None);
+        let plain = without["messages"][0]["content"].as_str().unwrap();
+        assert!(!plain.contains("summarized"));
     }
     #[test]
     fn the_two_ways_a_route_says_it_cannot_do_tools_read_the_same() {
@@ -929,6 +975,13 @@ mod tests {
     }
 
     #[test]
+    fn every_call_shares_one_client() {
+        let first = super::client().unwrap();
+        let again = super::client().unwrap();
+        assert!(std::ptr::eq(first, again));
+    }
+
+    #[test]
     fn a_call_with_no_arguments_goes_back_as_an_object() {
         let reply = Message {
             role: "assistant".into(),
@@ -965,6 +1018,7 @@ mod tests {
                     ..connection()
                 },
                 &[],
+                None,
             )["tools"]
                 .as_array()
                 .unwrap()
@@ -995,6 +1049,7 @@ mod tests {
                     ..connection()
                 },
                 &[],
+                None,
             )["messages"][0]["content"]
                 .as_str()
                 .unwrap()
@@ -1106,7 +1161,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let payload = body(&connection(), &messages);
+        let payload = body(&connection(), &messages, None);
         let context = payload["messages"].as_array().unwrap();
         let tools: Vec<&str> = context
             .iter()

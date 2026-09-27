@@ -119,6 +119,13 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(Todo),
         Arc::new(crate::messaging::ReadChat),
         Arc::new(Sessions),
+        Arc::new(crate::memory::Remember),
+        Arc::new(SearchSessions),
+        Arc::new(crate::web::WebFetch),
+        Arc::new(crate::media::MakeImage),
+        Arc::new(crate::media::Speak),
+        Arc::new(crate::media::Transcribe),
+        Arc::new(crate::media::MakeVideo),
     ];
     if let Ok(extra) = plugin_tools().lock() {
         for tool in extra.iter() {
@@ -128,6 +135,9 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
             }
         }
     }
+    // MCP servers' tools, once they have answered. Their names all start
+    // with `mcp__`, so they cannot shadow one of the above either.
+    tools.extend(crate::mcp::tools());
     tools
 }
 
@@ -223,11 +233,12 @@ pub fn clamp_lines(text: &str, max: usize) -> String {
 pub fn summary(name: &str, args: &str) -> String {
     let v: Value = serde_json::from_str(args).unwrap_or(Value::Null);
     let text = match name {
-        "search" => v["query"]
+        "search" | "search_sessions" => v["query"]
             .as_str()
             .map(|q| format!("\"{q}\""))
             .unwrap_or_default(),
         "run_command" => v["command"].as_str().unwrap_or_default().to_owned(),
+        "web_fetch" => v["url"].as_str().unwrap_or_default().to_owned(),
         "read_job" | "stop_job" => format!("#{}", v["id"].as_u64().unwrap_or(0)),
         "wait" => match (v["job"].as_u64(), v["until"].as_str()) {
             (Some(id), Some(until)) => format!("job #{id} until \"{until}\""),
@@ -235,10 +246,22 @@ pub fn summary(name: &str, args: &str) -> String {
             _ => format!("{}s", v["seconds"].as_f64().unwrap_or(10.)),
         },
         ASK_USER => v["question"].as_str().unwrap_or_default().to_owned(),
+        "make_image" => v["prompt"].as_str().unwrap_or_default().to_owned(),
+        "make_video" => v["prompt"]
+            .as_str()
+            .or(v["job"].as_str())
+            .unwrap_or_default()
+            .to_owned(),
+        "speak" => v["text"].as_str().unwrap_or_default().to_owned(),
         TODO => {
             let items = v["items"].as_array().map(Vec::len).unwrap_or(0);
             format!("{items} items")
         }
+        "memory" => format!(
+            "{} {}",
+            v["action"].as_str().unwrap_or_default(),
+            v["target"].as_str().unwrap_or_default()
+        ),
         _ => v["path"].as_str().unwrap_or(".").to_owned(),
     };
     one_line(&text)
@@ -554,6 +577,54 @@ The user opens one with /resume, or `letronna --resume <id>`.",
     }
 }
 
+/// Finds where earlier sessions talked about something. `list_sessions`
+/// gives titles only, so "what did we decide about X" had no answer short of
+/// the user opening sessions one by one.
+struct SearchSessions;
+impl Tool for SearchSessions {
+    fn name(&self) -> &'static str {
+        "search_sessions"
+    }
+    fn description(&self) -> &'static str {
+        "Search what was said in the user's earlier Letronna sessions for a word or phrase, ignoring case. Returns the matching lines with each session's id, title and age, newest sessions first. Use it when the user refers to something from an earlier conversation, or when an earlier session may already hold the answer."
+    }
+    fn parameters(&self) -> Value {
+        json!({"type": "object", "properties": {
+            "query": {"type": "string"},
+            "limit": {"type": "integer", "description": "How many matches at most. Default 20."}
+        }, "required": ["query"]})
+    }
+    fn run(&self, args: &Value, _: &ToolContext) -> Result<String, String> {
+        let query = args["query"].as_str().unwrap_or_default().trim();
+        if query.is_empty() {
+            return Err("Query is empty.".into());
+        }
+        let limit = args["limit"].as_u64().unwrap_or(20).clamp(1, 50) as usize;
+        let hits = crate::store::search(query, limit);
+        if hits.is_empty() {
+            return Ok(format!("No earlier session mentions \"{query}\"."));
+        }
+        let lines: Vec<String> = hits
+            .iter()
+            .map(|hit| {
+                let title = match hit.title.trim() {
+                    "" => "untitled",
+                    title => title,
+                };
+                let when = crate::chat::ago(hit.updated);
+                format!(
+                    "{}  {title}  ({when}) {}: {}",
+                    hit.id, hit.role, hit.snippet
+                )
+            })
+            .collect();
+        Ok(format!(
+            "id  title  (when) who: what was said\n{}\n\nThe user opens one with /resume, or `letronna --resume <id>`.",
+            lines.join("\n")
+        ))
+    }
+}
+
 struct ReadJob;
 impl Tool for ReadJob {
     fn name(&self) -> &'static str {
@@ -733,7 +804,7 @@ fn home() -> Option<PathBuf> {
 
 /// Resolve a user-supplied path and refuse anything outside the workspace or
 /// the home folder. Canonicalising also defeats `..` and symlink escapes.
-fn resolve(raw: &str, ctx: &ToolContext) -> Result<PathBuf, String> {
+pub(crate) fn resolve(raw: &str, ctx: &ToolContext) -> Result<PathBuf, String> {
     let base = ctx.workspace.clone().or_else(home).unwrap_or_default();
     let joined = base.join(raw);
     let path = std::fs::canonicalize(&joined).map_err(|_| format!("`{raw}` does not exist."))?;
@@ -745,7 +816,20 @@ fn resolve(raw: &str, ctx: &ToolContext) -> Result<PathBuf, String> {
     if !allowed {
         return Err(format!("`{raw}` is outside the workspace and home folder."));
     }
+    if private(&path, &crate::chat::data_dir()) {
+        return Err(format!(
+            "`{raw}` is in Letronna's own folder, with the keys and sign-in; it stays out of reach."
+        ));
+    }
     Ok(path)
+}
+
+/// Whether `path` lies in Letronna's own folder, `data`, which holds the API
+/// keys, the sign-in token and the bot tokens. It sits under the home folder,
+/// and reading there needs no approval, so a chat or a file that talked the
+/// model into it would have had them read out.
+fn private(path: &Path, data: &Path) -> bool {
+    std::fs::canonicalize(data).is_ok_and(|data| path.starts_with(data))
 }
 
 fn path_arg(args: &Value) -> &str {
@@ -859,6 +943,12 @@ fn search(root: &Path, query: &str, time: Duration, files: usize) -> String {
         let Some(text) = searchable(path) else {
             return true;
         };
+        // Most files hold no match at all, and lowercasing the whole file once
+        // says so; lowercasing it line by line made a new string for every
+        // line of every file searched.
+        if !text.to_lowercase().contains(query) {
+            return true;
+        }
         for (n, line) in text.lines().enumerate() {
             if line.to_lowercase().contains(query) {
                 let rel = path.strip_prefix(root).unwrap_or(path).display();
@@ -915,7 +1005,10 @@ fn walk(dir: &Path, f: &mut dyn FnMut(&Path, bool) -> bool) -> bool {
         if kind.is_dir() {
             let name = entry.file_name();
             let hidden = name.to_string_lossy().starts_with('.');
-            if hidden || SKIP_DIRS.iter().any(|s| name == *s) {
+            if hidden
+                || SKIP_DIRS.iter().any(|s| name == *s)
+                || private(&path, &crate::chat::data_dir())
+            {
                 continue;
             }
             if !f(&path, true) || !walk(&path, f) {
@@ -1059,6 +1152,39 @@ World"
             assert!(out.starts_with("No matches."), "{out}");
             assert!(out.contains("Stopped early after 0 files"), "{out}");
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn search_passes_over_files_without_a_match_and_numbers_the_rest() {
+        let dir = std::env::temp_dir().join(format!("letronna-lines-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("none.txt"), "nothing\nto see\nhere").unwrap();
+        std::fs::write(
+            dir.join("some.txt"),
+            "one\ntwo\nThe Needle\nfour\nneedle again",
+        )
+        .unwrap();
+        assert_eq!(
+            search(&dir, "needle", SEARCH_TIME, SEARCH_FILES),
+            "some.txt:3: The Needle\nsome.txt:5: needle again"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn letronnas_own_folder_is_out_of_reach() {
+        let dir = std::env::temp_dir().join(format!("letronna-private-{}", std::process::id()));
+        let data = dir.join("Letronna");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("keys.json"), "{}").unwrap();
+        let keys = std::fs::canonicalize(data.join("keys.json")).unwrap();
+        let beside = std::fs::canonicalize(&dir).unwrap();
+        assert!(private(&keys, &data));
+        assert!(!private(&beside, &data));
+        // No such folder makes nothing private, rather than everything.
+        assert!(!private(&keys, &dir.join("missing")));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
