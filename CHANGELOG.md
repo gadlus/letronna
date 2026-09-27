@@ -14,6 +14,13 @@ This file is also the App tab of https://letronna.ai/changelog.
 ## [Unreleased]
 
 ### Added
+- **All** — A real browser: Letronna reads pages, clicks, types and takes screenshots. In the app it sits beside the chat, where you can watch it and use it yourself.
+- **App** — Each session has a browser of its own, or one shared by all, and it can be a cloud browser or Chrome on another machine.
+- **All** — Letronna updates itself: the app finds, checks and installs new versions, and `letronna update` does it in the terminal.
+- **All** — Search the web with your own search service.
+- **All** — MCP servers reached by URL, with headers such as a key; one-shot questions wait for MCP servers to start.
+- **All** — Rewind a session, and it stays rewound.
+- **Terminal** — The guide is a click away, from `/help`.
 - **All** — Letronna makes images, speech and video, and turns speech into text; pick which model makes each.
 - **All** — Letronna remembers: `SOUL.md` says who it is, `USER.md` and `MEMORY.md` hold what it knows about you and its own notes, and a project's `AGENTS.md` is read as its instructions.
 - **All** — Tools from MCP servers, set up in `mcp.json`.
@@ -34,6 +41,10 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — Install in one line, then a few questions.
 
 ### Changed
+- **App** — Type while it answers, press Esc to stop, and deleting asks first.
+- **App** — The chat reads as a column, with your messages in cards and no flash when switching sessions.
+- **All** — Signing in no longer waits forever for the browser, ends on a page that looks like the website, and while waiting offers to open the page again, copy it or cancel.
+- **Windows**, **macOS** — Releases can be code signed, so Windows and macOS stop warning about an unknown publisher.
 - **All** — Old turns are summarized instead of forgotten when a conversation outgrows the model's window.
 - **All** — Model calls reuse one connection, and search skips files without a match before reading them.
 - **All** — Letronna is the default gateway, and the only hosted one.
@@ -43,6 +54,8 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — A turn that fails says why; tools work on gateways that rename them.
 
 ### Fixed
+- **All** — Names with accents are no longer garbled by signing in.
+- **Linux**, **macOS** — Keys and sign-in files are readable by you only.
 - **All** — Your keys and sign-in stay out of the model's reach.
 - **Terminal** — Sessions keep their pins and todos when the terminal saves them.
 - **Windows** — Pastes arrive as one paste, commands run without flashing a console window, and the wheel scrolls.
