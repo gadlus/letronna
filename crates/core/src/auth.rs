@@ -368,22 +368,24 @@ fn token(len: usize) -> String {
 
 /// Percent-decoding, enough for the fields a callback carries.
 fn unescape(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '+' => out.push(' '),
-            '%' => {
-                let hex: String = chars.by_ref().take(2).collect();
+    // Bytes first and text at the end: an accented name comes as several
+    // escapes, one for each byte of its UTF-8.
+    let mut out = Vec::with_capacity(text.len());
+    let mut bytes = text.bytes();
+    while let Some(byte) = bytes.next() {
+        match byte {
+            b'+' => out.push(b' '),
+            b'%' => {
+                let hex: String = bytes.by_ref().take(2).map(char::from).collect();
                 match u8::from_str_radix(&hex, 16) {
-                    Ok(byte) => out.push(byte as char),
-                    Err(_) => out.push('%'),
+                    Ok(byte) => out.push(byte),
+                    Err(_) => out.push(b'%'),
                 }
             }
-            _ => out.push(ch),
+            _ => out.push(byte),
         }
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]
@@ -397,6 +399,12 @@ mod tests {
         assert_eq!(unescape("plain"), "plain");
         // A stray percent is left alone rather than eating the rest.
         assert_eq!(unescape("100%"), "100%");
+    }
+
+    #[test]
+    fn a_name_with_accents_survives_the_callback() {
+        assert_eq!(unescape("Jos%C3%A9"), "José");
+        assert_eq!(unescape("%E2%9C%93"), "✓");
     }
 
     #[test]
