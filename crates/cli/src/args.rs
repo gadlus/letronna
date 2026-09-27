@@ -19,6 +19,7 @@ Options
       --yes                run tools without asking (careful)
       --plan               read and search only; never write or run
   -h, --help               this
+  -V, --version            which version this is
 ";
 
 /// What to open with.
@@ -40,6 +41,7 @@ pub struct Args {
     pub yes: bool,
     pub plan: bool,
     pub help: bool,
+    pub version: bool,
     pub gui: bool,
     pub install: bool,
     pub uninstall: bool,
@@ -52,6 +54,7 @@ pub fn parse(mut raw: impl Iterator<Item = String>) -> Args {
         yes: false,
         plan: false,
         help: false,
+        version: false,
         gui: false,
         install: false,
         uninstall: false,
@@ -74,6 +77,7 @@ pub fn parse(mut raw: impl Iterator<Item = String>) -> Args {
             "setup" | "--install" => args.install = true,
             "--uninstall" => args.uninstall = true,
             "-h" | "--help" => args.help = true,
+            "-V" | "--version" => args.version = true,
             // A bare word is the prompt, so `letronna "what is this"` works.
             other if !other.starts_with('-') && args.prompt.is_none() => {
                 args.prompt = Some(other.to_owned())
@@ -120,5 +124,6 @@ mod tests {
         assert!(args(&["gui"]).gui);
         assert!(args(&["--yes"]).yes);
         assert!(args(&["-h"]).help);
+        assert!(args(&["--version"]).version && args(&["-V"]).version);
     }
 }

@@ -33,6 +33,10 @@ fn main() {
         print!("{HELP}");
         return;
     }
+    if args.version {
+        println!("letronna {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     if args.gui {
         launch_window();
         return;
