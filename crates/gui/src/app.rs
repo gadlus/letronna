@@ -106,6 +106,11 @@ pub(crate) struct Chat {
     pub(crate) signing_in: bool,
     /// A messaging token is being checked with its service.
     pub(crate) connecting: bool,
+    /// The sign-in page the browser was sent to, while the window waits on
+    /// it, so it can be opened again or copied into another browser.
+    pub(crate) sign_in_url: Option<String>,
+    /// Ends the wait for the browser at once, for the Cancel button.
+    pub(crate) sign_in_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub(crate) loading_models: bool,
     pub(crate) gateway_error: Option<String>,
     pub(crate) busy: bool,
@@ -338,6 +343,8 @@ impl Chat {
             teams: Vec::new(),
             signing_in: false,
             connecting: false,
+            sign_in_url: None,
+            sign_in_cancel: None,
             loading_models: false,
             gateway_error: None,
             store,

@@ -530,6 +530,31 @@ impl Bar {
         handle.join().expect("the work panicked")
     }
 
+    /// Like `busy`, for a wait that can be given up on: escape flips `stop`,
+    /// which `work` watches, the same key that stops a reply.
+    pub fn busy_cancellable<T: Send + 'static>(
+        &mut self,
+        label: &str,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        if !self.live {
+            return crate::input::busy(label, work);
+        }
+        let handle = std::thread::spawn(work);
+        self.wait_line_about(label);
+        self.working(true);
+        while !handle.is_finished() {
+            self.pump();
+            if self.interrupted() {
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        self.working(false);
+        self.wait_line(false);
+        handle.join().expect("the work panicked")
+    }
+
     /// Show or take away the waiting line.
     pub fn wait_line(&mut self, on: bool) {
         self.waiting = on.then(crate::spinner::Waiting::new);
