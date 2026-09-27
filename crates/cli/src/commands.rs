@@ -139,6 +139,38 @@ pub fn command(
             resume(runner, session, workspace);
             Flow::Handled
         }
+        "/undo" => {
+            match take_back(runner, *session, workspace) {
+                Some(prompt) => {
+                    runner.bar.say(&prompt);
+                    render::blank();
+                    render::line(&render::dim(
+                        "Took back the last exchange. Your message is back in the box.",
+                    ));
+                }
+                None => {
+                    render::blank();
+                    render::line(&render::dim("Nothing to take back."));
+                }
+            }
+            Flow::Handled
+        }
+        "/retry" => {
+            match take_back(runner, *session, workspace) {
+                // Queued rather than asked from here, so it goes the way a
+                // typed line goes: the loop sends it and reports a failure.
+                Some(prompt) => runner.bar.send_first(&prompt),
+                None => {
+                    render::blank();
+                    render::line(&render::dim("Nothing to retry."));
+                }
+            }
+            Flow::Handled
+        }
+        "/branch" => {
+            branch(runner, session, rest);
+            Flow::Handled
+        }
         "/where" => {
             render::blank();
             render::line(&format!(
@@ -521,6 +553,67 @@ pub fn resume(runner: &mut Runner, session: &mut usize, workspace: Option<&std::
     replay(runner, index);
 }
 
+/// Take the session back to just before the last thing you said, and the
+/// screen with it. Returns what you said, or `None` when nothing has been.
+fn take_back(
+    runner: &mut Runner,
+    session: usize,
+    workspace: Option<&std::path::Path>,
+) -> Option<String> {
+    let (at, prompt) = last_prompt(&runner.store.conversations[session].messages)?;
+    runner.store.conversations[session].rewind(at);
+    // What was taken back is still on the screen, where a note saying it is
+    // gone would contradict it. Draw the session again from what is left,
+    // the way opening it does.
+    render::clear();
+    banner(runner, &folder_name(workspace), session);
+    if at > 0 {
+        replay(runner, session);
+    }
+    // After the redraw, so a failure to save is not cleared off the screen.
+    runner.persist();
+    Some(prompt)
+}
+
+/// Where the last thing you said sits among `messages`, and what it said.
+fn last_prompt(messages: &[letronna_core::chat::Message]) -> Option<(usize, String)> {
+    let at = messages.iter().rposition(|m| m.role == "user")?;
+    Some((at, messages[at].content.clone()))
+}
+
+/// Carry on in a copy of the open session, leaving the original as it was.
+fn branch(runner: &mut Runner, session: &mut usize, name: &str) {
+    let from = &runner.store.conversations[*session];
+    // A copy of nothing is only another new session, and /resume offers
+    // neither of them back.
+    if from.messages.is_empty() {
+        render::blank();
+        render::line(&render::dim("Nothing to branch from yet."));
+        return;
+    }
+    let title = match name {
+        "" => format!("{} (branch)", from.title),
+        name => name.to_owned(),
+    };
+    let copy = store::Conversation {
+        id: runner.store.next_id(),
+        title: title.clone(),
+        messages: from.messages.clone(),
+        updated: letronna_core::chat::now(),
+        workspace: from.workspace.clone(),
+        todos: from.todos.clone(),
+        ..Default::default()
+    };
+    runner.store.conversations.push(copy);
+    *session = runner.store.conversations.len() - 1;
+    runner.store.active = *session;
+    runner.persist();
+    render::blank();
+    render::line(&render::dim(&format!(
+        "Now in {title}. The original is kept; /resume goes back to it."
+    )));
+}
+
 /// Models offered at once. Some gateways carry hundreds; a list longer than
 /// this is narrowed with a word rather than scrolled.
 const MODEL_CHOICES: usize = 10;
@@ -742,4 +835,39 @@ pub fn gateways(runner: &mut Runner) {
         render::line(&render::red(&format!("Could not save the key: {error}")));
     }
     runner.persist();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::last_prompt;
+    use letronna_core::chat::Message;
+
+    fn said(role: &str, content: &str) -> Message {
+        Message {
+            role: role.into(),
+            content: content.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn taking_back_goes_to_the_last_thing_you_said() {
+        // A turn that used a tool ends on its result and the answer after
+        // it, and neither of those is something you said.
+        let messages = [
+            said("user", "first"),
+            said("assistant", "ok"),
+            said("user", "second"),
+            said("assistant", ""),
+            said("tool", "a result"),
+            said("assistant", "done"),
+        ];
+        assert_eq!(last_prompt(&messages), Some((2, "second".to_owned())));
+    }
+
+    #[test]
+    fn nothing_said_means_nothing_to_take_back() {
+        assert_eq!(last_prompt(&[]), None);
+        assert_eq!(last_prompt(&[said("assistant", "hello")]), None);
+    }
 }
