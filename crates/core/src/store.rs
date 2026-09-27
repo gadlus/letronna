@@ -39,14 +39,19 @@ pub struct Conversation {
     #[serde(default)]
     pub todos: Vec<Todo>,
     /// Messages already on disk. Everything past this is appended on save.
-    /// Only `flush` should touch it; it is visible because callers build a
-    /// Conversation with `..Default::default()`.
+    /// Only `flush` and `rewind` should touch it; it is visible because
+    /// callers build a Conversation with `..Default::default()`.
     #[serde(skip)]
     pub flushed: usize,
     /// The descriptive fields as last written, so save appends a `meta` line
     /// only when one of them actually changed.
     #[serde(skip)]
     pub written: Option<Meta>,
+    /// A rewind not yet on disk: how many messages the session was cut back
+    /// to. Only `rewind` and `flush` should touch it; it is visible for the
+    /// same reason as `flushed`.
+    #[serde(skip)]
+    pub rewound: Option<usize>,
 }
 
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -77,6 +82,11 @@ enum Record {
     /// The descriptive fields; the last one in the file wins.
     Meta(Meta),
     Message(Message),
+    /// From here on the session is its first `to` messages. Taking messages
+    /// back is appended like everything else rather than cutting the file.
+    Rewind {
+        to: usize,
+    },
 }
 
 /// Everything that is not a session.
@@ -125,6 +135,26 @@ impl Conversation {
             self.counted
         } else {
             self.messages.len()
+        }
+    }
+
+    /// Take the conversation back to its first `len` messages, on disk too
+    /// once it is saved.
+    pub fn rewind(&mut self, len: usize) {
+        if len >= self.messages.len() {
+            return;
+        }
+        self.messages.truncate(len);
+        // Rewound to nothing, the messages are empty and the listing's count
+        // is read again: left as it was, `length` would report the old
+        // history and `fill` would read it back in.
+        self.counted = self.counted.min(len);
+        // What is already written stays in the file; a rewind record goes
+        // after it, and anything said from here on after that. Rewinding
+        // again before a save only moves the record back.
+        if self.flushed > len {
+            self.flushed = len;
+            self.rewound = Some(len);
         }
     }
 }
@@ -193,21 +223,26 @@ impl Conversation {
         }
     }
 
-    /// Append the head (first time), any new messages, and the descriptive
-    /// fields if they have moved since the last write.
+    /// Append the head (first time), any rewind and new messages, and the
+    /// descriptive fields if they have moved since the last write.
     fn flush(&mut self) -> std::io::Result<()> {
         let meta = self.meta();
         let meta_changed = self.written.as_ref() != Some(&meta);
         // Every session is flushed on every save, and most have nothing new.
         // Those are known without the file system: taking the lock and
         // checking the file first made each save touch every session on disk.
-        if self.written.is_some() && self.flushed == self.messages.len() && !meta_changed {
+        if self.written.is_some()
+            && self.flushed == self.messages.len()
+            && self.rewound.is_none()
+            && !meta_changed
+        {
             return Ok(());
         }
         let path = session_path(self.id);
         let _lock = Lock::take(&path);
         let fresh = !path.exists();
-        if !fresh && self.flushed == self.messages.len() && !meta_changed {
+        if !fresh && self.flushed == self.messages.len() && self.rewound.is_none() && !meta_changed
+        {
             return Ok(());
         }
 
@@ -228,12 +263,16 @@ impl Conversation {
         if meta_changed {
             push(&mut out, &Record::Meta(meta.clone()));
         }
+        if let Some(to) = self.rewound {
+            push(&mut out, &Record::Rewind { to });
+        }
         for message in &self.messages[self.flushed.min(self.messages.len())..] {
             push(&mut out, &Record::Message(message.clone()));
         }
         file.write_all(out.as_bytes())?;
         self.flushed = self.messages.len();
         self.written = Some(meta);
+        self.rewound = None;
         Ok(())
     }
 }
@@ -265,6 +304,7 @@ fn replay(path: &std::path::Path) -> Option<Conversation> {
                 conversation.todos = meta.todos;
             }
             Ok(Record::Message(message)) => conversation.messages.push(message),
+            Ok(Record::Rewind { to }) => conversation.messages.truncate(to),
             Err(_) => continue,
         }
     }
@@ -326,6 +366,7 @@ pub fn summaries() -> Vec<Summary> {
                         summary.todos = meta.todos;
                     }
                     Ok(Record::Message(_)) => summary.messages += 1,
+                    Ok(Record::Rewind { to }) => summary.messages = summary.messages.min(to),
                     Err(_) => {}
                 }
             }
@@ -381,16 +422,24 @@ fn search_in(dir: &std::path::Path, query: &str, limit: usize) -> Vec<Hit> {
             continue;
         }
         let (mut id, mut title, mut updated) = (0, String::new(), 0);
-        let mut hits = Vec::new();
+        // Each hit keeps its message's place, and the cap waits for the end
+        // of the file: a rewind further down can take the first hits back
+        // and leave later ones standing.
+        let (mut hits, mut said) = (Vec::new(), 0);
         for line in text.lines() {
             match serde_json::from_str::<Record>(line) {
                 Ok(Record::Head { id: head, created }) => (id, updated) = (head, created),
                 // The last meta line wins, and it can come after messages.
                 Ok(Record::Meta(meta)) => (title, updated) = (meta.title, meta.updated),
-                Ok(Record::Message(message)) if hits.len() < HITS_PER_SESSION => {
+                Ok(Record::Message(message)) => {
                     if let Some(snippet) = around(&message.content, &query) {
-                        hits.push((message.role, snippet));
+                        hits.push((said, message.role, snippet));
                     }
+                    said += 1;
+                }
+                Ok(Record::Rewind { to }) => {
+                    hits.retain(|(at, ..)| *at < to);
+                    said = said.min(to);
                 }
                 _ => {}
             }
@@ -400,7 +449,8 @@ fn search_in(dir: &std::path::Path, query: &str, limit: usize) -> Vec<Hit> {
         }
         let hits = hits
             .into_iter()
-            .map(|(role, snippet)| Hit {
+            .take(HITS_PER_SESSION)
+            .map(|(_, role, snippet)| Hit {
                 id,
                 title: title.clone(),
                 updated,
@@ -734,7 +784,7 @@ pub fn age_label(updated: u64, now: u64) -> String {
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
-    use super::{Conversation, Store, Todo, fill, load_listing, replay, search_in};
+    use super::{Conversation, Store, Todo, fill, load_listing, replay, search_in, summaries};
     use crate::chat::Message;
 
     /// Held by every test that points `AGENT_DATA_DIR` somewhere: it is one
@@ -754,6 +804,15 @@ mod tests {
         Message {
             role: role.into(),
             content: text.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Session 1, holding `n` messages that each say their own place.
+    fn numbered(n: usize) -> Conversation {
+        Conversation {
+            id: 1,
+            messages: (0..n).map(|i| said("user", &i.to_string())).collect(),
             ..Default::default()
         }
     }
@@ -917,5 +976,149 @@ mod tests {
         );
         assert!(snippet.contains("the needle"));
         assert!(snippet.chars().count() < 220, "{}", snippet.chars().count());
+    }
+
+    #[test]
+    fn a_rewound_session_reads_back_shorter() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("rewind");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        store.conversations.push(numbered(6));
+        store.save().unwrap();
+        let path = dir.join("sessions/1.jsonl");
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        // The rewind is one more line; nothing already written changes.
+        store.conversations[0].rewind(2);
+        store.save().unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, format!("{before}{{\"type\":\"rewind\",\"to\":2}}\n"));
+
+        // It is written once: saving again with nothing new adds nothing.
+        store.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), after);
+
+        let back = replay(&path).unwrap();
+        assert_eq!(back.messages.len(), 2);
+        assert_eq!(back.messages[1].content, "1");
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn rewinding_twice_before_a_save_keeps_the_shorter() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("rewind-twice");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        store.conversations.push(numbered(6));
+        store.save().unwrap();
+        store.conversations[0].rewind(4);
+        store.conversations[0].rewind(2);
+        store.save().unwrap();
+
+        let back = replay(&dir.join("sessions/1.jsonl")).unwrap();
+        assert_eq!(back.messages.len(), 2);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn what_is_said_after_a_rewind_follows_it() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("rewind-then-say");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        store.conversations.push(numbered(6));
+        store.save().unwrap();
+        store.conversations[0].rewind(2);
+        store.conversations[0].messages.push(said("user", "again"));
+        store.save().unwrap();
+
+        let back = replay(&dir.join("sessions/1.jsonl")).unwrap();
+        let contents: Vec<&str> = back.messages.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, ["0", "1", "again"]);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn the_listing_counts_what_is_left() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("rewind-listing");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        store.conversations.push(numbered(6));
+        store.save().unwrap();
+        store.conversations[0].rewind(2);
+        store.save().unwrap();
+        assert_eq!(summaries()[0].messages, 2);
+
+        // Counting carries on from the rewind, not from the end of the file.
+        store.conversations[0].messages.push(said("user", "again"));
+        store.save().unwrap();
+        assert_eq!(summaries()[0].messages, 3);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn search_skips_what_was_rewound() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("rewind-search");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        store.conversations.push(Conversation {
+            id: 1,
+            messages: vec![
+                said("user", "one fig"),
+                said("user", "two fig"),
+                said("user", "three fig"),
+                said("user", "four fig"),
+            ],
+            ..Default::default()
+        });
+        store.save().unwrap();
+        store.conversations[0].rewind(1);
+        store.conversations[0]
+            .messages
+            .push(said("user", "five fig"));
+        store.save().unwrap();
+
+        let sessions = dir.join("sessions");
+        assert!(search_in(&sessions, "three", 10).is_empty());
+        // More hits than a session may show were taken back, which must not
+        // hide the one said after them.
+        let figs: Vec<String> = search_in(&sessions, "fig", 10)
+            .into_iter()
+            .map(|hit| hit.snippet)
+            .collect();
+        assert_eq!(figs, ["one fig", "five fig"]);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_listed_session_rewound_to_the_start_stays_empty() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("rewind-start");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        store.conversations.push(numbered(6));
+        store.save().unwrap();
+
+        // The terminal reads a listed session when it is opened, so opening
+        // it again must not bring back what was just taken out of it.
+        let mut listed = load_listing();
+        fill(&mut listed.conversations[0]);
+        listed.conversations[0].rewind(0);
+        fill(&mut listed.conversations[0]);
+        assert_eq!(listed.conversations[0].length(), 0);
+        listed.save().unwrap();
+        let back = replay(&dir.join("sessions/1.jsonl")).unwrap();
+        assert!(back.messages.is_empty());
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 }
