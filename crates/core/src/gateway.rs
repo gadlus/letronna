@@ -162,7 +162,7 @@ mod tests {
         assert_eq!(status("OpenAI", &keyed, "", 0), ("Set up · no models answered".into(), false, true));
         assert_eq!(status("OpenAI", &keyed, "", 3), ("Connected · 3 models".into(), true, true));
         assert_eq!(status("Ollama", &none, "", 1), ("Running · 1 model".into(), true, true));
-        assert_eq!(status("Custom", &none, "", 0).2, false);
+        assert!(!status("Custom", &none, "", 0).2);
         assert_eq!(status("Custom", &none, "http://x/v1", 2).0, "Connected · 2 models");
     }
 }
