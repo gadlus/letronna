@@ -11,7 +11,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// What a playing video sends the chat.
+/// What a playing video sends the chat. Only Windows decodes video, so only
+/// Windows sends these; elsewhere `play` refuses before anything is sent.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) enum Event {
     /// The next frame, due on screen now.
     Frame(Arc<RenderImage>),
@@ -288,7 +290,7 @@ mod decode {
         unsafe { buffer.Unlock() }?;
         // RGB32 is BGRX: the fourth byte is not alpha, and gpui would draw
         // whatever is in it as see-through.
-        for pixel in pixels.chunks_exact_mut(4) {
+        for pixel in pixels.as_chunks_mut::<4>().0 {
             pixel[3] = 255;
         }
         let image = image::RgbaImage::from_raw(width, height, pixels)
