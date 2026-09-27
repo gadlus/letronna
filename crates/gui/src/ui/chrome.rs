@@ -1,5 +1,8 @@
 use crate::prelude::*;
 
+/// The user guide on the website, opened from the account menu.
+const GUIDE: &str = "https://letronna.ai/docs";
+
 impl Chat {
     pub(crate) fn title_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         // On macOS the bar starts after the traffic lights: three 12px buttons
@@ -88,6 +91,11 @@ impl Chat {
                             .on_click(move |_, window, cx| {
                                 settings.update(cx, |this, cx| this.open_settings(window, cx))
                             }),
+                    )
+                    .item(
+                        PopupMenuItem::new("Guide")
+                            .icon(Icon::new(IconName::Info))
+                            .on_click(|_, _, cx| cx.open_url(GUIDE)),
                     )
                     .separator()
                     .item(

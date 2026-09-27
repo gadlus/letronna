@@ -35,6 +35,8 @@ pub fn command(
                     render::dim(entry.blurb)
                 ));
             }
+            render::blank();
+            render::line(&render::dim("The guide: https://letronna.ai/docs"));
             Flow::Handled
         }
         "/clear" => {
