@@ -128,6 +128,66 @@ fn matches(text: &str) -> Vec<&'static Command> {
         .collect()
 }
 
+/// Columns the longest command name takes, so every blurb starts in the
+/// same place however much of the list is showing.
+pub fn name_width() -> usize {
+    COMMANDS
+        .iter()
+        .map(|c| c.name.chars().count())
+        .max()
+        .unwrap_or(0)
+}
+
+/// Where the menu's shown rows start. It only moves as far as it has to for
+/// the highlighted row to be one of them: the list held more commands than
+/// it drew, and the arrows walked all of them, so a highlight could sit on a
+/// row nobody could see and enter would take it.
+fn menu_top(top: usize, picked: usize, len: usize, limit: usize) -> usize {
+    if len <= limit {
+        return 0;
+    }
+    let top = top.min(len - limit);
+    if picked < top {
+        picked
+    } else if picked >= top + limit {
+        picked + 1 - limit
+    } else {
+        top
+    }
+}
+
+/// The command a mistyped one was most likely meant to be, when one is
+/// within two keystrokes of it.
+pub fn closest(typed: &str) -> Option<&'static str> {
+    let typed = typed.to_lowercase();
+    COMMANDS
+        .iter()
+        .map(|c| (distance(&typed, c.name), c.name))
+        .filter(|(edits, _)| *edits <= 2)
+        .min_by_key(|(edits, _)| *edits)
+        .map(|(_, name)| name)
+}
+
+/// Letters to add, drop or change to turn `a` into `b`.
+fn distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, x) in a.chars().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, y) in b.iter().enumerate() {
+            let above = row[j + 1];
+            row[j + 1] = if x == *y {
+                diagonal
+            } else {
+                1 + diagonal.min(above).min(row[j])
+            };
+            diagonal = above;
+        }
+    }
+    row[b.len()]
+}
+
 /// A question with a fixed set of answers, asked in the box instead of the
 /// line: approvals are the same three or four answers every time, and typing
 /// a letter for them is a small thing to get wrong in a hurry.
@@ -150,6 +210,8 @@ struct Slider {
 pub struct Bar {
     line: Line,
     picked: usize,
+    /// The first of the menu's rows on show, when there are more than fit.
+    menu_top: usize,
     footer: String,
     /// Lines entered but not yet answered, in the order they were typed.
     queued: VecDeque<String>,
@@ -191,6 +253,7 @@ impl Bar {
         Self {
             line: Line::default(),
             picked: 0,
+            menu_top: 0,
             footer,
             queued: VecDeque::new(),
             live: false,
@@ -485,6 +548,10 @@ impl Bar {
         if !on {
             self.interrupt = false;
         }
+        // The footer says whether escape will stop anything, so it is
+        // redrawn now rather than at the next key; that also brings out the
+        // last of what the turn printed, "Stopped." included.
+        self.settle();
     }
 
     /// Whether the user has asked to stop the turn, clearing the request.
@@ -605,6 +672,8 @@ impl Bar {
             }
             _ => {}
         }
+        let shown = matches(self.line.text()).len();
+        self.menu_top = menu_top(self.menu_top, self.picked, shown, MENU_LIMIT);
     }
 
     /// Send what is in the box: the line ending the enter put in comes off,
@@ -804,22 +873,36 @@ impl Bar {
         ));
 
         if self.choice.is_none() {
-            for (i, option) in matches(self.line.text())
-                .iter()
-                .take(MENU_LIMIT)
-                .enumerate()
-            {
+            let options = matches(self.line.text());
+            let top = menu_top(self.menu_top, self.picked, options.len(), MENU_LIMIT);
+            let end = (top + MENU_LIMIT).min(options.len());
+            let width = name_width();
+            let more = |count: usize, arrow: &str| {
+                format!(
+                    "{}  {}",
+                    render::GUTTER,
+                    render::dim(&format!("{arrow} {count} more"))
+                )
+            };
+            if top > 0 {
+                lines.push(more(top, "↑"));
+            }
+            for (i, option) in options.iter().enumerate().take(end).skip(top) {
                 let marker = if i == self.picked { "›" } else { " " };
+                let padded = format!("{:<width$}", option.name);
                 let name = if i == self.picked {
-                    render::blue(option.name)
+                    render::blue(&padded)
                 } else {
-                    option.name.to_owned()
+                    padded
                 };
                 lines.push(format!(
                     "{}{marker} {name}  {}",
                     render::GUTTER,
                     render::dim(option.blurb)
                 ));
+            }
+            if end < options.len() {
+                lines.push(more(options.len() - end, "↓"));
             }
         }
 
@@ -832,6 +915,10 @@ impl Bar {
             "↑↓ to choose  ·  enter to take it  ·  esc to decline".to_owned()
         } else if back > 0 {
             format!("scrolled back {back} lines  ·  end to follow again")
+        } else if self.working {
+            // Said while it applies rather than only after a long silence:
+            // a reply going the wrong way is worth stopping early.
+            format!("{}  ·  esc to stop", self.footer)
         } else {
             self.footer.clone()
         };
@@ -993,7 +1080,7 @@ fn track(stops: &[String], at: usize, room: usize) -> (String, String, usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Bar, Slider, matches, stops_at, track};
+    use super::{Bar, MENU_LIMIT, Slider, closest, matches, menu_top, stops_at, track};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn press(bar: &mut Bar, code: KeyCode) {
@@ -1080,6 +1167,34 @@ mod tests {
         assert!(matches("what is this").is_empty());
         assert!(matches("").is_empty());
         assert!(!matches("/").is_empty());
+    }
+
+    #[test]
+    fn the_menu_keeps_the_highlight_in_view() {
+        let len = 16;
+        let shows = |top: usize, picked: usize| top <= picked && picked < top + MENU_LIMIT;
+        // Up from the first row wraps to the last, which has to come into view.
+        let top = menu_top(0, len - 1, len, MENU_LIMIT);
+        assert!(shows(top, len - 1));
+        assert_eq!(top + MENU_LIMIT, len);
+        // Walking back up does not shift the rows while the highlight is on show.
+        assert_eq!(menu_top(top, len - 3, len, MENU_LIMIT), top);
+        // Every step down the whole list keeps it on show.
+        let mut top = 0;
+        for picked in 0..len {
+            top = menu_top(top, picked, len, MENU_LIMIT);
+            assert!(shows(top, picked), "row {picked} hidden under top {top}");
+        }
+        // A list that fits never scrolls.
+        assert_eq!(menu_top(5, 3, 4, MENU_LIMIT), 0);
+    }
+
+    #[test]
+    fn a_typo_points_at_the_command_it_meant() {
+        assert_eq!(closest("/mdoel"), Some("/model"));
+        assert_eq!(closest("/hlep"), Some("/help"));
+        assert_eq!(closest("/Models"), Some("/model"));
+        assert_eq!(closest("/xyzzy"), None);
     }
 
     #[test]

@@ -161,9 +161,11 @@ fn main() {
         if line.starts_with('/') {
             let flow = command(&mut runner, &line, &mut session, workspace.as_deref());
             if let Flow::Unknown = flow {
-                render::line(&render::dim(&format!(
-                    "{line} is not a command. Type / to see what is."
-                )));
+                let name = line.split_whitespace().next().unwrap_or(&line);
+                render::line(&render::dim(&match bar::closest(name) {
+                    Some(meant) => format!("{name} is not a command. Did you mean {meant}?"),
+                    None => format!("{line} is not a command. Type / to see what is."),
+                }));
             }
             // Painting is throttled, so the last thing a command printed can
             // still be sitting in the buffer with nothing coming after it to

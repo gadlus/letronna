@@ -211,10 +211,12 @@ impl Chat {
     /// The Model page's Save: the default model.
     pub(crate) fn apply_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.store.settings.model = self.model.read(cx).value().to_string();
-        self.save();
+        // Cleared before saving, not after: clearing last threw away the very
+        // error that says the save failed.
         self.error = None;
+        self.save();
         self.load_models(window, cx);
-        self.close_settings(cx);
+        self.close_settings(window, cx);
     }
 
     pub(crate) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -224,16 +226,20 @@ impl Chat {
         self.settings_open = true;
         self.gateway_pick.update(cx, |g, _| g.clear());
         self.settings_closing = false;
+        // Somewhere inside the chat has to hold focus for escape to reach
+        // it; opened from a menu, nothing does.
+        self.settings_focus.focus(window);
         // The terminal may have signed in or out since this last looked.
         self.refresh_account(cx);
         cx.notify();
     }
 
-    pub(crate) fn close_settings(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.settings_closing {
             return;
         }
         self.settings_closing = true;
+        self.focus_composer(window, cx);
         cx.notify();
         cx.spawn(async move |this, cx| {
             cx.background_executor()
@@ -281,7 +287,7 @@ impl Chat {
             .bg(gpui::black())
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.close_settings(cx)),
+                cx.listener(|this, _, window, cx| this.close_settings(window, cx)),
             )
             .with_animation(
                 if closing { "scrim-out" } else { "scrim-in" },
@@ -398,6 +404,7 @@ impl Chat {
             _ => gateway_page(self.gateway_rows(), &pick, &endpoint, &key, &page, &chat, cx).into_any_element(),
         };
         div()
+            .track_focus(&self.settings_focus)
             .w(vp.width - gap * 2.)
             .bg(cx.theme().background)
             .border_1()
@@ -439,9 +446,9 @@ impl Chat {
                                         .ghost()
                                         .xsmall()
                                         .icon(Icon::new(IconName::Close))
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| this.close_settings(cx)),
-                                        ),
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.close_settings(window, cx)
+                                        })),
                                 ),
                             ),
                     ),
@@ -1442,7 +1449,7 @@ fn gateway_page(
                         v_flex()
                             .gap_1()
                             .child(label(if needs_key { "API key" } else { "API key (optional)" }, cx))
-                            .child(Input::new(key)),
+                            .child(Input::new(key).mask_toggle()),
                     )
                     .child(
                         h_flex()

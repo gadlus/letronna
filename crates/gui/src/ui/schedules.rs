@@ -240,6 +240,20 @@ impl Chat {
         self.save_schedules(cx);
     }
 
+    fn delete_schedule(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(job) = self.schedules.iter().find(|s| s.id == id) else {
+            return;
+        };
+        let body = format!("\"{}\" will stop running and be removed.", job.name);
+        let chat = cx.entity();
+        crate::ui::confirm_delete("Delete job", body, window, cx, move |_, cx| {
+            chat.update(cx, |this, cx| {
+                this.schedules.retain(|s| s.id != id);
+                this.save_schedules(cx);
+            })
+        });
+    }
+
     fn open_editor(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(job) = self.schedules.iter().find(|s| s.id == id) else {
             return;
@@ -335,9 +349,8 @@ impl Chat {
                             .xsmall()
                             .icon(Icon::new(AppIcon::Trash))
                             .tooltip("Delete")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.schedules.retain(|s| s.id != id);
-                                this.save_schedules(cx);
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.delete_schedule(id, window, cx)
                             })),
                     )
                     .child(

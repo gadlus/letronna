@@ -38,6 +38,20 @@ impl Chat {
         cx.notify();
     }
 
+    fn delete_skill(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(skill) = self.skills.iter().find(|s| s.id == id) else {
+            return;
+        };
+        let body = format!("\"{}\" will be removed from this device.", skill.name);
+        let chat = cx.entity();
+        crate::ui::confirm_delete("Delete skill", body, window, cx, move |_, cx| {
+            chat.update(cx, |this, cx| {
+                this.skills.retain(|s| s.id != id);
+                this.save_skills(cx);
+            })
+        });
+    }
+
     fn edit_skill(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(skill) = self.skills.iter().find(|s| s.id == id) else {
             return;
@@ -187,9 +201,8 @@ impl Chat {
                             .xsmall()
                             .icon(Icon::new(AppIcon::Trash))
                             .tooltip("Delete")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.skills.retain(|s| s.id != id);
-                                this.save_skills(cx);
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.delete_skill(id, window, cx)
                             })),
                     ),
             )

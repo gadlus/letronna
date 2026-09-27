@@ -14,8 +14,43 @@ pub(crate) mod skills;
 pub(crate) mod update;
 
 use crate::prelude::*;
+use gpui_component::{button::ButtonVariant, dialog::DialogButtonProps};
 
 const CODE_LINE: Pixels = px(18.);
+
+/// Ask before something is removed for good. The button says what it does
+/// and is red, where a plain "OK" read as agreeing to carry on.
+pub(crate) fn confirm_delete(
+    title: &'static str,
+    body: String,
+    window: &mut Window,
+    cx: &mut App,
+    delete: impl Fn(&mut Window, &mut App) + 'static,
+) {
+    let delete = std::rc::Rc::new(delete);
+    window.open_dialog(cx, move |dialog, _, cx| {
+        let delete = delete.clone();
+        dialog
+            .title(div().font_family(HEADING_FONT).child(title))
+            .w(px(420.))
+            .confirm()
+            .button_props(
+                DialogButtonProps::default()
+                    .ok_text("Delete")
+                    .ok_variant(ButtonVariant::Danger),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(body.clone()),
+            )
+            .on_ok(move |_, window, cx| {
+                delete(window, cx);
+                true
+            })
+    });
+}
 
 /// Monospaced output that turns into a scroll box only once it is taller than
 /// `max`. A short command then takes the room it needs instead of reserving a

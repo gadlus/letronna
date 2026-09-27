@@ -20,6 +20,7 @@ impl AssetSource for Assets {
                 "minus",
                 "settings",
                 "arrow-up",
+                "arrow-down",
                 "copy",
                 "panel-left-close",
                 "panel-left-open",
@@ -68,7 +69,8 @@ impl AssetSource for Assets {
                 "list-checks",
                 "circle",
                 "list-filter",
-                "envelope"
+                "envelope",
+                "eye"
             ),
             ("telegram", "discord", "slack", "whatsapp")
         ))
