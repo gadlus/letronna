@@ -19,6 +19,9 @@ pub struct ToolContext {
     /// Set when a chat app is driving the session: where `read_chat` reads,
     /// and whether other people can see the replies.
     pub remote: Option<Remote>,
+    /// The conversation the call is made in, which keeps a browser of its
+    /// own; 0 for none in particular.
+    pub conversation: u64,
 }
 
 impl ToolContext {
@@ -26,6 +29,7 @@ impl ToolContext {
         Self {
             workspace: connection.workspace.clone(),
             remote: connection.remote.clone(),
+            conversation: connection.conversation,
         }
     }
 

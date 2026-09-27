@@ -234,9 +234,16 @@ fn running(port: u16) -> Option<String> {
 /// A running browser: one Letronna started, or one it found still running on
 /// its profile from an earlier run.
 pub struct Browser {
-    port: u16,
+    /// How to reach it, which each conversation using it keeps a copy of.
+    pub reach: Reach,
     /// The process, when this run of Letronna started it.
     child: Option<Child>,
+}
+
+/// Where a running browser listens, and what it is: all it takes to use it.
+#[derive(Clone)]
+pub struct Reach {
+    port: u16,
     /// Running with no window, where nobody can see it or close it.
     pub headless: bool,
     /// What it calls itself to sites.
@@ -255,13 +262,6 @@ pub struct Target {
     kind: String,
     #[serde(rename = "webSocketDebuggerUrl", default)]
     socket: String,
-}
-
-impl Target {
-    /// The tab's own debugging socket, for a second connection to it.
-    pub(crate) fn socket(&self) -> &str {
-        &self.socket
-    }
 }
 
 impl Browser {
@@ -342,37 +342,149 @@ impl Browser {
     }
 
     fn on(port: u16, child: Option<Child>, agent: String) -> Browser {
-        Browser {
+        let reach = Reach {
             port,
-            child,
             headless: agent.contains(HEADLESS),
             agent,
-        }
+        };
+        Browser { reach, child }
     }
 
-    /// The browser's tabs, the one used most recently first.
-    pub fn tabs(&self) -> Result<Vec<Target>, String> {
-        let targets: Vec<Target> = http()?
+    /// Close the whole browser, every tab of it.
+    pub fn close(&mut self) {
+        if let Ok(mut browser) = self.reach.connect() {
+            let _ = browser.call::<Ignored>("Browser.close", json!({}));
+        }
+        let asked = Instant::now();
+        // One this run did not start is not its child to wait on: it has
+        // gone once its port stops answering, and its profile is free.
+        let Some(child) = self.child.as_mut() else {
+            while asked.elapsed() < PROBE_TIME && self.reach.alive() {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            return;
+        };
+        while asked.elapsed() < PROBE_TIME {
+            if let Ok(Some(_)) = child.try_wait() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+impl Reach {
+    /// Whether the browser still answers.
+    pub fn alive(&self) -> bool {
+        running(self.port).is_some()
+    }
+
+    /// A connection to the browser itself, rather than to one of its tabs.
+    fn connect(&self) -> Result<Tab, String> {
+        let version: Value = http()?
+            .get(format!("http://127.0.0.1:{}/json/version", self.port))
+            .send()
+            .and_then(|reply| reply.json())
+            .map_err(|_| "The browser did not answer.".to_owned())?;
+        let socket = version["webSocketDebuggerUrl"]
+            .as_str()
+            .ok_or("The browser did not say where to reach it.")?;
+        Tab::connect(socket, "browser")
+    }
+
+    /// A tab's own debugging socket.
+    pub fn socket_of(&self, id: &str) -> String {
+        format!("ws://127.0.0.1:{}/devtools/page/{id}", self.port)
+    }
+
+    /// The tabs in a browser context -- a private one, or with `None` the
+    /// browser's own -- the one used most recently first.
+    pub fn tabs(&self, context: Option<&str>) -> Result<Vec<Target>, String> {
+        let listed: Vec<Target> = http()?
             .get(format!("http://127.0.0.1:{}/json/list", self.port))
             .send()
             .and_then(|reply| reply.json())
             .map_err(|_| "The browser did not list its tabs.".to_owned())?;
-        Ok(targets
+        // The list says nothing of contexts: the browser itself does.
+        let mut browser = self.connect()?;
+        let targets: Value = browser.call("Target.getTargets", json!({}))?;
+        let private: Value = browser.call("Target.getBrowserContexts", json!({}))?;
+        let private: Vec<&str> = private["browserContextIds"]
+            .as_array()
+            .map(|ids| ids.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let inside: Vec<&str> = targets["targetInfos"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter(|info| {
+                let own = info["browserContextId"].as_str().unwrap_or_default();
+                match context {
+                    Some(context) => own == context,
+                    None => !private.contains(&own),
+                }
+            })
+            .filter_map(|info| info["targetId"].as_str())
+            .collect();
+        Ok(listed
             .into_iter()
             .filter(|target| target.kind == "page" && !target.socket.is_empty())
+            .filter(|target| inside.contains(&target.id.as_str()))
             .collect())
     }
 
-    /// A new blank tab.
-    pub fn new_tab(&self) -> Result<Target, String> {
-        http()?
-            .put(format!(
-                "http://127.0.0.1:{}/json/new?about:blank",
-                self.port
-            ))
-            .send()
-            .and_then(|reply| reply.json())
-            .map_err(|_| "The browser did not open a new tab.".to_owned())
+    /// A new blank tab in a browser context.
+    pub fn new_tab(&self, context: Option<&str>) -> Result<Target, String> {
+        let Some(context) = context else {
+            return http()?
+                .put(format!(
+                    "http://127.0.0.1:{}/json/new?about:blank",
+                    self.port
+                ))
+                .send()
+                .and_then(|reply| reply.json())
+                .map_err(|_| "The browser did not open a new tab.".to_owned());
+        };
+        let made: Value = self.connect()?.call(
+            "Target.createTarget",
+            json!({"url": "about:blank", "browserContextId": context}),
+        )?;
+        let id = made["targetId"]
+            .as_str()
+            .ok_or("The browser did not open a new tab.")?;
+        Ok(Target {
+            id: id.to_owned(),
+            title: String::new(),
+            url: "about:blank".into(),
+            kind: "page".into(),
+            socket: self.socket_of(id),
+        })
+    }
+
+    /// A private browser context: its own cookies, storage and tabs, as an
+    /// incognito window has, kept in memory only.
+    pub fn new_context(&self) -> Result<String, String> {
+        let made: Value = self.connect()?.call(
+            "Target.createBrowserContext",
+            json!({"disposeOnDetach": false}),
+        )?;
+        made["browserContextId"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| "The browser did not make a private context.".to_owned())
+    }
+
+    /// Close a private browser context, every tab of it, and forget it.
+    pub fn drop_context(&self, context: &str) {
+        if let Ok(mut browser) = self.connect() {
+            let _ = browser.call::<Ignored>(
+                "Target.disposeBrowserContext",
+                json!({"browserContextId": context}),
+            );
+        }
     }
 
     /// Connect to a tab, ready to be driven.
@@ -402,38 +514,6 @@ impl Browser {
                 ))
                 .send();
         }
-    }
-
-    /// Close the whole browser, every tab of it.
-    pub fn close(&mut self) {
-        let socket = http().ok().and_then(|client| {
-            let version: Value = client
-                .get(format!("http://127.0.0.1:{}/json/version", self.port))
-                .send()
-                .and_then(|reply| reply.json())
-                .ok()?;
-            version["webSocketDebuggerUrl"].as_str().map(str::to_owned)
-        });
-        if let Some(mut browser) = socket.and_then(|socket| Tab::connect(&socket, "browser").ok()) {
-            let _ = browser.call::<Ignored>("Browser.close", json!({}));
-        }
-        let asked = Instant::now();
-        // One this run did not start is not its child to wait on: it has
-        // gone once its port stops answering, and its profile is free.
-        let Some(child) = self.child.as_mut() else {
-            while asked.elapsed() < PROBE_TIME && running(self.port).is_some() {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            return;
-        };
-        while asked.elapsed() < PROBE_TIME {
-            if let Ok(Some(_)) = child.try_wait() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        let _ = child.kill();
-        let _ = child.wait();
     }
 }
 

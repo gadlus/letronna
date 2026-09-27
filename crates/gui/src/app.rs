@@ -150,8 +150,10 @@ pub(crate) struct Chat {
     /// The video playing in the chat, if one is, and its newest frame.
     pub(crate) video: Option<crate::platform::video::Playing>,
     pub(crate) video_frame: Option<std::sync::Arc<RenderImage>>,
-    /// The browser the agent uses, shown beside the chat while it does.
+    /// The browser the agent uses, shown beside the chat while it does, and
+    /// the session whose browser it shows: each session has its own.
     pub(crate) browser: Entity<crate::ui::browser::BrowserView>,
+    pub(crate) browser_for: u64,
     pub(crate) error: Option<String>,
     pub(crate) scroll: ScrollHandle,
     pub(crate) _subscriptions: Vec<Subscription>,
@@ -162,6 +164,7 @@ impl Chat {
         // Sessions are separate files now, so a damaged one costs that
         // session rather than the history.
         let (mut store, error) = (letronna_core::store::load(), None);
+        letronna_core::browser::share_browser(store.settings.browser_shared);
         if store.conversations.is_empty() {
             store.conversations.push(Conversation {
                 title: "New session".into(),
@@ -336,6 +339,7 @@ impl Chat {
             video: None,
             video_frame: None,
             browser: cx.new(|cx| crate::ui::browser::BrowserView::new(window, cx)),
+            browser_for: 0,
             error,
             scroll: ScrollHandle::new(),
             _subscriptions: subscriptions,
@@ -482,6 +486,7 @@ impl Chat {
             effort: self.store.settings.effort.clone(),
             search: self.store.settings.search,
             remote,
+            conversation: self.store.conversations[self.store.active].id,
         };
         if let Err(error) = backend::validate(&connection) {
             self.error = Some(error);
@@ -1101,6 +1106,12 @@ impl Chat {
 
 impl Render for Chat {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The panel shows the browser of the session on screen.
+        let on_screen = self.store.conversations[self.store.active].id;
+        if self.browser_for != on_screen {
+            self.browser_for = on_screen;
+            letronna_core::browser::show_conversation(on_screen);
+        }
         // A job starting or exiting happens off the UI thread, so the footer
         // chips need a poll while any of them is alive. It stops on its own.
         if !self.job_tick && letronna_core::jobs::list().iter().any(|job| job.running) {

@@ -107,6 +107,10 @@ pub struct Settings {
     /// Which session was open last, by id rather than position.
     #[serde(default)]
     pub active_id: u64,
+    /// Every session shares one browser, its sign-ins remembered, rather
+    /// than each having a private one, forgotten when Letronna quits.
+    #[serde(default)]
+    pub browser_shared: bool,
 }
 
 #[derive(Default)]

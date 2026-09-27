@@ -54,6 +54,7 @@ fn main() {
         plan: args.plan,
         bar: bar::Bar::new(String::new()),
     };
+    letronna_core::browser::share_browser(runner.store.settings.browser_shared);
     // With nothing set up there is nothing to talk to, so the first run is
     // the setup -- the same one the installers hand over to. Asking a
     // question from a pipe cannot wait for answers, so that one stops here.

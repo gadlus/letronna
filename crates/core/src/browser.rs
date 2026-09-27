@@ -20,7 +20,7 @@ use crate::tools::{Tool, ToolContext};
 use crate::watch::{self, Sight};
 use serde_json::{Value, json};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -128,17 +128,17 @@ impl Tool for Browse {
     fn needs_approval(&self) -> bool {
         true
     }
-    fn preview(&self, args: &Value, _: &ToolContext) -> String {
+    fn preview(&self, args: &Value, ctx: &ToolContext) -> String {
         if args["action"] == "open" {
             return format!("GET {}", args["url"].as_str().unwrap_or_default());
         }
         let what = crate::tools::summary(BROWSE, &args.to_string());
-        match current_page() {
+        match current_page(ctx.conversation) {
             Some(page) => format!("{what}\non {page}"),
             None => what,
         }
     }
-    fn run(&self, args: &Value, _: &ToolContext) -> Result<String, String> {
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         let view = View {
             full: args["full"].as_bool().unwrap_or(false),
             find: args["find"].as_str().map(str::to_owned),
@@ -147,25 +147,27 @@ impl Tool for Browse {
         match args["action"].as_str().unwrap_or("look") {
             "open" => {
                 let url = address(args["url"].as_str().unwrap_or_default(), &secrets())?;
-                with_session(|session| session.open(&url))
+                with_session(ctx.conversation, |session| session.open(&url))
             }
             // Finding looks through the words too: those are what is
             // looked for.
-            "look" => with_session(|session| {
+            "look" => with_session(ctx.conversation, |session| {
                 let page = session.read(view.full || view.find.is_some())?;
                 session.show(&page, &view, Vec::new())
             }),
             "scroll" => {
                 let down = args["direction"].as_str() != Some("up");
-                with_session(|session| session.scroll(down, view.full))
+                with_session(ctx.conversation, |session| session.scroll(down, view.full))
             }
-            "back" => with_session(Session::back),
+            "back" => with_session(ctx.conversation, Session::back),
             "tabs" => match args["tab"].as_u64() {
-                Some(number) => with_session(|session| session.switch(number as usize)),
-                None => with_session(Session::list_tabs),
+                Some(number) => {
+                    with_session(ctx.conversation, |session| session.switch(number as usize))
+                }
+                None => with_session(ctx.conversation, Session::list_tabs),
             },
-            "console" => with_session(Session::console),
-            "screenshot" => with_session(Session::screenshot),
+            "console" => with_session(ctx.conversation, Session::console),
+            "screenshot" => with_session(ctx.conversation, Session::screenshot),
             other => Err(format!(
                 "browse cannot `{other}`; it can open, look, scroll, back, tabs, console or screenshot."
             )),
@@ -199,7 +201,7 @@ impl Tool for UsePage {
     fn mutates(&self) -> bool {
         true
     }
-    fn preview(&self, args: &Value, _: &ToolContext) -> String {
+    fn preview(&self, args: &Value, ctx: &ToolContext) -> String {
         if args["action"] == "eval" {
             return format!(
                 "Run in the page:\n\n{}",
@@ -207,7 +209,10 @@ impl Tool for UsePage {
             );
         }
         let mut text = crate::tools::summary("use_page", &args.to_string());
-        let element = args["ref"].as_str().and_then(ref_number).and_then(label_of);
+        let element = args["ref"]
+            .as_str()
+            .and_then(ref_number)
+            .and_then(|number| label_of(ctx.conversation, number));
         if let Some(element) = element {
             text.push_str(&format!(": {element}"));
         }
@@ -217,12 +222,12 @@ impl Tool for UsePage {
                 args["text"].as_str().unwrap_or_default()
             ));
         }
-        if let Some(page) = current_page() {
+        if let Some(page) = current_page(ctx.conversation) {
             text.push_str(&format!("\n\non {page}"));
         }
         text
     }
-    fn run(&self, args: &Value, _: &ToolContext) -> Result<String, String> {
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         let agree = args["confirm"].as_bool().unwrap_or(false);
         let target = |session: &Session| -> Result<i64, String> {
             let raw = args["ref"]
@@ -238,7 +243,7 @@ impl Tool for UsePage {
             })
         };
         match args["action"].as_str().unwrap_or_default() {
-            "click" => with_session(|session| {
+            "click" => with_session(ctx.conversation, |session| {
                 let node = target(session)?;
                 session.act(agree, |session| session.click(node))
             }),
@@ -247,7 +252,7 @@ impl Tool for UsePage {
                     .as_str()
                     .ok_or("`text` is required for type.")?;
                 let submit = args["submit"].as_bool().unwrap_or(false);
-                with_session(|session| {
+                with_session(ctx.conversation, |session| {
                     let node = target(session)?;
                     session.act(agree, |session| session.type_into(node, text, submit))
                 })
@@ -256,7 +261,7 @@ impl Tool for UsePage {
                 let name = args["key"].as_str().ok_or("`key` is required for press.")?;
                 let key =
                     key(name).ok_or_else(|| format!("`{name}` is not a key use_page knows."))?;
-                with_session(|session| {
+                with_session(ctx.conversation, |session| {
                     let node = args["ref"].as_str().map(|_| target(session)).transpose()?;
                     session.act(agree, |session| {
                         if let Some(node) = node {
@@ -270,7 +275,7 @@ impl Tool for UsePage {
                 let choice = args["text"]
                     .as_str()
                     .ok_or("`text` is required for select: the option.")?;
-                with_session(|session| {
+                with_session(ctx.conversation, |session| {
                     let node = target(session)?;
                     session.act(agree, |session| session.choose(node, choice))
                 })
@@ -279,7 +284,7 @@ impl Tool for UsePage {
                 let script = args["script"]
                     .as_str()
                     .ok_or("`script` is required for eval.")?;
-                with_session(|session| session.eval(script, agree))
+                with_session(ctx.conversation, |session| session.eval(script, agree))
             }
             other => Err(format!(
                 "use_page cannot `{other}`; it can click, type, press, select or eval."
@@ -493,12 +498,15 @@ pub(crate) fn key_events(key: &Key, modifiers: i64) -> [Value; 2] {
     [down, up]
 }
 
-/// The browser in use: the browser, the tab being driven, and what the
-/// model has been shown of it.
+/// A conversation's use of the browser: its tab, and what the model has been
+/// shown of it.
 struct Session {
-    browser: cdp::Browser,
-    /// The profile the browser runs on, to start it there again.
-    profile: PathBuf,
+    /// The conversation it is for, or `SHARED`.
+    owner: u64,
+    /// Its private browser context, or `None` for the browser's own, which
+    /// every conversation shares.
+    context: Option<String>,
+    reach: cdp::Reach,
     tab: Tab,
     refs: Refs,
     /// The page as last listed in short, to say when an action changed nothing.
@@ -509,38 +517,208 @@ struct Session {
     known: Vec<String>,
 }
 
-fn state() -> &'static Mutex<Option<Session>> {
-    static SESSION: OnceLock<Mutex<Option<Session>>> = OnceLock::new();
-    SESSION.get_or_init(|| Mutex::new(None))
+/// The browser, and each conversation's use of it.
+struct Browsers {
+    /// The profile the browser runs on: the data folder's.
+    profile: PathBuf,
+    browser: Option<cdp::Browser>,
+    /// A session per conversation using the browser, the one used most
+    /// recently last.
+    sessions: Vec<Session>,
 }
 
-/// Run `act` on the browser, starting it if it is not running. When the tab
-/// or the whole browser turns out to have been closed, it is opened again
-/// and `act` gets one more go there.
-fn with_session(act: impl Fn(&mut Session) -> Result<String, String>) -> Result<String, String> {
-    let mut slot = state()
+/// The session every conversation uses when the browser is shared, and one
+/// with no conversation of its own always does.
+const SHARED: u64 = 0;
+/// At most this many conversations keep a private browser at once: past
+/// that, the one used longest ago lets its go.
+const MAX_PRIVATE: usize = 4;
+
+fn state() -> &'static Mutex<Browsers> {
+    static BROWSERS: OnceLock<Mutex<Browsers>> = OnceLock::new();
+    BROWSERS.get_or_init(|| {
+        Mutex::new(Browsers {
+            profile: crate::chat::data_dir().join("browser"),
+            browser: None,
+            sessions: Vec::new(),
+        })
+    })
+}
+
+fn lock() -> Result<std::sync::MutexGuard<'static, Browsers>, String> {
+    state()
         .lock()
-        .map_err(|_| "The browser stopped working; restart Letronna to use it again.".to_owned())?;
+        .map_err(|_| "The browser stopped working; restart Letronna to use it again.".to_owned())
+}
+
+/// Run `act` on a conversation's browser, starting it if it is not running.
+/// When the tab or the whole browser turns out to have been closed, it is
+/// opened again and `act` gets one more go there.
+fn with_session(
+    conversation: u64,
+    act: impl Fn(&mut Session) -> Result<String, String>,
+) -> Result<String, String> {
+    let owner = owner_of(conversation);
+    let mut all = lock()?;
     let mut outcome = Err("The browser was closed.".to_owned());
     for _ in 0..2 {
-        match slot.as_ref() {
-            None => *slot = Some(Session::start()?),
-            // Started again on the same profile, in the mode asked for: the
-            // mode it was in may have been a leftover browser's.
-            Some(session) if session.tab.broken => {
-                *slot = Some(Session::on(session.profile.clone(), headless())?);
-            }
-            Some(_) => {}
-        }
-        let Some(session) = slot.as_mut() else {
-            break;
-        };
+        let session = all.session(owner)?;
         outcome = act(session);
         if !session.tab.broken {
             break;
         }
+        all.lost(owner);
     }
     outcome
+}
+
+/// Whether every conversation shares one browser, its sign-ins kept in the
+/// profile, rather than each having a private one of its own, forgotten
+/// when Letronna quits.
+fn shared() -> &'static AtomicBool {
+    static SHARED_BROWSER: OnceLock<AtomicBool> = OnceLock::new();
+    SHARED_BROWSER.get_or_init(|| AtomicBool::new(false))
+}
+
+/// The conversation the window shows, whose browser its panel follows.
+fn shown() -> &'static AtomicU64 {
+    static SHOWN: OnceLock<AtomicU64> = OnceLock::new();
+    SHOWN.get_or_init(|| AtomicU64::new(SHARED))
+}
+
+/// Whose session a conversation uses.
+fn owner_of(conversation: u64) -> u64 {
+    match shared().load(Ordering::Relaxed) {
+        true => SHARED,
+        false => conversation,
+    }
+}
+
+/// Share one browser between every conversation, or give each its own.
+/// Changing it lets go of what each had.
+pub fn share_browser(share: bool) {
+    if shared().swap(share, Ordering::Relaxed) == share {
+        return;
+    }
+    // Not on this thread: the browser may be in the middle of an action.
+    std::thread::spawn(|| {
+        if let Ok(mut all) = state().lock() {
+            all.forget_all();
+        }
+    });
+}
+
+/// Say which conversation the window shows: the panel follows its browser,
+/// or shows none, when it has not used one.
+pub fn show_conversation(conversation: u64) {
+    if shown().swap(conversation, Ordering::Relaxed) == conversation {
+        return;
+    }
+    std::thread::spawn(move || {
+        let Ok(all) = state().lock() else {
+            return;
+        };
+        let owner = owner_of(conversation);
+        match all.sessions.iter().find(|session| session.owner == owner) {
+            Some(session) => session.follow(),
+            None => watch::unfollow(),
+        }
+    });
+}
+
+/// Let go of a conversation's private browser, as when it is deleted.
+pub fn forget(conversation: u64) {
+    std::thread::spawn(move || {
+        if let Ok(mut all) = state().lock() {
+            all.forget(conversation);
+        }
+    });
+}
+
+impl Browsers {
+    /// The running browser, started now if it is not.
+    fn reach(&mut self) -> Result<cdp::Reach, String> {
+        if let Some(browser) = &self.browser {
+            return Ok(browser.reach.clone());
+        }
+        let browser = cdp::Browser::start(&self.profile, headless(), watch::scale())?;
+        let reach = browser.reach.clone();
+        self.browser = Some(browser);
+        self.sessions.clear();
+        Ok(reach)
+    }
+
+    /// An owner's session, opened if it has none, and the most recently used
+    /// now.
+    fn session(&mut self, owner: u64) -> Result<&mut Session, String> {
+        let reach = self.reach()?;
+        match self
+            .sessions
+            .iter()
+            .position(|session| session.owner == owner)
+        {
+            Some(at) => {
+                let session = self.sessions.remove(at);
+                self.sessions.push(session);
+            }
+            None => {
+                self.sessions.push(Session::begin(reach, owner)?);
+                self.make_room();
+            }
+        }
+        self.sessions
+            .last_mut()
+            .ok_or_else(|| "The browser was closed.".to_owned())
+    }
+
+    /// An owner's tab went away -- and the browser too, if it no longer
+    /// answers.
+    fn lost(&mut self, owner: u64) {
+        self.sessions.retain(|session| session.owner != owner);
+        if self
+            .browser
+            .as_ref()
+            .is_some_and(|browser| !browser.reach.alive())
+        {
+            self.browser = None;
+            self.sessions.clear();
+        }
+    }
+
+    /// Close private browsers past the most kept, the one used longest ago
+    /// first, but never the one the window shows.
+    fn make_room(&mut self) {
+        let private = |session: &Session| session.context.is_some();
+        while self.sessions.iter().filter(|s| private(s)).count() > MAX_PRIVATE {
+            let Some(at) = self
+                .sessions
+                .iter()
+                .position(|s| private(s) && !s.on_screen())
+            else {
+                break;
+            };
+            self.sessions.remove(at).close();
+        }
+    }
+
+    fn forget(&mut self, conversation: u64) {
+        let private =
+            |session: &Session| session.owner == conversation && session.context.is_some();
+        if let Some(at) = self.sessions.iter().position(private) {
+            self.sessions.remove(at).close();
+        }
+    }
+
+    fn forget_all(&mut self) {
+        for session in std::mem::take(&mut self.sessions) {
+            session.close();
+        }
+    }
+
+    /// The session the window shows, if it has one.
+    fn on_screen(&mut self) -> Option<&mut Session> {
+        self.sessions.iter_mut().find(|session| session.on_screen())
+    }
 }
 
 /// Whether the browser has a window of its own: as the user last chose in
@@ -564,29 +742,35 @@ pub fn has_window() -> bool {
 }
 
 /// Give the browser a window of its own, or take it away, keeping the page
-/// that is open. A running browser can do neither, so it is closed and
-/// started again on its profile, which keeps every sign-in.
-pub fn give_window(shown: bool) -> Result<(), String> {
-    own_window().store(shown, Ordering::Relaxed);
-    let mut slot = state()
-        .lock()
-        .map_err(|_| "The browser stopped working; restart Letronna to use it again.".to_owned())?;
+/// the window shows. A running browser can do neither, so it is closed and
+/// started again on its profile, which keeps every sign-in made there;
+/// private browsers are kept in memory only, and are not kept.
+pub fn give_window(window: bool) -> Result<(), String> {
+    own_window().store(window, Ordering::Relaxed);
+    let mut all = lock()?;
     // Not running, or already so: it starts as asked when next needed.
-    let Some(session) = slot
-        .as_mut()
-        .filter(|session| session.browser.headless == shown)
-    else {
+    if !all
+        .browser
+        .as_ref()
+        .is_some_and(|browser| browser.reach.headless == window)
+    {
         return Ok(());
-    };
-    let url = session.url();
-    let profile = session.profile.clone();
-    session.browser.close();
-    *slot = None;
-    let mut fresh = Session::on(profile, !shown)?;
-    if !url.is_empty() && url != "about:blank" {
-        fresh.go_to(&url)?;
     }
-    *slot = Some(fresh);
+    let owner = owner_of(shown().load(Ordering::Relaxed));
+    let url = all
+        .sessions
+        .iter_mut()
+        .find(|session| session.owner == owner)
+        .map(|session| session.url())
+        .unwrap_or_default();
+    all.sessions.clear();
+    if let Some(mut browser) = all.browser.take() {
+        browser.close();
+    }
+    let session = all.session(owner)?;
+    if !url.is_empty() && url != "about:blank" {
+        session.go_to(&url)?;
+    }
     Ok(())
 }
 
@@ -607,7 +791,7 @@ pub fn visit(raw: &str) -> Result<(), String> {
     // The user's own address: any key of theirs in it is theirs to send.
     let url = address(&typed, &[])?;
     let plain = (bare && !local).then(|| url.replacen("https://", "http://", 1));
-    with_session(|session| {
+    with_session(shown().load(Ordering::Relaxed), |session| {
         let mut opened = session.go_to(&url);
         if let (Err(_), Some(plain)) = (&opened, &plain) {
             opened = session.go_to(plain);
@@ -632,8 +816,8 @@ fn local_host(raw: &str) -> bool {
 /// Carry on in a tab the user opened from the window, as a link with a tab
 /// of its own does. One an action of the agent's opened is followed by then.
 pub(crate) fn follow_opened_tab() {
-    if let Ok(mut slot) = state().lock()
-        && let Some(session) = slot.as_mut()
+    if let Ok(mut all) = state().lock()
+        && let Some(session) = all.on_screen()
     {
         let _ = session.follow_new_tab();
     }
@@ -643,13 +827,13 @@ pub(crate) fn follow_opened_tab() {
 /// itself, as a sign-in window does once it is done. A browser that has
 /// gone is left gone: the agent starts one when it next needs it.
 pub(crate) fn follow_remaining_tab() {
-    let Ok(mut slot) = state().lock() else {
+    let Ok(mut all) = state().lock() else {
         return;
     };
-    let Some(session) = slot.as_mut() else {
+    let Some(session) = all.on_screen() else {
         return;
     };
-    let Ok(tabs) = session.browser.tabs() else {
+    let Ok(tabs) = session.reach.tabs(session.context.as_deref()) else {
         return;
     };
     if tabs.iter().any(|tab| tab.id == session.tab.id) {
@@ -658,64 +842,103 @@ pub(crate) fn follow_remaining_tab() {
     let Some(target) = tabs.first() else {
         return;
     };
-    if let Ok(tab) = session.browser.attach(target) {
+    if let Ok(tab) = session.reach.attach(target) {
         session.tab = tab;
         session.refs.forget();
-        watch::follow(target.socket(), &target.id, session.browser.headless);
+        session.follow();
     }
 }
 
-/// The page shown on approval cards, if the browser is free to say.
-fn current_page() -> Option<String> {
-    let slot = state().try_lock().ok()?;
-    slot.as_ref()
+/// The page a conversation's approval cards name, if the browser is free to
+/// say.
+fn current_page(conversation: u64) -> Option<String> {
+    let all = state().try_lock().ok()?;
+    let owner = owner_of(conversation);
+    all.sessions
+        .iter()
+        .find(|session| session.owner == owner)
         .map(|session| session.page.clone())
         .filter(|page| !page.is_empty())
 }
 
-/// How an element reads, if the browser is free to say.
-fn label_of(number: u32) -> Option<String> {
-    let slot = state().try_lock().ok()?;
-    slot.as_ref()?.refs.label(number).map(str::to_owned)
+/// How an element of a conversation's page reads, if the browser is free to
+/// say.
+fn label_of(conversation: u64, number: u32) -> Option<String> {
+    let all = state().try_lock().ok()?;
+    let owner = owner_of(conversation);
+    let session = all.sessions.iter().find(|session| session.owner == owner)?;
+    session.refs.label(number).map(str::to_owned)
 }
 
 /// Close the browser if it has no window, so it does not outlive Letronna
 /// unseen. A window is left for the user to close.
 pub fn close_hidden() {
-    let Ok(mut slot) = state().try_lock() else {
+    let Ok(mut all) = state().try_lock() else {
         return;
     };
-    if let Some(mut session) = slot.take_if(|session| session.browser.headless) {
-        session.browser.close();
+    if all
+        .browser
+        .as_ref()
+        .is_some_and(|browser| browser.reach.headless)
+    {
+        all.sessions.clear();
+        if let Some(mut browser) = all.browser.take() {
+            browser.close();
+        }
     }
 }
 
 impl Session {
-    /// The browser Letronna uses, on its profile in the data folder.
-    fn start() -> Result<Session, String> {
-        Session::on(crate::chat::data_dir().join("browser"), headless())
-    }
-
-    fn on(profile: PathBuf, headless: bool) -> Result<Session, String> {
-        let browser = cdp::Browser::start(&profile, headless, watch::scale())?;
-        let tabs = browser.tabs()?;
+    /// A conversation's session: in a private context of its own, unless it
+    /// is the shared one.
+    fn begin(reach: cdp::Reach, owner: u64) -> Result<Session, String> {
+        let context = match owner {
+            SHARED => None,
+            _ => Some(reach.new_context()?),
+        };
+        let tabs = reach.tabs(context.as_deref())?;
         let target = match tabs.first() {
             Some(target) => target.clone(),
-            None => browser.new_tab()?,
+            None => reach.new_tab(context.as_deref())?,
         };
-        let tab = browser.attach(&target)?;
-        watch::follow(target.socket(), &target.id, browser.headless);
+        let tab = reach.attach(&target)?;
         let mut known: Vec<String> = tabs.into_iter().map(|t| t.id).collect();
         known.push(target.id);
-        Ok(Session {
-            browser,
-            profile,
+        let session = Session {
+            owner,
+            context,
+            reach,
             tab,
             refs: Refs::default(),
             last: String::new(),
             page: String::new(),
             known,
-        })
+        };
+        session.follow();
+        Ok(session)
+    }
+
+    /// Whether this is the session the window shows.
+    fn on_screen(&self) -> bool {
+        self.owner == owner_of(shown().load(Ordering::Relaxed))
+    }
+
+    /// Have the window follow this session's tab, if it shows this session.
+    fn follow(&self) {
+        if self.on_screen() {
+            let socket = self.reach.socket_of(&self.tab.id);
+            watch::follow(&socket, &self.tab.id, self.reach.headless);
+        }
+    }
+
+    /// Let the session go, and its private context with every tab of it.
+    fn close(self) {
+        if self.on_screen() {
+            watch::unfollow();
+        }
+        if let Some(context) = &self.context {
+            self.reach.drop_context(context);
+        }
     }
 
     /// The address of the page open now.
@@ -850,7 +1073,7 @@ impl Session {
     fn follow_new_tab(&mut self) -> Result<Option<String>, String> {
         let asked = Instant::now();
         let fresh = loop {
-            let tabs = self.browser.tabs()?;
+            let tabs = self.reach.tabs(self.context.as_deref())?;
             if let Some(fresh) = tabs.iter().find(|t| !self.known.contains(&t.id)).cloned() {
                 self.known.extend(tabs.into_iter().map(|t| t.id));
                 break fresh;
@@ -860,8 +1083,8 @@ impl Session {
             }
             std::thread::sleep(Duration::from_millis(100));
         };
-        self.tab = self.browser.attach(&fresh)?;
-        watch::follow(fresh.socket(), &fresh.id, self.browser.headless);
+        self.tab = self.reach.attach(&fresh)?;
+        self.follow();
         self.refs.forget();
         // Joined part way through its loading, so its events from before
         // were never heard: ask the page instead.
@@ -885,7 +1108,7 @@ impl Session {
         let tree: Tree = self.tab.call("Accessibility.getFullAXTree", json!({}))?;
         let page = page(&tree, full, &mut self.refs);
         self.page = page.named();
-        if watch::watched() {
+        if watch::watched() && self.on_screen() {
             watch::show(Sight::Page {
                 title: page.title.clone(),
                 url: page.url.clone(),
@@ -902,7 +1125,7 @@ impl Session {
     fn show(&mut self, page: &Page, view: &View, mut notes: Vec<String>) -> Result<String, String> {
         notes.append(&mut self.tab.dialogs);
         if bot_check(&page.title) {
-            notes.push(if self.browser.headless {
+            notes.push(if self.reach.headless {
                 "This looks like the site's bot check. Ask the user to get past it in the \
                  browser panel beside the chat in Letronna's window, then look again. In the \
                  terminal, where there is no panel, LETRONNA_BROWSER_HEADLESS=0 gives the \
@@ -1007,7 +1230,7 @@ impl Session {
     }
 
     fn list_tabs(&mut self) -> Result<String, String> {
-        let tabs = self.browser.tabs()?;
+        let tabs = self.reach.tabs(self.context.as_deref())?;
         let mut out = String::new();
         for (number, tab) in tabs.iter().enumerate() {
             let here = if tab.id == self.tab.id {
@@ -1027,18 +1250,18 @@ impl Session {
     }
 
     fn switch(&mut self, number: usize) -> Result<String, String> {
-        let tabs = self.browser.tabs()?;
+        let tabs = self.reach.tabs(self.context.as_deref())?;
         let target = number
             .checked_sub(1)
             .and_then(|at| tabs.get(at))
             .ok_or_else(|| format!("There is no tab {number}; there are {}.", tabs.len()))?
             .clone();
         if target.id != self.tab.id {
-            self.tab = self.browser.attach(&target)?;
-            watch::follow(target.socket(), &target.id, self.browser.headless);
+            self.tab = self.reach.attach(&target)?;
+            self.follow();
             self.refs.forget();
         }
-        self.browser.show(&target);
+        self.reach.show(&target);
         let page = self.read(false)?;
         self.show(&page, &View::default(), Vec::new())
     }
@@ -1184,7 +1407,7 @@ impl Session {
     /// time to get there first. Nothing is shown, and nothing waits, while
     /// the window is not watching.
     fn point(&mut self, node: i64, doing: String, quads: Option<&Value>) {
-        if !watch::watched() {
+        if !watch::watched() || !self.on_screen() {
             return;
         }
         let fetched;
@@ -1606,28 +1829,35 @@ mod tests {
             std::thread::spawn(move || {
                 for socket in listener.incoming() {
                     let Ok(mut socket) = socket else { continue };
-                    let mut request = [0u8; 4096];
-                    let n = socket.read(&mut request).unwrap_or(0);
-                    let request = String::from_utf8_lossy(&request[..n]);
-                    let body = match request.split_whitespace().nth(1).unwrap_or("/") {
-                        "/two" => "<!doctype html><title>Two</title><h1>Page two</h1>",
-                        "/three" => "<!doctype html><title>Three</title><h1>Page three</h1>",
-                        // A sign-in window, which closes itself when done.
-                        "/closes" => {
-                            "<!doctype html><title>Signing in</title>\
-                             <script>setTimeout(() => window.close(), 800)</script>"
-                        }
-                        "/" => PAGE,
-                        _ => "",
-                    };
-                    let _ = write!(
-                        socket,
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
+                    // Each on its own: a browser may open a connection before
+                    // it has anything to ask on it, and one waited on would
+                    // hold up the rest.
+                    std::thread::spawn(move || answer(&mut socket));
                 }
             });
             address
+        }
+
+        fn answer(socket: &mut std::net::TcpStream) {
+            let mut request = [0u8; 4096];
+            let n = socket.read(&mut request).unwrap_or(0);
+            let request = String::from_utf8_lossy(&request[..n]);
+            let body = match request.split_whitespace().nth(1).unwrap_or("/") {
+                "/two" => "<!doctype html><title>Two</title><h1>Page two</h1>",
+                "/three" => "<!doctype html><title>Three</title><h1>Page three</h1>",
+                // A sign-in window, which closes itself when done.
+                "/closes" => {
+                    "<!doctype html><title>Signing in</title>\
+                             <script>setTimeout(() => window.close(), 800)</script>"
+                }
+                "/" => PAGE,
+                _ => "",
+            };
+            let _ = write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
         }
 
         /// The ref on the listing's line that contains `needle`.
@@ -1715,13 +1945,15 @@ mod tests {
 
         impl Drop for Cleanup {
             fn drop(&mut self) {
-                let session = state()
+                let mut all = state()
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .take();
-                if let Some(mut session) = session {
-                    session.browser.close();
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                // Private contexts go with the browser.
+                all.sessions.clear();
+                if let Some(mut browser) = all.browser.take() {
+                    browser.close();
                 }
+                drop(all);
                 // The browser's helper processes let go of their files a
                 // moment after it has gone.
                 for _ in 0..40 {
@@ -1745,12 +1977,16 @@ mod tests {
             let site = serve();
             let profile =
                 std::env::temp_dir().join(format!("letronna-live-{}", std::process::id()));
-            // Started for a screen at 150%, as a window there would say.
+            // Started for a screen at 150%, as a window there would say, on
+            // a profile of the test's own and with no window.
             crate::watch::screen(1.5);
-            let session =
-                timed("start the browser", || Session::on(profile.clone(), true)).unwrap();
-            *state().lock().unwrap() = Some(session);
+            state().lock().unwrap().profile = profile.clone();
+            own_window().store(false, Ordering::Relaxed);
             let _cleanup = Cleanup(profile);
+            timed("start the browser", || {
+                with_session(SHARED, |_| Ok(String::new()))
+            })
+            .unwrap();
 
             let page = timed("open", || {
                 browse(json!({"action": "open", "url": format!("{site}/")}))
@@ -2044,6 +2280,35 @@ mod tests {
             let refused =
                 browse(json!({"action": "open", "url": format!("http://{closed}/")})).unwrap_err();
             assert!(refused.contains("ERR_CONNECTION_REFUSED"), "{refused}");
+
+            // Each conversation has a browser of its own: a cookie one sets,
+            // as a sign-in does, another never sees, and one let go of is
+            // gone with its browser.
+            let in_conversation = |conversation: u64| ToolContext {
+                conversation,
+                ..ToolContext::default()
+            };
+            let (first, second) = (in_conversation(1), in_conversation(2));
+            let open = json!({"action": "open", "url": format!("{site}/two")});
+            let set = json!({"action": "eval", "script": "document.cookie = 'signed=in'"});
+            let get = json!({"action": "eval", "script": "document.cookie"});
+            Browse.run(&open, &first).unwrap();
+            UsePage.run(&set, &first).unwrap();
+            Browse.run(&open, &second).unwrap();
+            assert_eq!(UsePage.run(&get, &second).unwrap(), "");
+            assert_eq!(UsePage.run(&get, &first).unwrap(), "signed=in");
+            forget(1);
+            std::thread::sleep(Duration::from_millis(500));
+            Browse.run(&open, &first).unwrap();
+            assert_eq!(UsePage.run(&get, &first).unwrap(), "");
+            // Shared, they are one browser.
+            share_browser(true);
+            std::thread::sleep(Duration::from_millis(500));
+            Browse.run(&open, &first).unwrap();
+            UsePage.run(&set, &first).unwrap();
+            Browse.run(&open, &second).unwrap();
+            assert_eq!(UsePage.run(&get, &second).unwrap(), "signed=in");
+            share_browser(false);
         }
     }
 }

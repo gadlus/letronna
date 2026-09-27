@@ -193,6 +193,7 @@ mod tests {
             remote: None,
             effort: String::new(),
             search: false,
+            conversation: 0,
         })
     }
 
