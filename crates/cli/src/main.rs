@@ -28,6 +28,8 @@ use session::Runner;
 
 /// How often a session start quietly asks whether there is a newer version.
 const LOOK_FOR_UPDATES: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+/// How long a question asked once waits for MCP servers still starting.
+const MCP_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 
 fn main() {
     rescue_terminal();
@@ -109,6 +111,8 @@ fn main() {
 
     // One question, one answer, no banner: this form gets piped.
     if let Some(prompt) = args.prompt {
+        // It goes out at once, so the MCP servers' tools would miss it.
+        letronna_core::mcp::ready(MCP_WAIT);
         let asked = runner.ask(session, &prompt);
         // A browser with no window would outlive this run unseen.
         letronna_core::browser::close_hidden();
