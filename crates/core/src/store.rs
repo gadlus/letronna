@@ -107,6 +107,9 @@ pub struct Settings {
     /// Which session was open last, by id rather than position.
     #[serde(default)]
     pub active_id: u64,
+    /// Only look for updates when asked.
+    #[serde(default)]
+    pub manual_updates: bool,
 }
 
 #[derive(Default)]
