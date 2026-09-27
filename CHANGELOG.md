@@ -13,6 +13,8 @@ This file is also the App tab of https://letronna.ai/changelog.
 
 ## [Unreleased]
 
+## [0.1.0-alpha.2] - 2026-09-27
+
 ### Added
 - **App** — Right-click or hover a turn to copy, edit, retry, rewind or fork it.
 - **Terminal** — Take back or retry the last exchange, or branch a session.
