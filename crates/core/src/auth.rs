@@ -337,14 +337,11 @@ impl Pending {
         }
 
         let good = state == self.state && !token.is_empty();
-        let body = if good {
-            "<h2>Signed in.</h2><p>You can close this tab and go back to Letronna.</p>"
-        } else {
-            "<h2>That did not work.</h2><p>Start the sign-in again from Letronna.</p>"
-        };
+        let body = page(good);
         let _ = write!(
             stream,
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
+             Content-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
         let _ = stream.flush();
@@ -361,6 +358,33 @@ impl Pending {
             ..Account::default()
         })
     }
+}
+
+/// The page left in the browser, in the website's look. Nothing on it comes
+/// from elsewhere, so it shows offline too and no other site hears of it.
+fn page(good: bool) -> String {
+    const STYLE: &str = "body{margin:0;min-height:100vh;box-sizing:border-box;padding:24px;\
+        display:grid;place-items:center;background:#0040FF;color:#F2F4FF;\
+        font:300 16px/1.5 'Barlow',system-ui,sans-serif}\
+        main{max-width:440px;padding:40px;border:1px solid rgba(242,244,255,.26)}\
+        p{margin:0;color:rgba(242,244,255,.85)}\
+        .kicker{margin-bottom:12px;font-size:11px;font-weight:400;letter-spacing:.2em;\
+        text-transform:uppercase}\
+        h1{margin:0 0 12px;font-size:32px;font-weight:300;line-height:1;text-transform:uppercase}";
+    // Browsers mostly refuse to close a tab that no script opened, which is
+    // why the page still says it can be closed.
+    let words = if good {
+        "<h1>Signed in.</h1><p>You can close this tab and go back to Letronna.</p>\
+         <script>setTimeout(() => window.close(), 1500)</script>"
+    } else {
+        "<h1>That did not work.</h1><p>Start the sign-in again from Letronna.</p>"
+    };
+    format!(
+        "<!doctype html><html lang='en'><head><meta charset='utf-8'>\
+         <meta name='viewport' content='width=device-width, initial-scale=1'>\
+         <title>Letronna</title><style>{STYLE}</style></head>\
+         <body><main><p class='kicker'>Letronna</p>{words}</main></body></html>"
+    )
 }
 
 fn now() -> u64 {
@@ -419,7 +443,7 @@ fn unescape(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Account, Client, Pending, begin, token, unescape};
+    use super::{Account, Client, Pending, begin, page, token, unescape};
     use std::io::{Read, Write};
     use std::net::TcpStream;
     use std::sync::atomic::Ordering;
@@ -524,5 +548,17 @@ mod tests {
         let mut answer = String::new();
         wrong.read_to_string(&mut answer).unwrap();
         assert!(answer.contains("That did not work."));
+    }
+
+    #[test]
+    fn the_page_left_in_the_browser_is_whole_and_fetches_nothing() {
+        for (good, heading) in [(true, "Signed in."), (false, "That did not work.")] {
+            let html = page(good);
+            assert!(html.starts_with("<!doctype html>"));
+            assert!(html.ends_with("</html>"));
+            assert!(html.contains("<meta charset='utf-8'>"));
+            assert!(html.contains(&format!("<h1>{heading}</h1>")));
+            assert!(!html.contains("http"), "the page fetches nothing");
+        }
     }
 }
