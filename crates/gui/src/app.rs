@@ -158,6 +158,8 @@ pub(crate) struct Chat {
     /// The video playing in the chat, if one is, and its newest frame.
     pub(crate) video: Option<crate::platform::video::Playing>,
     pub(crate) video_frame: Option<std::sync::Arc<RenderImage>>,
+    /// The browser the agent uses, shown beside the chat while it does.
+    pub(crate) browser: Entity<crate::ui::browser::BrowserView>,
     pub(crate) error: Option<String>,
     pub(crate) scroll: ScrollHandle,
     pub(crate) _subscriptions: Vec<Subscription>,
@@ -345,6 +347,7 @@ impl Chat {
             thinking_open: std::collections::HashSet::new(),
             video: None,
             video_frame: None,
+            browser: cx.new(|cx| crate::ui::browser::BrowserView::new(window, cx)),
             error,
             scroll: ScrollHandle::new(),
             _subscriptions: subscriptions,
@@ -536,6 +539,8 @@ impl Chat {
         self.busy = true;
         self.streaming_id = Some(target_id);
         self.turn = Some(agent::Turn::new(connection));
+        // A browser closed during the last turn shows again in this one.
+        self.browser.update(cx, |view, _| view.dismissed = false);
         self.page = Page::Chat;
         let convo_title = self.store.conversations[self.store.active].title.clone();
         plugins::emit(
@@ -706,7 +711,11 @@ impl Chat {
             return;
         };
         let gate = |name: &str| self.needs_user(name);
-        match turn.next(gate) {
+        let next = turn.next(gate);
+        if let agent::Next::AskUser(call) | agent::Next::Run(call) = &next {
+            self.show_browser(&call.name, cx);
+        }
+        match next {
             agent::Next::Done => self.finish(cx),
             agent::Next::AskUser(call) => {
                 self.ask_remote(call, cx);
@@ -1191,7 +1200,10 @@ impl Render for Chat {
         // The chat column stays narrower than the pane beside the sidebar, but
         // only while the pane is wide enough that the composer keeps room to
         // type; at the minimum window size the cap is dropped.
-        let narrow_column = self.sidebar_open && window.viewport_size().width >= px(960.);
+        // Beside the browser, the pane is narrow enough already.
+        let narrow_column = self.sidebar_open
+            && window.viewport_size().width >= px(960.)
+            && !self.browser.read(cx).docked(window);
 
         let body: AnyElement = if self.page == Page::Jobs {
             self.schedules_page(cx).into_any_element()
@@ -1327,7 +1339,10 @@ impl Render for Chat {
                     .flex_1()
                     .min_h_0()
                     .when(self.sidebar_open, |this| this.child(self.sidebar(cx)))
-                    .child(main),
+                    .child(main)
+                    .when(self.page == Page::Chat, |row| {
+                        row.child(self.browser.clone())
+                    }),
             )
             .children(self.settings_overlay(window, cx))
             .children(Root::render_dialog_layer(window, cx))

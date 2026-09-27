@@ -23,6 +23,7 @@ pub mod schedule;
 pub mod skills;
 pub mod store;
 pub mod tools;
+pub mod watch;
 pub mod web;
 
 /// The name the app goes by, used in paths and on screen.

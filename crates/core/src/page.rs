@@ -136,7 +136,9 @@ pub(crate) struct Refs {
     last: u32,
     by_node: HashMap<i64, u32>,
     nodes: HashMap<u32, i64>,
-    labels: HashMap<u32, String>,
+    /// How each element's line reads, and how much of that names it: the
+    /// rest is the value it holds.
+    labels: HashMap<u32, (String, usize)>,
 }
 
 impl Refs {
@@ -156,7 +158,14 @@ impl Refs {
 
     /// How the line of the element a ref names reads.
     pub(crate) fn label(&self, number: u32) -> Option<&str> {
-        self.labels.get(&number).map(String::as_str)
+        self.labels.get(&number).map(|(label, _)| label.as_str())
+    }
+
+    /// What an element is, found by its node: its line without the value it
+    /// holds, which an action on it is about to change.
+    pub(crate) fn name_for(&self, node: i64) -> Option<&str> {
+        let (label, named) = self.labels.get(self.by_node.get(&node)?)?;
+        label.get(..*named)
     }
 
     /// A new page: its nodes are new, even where their numbers are not.
@@ -272,7 +281,7 @@ struct Run {
 /// parent is, to find a line from a point on the page.
 pub(crate) struct Page {
     pub(crate) title: String,
-    url: String,
+    pub(crate) url: String,
     pub(crate) lines: Vec<Line>,
     parents: HashMap<i64, i64>,
     /// The line where the page's main content starts, when it marks one.
@@ -480,9 +489,10 @@ impl Walk<'_> {
         }
         let number = self.refs.of(first);
         let plain = words(&run.plain);
+        let label = format!("\"{}\"", cut(&plain, NAME_CHARS));
         self.refs
             .labels
-            .insert(number, format!("\"{}\"", cut(&plain, NAME_CHARS)));
+            .insert(number, (label.clone(), label.len()));
         self.lines.push(Line {
             text: format!("{}- \"{said}\" [e{number}]", pad(indent)),
             plain: run.links.then_some(plain),
@@ -503,8 +513,8 @@ impl Walk<'_> {
             self.main = Some(self.lines.len());
         }
         let number = self.refs.of(backend);
-        let label = describe(node);
-        self.refs.labels.insert(number, label.clone());
+        let (label, named) = describe(node);
+        self.refs.labels.insert(number, (label.clone(), named));
         self.lines.push(Line {
             text: format!("{}- {label} [e{number}]{}", pad(indent), states(node)),
             plain: None,
@@ -566,8 +576,9 @@ fn pad(indent: usize) -> String {
     "  ".repeat(indent.min(MAX_INDENT))
 }
 
-/// How an element reads: its role, its name, and what is in it.
-fn describe(node: &Node) -> String {
+/// How an element reads -- its role, its name, and what is in it -- and how
+/// much of that names it.
+fn describe(node: &Node) -> (String, usize) {
     let role = match node.role() {
         "img" => "image",
         "DisclosureTriangle" => "disclosure",
@@ -583,10 +594,11 @@ fn describe(node: &Node) -> String {
         Some(Value::Null) | None => String::new(),
         Some(other) => other.to_string(),
     };
+    let named = text.len();
     if !value.is_empty() && value != name {
         text.push_str(&format!(" = \"{}\"", cut(&value, NAME_CHARS)));
     }
-    text
+    (text, named)
 }
 
 /// The states worth saying about an element: checked, collapsed, disabled.
@@ -866,10 +878,7 @@ mod tests {
         let mut refs = Refs::default();
         page(&sign_up(), false, &mut refs);
         assert_eq!(refs.node(5), Some(12));
-        assert_eq!(
-            refs.labels.get(&5).map(String::as_str),
-            Some("button \"Send\"")
-        );
+        assert_eq!(refs.label(5), Some("button \"Send\""));
         // The same page listed again keeps its refs.
         page(&sign_up(), false, &mut refs);
         assert_eq!(refs.node(5), Some(12));

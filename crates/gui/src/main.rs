@@ -39,6 +39,10 @@ fn main() {
                 gpui_component::input::Enter { secondary: true },
                 Some("Input"),
             ),
+            // On the browser's page, Tab moves through the page, not the
+            // window.
+            KeyBinding::new("tab", ui::browser::PageTab, Some("Browser")),
+            KeyBinding::new("shift-tab", ui::browser::PageTabBack, Some("Browser")),
         ]);
         platform::tray::init(cx);
         cx.on_window_closed(|cx| {
