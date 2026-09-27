@@ -158,7 +158,23 @@ Letronna can use the tools of any [MCP](https://modelcontextprotocol.io) server 
 }
 ```
 
-Servers start when Letronna does, and their tools appear as `mcp__<server>__<tool>` once they answer; `letronna -p` waits up to 15 seconds for them before it asks. Every call asks first unless the tool is listed in `autoApprove`; `"disabled": true` leaves a server off. Servers reached by URL rather than a command are not supported yet.
+Servers start when Letronna does, and their tools appear as `mcp__<server>__<tool>` once they answer; `letronna -p` waits up to 15 seconds for them before it asks. Every call asks first unless the tool is listed in `autoApprove`; `"disabled": true` leaves a server off.
+
+A server that runs elsewhere -- a hosted one, or one on another machine -- is given by its address instead of a command, with any headers it needs, such as a key:
+
+```json
+{
+  "mcpServers": {
+    "deepwiki": { "url": "https://mcp.deepwiki.com/mcp" },
+    "hosted": {
+      "url": "https://example.com/mcp",
+      "headers": { "Authorization": "Bearer your-key" }
+    }
+  }
+}
+```
+
+It is spoken to over HTTP as the protocol now has it (streamable HTTP: an address that usually ends in `/mcp`). The older way, an address ending in `/sse`, is not supported.
 
 ### A lighter browser
 

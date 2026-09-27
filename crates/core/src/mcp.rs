@@ -14,6 +14,13 @@
 //! Every call asks the user first unless the config's `autoApprove` names the
 //! tool: a server is somebody else's code, and it alone says what its tools
 //! do. They are never offered where other people can read the replies.
+//!
+//! A server that runs elsewhere is given by its `url` instead of a command,
+//! with any `headers` it needs, such as a key. It is spoken to over HTTP as
+//! the protocol now has it: each message is POSTed, and the reply -- one
+//! message, or a stream of events -- is read back as if it had come down a
+//! pipe, so nothing past that knows the difference. The older way, a stream
+//! opened first at an address ending in /sse, is not spoken.
 
 use crate::tools::{Tool, ToolContext};
 use serde::Deserialize;
@@ -41,9 +48,15 @@ struct Config {
 
 #[derive(Deserialize, Clone, Default)]
 struct ServerConfig {
-    /// Empty for a server reached by URL, which is not supported yet.
+    /// Empty for a server reached by URL.
     #[serde(default)]
     command: String,
+    /// Where a server that runs elsewhere is reached, in place of a command.
+    #[serde(default)]
+    url: String,
+    /// Sent with every request to a server reached by URL: a key, say.
+    #[serde(default)]
+    headers: HashMap<String, String>,
     #[serde(default)]
     args: Vec<String>,
     #[serde(default)]
@@ -81,7 +94,8 @@ pub fn start() {
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
         for (name, server) in config.servers {
-            if server.disabled || server.command.trim().is_empty() {
+            if server.disabled || (server.command.trim().is_empty() && server.url.trim().is_empty())
+            {
                 continue;
             }
             begin_start();
@@ -139,6 +153,9 @@ fn registry() -> &'static Mutex<Vec<Arc<dyn Tool>>> {
 
 /// Start one server and list its tools.
 fn launch(name: &str, config: &ServerConfig) -> Result<Vec<Arc<dyn Tool>>, String> {
+    if !config.url.trim().is_empty() {
+        return reach(name, config);
+    }
     let mut child = spawn(config)?;
     let (Some(stdin), Some(stdout), Some(mut stderr)) =
         (child.stdin.take(), child.stdout.take(), child.stderr.take())
@@ -183,6 +200,200 @@ fn spawn(config: &ServerConfig) -> Result<std::process::Child, String> {
         }
         Err(e) => Err(failed(e)),
     }
+}
+
+/// Greet a server reached by URL and wrap each tool it lists.
+fn reach(name: &str, config: &ServerConfig) -> Result<Vec<Arc<dyn Tool>>, String> {
+    let (from, replies) = std::io::pipe().map_err(|e| format!("{name}: {e}"))?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(CALL_TIME)
+        .build()
+        .map_err(|e| e.to_string())?;
+    let link = Http {
+        name: name.to_owned(),
+        url: config.url.trim().to_owned(),
+        headers: config.headers.clone(),
+        client,
+        session: Arc::default(),
+        replies: Arc::new(Mutex::new(replies)),
+        line: Vec::new(),
+    };
+    connect(name, config, from, link)
+}
+
+/// A server reached by URL, spoken to as if over pipes: each message written
+/// to it is POSTed, and every message in the reply is handed on as a line to
+/// read. A request is sent on a thread of its own, since its reply can take
+/// as long as a tool call and the server may want an answer meanwhile;
+/// anything else is sent at once, so the greeting comes before what follows.
+struct Http {
+    name: String,
+    url: String,
+    headers: HashMap<String, String>,
+    client: reqwest::blocking::Client,
+    session: Arc<Mutex<Session>>,
+    replies: Arc<Mutex<std::io::PipeWriter>>,
+    /// What has been written of the next message so far.
+    line: Vec<u8>,
+}
+
+/// What a server reached by URL gave back when greeted, which goes with
+/// every message after.
+#[derive(Default)]
+struct Session {
+    id: Option<String>,
+    version: Option<String>,
+}
+
+impl Write for Http {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.line.extend_from_slice(buf);
+        while let Some(end) = self.line.iter().position(|&b| b == b'\n') {
+            let message: Vec<u8> = self.line.drain(..=end).collect();
+            self.post(message);
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Http {
+    fn post(&self, message: Vec<u8>) {
+        let parsed: Value = serde_json::from_slice(&message).unwrap_or_default();
+        // Only a request waits on an answer: its failure is handed back as
+        // one, so the asker hears why at once rather than at a timeout.
+        let request = parsed
+            .get("method")
+            .is_some()
+            .then(|| parsed.get("id").cloned())
+            .flatten();
+        let waits = request.is_some();
+        let (name, url, headers) = (self.name.clone(), self.url.clone(), self.headers.clone());
+        let (client, session, replies) = (
+            self.client.clone(),
+            self.session.clone(),
+            self.replies.clone(),
+        );
+        let send = move || {
+            let messages = match exchange(&client, &url, &headers, &session, message) {
+                Ok(messages) => messages,
+                Err(why) => match &request {
+                    Some(id) => vec![json!({"jsonrpc": "2.0", "id": id,
+                        "error": {"code": -32000, "message": format!("{name}: {why}")}})],
+                    None => Vec::new(),
+                },
+            };
+            if let Ok(mut replies) = replies.lock() {
+                for message in messages {
+                    let _ = writeln!(replies, "{message}");
+                }
+            }
+        };
+        match waits {
+            true => {
+                std::thread::spawn(send);
+            }
+            false => send(),
+        }
+    }
+}
+
+/// Send one message to a server reached by URL, and the messages it answers
+/// with.
+fn exchange(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    headers: &HashMap<String, String>,
+    session: &Mutex<Session>,
+    message: Vec<u8>,
+) -> Result<Vec<Value>, String> {
+    let mut request = client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .body(message);
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    if let Ok(session) = session.lock() {
+        if let Some(id) = &session.id {
+            request = request.header("Mcp-Session-Id", id);
+        }
+        if let Some(version) = &session.version {
+            request = request.header("MCP-Protocol-Version", version);
+        }
+    }
+    let reply = request
+        .send()
+        .map_err(|e| format!("could not reach {url}: {e}"))?;
+    let status = reply.status();
+    if let Some(id) = reply
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        && let Ok(mut session) = session.lock()
+    {
+        session.id = Some(id.to_owned());
+    }
+    if !status.is_success() {
+        return Err(match status.as_u16() {
+            401 | 403 => format!(
+                "{url} refused (HTTP {status}): check the headers given for it in mcp.json."
+            ),
+            404 | 405 => format!("{url} has no MCP server that speaks HTTP (HTTP {status})."),
+            _ => format!("{url} answered HTTP {status}."),
+        });
+    }
+    let streamed = reply
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|kind| kind.contains("text/event-stream"));
+    let body = reply
+        .text()
+        .map_err(|e| format!("{url} stopped answering: {e}"))?;
+    let messages = match streamed {
+        true => events(&body),
+        false => match serde_json::from_str::<Value>(&body) {
+            Ok(Value::Array(batch)) => batch,
+            Ok(one) => vec![one],
+            // A notification is taken with no body at all.
+            Err(_) => Vec::new(),
+        },
+    };
+    // The answer to the greeting says which version to speak from now on.
+    if let Some(version) = messages
+        .iter()
+        .find_map(|m| m["result"]["protocolVersion"].as_str())
+        && let Ok(mut session) = session.lock()
+    {
+        session.version = Some(version.to_owned());
+    }
+    Ok(messages)
+}
+
+/// The messages in a stream of server-sent events: each event's data lines,
+/// joined.
+fn events(body: &str) -> Vec<Value> {
+    let mut messages = Vec::new();
+    let mut data = String::new();
+    for line in body.lines().chain([""]) {
+        if line.is_empty() {
+            if let Ok(message) = serde_json::from_str(&data) {
+                messages.push(message);
+            }
+            data.clear();
+        } else if let Some(part) = line.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(part.strip_prefix(' ').unwrap_or(part));
+        }
+    }
+    messages
 }
 
 /// Greet a server over its pipes and wrap each tool it lists.
@@ -544,6 +755,163 @@ mod tests {
         wait_started(Duration::from_millis(200));
         assert!(asked.elapsed() < Duration::from_secs(2));
         end_start();
+    }
+
+    /// A server reached by URL, standing in for a hosted one: it answers the
+    /// greeting with a session and plain JSON, takes the notification with
+    /// no body, lists its tool as a stream of events after pinging the
+    /// client, and echoes a call. It sends back what it was asked, request
+    /// by request, headers and all.
+    fn http_server() -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let (heard, asked) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let heard = heard.clone();
+                std::thread::spawn(move || {
+                    let mut stream = stream.unwrap();
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut head = String::new();
+                    let mut length = 0;
+                    loop {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        if let Some(n) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                            length = n.trim().parse().unwrap();
+                        }
+                        head.push_str(&line);
+                        if line == "\r\n" {
+                            break;
+                        }
+                    }
+                    let mut body = vec![0; length];
+                    reader.read_exact(&mut body).unwrap();
+                    let message: Value = serde_json::from_slice(&body).unwrap();
+                    let _ = heard.send(format!("{head}{message}"));
+                    let id = message["id"].clone();
+                    let reply = match message["method"].as_str().unwrap_or_default() {
+                        "initialize" => {
+                            let body = json!({"jsonrpc": "2.0", "id": id, "result": {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}}}).to_string();
+                            format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: s-42\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+                        }
+                        "tools/list" => {
+                            let ping = json!({"jsonrpc": "2.0", "id": "p1", "method": "ping"});
+                            let list = json!({"jsonrpc": "2.0", "id": id, "result": {"tools": [{"name": "echo", "description": "Echo it.", "inputSchema": {"type": "object"}}]}});
+                            let body = format!("event: message\ndata: {ping}\n\nevent: message\ndata: {list}\n\n");
+                            format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+                        }
+                        "tools/call" => {
+                            let said = message["params"]["arguments"]["text"].clone();
+                            let body = json!({"jsonrpc": "2.0", "id": id, "result": {"content": [{"type": "text", "text": said}]}}).to_string();
+                            format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+                        }
+                        _ => "HTTP/1.1 202 Accepted\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".to_owned(),
+                    };
+                    let _ = stream.write_all(reply.as_bytes());
+                });
+            }
+        });
+        (url, asked)
+    }
+
+    #[test]
+    fn a_server_reached_by_url_is_greeted_listed_and_called() {
+        let (url, asked) = http_server();
+        let config = ServerConfig {
+            url,
+            headers: HashMap::from([("Authorization".into(), "Bearer key-1".into())]),
+            ..ServerConfig::default()
+        };
+        let tools = launch("far", &config).unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name(), "mcp__far__echo");
+        let said = tools[0]
+            .run(&json!({"text": "hello"}), &ToolContext::default())
+            .unwrap();
+        assert_eq!(said, "hello");
+
+        let asked: Vec<String> = asked.try_iter().map(|a| a.to_ascii_lowercase()).collect();
+        let first = |method: &str| {
+            asked
+                .iter()
+                .find(|a| a.contains(&format!("\"method\":\"{method}\"")))
+                .unwrap()
+        };
+        assert!(
+            asked
+                .iter()
+                .all(|a| a.contains("authorization: bearer key-1")),
+            "{asked:?}"
+        );
+        // The greeting goes out with no session; after it, everything carries
+        // the one the server gave, and the version it answered with.
+        assert!(!first("initialize").contains("mcp-session-id"));
+        let call = first("tools/call");
+        assert!(call.contains("mcp-session-id: s-42"), "{call}");
+        assert!(call.contains("mcp-protocol-version: 2025-06-18"), "{call}");
+        // The ping in the tool list's stream was answered.
+        assert!(
+            asked
+                .iter()
+                .any(|a| a.contains("\"id\":\"p1\"") && a.contains("\"result\"")),
+            "{asked:?}"
+        );
+    }
+
+    #[test]
+    fn a_server_reached_by_url_that_refuses_says_why() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let _ = stream.read(&mut [0; 4096]);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                );
+            }
+        });
+        let config = ServerConfig {
+            url,
+            ..ServerConfig::default()
+        };
+        let refused = launch("locked", &config).err().unwrap();
+        assert!(
+            refused.contains("HTTP 401") && refused.contains("headers"),
+            "{refused}"
+        );
+    }
+
+    #[test]
+    fn a_stream_of_events_is_read_as_its_messages() {
+        let body = "event: message\ndata: {\"a\":1}\n\n: a comment\ndata: {\"b\":\ndata: 2}\n\ndata: {\"c\":3}";
+        assert_eq!(
+            events(body),
+            vec![json!({"a": 1}), json!({"b": 2}), json!({"c": 3})]
+        );
+        assert_eq!(
+            events("event: message\r\ndata: {\"d\":4}\r\n\r\n"),
+            vec![json!({"d": 4})]
+        );
+    }
+
+    /// Needs the network: DeepWiki's free MCP server, which asks for no key.
+    #[test]
+    #[ignore = "reaches mcp.deepwiki.com over the network"]
+    fn talks_to_a_real_server_by_url() {
+        let config = ServerConfig {
+            url: "https://mcp.deepwiki.com/mcp".into(),
+            ..ServerConfig::default()
+        };
+        let tools = launch("deepwiki", &config).unwrap();
+        assert!(
+            tools
+                .iter()
+                .any(|t| t.name().starts_with("mcp__deepwiki__"))
+        );
     }
 
     #[test]
