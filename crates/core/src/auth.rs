@@ -13,6 +13,8 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -50,8 +52,10 @@ pub fn dashboard() -> String {
     format!("{}/dashboard", site.trim_end_matches('/'))
 }
 
-/// How long to hold the port open before giving up on the browser.
-const PATIENCE: Duration = Duration::from_secs(120);
+/// How long to hold the port open before giving up on the browser. Ten
+/// minutes, because a first sign-in can take a GitHub login and a wait for
+/// the device-verification email.
+const PATIENCE: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Account {
@@ -218,6 +222,7 @@ pub struct Pending {
     /// Sent to the site and checked when it answers, so another page on the
     /// machine cannot hand us a token we did not ask for.
     state: String,
+    cancel: Arc<AtomicBool>,
     pub url: String,
 }
 
@@ -248,6 +253,7 @@ pub fn begin(client: Client) -> Result<Pending, String> {
     Ok(Pending {
         listener,
         state,
+        cancel: Arc::new(AtomicBool::new(false)),
         url,
     })
 }
@@ -256,32 +262,57 @@ impl Pending {
     /// Wait for the browser. The page is expected to come back to the
     /// callback with `token`, `state` and who it belongs to.
     pub fn finish(self) -> Result<Account, String> {
+        let account = self.wait()?;
+        remember(&account)?;
+        // The plan and credits, when the API answers; the sign-in stands
+        // either way.
+        Ok(refresh().unwrap_or(account))
+    }
+
+    /// A switch that ends the wait at once, for a Cancel button or escape.
+    pub fn cancel(&self) -> Arc<AtomicBool> {
+        self.cancel.clone()
+    }
+
+    /// Take connections until one is a good callback, and hand back the
+    /// account it brought.
+    fn wait(&self) -> Result<Account, String> {
+        // Blocking in `accept` would never look at the deadline or the
+        // switch if the browser was closed without coming back.
         self.listener
-            .set_nonblocking(false)
+            .set_nonblocking(true)
             .map_err(|e| e.to_string())?;
         let deadline = std::time::Instant::now() + PATIENCE;
 
         while std::time::Instant::now() < deadline {
+            if self.cancel.load(Ordering::Relaxed) {
+                return Err("Sign-in cancelled.".into());
+            }
             let Ok((stream, _)) = self.listener.accept() else {
+                // Nobody yet, or a connection that dropped before it was
+                // taken; neither ends the sign-in. A fifth of a second
+                // between looks still notices a cancel quickly.
+                std::thread::sleep(Duration::from_millis(200));
                 continue;
             };
             match self.read_callback(stream) {
-                Some(account) => {
-                    remember(&account)?;
-                    // The plan and credits, when the API answers; the
-                    // sign-in stands either way.
-                    return Ok(refresh().unwrap_or(account));
-                }
+                Some(account) => return Ok(account),
                 // Something else knocked on the port. Keep waiting for the
                 // browser rather than failing the sign-in on it.
                 None => continue,
             }
         }
-        Err("The sign-in was not finished in time.".into())
+        Err("The sign-in page was not finished in 10 minutes. Start again from Letronna.".into())
     }
 
     /// Read one request, answer the browser, and take what it brought.
     fn read_callback(&self, mut stream: TcpStream) -> Option<Account> {
+        // An accepted socket can come out non-blocking like the listener (it
+        // does on Windows) and would drop a browser that has not written yet.
+        // A browser may also open a spare connection that never writes, and
+        // the real one must not wait behind it for long.
+        stream.set_nonblocking(false).ok()?;
+        stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
         let mut line = String::new();
         BufReader::new(stream.try_clone().ok()?)
             .read_line(&mut line)
@@ -340,7 +371,7 @@ fn now() -> u64 {
 }
 
 /// A random-enough string. This guards a callback on this machine for the
-/// next two minutes, which does not want a cryptographic generator, and
+/// next ten minutes, which does not want a cryptographic generator, and
 /// pulling one in for it would be the only reason to have it.
 fn token(len: usize) -> String {
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
@@ -388,7 +419,11 @@ fn unescape(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{token, unescape};
+    use super::{Account, Client, Pending, begin, token, unescape};
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn a_callback_is_read_the_way_a_browser_writes_it() {
@@ -406,5 +441,88 @@ mod tests {
         assert_eq!(a.len(), 16);
         assert_ne!(a, b);
         assert!(a.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    /// The port and state a sign-in sends the browser off with.
+    fn callback(pending: &Pending) -> (u16, String) {
+        let (_, rest) = pending.url.rsplit_once("127.0.0.1:").unwrap();
+        let (port, rest) = rest.split_once("/&state=").unwrap();
+        let (state, _) = rest.split_once('&').unwrap();
+        (port.parse().unwrap(), state.to_owned())
+    }
+
+    /// Connect to the sign-in's port and ask for `/?{query}`, as the browser
+    /// does when the page sends it back.
+    fn knock(port: u16, query: &str) -> TcpStream {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let request = format!("GET /?{query} HTTP/1.1\r\n\r\n");
+        stream.write_all(request.as_bytes()).unwrap();
+        stream
+    }
+
+    /// Wait on a thread of its own and cancel after a few seconds, so a wait
+    /// that never ends fails the test instead of hanging it.
+    fn wait_a_little(pending: Pending) -> Result<Account, String> {
+        let cancel = pending.cancel();
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(pending.wait());
+        });
+        let result = result.recv_timeout(Duration::from_secs(10));
+        cancel.store(true, Ordering::Relaxed);
+        result.expect("the wait never ended")
+    }
+
+    #[test]
+    fn a_silent_connection_does_not_stop_the_sign_in() {
+        let pending = begin(Client::App).unwrap();
+        let (port, state) = callback(&pending);
+        // Opened and never written to, like a browser's spare connection.
+        let _spare = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let _browser = knock(port, &format!("token=t&state={state}&name=Ada"));
+        let account = wait_a_little(pending).unwrap();
+        assert_eq!(account.name, "Ada");
+        assert_eq!(account.token, "t");
+    }
+
+    #[test]
+    fn a_browser_slow_to_ask_is_still_heard() {
+        let pending = begin(Client::App).unwrap();
+        let (port, state) = callback(&pending);
+        let browser = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let mut late = browser.try_clone().unwrap();
+        std::thread::spawn(move || {
+            // Only after the connection has been taken, which is when a
+            // socket left non-blocking would give up on it.
+            std::thread::sleep(Duration::from_millis(500));
+            late.write_all(format!("GET /?token=t&state={state} HTTP/1.1\r\n\r\n").as_bytes())
+        });
+        assert_eq!(wait_a_little(pending).unwrap().token, "t");
+    }
+
+    #[test]
+    fn cancelling_ends_the_wait_at_once() {
+        let pending = begin(Client::App).unwrap();
+        let cancel = pending.cancel();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            cancel.store(true, Ordering::Relaxed);
+        });
+        let started = Instant::now();
+        assert_eq!(wait_a_little(pending).unwrap_err(), "Sign-in cancelled.");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_callback_with_the_wrong_state_is_refused_and_waiting_goes_on() {
+        let pending = begin(Client::App).unwrap();
+        let (port, state) = callback(&pending);
+        let mut wrong = knock(port, &format!("token=t&state=x{state}"));
+        let _right = knock(port, &format!("token=t&state={state}"));
+        let account = wait_a_little(pending).unwrap();
+        assert_eq!(account.token, "t");
+        let mut answer = String::new();
+        wrong.read_to_string(&mut answer).unwrap();
+        assert!(answer.contains("That did not work."));
     }
 }
