@@ -592,7 +592,7 @@ pub fn data_dir() -> std::path::PathBuf {
 /// handshake for each round of a turn -- up to `MAX_ROUNDS` of them, all to
 /// the same gateway. This one keeps the connection open between rounds.
 /// Timeouts are set per request, since a model list and a reply differ.
-fn client() -> Result<&'static reqwest::blocking::Client, String> {
+pub(crate) fn client() -> Result<&'static reqwest::blocking::Client, String> {
     static CLIENT: OnceLock<Result<reqwest::blocking::Client, String>> = OnceLock::new();
     CLIENT
         .get_or_init(|| {

@@ -162,13 +162,7 @@ fn ask(connection: &Connection, earlier: Option<&str>, transcript: &str) -> Resu
         "stream": false,
         "max_tokens": 1500,
     });
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(60))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| e.to_string())?;
-    let mut request = client.post(endpoint).json(&body);
+    let mut request = post(endpoint)?.json(&body);
     if !connection.key.trim().is_empty() {
         request = request.bearer_auth(connection.key.trim());
     }
@@ -182,6 +176,16 @@ fn ask(connection: &Connection, earlier: Option<&str>, transcript: &str) -> Resu
         .and_then(Value::as_str)
         .map(str::to_owned)
         .ok_or_else(|| "No summary came back.".to_owned())
+}
+
+/// A summary request to `endpoint`, on the chat's connection but with a
+/// timeout of its own.
+fn post(endpoint: String) -> Result<reqwest::blocking::RequestBuilder, String> {
+    // Without one the shared client would cut a summary off at reqwest's
+    // default of 30 seconds.
+    Ok(crate::chat::client()?
+        .post(endpoint)
+        .timeout(Duration::from_secs(60)))
 }
 
 #[cfg(test)]
@@ -255,5 +259,14 @@ mod tests {
         assert!(text.starts_with("[the earliest part is left out]"));
         assert!(!text.contains("the very first question"));
         assert!(text.contains("the latest question"));
+    }
+
+    #[test]
+    fn a_summary_request_keeps_its_own_timeout() {
+        let request = post("http://localhost:11434/v1/chat/completions".into())
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(request.timeout(), Some(&Duration::from_secs(60)));
     }
 }
