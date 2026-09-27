@@ -10,6 +10,7 @@ Letronna — a small agent in your terminal
   letronna --resume <id>   open that session, by the id /where shows
   letronna gui             open the window instead
   letronna setup           name, sign in, provider, model, install
+  letronna update          install the newest version
   letronna --uninstall     take it off again
 
 Options
@@ -45,6 +46,7 @@ pub struct Args {
     pub gui: bool,
     pub install: bool,
     pub uninstall: bool,
+    pub update: bool,
 }
 
 pub fn parse(mut raw: impl Iterator<Item = String>) -> Args {
@@ -58,10 +60,12 @@ pub fn parse(mut raw: impl Iterator<Item = String>) -> Args {
         gui: false,
         install: false,
         uninstall: false,
+        update: false,
     };
     while let Some(arg) = raw.next() {
         match arg.as_str() {
             "gui" => args.gui = true,
+            "update" => args.update = true,
             "-p" | "--print" => args.prompt = raw.next(),
             "-c" | "--continue" => args.start = Start::Last,
             // `--resume` on its own offers the recent sessions; with an id it
@@ -122,6 +126,7 @@ mod tests {
         let worded = args(&["--resume", "hello"]);
         assert_eq!(worded.start, super::Start::Choose);
         assert!(args(&["gui"]).gui);
+        assert!(args(&["update"]).update && args(&["update"]).prompt.is_none());
         assert!(args(&["--yes"]).yes);
         assert!(args(&["-h"]).help);
         assert!(args(&["--version"]).version && args(&["-V"]).version);
