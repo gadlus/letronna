@@ -114,6 +114,10 @@ pub fn command(
             }));
             Flow::Handled
         }
+        "/search" if rest == "services" => {
+            search_services(runner);
+            Flow::Handled
+        }
         "/search" => {
             runner.store.settings.search = !runner.store.settings.search;
             runner.persist();
@@ -672,6 +676,86 @@ fn set_model(runner: &mut Runner, gateway: String, model: String) {
         render::bold(&model),
         render::dim(&format!("· {gateway}"))
     ));
+}
+
+/// Every search service and where it stands, then set one up to search with,
+/// or remove one. The one set up last is used.
+pub fn search_services(runner: &mut Runner) {
+    use letronna_core::search::{self, SERVICES};
+    let mut keys = store::load_keys();
+    let mut choice = search::choice();
+    let mut rows = Vec::new();
+    let mut choices: Vec<(String, &'static str, &'static str)> = Vec::new();
+    for s in SERVICES {
+        let (status, good, set_up) = search::status(s.name, &choice, &keys);
+        rows.push(format!(
+            "{} {:<8} {status}",
+            if good { "●" } else { "○" },
+            s.name
+        ));
+        let verb = if set_up { "Change" } else { "Set up" };
+        choices.push((format!("{verb} {}", s.name), s.name, "set"));
+        if set_up {
+            choices.push((format!("Remove {}", s.name), s.name, "remove"));
+        }
+    }
+    let mut options: Vec<&str> = choices.iter().map(|c| c.0.as_str()).collect();
+    options.push("Done");
+    let Some(picked) = runner.bar.choose("Search services", rows, &options) else {
+        return;
+    };
+    let Some((_, name, what)) = choices.get(picked).cloned() else {
+        return;
+    };
+    let Some(service) = search::service(name) else {
+        return;
+    };
+    render::blank();
+    if what == "remove" {
+        keys.remove(name);
+        choice.set_address(service, "");
+        if choice.service == name {
+            choice.service.clear();
+        }
+        render::line(&render::dim(&format!("{name} removed.")));
+    } else if service.self_hosted() {
+        let hint = format!("{name} address, like http://mac-mini:8888");
+        let given = runner.bar.ask(&hint, false).unwrap_or_default();
+        if given.trim().is_empty() {
+            return;
+        }
+        choice.set_address(service, &given);
+    } else {
+        let given = runner
+            .bar
+            .ask(&format!("{name} API key"), true)
+            .unwrap_or_default();
+        if given.trim().is_empty() {
+            return;
+        }
+        keys.insert(name.to_owned(), given.trim().to_owned());
+        // Its official address unless another is given; "official" goes back to it.
+        let now = choice.address(service);
+        let hint = format!("{name} address (Enter keeps {now}; official resets it)");
+        match runner.bar.ask(&hint, false).unwrap_or_default().trim() {
+            "" => {}
+            "official" => choice.set_address(service, ""),
+            other => choice.set_address(service, other),
+        }
+    }
+    if what != "remove" {
+        choice.service = name.to_owned();
+        render::line(&render::dim(&format!(
+            "The model now searches with {name} at {}, asking before each search.",
+            choice.address(service)
+        )));
+    }
+    if let Err(error) = store::save_keys(&keys) {
+        render::line(&render::red(&format!("Could not save the key: {error}")));
+    }
+    if let Err(error) = search::choose(&choice) {
+        render::line(&render::red(&error));
+    }
 }
 
 /// Every gateway and where it stands, then set one up, change it or remove it.

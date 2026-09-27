@@ -127,6 +127,10 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(crate::media::Transcribe),
         Arc::new(crate::media::MakeVideo),
     ];
+    // The user's own search service, once one is set up.
+    if crate::search::ready() {
+        tools.push(Arc::new(crate::search::SearchWeb));
+    }
     if let Ok(extra) = plugin_tools().lock() {
         for tool in extra.iter() {
             // A plugin cannot take over the name of a built-in tool.
