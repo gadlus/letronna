@@ -1200,7 +1200,10 @@ impl Chat {
         if self.settings_open {
             self.close_settings(window, cx);
         } else if self.model_open {
+            // Back to the box, as picking a model does; the search field
+            // had focus, and closing it left typing going nowhere.
             self.model_open = false;
+            self.focus_composer(window, cx);
             cx.notify();
         } else {
             self.stop_turn(cx);
