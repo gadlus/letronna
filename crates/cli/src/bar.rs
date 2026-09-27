@@ -90,6 +90,18 @@ pub const COMMANDS: &[Command] = &[
         blurb: "pick up a session from before",
     },
     Command {
+        name: "/undo",
+        blurb: "take back the last exchange",
+    },
+    Command {
+        name: "/retry",
+        blurb: "ask your last message again",
+    },
+    Command {
+        name: "/branch",
+        blurb: "carry on in a copy of this session",
+    },
+    Command {
         name: "/where",
         blurb: "show the project folder and session file",
     },
@@ -508,6 +520,14 @@ impl Bar {
     pub fn say(&mut self, text: &str) {
         self.line.clear();
         self.line.insert_str(text);
+        self.settle();
+    }
+
+    /// Send words as though they had just been typed and entered, ahead of
+    /// anything already waiting, for a command that asks something again.
+    pub fn send_first(&mut self, text: &str) {
+        self.echo(text);
+        self.queued.push_front(text.to_owned());
         self.settle();
     }
 
