@@ -10,6 +10,7 @@ Letronna — a small agent in your terminal
   letronna --resume <id>   open that session, by the id /where shows
   letronna gui             open the window instead
   letronna setup           name, sign in, provider, model, install
+  letronna update          install the newest version
   letronna --uninstall     take it off again
 
 Options
@@ -19,6 +20,7 @@ Options
       --yes                run tools without asking (careful)
       --plan               read and search only; never write or run
   -h, --help               this
+  -V, --version            which version this is
 ";
 
 /// What to open with.
@@ -40,9 +42,11 @@ pub struct Args {
     pub yes: bool,
     pub plan: bool,
     pub help: bool,
+    pub version: bool,
     pub gui: bool,
     pub install: bool,
     pub uninstall: bool,
+    pub update: bool,
 }
 
 pub fn parse(mut raw: impl Iterator<Item = String>) -> Args {
@@ -52,13 +56,16 @@ pub fn parse(mut raw: impl Iterator<Item = String>) -> Args {
         yes: false,
         plan: false,
         help: false,
+        version: false,
         gui: false,
         install: false,
         uninstall: false,
+        update: false,
     };
     while let Some(arg) = raw.next() {
         match arg.as_str() {
             "gui" => args.gui = true,
+            "update" => args.update = true,
             "-p" | "--print" => args.prompt = raw.next(),
             "-c" | "--continue" => args.start = Start::Last,
             // `--resume` on its own offers the recent sessions; with an id it
@@ -74,6 +81,7 @@ pub fn parse(mut raw: impl Iterator<Item = String>) -> Args {
             "setup" | "--install" => args.install = true,
             "--uninstall" => args.uninstall = true,
             "-h" | "--help" => args.help = true,
+            "-V" | "--version" => args.version = true,
             // A bare word is the prompt, so `letronna "what is this"` works.
             other if !other.starts_with('-') && args.prompt.is_none() => {
                 args.prompt = Some(other.to_owned())
@@ -118,7 +126,9 @@ mod tests {
         let worded = args(&["--resume", "hello"]);
         assert_eq!(worded.start, super::Start::Choose);
         assert!(args(&["gui"]).gui);
+        assert!(args(&["update"]).update && args(&["update"]).prompt.is_none());
         assert!(args(&["--yes"]).yes);
         assert!(args(&["-h"]).help);
+        assert!(args(&["--version"]).version && args(&["-V"]).version);
     }
 }

@@ -55,8 +55,14 @@ impl Chat {
         self.open_settings(window, cx);
     }
 
-    /// Open the browser and wait for it to hand a token back.
+    /// Open the browser and wait for it to hand a token back. Asked again
+    /// while it waits, it shows the same page again: the tab may have been
+    /// closed, or never opened in the browser that is in use.
     pub(crate) fn sign_in(&mut self, cx: &mut Context<Self>) {
+        if let Some(url) = &self.sign_in_url {
+            cx.open_url(url);
+            return;
+        }
         if self.signing_in {
             return;
         }
@@ -70,8 +76,18 @@ impl Chat {
         };
         cx.open_url(&pending.url);
         self.signing_in = true;
-        self.account_note = Some("Waiting for the browser. Allow Letronna there.".into());
+        self.sign_in_url = Some(pending.url.clone());
+        self.sign_in_cancel = Some(pending.cancel());
+        // The waiting card on the Account page says what to do now.
+        self.account_note = None;
         self.off_thread(move || pending.finish(), cx);
+    }
+
+    /// Stop waiting for the browser; the port closes at once.
+    pub(crate) fn cancel_sign_in(&mut self) {
+        if let Some(cancel) = &self.sign_in_cancel {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn sign_out(&mut self, cx: &mut Context<Self>) {
@@ -100,6 +116,9 @@ impl Chat {
             if let Ok(result) = rx.recv().await {
                 let _ = this.update(cx, |this, cx| {
                     this.signing_in = false;
+                    // A sign-in that was waiting is over, however it ended.
+                    this.sign_in_url = None;
+                    this.sign_in_cancel = None;
                     // Whatever happened, the file says who is signed in now.
                     this.account = auth::account();
                     this.account_note = match result {
@@ -129,6 +148,16 @@ pub(crate) fn account_page(chat: &Entity<Chat>, this: &Chat, cx: &App) -> Div {
         .map(|note| div().text_sm().text_color(muted).child(note));
 
     let Some(account) = this.account.clone() else {
+        if let Some(url) = this.sign_in_url.clone() {
+            return v_flex()
+                .gap_4()
+                .child(super::settings::heading(
+                    "Account",
+                    "Hosted models and cloud runs need a Letronna account. Your own keys do not.",
+                    cx,
+                ))
+                .child(waiting_card(chat, url, cx));
+        }
         let chat = chat.clone();
         return v_flex()
             .gap_4()
@@ -181,7 +210,12 @@ pub(crate) fn account_page(chat: &Entity<Chat>, this: &Chat, cx: &App) -> Div {
                 .child(row(
                     "Team",
                     match &account.team {
-                        Some(t) => format!("{} · pool ${}.{:02}", t.name, t.credits / 100, t.credits.rem_euclid(100)),
+                        Some(t) => format!(
+                            "{} · pool ${}.{:02}",
+                            t.name,
+                            t.credits / 100,
+                            t.credits.rem_euclid(100)
+                        ),
                         None => "None · your own credit".to_owned(),
                     },
                 )),
@@ -235,7 +269,10 @@ fn billing(chat: &Entity<Chat>, this: &Chat, account: &Account, cx: &App) -> Div
                 chat.update(cx, |this, cx| this.pick_team(id, cx))
             })
     };
-    let mut row = h_flex().gap_2().flex_wrap().child(choice(0, "Personal".into(), None));
+    let mut row = h_flex()
+        .gap_2()
+        .flex_wrap()
+        .child(choice(0, "Personal".into(), None));
     for (i, t) in this.teams.iter().enumerate() {
         row = row.child(choice(i + 1, t.name.clone(), Some(t.id.clone())));
     }
@@ -252,5 +289,81 @@ fn billing(chat: &Entity<Chat>, this: &Chat, account: &Account, cx: &App) -> Div
                 } else {
                     "One pays for each call, never both. Same choice as /team in the terminal."
                 }),
+        )
+}
+
+/// What to do while the browser has the sign-in: the page may have been
+/// closed, may not have opened at all, or may have opened in a browser that
+/// is not the one in use -- carrying it across part way fails, so the link
+/// is offered to start over in the right one.
+fn waiting_card(chat: &Entity<Chat>, url: String, cx: &App) -> Div {
+    let (again, copy, cancel) = (chat.clone(), url, chat.clone());
+    v_flex()
+        .gap_3()
+        .p_4()
+        .rounded(cx.theme().radius)
+        .border_1()
+        .border_color(cx.theme().border)
+        .child(
+            h_flex()
+                .gap_2()
+                .items_center()
+                .child(
+                    gpui_component::spinner::Spinner::new()
+                        .small()
+                        .color(cx.theme().primary),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .child("Waiting for you to allow Letronna in the browser."),
+                ),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(
+                    "No page opened, or not in the browser you use? Copy the link into the one \
+                     you are signed in to, and finish there.",
+                ),
+        )
+        .child(
+            h_flex()
+                .gap_2()
+                .child(
+                    Button::new("sign-in-again")
+                        .primary()
+                        .small()
+                        .label("Open the page again")
+                        .on_click(move |_, _, cx| again.update(cx, |this, cx| this.sign_in(cx))),
+                )
+                .child(
+                    Button::new("sign-in-copy")
+                        .outline()
+                        .small()
+                        .label("Copy link")
+                        .on_click(move |_, window, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
+                            window.push_notification(
+                                gpui_component::notification::Notification::success(
+                                    "Link copied. Open it in the browser you use.",
+                                ),
+                                cx,
+                            );
+                        }),
+                )
+                .child(
+                    Button::new("sign-in-cancel")
+                        .ghost()
+                        .small()
+                        .label("Cancel")
+                        .on_click(move |_, _, cx| {
+                            cancel.update(cx, |this, cx| {
+                                this.cancel_sign_in();
+                                cx.notify();
+                            })
+                        }),
+                ),
         )
 }

@@ -107,6 +107,10 @@ pub fn command(
             }));
             Flow::Handled
         }
+        "/search" if rest == "services" => {
+            search_services(runner);
+            Flow::Handled
+        }
         "/search" => {
             runner.store.settings.search = !runner.store.settings.search;
             runner.persist();
@@ -130,6 +134,38 @@ pub fn command(
         }
         "/resume" => {
             resume(runner, session, workspace);
+            Flow::Handled
+        }
+        "/undo" => {
+            match take_back(runner, *session, workspace) {
+                Some(prompt) => {
+                    runner.bar.say(&prompt);
+                    render::blank();
+                    render::line(&render::dim(
+                        "Took back the last exchange. Your message is back in the box.",
+                    ));
+                }
+                None => {
+                    render::blank();
+                    render::line(&render::dim("Nothing to take back."));
+                }
+            }
+            Flow::Handled
+        }
+        "/retry" => {
+            match take_back(runner, *session, workspace) {
+                // Queued rather than asked from here, so it goes the way a
+                // typed line goes: the loop sends it and reports a failure.
+                Some(prompt) => runner.bar.send_first(&prompt),
+                None => {
+                    render::blank();
+                    render::line(&render::dim("Nothing to retry."));
+                }
+            }
+            Flow::Handled
+        }
+        "/branch" => {
+            branch(runner, session, rest);
             Flow::Handled
         }
         "/where" => {
@@ -189,6 +225,8 @@ fn help() {
             render::dim(what)
         ));
     }
+    render::blank();
+    render::line(&render::dim("The guide: https://letronna.ai/docs"));
 }
 
 /// Who is signed in, checked with the API; what was known last is shown when
@@ -235,9 +273,15 @@ fn whoami(runner: &mut Runner) {
             render::dim("team   "),
             team.name,
             render::dim("pool   "),
-            format!("${}.{:02}", team.credits / 100, team.credits.rem_euclid(100))
+            format_args!(
+                "${}.{:02}",
+                team.credits / 100,
+                team.credits.rem_euclid(100)
+            )
         )),
-        None => render::line(&render::dim("team    none · hosted models use your own credit · /team to pick one")),
+        None => render::line(&render::dim(
+            "team    none · hosted models use your own credit · /team to pick one",
+        )),
     }
 }
 
@@ -249,7 +293,9 @@ fn team(runner: &mut Runner) {
         render::line(&render::dim("Not signed in. /login first."));
         return;
     }
-    let found = runner.bar.busy("loading your teams", letronna_core::auth::teams);
+    let found = runner
+        .bar
+        .busy("loading your teams", letronna_core::auth::teams);
     let teams = match found {
         Ok(teams) => teams,
         Err(error) => {
@@ -258,26 +304,48 @@ fn team(runner: &mut Runner) {
             return;
         }
     };
-    let current = letronna_core::auth::account().and_then(|a| a.team).map(|t| t.id);
+    let current = letronna_core::auth::account()
+        .and_then(|a| a.team)
+        .map(|t| t.id);
     let mark = |on: bool| if on { "● " } else { "  " };
-    let mut labels = vec![format!("{}Personal — your own credit", mark(current.is_none()))];
-    labels.extend(teams.iter().map(|t| format!("{}{} — team pool", mark(current.as_deref() == Some(t.id.as_str())), t.name)));
+    let mut labels = vec![format!(
+        "{}Personal — your own credit",
+        mark(current.is_none())
+    )];
+    labels.extend(teams.iter().map(|t| {
+        format!(
+            "{}{} — team pool",
+            mark(current.as_deref() == Some(t.id.as_str())),
+            t.name
+        )
+    }));
     let options: Vec<&str> = labels.iter().map(String::as_str).collect();
     let detail = if teams.is_empty() {
-        vec!["You are not in a team yet. Create or join one at letronna.ai/dashboard/team.".to_owned()]
+        vec![
+            "You are not in a team yet. Create or join one at letronna.ai/dashboard/team."
+                .to_owned(),
+        ]
     } else {
         Vec::new()
     };
     let Some(picked) = runner.bar.choose("Bill hosted models to", detail, &options) else {
         return;
     };
-    let id = picked.checked_sub(1).and_then(|i| teams.get(i)).map(|t| t.id.clone());
-    let done = runner.bar.busy("switching", move || letronna_core::auth::use_team(id.as_deref()));
+    let id = picked
+        .checked_sub(1)
+        .and_then(|i| teams.get(i))
+        .map(|t| t.id.clone());
+    let done = runner.bar.busy("switching", move || {
+        letronna_core::auth::use_team(id.as_deref())
+    });
     render::blank();
     match done {
         Ok(account) => {
             match &account.team {
-                Some(team) => render::line(&format!("Hosted models now bill {}.", render::bold(&team.name))),
+                Some(team) => render::line(&format!(
+                    "Hosted models now bill {}.",
+                    render::bold(&team.name)
+                )),
                 None => render::line("Hosted models now use your own credit."),
             }
             let note = footer(runner);
@@ -314,12 +382,19 @@ pub fn sign_in(runner: &mut Runner) {
         "Opening your browser. Come back when it is done.",
     ));
     render::line(&render::dim(&pending.url));
+    // The link opens in the system's default browser, which may not be the
+    // one in use; a sign-in carried across part way fails, so say so now.
+    render::line(&render::dim(
+        "Not your usual browser? Paste the link into the one you use.",
+    ));
     open_in_browser(&pending.url);
 
-    match runner
-        .bar
-        .busy("waiting for the browser", move || pending.finish())
-    {
+    let stop = pending.cancel();
+    match runner.bar.busy_cancellable(
+        "waiting for the browser · esc to cancel",
+        stop,
+        move || pending.finish(),
+    ) {
         Ok(account) => {
             render::said(&render::blue("›"), &render::bold(&account.name));
             let plan = account.plan_name();
@@ -329,6 +404,8 @@ pub fn sign_in(runner: &mut Runner) {
                 format!("Signed in · {plan} · {} credit", account.credit())
             }));
         }
+        // Given up on with escape: what was asked for, not a failure.
+        Err(error) if error == "Sign-in cancelled." => render::line(&render::dim(&error)),
         Err(error) => render::line(&render::red(&error)),
     }
 }
@@ -552,6 +629,67 @@ pub fn resume(runner: &mut Runner, session: &mut usize, workspace: Option<&std::
     replay(runner, index);
 }
 
+/// Take the session back to just before the last thing you said, and the
+/// screen with it. Returns what you said, or `None` when nothing has been.
+fn take_back(
+    runner: &mut Runner,
+    session: usize,
+    workspace: Option<&std::path::Path>,
+) -> Option<String> {
+    let (at, prompt) = last_prompt(&runner.store.conversations[session].messages)?;
+    runner.store.conversations[session].rewind(at);
+    // What was taken back is still on the screen, where a note saying it is
+    // gone would contradict it. Draw the session again from what is left,
+    // the way opening it does.
+    render::clear();
+    banner(runner, &folder_name(workspace), session);
+    if at > 0 {
+        replay(runner, session);
+    }
+    // After the redraw, so a failure to save is not cleared off the screen.
+    runner.persist();
+    Some(prompt)
+}
+
+/// Where the last thing you said sits among `messages`, and what it said.
+fn last_prompt(messages: &[letronna_core::chat::Message]) -> Option<(usize, String)> {
+    let at = messages.iter().rposition(|m| m.role == "user")?;
+    Some((at, messages[at].content.clone()))
+}
+
+/// Carry on in a copy of the open session, leaving the original as it was.
+fn branch(runner: &mut Runner, session: &mut usize, name: &str) {
+    let from = &runner.store.conversations[*session];
+    // A copy of nothing is only another new session, and /resume offers
+    // neither of them back.
+    if from.messages.is_empty() {
+        render::blank();
+        render::line(&render::dim("Nothing to branch from yet."));
+        return;
+    }
+    let title = match name {
+        "" => format!("{} (branch)", from.title),
+        name => name.to_owned(),
+    };
+    let copy = store::Conversation {
+        id: runner.store.next_id(),
+        title: title.clone(),
+        messages: from.messages.clone(),
+        updated: letronna_core::chat::now(),
+        workspace: from.workspace.clone(),
+        todos: from.todos.clone(),
+        ..Default::default()
+    };
+    runner.store.conversations.push(copy);
+    *session = runner.store.conversations.len() - 1;
+    runner.store.active = *session;
+    runner.persist();
+    render::blank();
+    render::line(&render::dim(&format!(
+        "Now in {title}. The original is kept; /resume goes back to it."
+    )));
+}
+
 /// Models offered at once. Some gateways carry hundreds; a list longer than
 /// this is narrowed with a word rather than scrolled.
 const MODEL_CHOICES: usize = 10;
@@ -631,15 +769,19 @@ pub fn switch_model(runner: &mut Runner, filter: &str) {
     render::blank();
     render::said(&render::blue("●"), &render::bold("Models"));
     // Fetching takes a moment over the network; say so rather than freezing.
-    let (mut models, errors) = runner.bar.busy("asking every gateway what it has", move || {
-        letronna_core::gateway::all_models(&keys, &custom)
-    });
+    let (mut models, errors) = runner
+        .bar
+        .busy("asking every gateway what it has", move || {
+            letronna_core::gateway::all_models(&keys, &custom)
+        });
     for error in &errors {
         render::line(&render::red(error));
     }
     if models.is_empty() {
         if errors.is_empty() {
-            render::line(&render::dim("No gateway offered any models. Sign in with /login, or add a provider with `letronna setup`."));
+            render::line(&render::dim(
+                "No gateway offered any models. Sign in with /login, or add a provider with `letronna setup`.",
+            ));
         }
         return;
     }
@@ -705,6 +847,86 @@ fn set_model(runner: &mut Runner, gateway: String, model: String) {
     ));
 }
 
+/// Every search service and where it stands, then set one up to search with,
+/// or remove one. The one set up last is used.
+pub fn search_services(runner: &mut Runner) {
+    use letronna_core::search::{self, SERVICES};
+    let mut keys = store::load_keys();
+    let mut choice = search::choice();
+    let mut rows = Vec::new();
+    let mut choices: Vec<(String, &'static str, &'static str)> = Vec::new();
+    for s in SERVICES {
+        let (status, good, set_up) = search::status(s.name, &choice, &keys);
+        rows.push(format!(
+            "{} {:<8} {status}",
+            if good { "●" } else { "○" },
+            s.name
+        ));
+        let verb = if set_up { "Change" } else { "Set up" };
+        choices.push((format!("{verb} {}", s.name), s.name, "set"));
+        if set_up {
+            choices.push((format!("Remove {}", s.name), s.name, "remove"));
+        }
+    }
+    let mut options: Vec<&str> = choices.iter().map(|c| c.0.as_str()).collect();
+    options.push("Done");
+    let Some(picked) = runner.bar.choose("Search services", rows, &options) else {
+        return;
+    };
+    let Some((_, name, what)) = choices.get(picked).cloned() else {
+        return;
+    };
+    let Some(service) = search::service(name) else {
+        return;
+    };
+    render::blank();
+    if what == "remove" {
+        keys.remove(name);
+        choice.set_address(service, "");
+        if choice.service == name {
+            choice.service.clear();
+        }
+        render::line(&render::dim(&format!("{name} removed.")));
+    } else if service.self_hosted() {
+        let hint = format!("{name} address, like http://mac-mini:8888");
+        let given = runner.bar.ask(&hint, false).unwrap_or_default();
+        if given.trim().is_empty() {
+            return;
+        }
+        choice.set_address(service, &given);
+    } else {
+        let given = runner
+            .bar
+            .ask(&format!("{name} API key"), true)
+            .unwrap_or_default();
+        if given.trim().is_empty() {
+            return;
+        }
+        keys.insert(name.to_owned(), given.trim().to_owned());
+        // Its official address unless another is given; "official" goes back to it.
+        let now = choice.address(service);
+        let hint = format!("{name} address (Enter keeps {now}; official resets it)");
+        match runner.bar.ask(&hint, false).unwrap_or_default().trim() {
+            "" => {}
+            "official" => choice.set_address(service, ""),
+            other => choice.set_address(service, other),
+        }
+    }
+    if what != "remove" {
+        choice.service = name.to_owned();
+        render::line(&render::dim(&format!(
+            "The model now searches with {name} at {}, asking before each search.",
+            choice.address(service)
+        )));
+    }
+    if let Err(error) = store::save_keys(&keys) {
+        render::line(&render::red(&format!("Could not save the key: {error}")));
+    }
+    if let Err(error) = search::choose(&choice) {
+        render::line(&render::red(&error));
+    }
+}
+
 /// Every gateway and where it stands, then set one up, change it or remove it.
 /// Everything set up is used at once; `/model` picks among all their models.
 pub fn gateways(runner: &mut Runner) {
@@ -714,7 +936,9 @@ pub fn gateways(runner: &mut Runner) {
     let (k, c) = (keys.clone(), custom.clone());
     let (models, _) = runner
         .bar
-        .busy("asking every gateway what it has", move || gateway::all_models(&k, &c));
+        .busy("asking every gateway what it has", move || {
+            gateway::all_models(&k, &c)
+        });
 
     // The list sits in the box with its choices, not in the conversation.
     // Letronna is the account, not a gateway to add or remove: /login and
@@ -724,8 +948,16 @@ pub fn gateways(runner: &mut Runner) {
     for g in GATEWAYS {
         let count = models.iter().filter(|(n, _)| n == g.name).count();
         let (status, good, set_up) = gateway::status(g.name, &keys, &custom, count);
-        let status = if g.name == LETRONNA && !set_up { format!("{status} · /login") } else { status };
-        rows.push(format!("{} {:<11} {status}", if good { "●" } else { "○" }, g.name));
+        let status = if g.name == LETRONNA && !set_up {
+            format!("{status} · /login")
+        } else {
+            status
+        };
+        rows.push(format!(
+            "{} {:<11} {status}",
+            if good { "●" } else { "○" },
+            g.name
+        ));
         match (g.name, set_up) {
             (LETRONNA, _) | ("Ollama", _) => {}
             (_, false) => choices.push((format!("Set up {}", g.name), g.name, "set")),
@@ -751,26 +983,76 @@ pub fn gateways(runner: &mut Runner) {
                 runner.store.settings.custom_endpoint.clear();
             }
             render::blank();
-            render::line(&render::dim(&format!("{name} removed. Its models leave /model.")));
+            render::line(&render::dim(&format!(
+                "{name} removed. Its models leave /model."
+            )));
         }
         _ => {
             if gateway::gateway(name).base.is_empty() {
-                let url = runner.bar.ask(&format!("{name} base URL, like http://localhost:8000/v1"), false).unwrap_or_default();
+                let url = runner
+                    .bar
+                    .ask(
+                        &format!("{name} base URL, like http://localhost:8000/v1"),
+                        false,
+                    )
+                    .unwrap_or_default();
                 if !url.trim().is_empty() {
-                    runner.store.settings.custom_endpoint = url.trim().trim_end_matches('/').to_owned();
+                    runner.store.settings.custom_endpoint =
+                        url.trim().trim_end_matches('/').to_owned();
                 }
             }
-            let hint = if gateway::gateway(name).needs_key { format!("{name} API key") } else { format!("{name} API key (optional)") };
+            let hint = if gateway::gateway(name).needs_key {
+                format!("{name} API key")
+            } else {
+                format!("{name} API key (optional)")
+            };
             let key = runner.bar.ask(&hint, true).unwrap_or_default();
             if !key.trim().is_empty() {
                 keys.insert(gateway::key_slot(name).to_owned(), key.trim().to_owned());
             }
             render::blank();
-            render::line(&render::dim(&format!("{name} saved. /model now lists its models too.")));
+            render::line(&render::dim(&format!(
+                "{name} saved. /model now lists its models too."
+            )));
         }
     }
     if let Err(error) = store::save_keys(&keys) {
         render::line(&render::red(&format!("Could not save the key: {error}")));
     }
     runner.persist();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::last_prompt;
+    use letronna_core::chat::Message;
+
+    fn said(role: &str, content: &str) -> Message {
+        Message {
+            role: role.into(),
+            content: content.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn taking_back_goes_to_the_last_thing_you_said() {
+        // A turn that used a tool ends on its result and the answer after
+        // it, and neither of those is something you said.
+        let messages = [
+            said("user", "first"),
+            said("assistant", "ok"),
+            said("user", "second"),
+            said("assistant", ""),
+            said("tool", "a result"),
+            said("assistant", "done"),
+        ];
+        assert_eq!(last_prompt(&messages), Some((2, "second".to_owned())));
+    }
+
+    #[test]
+    fn nothing_said_means_nothing_to_take_back() {
+        assert_eq!(last_prompt(&[]), None);
+        assert_eq!(last_prompt(&[said("assistant", "hello")]), None);
+    }
 }

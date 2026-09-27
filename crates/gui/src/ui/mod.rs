@@ -2,6 +2,7 @@ pub(crate) mod account;
 pub(crate) mod actions;
 pub(crate) mod approval;
 pub(crate) mod artifacts;
+pub(crate) mod browser;
 pub(crate) mod chrome;
 pub(crate) mod composer;
 pub(crate) mod messages;
@@ -11,6 +12,7 @@ pub(crate) mod sessions;
 pub(crate) mod settings;
 pub(crate) mod sidebar;
 pub(crate) mod skills;
+pub(crate) mod update;
 
 use crate::prelude::*;
 use gpui_component::{button::ButtonVariant, dialog::DialogButtonProps};

@@ -83,6 +83,19 @@ The Letronna gateway's address follows `LETRONNA_API`, for working against a loc
 
 Model lists come from `GET {base}/models`. Streaming uses SSE chat completions.
 
+## Web search
+
+The Web toggle is the gateway's own search, and only some gateways have one. A search service of your own works with any of them: set one up in Settings under Search, or with `/search services` in the terminal, and the agent gets a `search_web` tool that asks before each search.
+
+| Service  | Official address                                  | Needs               |
+|----------|---------------------------------------------------|---------------------|
+| Brave    | `https://api.search.brave.com/res/v1/web/search`  | an API key          |
+| Tavily   | `https://api.tavily.com/search`                   | an API key          |
+| Exa      | `https://api.exa.ai/search`                       | an API key          |
+| SearXNG  | your own server, such as `http://mac-mini:8888`   | its json format on  |
+
+The one set up last is used. Each is reached at its official address unless you give another, such as a proxy; Reset, or `official` in the terminal, goes back to it. A SearXNG answers searches from Letronna only with `json` among the `formats` in its `settings.yml`. Keys stay in `keys.json` with the gateways'.
+
 ## Images, speech and video
 
 Signed in, the agent can also make things on Letronna's hosted models, whichever gateway the chat itself uses:
@@ -96,6 +109,23 @@ Signed in, the agent can also make things on Letronna's hosted models, whichever
 
 Each one asks first, since it spends your credit, and none is offered in plan mode or in a shared chat. Unless a model is named, the cheapest one working is used; the prices are on the dashboard's models page. What is made is saved in `media/` in the project folder, or in the data folder when no project is attached. The window shows a made image in the chat, and opens any made file.
 
+## Browser
+
+The agent can use a real web browser: the Chrome, Edge or Brave already installed (Edge comes with Windows), driven over the DevTools protocol. Nothing is downloaded and no Node or Python is needed.
+
+| Tool       | Does                                                                            |
+|------------|---------------------------------------------------------------------------------|
+| `browse`   | opens a page and lists it, scrolls, goes back, switches tabs, reads the console, takes a screenshot |
+| `use_page` | clicks, types, presses keys, picks from dropdowns, runs JavaScript              |
+
+A page reaches the model as its accessibility tree, one element a line with a ref such as `e12` to click or type into; screenshots show in the chat, and a model that takes images sees the newest one. Each session browses in a browser of its own, as a separate agent would: a private one, as an incognito window is, with its own sign-ins and tabs, forgotten when Letronna quits. The window's browser panel shows the one of the session on screen. **One browser for every session** (Settings, Privacy) shares a single one instead, on its own profile in the data folder, never your usual one, where a site signed in to once stays signed in. It is one browser either way, the sessions' private ones living inside it, and at most four private ones are kept at once. It has no window of its own, and closes when Letronna exits, or once nothing has used it for a while (15 seconds after the panel closes, 3 minutes after the agent's last step), to start again when next needed with each session's page and sign-ins as they were; `LETRONNA_BROWSER_HEADLESS=0` gives it one, for the terminal or for a site that turns away a browser without one. `LETRONNA_BROWSER` picks the browser by its path.
+
+The browser can be elsewhere instead: a cloud browser, or Chrome on another machine. Give its address under **Browser elsewhere** (Settings, Privacy), or in `LETRONNA_BROWSER_URL`: a cloud service's connect address with its key in it as the service gives it (`wss://…?token=…` or `?apiKey=…`), or `http://its-address:9222` for a Chrome started with `--remote-debugging-port=9222` (through an SSH tunnel is safest; the port lets anyone who reaches it drive the browser). The address is kept in `keys.json`, since it may carry a key. Everything works the same there, the panel included, over the one connection such a browser gives, with some differences: it has no window here; it draws at its own screen's scale (start it with `--force-device-scale-factor` to match yours); it cannot open addresses on this computer, as `localhost` is its own; each step crosses the network, so it is as quick as the link is; and when Letronna quits or the browser goes idle, it is let go of, with the private browsers made in it, rather than closed, as it may be somebody else's. A cloud service's session ends there.
+
+Both tools ask first, as a web address can carry things out as well as bring them in. Looking is allowed in plan mode and acting is not; neither is offered in a shared chat. An address carrying one of your own keys or tokens is never opened, nor a cloud machine's metadata service.
+
+The window shows the browser beside the chat, live, while the agent uses it or once **Browser** in the menu is clicked, which opens on the session's page, or on Google: a pointer goes to what the agent is about to click or type into, outlines it, and lands as the action happens, with a line saying what it is doing. It is yours to use too: type an address, go back and forward, reload, and click, type, scroll, copy and paste on the page. A question the page asks waits there for your answer, and a sign-in or a site's check is got past there. The panel's view menu lays the page out in portrait, as a phone does, or in landscape, as a desktop browser does in a wider panel, and zooms it (also Ctrl and +, -, 0, or the wheel); drag the panel's edge to widen it, and its window button gives the browser a window of its own, with the same page and sign-ins, until clicked again. The page is drawn as sharp as the screen: the browser's own pictures of it, sent only when it changes, 30 a second at most, and made sharp once it stands still, so a page standing still costs nothing, and none are sent once the panel is closed. A narrow window floats the panel in a corner, showing the page smaller. With **Show the page as the agent browses** (Settings, Privacy) off, the agent browses unseen, lighter on memory, and the panel opens only from the menu. The terminal shows none of this and waits for no pointer.
+
 ## Local data
 
 `%LOCALAPPDATA%\Letronna\` on Windows, `~/Library/Application Support/Letronna/` on macOS, `~/.local/share/Letronna/` on Linux. `AGENT_DATA_DIR` overrides all three.
@@ -106,7 +136,9 @@ Each one asks first, since it spends your credit, and none is offered in plan mo
 - `SOUL.md` who Letronna is, in your words; replaces the built-in first line of the prompt (optional, yours to write)
 - `USER.md` what Letronna knows about you, and `MEMORY.md` its own notes; it keeps both with its `memory` tool, and you can edit them. Both go into every conversation except chats other people can read, so they stay small (1,375 and 2,200 characters)
 - `mcp.json` MCP servers whose tools Letronna may use (optional, see below)
-- `media/` images, speech and video made with no project attached
+- `search.json` the search service in use, and any address given for one
+- `media/` images, speech and video made with no project attached, and browser screenshots
+- `browser/` the browser's own profile: delete it to sign out of everything there
 
 With a project folder attached, its `AGENTS.md` (or `CLAUDE.md`) is read as the project's instructions.
 
@@ -128,7 +160,50 @@ Letronna can use the tools of any [MCP](https://modelcontextprotocol.io) server 
 }
 ```
 
-Servers start when Letronna does, and their tools appear as `mcp__<server>__<tool>` once they answer. Every call asks first unless the tool is listed in `autoApprove`; `"disabled": true` leaves a server off. Servers reached by URL rather than a command are not supported yet.
+Servers start when Letronna does, and their tools appear as `mcp__<server>__<tool>` once they answer; `letronna -p` waits up to 15 seconds for them before it asks. Every call asks first unless the tool is listed in `autoApprove`; `"disabled": true` leaves a server off.
+
+A server that runs elsewhere -- a hosted one, or one on another machine -- is given by its address instead of a command, with any headers it needs, such as a key:
+
+```json
+{
+  "mcpServers": {
+    "deepwiki": { "url": "https://mcp.deepwiki.com/mcp" },
+    "hosted": {
+      "url": "https://example.com/mcp",
+      "headers": { "Authorization": "Bearer your-key" }
+    }
+  }
+}
+```
+
+It is spoken to over HTTP as the protocol now has it (streamable HTTP: an address that usually ends in `/mcp`). The older way, an address ending in `/sse`, is not supported.
+
+### A lighter browser
+
+On Linux and macOS, [Lightpanda](https://github.com/lightpanda-io/browser) is a browser made for agents that draws nothing, which makes it far lighter than Chrome or Edge with no window: on a Mac mini, about 20 MB idle and under 60 MB with Wikipedia open, where a hidden Edge takes over 160 MB with a small page. It comes with an MCP server, so with `lightpanda` on the PATH this is all it needs (it sends usage telemetry unless told not to, as here):
+
+```json
+{
+  "mcpServers": {
+    "lightpanda": {
+      "command": "lightpanda",
+      "args": ["mcp"],
+      "env": { "LIGHTPANDA_DISABLE_TELEMETRY": "true" }
+    }
+  }
+}
+```
+
+Its tools open pages and read them as text or markdown, find, click and fill what is on them, run scripts, and keep private sessions apart. Drawing nothing, it has nothing to show, and its screenshots are the page's text laid out; a site that needs what it does not implement yet can fail.
+
+There is no Windows build, and inside WSL or Docker its virtual machine costs more than it saves. It can run on another machine instead, a Mac or Linux box on the same Tailscale network say, over SSH with a key that logs in without asking; browsing then costs this one only the connection:
+
+```json
+"lightpanda": {
+  "command": "ssh",
+  "args": ["you@mac-mini", "LIGHTPANDA_DISABLE_TELEMETRY=true exec ~/.local/bin/lightpanda mcp"]
+}
+```
 
 ## Build
 

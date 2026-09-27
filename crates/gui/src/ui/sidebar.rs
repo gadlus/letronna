@@ -224,6 +224,7 @@ impl Chat {
                         Some(Page::Artifacts),
                         cx,
                     ))
+                    .child(self.browser_item(cx))
                     .child(self.nav_item(
                         "jobs",
                         AppIcon::Clock,

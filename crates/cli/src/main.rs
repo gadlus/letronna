@@ -23,14 +23,23 @@ mod title;
 use args::{HELP, Start, parse};
 use banner::{banner, folder_name, footer, replay};
 use commands::{Flow, command, resume};
-use letronna_core::store;
+use letronna_core::{store, update};
 use session::Runner;
+
+/// How often a session start quietly asks whether there is a newer version.
+const LOOK_FOR_UPDATES: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+/// How long a question asked once waits for MCP servers still starting.
+const MCP_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 
 fn main() {
     rescue_terminal();
     let args = parse(std::env::args().skip(1));
     if args.help {
         print!("{HELP}");
+        return;
+    }
+    if args.version {
+        println!("letronna {}", env!("CARGO_PKG_VERSION"));
         return;
     }
     if args.gui {
@@ -46,6 +55,10 @@ fn main() {
         }
         return;
     }
+    if args.update {
+        update_now();
+        return;
+    }
     // MCP servers can take seconds to start; started now, their tools are
     // there by the first question.
     letronna_core::mcp::start();
@@ -57,6 +70,8 @@ fn main() {
         plan: args.plan,
         bar: bar::Bar::new(String::new()),
     };
+    letronna_core::browser::share_browser(runner.store.settings.browser_shared);
+    std::thread::spawn(letronna_core::browser::close_left_over);
     // With nothing set up there is nothing to talk to, so the first run is
     // the setup -- the same one the installers hand over to. Asking a
     // question from a pipe cannot wait for answers, so that one stops here.
@@ -96,7 +111,12 @@ fn main() {
 
     // One question, one answer, no banner: this form gets piped.
     if let Some(prompt) = args.prompt {
-        match runner.ask(session, &prompt) {
+        // It goes out at once, so the MCP servers' tools would miss it.
+        letronna_core::mcp::ready(MCP_WAIT);
+        let asked = runner.ask(session, &prompt);
+        // A browser with no window would outlive this run unseen.
+        letronna_core::browser::close_hidden();
+        match asked {
             Ok(_) => runner.persist(),
             Err(error) => {
                 render::line(&render::red(&error));
@@ -115,6 +135,18 @@ fn main() {
     runner.bar.install();
     render::clear();
     banner(&runner, &folder, session);
+    if let Some(version) = update::seen() {
+        render::line(&render::dim(&format!(
+            "Letronna {version} is out · letronna update"
+        )));
+    }
+    // Asked in the background and only said next time, so a start never
+    // waits on the network for it.
+    if update::enabled() && !runner.store.settings.manual_updates && update::due(LOOK_FOR_UPDATES) {
+        std::thread::spawn(|| {
+            let _ = update::check();
+        });
+    }
     if args.start == Start::Choose {
         resume(&mut runner, &mut session, workspace.as_deref());
     } else if runner.store.conversations[session].length() > 0 {
@@ -157,6 +189,7 @@ fn main() {
         }
     }
     runner.bar.uninstall();
+    letronna_core::browser::close_hidden();
     render::title("");
     render::blank();
 }
@@ -175,6 +208,48 @@ fn rescue_terminal() {
         render::title("");
         previous(info);
     }));
+}
+
+/// `letronna update`: download the newest version, check it, and put it in
+/// place of this one. The window, when it is installed, is replaced with it.
+fn update_now() {
+    let release = match input::busy("looking for a newer version", update::check) {
+        Ok(Some(release)) => release,
+        Ok(None) => {
+            render::line(&render::dim(&format!(
+                "This is the newest version, {}.",
+                update::VERSION
+            )));
+            return;
+        }
+        Err(error) => {
+            render::line(&render::red(&error));
+            std::process::exit(1);
+        }
+    };
+    render::line(&format!(
+        "Letronna {} is out {}",
+        release.version,
+        render::dim(&format!("(this is {})", update::VERSION))
+    ));
+    let version = release.version.clone();
+    // The window may have downloaded it already.
+    if update::staged().as_ref() != Some(&version) {
+        let label = format!("downloading {version}");
+        if let Err(error) = input::busy(&label, move || update::download(&release)) {
+            render::line(&render::red(&error));
+            std::process::exit(1);
+        }
+    }
+    match update::install() {
+        Ok(_) => render::line(&render::dim(&format!(
+            "Updated to {version}. Start letronna again to use it."
+        ))),
+        Err(error) => {
+            render::line(&render::red(&error));
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Start the window. It is a separate binary because a GUI-subsystem

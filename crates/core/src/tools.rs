@@ -19,6 +19,9 @@ pub struct ToolContext {
     /// Set when a chat app is driving the session: where `read_chat` reads,
     /// and whether other people can see the replies.
     pub remote: Option<Remote>,
+    /// The conversation the call is made in, which keeps a browser of its
+    /// own; 0 for none in particular.
+    pub conversation: u64,
 }
 
 impl ToolContext {
@@ -26,6 +29,7 @@ impl ToolContext {
         Self {
             workspace: connection.workspace.clone(),
             remote: connection.remote.clone(),
+            conversation: connection.conversation,
         }
     }
 
@@ -126,7 +130,13 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(crate::media::Speak),
         Arc::new(crate::media::Transcribe),
         Arc::new(crate::media::MakeVideo),
+        Arc::new(crate::browser::Browse),
+        Arc::new(crate::browser::UsePage),
     ];
+    // The user's own search service, once one is set up.
+    if crate::search::ready() {
+        tools.push(Arc::new(crate::search::SearchWeb));
+    }
     if let Ok(extra) = plugin_tools().lock() {
         for tool in extra.iter() {
             // A plugin cannot take over the name of a built-in tool.
@@ -253,6 +263,7 @@ pub fn summary(name: &str, args: &str) -> String {
             .unwrap_or_default()
             .to_owned(),
         "speak" => v["text"].as_str().unwrap_or_default().to_owned(),
+        crate::browser::BROWSE | "use_page" => crate::browser::summary(&v),
         TODO => {
             let items = v["items"].as_array().map(Vec::len).unwrap_or(0);
             format!("{items} items")

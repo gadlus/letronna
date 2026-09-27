@@ -117,6 +117,17 @@ pub struct Settings {
     /// Which session was open last, by id rather than position.
     #[serde(default)]
     pub active_id: u64,
+    /// Only look for updates when asked.
+    #[serde(default)]
+    pub manual_updates: bool,
+    /// Every session shares one browser, its sign-ins remembered, rather
+    /// than each having a private one, forgotten when Letronna quits.
+    #[serde(default)]
+    pub browser_shared: bool,
+    /// The agent browses unseen: the browser panel does not open by itself
+    /// when it uses the browser, though it can still be opened to look.
+    #[serde(default)]
+    pub browse_unseen: bool,
 }
 
 #[derive(Default)]
@@ -652,15 +663,26 @@ mod retire_tests {
 
     #[test]
     fn old_gateways_move_to_letronna_and_known_ones_stay() {
-        let mut s = Settings { gateway: "Retired".into(), model: "retired/some-model".into(), ..Default::default() };
+        let mut s = Settings {
+            gateway: "Retired".into(),
+            model: "retired/some-model".into(),
+            ..Default::default()
+        };
         retire_gateway(&mut s);
         assert_eq!(s.gateway, "Letronna");
         assert_eq!(s.endpoint, "https://api.letronna.ai/v1");
         assert!(s.model.is_empty());
 
-        let mut s = Settings { gateway: "OpenRouter".into(), model: "x/y".into(), ..Default::default() };
+        let mut s = Settings {
+            gateway: "OpenRouter".into(),
+            model: "x/y".into(),
+            ..Default::default()
+        };
         retire_gateway(&mut s);
-        assert_eq!((s.gateway.as_str(), s.model.as_str()), ("OpenRouter", "x/y"));
+        assert_eq!(
+            (s.gateway.as_str(), s.model.as_str()),
+            ("OpenRouter", "x/y")
+        );
     }
 }
 
@@ -746,7 +768,30 @@ pub fn keys_path() -> PathBuf {
 /// here worth stealing.
 pub fn save_keys(keys: &std::collections::HashMap<String, String>) -> std::io::Result<()> {
     std::fs::create_dir_all(backend::data_dir())?;
-    std::fs::write(keys_path(), serde_json::to_vec_pretty(keys)?)
+    write_private(&keys_path(), &serde_json::to_vec_pretty(keys)?)
+}
+
+/// Write a file only its owner may read: the keys, the sign-in, bot tokens.
+/// On Linux and macOS a plain write leaves it readable by every account on
+/// the machine (0644), so it is made 0600, a file from before included;
+/// on Windows the user's own AppData is private already.
+pub fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        // `mode` only applies to a new file.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.write_all(bytes)
+    }
+    #[cfg(not(unix))]
+    std::fs::write(path, bytes)
 }
 
 pub fn load_keys() -> std::collections::HashMap<String, String> {
@@ -784,6 +829,8 @@ pub fn age_label(updated: u64, now: u64) -> String {
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
+    #[cfg(unix)]
+    use super::write_private;
     use super::{Conversation, Store, Todo, fill, load_listing, replay, search_in, summaries};
     use crate::chat::Message;
 
@@ -798,6 +845,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_private_file_is_readable_by_its_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("private");
+        let file = dir.join("keys.json");
+        // Written before, readable by everyone, as a plain write left it.
+        std::fs::write(&file, "{}").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_private(&file, b"{\"OpenAI\":\"sk-1\"}").unwrap();
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "{\"OpenAI\":\"sk-1\"}"
+        );
+        // And a new one starts that way.
+        let fresh = dir.join("account.json");
+        write_private(&fresh, b"{}").unwrap();
+        assert_eq!(
+            std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     fn said(role: &str, text: &str) -> Message {

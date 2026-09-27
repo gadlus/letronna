@@ -75,7 +75,7 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "/search",
-        blurb: "let the model search the web",
+        blurb: "let the model search the web; /search services for your own",
     },
     Command {
         name: "/jobs",
@@ -88,6 +88,18 @@ pub const COMMANDS: &[Command] = &[
     Command {
         name: "/resume",
         blurb: "pick up a session from before",
+    },
+    Command {
+        name: "/undo",
+        blurb: "take back the last exchange",
+    },
+    Command {
+        name: "/retry",
+        blurb: "ask your last message again",
+    },
+    Command {
+        name: "/branch",
+        blurb: "carry on in a copy of this session",
     },
     Command {
         name: "/where",
@@ -511,6 +523,14 @@ impl Bar {
         self.settle();
     }
 
+    /// Send words as though they had just been typed and entered, ahead of
+    /// anything already waiting, for a command that asks something again.
+    pub fn send_first(&mut self, text: &str) {
+        self.echo(text);
+        self.queued.push_front(text.to_owned());
+        self.settle();
+    }
+
     /// Do `work` without the screen going quiet: the waiting line in the
     /// box while it is up, a wheel printed in place when it is not.
     pub fn busy<T: Send + 'static>(
@@ -526,6 +546,31 @@ impl Bar {
         while !handle.is_finished() {
             self.pump();
         }
+        self.wait_line(false);
+        handle.join().expect("the work panicked")
+    }
+
+    /// Like `busy`, for a wait that can be given up on: escape flips `stop`,
+    /// which `work` watches, the same key that stops a reply.
+    pub fn busy_cancellable<T: Send + 'static>(
+        &mut self,
+        label: &str,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        if !self.live {
+            return crate::input::busy(label, work);
+        }
+        let handle = std::thread::spawn(work);
+        self.wait_line_about(label);
+        self.working(true);
+        while !handle.is_finished() {
+            self.pump();
+            if self.interrupted() {
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        self.working(false);
         self.wait_line(false);
         handle.join().expect("the work panicked")
     }

@@ -1,48 +1,57 @@
 use crate::prelude::*;
 
+/// The user guide on the website, opened from the account menu.
+const GUIDE: &str = "https://letronna.ai/docs";
+
 impl Chat {
     pub(crate) fn title_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         // On macOS the bar starts after the traffic lights: three 12px buttons
         // 20px apart from x=12 end at 64, so leave the same 12px gap after them
         // that the other platforms have at the edge. Fullscreen hides the lights
         // and the bar adds that 12px by itself.
-        let inset = if window.is_fullscreen() { px(0.) } else { px(76.) };
-        TitleBar::new().when(cfg!(target_os = "macos"), |bar| bar.pl(inset)).child(
-            h_flex()
-                .flex_1()
-                .items_center()
-                .gap_2()
-                // Nothing follows the chip on macOS, so keep it off the edge.
-                .when(cfg!(target_os = "macos"), |bar| bar.pr_3())
-                .child(
-                    Button::new("toggle-sidebar")
-                        .ghost()
-                        .small()
-                        .icon(
-                            Icon::new(if self.sidebar_open {
-                                IconName::PanelLeftClose
-                            } else {
-                                IconName::PanelLeftOpen
-                            })
-                            .size_4(),
-                        )
-                        .tooltip_with_action("Toggle sidebar", &ToggleSidebar, None)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.sidebar_open = !this.sidebar_open;
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    h_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .justify_center()
-                        .when(self.page == Page::Chat, |this| {
-                            this.child(self.session_title(cx))
-                        }),
-                )
-                .child(self.account_chip(cx)),
-        )
+        let inset = if window.is_fullscreen() {
+            px(0.)
+        } else {
+            px(76.)
+        };
+        TitleBar::new()
+            .when(cfg!(target_os = "macos"), |bar| bar.pl(inset))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .items_center()
+                    .gap_2()
+                    // Nothing follows the chip on macOS, so keep it off the edge.
+                    .when(cfg!(target_os = "macos"), |bar| bar.pr_3())
+                    .child(
+                        Button::new("toggle-sidebar")
+                            .ghost()
+                            .small()
+                            .icon(
+                                Icon::new(if self.sidebar_open {
+                                    IconName::PanelLeftClose
+                                } else {
+                                    IconName::PanelLeftOpen
+                                })
+                                .size_4(),
+                            )
+                            .tooltip_with_action("Toggle sidebar", &ToggleSidebar, None)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.sidebar_open = !this.sidebar_open;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .justify_center()
+                            .when(self.page == Page::Chat, |this| {
+                                this.child(self.session_title(cx))
+                            }),
+                    )
+                    .child(self.account_chip(cx)),
+            )
     }
 
     /// The open session's name, so it is clear which one this is; click
@@ -71,6 +80,13 @@ impl Chat {
             .unwrap_or_else(|| "Guest".into())
             .into();
         let signed_in = self.account.is_some();
+        // While the browser has the sign-in, the chip says so.
+        let waiting = self.sign_in_url.is_some();
+        let name: SharedString = if waiting && !signed_in {
+            "Signing in…".into()
+        } else {
+            name
+        };
         let chat = cx.entity();
         Button::new("account")
             .ghost()
@@ -114,19 +130,34 @@ impl Chat {
                                 settings.update(cx, |this, cx| this.open_settings(window, cx))
                             }),
                     )
+                    .item(
+                        PopupMenuItem::new("Guide")
+                            .icon(Icon::new(IconName::Info))
+                            .on_click(|_, _, cx| cx.open_url(GUIDE)),
+                    )
                     .separator()
                     .item(
-                        PopupMenuItem::new(if signed_in { "Sign out" } else { "Sign in" })
-                            .icon(Icon::new(IconName::CircleUser))
-                            .on_click(move |_, _, cx| {
-                                auth.update(cx, |this, cx| {
-                                    if signed_in {
-                                        this.sign_out(cx)
-                                    } else {
-                                        this.sign_in(cx)
-                                    }
-                                })
-                            }),
+                        PopupMenuItem::new(if signed_in {
+                            "Sign out"
+                        } else if waiting {
+                            "Open the sign-in page again"
+                        } else {
+                            "Sign in"
+                        })
+                        .icon(Icon::new(IconName::CircleUser))
+                        .on_click(move |_, window, cx| {
+                            auth.update(cx, |this, cx| {
+                                if signed_in {
+                                    this.sign_out(cx)
+                                } else {
+                                    // On the Account page, where the wait
+                                    // for the browser shows and can be
+                                    // cancelled or copied elsewhere.
+                                    this.open_account(window, cx);
+                                    this.sign_in(cx)
+                                }
+                            })
+                        }),
                     )
             })
     }
@@ -139,21 +170,13 @@ impl Chat {
                 "Loading every gateway's models".to_string(),
             )
         } else if let Some(e) = &self.gateway_error {
-            (
-                cx.theme().danger,
-                "error",
-                e.clone(),
-            )
+            (cx.theme().danger, "error", e.clone())
         } else {
-            (
-                cx.theme().green,
-                "ready",
-                {
-                    let mut gateways: Vec<&str> = self.models.iter().map(|(g, _)| g.as_str()).collect();
-                    gateways.dedup();
-                    format!("{} models from {}", self.models.len(), gateways.join(", "))
-                },
-            )
+            (cx.theme().green, "ready", {
+                let mut gateways: Vec<&str> = self.models.iter().map(|(g, _)| g.as_str()).collect();
+                gateways.dedup();
+                format!("{} models from {}", self.models.len(), gateways.join(", "))
+            })
         };
         Button::new("gateway")
             .ghost()
@@ -242,6 +265,7 @@ impl Chat {
             .child(self.workspace_chip(cx))
             .child(self.job_chips(cx))
             .child(div().flex_1())
+            .children(self.update_chip(cx))
             .child(concat!("v", env!("CARGO_PKG_VERSION")))
             .child(
                 div()

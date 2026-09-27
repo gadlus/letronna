@@ -10,10 +10,25 @@ mod ui;
 use prelude::*;
 
 fn main() {
+    // Asked by the updater and the release build before a new binary is
+    // trusted. First, because a release build that went on would install
+    // itself over the Letronna already there.
+    if std::env::args().any(|a| a == "--version") {
+        println!("{BRAND} {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     if std::env::args().any(|a| a == "--uninstall") {
         platform::install::uninstall();
     }
     if platform::install::ensure_installed() || !platform::install::single_instance() {
+        return;
+    }
+    // An update downloaded last time goes in now, before anything is running,
+    // and so does the old version when a new one keeps failing to start.
+    if let Some(program) = letronna_core::update::on_start() {
+        let _ = std::process::Command::new(program)
+            .arg("--relaunch")
+            .spawn();
         return;
     }
     Application::new().with_assets(Assets).run(|cx| {
@@ -45,6 +60,10 @@ fn main() {
                 gpui_component::input::Enter { secondary: true },
                 Some("Input"),
             ),
+            // On the browser's page, Tab moves through the page, not the
+            // window.
+            KeyBinding::new("tab", ui::browser::PageTab, Some("Browser")),
+            KeyBinding::new("shift-tab", ui::browser::PageTabBack, Some("Browser")),
         ]);
         platform::tray::init(cx);
         cx.on_window_closed(|cx| {
@@ -54,8 +73,10 @@ fn main() {
         })
         .detach();
         // Background jobs are children of this process; do not outlive it.
+        // Nor does a browser with no window, which nobody could close.
         cx.on_app_quit(|_| {
             letronna_core::jobs::stop_all();
+            letronna_core::browser::close_hidden();
             async {}
         })
         .detach();

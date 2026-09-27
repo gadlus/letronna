@@ -1,30 +1,66 @@
 name: Release
 
+# A v* tag builds every platform into a draft release, and stops there. The
+# draft reaches nobody: it is signed and published by hand with
+# `scripts/release.ps1 sign <tag>`, on the machine that holds the key every
+# copy of Letronna trusts. A workflow or an account that is taken over can
+# build a draft, but cannot ship it.
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  version:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # A binary that calls itself another version than its release would be
+      # offered as an update over and over.
+      - name: The tag is the version in Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME is not v$version, the version in Cargo.toml"
+            exit 1
+          fi
+
   build:
+    needs: version
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: windows-latest
             target: windows-x64
-          - os: ubuntu-latest
+            exe: .exe
+          # 22.04, not latest: a binary built there runs on the older glibc
+          # most distributions still ship.
+          - os: ubuntu-22.04
             target: linux-x64
+            exe: ""
+          - os: macos-14
+            target: macos-arm64
+            exe: ""
     runs-on: ${{ matrix.os }}
+    # Code signing runs where its secrets are set, and is skipped where they
+    # are not: the build is then unsigned, as before, and Windows SmartScreen
+    # and macOS Gatekeeper warn about it.
+    env:
+      SIGN_WINDOWS: ${{ secrets.AZURE_CLIENT_ID != '' }}
+      SIGN_MACOS: ${{ secrets.MACOS_CERTIFICATE != '' }}
     steps:
-      - uses: actions/checkout@v4
+      # Third-party actions are pinned to a commit, not a tag that can move.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+        with:
+          toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Linux build dependencies
         if: runner.os == 'Linux'
@@ -45,6 +81,63 @@ jobs:
       - name: Build
         run: cargo build --release --locked
 
+      # Azure Artifact Signing (formerly Trusted Signing): the certificate
+      # lives in Azure and never reaches the runner. Signed before packaging,
+      # so the zip and the bare binaries carry the same signed files.
+      - name: Sign (Windows)
+        if: runner.os == 'Windows' && env.SIGN_WINDOWS == 'true'
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_CERTIFICATE_PROFILE }}
+          files: |
+            ${{ github.workspace }}\target\release\letronna.exe
+            ${{ github.workspace }}\target\release\letronna-gui.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      # The Developer ID certificate goes into a keychain of this run's own,
+      # which bundle-macos.sh then signs with (MACOS_SIGN_IDENTITY).
+      - name: Signing identity (macOS)
+        if: runner.os == 'macOS' && env.SIGN_MACOS == 'true'
+        env:
+          CERT: ${{ secrets.MACOS_CERTIFICATE }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          pass=$(openssl rand -hex 16)
+          security create-keychain -p "$pass" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$pass" "$keychain"
+          echo "$CERT" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -P "$CERT_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          rm "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$pass" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          identity=$(security find-identity -v -p codesigning "$keychain" | awk -F'"' '/Developer ID Application/ {print $2; exit}')
+          [ -n "$identity" ] || { echo "::error::no Developer ID Application identity in MACOS_CERTIFICATE"; exit 1; }
+          echo "MACOS_SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+
+      # What the updater asks each new binary before it is swapped in.
+      - name: Both binaries say the tag's version
+        shell: bash
+        run: |
+          want="${GITHUB_REF_NAME#v}"
+          for bin in letronna letronna-gui; do
+            said=$(./target/release/$bin${{ matrix.exe }} --version | awk '{print $NF}')
+            if [ "$said" != "$want" ]; then
+              echo "::error::$bin says $said, not $want"
+              exit 1
+            fi
+          done
+
+      # The archives are what the install scripts unpack; the bare binaries
+      # are what the updater downloads.
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -53,38 +146,82 @@ jobs:
           # Both halves: the terminal, which runs setup, and the window it
           # installs. The install scripts expect to find both in here.
           Compress-Archive -Path target\release\letronna.exe, target\release\letronna-gui.exe, LICENSE, README.md `
-            -DestinationPath dist\letronna-${{ matrix.target }}.zip
+            -DestinationPath dist\letronna-windows-x64.zip
+          Copy-Item target\release\letronna.exe dist\letronna-windows-x64.exe
+          Copy-Item target\release\letronna-gui.exe dist\letronna-gui-windows-x64.exe
 
       - name: Package (Linux)
         if: runner.os == 'Linux'
         run: |
           mkdir -p dist
-          tar -czf dist/letronna-${{ matrix.target }}.tar.gz \
+          tar -czf dist/letronna-linux-x64.tar.gz \
             -C target/release letronna letronna-gui -C ../.. LICENSE README.md
+          cp target/release/letronna dist/letronna-linux-x64
+          cp target/release/letronna-gui dist/letronna-gui-linux-x64
 
-      - uses: actions/upload-artifact@v4
+      # The app is a disk image to drag into Applications; the terminal is the
+      # bare binary.
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          scripts/bundle-macos.sh --dmg
+          mkdir -p dist
+          cp target/letronna-macos-arm64-*.dmg dist/letronna-macos-arm64.dmg
+          cp target/release/letronna dist/letronna-macos-arm64
+          if [ -n "${MACOS_SIGN_IDENTITY-}" ]; then
+            codesign --force --options runtime --timestamp --sign "$MACOS_SIGN_IDENTITY" dist/letronna-macos-arm64
+          fi
+
+      # Apple checks the signed app and vouches for it; the ticket is stapled
+      # to the disk image, so Gatekeeper opens it without going online. The
+      # bare terminal binary is signed only: Apple cannot staple a lone file.
+      - name: Notarize (macOS)
+        if: runner.os == 'macOS' && env.SIGN_MACOS == 'true'
+        env:
+          API_KEY: ${{ secrets.APPLE_API_KEY }}
+          API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          echo "$API_KEY" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          xcrun notarytool submit dist/letronna-macos-arm64.dmg \
+            --key "$RUNNER_TEMP/notary.p8" --key-id "$API_KEY_ID" --issuer "$API_ISSUER" --wait
+          rm "$RUNNER_TEMP/notary.p8"
+          xcrun stapler staple dist/letronna-macos-arm64.dmg
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: letronna-${{ matrix.target }}
           path: dist/*
+          if-no-files-found: error
 
-  release:
+  draft:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
           merge-multiple: true
 
-      # The install scripts go up beside the archives, so the one-line
-      # commands can point at the release until letronna.ai serves them.
-      - uses: softprops/action-gh-release@v2
-        with:
-          prerelease: true
-          files: |
-            dist/*
-            scripts/install.ps1
-            scripts/install.sh
+      # A draft is invisible to the account API, which only serves published
+      # releases, and a run that is repeated replaces the draft's files.
+      - name: Draft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          files="dist/* scripts/install.ps1 scripts/install.sh"
+          if draft=$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft 2>/dev/null); then
+            if [ "$draft" != "true" ]; then
+              echo "::error::$GITHUB_REF_NAME is already published"
+              exit 1
+            fi
+            gh release upload "$GITHUB_REF_NAME" $files --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" $files --draft --verify-tag \
+              --title "Letronna ${GITHUB_REF_NAME#v}" \
+              --notes "Built by CI. Sign and publish with: scripts/release.ps1 sign $GITHUB_REF_NAME"
+          fi

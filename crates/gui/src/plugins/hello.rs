@@ -88,7 +88,13 @@ impl Plugin for Hello {
                         .items_center()
                         .justify_between()
                         .gap_3()
-                        .child(div().flex_1().min_w_0().text_sm().child("Log replies to the console"))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_sm()
+                                .child("Log replies to the console"),
+                        )
                         .child(
                             div().flex_shrink_0().cursor_pointer().child(
                                 gpui_component::switch::Switch::new("hello-log")

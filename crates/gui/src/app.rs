@@ -72,6 +72,8 @@ pub(crate) struct Chat {
     pub(crate) endpoint: Entity<InputState>,
     pub(crate) model: Entity<InputState>,
     pub(crate) key: Entity<InputState>,
+    /// Where the browser is when it is not on this computer.
+    pub(crate) browser_address: Entity<InputState>,
     /// Every model on every set-up gateway, as (gateway, model).
     pub(crate) models: Vec<(String, String)>,
     /// Which list the model menu shows: `chat`, or one of the media kinds.
@@ -104,6 +106,11 @@ pub(crate) struct Chat {
     pub(crate) signing_in: bool,
     /// A messaging token is being checked with its service.
     pub(crate) connecting: bool,
+    /// The sign-in page the browser was sent to, while the window waits on
+    /// it, so it can be opened again or copied into another browser.
+    pub(crate) sign_in_url: Option<String>,
+    /// Ends the wait for the browser at once, for the Cancel button.
+    pub(crate) sign_in_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub(crate) loading_models: bool,
     pub(crate) gateway_error: Option<String>,
     pub(crate) busy: bool,
@@ -184,7 +191,15 @@ pub(crate) struct Chat {
     /// The video playing in the chat, if one is, and its newest frame.
     pub(crate) video: Option<crate::platform::video::Playing>,
     pub(crate) video_frame: Option<std::sync::Arc<RenderImage>>,
+    /// The browser the agent uses, shown beside the chat while it does, and
+    /// the session whose browser it shows: each session has its own.
+    pub(crate) browser: Entity<crate::ui::browser::BrowserView>,
+    pub(crate) browser_for: u64,
     pub(crate) error: Option<String>,
+    /// Where updating stands, for the About page and the status bar.
+    pub(crate) updating: crate::ui::update::Updating,
+    /// A new version to announce, the next time the window draws.
+    pub(crate) update_note: Option<String>,
     pub(crate) scroll: ScrollHandle,
     /// Whether the chat keeps to its newest message as more arrives.
     pub(crate) following: bool,
@@ -199,6 +214,8 @@ impl Chat {
         // Sessions are separate files now, so a damaged one costs that
         // session rather than the history.
         let (mut store, error) = (letronna_core::store::load(), None);
+        letronna_core::browser::share_browser(store.settings.browser_shared);
+        std::thread::spawn(letronna_core::browser::close_left_over);
         if store.conversations.is_empty() {
             store.conversations.push(Conversation {
                 title: "New session".into(),
@@ -245,6 +262,16 @@ impl Chat {
                 .placeholder("API key")
                 .masked(true)
                 .default_value(saved_key)
+        });
+        let browser_address = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("wss://… or http://address:9222")
+                .masked(true)
+                .default_value(
+                    keys.get(letronna_core::browser::ELSEWHERE)
+                        .cloned()
+                        .unwrap_or_default(),
+                )
         });
         let model_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search models…"));
         let gateway_pick = cx.new(|_| store.settings.gateway.clone());
@@ -338,6 +365,8 @@ impl Chat {
             teams: Vec::new(),
             signing_in: false,
             connecting: false,
+            sign_in_url: None,
+            sign_in_cancel: None,
             loading_models: false,
             gateway_error: None,
             store,
@@ -346,6 +375,7 @@ impl Chat {
             endpoint,
             model,
             key,
+            browser_address,
             models: Vec::new(),
             model_kind: "chat",
             media_models: Vec::new(),
@@ -401,7 +431,11 @@ impl Chat {
             thinking_open: std::collections::HashSet::new(),
             video: None,
             video_frame: None,
+            browser: cx.new(|cx| crate::ui::browser::BrowserView::new(window, cx)),
+            browser_for: 0,
             error,
+            updating: Default::default(),
+            update_note: None,
             scroll: ScrollHandle::new(),
             following: true,
             followed_offset: px(0.),
@@ -413,6 +447,7 @@ impl Chat {
         this.composer
             .update(cx, |input, cx| input.focus(window, cx));
         Self::watch_schedules(cx);
+        Self::watch_updates(cx);
         this.restart_messaging(cx);
         if this.store.settings.presence == "off" {
             plugins::set_enabled(cx, plugins::DISCORD, false);
@@ -577,6 +612,7 @@ impl Chat {
             effort: self.store.settings.effort.clone(),
             search: self.store.settings.search,
             remote,
+            conversation: self.store.conversations[self.store.active].id,
         };
         if let Err(error) = backend::validate(&connection) {
             self.error = Some(error);
@@ -603,6 +639,8 @@ impl Chat {
         self.busy = true;
         self.streaming_id = Some(target_id);
         self.turn = Some(agent::Turn::new(connection));
+        // A browser closed during the last turn shows again in this one.
+        self.browser.update(cx, |view, _| view.dismissed = false);
         self.page = Page::Chat;
         let convo_title = self.store.conversations[self.store.active].title.clone();
         plugins::emit(
@@ -771,7 +809,11 @@ impl Chat {
             return;
         };
         let gate = |name: &str| self.needs_user(name);
-        match turn.next(gate) {
+        let next = turn.next(gate);
+        if let agent::Next::AskUser(call) | agent::Next::Run(call) = &next {
+            self.show_browser(&call.name, cx);
+        }
+        match next {
             agent::Next::Done => self.finish(cx),
             agent::Next::AskUser(call) => {
                 self.ask_remote(call, cx);
@@ -1356,6 +1398,12 @@ impl Chat {
 
 impl Render for Chat {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The panel shows the browser of the session on screen.
+        let on_screen = self.store.conversations[self.store.active].id;
+        if self.browser_for != on_screen {
+            self.browser_for = on_screen;
+            letronna_core::browser::show_conversation(on_screen);
+        }
         self.keep_following();
         // What a stopped or failed reply did not take goes back in the box,
         // ahead of anything typed since.
@@ -1390,6 +1438,9 @@ impl Render for Chat {
                 }
             })
             .detach();
+        }
+        if let Some(note) = self.update_note.take() {
+            window.push_notification(gpui_component::notification::Notification::info(note), cx);
         }
         if let Some(error) = self.error.take() {
             let text = error.clone();
@@ -1445,7 +1496,9 @@ impl Render for Chat {
                 crate::ui::sidebar::SIDEBAR_WIDTH
             } else {
                 px(0.)
-            };
+            }
+            // Beside the docked browser, less again.
+            - self.browser.read(cx).docked_width(window);
         let column = pane.min(COLUMN).max(px(0.));
 
         let body: AnyElement = if self.page == Page::Jobs {
@@ -1658,7 +1711,10 @@ impl Render for Chat {
                     .flex_1()
                     .min_h_0()
                     .when(self.sidebar_open, |this| this.child(self.sidebar(cx)))
-                    .child(main),
+                    .child(main)
+                    .when(self.page == Page::Chat, |row| {
+                        row.child(self.browser.clone())
+                    }),
             )
             .children(self.settings_overlay(window, cx))
             .children(Root::render_dialog_layer(window, cx))
