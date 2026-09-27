@@ -593,11 +593,20 @@ pub fn give_window(shown: bool) -> Result<(), String> {
 /// Open an address the user typed in the window, starting the browser if it
 /// is not running. The page loads in front of them; nothing waits for it.
 pub fn visit(raw: &str) -> Result<(), String> {
+    let raw = raw.trim();
+    let bare = !raw.contains("://");
+    // Typed with no scheme, this machine or one on its network by number is
+    // plain http, and anything else is tried over https first and plain
+    // http after, as a browser's own address bar does: a local server
+    // seldom has https, and a failed try would stay in the tab's history.
+    let local = bare && local_host(raw);
+    let typed = match local {
+        true => format!("http://{raw}"),
+        false => raw.to_owned(),
+    };
     // The user's own address: any key of theirs in it is theirs to send.
-    let url = address(raw, &[])?;
-    // Typed with no scheme, it is tried over https first, and plain http
-    // after, as a browser's own address bar does.
-    let plain = (!raw.contains("://")).then(|| url.replacen("https://", "http://", 1));
+    let url = address(&typed, &[])?;
+    let plain = (bare && !local).then(|| url.replacen("https://", "http://", 1));
     with_session(|session| {
         let mut opened = session.go_to(&url);
         if let (Err(_), Some(plain)) = (&opened, &plain) {
@@ -606,6 +615,18 @@ pub fn visit(raw: &str) -> Result<(), String> {
         opened.map(|_| String::new())
     })
     .map(drop)
+}
+
+/// Whether an address typed with no scheme names this machine, or a machine
+/// by its number: `localhost:3000`, `192.168.1.5`, `[::1]:8080/app`.
+fn local_host(raw: &str) -> bool {
+    let place = raw.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = match place.rsplit_once(':') {
+        Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host,
+        _ => place,
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::IpAddr>().is_ok()
 }
 
 /// Carry on in a tab the user opened from the window, as a link with a tab
@@ -1377,6 +1398,27 @@ mod tests {
         ] {
             let why = address(metadata, &[]).unwrap_err();
             assert!(why.contains("metadata"), "{metadata}: {why}");
+        }
+    }
+
+    #[test]
+    fn an_address_on_this_machine_or_by_number_is_typed_as_http() {
+        for local in [
+            "localhost:3000",
+            "127.0.0.1:8765/form.html",
+            "192.168.1.5",
+            "[::1]:8080/app",
+            "[::1]",
+        ] {
+            assert!(local_host(local), "{local}");
+        }
+        for remote in [
+            "example.com",
+            "example.com:8080/x",
+            "localhost.example.com",
+            "google.com/search?q=1:2",
+        ] {
+            assert!(!local_host(remote), "{remote}");
         }
     }
 
