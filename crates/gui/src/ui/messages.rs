@@ -1,6 +1,20 @@
 use crate::prelude::*;
 
 impl Chat {
+    /// An id for part of a message that also names its session, so state
+    /// kept by id -- a reply's parsed markdown, its fade-in -- never shows
+    /// in another session with a message at the same place.
+    pub(crate) fn row_id(&self, name: &str, index: usize) -> ElementId {
+        let session = self.store.conversations[self.store.active].id;
+        (SharedString::from(format!("{name}-{session}")), index).into()
+    }
+
+    /// Whether a thought or a tool's output is shown open, by session and
+    /// place, so opening one does not open its twin in another session.
+    fn open_key(&self, index: usize) -> (u64, usize) {
+        (self.store.conversations[self.store.active].id, index)
+    }
+
     pub(crate) fn message_row(
         &self,
         index: usize,
@@ -14,24 +28,21 @@ impl Chat {
             return self.tool_row(index, message, window, cx).into_any_element();
         }
         let is_user = message.role == "user";
-        let label: String = if is_user {
-            "You".into()
-        } else if message.model.is_empty() {
+        // A reply that only asked for tools: its tool rows say what happened.
+        let tool_only = !is_user && message.content.is_empty() && !message.tool_calls.is_empty();
+        let label: String = if message.model.is_empty() {
             self.store.settings.model.clone()
         } else {
             message.model.clone()
         };
         let leading = px(26.);
         let cx_muted = cx.theme().muted_foreground;
+        let md = self.row_id("md", index);
         let body: AnyElement = if is_user {
-            TextView::markdown(("md", index), message.content.clone(), window, cx)
-                .text(message.content.clone())
+            TextView::markdown(md, message.content.clone(), window, cx)
                 .selectable(true)
                 .line_height(leading)
                 .into_any_element()
-        } else if message.content.is_empty() && !message.tool_calls.is_empty() {
-            // A turn that only asked for tools; the tool rows below say what happened.
-            div().into_any_element()
         } else if message.content.is_empty() {
             h_flex()
                 .gap_2()
@@ -45,7 +56,7 @@ impl Chat {
                 .child("Thinking…")
                 .into_any_element()
         } else {
-            TextView::markdown(("md", index), message.content.clone(), window, cx)
+            TextView::markdown(md, message.content.clone(), window, cx)
                 .selectable(true)
                 .line_height(leading)
                 .style(gpui_component::text::TextViewStyle::default().heading_gap(gpui::rems(1.)))
@@ -73,7 +84,8 @@ impl Chat {
         v_flex()
             .w_full()
             .gap_2p5()
-            .when(labeled, |this| {
+            // Your own messages carry no label: the card says whose they are.
+            .when(labeled && !is_user, |this| {
                 this.child(
                     h_flex()
                         .items_center()
@@ -83,11 +95,7 @@ impl Chat {
                         .child(
                             div()
                                 .font_weight(FontWeight::MEDIUM)
-                                .text_color(if is_user {
-                                    cx.theme().muted_foreground
-                                } else {
-                                    cx.theme().primary
-                                })
+                                .text_color(cx.theme().primary)
                                 .child(label),
                         )
                         .when(streaming, |this| {
@@ -121,7 +129,25 @@ impl Chat {
             // column for some documents (lists after a wrapped paragraph),
             // which pushes the whole chat past the composer. Clipping here
             // clamps it; min_w_0 would instead collapse list layout.
-            .child(div().w_full().overflow_hidden().pb_1().child(body))
+            .when(!tool_only, |this| {
+                this.child(
+                    div()
+                        .w_full()
+                        .overflow_hidden()
+                        .pb_1()
+                        // Your prompt sits in a card, so a long exchange
+                        // reads as turns rather than one run of text.
+                        .when(is_user, |card| {
+                            card.px_4()
+                                .py_3()
+                                .rounded(cx.theme().radius_lg)
+                                .bg(cx.theme().secondary.opacity(0.5))
+                                .border_1()
+                                .border_color(cx.theme().border)
+                        })
+                        .child(body),
+                )
+            })
             // A reply is often wanted whole, and selecting it across
             // paragraphs and code blocks is fiddly.
             .when(
@@ -147,7 +173,7 @@ impl Chat {
                 },
             )
             .with_animation(
-                ("appear", index),
+                self.row_id("appear", index),
                 Animation::new(std::time::Duration::from_millis(260))
                     .with_easing(gpui::ease_out_quint()),
                 |el, delta| el.opacity(delta).mt(px(10. * (1. - delta))),
@@ -163,7 +189,8 @@ impl Chat {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let open = self.thinking_open.contains(&index);
+        let key = self.open_key(index);
+        let open = self.thinking_open.contains(&key);
         let summary = letronna_core::tools::summary(&message.name, &message.args);
         let lines = message.content.lines().count();
         let content = message.content.clone();
@@ -186,7 +213,12 @@ impl Chat {
                 cx.theme().muted_foreground,
             )
         } else {
-            (format!("{lines} lines"), cx.theme().muted_foreground)
+            let count = if lines == 1 {
+                "1 line".to_owned()
+            } else {
+                format!("{lines} lines")
+            };
+            (count, cx.theme().muted_foreground)
         };
         v_flex()
             .w_full()
@@ -233,8 +265,8 @@ impl Chat {
                     )
                     .child(div().min_w_0().text_color(color).truncate().child(status))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if !this.thinking_open.remove(&index) {
-                            this.thinking_open.insert(index);
+                        if !this.thinking_open.remove(&key) {
+                            this.thinking_open.insert(key);
                         }
                         cx.notify();
                     })),
@@ -272,7 +304,8 @@ impl Chat {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let open = streaming || self.thinking_open.contains(&index);
+        let key = self.open_key(index);
+        let open = streaming || self.thinking_open.contains(&key);
         let reasoning = message.reasoning.clone();
         v_flex()
             .w_full()
@@ -304,10 +337,8 @@ impl Chat {
                         "Thought process"
                     })
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if this.thinking_open.contains(&index) {
-                            this.thinking_open.remove(&index);
-                        } else {
-                            this.thinking_open.insert(index);
+                        if !this.thinking_open.remove(&key) {
+                            this.thinking_open.insert(key);
                         }
                         cx.notify();
                     })),
@@ -322,7 +353,7 @@ impl Chat {
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
                         .child(
-                            TextView::markdown(("reason", index), reasoning, window, cx)
+                            TextView::markdown(self.row_id("reason", index), reasoning, window, cx)
                                 .selectable(true)
                                 .line_height(px(21.)),
                         ),

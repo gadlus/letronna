@@ -1,5 +1,9 @@
 use crate::prelude::*;
 
+/// The sidebar's width, its border included, which the chat column is
+/// sized from.
+pub(crate) const SIDEBAR_WIDTH: Pixels = px(250.);
+
 impl Chat {
     pub(crate) fn nav_item(
         &self,
@@ -169,7 +173,7 @@ impl Chat {
         }
 
         v_flex()
-            .w(px(250.))
+            .w(SIDEBAR_WIDTH)
             .h_full()
             .flex_shrink_0()
             .bg(cx.theme().sidebar)

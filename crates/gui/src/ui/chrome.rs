@@ -32,9 +32,33 @@ impl Chat {
                             cx.notify();
                         })),
                 )
-                .child(div().flex_1())
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .justify_center()
+                        .when(self.page == Page::Chat, |this| {
+                            this.child(self.session_title(cx))
+                        }),
+                )
                 .child(self.account_chip(cx)),
         )
+    }
+
+    /// The open session's name, so it is clear which one this is; click
+    /// to rename it.
+    fn session_title(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let index = self.store.active;
+        let title = self.store.conversations[index].title.clone();
+        Button::new("session-title")
+            .ghost()
+            .xsmall()
+            .tooltip("Rename")
+            .text_color(cx.theme().muted_foreground)
+            .child(div().max_w(px(420.)).truncate().child(title))
+            .on_click(
+                cx.listener(move |this, _, window, cx| this.rename_session(index, window, cx)),
+            )
     }
 
     fn account_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {

@@ -17,6 +17,11 @@ actions!(letronna, [NewSession, Dismiss, ToggleSidebar, OpenSettings]);
 /// that grew a little since the last look is still followed.
 const FOLLOW_SLACK: Pixels = px(48.);
 
+/// The chat column's widest, gutters included: about 90 characters of
+/// text, which reads as one measure. A wider window gets wider margins
+/// rather than longer lines.
+const COLUMN: Pixels = px(816.);
+
 pub(crate) enum Verdict {
     Allow {
         remember: bool,
@@ -162,7 +167,8 @@ pub(crate) struct Chat {
     pub(crate) editing_skill: Option<u64>,
     pub(crate) skill_name: Entity<InputState>,
     pub(crate) skill_prompt: Entity<InputState>,
-    pub(crate) thinking_open: std::collections::HashSet<usize>,
+    /// Thoughts and tool outputs shown open, by session id and place.
+    pub(crate) thinking_open: std::collections::HashSet<(u64, usize)>,
     /// The video playing in the chat, if one is, and its newest frame.
     pub(crate) video: Option<crate::platform::video::Playing>,
     pub(crate) video_frame: Option<std::sync::Arc<RenderImage>>,
@@ -1289,10 +1295,18 @@ impl Render for Chat {
         let conversation = &self.store.conversations[active];
         // Only the session the reply was sent from shows the live row.
         let streaming_here = self.busy && self.streaming_id == Some(conversation.id);
-        // The chat column stays narrower than the pane beside the sidebar, but
-        // only while the pane is wide enough that the composer keeps room to
-        // type; at the minimum window size the cap is dropped.
-        let narrow_column = self.sidebar_open && window.viewport_size().width >= px(960.);
+        // The column is given a width outright, from the window's, rather
+        // than a maximum: the markdown renderer reports an intrinsic width
+        // that beats a max width and drags the chat past the composer, but
+        // it cannot push back on a definite one. Worked out here, not by
+        // measuring the pane, so a resize does not lag a frame behind.
+        let pane = window.viewport_size().width
+            - if self.sidebar_open {
+                crate::ui::sidebar::SIDEBAR_WIDTH
+            } else {
+                px(0.)
+            };
+        let column = pane.min(COLUMN).max(px(0.));
 
         let body: AnyElement = if self.page == Page::Jobs {
             self.schedules_page(cx).into_any_element()
@@ -1318,6 +1332,19 @@ impl Render for Chat {
                 }
                 let labeled = is_user || !assistant_turn;
                 assistant_turn = !is_user;
+                // A reply that only asked for tools has nothing to show of
+                // its own; the tool rows speak for it. Kept only when it
+                // carries the turn's label or visible thinking, so it adds
+                // no empty gap.
+                let thinking = self.store.settings.thinking && !m.reasoning.is_empty();
+                if m.role == "assistant"
+                    && m.content.is_empty()
+                    && !m.tool_calls.is_empty()
+                    && !labeled
+                    && !thinking
+                {
+                    continue;
+                }
                 turns
                     .last_mut()
                     .unwrap()
@@ -1345,8 +1372,11 @@ impl Render for Chat {
                     cached_tokens: turn.live.cached_tokens,
                     ..Default::default()
                 }) {
+                    // Keyed by the place the reply will have once it is
+                    // stored, so finishing does not start its markdown or
+                    // its fade-in over again.
                     rows_here.push(self.message_row(
-                        usize::MAX,
+                        conversation.messages.len(),
                         &live,
                         !assistant_turn,
                         true,
@@ -1366,28 +1396,32 @@ impl Render for Chat {
                 .map(|turn| v_flex().w_full().gap_3().children(turn).into_any_element())
                 .collect();
             // The scrollbar must sit outside the scrolling element, or it
-            // scrolls away with the content.
+            // scrolls away with the content. The scrolling box spans the
+            // pane, so the bar is at its edge and the wheel works over the
+            // margins too; only the column inside it is narrow.
             div()
                 .relative()
                 .flex_1()
                 .min_h_0()
-                // Constrain the scroll area itself rather than the column
-                // inside it. A max width on the inner column loses to the
-                // markdown renderer's intrinsic width, which then drags the
-                // whole chat wider than the composer. Here min_w_0 pins this
-                // box to 82%, so everything inside inherits a definite width
-                // and cannot push back.
                 .min_w_0()
                 .w_full()
-                .when(narrow_column, |d| d.max_w(relative(0.82)))
-                .mx_auto()
                 .child(
                     div()
                         .id("messages")
                         .size_full()
                         .overflow_y_scroll()
                         .track_scroll(&self.scroll)
-                        .child(v_flex().w_full().px_6().py_6().gap_6().children(rows)),
+                        .child(
+                            h_flex().w_full().justify_center().child(
+                                v_flex()
+                                    .w(column)
+                                    .flex_shrink_0()
+                                    .px_6()
+                                    .py_6()
+                                    .gap_6()
+                                    .children(rows),
+                            ),
+                        ),
                 )
                 .vertical_scrollbar(&self.scroll)
                 .children(self.jump_to_latest(cx))
@@ -1403,8 +1437,7 @@ impl Render for Chat {
             .when(self.page == Page::Chat, |this| {
                 this.child(
                     v_flex()
-                        .w_full()
-                        .when(narrow_column, |d| d.max_w(relative(0.82)))
+                        .w(column)
                         .mx_auto()
                         .px_6()
                         .pb_2()
