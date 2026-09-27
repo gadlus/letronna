@@ -283,12 +283,19 @@ pub fn sign_in(runner: &mut Runner) {
         "Opening your browser. Come back when it is done.",
     ));
     render::line(&render::dim(&pending.url));
+    // The link opens in the system's default browser, which may not be the
+    // one in use; a sign-in carried across part way fails, so say so now.
+    render::line(&render::dim(
+        "Not your usual browser? Paste the link into the one you use.",
+    ));
     open_in_browser(&pending.url);
 
-    match runner
-        .bar
-        .busy("waiting for the browser", move || pending.finish())
-    {
+    let stop = pending.cancel();
+    match runner.bar.busy_cancellable(
+        "waiting for the browser · esc to cancel",
+        stop,
+        move || pending.finish(),
+    ) {
         Ok(account) => {
             render::said(&render::blue("›"), &render::bold(&account.name));
             let plan = account.plan_name();
@@ -298,6 +305,8 @@ pub fn sign_in(runner: &mut Runner) {
                 format!("Signed in · {plan} · {} credit", account.credit())
             }));
         }
+        // Given up on with escape: what was asked for, not a failure.
+        Err(error) if error == "Sign-in cancelled." => render::line(&render::dim(&error)),
         Err(error) => render::line(&render::red(&error)),
     }
 }

@@ -91,6 +91,11 @@ pub(crate) struct Chat {
     /// The teams the account is in, for the Account page's billing choice.
     pub(crate) teams: Vec<letronna_core::auth::Team>,
     pub(crate) signing_in: bool,
+    /// The sign-in page the browser was sent to, while the window waits on
+    /// it, so it can be opened again or copied into another browser.
+    pub(crate) sign_in_url: Option<String>,
+    /// Ends the wait for the browser at once, for the Cancel button.
+    pub(crate) sign_in_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub(crate) loading_models: bool,
     pub(crate) gateway_error: Option<String>,
     pub(crate) busy: bool,
@@ -287,6 +292,8 @@ impl Chat {
             account_note: None,
             teams: Vec::new(),
             signing_in: false,
+            sign_in_url: None,
+            sign_in_cancel: None,
             loading_models: false,
             gateway_error: None,
             store,

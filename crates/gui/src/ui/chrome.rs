@@ -46,6 +46,13 @@ impl Chat {
             .unwrap_or_else(|| "Guest".into())
             .into();
         let signed_in = self.account.is_some();
+        // While the browser has the sign-in, the chip says so.
+        let waiting = self.sign_in_url.is_some();
+        let name: SharedString = if waiting && !signed_in {
+            "Signing in…".into()
+        } else {
+            name
+        };
         let chat = cx.entity();
         Button::new("account")
             .ghost()
@@ -91,17 +98,27 @@ impl Chat {
                     )
                     .separator()
                     .item(
-                        PopupMenuItem::new(if signed_in { "Sign out" } else { "Sign in" })
-                            .icon(Icon::new(IconName::CircleUser))
-                            .on_click(move |_, _, cx| {
-                                auth.update(cx, |this, cx| {
-                                    if signed_in {
-                                        this.sign_out(cx)
-                                    } else {
-                                        this.sign_in(cx)
-                                    }
-                                })
-                            }),
+                        PopupMenuItem::new(if signed_in {
+                            "Sign out"
+                        } else if waiting {
+                            "Open the sign-in page again"
+                        } else {
+                            "Sign in"
+                        })
+                        .icon(Icon::new(IconName::CircleUser))
+                        .on_click(move |_, window, cx| {
+                            auth.update(cx, |this, cx| {
+                                if signed_in {
+                                    this.sign_out(cx)
+                                } else {
+                                    // On the Account page, where the wait
+                                    // for the browser shows and can be
+                                    // cancelled or copied elsewhere.
+                                    this.open_account(window, cx);
+                                    this.sign_in(cx)
+                                }
+                            })
+                        }),
                     )
             })
     }
