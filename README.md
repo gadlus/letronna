@@ -83,6 +83,19 @@ The Letronna gateway's address follows `LETRONNA_API`, for working against a loc
 
 Model lists come from `GET {base}/models`. Streaming uses SSE chat completions.
 
+## Web search
+
+The Web toggle is the gateway's own search, and only some gateways have one. A search service of your own works with any of them: set one up in Settings under Search, or with `/search services` in the terminal, and the agent gets a `search_web` tool that asks before each search.
+
+| Service  | Official address                                  | Needs               |
+|----------|---------------------------------------------------|---------------------|
+| Brave    | `https://api.search.brave.com/res/v1/web/search`  | an API key          |
+| Tavily   | `https://api.tavily.com/search`                   | an API key          |
+| Exa      | `https://api.exa.ai/search`                       | an API key          |
+| SearXNG  | your own server, such as `http://mac-mini:8888`   | its json format on  |
+
+The one set up last is used. Each is reached at its official address unless you give another, such as a proxy; Reset, or `official` in the terminal, goes back to it. A SearXNG answers searches from Letronna only with `json` among the `formats` in its `settings.yml`. Keys stay in `keys.json` with the gateways'.
+
 ## Images, speech and video
 
 Signed in, the agent can also make things on Letronna's hosted models, whichever gateway the chat itself uses:
@@ -121,6 +134,7 @@ The window shows the browser beside the chat, live, while the agent uses it or o
 - `SOUL.md` who Letronna is, in your words; replaces the built-in first line of the prompt (optional, yours to write)
 - `USER.md` what Letronna knows about you, and `MEMORY.md` its own notes; it keeps both with its `memory` tool, and you can edit them. Both go into every conversation except chats other people can read, so they stay small (1,375 and 2,200 characters)
 - `mcp.json` MCP servers whose tools Letronna may use (optional, see below)
+- `search.json` the search service in use, and any address given for one
 - `media/` images, speech and video made with no project attached, and browser screenshots
 - `browser/` the browser's own profile: delete it to sign out of everything there
 

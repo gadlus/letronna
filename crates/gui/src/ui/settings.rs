@@ -5,6 +5,7 @@ type ApplyMode = std::rc::Rc<dyn Fn(plugins::PresenceMode, &mut App)>;
 const PAGES: &[(&str, AppIcon)] = &[
     ("Account", AppIcon::User),
     ("Gateways", AppIcon::Plugs),
+    ("Search", AppIcon::Search),
     ("Model", AppIcon::Robot),
     ("Appearance", AppIcon::Palette),
     ("Thinking", AppIcon::Sparkles),
@@ -88,6 +89,101 @@ impl Chat {
             cx.notify();
         });
         self.load_models(window, cx);
+    }
+
+    /// Open a search service's row to set it up, or close it if it is open.
+    /// It shares the gateways' fields: one row is open at a time.
+    pub(crate) fn select_search(
+        &mut self,
+        name: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let row = format!("search:{name}");
+        let open = *self.gateway_pick.read(cx) == row;
+        self.gateway_pick.update(cx, |g, cx| {
+            *g = if open { String::new() } else { row };
+            cx.notify();
+        });
+        let Some(service) = letronna_core::search::service(name).filter(|_| !open) else {
+            return;
+        };
+        let address = letronna_core::search::choice().address(service);
+        self.endpoint
+            .update(cx, |input, cx| input.set_value(address, window, cx));
+        let key = self.keys.get(name).cloned().unwrap_or_default();
+        self.key
+            .update(cx, |input, cx| input.set_value(key, window, cx));
+        cx.notify();
+    }
+
+    /// Put the open search row's address back to the service's official one.
+    pub(crate) fn reset_search_address(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let open = self.gateway_pick.read(cx).clone();
+        let Some(service) = open
+            .strip_prefix("search:")
+            .and_then(letronna_core::search::service)
+        else {
+            return;
+        };
+        self.endpoint.update(cx, |input, cx| {
+            input.set_value(service.official, window, cx)
+        });
+    }
+
+    /// Save the open search row's key and address, and search with it from now on.
+    pub(crate) fn save_search(&mut self, cx: &mut Context<Self>) {
+        let open = self.gateway_pick.read(cx).clone();
+        let Some(service) = open
+            .strip_prefix("search:")
+            .and_then(letronna_core::search::service)
+        else {
+            return;
+        };
+        let mut choice = letronna_core::search::choice();
+        choice.set_address(service, self.endpoint.read(cx).value().as_ref());
+        if !service.self_hosted() {
+            let key = self.key.read(cx).value().trim().to_string();
+            if key.is_empty() {
+                self.keys.remove(service.name);
+            } else {
+                self.keys.insert(service.name.to_owned(), key);
+            }
+            self.write_keys();
+        }
+        choice.service = service.name.to_owned();
+        if let Err(error) = letronna_core::search::choose(&choice) {
+            self.error = Some(error);
+        }
+        self.gateway_pick.update(cx, |g, cx| {
+            g.clear();
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// Forget a search service's key and address; if it was the one in use,
+    /// the agent no longer searches.
+    pub(crate) fn remove_search(&mut self, name: &str, cx: &mut Context<Self>) {
+        let Some(service) = letronna_core::search::service(name) else {
+            return;
+        };
+        let mut choice = letronna_core::search::choice();
+        choice.set_address(service, "");
+        if self.keys.remove(name).is_some() {
+            self.write_keys();
+        }
+        if choice.service == name {
+            choice.service.clear();
+        }
+        if let Err(error) = letronna_core::search::choose(&choice) {
+            self.error = Some(error);
+        }
+        self.gateway_pick.update(cx, |g, cx| {
+            g.clear();
+            cx.notify();
+        });
+        cx.notify();
     }
 
     /// The Model page's Save: the default model.
@@ -270,6 +366,8 @@ impl Chat {
             "Thinking" => thinking_page(&chat, &self.store.settings, cx).into_any_element(),
             "Plugins" => plugins_page(&chat, cx).into_any_element(),
             "About" => about_page(&chat, self, cx).into_any_element(),
+            "Search" => search_page(self.search_rows(), &pick, &endpoint, &key, &chat, cx)
+                .into_any_element(),
             _ => gateway_page(self.gateway_rows(), &pick, &endpoint, &key, &page, &chat, cx).into_any_element(),
         };
         div()
@@ -974,6 +1072,200 @@ impl Chat {
             })
             .collect()
     }
+}
+
+/// One search service as the settings list shows it.
+pub(crate) struct SearchRow {
+    name: &'static str,
+    blurb: &'static str,
+    status: &'static str,
+    good: bool,
+    set_up: bool,
+    self_hosted: bool,
+}
+
+impl Chat {
+    /// Every search service with where it stands now.
+    pub(crate) fn search_rows(&self) -> Vec<SearchRow> {
+        let choice = letronna_core::search::choice();
+        letronna_core::search::SERVICES
+            .iter()
+            .map(|s| {
+                let (status, good, set_up) =
+                    letronna_core::search::status(s.name, &choice, &self.keys);
+                SearchRow {
+                    name: s.name,
+                    blurb: s.blurb,
+                    status,
+                    good,
+                    set_up,
+                    self_hosted: s.self_hosted(),
+                }
+            })
+            .collect()
+    }
+}
+
+fn search_page(
+    rows: Vec<SearchRow>,
+    pick: &Entity<String>,
+    endpoint: &Entity<InputState>,
+    key: &Entity<InputState>,
+    chat: &Entity<Chat>,
+    cx: &App,
+) -> Div {
+    let open = pick.read(cx).clone();
+    let mut list = v_flex()
+        .border_1()
+        .border_color(cx.theme().border)
+        .rounded(cx.theme().radius);
+    for (i, row) in rows.into_iter().enumerate() {
+        let name = row.name;
+        let editing = open.strip_prefix("search:") == Some(name);
+        let dot = if row.good {
+            cx.theme().green
+        } else {
+            cx.theme().muted_foreground.opacity(0.5)
+        };
+        let action = match (row.set_up, row.self_hosted) {
+            (true, _) => "Edit",
+            (false, true) => "Add address",
+            (false, false) => "Add key",
+        };
+        let button = {
+            let chat = chat.clone();
+            Button::new(("search-action", i))
+                .small()
+                .when(!row.set_up, |b| b.primary())
+                .when(row.set_up, |b| b.ghost())
+                .label(if editing { "Close" } else { action })
+                .on_click(move |_, window, cx| {
+                    chat.update(cx, |this, cx| this.select_search(name, window, cx))
+                })
+        };
+        let head = h_flex()
+            .px_4()
+            .py_3()
+            .gap_4()
+            .items_center()
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_family(HEADING_FONT)
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(name),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(row.blurb),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .flex_shrink_0()
+                    .child(div().size(px(7.)).rounded_full().bg(dot))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(if row.good {
+                                cx.theme().foreground
+                            } else {
+                                cx.theme().muted_foreground
+                            })
+                            .child(row.status),
+                    ),
+            )
+            .child(div().w(px(96.)).flex().justify_end().child(button));
+        let mut item = v_flex()
+            .when(i > 0, |d| d.border_t_1().border_color(cx.theme().border))
+            .child(head);
+        if editing {
+            let (save, remove, reset) = (chat.clone(), chat.clone(), chat.clone());
+            // A service's address starts as its official one; SearXNG has
+            // none to go back to.
+            let address = match row.self_hosted {
+                true => v_flex()
+                    .gap_1()
+                    .child(label("Address, like http://mac-mini:8888", cx))
+                    .child(Input::new(endpoint)),
+                false => v_flex().gap_1().child(label("Address", cx)).child(
+                    h_flex()
+                        .gap_2()
+                        .child(div().flex_1().child(Input::new(endpoint)))
+                        .child(
+                            Button::new("search-reset")
+                                .ghost()
+                                .small()
+                                .label("Reset")
+                                .on_click(move |_, window, cx| {
+                                    reset.update(cx, |this, cx| {
+                                        this.reset_search_address(window, cx)
+                                    })
+                                }),
+                        ),
+                ),
+            };
+            item = item.child(
+                v_flex()
+                    .px_4()
+                    .pb_4()
+                    .gap_3()
+                    .when(!row.self_hosted, |d| {
+                        d.child(
+                            v_flex()
+                                .gap_1()
+                                .child(label("API key", cx))
+                                .child(Input::new(key)),
+                        )
+                    })
+                    .child(address)
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .when(row.set_up, |d| {
+                                d.child(
+                                    Button::new("search-remove")
+                                        .ghost()
+                                        .small()
+                                        .label("Remove")
+                                        .on_click(move |_, _, cx| {
+                                            remove
+                                                .update(cx, |this, cx| this.remove_search(name, cx))
+                                        }),
+                                )
+                            })
+                            .child(
+                                Button::new("search-save")
+                                    .primary()
+                                    .small()
+                                    .label("Save and use")
+                                    .on_click(move |_, _, cx| {
+                                        save.update(cx, |this, cx| this.save_search(cx))
+                                    }),
+                            ),
+                    ),
+            );
+        }
+        list = list.child(item);
+    }
+    v_flex()
+        .gap_5()
+        .child(heading(
+            "Search",
+            "A search service of your own, which the agent searches the web with, asking you before each search. The one saved last is used, at its official address unless you give another. Keys stay in keys.json on this machine; the Web toggle is the gateway's own search, where it has one.",
+            cx,
+        ))
+        .child(list)
 }
 
 fn gateway_page(

@@ -453,6 +453,7 @@ fn intent(name: &str, summary: &str) -> String {
         "edit_file" => format!("edit {summary}"),
         "run_command" => "run a command".to_owned(),
         "browse" | "use_page" => summary.to_owned(),
+        "search_web" => "search the web".to_owned(),
         other => format!("use {other}"),
     }
 }

@@ -20,6 +20,7 @@ pub mod memory;
 pub mod messaging;
 mod page;
 pub mod schedule;
+pub mod search;
 pub mod skills;
 pub mod store;
 pub mod tools;

@@ -75,7 +75,7 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "/search",
-        blurb: "let the model search the web",
+        blurb: "let the model search the web; /search services for your own",
     },
     Command {
         name: "/jobs",
