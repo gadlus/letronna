@@ -96,7 +96,10 @@ fn main() {
 
     // One question, one answer, no banner: this form gets piped.
     if let Some(prompt) = args.prompt {
-        match runner.ask(session, &prompt) {
+        let asked = runner.ask(session, &prompt);
+        // A browser with no window would outlive this run unseen.
+        letronna_core::browser::close_hidden();
+        match asked {
             Ok(_) => runner.persist(),
             Err(error) => {
                 render::line(&render::red(&error));
@@ -155,6 +158,7 @@ fn main() {
         }
     }
     runner.bar.uninstall();
+    letronna_core::browser::close_hidden();
     render::title("");
     render::blank();
 }

@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// How a result names the file it saved; see `saved`.
-const SAVED: &str = "Saved to ";
+pub(crate) const SAVED: &str = "Saved to ";
 /// An image or a long reading can take minutes, and the API holds the reply
 /// open until it is done.
 const MAKE_TIME: Duration = Duration::from_secs(300);
@@ -502,7 +502,12 @@ fn card(what: String, args: &Value, kind: &str) -> String {
 }
 
 /// Save what was made under `media/`, named after what it shows and when.
-fn save(ctx: &ToolContext, about: &str, extension: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+pub(crate) fn save(
+    ctx: &ToolContext,
+    about: &str,
+    extension: &str,
+    bytes: &[u8],
+) -> Result<PathBuf, String> {
     let dir = ctx
         .workspace
         .clone()
@@ -637,7 +642,7 @@ fn size(bytes: usize) -> String {
 
 /// Standard base64, as images come back from the API. Decoding it is a dozen
 /// lines, and it would be the only use of a crate for it.
-fn base64(text: &str) -> Option<Vec<u8>> {
+pub(crate) fn base64(text: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(text.len() / 4 * 3);
     let (mut buffer, mut bits) = (0u32, 0);
     for byte in text.bytes() {
@@ -661,6 +666,35 @@ fn base64(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// An image file as a `data:` address, which is how a chat request carries
+/// a picture. None when the file cannot be read.
+pub(crate) fn data_url(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let kind = match image_extension(&bytes) {
+        "jpg" => "jpeg",
+        other => other,
+    };
+    Some(format!("data:image/{kind};base64,{}", to_base64(&bytes)))
+}
+
+/// Standard base64 the other way, for pictures sent to a model.
+fn to_base64(bytes: &[u8]) -> String {
+    const LETTERS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let group = chunk.iter().enumerate().fold(0u32, |group, (at, byte)| {
+            group | u32::from(*byte) << (16 - 8 * at)
+        });
+        for at in 0..4 {
+            match at <= chunk.len() {
+                true => out.push(LETTERS[(group >> (18 - 6 * at)) as usize & 63] as char),
+                false => out.push('='),
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -678,6 +712,26 @@ mod tests {
         let encoded = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/w==";
         assert_eq!(base64(encoded).unwrap(), all);
         assert!(base64("not base64!").is_none());
+    }
+
+    #[test]
+    fn base64_goes_back_the_way_it_came() {
+        for bytes in [&b""[..], b"a", b"ab", b"abc", b"hello world"] {
+            assert_eq!(base64(&to_base64(bytes)).unwrap(), bytes);
+        }
+        assert_eq!(to_base64(b"hello"), "aGVsbG8=");
+        let all: Vec<u8> = (0..=255).collect();
+        assert_eq!(base64(&to_base64(&all)).unwrap(), all);
+        let dir = std::env::temp_dir().join(format!("letronna-data-url-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let picture = dir.join("shot.jpg");
+        std::fs::write(&picture, [0xFF, 0xD8, 0xFF, 0xE0]).unwrap();
+        assert_eq!(
+            data_url(&picture).unwrap(),
+            "data:image/jpeg;base64,/9j/4A=="
+        );
+        assert_eq!(data_url(&dir.join("gone.jpg")), None);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

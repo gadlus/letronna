@@ -126,6 +126,8 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(crate::media::Speak),
         Arc::new(crate::media::Transcribe),
         Arc::new(crate::media::MakeVideo),
+        Arc::new(crate::browser::Browse),
+        Arc::new(crate::browser::UsePage),
     ];
     if let Ok(extra) = plugin_tools().lock() {
         for tool in extra.iter() {
@@ -253,6 +255,7 @@ pub fn summary(name: &str, args: &str) -> String {
             .unwrap_or_default()
             .to_owned(),
         "speak" => v["text"].as_str().unwrap_or_default().to_owned(),
+        crate::browser::BROWSE | "use_page" => crate::browser::summary(&v),
         TODO => {
             let items = v["items"].as_array().map(Vec::len).unwrap_or(0);
             format!("{items} items")

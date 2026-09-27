@@ -113,6 +113,7 @@ impl Chat {
             "write_file" => format!("Letronna wants to write {summary}"),
             "edit_file" => format!("Letronna wants to edit {summary}"),
             "run_command" => "Letronna wants to run a command".to_owned(),
+            "browse" | "use_page" => format!("Letronna wants to {summary}"),
             other => format!("Letronna wants to use {other}"),
         };
         let preview = tools::preview(&call.name, &call.arguments, &ctx);

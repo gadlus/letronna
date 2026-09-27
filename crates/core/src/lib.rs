@@ -8,6 +8,8 @@
 
 pub mod agent;
 pub mod auth;
+pub mod browser;
+mod cdp;
 pub mod chat;
 pub mod compact;
 pub mod gateway;
@@ -16,6 +18,7 @@ pub mod mcp;
 pub mod media;
 pub mod memory;
 pub mod messaging;
+mod page;
 pub mod schedule;
 pub mod skills;
 pub mod store;
