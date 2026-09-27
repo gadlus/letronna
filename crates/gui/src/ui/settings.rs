@@ -263,8 +263,9 @@ impl Chat {
                 cx,
             )
             .into_any_element(),
-            "Privacy" => privacy_page(&chat, &presence, self.store.settings.skip_approvals, cx)
-                .into_any_element(),
+            "Privacy" => {
+                privacy_page(&chat, &presence, &self.store.settings, cx).into_any_element()
+            }
             "Account" => super::account::account_page(&chat, self, cx).into_any_element(),
             "Thinking" => thinking_page(&chat, &self.store.settings, cx).into_any_element(),
             "Plugins" => plugins_page(&chat, cx).into_any_element(),
@@ -426,7 +427,14 @@ pub(crate) fn label(text: &'static str, cx: &App) -> Div {
         .child(text)
 }
 
-fn privacy_page(chat: &Entity<Chat>, presence: &Entity<String>, skip: bool, cx: &App) -> Div {
+fn privacy_page(
+    chat: &Entity<Chat>,
+    presence: &Entity<String>,
+    settings: &Settings,
+    cx: &App,
+) -> Div {
+    let (skip, shared) = (settings.skip_approvals, settings.browser_shared);
+    let unseen = settings.browse_unseen;
     let current = plugins::PresenceMode::from_str(presence.read(cx));
     let enabled = plugins::list(cx)
         .iter()
@@ -544,6 +552,91 @@ fn privacy_page(chat: &Entity<Chat>, presence: &Entity<String>, skip: bool, cx: 
             ),
         );
 
+    let browser = h_flex()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .px_3()
+        .py_2p5()
+        .rounded(cx.theme().radius)
+        .bg(cx.theme().secondary.opacity(0.3))
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_0p5()
+                .child(div().text_sm().child("One browser for every session"))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(
+                            "Share the sign-ins and pages of one browser, remembered between \
+                             runs. Off, each session gets a private one, forgotten when Letronna \
+                             quits.",
+                        ),
+                ),
+        )
+        .child(
+            div().flex_shrink_0().cursor_pointer().child(
+                gpui_component::switch::Switch::new("browser-shared")
+                    .checked(shared)
+                    .on_click({
+                        let chat = chat.clone();
+                        move |_, _, cx| {
+                            chat.update(cx, |this, cx| {
+                                this.store.settings.browser_shared = !shared;
+                                this.save();
+                                letronna_core::browser::share_browser(!shared);
+                                cx.notify();
+                            })
+                        }
+                    }),
+            ),
+        );
+
+    let seen = h_flex()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .px_3()
+        .py_2p5()
+        .rounded(cx.theme().radius)
+        .bg(cx.theme().secondary.opacity(0.3))
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_0p5()
+                .child(div().text_sm().child("Show the page as the agent browses"))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(
+                            "The browser opens beside the chat when the agent uses it. Off, the \
+                             agent browses unseen, lighter on memory; open the browser from the \
+                             menu to look.",
+                        ),
+                ),
+        )
+        .child(
+            div().flex_shrink_0().cursor_pointer().child(
+                gpui_component::switch::Switch::new("browser-seen")
+                    .checked(!unseen)
+                    .on_click({
+                        let chat = chat.clone();
+                        move |_, _, cx| {
+                            chat.update(cx, |this, cx| {
+                                this.store.settings.browse_unseen = !unseen;
+                                this.save();
+                                cx.notify();
+                            })
+                        }
+                    }),
+            ),
+        );
+
     v_flex()
         .gap_4()
         .child(heading(
@@ -552,6 +645,13 @@ fn privacy_page(chat: &Entity<Chat>, presence: &Entity<String>, skip: bool, cx: 
             cx,
         ))
         .child(approvals)
+        .child(heading(
+            "Browser",
+            "Each session browses in a browser of its own, as a separate agent would.",
+            cx,
+        ))
+        .child(browser)
+        .child(seen)
         .child(heading(
             "Discord Rich Presence",
             "What Letronna shares with Discord. The integration is turned on or off in the Plugins tab.",

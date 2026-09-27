@@ -86,6 +86,8 @@ pub struct Connection {
     pub search: bool,
     /// Set when a chat app is driving the session rather than this window.
     pub remote: Option<Remote>,
+    /// The session's id: each keeps a browser of its own.
+    pub conversation: u64,
 }
 
 /// Where a remote conversation is happening, and what that allows.
@@ -790,6 +792,7 @@ mod tests {
             remote: None,
             effort: String::new(),
             search: false,
+            conversation: 0,
         }
     }
     #[test]
@@ -851,6 +854,7 @@ mod tests {
             remote: None,
             effort: String::new(),
             search: false,
+            conversation: 0,
         };
         let ctx = crate::tools::ToolContext::of(&connection);
         let mut messages = vec![Message {

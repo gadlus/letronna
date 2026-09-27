@@ -31,7 +31,8 @@ pub struct Runner {
 }
 
 impl Runner {
-    fn connection(&self, workspace: Option<std::path::PathBuf>) -> Connection {
+    fn connection(&self, session: usize) -> Connection {
+        let workspace = self.store.conversations[session].workspace.clone();
         let settings = &self.store.settings;
         let saved = letronna_core::store::load_keys()
             .get(letronna_core::gateway::key_slot(&settings.gateway))
@@ -49,14 +50,14 @@ impl Runner {
             remote: None,
             effort: settings.effort.clone(),
             search: settings.search,
+            conversation: self.store.conversations[session].id,
         }
     }
 
     /// Send one prompt and run the agent to completion. Returns the final
     /// answer, or an error worth showing.
     pub fn ask(&mut self, session: usize, prompt: &str) -> Result<String, String> {
-        let workspace = self.store.conversations[session].workspace.clone();
-        let connection = self.connection(workspace);
+        let connection = self.connection(session);
         chat::validate(&connection)?;
 
         {

@@ -353,6 +353,20 @@ pub(crate) fn follow(socket: &str, id: &str, headless: bool) {
     }
 }
 
+/// Nothing for the window to follow: the conversation it shows has no
+/// browser. It is told, so it lets go of the last picture.
+pub(crate) fn unfollow() {
+    let (lock, wake) = state();
+    if let Ok(mut watch) = lock.lock() {
+        if watch.tab.take().is_some()
+            && let Some((_, sights)) = watch.to.as_ref()
+        {
+            let _ = sights.try_send(Sight::Closed);
+        }
+        wake.notify_all();
+    }
+}
+
 /// Show the window something, if it is watching.
 pub(crate) fn show(sight: Sight) {
     if let Ok(watch) = state().0.lock()
