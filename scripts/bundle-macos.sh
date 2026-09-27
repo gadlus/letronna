@@ -47,9 +47,15 @@ cat > "$app/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# An unsigned bundle has no stable identity, so macOS can keep serving a stale
-# icon from its cache. Ad-hoc signing is enough to give it one.
-codesign --force --sign - "$app" >/dev/null 2>&1 || true
+# Signed with a Developer ID when the release workflow provides one
+# (MACOS_SIGN_IDENTITY), with the hardened runtime notarization asks for.
+# Otherwise ad-hoc: an unsigned bundle has no stable identity, so macOS can
+# keep serving a stale icon from its cache, and ad-hoc is enough for that.
+if [ -n "${MACOS_SIGN_IDENTITY-}" ]; then
+  codesign --force --options runtime --timestamp --sign "$MACOS_SIGN_IDENTITY" "$app"
+else
+  codesign --force --sign - "$app" >/dev/null 2>&1 || true
+fi
 touch "$app"
 echo "built $app ($version)"
 
@@ -64,4 +70,7 @@ cp -R "$app" "$stage/"
 ln -s /Applications "$stage/Applications"
 rm -f "$dmg"
 hdiutil create -volname Letronna -srcfolder "$stage" -format UDZO -quiet "$dmg"
+if [ -n "${MACOS_SIGN_IDENTITY-}" ]; then
+  codesign --force --timestamp --sign "$MACOS_SIGN_IDENTITY" "$dmg"
+fi
 echo "built $dmg"

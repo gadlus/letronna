@@ -46,6 +46,12 @@ jobs:
             target: macos-arm64
             exe: ""
     runs-on: ${{ matrix.os }}
+    # Code signing runs where its secrets are set, and is skipped where they
+    # are not: the build is then unsigned, as before, and Windows SmartScreen
+    # and macOS Gatekeeper warn about it.
+    env:
+      SIGN_WINDOWS: ${{ secrets.AZURE_CLIENT_ID != '' }}
+      SIGN_MACOS: ${{ secrets.MACOS_CERTIFICATE != '' }}
     steps:
       # Third-party actions are pinned to a commit, not a tag that can move.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -74,6 +80,48 @@ jobs:
 
       - name: Build
         run: cargo build --release --locked
+
+      # Azure Artifact Signing (formerly Trusted Signing): the certificate
+      # lives in Azure and never reaches the runner. Signed before packaging,
+      # so the zip and the bare binaries carry the same signed files.
+      - name: Sign (Windows)
+        if: runner.os == 'Windows' && env.SIGN_WINDOWS == 'true'
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_CERTIFICATE_PROFILE }}
+          files: |
+            ${{ github.workspace }}\target\release\letronna.exe
+            ${{ github.workspace }}\target\release\letronna-gui.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      # The Developer ID certificate goes into a keychain of this run's own,
+      # which bundle-macos.sh then signs with (MACOS_SIGN_IDENTITY).
+      - name: Signing identity (macOS)
+        if: runner.os == 'macOS' && env.SIGN_MACOS == 'true'
+        env:
+          CERT: ${{ secrets.MACOS_CERTIFICATE }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          pass=$(openssl rand -hex 16)
+          security create-keychain -p "$pass" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$pass" "$keychain"
+          echo "$CERT" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -P "$CERT_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          rm "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$pass" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          identity=$(security find-identity -v -p codesigning "$keychain" | awk -F'"' '/Developer ID Application/ {print $2; exit}')
+          [ -n "$identity" ] || { echo "::error::no Developer ID Application identity in MACOS_CERTIFICATE"; exit 1; }
+          echo "MACOS_SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
 
       # What the updater asks each new binary before it is swapped in.
       - name: Both binaries say the tag's version
@@ -120,6 +168,25 @@ jobs:
           mkdir -p dist
           cp target/letronna-macos-arm64-*.dmg dist/letronna-macos-arm64.dmg
           cp target/release/letronna dist/letronna-macos-arm64
+          if [ -n "${MACOS_SIGN_IDENTITY-}" ]; then
+            codesign --force --options runtime --timestamp --sign "$MACOS_SIGN_IDENTITY" dist/letronna-macos-arm64
+          fi
+
+      # Apple checks the signed app and vouches for it; the ticket is stapled
+      # to the disk image, so Gatekeeper opens it without going online. The
+      # bare terminal binary is signed only: Apple cannot staple a lone file.
+      - name: Notarize (macOS)
+        if: runner.os == 'macOS' && env.SIGN_MACOS == 'true'
+        env:
+          API_KEY: ${{ secrets.APPLE_API_KEY }}
+          API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          echo "$API_KEY" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          xcrun notarytool submit dist/letronna-macos-arm64.dmg \
+            --key "$RUNNER_TEMP/notary.p8" --key-id "$API_KEY_ID" --issuer "$API_ISSUER" --wait
+          rm "$RUNNER_TEMP/notary.p8"
+          xcrun stapler staple dist/letronna-macos-arm64.dmg
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
