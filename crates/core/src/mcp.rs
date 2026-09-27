@@ -9,7 +9,8 @@
 //!
 //! Starting a server can take a while (npx may be downloading it first), so
 //! the servers start on threads of their own the first time the tools are
-//! listed, and their tools appear once they answer; nothing waits for them.
+//! listed, and their tools appear once they answer; only a question asked
+//! once waits for them, as it goes out at once.
 //! Every call asks the user first unless the config's `autoApprove` names the
 //! tool: a server is somebody else's code, and it alone says what its tools
 //! do. They are never offered where other people can read the replies.
@@ -20,7 +21,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Once, OnceLock, mpsc};
+use std::sync::{Arc, Condvar, Mutex, Once, OnceLock, mpsc};
 use std::time::Duration;
 
 /// How long a server gets to start and list its tools. The first run of an
@@ -83,15 +84,52 @@ pub fn start() {
             if server.disabled || server.command.trim().is_empty() {
                 continue;
             }
+            begin_start();
             std::thread::spawn(move || {
                 if let Ok(tools) = launch(&name, &server)
                     && let Ok(mut known) = registry().lock()
                 {
                     known.extend(tools);
                 }
+                end_start();
             });
         }
     });
+}
+
+/// Wait until every server has answered or given up, for at most `limit`:
+/// for a question asked once, whose first request would otherwise go out
+/// before any server's tools are there.
+pub fn ready(limit: Duration) {
+    start();
+    wait_started(limit);
+}
+
+/// How many servers are still starting, and a signal as each is done.
+fn starting() -> &'static (Mutex<usize>, Condvar) {
+    static STARTING: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new();
+    STARTING.get_or_init(Default::default)
+}
+
+fn begin_start() {
+    if let Ok(mut left) = starting().0.lock() {
+        *left += 1;
+    }
+}
+
+fn end_start() {
+    let (left, done) = starting();
+    if let Ok(mut left) = left.lock() {
+        *left = left.saturating_sub(1);
+    }
+    done.notify_all();
+}
+
+fn wait_started(limit: Duration) {
+    let (left, done) = starting();
+    if let Ok(left) = left.lock() {
+        let _ = done.wait_timeout_while(left, limit, |left| *left > 0);
+    }
 }
 
 fn registry() -> &'static Mutex<Vec<Arc<dyn Tool>>> {
@@ -485,6 +523,27 @@ mod tests {
                 }
             }
         });
+    }
+
+    #[test]
+    fn a_question_asked_once_waits_for_servers_still_starting() {
+        begin_start();
+        let asked = std::time::Instant::now();
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(100));
+            end_start();
+        });
+        wait_started(Duration::from_secs(5));
+        let waited = asked.elapsed();
+        assert!(waited >= Duration::from_millis(100), "{waited:?}");
+        assert!(waited < Duration::from_secs(2), "{waited:?}");
+
+        // One that never answers is waited for no longer than asked.
+        begin_start();
+        let asked = std::time::Instant::now();
+        wait_started(Duration::from_millis(200));
+        assert!(asked.elapsed() < Duration::from_secs(2));
+        end_start();
     }
 
     #[test]

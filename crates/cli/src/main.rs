@@ -26,6 +26,9 @@ use commands::{Flow, command, resume};
 use letronna_core::store;
 use session::Runner;
 
+/// How long a question asked once waits for MCP servers still starting.
+const MCP_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
 fn main() {
     rescue_terminal();
     let args = parse(std::env::args().skip(1));
@@ -96,6 +99,8 @@ fn main() {
 
     // One question, one answer, no banner: this form gets piped.
     if let Some(prompt) = args.prompt {
+        // It goes out at once, so the MCP servers' tools would miss it.
+        letronna_core::mcp::ready(MCP_WAIT);
         match runner.ask(session, &prompt) {
             Ok(_) => runner.persist(),
             Err(error) => {

@@ -128,7 +128,21 @@ Letronna can use the tools of any [MCP](https://modelcontextprotocol.io) server 
 }
 ```
 
-Servers start when Letronna does, and their tools appear as `mcp__<server>__<tool>` once they answer. Every call asks first unless the tool is listed in `autoApprove`; `"disabled": true` leaves a server off. Servers reached by URL rather than a command are not supported yet.
+Servers start when Letronna does, and their tools appear as `mcp__<server>__<tool>` once they answer; `letronna -p` waits up to 15 seconds for them before it asks. Every call asks first unless the tool is listed in `autoApprove`; `"disabled": true` leaves a server off. Servers reached by URL rather than a command are not supported yet.
+
+### A lighter browser
+
+On Linux and macOS, [Lightpanda](https://github.com/lightpanda-io/browser) is a browser made for agents that draws nothing, which makes it far lighter than Chrome or Edge with no window: about 10 MB with a page open, where they take well over 100 MB. It comes with an MCP server, so with `lightpanda` on the PATH this is all it needs:
+
+```json
+{
+  "mcpServers": {
+    "lightpanda": { "command": "lightpanda", "args": ["mcp"] }
+  }
+}
+```
+
+Its tools open pages and read them as text or markdown, find, click and fill what is on them, run scripts, and keep private sessions apart. Drawing nothing, it has nothing to show, and its screenshots are the page's text laid out; a site that needs what it does not implement yet can fail. There is no Windows build: it runs inside WSL or Docker there, whose virtual machine costs more than it saves.
 
 ## Build
 
