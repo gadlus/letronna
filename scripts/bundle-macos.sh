@@ -5,7 +5,7 @@
 # `cargo build --release`. Pass --dmg to also package it for download.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-bin=target/release/letronna
+bin=target/release/letronna-gui
 [ -x "$bin" ] || { echo "build it first: cargo build --release" >&2; exit 1; }
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 
@@ -19,7 +19,7 @@ cp "$bin" "$app/Contents/MacOS/Letronna"
 # bigger slots are upscaled; they only show in Finder at large icon sizes.
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-sips -s format png assets/icon.ico --out "$tmp/icon.png" >/dev/null
+sips -s format png crates/gui/assets/icon.ico --out "$tmp/icon.png" >/dev/null
 mkdir "$tmp/Letronna.iconset"
 for size in 16 32 128 256 512; do
   sips -z $size $size "$tmp/icon.png" --out "$tmp/Letronna.iconset/icon_${size}x${size}.png" >/dev/null

@@ -10,6 +10,13 @@ mod ui;
 use prelude::*;
 
 fn main() {
+    // Asked by the updater and the release build before a new binary is
+    // trusted. First, because a release build that went on would install
+    // itself over the Letronna already there.
+    if std::env::args().any(|a| a == "--version") {
+        println!("{BRAND} {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     if std::env::args().any(|a| a == "--uninstall") {
         platform::install::uninstall();
     }

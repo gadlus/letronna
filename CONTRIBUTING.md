@@ -94,6 +94,34 @@ pipe the answers in, and point `LETRONNA_DOWNLOAD` at a local zip and
 folder does not isolate: the PATH step writes your real user PATH. Take the
 scratch entry back out afterwards.
 
+## Releasing
+
+A release is one version for the window and the terminal on every platform.
+
+1. Set `version` in `Cargo.toml`, move **Unreleased** in `CHANGELOG.md` under
+   it, and merge that to `main`.
+2. Tag it and push the tag: `git tag v0.1.0-alpha.2` and
+   `git push origin v0.1.0-alpha.2`. CI builds Windows, Linux and macOS into a
+   **draft** release, after checking that the tag is the version in
+   `Cargo.toml` and that each binary says so. While Actions cannot run,
+   `scripts/release.ps1 build` makes the same draft here, with the Windows
+   files only.
+3. `scripts/release.ps1 sign v0.1.0-alpha.2` on the machine that holds the
+   release key. It downloads the draft, runs the Windows binaries, writes
+   `latest.json` with every file's SHA-256 and size, signs it, shows it, and
+   publishes once you say yes. Letronna installs an update only when that
+   signature is from a key in `RELEASE_KEYS` in `crates/core/src/update.rs`.
+   The key never goes near GitHub.
+
+A draft reaches nobody: the account API only serves published releases. To
+take a bad release back, `gh release edit <tag> --draft=true` makes the one
+before it the latest again. Copies that already updated keep it, because
+Letronna never moves back a version, so the fix is a newer release.
+
+Keep a second key offline. Its public half sits in `RELEASE_KEYS` beside the
+first, so if the one in use is lost or leaks, releases signed with the backup
+still install and the next release can drop the bad key.
+
 ## Reporting bugs
 
 Open an issue with the gateway you used, the model, and what you expected.
