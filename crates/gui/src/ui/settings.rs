@@ -38,6 +38,28 @@ impl Chat {
         cx.notify();
     }
 
+    /// Use the browser at the address in the field, or with none this
+    /// computer's; the one running now is let go of, its pages kept.
+    pub(crate) fn save_browser_address(&mut self, cx: &mut Context<Self>) {
+        let address = self.browser_address.read(cx).value().trim().to_string();
+        let slot = letronna_core::browser::ELSEWHERE;
+        if address.is_empty() {
+            self.keys.remove(slot);
+        } else {
+            self.keys.insert(slot.to_owned(), address);
+        }
+        self.write_keys();
+        letronna_core::browser::restart();
+        cx.notify();
+    }
+
+    /// Go back to the browser on this computer.
+    pub(crate) fn clear_browser_address(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.browser_address
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.save_browser_address(cx);
+    }
+
     fn write_keys(&mut self) {
         if std::fs::create_dir_all(backend::data_dir())
             .and_then(|_| {
@@ -263,9 +285,14 @@ impl Chat {
                 cx,
             )
             .into_any_element(),
-            "Privacy" => {
-                privacy_page(&chat, &presence, &self.store.settings, cx).into_any_element()
-            }
+            "Privacy" => privacy_page(
+                &chat,
+                &presence,
+                &self.browser_address,
+                &self.store.settings,
+                cx,
+            )
+            .into_any_element(),
             "Account" => super::account::account_page(&chat, self, cx).into_any_element(),
             "Thinking" => thinking_page(&chat, &self.store.settings, cx).into_any_element(),
             "Plugins" => plugins_page(&chat, cx).into_any_element(),
@@ -427,9 +454,65 @@ pub(crate) fn label(text: &'static str, cx: &App) -> Div {
         .child(text)
 }
 
+/// Where the browser runs: this computer, or an address given for one
+/// elsewhere.
+fn elsewhere_row(chat: &Entity<Chat>, address: &Entity<InputState>, cx: &App) -> Div {
+    let now = match letronna_core::browser::remote_place() {
+        Some(place) => format!("Now the browser at {place}."),
+        None => "Now Chrome or Edge on this computer.".to_owned(),
+    };
+    let (save, clear) = (chat.clone(), chat.clone());
+    v_flex()
+        .gap_2()
+        .px_3()
+        .py_2p5()
+        .rounded(cx.theme().radius)
+        .bg(cx.theme().secondary.opacity(0.3))
+        .child(
+            v_flex()
+                .gap_0p5()
+                .child(div().text_sm().child("Browser elsewhere"))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!(
+                            "A cloud browser's connect address, its key in it as the service \
+                             gives it (wss://…?token=…), or Chrome on another machine started \
+                             with --remote-debugging-port (http://its-address:9222). Empty, the \
+                             browser runs on this computer. {now}"
+                        )),
+                ),
+        )
+        .child(
+            h_flex()
+                .gap_2()
+                .child(div().flex_1().child(Input::new(address)))
+                .child(
+                    Button::new("browser-elsewhere-clear")
+                        .ghost()
+                        .small()
+                        .label("This computer")
+                        .on_click(move |_, window, cx| {
+                            clear.update(cx, |this, cx| this.clear_browser_address(window, cx))
+                        }),
+                )
+                .child(
+                    Button::new("browser-elsewhere-save")
+                        .primary()
+                        .small()
+                        .label("Save")
+                        .on_click(move |_, _, cx| {
+                            save.update(cx, |this, cx| this.save_browser_address(cx))
+                        }),
+                ),
+        )
+}
+
 fn privacy_page(
     chat: &Entity<Chat>,
     presence: &Entity<String>,
+    address: &Entity<InputState>,
     settings: &Settings,
     cx: &App,
 ) -> Div {
@@ -652,6 +735,7 @@ fn privacy_page(
         ))
         .child(browser)
         .child(seen)
+        .child(elsewhere_row(chat, address, cx))
         .child(heading(
             "Discord Rich Presence",
             "What Letronna shares with Discord. The integration is turned on or off in the Plugins tab.",

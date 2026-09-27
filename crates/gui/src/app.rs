@@ -63,6 +63,8 @@ pub(crate) struct Chat {
     pub(crate) endpoint: Entity<InputState>,
     pub(crate) model: Entity<InputState>,
     pub(crate) key: Entity<InputState>,
+    /// Where the browser is when it is not on this computer.
+    pub(crate) browser_address: Entity<InputState>,
     /// Every model on every set-up gateway, as (gateway, model).
     pub(crate) models: Vec<(String, String)>,
     pub(crate) model_open: bool,
@@ -213,6 +215,16 @@ impl Chat {
                 .masked(true)
                 .default_value(saved_key)
         });
+        let browser_address = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("wss://… or http://address:9222")
+                .masked(true)
+                .default_value(
+                    keys.get(letronna_core::browser::ELSEWHERE)
+                        .cloned()
+                        .unwrap_or_default(),
+                )
+        });
         let model_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search models…"));
         let gateway_pick = cx.new(|_| store.settings.gateway.clone());
         let presence_pick = cx.new(|_| store.settings.presence.clone());
@@ -292,6 +304,7 @@ impl Chat {
             endpoint,
             model,
             key,
+            browser_address,
             models: Vec::new(),
             model_open: false,
             model_search,
