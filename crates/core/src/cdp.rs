@@ -367,6 +367,28 @@ impl Browser {
         Browser { reach, child }
     }
 
+    /// A browser with no window that an earlier run left on the profile --
+    /// one that crashed, or was stopped to be updated -- if nothing drives
+    /// it: nothing is attached to any tab of it.
+    pub fn left_over(profile: &Path) -> Option<Browser> {
+        let port = read_port(profile)?;
+        let browser = Browser::on(port, None, running(port)?);
+        if !browser.reach.headless {
+            return None;
+        }
+        let targets: Value = browser
+            .reach
+            .connect()
+            .ok()?
+            .call("Target.getTargets", json!({}))
+            .ok()?;
+        let driven = targets["targetInfos"]
+            .as_array()?
+            .iter()
+            .any(|info| info["attached"] == true);
+        (!driven).then_some(browser)
+    }
+
     /// Close the whole browser, every tab of it.
     pub fn close(&mut self) {
         if let Ok(mut browser) = self.reach.connect() {

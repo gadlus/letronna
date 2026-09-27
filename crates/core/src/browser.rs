@@ -735,7 +735,11 @@ pub fn forget(conversation: u64) {
 impl Browsers {
     /// The running browser, started now if it is not.
     fn reach(&mut self) -> Result<cdp::Reach, String> {
-        if let Some(browser) = &self.browser {
+        // With no session, no tab says when it has gone -- as when another
+        // Letronna closed it for being left over -- so it is asked.
+        if let Some(browser) = &self.browser
+            && (!self.sessions.is_empty() || browser.reach.alive())
+        {
             return Ok(browser.reach.clone());
         }
         let browser = cdp::Browser::start(&self.profile, headless(), watch::scale())?;
@@ -1002,6 +1006,21 @@ fn label_of(conversation: u64, number: u32) -> Option<String> {
     let owner = owner_of(conversation);
     let session = all.sessions.iter().find(|session| session.owner == owner)?;
     session.refs.label(number).map(str::to_owned)
+}
+
+/// Close a browser with no window that an earlier run left behind, as one
+/// that crashed or was stopped to be updated does, so it holds no memory
+/// until it is next needed. One something drives is left alone.
+pub fn close_left_over() {
+    let Ok(all) = state().lock() else {
+        return;
+    };
+    if all.browser.is_some() {
+        return;
+    }
+    if let Some(mut browser) = cdp::Browser::left_over(&all.profile) {
+        browser.close();
+    }
 }
 
 /// Close the browser if it has no window, so it does not outlive Letronna
@@ -2479,6 +2498,22 @@ mod tests {
             assert_eq!(UsePage.run(&get, &first).unwrap(), "signed=in");
             Browse.run(&open, &second).unwrap();
             assert_eq!(UsePage.run(&get, &second).unwrap(), "");
+
+            // One left running with nothing driving it, as a crash leaves
+            // one, is closed as Letronna starts; one in use is not.
+            let profile = state().lock().unwrap().profile.clone();
+            assert!(cdp::Browser::left_over(&profile).is_none(), "in use");
+            let reach = {
+                let mut all = state().lock().unwrap();
+                all.sessions.clear();
+                all.browser.take().unwrap().reach
+            };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while cdp::Browser::left_over(&profile).is_none() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            close_left_over();
+            assert!(!reach.alive(), "the left over browser still answers");
         }
     }
 }

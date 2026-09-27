@@ -165,6 +165,7 @@ impl Chat {
         // session rather than the history.
         let (mut store, error) = (letronna_core::store::load(), None);
         letronna_core::browser::share_browser(store.settings.browser_shared);
+        std::thread::spawn(letronna_core::browser::close_left_over);
         if store.conversations.is_empty() {
             store.conversations.push(Conversation {
                 title: "New session".into(),
