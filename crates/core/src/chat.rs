@@ -626,9 +626,11 @@ pub fn list_models(base: &str, key: &str) -> Result<Vec<String>, String> {
     let value: Value = response
         .json()
         .map_err(|_| "Invalid model list.".to_owned())?;
-    let models = unwrap_response(&value)?["data"]
+    let list = unwrap_response(&value)?["data"]
         .as_array()
-        .ok_or("Invalid model list.")?
+        .ok_or("Invalid model list.")?;
+    crate::models::remember(base, list);
+    let models = list
         .iter()
         .filter_map(|m| m["id"].as_str().or_else(|| m["key"].as_str()))
         .map(str::to_owned)
