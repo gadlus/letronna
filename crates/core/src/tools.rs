@@ -8,7 +8,7 @@
 use crate::budget::Budget;
 use crate::cancel::Cancel;
 use crate::chat::{Connection, Remote};
-use crate::driver::AgentId;
+use crate::driver::{AgentId, Allow};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -49,6 +49,10 @@ pub(crate) struct Caller {
     pub budget: Option<Arc<Budget>>,
     /// The tree of helpers the call is made in, which an approval for the run covers.
     pub run: Option<u64>,
+    /// Whether the calling agent is a fork, which may start no agent of its own.
+    pub fork: bool,
+    /// What the calling agent may call, which a fork of it is held to.
+    pub allow: Allow,
 }
 
 impl ToolContext {

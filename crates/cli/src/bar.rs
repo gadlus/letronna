@@ -103,6 +103,10 @@ pub const COMMANDS: &[Command] = &[
         blurb: "carry on in a copy of this session",
     },
     Command {
+        name: "/btw",
+        blurb: "ask something aside; the answer is not kept",
+    },
+    Command {
         name: "/where",
         blurb: "show the project folder and session file",
     },

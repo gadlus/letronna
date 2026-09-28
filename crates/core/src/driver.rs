@@ -45,7 +45,9 @@ const NO_QUESTIONS: &str = "Questions are not available to helpers. Decide for y
 const NOT_APPROVED: &str = "This was not approved, so it did not run. Do not try to get the same result another way: leave it, and say in your report what you could not do.";
 
 /// Which tools an agent may call, before the deny set is taken out.
+#[derive(Clone, Default)]
 pub enum Allow {
+    #[default]
     All,
     Only(Vec<String>),
 }
@@ -73,6 +75,10 @@ pub struct Spec {
     pub status: Arc<Status>,
     /// How many helpers deep the agent is: 0 for a session's own, 1 for its helper.
     pub depth: u8,
+    /// Whether it is a fork, started from its parent's messages, which may start no agent.
+    pub fork: bool,
+    /// Where its own messages start in its transcript: after its parent's, for a fork.
+    pub from: usize,
 }
 
 /// How a run is getting on, in atomics a frontend reads while the run writes them.
@@ -163,7 +169,9 @@ pub fn run(mut spec: Spec) -> Report {
         .collect();
     forward_unread(&spec);
     report.status = status;
-    report.text = last_said(&spec.transcript.conversation.messages);
+    // Only what it said: a fork's transcript opens with its parent's words.
+    let messages = &spec.transcript.conversation.messages;
+    report.text = last_said(messages.get(spec.from..).unwrap_or_default());
     report.seconds = started.elapsed().as_secs();
     report
 }
@@ -362,6 +370,8 @@ fn context(spec: &Spec) -> ToolContext {
             depth: spec.depth,
             budget: spec.budget.clone(),
             run: Some(spec.run),
+            fork: spec.fork,
+            allow: spec.allow.clone(),
             ..ctx.caller.clone()
         },
         ..ctx
@@ -546,6 +556,8 @@ mod tests {
             budget: None,
             status: Arc::default(),
             depth: 1,
+            fork: false,
+            from: 0,
         }
     }
 

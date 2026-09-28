@@ -6,7 +6,7 @@ use letronna_core::store;
 use crate::banner::{banner, folder_name, footer, replay};
 use crate::bar;
 use crate::render;
-use crate::session::Runner;
+use crate::session::{Runner, usage};
 
 pub enum Flow {
     Handled,
@@ -168,6 +168,10 @@ pub fn command(
             branch(runner, session, rest);
             Flow::Handled
         }
+        "/btw" => {
+            aside(runner, *session, rest);
+            Flow::Handled
+        }
         "/where" => {
             render::blank();
             render::line(&format!(
@@ -186,6 +190,24 @@ pub fn command(
             Flow::Handled
         }
         _ => Flow::Unknown,
+    }
+}
+
+/// A side question, answered dim under it from what the session holds so far
+/// and kept out of the session.
+fn aside(runner: &mut Runner, session: usize, question: &str) {
+    match runner.btw(session, question) {
+        Ok(answer) => {
+            let mut lines = answer.content.lines();
+            let first = lines.next().unwrap_or_default();
+            render::said(&render::dim("◇"), &render::dim(first));
+            for line in lines {
+                render::line(&render::dim(line));
+            }
+            // What it cost, as under a reply, since the session keeps no trace of it.
+            render::line(&render::dim(&usage(&answer)));
+        }
+        Err(error) => render::line(&render::red(&error)),
     }
 }
 

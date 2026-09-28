@@ -15,6 +15,14 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::PathBuf;
 
+/// Starts the name of every side question's conversation, which only the
+/// sweep of them looks for.
+const ASIDE: &str = "btw-";
+/// How old a side question's conversation is before the sweep takes it: an
+/// aside makes one request, which never takes this long, so an older one's
+/// process is gone, while a younger one may be another process's, running.
+const ASIDE_STALE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
 #[derive(Default, Serialize, Deserialize)]
 pub struct Conversation {
     /// Stable identity, so a streaming reply lands in the session it was sent
@@ -362,8 +370,24 @@ impl Transcript {
         title: &str,
         workspace: Option<PathBuf>,
     ) -> Result<(u32, Self), String> {
-        let dir = helpers_dir(session);
-        std::fs::create_dir_all(&dir)
+        Self::create_in(&helpers_dir(session), "", session, title, workspace)
+    }
+
+    /// Start the throwaway conversation a side question about `session` runs
+    /// in, apart from its helpers' and named so `sweep_asides` knows it.
+    pub fn aside(session: u64, workspace: Option<PathBuf>) -> Result<Self, String> {
+        Self::create_in(&asides_dir(), ASIDE, session, "btw", workspace).map(|(_, t)| t)
+    }
+
+    /// Start a conversation in `dir` as the first free `<prefix><n>.jsonl`.
+    fn create_in(
+        dir: &std::path::Path,
+        prefix: &str,
+        session: u64,
+        title: &str,
+        workspace: Option<PathBuf>,
+    ) -> Result<(u32, Self), String> {
+        std::fs::create_dir_all(dir)
             .map_err(|e| format!("Could not make a place for the helper's conversation: {e}"))?;
         let conversation = Conversation {
             id: session,
@@ -373,7 +397,7 @@ impl Transcript {
             ..Default::default()
         };
         for n in 1..=u32::MAX {
-            let path = dir.join(format!("{n}.jsonl"));
+            let path = dir.join(format!("{prefix}{n}.jsonl"));
             // Making the file is what claims the number: of two processes
             // asking at once exactly one gets it, where counting and adding
             // one, as `next_id` does, would hand both the same.
@@ -613,6 +637,30 @@ fn helpers_dir(session: u64) -> PathBuf {
     backend::data_dir().join("agents").join(session.to_string())
 }
 
+/// Where side questions keep their conversations while they run.
+fn asides_dir() -> PathBuf {
+    backend::data_dir().join("asides")
+}
+
+/// Removes the conversations side questions left behind when their process
+/// quit or crashed mid-answer, and only those.
+fn sweep_asides() {
+    let Ok(entries) = std::fs::read_dir(asides_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let stale = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .is_ok_and(|at| at.elapsed().is_ok_and(|age| age > ASIDE_STALE));
+        if name.starts_with(ASIDE) && name.ends_with(".jsonl") && stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 pub fn settings_path() -> PathBuf {
     backend::data_dir().join("settings.json")
 }
@@ -695,6 +743,7 @@ fn session_ids() -> Vec<u64> {
 /// sidebar searches across all of them.
 pub fn load_listing() -> Store {
     migrate();
+    sweep_asides();
     let mut conversations: Vec<Conversation> = summaries()
         .into_iter()
         .map(|s| {
@@ -721,6 +770,11 @@ pub fn load_listing() -> Store {
         active: 0,
         settings: settings(),
     }
+}
+
+/// Session `id` as its file holds it now, if it has one.
+pub(crate) fn session(id: u64) -> Option<Conversation> {
+    replay(&session_path(id))
 }
 
 /// Read a session's messages, if they are not already here.
@@ -794,6 +848,7 @@ mod retire_tests {
 
 pub fn load() -> Store {
     migrate();
+    sweep_asides();
     let mut conversations: Vec<Conversation> = session_ids()
         .into_iter()
         .filter_map(|id| replay(&session_path(id)))
@@ -938,8 +993,8 @@ pub(crate) mod tests {
     #[cfg(unix)]
     use super::write_private;
     use super::{
-        Conversation, Store, Todo, Transcript, fill, load, load_listing, replay, search, search_in,
-        summaries,
+        ASIDE_STALE, Conversation, Store, Todo, Transcript, fill, load, load_listing, replay,
+        search, search_in, summaries,
     };
     use crate::chat::Message;
 
@@ -1470,6 +1525,27 @@ pub(crate) mod tests {
         assert!(Transcript::open(1, 1).is_none());
         // Another session's helpers are its own.
         assert!(Transcript::open(2, 1).is_some());
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn the_startup_sweep_takes_only_old_side_question_files() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("asides");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let old = Transcript::aside(1, None).unwrap().path;
+        let running = Transcript::aside(1, None).unwrap().path;
+        let other = dir.join("asides").join("notes.jsonl");
+        std::fs::write(&other, "").unwrap();
+        let long_ago = std::time::SystemTime::now() - ASIDE_STALE * 2;
+        for path in [&old, &other] {
+            let file = std::fs::File::options().write(true).open(path).unwrap();
+            file.set_modified(long_ago).unwrap();
+        }
+        load_listing();
+        assert!(!old.exists());
+        assert!(running.exists() && other.exists());
+        assert!(!dir.join("agents").exists());
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 }
