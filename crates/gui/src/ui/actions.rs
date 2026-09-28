@@ -326,9 +326,26 @@ impl Chat {
             .clone()
     }
 
-    /// The row of small buttons for a turn, always laid out so nothing moves
-    /// when it shows, and drawn only where `shows_bar` says.
+    /// The row of small buttons for a turn where `shows_bar` says. Other
+    /// turns get one quiet button with the same actions in a menu, so an
+    /// earlier turn still shows that it has them.
     pub(crate) fn turn_bar(&self, span: Span, shown: bool, cx: &Context<Self>) -> AnyElement {
+        if !shown {
+            // Your prompt's sits at the right end of its label.
+            let corner = if span.yours {
+                gpui::Corner::TopRight
+            } else {
+                gpui::Corner::TopLeft
+            };
+            return Button::new(self.row_id("more", span.first))
+                .plain(cx)
+                .xsmall()
+                .icon(Icon::new(IconName::Ellipsis))
+                .text_color(cx.theme().muted_foreground)
+                .tooltip("More")
+                .dropdown_menu_with_anchor(corner, self.turn_menu(span, cx))
+                .into_any_element();
+        }
         let (retry, rewind) = self.can_retry_and_rewind(span);
         let button =
             |name: &'static str, icon: Icon, tip: &'static str, enabled: bool, act: Act| {
@@ -343,7 +360,6 @@ impl Chat {
         h_flex()
             .gap_0p5()
             .items_center()
-            .when(!shown, |bar| bar.invisible())
             .when(span.yours, |bar| {
                 bar.child(button(
                     "edit",
