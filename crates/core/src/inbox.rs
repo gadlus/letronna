@@ -230,12 +230,12 @@ pub fn listened() -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Held by every test that pushes, since a push from one test would ring
     /// the doorbell another is counting.
-    static DOORBELL: Mutex<()> = Mutex::new(());
+    pub(crate) static DOORBELL: Mutex<()> = Mutex::new(());
 
     fn notice(from: &str, when: When, text: &str) -> Notice {
         Notice {

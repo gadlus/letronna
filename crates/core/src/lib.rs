@@ -15,6 +15,7 @@ pub mod cancel;
 mod cdp;
 pub mod chat;
 pub mod compact;
+pub mod driver;
 pub mod gateway;
 pub mod inbox;
 pub mod jobs;
