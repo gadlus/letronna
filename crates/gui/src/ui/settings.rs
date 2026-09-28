@@ -270,10 +270,7 @@ impl Chat {
             return None;
         }
         let closing = self.settings_closing;
-        let anim = || {
-            Animation::new(std::time::Duration::from_millis(180))
-                .with_easing(gpui::ease_out_quint())
-        };
+        let anim = || Animation::new(std::time::Duration::from_millis(180)).with_easing(expo_out);
         let blur = self.settings_backdrop.clone().map(|image| {
             img(image)
                 .absolute()
@@ -365,7 +362,6 @@ impl Chat {
                         .rounded(cx.theme().radius)
                         .cursor_pointer()
                         .text_sm()
-                        .font_family(HEADING_FONT)
                         .font_weight(FontWeight::MEDIUM)
                         .when(active, |this| this.bg(cx.theme().sidebar_accent))
                         .hover(|s| s.bg(cx.theme().sidebar_accent.opacity(0.6)))
@@ -449,7 +445,7 @@ impl Chat {
                                         div().child(body).with_animation(
                                             SharedString::from(format!("page-{current_page}")),
                                             Animation::new(std::time::Duration::from_millis(200))
-                                                .with_easing(gpui::ease_out_quint()),
+                                                .with_easing(expo_out),
                                             |el, delta| el.opacity(delta).mt(px(6. * (1. - delta))),
                                         ),
                                     ),
@@ -548,27 +544,17 @@ fn plugins_page(chat: &Entity<Chat>, cx: &App) -> Div {
 }
 
 pub(crate) fn heading(title: &'static str, blurb: &'static str, cx: &App) -> Div {
-    v_flex()
-        .gap_1()
-        .child(
-            div()
-                .text_base()
-                .font_family(HEADING_FONT)
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(title),
-        )
-        .child(
-            div()
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child(blurb),
-        )
+    v_flex().gap_1().child(crate::ui::section(title, cx)).child(
+        div()
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .child(blurb),
+    )
 }
 
 pub(crate) fn label(text: &'static str, cx: &App) -> Div {
     div()
         .text_xs()
-        .font_family(HEADING_FONT)
         .text_color(cx.theme().muted_foreground)
         .child(text)
 }
@@ -890,13 +876,7 @@ fn about_page(chat: &Entity<Chat>, this: &Chat, cx: &App) -> Div {
                 .rounded(cx.theme().radius_lg)
                 .mb_3(),
         )
-        .child(
-            div()
-                .font_family(WORDMARK_FONT)
-                .italic()
-                .text_size(px(36.))
-                .child(BRAND),
-        )
+        .child(crate::ui::wordmark(px(28.), cx).mb_1())
         .child(line(
             concat!(
                 "Version ",
@@ -926,7 +906,16 @@ fn about_page(chat: &Entity<Chat>, this: &Chat, cx: &App) -> Div {
                 .child(line(
                     "Built with GPUI and gpui-component (Apache-2.0). Icons by Phosphor (MIT).",
                     12.,
-                )),
+                ))
+                .child(line(
+                    "Type in Barlow, Barlow Condensed and DM Mono (SIL Open Font License 1.1).",
+                    12.,
+                ))
+                .children(missing_fonts(cx).iter().map(|family| {
+                    div().text_size(px(12.)).text_color(muted).child(format!(
+                        "{family} did not load here, so the system's own face stands in."
+                    ))
+                })),
         )
 }
 
@@ -1273,13 +1262,7 @@ fn search_page(
                     .flex_1()
                     .min_w_0()
                     .gap_0p5()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_family(HEADING_FONT)
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(name),
-                    )
+                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(name))
                     .child(
                         div()
                             .text_xs()
@@ -1439,13 +1422,7 @@ fn gateway_page(
                     .flex_1()
                     .min_w_0()
                     .gap_0p5()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_family(HEADING_FONT)
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(name),
-                    )
+                    .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(name))
                     .child(
                         div()
                             .text_xs()

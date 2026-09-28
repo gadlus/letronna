@@ -370,7 +370,6 @@ impl Chat {
                 .child(
                     div()
                         .text_xs()
-                        .font_family(HEADING_FONT)
                         .text_color(cx.theme().muted_foreground)
                         .child(format!("Plan · {done} of {} done", todos.len())),
                 )
