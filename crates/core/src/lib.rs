@@ -9,6 +9,7 @@
 pub mod agent;
 pub mod auth;
 pub mod browser;
+pub mod budget;
 mod cdp;
 pub mod chat;
 pub mod compact;
