@@ -95,6 +95,16 @@ impl Chat {
                     .into_any_element()
             })
             .child(div().flex_1().min_w_0().truncate().child(c.title.clone()))
+            // A notice started a turn there while you were elsewhere.
+            .when(self.unseen.contains(&c.id), |this| {
+                this.child(
+                    div()
+                        .size(px(6.))
+                        .rounded_full()
+                        .flex_shrink_0()
+                        .bg(cx.theme().primary),
+                )
+            })
             .child(
                 div()
                     .text_xs()

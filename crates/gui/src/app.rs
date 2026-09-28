@@ -1,5 +1,5 @@
 use crate::prelude::*;
-use letronna_core::agent;
+use letronna_core::{agent, inbox};
 
 pub(crate) const BRAND: &str = "Letronna";
 
@@ -182,6 +182,12 @@ pub(crate) struct Chat {
     /// into the box; set where there is no window to hand, put there when
     /// the window next draws.
     pub(crate) returned_follow_ups: Option<String>,
+    /// Sessions a notice woke, marked in the sidebar until they are next on
+    /// screen.
+    pub(crate) unseen: std::collections::HashSet<u64>,
+    /// Set by Stop for the `finish` it causes, so stopping does not start a
+    /// turn for notices in the same moment.
+    pub(crate) stopping: bool,
     /// Your message being changed in place, by session id and place.
     pub(crate) editing_message: Option<(u64, usize)>,
     /// The box a message is changed in.
@@ -426,6 +432,8 @@ impl Chat {
             skill_prompt,
             follow_ups: Vec::new(),
             returned_follow_ups: None,
+            unseen: std::collections::HashSet::new(),
+            stopping: false,
             editing_message: None,
             edit_message,
             thinking_open: std::collections::HashSet::new(),
@@ -448,6 +456,7 @@ impl Chat {
             .update(cx, |input, cx| input.focus(window, cx));
         Self::watch_schedules(cx);
         Self::watch_updates(cx);
+        Self::watch_inbox(cx);
         this.restart_messaging(cx);
         if this.store.settings.presence == "off" {
             plugins::set_enabled(cx, plugins::DISCORD, false);
@@ -592,33 +601,14 @@ impl Chat {
         remote: Option<letronna_core::chat::Remote>,
         cx: &mut Context<Self>,
     ) -> std::result::Result<(), ()> {
-        let saved = self
-            .keys
-            .get(key_slot(&self.store.settings.gateway))
-            .cloned()
-            .unwrap_or_default();
-        let (endpoint, key) = resolve(
-            &self.store.settings.gateway,
-            &self.store.settings.custom_endpoint,
-            &saved,
-        );
-        let connection = Connection {
-            endpoint,
-            model: self.model.read(cx).value().to_string(),
-            key,
-            tools: true,
-            workspace: None,
-            plan: self.plan_mode,
-            effort: self.store.settings.effort.clone(),
-            search: self.store.settings.search,
-            remote,
-            conversation: self.store.conversations[self.store.active].id,
+        let connection = match self.connection_for(self.store.active, remote, cx) {
+            Ok(connection) => connection,
+            Err(error) => {
+                self.error = Some(error);
+                cx.notify();
+                return Err(());
+            }
         };
-        if let Err(error) = backend::validate(&connection) {
-            self.error = Some(error);
-            cx.notify();
-            return Err(());
-        }
         self.store.settings.endpoint = connection.endpoint.clone();
         self.store.settings.model = connection.model.clone();
         let conversation = &mut self.store.conversations[self.store.active];
@@ -630,6 +620,10 @@ impl Chat {
             conversation.title = prompt.chars().take(40).collect();
         }
         conversation.updated = backend::now();
+        // What came in meanwhile goes first, so the prompt is read last.
+        conversation
+            .messages
+            .extend(inbox::fold(&inbox::take(conversation.id, true)));
         conversation.messages.push(Message {
             role: "user".into(),
             content: prompt,
@@ -657,6 +651,40 @@ impl Chat {
         Ok(())
     }
 
+    /// A checked connection for a turn in the session at `ix`, on the gateway
+    /// and model chosen now.
+    fn connection_for(
+        &self,
+        ix: usize,
+        remote: Option<letronna_core::chat::Remote>,
+        cx: &App,
+    ) -> std::result::Result<Connection, String> {
+        let saved = self
+            .keys
+            .get(key_slot(&self.store.settings.gateway))
+            .cloned()
+            .unwrap_or_default();
+        let (endpoint, key) = resolve(
+            &self.store.settings.gateway,
+            &self.store.settings.custom_endpoint,
+            &saved,
+        );
+        let connection = Connection {
+            endpoint,
+            model: self.model.read(cx).value().to_string(),
+            key,
+            tools: true,
+            workspace: None,
+            plan: self.plan_mode,
+            effort: self.store.settings.effort.clone(),
+            search: self.store.settings.search,
+            remote,
+            conversation: self.store.conversations[ix].id,
+        };
+        backend::validate(&connection)?;
+        Ok(connection)
+    }
+
     /// Check every half minute for a schedule that is due and run it. Only one
     /// fires per check, so a backlog drains one at a time instead of opening a
     /// dozen sessions at once.
@@ -667,6 +695,19 @@ impl Chat {
                     .timer(std::time::Duration::from_secs(30))
                     .await;
                 if this.update(cx, |this, cx| this.run_due(cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Wake an idle session whenever a notice arrives for one.
+    fn watch_inbox(cx: &mut Context<Self>) {
+        let doorbell = inbox::listen();
+        cx.spawn(async move |this, cx| {
+            while doorbell.recv().await.is_ok() {
+                if this.update(cx, |this, cx| this.wake_idle(cx)).is_err() {
                     break;
                 }
             }
@@ -817,6 +858,19 @@ impl Chat {
             agent::Next::Done => self.finish(cx),
             agent::Next::AskUser(call) => {
                 self.ask_remote(call, cx);
+                // The card shows only with its session on screen, and until
+                // it is answered no other session can start, so say which one
+                // is waiting. A chat app's session had it sent to the chat.
+                let on_screen = self.page == Page::Chat
+                    && self.streaming_id == Some(self.store.conversations[self.store.active].id);
+                if let Some(ix) = self
+                    .streaming_id
+                    .filter(|id| !on_screen && !self.remote.contains_key(id))
+                    .and_then(|id| self.store.index_of(id))
+                {
+                    let title = &self.store.conversations[ix].title;
+                    self.error = Some(format!("\"{title}\" is waiting for your answer."));
+                }
                 cx.notify()
             }
             agent::Next::Run(call) if call.name == letronna_core::tools::TODO => {
@@ -832,6 +886,11 @@ impl Chat {
                 if let Some(ix) = self.streaming_id.and_then(|id| self.store.index_of(id)) {
                     let conversation = &mut self.store.conversations[ix];
                     conversation.messages.extend(results);
+                    // After the results, which have to follow the calls they
+                    // answer, and before what you typed, so yours is read last.
+                    conversation
+                        .messages
+                        .extend(inbox::fold(&inbox::take(conversation.id, false)));
                     // What you sent while it worked goes in now: after the
                     // tool results, before the model is asked again, so it
                     // reads it before going on.
@@ -1083,7 +1142,7 @@ impl Chat {
                         .messages
                         .iter()
                         .rev()
-                        .take_while(|m| m.role != "user")
+                        .take_while(|m| m.role != "user" || m.notice)
                         .find(|m| m.role == "assistant" && !m.content.is_empty())
                 })
                 .map(|m| m.content.clone())
@@ -1271,6 +1330,7 @@ impl Chat {
                 self.send_report(title, "Stopped.".into(), cx);
             }
         }
+        self.stopping = true;
         self.finish(cx);
     }
 
@@ -1293,6 +1353,7 @@ impl Chat {
     }
 
     fn finish(&mut self, cx: &mut Context<Self>) {
+        let stopped = std::mem::take(&mut self.stopping);
         self.answer_remote(cx);
         self.report_scheduled(cx);
         let session = self.streaming_id;
@@ -1301,7 +1362,60 @@ impl Chat {
         self.turn = None;
         plugins::emit(cx, plugins::AppEvent::ChatIdle);
         self.send_follow_ups(session, cx);
+        // Stop means stop, and after a failure the next turn would most
+        // likely fail too: what is waiting goes in at the next ring or prompt.
+        if !stopped && self.error.is_none() {
+            self.wake_idle(cx);
+        }
         cx.notify();
+    }
+
+    /// Start a turn for notices that came while nothing ran: in the session
+    /// on screen if it has any, otherwise in the one waiting longest.
+    fn wake_idle(&mut self, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        let on_screen = self.store.conversations[self.store.active].id;
+        // A chat app hears only the answer to what it sent, so a turn started
+        // in its session would answer nobody; its next message takes them.
+        let wakes = |id| {
+            self.store.index_of(id).is_some() && !self.remote_session.values().any(|&s| s == id)
+        };
+        let Some(id) = woken(on_screen, &inbox::pending(), wakes) else {
+            return;
+        };
+        let Some(notice) = inbox::fold(&inbox::take(id, true)) else {
+            return;
+        };
+        self.start_in(id, notice, cx);
+    }
+
+    /// Start a turn in a session with a notice, leaving the view where it is.
+    fn start_in(&mut self, id: u64, notice: Message, cx: &mut Context<Self>) {
+        let Some(ix) = self.store.index_of(id) else {
+            return;
+        };
+        // Kept even when no turn can start, so the next prompt there reads
+        // it rather than it being lost.
+        let conversation = &mut self.store.conversations[ix];
+        conversation.updated = backend::now();
+        conversation.messages.push(notice);
+        self.unseen.insert(id);
+        self.save();
+        let connection = match self.connection_for(ix, None, cx) {
+            Ok(connection) => connection,
+            Err(error) => {
+                self.error = Some(error);
+                cx.notify();
+                return;
+            }
+        };
+        self.busy = true;
+        self.streaming_id = Some(id);
+        self.turn = Some(agent::Turn::new(connection));
+        self.error = None;
+        self.run_turn(cx);
     }
 
     /// Queue what was typed while a reply runs, for its next step. Only in
@@ -1403,6 +1517,9 @@ impl Render for Chat {
         if self.browser_for != on_screen {
             self.browser_for = on_screen;
             letronna_core::browser::show_conversation(on_screen);
+        }
+        if self.page == Page::Chat {
+            self.unseen.remove(&on_screen);
         }
         self.keep_following();
         // What a stopped or failed reply did not take goes back in the box,
@@ -1524,10 +1641,12 @@ impl Render for Chat {
             for (i, m) in messages.iter().enumerate() {
                 let is_user = m.role == "user";
                 if is_user || !assistant_turn {
+                    // A notice stands apart as your message does, but it is
+                    // nobody's prompt to change or ask again.
                     let span = Span {
                         first: i,
                         last: i,
-                        yours: is_user,
+                        yours: is_user && !m.notice,
                     };
                     turns.push((Vec::new(), span));
                 }
@@ -1552,7 +1671,7 @@ impl Render for Chat {
                 // to it is still coming in.
                 let ends = messages.get(i + 1).is_none_or(|next| next.role == "user")
                     && !(streaming_here && i + 1 == messages.len());
-                let bar = (is_user || ends).then(|| {
+                let bar = (!m.notice && (is_user || ends)).then(|| {
                     // The newest reply keeps its buttons in view; the rest
                     // show them on hover.
                     let newest = !is_user && i + 1 == messages.len();
@@ -1622,7 +1741,8 @@ impl Render for Chat {
                 // Long lines are held in by the row and code-block widths.
                 .map(|(n, (turn, span))| {
                     let group = v_flex().w_full().gap_3().group("turn").children(turn);
-                    if live_turn == Some(n) {
+                    // A notice has no menu either: it is no place to go back to.
+                    if live_turn == Some(n) || messages.get(span.first).is_some_and(|m| m.notice) {
                         return group.into_any_element();
                     }
                     // Its own id, so each turn's menu keeps its own state.
@@ -1735,4 +1855,31 @@ pub(crate) fn parse_todos(arguments: &str) -> std::result::Result<Vec<Todo>, Str
         })
         .filter(|todo| !todo.text.is_empty())
         .collect())
+}
+
+/// The session to wake, of those with notices waiting that `wakes` allows:
+/// the one on screen, else the one waiting longest.
+fn woken(on_screen: u64, pending: &[u64], wakes: impl Fn(u64) -> bool) -> Option<u64> {
+    pending
+        .iter()
+        .copied()
+        .filter(|&id| wakes(id))
+        .min_by_key(|&id| id != on_screen)
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
+    // would shadow the built-in attribute.
+    use super::woken;
+
+    #[test]
+    fn the_session_on_screen_is_woken_first() {
+        let any = |_| true;
+        assert_eq!(woken(7, &[3, 7, 5], any), Some(7));
+        assert_eq!(woken(9, &[3, 7, 5], any), Some(3));
+        assert_eq!(woken(3, &[3, 7, 5], |id| id != 3), Some(7));
+        assert_eq!(woken(3, &[3], |id| id != 3), None);
+        assert_eq!(woken(3, &[], any), None);
+    }
 }
