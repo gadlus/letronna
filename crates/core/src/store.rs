@@ -130,11 +130,18 @@ pub struct Settings {
     pub browse_unseen: bool,
 }
 
+/// Settings that are chosen as one and so saved as one: a model id belongs
+/// to its gateway and that gateway's endpoint.
+const CHOSEN_TOGETHER: [&str; 3] = ["gateway", "model", "endpoint"];
+
 #[derive(Default)]
 pub struct Store {
     pub conversations: Vec<Conversation>,
     pub active: usize,
     pub settings: Settings,
+    /// The settings as JSON when last read or written, so a save puts back
+    /// only the fields changed here since; only loading and `save` touch it.
+    pub settings_written: serde_json::Value,
 }
 
 impl Conversation {
@@ -206,11 +213,38 @@ impl Store {
             .get(self.active)
             .map(|c| c.id)
             .unwrap_or(0);
-        let bytes = serde_json::to_vec_pretty(&self.settings)?;
-        let path = settings_path();
-        let temp = path.with_extension("tmp");
-        std::fs::write(&temp, bytes)?;
-        std::fs::rename(temp, path)
+        let now = serde_json::to_value(&self.settings)?;
+        // Most saves are for a message, with no setting moved, and those are
+        // known without reading the file.
+        if now == self.settings_written {
+            return Ok(());
+        }
+        // Only what moved here goes back, so a setting the other process
+        // changed meanwhile is not put back the way this one last saw it.
+        let mut then = self.settings_written.clone();
+        // But a model goes back with the gateway it was chosen on, or the
+        // file could pair it with the one the other process chose. Only a
+        // new model or gateway does that: a send sets the endpoint again and
+        // the Custom URL is edited on its own, and neither is a pick to put
+        // back over the other process's.
+        let picked = ["gateway", "model"]
+            .iter()
+            .any(|&f| then.get(f) != now.get(f));
+        if picked && let Some(fields) = then.as_object_mut() {
+            for field in CHOSEN_TOGETHER {
+                fields.remove(field);
+            }
+            // A Custom model was listed from the Custom URL, so it goes too.
+            if self.settings.gateway == "Custom" {
+                fields.remove("custom_endpoint");
+            }
+        }
+        crate::state::update::<Settings>(&settings_path(), |disk| {
+            crate::state::merge(disk, &then, &now)
+        })
+        .map_err(std::io::Error::other)?;
+        self.settings_written = now;
+        Ok(())
     }
 
     /// Forget a session and remove its file.
@@ -529,7 +563,7 @@ impl Lock {
     /// Wait for the lock, but not forever. A process that died holding one
     /// would otherwise keep every other process out of that session for good,
     /// so a lock nobody has touched for a while is taken anyway.
-    fn take(path: &std::path::Path) -> Self {
+    pub(crate) fn take(path: &std::path::Path) -> Self {
         let lock = path.with_extension("lock");
         for _ in 0..40 {
             if std::fs::OpenOptions::new()
@@ -610,10 +644,12 @@ pub fn load_listing() -> Store {
         })
         .collect();
     conversations.sort_by_key(|c| c.updated);
+    let (settings, settings_written) = settings();
     Store {
         conversations,
         active: 0,
-        settings: settings(),
+        settings,
+        settings_written,
     }
 }
 
@@ -631,13 +667,13 @@ pub fn fill(conversation: &mut Conversation) {
     }
 }
 
-fn settings() -> Settings {
-    let mut s: Settings = std::fs::read(settings_path())
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
+/// The settings, and as JSON what the file said before a retired gateway is
+/// moved, so the move is saved like any other change.
+fn settings() -> (Settings, serde_json::Value) {
+    let mut s: Settings = crate::state::read(&settings_path()).unwrap_or_default();
+    let read = serde_json::to_value(&s).unwrap_or_default();
     retire_gateway(&mut s);
-    s
+    (s, read)
 }
 
 /// A gateway that is no longer offered moves to the Letronna account. Its
@@ -693,18 +729,17 @@ pub fn load() -> Store {
         .filter_map(|id| replay(&session_path(id)))
         .collect();
     conversations.sort_by_key(|c| c.updated);
-    let settings: Settings = std::fs::read(settings_path())
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
+    let settings: Settings = crate::state::read(&settings_path()).unwrap_or_default();
     let active = conversations
         .iter()
         .position(|c| c.id == settings.active_id)
         .unwrap_or(conversations.len().saturating_sub(1));
+    let settings_written = serde_json::to_value(&settings).unwrap_or_default();
     Store {
         conversations,
         active,
         settings,
+        settings_written,
     }
 }
 
@@ -753,6 +788,7 @@ fn migrate() {
             // Settings that did not exist when the old file was written.
             ..Default::default()
         },
+        ..Default::default()
     };
     store.assign_ids();
     if store.save().is_ok() {
@@ -768,7 +804,37 @@ pub fn keys_path() -> PathBuf {
 /// here worth stealing.
 pub fn save_keys(keys: &std::collections::HashMap<String, String>) -> std::io::Result<()> {
     std::fs::create_dir_all(backend::data_dir())?;
-    write_private(&keys_path(), &serde_json::to_vec_pretty(keys)?)
+    let keys = serde_json::to_value(keys)?;
+    crate::state::update::<std::collections::HashMap<String, String>>(&keys_path(), |disk| {
+        *disk = keys
+    })
+    .map_err(std::io::Error::other)
+}
+
+/// Put one key in the keys file, or with `None` take it out, leaving every
+/// other slot as the file has it, and give back the keys it then holds.
+pub fn save_key(
+    slot: &str,
+    key: Option<&str>,
+) -> std::io::Result<std::collections::HashMap<String, String>> {
+    std::fs::create_dir_all(backend::data_dir())?;
+    let mut saved = serde_json::Value::Null;
+    crate::state::update::<std::collections::HashMap<String, String>>(&keys_path(), |disk| {
+        match (disk.as_object_mut(), key) {
+            (Some(keys), Some(key)) => {
+                keys.insert(slot.to_owned(), key.into());
+            }
+            (Some(keys), None) => {
+                keys.remove(slot);
+            }
+            (None, Some(key)) => *disk = serde_json::json!({ slot: key }),
+            (None, None) => {}
+        }
+        saved = disk.clone();
+    })
+    .map_err(std::io::Error::other)?;
+    // Null, with no file and nothing to put in one, is no keys.
+    Ok(serde_json::from_value(saved).unwrap_or_default())
 }
 
 /// Write a file only its owner may read: the keys, the sign-in, bot tokens.
@@ -795,10 +861,7 @@ pub fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()
 }
 
 pub fn load_keys() -> std::collections::HashMap<String, String> {
-    std::fs::read(keys_path())
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+    crate::state::read(&keys_path()).unwrap_or_default()
 }
 
 pub fn bucket(updated: u64, now: u64) -> &'static str {
@@ -1191,6 +1254,180 @@ mod tests {
         listed.save().unwrap();
         let back = replay(&dir.join("sessions/1.jsonl")).unwrap();
         assert!(back.messages.is_empty());
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_setting_changed_in_one_process_survives_the_other_saving() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("settings-merge");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let path = dir.join("settings.json");
+        // Laid out by hand, not the way a save lays it out.
+        let by_hand = "{\"endpoint\":\"\",\"model\":\"a/one\"}";
+        std::fs::write(&path, by_hand).unwrap();
+
+        // The window and the terminal, both started from that file.
+        let mut window = load_listing();
+        let mut terminal = load_listing();
+        // Saving with no setting changed leaves the file as it was.
+        window.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), by_hand);
+
+        terminal.settings.model = "b/two".into();
+        terminal.save().unwrap();
+        window.settings.effort = "high".into();
+        window.save().unwrap();
+        let back = load_listing().settings;
+        assert_eq!(
+            (back.model.as_str(), back.effort.as_str()),
+            ("b/two", "high")
+        );
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_settings_file_that_will_not_parse_is_kept_beside_the_new_one() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("settings-corrupt");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let torn = "{\"endpoint\":\"\",\"model\":\"a/one\",\"gatew";
+        std::fs::write(dir.join("settings.json"), torn).unwrap();
+
+        let mut store = load_listing();
+        assert!(store.settings.model.is_empty());
+        store.settings.model = "b/two".into();
+        store.save().unwrap();
+
+        let aside: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|p| p.to_string_lossy().contains("settings.json.corrupt-"))
+            .collect();
+        assert_eq!(aside.len(), 1);
+        assert_eq!(std::fs::read_to_string(&aside[0]).unwrap(), torn);
+        assert_eq!(load_listing().settings.model, "b/two");
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_model_is_saved_with_the_gateway_it_was_chosen_on() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("settings-pair");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        std::fs::write(
+            dir.join("settings.json"),
+            "{\"endpoint\":\"https://api.openai.com/v1\",\"model\":\"gpt-a\",\"gateway\":\"OpenAI\"}",
+        )
+        .unwrap();
+
+        let mut window = load_listing();
+        let mut terminal = load_listing();
+        terminal.settings.gateway = "OpenRouter".into();
+        terminal.settings.model = "x/y".into();
+        terminal.save().unwrap();
+        // The window picks another model on the gateway it was already on.
+        window.settings.model = "gpt-b".into();
+        window.save().unwrap();
+        let back = load_listing().settings;
+        assert_eq!(
+            (back.gateway.as_str(), back.model.as_str()),
+            ("OpenAI", "gpt-b")
+        );
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_new_endpoint_or_custom_url_alone_leaves_the_other_process_model_be() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("settings-endpoint");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        // The terminal's /model leaves the endpoint as it was, here empty.
+        std::fs::write(
+            dir.join("settings.json"),
+            "{\"endpoint\":\"\",\"model\":\"gpt-a\",\"gateway\":\"OpenAI\"}",
+        )
+        .unwrap();
+
+        let mut window = load_listing();
+        let mut terminal = load_listing();
+        terminal.settings.gateway = "OpenRouter".into();
+        terminal.settings.model = "x/y".into();
+        terminal.save().unwrap();
+        // The window edits the Custom URL, then sends, which sets the
+        // endpoint of the gateway it is still on.
+        window.settings.custom_endpoint = "http://localhost:8000/v1".into();
+        window.save().unwrap();
+        window.settings.endpoint = "https://api.openai.com/v1".into();
+        window.save().unwrap();
+        let back = load_listing().settings;
+        assert_eq!(
+            (
+                back.gateway.as_str(),
+                back.model.as_str(),
+                back.custom_endpoint.as_str()
+            ),
+            ("OpenRouter", "x/y", "http://localhost:8000/v1")
+        );
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_custom_model_is_saved_with_the_custom_url_it_was_listed_from() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("settings-custom");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        std::fs::write(
+            dir.join("settings.json"),
+            "{\"endpoint\":\"\",\"model\":\"gpt-a\",\"gateway\":\"OpenAI\",\"custom_endpoint\":\"http://one/v1\"}",
+        )
+        .unwrap();
+
+        let mut window = load_listing();
+        let mut terminal = load_listing();
+        terminal.settings.custom_endpoint = "http://two/v1".into();
+        terminal.save().unwrap();
+        // The window picks a model from the list it loaded from the old URL.
+        window.settings.gateway = "Custom".into();
+        window.settings.model = "local/m".into();
+        window.save().unwrap();
+        let back = load_listing().settings;
+        assert_eq!(
+            (back.model.as_str(), back.custom_endpoint.as_str()),
+            ("local/m", "http://one/v1")
+        );
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_key_saved_for_one_slot_leaves_every_other_slot_as_the_file_has_it() {
+        use std::collections::HashMap;
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("keys-slot");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let path = dir.join("keys.json");
+        // Saved by the terminal after the window last read the file.
+        std::fs::write(&path, "{\"OpenAI\":\"sk-1\",\"Custom\":\"c-2\"}").unwrap();
+
+        let saved = super::save_key("OpenRouter", Some("or-3")).unwrap();
+        let all = HashMap::from([
+            ("OpenAI".to_owned(), "sk-1".to_owned()),
+            ("Custom".to_owned(), "c-2".to_owned()),
+            ("OpenRouter".to_owned(), "or-3".to_owned()),
+        ]);
+        assert_eq!(saved, all);
+        assert_eq!(super::load_keys(), all);
+
+        // Taking a key out takes out that slot and nothing else.
+        let saved = super::save_key("Custom", None).unwrap();
+        assert_eq!(saved.len(), 2);
+        assert!(!saved.contains_key("Custom"));
+        assert_eq!(super::load_keys(), saved);
+
+        // With no file, taking a key out writes none.
+        std::fs::remove_file(&path).unwrap();
+        assert!(super::save_key("OpenAI", None).unwrap().is_empty());
+        assert!(!path.exists());
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 }

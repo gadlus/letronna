@@ -49,7 +49,7 @@ impl Chat {
         } else {
             self.keys.insert(slot.to_owned(), address);
         }
-        self.write_keys();
+        self.write_keys(slot);
         letronna_core::browser::restart();
         cx.notify();
     }
@@ -61,14 +61,12 @@ impl Chat {
         self.save_browser_address(cx);
     }
 
-    fn write_keys(&mut self) {
-        if std::fs::create_dir_all(backend::data_dir())
-            .and_then(|_| {
-                std::fs::write(keys_path(), serde_json::to_vec_pretty(&self.keys).unwrap())
-            })
-            .is_err()
-        {
-            self.error = Some("Could not save the API key.".into());
+    /// Save the window's key for `slot`, or its removal, and nothing else, so
+    /// a key the terminal saved meanwhile is kept and seen here too.
+    fn write_keys(&mut self, slot: &str) {
+        match save_key(slot, self.keys.get(slot).map(String::as_str)) {
+            Ok(keys) => self.keys = keys,
+            Err(_) => self.error = Some("Could not save the API key.".into()),
         }
     }
 
@@ -89,7 +87,7 @@ impl Chat {
         } else {
             self.keys.insert(slot, key);
         }
-        self.write_keys();
+        self.write_keys(key_slot(&editing));
         self.save();
         self.gateway_pick.update(cx, |g, cx| {
             g.clear();
@@ -109,7 +107,7 @@ impl Chat {
         if gateway(name).base.is_empty() {
             self.store.settings.custom_endpoint.clear();
         }
-        self.write_keys();
+        self.write_keys(key_slot(name));
         self.save();
         self.gateway_pick.update(cx, |g, cx| {
             g.clear();
@@ -176,7 +174,7 @@ impl Chat {
             } else {
                 self.keys.insert(service.name.to_owned(), key);
             }
-            self.write_keys();
+            self.write_keys(service.name);
         }
         choice.service = service.name.to_owned();
         if let Err(error) = letronna_core::search::choose(&choice) {
@@ -198,7 +196,7 @@ impl Chat {
         let mut choice = letronna_core::search::choice();
         choice.set_address(service, "");
         if self.keys.remove(name).is_some() {
-            self.write_keys();
+            self.write_keys(name);
         }
         if choice.service == name {
             choice.service.clear();
