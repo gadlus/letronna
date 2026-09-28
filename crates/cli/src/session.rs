@@ -178,7 +178,7 @@ impl Runner {
                 out.end();
                 // Catch up on anything a throttled paint skipped.
                 crate::screen::settle();
-                result?;
+                result.map_err(|failure| failure.to_string())?;
                 break;
             }
         }
