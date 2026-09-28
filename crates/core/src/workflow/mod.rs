@@ -24,6 +24,7 @@
 //! kept fresh only while the run is really being driven, and one nobody has
 //! touched for two minutes belongs to a run that is gone and can be taken over.
 
+pub mod host;
 mod journal;
 
 use crate::agent_defs::{self, AgentDef};
@@ -839,13 +840,13 @@ mod tests {
 
     /// Letronna's data and a project folder, both the test's own, kept from
     /// other tests until dropped.
-    struct Data {
+    pub(super) struct Data {
         dir: PathBuf,
         _locks: [MutexGuard<'static, ()>; 2],
     }
 
     impl Data {
-        fn new(name: &str) -> Self {
+        pub(super) fn new(name: &str) -> Self {
             let locks = [
                 crate::store::tests::DATA_DIR
                     .lock()
@@ -866,7 +867,7 @@ mod tests {
         }
 
         /// The session's connection, to the provider at `endpoint`.
-        fn connection(&self, endpoint: &str) -> Connection {
+        pub(super) fn connection(&self, endpoint: &str) -> Connection {
             Connection {
                 endpoint: endpoint.into(),
                 model: "test-model".into(),
@@ -879,7 +880,7 @@ mod tests {
 
         /// A new run, or run `resume` picked up, whose agents never reach a
         /// model: `spawn` stands in for the driver.
-        fn run(&self, resume: Option<&str>, spawn: Spawn) -> Run {
+        pub(super) fn run(&self, resume: Option<&str>, spawn: Spawn) -> Run {
             let connection = self.connection("http://127.0.0.1:9/v1");
             let mut run = Run::open(
                 resume,
@@ -895,7 +896,7 @@ mod tests {
         }
 
         /// The lines of run `name`'s journal that parse.
-        fn journal(&self, name: &str) -> Vec<Value> {
+        pub(super) fn journal(&self, name: &str) -> Vec<Value> {
             std::fs::read_to_string(self.folder(name).join("journal.jsonl"))
                 .unwrap()
                 .lines()
@@ -903,7 +904,7 @@ mod tests {
                 .collect()
         }
 
-        fn folder(&self, name: &str) -> PathBuf {
+        pub(super) fn folder(&self, name: &str) -> PathBuf {
             self.dir.join("data").join("workflows").join(name)
         }
     }
@@ -929,7 +930,7 @@ mod tests {
         lines.join("\n")
     }
 
-    fn report(status: Outcome, text: &str) -> Report {
+    pub(super) fn report(status: Outcome, text: &str) -> Report {
         Report {
             status,
             text: text.into(),
@@ -944,16 +945,16 @@ mod tests {
     }
 
     /// What every stand-in agent answers.
-    fn done(task: &str) -> Report {
+    pub(super) fn done(task: &str) -> Report {
         report(Outcome::Done, &format!("{task} -> done"))
     }
 
     /// Tasks the agents of a run were given, in the order they started.
-    type Asked = Arc<Mutex<Vec<String>>>;
+    pub(super) type Asked = Arc<Mutex<Vec<String>>>;
 
     /// Stands in for the driver: each agent is answered with what `answer`
     /// makes of its task, on a thread of its own, and its task kept in `asked_for`.
-    fn answering(asked_for: &Asked, answer: fn(&str) -> Report) -> Spawn {
+    pub(super) fn answering(asked_for: &Asked, answer: fn(&str) -> Report) -> Spawn {
         let log = asked_for.clone();
         Box::new(move |spec, then| {
             let task = asked(&spec);
@@ -1099,7 +1100,10 @@ mod tests {
     /// A provider on this machine that takes `count` requests one after the
     /// other, answering each with `reply` of what it was sent, and says how
     /// many it took.
-    fn provider(count: usize, reply: fn(&str) -> &'static str) -> (String, JoinHandle<usize>) {
+    pub(super) fn provider(
+        count: usize,
+        reply: fn(&str) -> &'static str,
+    ) -> (String, JoinHandle<usize>) {
         let server = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}/v1", server.local_addr().unwrap());
         let worker = std::thread::spawn(move || {

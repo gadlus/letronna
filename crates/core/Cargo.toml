@@ -19,9 +19,12 @@ semver = "1"
 # Discord's Gateway, for hearing server mentions as they happen. Blocking
 # like reqwest here, and on the same rustls.
 tungstenite = { version = "0.30", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
+# Runs workflow scripts: QuickJS, in C built by cc, which ring already
+# needs. It can be stopped from outside and held to a heap and a stack.
+rquickjs = { version = "0.14", optional = true }
 
 [features]
 default = ["workflows"]
 # Orchestration scripts that run many agents at once. On by default, so CI
 # builds, lints and tests it; a build without it leaves the runtime out.
-workflows = []
+workflows = ["dep:rquickjs"]
