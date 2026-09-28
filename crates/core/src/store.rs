@@ -70,6 +70,46 @@ pub struct Todo {
     pub status: String,
 }
 
+/// Replace `todos` with the checklist a `todo` call sends and answer the
+/// call with how far along it is; a call that cannot be read changes nothing.
+pub fn apply_todo(todos: &mut Vec<Todo>, arguments: &str) -> Result<String, String> {
+    *todos = parse_todos(arguments)?;
+    let done = todos.iter().filter(|t| t.status == "done").count();
+    Ok(format!(
+        "Checklist updated: {done} of {} done.",
+        todos.len()
+    ))
+}
+
+/// The checklist the last readable `todo` call in `messages` set, or none.
+pub fn todos_in(messages: &[Message]) -> Vec<Todo> {
+    // One that cannot be read changed nothing, as `apply_todo` has it, so the
+    // one before it still stands.
+    messages
+        .iter()
+        .rev()
+        .flat_map(|m| m.tool_calls.iter().rev())
+        .filter(|call| call.name == crate::tools::TODO)
+        .find_map(|call| parse_todos(&call.arguments).ok())
+        .unwrap_or_default()
+}
+
+/// The checklist a `todo` call sets, from its arguments.
+fn parse_todos(arguments: &str) -> Result<Vec<Todo>, String> {
+    let args = crate::tools::parse_args(arguments)?;
+    let items = args["items"]
+        .as_array()
+        .ok_or_else(|| "`items` is required.".to_owned())?;
+    Ok(items
+        .iter()
+        .map(|item| Todo {
+            text: item["text"].as_str().unwrap_or_default().to_owned(),
+            status: item["status"].as_str().unwrap_or("pending").to_owned(),
+        })
+        .filter(|todo| !todo.text.is_empty())
+        .collect())
+}
+
 /// A line in a session file.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -831,8 +871,11 @@ mod tests {
     // would shadow the built-in attribute.
     #[cfg(unix)]
     use super::write_private;
-    use super::{Conversation, Store, Todo, fill, load_listing, replay, search_in, summaries};
-    use crate::chat::Message;
+    use super::{
+        Conversation, Store, Todo, apply_todo, fill, load_listing, replay, search_in, summaries,
+        todos_in,
+    };
+    use crate::chat::{Message, ToolCall};
 
     /// Held by every test that points `AGENT_DATA_DIR` somewhere: it is one
     /// variable for the whole process, and tests run side by side.
@@ -1192,5 +1235,61 @@ mod tests {
         let back = replay(&dir.join("sessions/1.jsonl")).unwrap();
         assert!(back.messages.is_empty());
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_todo_call_sets_the_whole_checklist_and_says_how_far_along_it_is() {
+        let mut todos = vec![Todo {
+            text: "an old plan".into(),
+            status: "doing".into(),
+        }];
+        let said = apply_todo(
+            &mut todos,
+            r#"{"items":[{"text":"read","status":"done"},{"text":"write"},{"text":"","status":"doing"}]}"#,
+        );
+        assert_eq!(said.unwrap(), "Checklist updated: 1 of 2 done.");
+        // A missing status is still to do, and an item with no words is dropped.
+        let items: Vec<_> = todos
+            .iter()
+            .map(|t| (t.text.as_str(), t.status.as_str()))
+            .collect();
+        assert_eq!(items, [("read", "done"), ("write", "pending")]);
+    }
+
+    #[test]
+    fn a_todo_call_that_cannot_be_read_leaves_the_checklist_as_it_was() {
+        let plan = vec![Todo {
+            text: "step".into(),
+            status: "doing".into(),
+        }];
+        let mut todos = plan.clone();
+        assert_eq!(
+            apply_todo(&mut todos, r#"{"text":"step"}"#).unwrap_err(),
+            "`items` is required."
+        );
+        assert!(apply_todo(&mut todos, r#"{"items":[{"text":"#).is_err());
+        assert!(todos == plan);
+    }
+
+    #[test]
+    fn the_checklist_is_the_last_one_left_standing() {
+        let todo = |items: &str| Message {
+            role: "assistant".into(),
+            tool_calls: vec![ToolCall {
+                id: "call".into(),
+                name: crate::tools::TODO.into(),
+                arguments: format!(r#"{{"items":[{items}]}}"#),
+            }],
+            ..Default::default()
+        };
+        let first = todo(r#"{"text":"plan","status":"done"}"#);
+        let second = todo(r#"{"text":"build","status":"doing"}"#);
+        assert_eq!(todos_in(&[first.clone(), second.clone()])[0].text, "build");
+        assert_eq!(todos_in(&[first])[0].text, "plan");
+        assert!(todos_in(&[]).is_empty());
+        // A call that could not be read changed nothing, so the one before stands.
+        let mut garbled = second.clone();
+        garbled.tool_calls[0].arguments = r#"{"items":"[{\"text\":\"lost\"}]"}"#.into();
+        assert_eq!(todos_in(&[second, garbled])[0].text, "build");
     }
 }

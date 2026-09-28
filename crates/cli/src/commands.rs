@@ -637,7 +637,11 @@ fn take_back(
     workspace: Option<&std::path::Path>,
 ) -> Option<String> {
     let (at, prompt) = last_prompt(&runner.store.conversations[session].messages)?;
-    runner.store.conversations[session].rewind(at);
+    let conversation = &mut runner.store.conversations[session];
+    conversation.rewind(at);
+    // The checklist is the one the last `todo` left standing.
+    conversation.todos = store::todos_in(&conversation.messages);
+    runner.bar.set_plan(&conversation.todos);
     // What was taken back is still on the screen, where a note saying it is
     // gone would contradict it. Draw the session again from what is left,
     // the way opening it does.

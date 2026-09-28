@@ -780,8 +780,9 @@ impl Tool for AskUser {
     }
 }
 
-/// A checklist the model keeps for itself. The app stores the items on the
-/// conversation and draws them above the composer; see `Chat::apply_todo`.
+/// A checklist the model keeps for itself. The window and the terminal store
+/// the items on the conversation and draw them above where you type; see
+/// `store::apply_todo`.
 struct Todo;
 impl Tool for Todo {
     fn name(&self) -> &'static str {

@@ -1084,21 +1084,14 @@ impl Chat {
 
     /// Store the model's checklist on the session so the composer can show it.
     fn apply_todo(&mut self, arguments: &str, cx: &mut Context<Self>) {
-        let result = parse_todos(arguments).map(|todos| {
-            let done = todos.iter().filter(|t| t.status == "done").count();
-            (todos, done)
-        });
-        let message = match result {
-            Ok((todos, done)) => {
-                let total = todos.len();
-                if let Some(ix) = self.streaming_id.and_then(|id| self.store.index_of(id)) {
-                    self.store.conversations[ix].todos = todos;
-                    self.save();
-                }
-                Ok(format!("Checklist updated: {done} of {total} done."))
-            }
-            Err(error) => Err(error),
-        };
+        let mut todos = Vec::new();
+        let message = letronna_core::store::apply_todo(&mut todos, arguments);
+        if message.is_ok()
+            && let Some(ix) = self.streaming_id.and_then(|id| self.store.index_of(id))
+        {
+            self.store.conversations[ix].todos = todos;
+            self.save();
+        }
         self.record_result(message, cx);
     }
 
@@ -1583,20 +1576,4 @@ impl Render for Chat {
             .children(self.settings_overlay(window, cx))
             .children(Root::render_dialog_layer(window, cx))
     }
-}
-
-/// The checklist a `todo` call sets, from its arguments.
-pub(crate) fn parse_todos(arguments: &str) -> std::result::Result<Vec<Todo>, String> {
-    let args = letronna_core::tools::parse_args(arguments)?;
-    let items = args["items"]
-        .as_array()
-        .ok_or_else(|| "`items` is required.".to_owned())?;
-    Ok(items
-        .iter()
-        .map(|item| Todo {
-            text: item["text"].as_str().unwrap_or_default().to_owned(),
-            status: item["status"].as_str().unwrap_or("pending").to_owned(),
-        })
-        .filter(|todo| !todo.text.is_empty())
-        .collect())
 }
