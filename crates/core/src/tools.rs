@@ -304,6 +304,10 @@ fn resolve_write_in(
         .as_ref()
         .ok_or("No project folder is attached. Ask the user to attach one first.")?;
     let root = std::fs::canonicalize(workspace).map_err(|_| "The project folder is missing.")?;
+    // Before the probe below touches it: on Windows the touch is the harm.
+    if let Some(why) = crate::paths::unsafe_raw(raw, Some(workspace)) {
+        return Err(format!("`{raw}` {why}; it stays out of reach."));
+    }
     // Refused, not folded: on Linux and macOS a missing folder hid the `..`
     // after it from the check below, so `new/../../x` was written beside the
     // project. Folding by hand would judge `link/..` unlike the system, which
@@ -883,6 +887,11 @@ fn home() -> Option<PathBuf> {
 /// Resolve a user-supplied path and refuse anything outside the workspace or
 /// the home folder. Canonicalising also defeats `..` and symlink escapes.
 pub(crate) fn resolve(raw: &str, ctx: &ToolContext) -> Result<PathBuf, String> {
+    // Before canonicalising, which opens the path: on Windows that alone
+    // signs in to another computer, and these reads never ask first.
+    if let Some(why) = crate::paths::unsafe_raw(raw, ctx.workspace.as_deref()) {
+        return Err(format!("`{raw}` {why}; it stays out of reach."));
+    }
     let base = ctx.workspace.clone().or_else(home).unwrap_or_default();
     let joined = base.join(raw);
     let path = std::fs::canonicalize(&joined).map_err(|_| format!("`{raw}` does not exist."))?;
@@ -1585,6 +1594,51 @@ World"
         let refused = WriteFile.run(&args, &ctx).unwrap_err();
         assert!(refused.contains("leads nowhere"), "{refused}");
         assert!(!data.join("mcp.json").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_network_path_is_refused_before_it_is_touched() {
+        let dir = std::env::temp_dir().join(format!("letronna-network-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("notes.txt"), "kept").unwrap();
+        let me = dir.join("bin").join("letronna.exe");
+        std::fs::write(&me, "program").unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        // `.invalid` never resolves, so a regression fails here rather than
+        // reaching a real computer.
+        for path in [
+            r"\\nowhere.invalid\share\a.txt",
+            "//nowhere.invalid/share/a.txt",
+        ] {
+            let refused = resolve(path, &ctx).unwrap_err();
+            assert!(refused.contains("another computer"), "{path}: {refused}");
+            let refused = resolve_write(path, &ctx).unwrap_err();
+            assert!(refused.contains("another computer"), "{path}: {refused}");
+        }
+        // The file reads by its plain name, so only the check refuses it by
+        // its device name.
+        let plain = ReadFile.run(&json!({"path": "notes.txt"}), &ctx).unwrap();
+        assert_eq!(plain, "kept");
+        let device = format!(r"\\?\{}", dir.join("notes.txt").display());
+        let refused = ReadFile.run(&json!({"path": device}), &ctx).unwrap_err();
+        assert!(refused.contains("device path"), "{refused}");
+        // Windows writes both as `letronna.new.exe`, the update later moved
+        // over the program, but the own-program check saw the name with its
+        // dot or stream still on and let them through.
+        let data = dir.join("Letronna");
+        for (path, reason) in [
+            ("bin/letronna.new.exe.", "dot or a space"),
+            ("bin/letronna.new.exe::$DATA", "hidden stream"),
+        ] {
+            let refused = resolve_write_in(path, &ctx, &data, Some(&me)).unwrap_err();
+            assert!(refused.contains(reason), "{path}: {refused}");
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

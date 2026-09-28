@@ -318,6 +318,28 @@ pub fn saved(result: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// The tools whose results start with `SAVED` and the file they wrote.
+const SAVERS: [&str; 4] = ["make_image", "speak", "make_video", crate::browser::BROWSE];
+
+/// The file `tool`'s result says it saved, believed only from `SAVERS`, and
+/// from browse only when Windows would open it as a plain file.
+pub fn saved_by(tool: &str, result: &str) -> Option<PathBuf> {
+    // Any other result -- a file read out, a command's output -- can start
+    // with the same words, and the window would then open that path.
+    if !SAVERS.contains(&tool) {
+        return None;
+    }
+    let path = saved(result)?;
+    // A page's title heads browse's listing, so a page can write this line
+    // and name any share. The media tools write theirs themselves, into the
+    // project, which may sit on a share of its own.
+    let named_by_page = tool == crate::browser::BROWSE;
+    if named_by_page && crate::paths::unsafe_raw(&path.to_string_lossy(), None).is_some() {
+        return None;
+    }
+    Some(path)
+}
+
 /// What the hosted models make besides text, as the model menus name each
 /// kind, in the order they list them.
 pub const KINDS: [(&str, &str); 4] = [
@@ -771,6 +793,29 @@ mod tests {
         assert_eq!(saved(&result), Some(first));
         assert_eq!(saved("Transcript of `a.mp3`:"), None);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_saved_file_is_believed_only_from_a_tool_that_saves_and_from_a_page_never_on_a_share() {
+        let result = "Saved to media/a-cat.png\nA 1 KB image.";
+        for name in SAVERS {
+            assert!(crate::tools::find(name).is_some(), "{name} missing");
+            assert_eq!(
+                saved_by(name, result),
+                Some(PathBuf::from("media/a-cat.png"))
+            );
+        }
+        for name in ["read_file", "run_command", "web_fetch", "transcribe"] {
+            assert_eq!(saved_by(name, result), None, "{name}");
+        }
+        let share = r"Saved to \\nowhere.invalid\s\a.png — https://example.com";
+        assert_eq!(saved_by("browse", share).is_none(), cfg!(windows));
+        // What the media tools made in a project on a share is still shown.
+        let made = r"Saved to \\nas\p\app\media\a-cat.png";
+        assert_eq!(
+            saved_by("make_image", made),
+            Some(PathBuf::from(r"\\nas\p\app\media\a-cat.png"))
+        );
     }
 
     #[test]

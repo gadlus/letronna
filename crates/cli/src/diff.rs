@@ -33,6 +33,9 @@ pub fn of(name: &str, args: &str, ctx: &ToolContext) -> Option<Vec<String>> {
             let old = ctx
                 .workspace
                 .as_ref()
+                // Read before the user answers, so a path Windows would take
+                // to another computer is shown as new rather than read.
+                .filter(|root| letronna_core::paths::unsafe_raw(path, Some(root)).is_none())
                 .map(|root| root.join(path))
                 .and_then(|full| std::fs::read_to_string(full).ok())
                 .unwrap_or_default();
@@ -247,5 +250,26 @@ mod tests {
                 .iter()
                 .any(|r| matches!(r, Row::Same(text) if text.contains("unchanged")))
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_device_path_is_not_read_for_the_preview() {
+        let dir = std::env::temp_dir().join(format!("letronna-preview-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("old.txt"), "unread_before").unwrap();
+        let ctx = letronna_core::tools::ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let shown = |path: String| {
+            let args = serde_json::json!({"path": path, "content": "new"}).to_string();
+            super::of("write_file", &args, &ctx).unwrap().join("\n")
+        };
+        // Named plainly the file is read, so only the check leaves it unread.
+        assert!(shown("old.txt".into()).contains("unread_before"));
+        let device = format!(r"\\?\{}", dir.join("old.txt").display());
+        assert!(!shown(device).contains("unread_before"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
