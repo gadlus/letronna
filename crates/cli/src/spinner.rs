@@ -114,6 +114,14 @@ impl Waiting {
         }
     }
 
+    /// The same wait under another name, its clock still running.
+    pub fn renamed(self, what: &str) -> Self {
+        Self {
+            about: Some(what.to_owned()),
+            ..self
+        }
+    }
+
     /// The line as it should look now.
     pub fn line(&self) -> String {
         let elapsed = self.began.elapsed();
@@ -159,5 +167,14 @@ mod tests {
     #[test]
     fn the_line_says_something_from_the_first_moment() {
         assert!(!Waiting::new().line().trim().is_empty());
+    }
+
+    #[test]
+    fn a_renamed_wait_keeps_its_clock() {
+        let wait = Waiting::about("read_file(a) and 1 more");
+        let began = wait.began;
+        let wait = wait.renamed("read_file(b)");
+        assert_eq!(wait.began, began);
+        assert_eq!(wait.about.as_deref(), Some("read_file(b)"));
     }
 }
