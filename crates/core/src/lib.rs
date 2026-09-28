@@ -21,6 +21,7 @@ pub mod driver;
 pub mod gateway;
 pub mod inbox;
 pub mod jobs;
+pub mod limits;
 pub mod mcp;
 pub mod media;
 pub mod memory;
