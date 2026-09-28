@@ -103,7 +103,8 @@ impl Chat {
                         h_flex()
                             .gap_1()
                             .items_center()
-                            .child(short)
+                            // A long model name gives way before the text does.
+                            .child(div().max_w(px(160.)).truncate().child(short))
                             .child(Icon::new(IconName::ChevronDown).size_3()),
                     )
                     .on_click(cx.listener(|this, _, window, cx| {
@@ -377,7 +378,9 @@ impl Chat {
         )
     }
 
-    pub(crate) fn composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The box a message is written in, with its controls. `compact` puts
+    /// the controls under the text, for a narrow pane.
+    pub(crate) fn composer(&self, compact: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let chat = cx.entity();
         let attach = Button::new("attach")
             .plain(cx)
@@ -426,25 +429,14 @@ impl Chat {
                             }),
                     )
             });
-        h_flex()
-            .w_full()
+        // Open while a reply streams, so the next message can be written
+        // in the meantime; `send` holds it until the reply is done.
+        let input = div()
+            .min_w_0()
+            .child(Input::new(&self.composer).w_full().appearance(false));
+        let controls = h_flex()
             .items_center()
             .gap_1()
-            .rounded(cx.theme().radius)
-            .border_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().secondary.opacity(0.4))
-            .px_2()
-            .py_1()
-            .child(attach)
-            // Open while a reply streams, so the next message can be written
-            // in the meantime; `send` holds it until the reply is done.
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(Input::new(&self.composer).w_full().appearance(false)),
-            )
             .child(
                 Button::new("plan-mode")
                     .plain(cx)
@@ -527,6 +519,33 @@ impl Chat {
                     .icon(Icon::new(IconName::ArrowUp))
                     .tooltip("Send (Enter)")
                     .on_click(cx.listener(|this, _, window, cx| this.send(window, cx)))
-            })
+            });
+        let frame = if compact {
+            v_flex()
+        } else {
+            h_flex().items_center()
+        }
+        .w_full()
+        .gap_1()
+        .rounded(cx.theme().radius)
+        .border_1()
+        .border_color(cx.theme().border)
+        .bg(cx.theme().secondary.opacity(0.4))
+        .px_2()
+        .py_1();
+        // Narrow, the text takes the whole width and the controls go under
+        // it, rather than the text being squeezed to a few words a line.
+        if compact {
+            frame.child(input.w_full()).child(
+                h_flex()
+                    .items_center()
+                    .gap_1()
+                    .child(attach)
+                    .child(div().flex_1())
+                    .child(controls),
+            )
+        } else {
+            frame.child(attach).child(input.flex_1()).child(controls)
+        }
     }
 }

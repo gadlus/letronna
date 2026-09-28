@@ -1554,7 +1554,7 @@ impl Render for Chat {
                         .px_6()
                         .pb_2()
                         .children(self.todo_panel(cx))
-                        .child(self.composer(cx)),
+                        .child(self.composer(pane < px(600.), cx)),
                 )
             })
             .child(self.status_bar(cx))
