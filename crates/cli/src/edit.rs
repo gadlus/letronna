@@ -279,7 +279,9 @@ impl Line {
                 self.draft = self.text.clone();
                 Some(newest)
             }
-            (None, _) => None,
+            // Nothing is newer than the line being written, so it stays put
+            // rather than being swapped for an empty draft.
+            (None, _) => return,
             (Some(0), -1) => Some(0),
             (Some(at), -1) => Some(at - 1),
             (Some(at), _) if at >= newest => None,
@@ -430,6 +432,16 @@ three"
         // Forward past the newest brings the half-written line back.
         line.down();
         assert_eq!(line.text(), "half");
+    }
+
+    #[test]
+    fn down_on_a_line_not_recalled_leaves_it_alone() {
+        let mut line = typed("first prompt");
+        line.take();
+        // As a queued line is brought back into the box.
+        line.set("and the tests");
+        line.down();
+        assert_eq!(line.text(), "and the tests");
     }
 
     #[test]
