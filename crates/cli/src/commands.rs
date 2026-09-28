@@ -49,7 +49,7 @@ pub fn command(
             runner.bar.set_footer(note);
             render::blank();
             render::line(&render::dim(if runner.plan {
-                "Plan mode on: reads and searches, never writes or runs."
+                "Plan mode on: reads, searches and runs read-only commands, never edits your files."
             } else {
                 "Plan mode off."
             }));

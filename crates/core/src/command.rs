@@ -18,7 +18,7 @@
 //! It is a floor under mistakes, not a sandbox: a script set on harm has ways
 //! past any table.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Longer than this, a line is more than anyone reads on a card, so it
 /// counts as opaque whatever it holds; it is still scanned to the end, so
@@ -28,6 +28,10 @@ const LONG: usize = 10_000;
 /// `powershell -c` inside `sh -c`, before the rest counts as opaque; real
 /// commands rarely nest two.
 const DEPTH: u8 = 4;
+/// How many folder entries a reader's glob may be matched against before
+/// the command asks instead; a project folder has far fewer, and a walk of
+/// a whole tree for `findstr /s` stops there.
+const GLOB_ENTRIES: usize = 10_000;
 
 const WIPE: Risk = Risk::Hardline("formats or wipes a disk");
 const POWER: Risk = Risk::Hardline("shuts down or restarts the computer");
@@ -74,11 +78,117 @@ const ALIASES: &[(&str, &str)] = &[
     ("ksh", "sh"),
 ];
 
-/// Commands that only read and print, by the names `name_of` gives them.
-const READERS: &[&str] = &["ls", "cat", "head", "wc", "grep", "rg"];
+/// Commands that only read and print, by the names `name_of` gives them;
+/// `find`, `grep`, `rg` and `git` are only readers without the options
+/// `reads` looks for.
+const READERS: &[&str] = &[
+    "ls", "cat", "head", "tail", "wc", "grep", "rg", "find", "git",
+];
 
-/// Where a reader's output may go and still write nothing.
-const NOWHERE: &[&str] = &["/dev/null", "nul", "$null"];
+/// The readers that print what is in files rather than their names or a
+/// count, so a secret file is kept from them even through a glob.
+const CONTENTS: &[&str] = &["cat", "head", "tail", "grep", "rg"];
+
+/// What turns `find` from listing into acting on what it finds.
+const FIND_ACTIONS: &[&str] = &[
+    "-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls",
+];
+
+/// Git's subcommands that only read, as long as `git_reads` finds no
+/// option on them that writes a file or runs a program.
+const GIT_READERS: &[&str] = &[
+    "status",
+    "log",
+    "diff",
+    "show",
+    "branch",
+    "rev-parse",
+    "ls-files",
+];
+
+/// The long options `git branch` lists with rather than creating, moving
+/// or deleting a branch.
+const BRANCH_LISTING: &[&str] = &[
+    "--list",
+    "--all",
+    "--remotes",
+    "--verbose",
+    "--show-current",
+    "--color",
+    "--no-color",
+    "--column",
+    "--no-column",
+    "--sort",
+    "--format",
+    "--contains",
+    "--no-contains",
+    "--merged",
+    "--no-merged",
+    "--points-at",
+    "--ignore-case",
+    "--abbrev",
+    "--no-abbrev",
+    "--omit-empty",
+];
+
+/// The environment a line judged read-only runs in, since it runs without
+/// asking. A repository's own config can name programs for a git read to
+/// run, so git runs no fsmonitor and no hook (such as the one run when
+/// `status` or `diff` rewrites the index), pages with `cat`, checks a
+/// signature only with the stock gpg, ssh-keygen or gpgsm, and shows none
+/// unasked. Its filters, diff drivers, textconv, external diff and
+/// includes cannot be turned off here, so `repo_runs_programs` asks for a
+/// git line in a repository whose config sets one; a submodule's config
+/// is not read, and drivers in the user's own config still run. cmd looks
+/// in the folder for a program before the path, where a repository could
+/// put its own `git.bat`. What `git log -p`, `git diff` or `git show`
+/// prints with no path is every tracked file, a committed `.env` too, and
+/// is taken as the project's own; only the paths git is given are judged.
+/// It takes the place of a `GIT_CONFIG_COUNT` of the user's own on these
+/// lines, and `git diff` still refreshes the index. It is a floor, not a
+/// sandbox.
+pub const GUARDS: &[(&str, &str)] = &[
+    ("GIT_CONFIG_COUNT", "7"),
+    ("GIT_CONFIG_KEY_0", "core.fsmonitor"),
+    ("GIT_CONFIG_VALUE_0", ""),
+    ("GIT_CONFIG_KEY_1", "core.pager"),
+    ("GIT_CONFIG_VALUE_1", "cat"),
+    // Nothing is ever below the null device, and `<` is no name on Windows.
+    ("GIT_CONFIG_KEY_2", "core.hooksPath"),
+    ("GIT_CONFIG_VALUE_2", "/dev/null/<no hooks>"),
+    ("GIT_CONFIG_KEY_3", "gpg.program"),
+    ("GIT_CONFIG_VALUE_3", "gpg"),
+    ("GIT_CONFIG_KEY_4", "gpg.ssh.program"),
+    ("GIT_CONFIG_VALUE_4", "ssh-keygen"),
+    ("GIT_CONFIG_KEY_5", "gpg.x509.program"),
+    ("GIT_CONFIG_VALUE_5", "gpgsm"),
+    ("GIT_CONFIG_KEY_6", "log.showSignature"),
+    ("GIT_CONFIG_VALUE_6", "false"),
+    ("GIT_OPTIONAL_LOCKS", "0"),
+    ("NoDefaultCurrentDirectoryInExePath", "1"),
+];
+
+/// Names of secrets, and of the folders other agents keep their sign-ins
+/// in, that rg leaves out as hidden files, for telling whether a glob of
+/// its could take one in.
+const HIDDEN_SECRETS: &[&str] = &[
+    ".env",
+    ".env.local",
+    ".netrc",
+    ".git-credentials",
+    ".ssh",
+    ".aws",
+    ".claude",
+    ".codex",
+];
+
+/// Where a reader's output may go and still write nothing, by dialect: to
+/// sh, `nul` and `$null` are plain file names, created where they stand.
+const NOWHERE: &[(Dialect, &[&str])] = &[
+    (Dialect::Sh, &["/dev/null"]),
+    (Dialect::PowerShell, &["$null", "nul"]),
+    (Dialect::Cmd, &["nul"]),
+];
 
 /// Commands that run the rest of their words as a command, with those of
 /// their options that take a value.
@@ -266,6 +376,12 @@ struct Places {
     data: Option<Vec<String>>,
     exe: Option<Vec<String>>,
     cwd: Option<Vec<String>>,
+    /// The folder a command runs in as the file system spells it, for
+    /// following links; forgotten after a change of folder.
+    dir: Option<PathBuf>,
+    /// Letronna's own folder and program with links followed, so a link
+    /// into them is seen through.
+    linked: Vec<Vec<String>>,
     /// Variables that name these places, by lowercase name, with their values.
     vars: Vec<(&'static str, String)>,
 }
@@ -275,7 +391,9 @@ impl Places {
     fn here(cwd: Option<&Path>) -> Self {
         let bare = Self::default();
         let path = |p: &Path| bare.path(&p.to_string_lossy());
+        let linked = |p: &Path| std::fs::canonicalize(p).ok().and_then(|p| path(&p));
         let home = crate::tools::home();
+        let exe = std::env::current_exe().ok();
         let mut vars: Vec<(&'static str, String)> = VARS
             .iter()
             .filter_map(|name| Some((*name, std::env::var(name.to_uppercase()).ok()?)))
@@ -286,8 +404,14 @@ impl Places {
         Self {
             home: home.as_deref().and_then(path),
             data: path(&crate::chat::data_dir()),
-            exe: std::env::current_exe().ok().as_deref().and_then(path),
+            exe: exe.as_deref().and_then(path),
             cwd: cwd.and_then(path),
+            dir: cwd.map(Path::to_path_buf),
+            linked: [Some(crate::chat::data_dir()), exe]
+                .into_iter()
+                .flatten()
+                .filter_map(|p| linked(&p))
+                .collect(),
             vars,
         }
     }
@@ -355,7 +479,24 @@ impl Places {
         [&self.data, &self.exe]
             .into_iter()
             .flatten()
+            .chain(&self.linked)
             .any(|place| within(path, place))
+    }
+
+    /// `raw` as the file system spells it from the folder a command runs
+    /// in, or None when that folder is not known.
+    fn real(&self, raw: &str, dialect: Dialect) -> Option<PathBuf> {
+        let raw = match dialect {
+            Dialect::Sh => raw.to_owned(),
+            _ => raw.replace('\\', "/"),
+        };
+        match raw.strip_prefix('~') {
+            Some(rest) => {
+                let (_, home) = self.vars.iter().find(|(name, _)| *name == "home")?;
+                Some(Path::new(home).join(rest.trim_start_matches('/')))
+            }
+            None => Some(self.dir.as_ref()?.join(raw)),
+        }
     }
 
     /// Moves `cwd` where `simple` goes if it changes folder, as `cd` and
@@ -379,6 +520,7 @@ impl Places {
             Some(rest) => Some(rest.to_owned()),
             None => destination(&argv[at + 1..], dialect),
         };
+        self.dir = None;
         self.cwd = match to.as_deref() {
             _ if name == "popd" || !known => None,
             // A bare cd goes home in sh, and in PowerShell 7 too; 5.1 stays
@@ -445,6 +587,25 @@ struct Word {
     opaque: bool,
     /// Part of it is a variable this does not know.
     var: bool,
+    /// Its `{`, `,`, `.` and `}` outside quotes and escapes, in order, for
+    /// telling whether sh expands braces in it.
+    braces: String,
+}
+
+impl Word {
+    /// Whether sh would expand braces in it, as in `{a,b}` or `{1..3}`,
+    /// which can spell any path at all out of pieces that look harmless.
+    fn expands(&self) -> bool {
+        let Some(open) = self.braces.find('{') else {
+            return false;
+        };
+        let inside = &self.braces[open..];
+        let list = [inside.find(','), inside.find("..")]
+            .into_iter()
+            .flatten()
+            .min();
+        list.is_some_and(|at| inside[at..].contains('}'))
+    }
 }
 
 /// One simple command as the scanner found it.
@@ -453,6 +614,8 @@ struct Simple {
     words: Vec<Word>,
     /// Where its output is written: the words after `>` and `>>`.
     writes: Vec<Word>,
+    /// Where its input is read from: the words after `<`.
+    reads: Vec<Word>,
     /// Whether its input is the output of the command before it.
     piped: bool,
     /// Whether some of it could not be read, such as a heredoc.
@@ -559,7 +722,7 @@ impl Scanner<'_> {
         };
         match self.frame.redirect.take() {
             Some(true) => self.frame.simple.writes.push(word),
-            Some(false) => {}
+            Some(false) => self.frame.simple.reads.push(word),
             None => self.frame.simple.words.push(word),
         }
     }
@@ -640,7 +803,12 @@ impl Scanner<'_> {
             '{' if ps => self.open('}'),
             ')' | '}' if self.closes(c) => self.close(),
             '(' | ')' => self.end_command(false),
-            _ => self.push(c),
+            _ => {
+                if sh && matches!(c, '{' | ',' | '.' | '}') {
+                    self.word().braces.push(c);
+                }
+                self.push(c);
+            }
         }
     }
 
@@ -945,17 +1113,30 @@ fn judge(simple: &Simple, dialect: Dialect, places: &Places, depth: u8) -> Comma
     let argv: Vec<String> = simple.words.iter().map(|w| w.text.clone()).collect();
     let (at, least) = peel(&argv, dialect);
     let mut risk = match argv.get(at) {
-        Some(word) => classify(
-            &name_of(word),
-            &argv[at + 1..],
-            simple,
-            dialect,
-            places,
-            depth,
-        ),
+        Some(word) => {
+            let name = name_of(word);
+            let args = &argv[at + 1..];
+            match classify(&name, args, simple, dialect, places, depth) {
+                Risk::Plain
+                    if reads(&name, word, args)
+                        && in_reach(&name, args, simple, dialect, places)
+                        && !(name == "git" && repo_runs_programs(args, places))
+                        && !(name == "rg" && ignores_let_in_secrets(args, places)) =>
+                {
+                    Risk::ReadOnly
+                }
+                risk => risk,
+            }
+        }
         None => Risk::Plain,
     }
     .max(least);
+    // Only the program the path finds is on the table, not one in the
+    // project that shares its name; and a read written to a file is a write.
+    let bare = argv.get(at).is_some_and(|w| !w.contains(['/', '\\']));
+    if risk == Risk::ReadOnly && !(bare && reads_only(simple, dialect)) {
+        risk = Risk::Plain;
+    }
     let unknown_command = simple.words.get(at).is_some_and(|w| w.var);
     if simple.opaque || unknown_command || simple.words.iter().any(|w| w.opaque) {
         risk = risk.max(Risk::Opaque);
@@ -987,7 +1168,11 @@ fn peel(argv: &[String], dialect: Dialect) -> (usize, Risk) {
     let mut least = Risk::ReadOnly;
     while let Some(word) = argv.get(at) {
         let lower = word.to_lowercase();
+        // A variable set for the command, such as `LD_PRELOAD` or `PAGER`,
+        // can make a reader run a program; so can a wrapper, and `xargs`
+        // hands a reader options from its input.
         if assignment(word) {
+            least = least.max(Risk::Plain);
             at += 1;
             continue;
         }
@@ -1004,6 +1189,7 @@ fn peel(argv: &[String], dialect: Dialect) -> (usize, Risk) {
         let Some((_, values)) = WRAPPERS.iter().find(|(wrapper, _)| *wrapper == name) else {
             break;
         };
+        least = least.max(Risk::Plain);
         if matches!(name.as_str(), "sudo" | "doas") {
             least = least.max(ADMIN);
         }
@@ -1101,7 +1287,6 @@ fn classify(
         // It starts whatever it names, with arguments this does not read.
         "start" => Risk::Opaque,
         _ if inline => Risk::Opaque,
-        _ if READERS.contains(&name) && reads_only(simple) => Risk::ReadOnly,
         _ => Risk::Plain,
     }
 }
@@ -1300,17 +1485,702 @@ fn git(args: &[String]) -> Risk {
     }
 }
 
-/// Whether a reader stays one: every word known, and nothing written but to
-/// nowhere, no program run for it and no other machine's share read.
-fn reads_only(simple: &Simple) -> bool {
-    let nowhere = |w: &Word| NOWHERE.contains(&w.text.to_lowercase().as_str());
+/// Whether a reader stays one: every word known and none spelt by braces,
+/// and nothing written but to nowhere, no program run for it and no other
+/// machine's share read.
+fn reads_only(simple: &Simple, dialect: Dialect) -> bool {
+    let nowhere = |w: &Word| {
+        // cmd and PowerShell take `NUL` and `$Null` without case.
+        let text = match dialect {
+            Dialect::Sh => w.text.clone(),
+            _ => w.text.to_lowercase(),
+        };
+        NOWHERE
+            .iter()
+            .any(|(of, names)| *of == dialect && names.contains(&text.as_str()))
+    };
     simple.writes.iter().all(nowhere)
-        && simple.words.iter().all(|w| {
+        && simple.words.iter().chain(&simple.reads).all(|w| {
             !w.var
+                && !w.expands()
                 && !w.text.starts_with("--pre")
                 && !w.text.starts_with("\\\\")
                 && !w.text.starts_with("//")
         })
+}
+
+/// Whether `name`, spelt `word`, with `args` is on the table of commands
+/// that only read, without an option that makes it act, write or read
+/// hidden files.
+fn reads(name: &str, word: &str, args: &[String]) -> bool {
+    let lower: Vec<String> = args.iter().map(|a| a.to_lowercase()).collect();
+    let short = |a: &str| a.starts_with('-') && !a.starts_with("--");
+    // Following links while walking reaches past the folder it was given.
+    let follows =
+        |a: &String| a == "--follow" || a == "--dereference" || short(a) && a.contains('L');
+    match name {
+        "find" => {
+            !lower
+                .iter()
+                .any(|a| FIND_ACTIONS.contains(&a.as_str()) || a == "-follow")
+                && !args.iter().any(follows)
+        }
+        // Searching every file takes in `.env` and the like, which `rg`
+        // leaves out unless told to search hidden files. grep takes any
+        // start of a long option, and `--directories` or `-d` any start of
+        // `recurse`, so each counts whatever it is given; findstr and
+        // Select-String spell long options with one dash, so only grep's
+        // own short flags are looked into.
+        "grep" => {
+            let grep = matches!(word.to_lowercase().as_str(), "grep" | "grep.exe");
+            !lower.iter().any(|a| {
+                a == "-r"
+                    || a.ends_with("recurse")
+                    || abbreviates(
+                        a,
+                        &["--recursive", "--dereference-recursive", "--directories"],
+                    )
+                    || grep && short(a) && a.contains(['r', 'd'])
+            })
+        }
+        "rg" => {
+            // rg adds up `-u` across words, and `-uu` searches hidden files.
+            let unrestricted: usize = args
+                .iter()
+                .filter(|a| short(a))
+                .map(|a| a.matches('u').count())
+                .sum();
+            unrestricted < 2
+                // It then searches a secret such as `.env` though it is hidden.
+                && !globs(args).into_iter().any(takes_in_secret)
+                && !args.iter().any(|a| {
+                    a == "--hidden"
+                        || a.starts_with("--unrestricted")
+                        // It runs this program to fill in a link's `{host}`.
+                        || a.starts_with("--hostname-bin")
+                        // Its `!` lines could let a secret through.
+                        || a.starts_with("--ignore-file")
+                        || short(a) && a.contains('.')
+                        || follows(a)
+                })
+        }
+        // A follower never ends: it holds the turn, or in the background runs
+        // on unasked; PowerShell's `Get-Content -Wait` is one too.
+        "tail" => {
+            !args.iter().any(|a| short(a) && a.contains(['f', 'F']))
+                && !lower.iter().any(|a| abbreviates(a, &["--follow", "--pid"]))
+        }
+        "cat" => !lower.iter().any(|a| a.starts_with("-w")),
+        // PowerShell's `-FollowSymlink` is the same as `-L`.
+        "ls" => !args.iter().any(follows) && !lower.iter().any(|a| a.starts_with("-fol")),
+        "git" => git_reads(args),
+        _ => READERS.contains(&name),
+    }
+}
+
+/// Whether `arg` is one of the long options `longs` as getopt_long reads
+/// it: any start of one, with or without a value.
+fn abbreviates(arg: &str, longs: &[&str]) -> bool {
+    let flag = arg.split('=').next().unwrap_or(arg);
+    flag.len() > 2 && longs.iter().any(|long| long.starts_with(flag))
+}
+
+/// The globs `rg` with `args` is given to search by, as with `-g '*.rs'`,
+/// without those starting `!`, which leave files out.
+fn globs(args: &[String]) -> Vec<&str> {
+    let mut found = Vec::new();
+    let mut words = args.iter().map(String::as_str);
+    while let Some(word) = words.next() {
+        // In a run of short flags, what follows `g` is its glob.
+        let short = word.strip_prefix('-').filter(|w| !w.starts_with('-'));
+        let glued = match (short.and_then(|w| w.split_once('g')), word.split_once('=')) {
+            (Some((_, glob)), _) | (_, Some(("--glob" | "--iglob", glob))) => glob,
+            _ if matches!(word, "--glob" | "--iglob") => "",
+            _ => continue,
+        };
+        // rg reads `-g=x` as `-g x`.
+        let glob = match glued.strip_prefix('=').unwrap_or(glued) {
+            "" => words.next().unwrap_or_default(),
+            glob => glob,
+        };
+        if !glob.starts_with('!') {
+            found.push(glob);
+        }
+    }
+    found
+}
+
+/// Whether a glob rg lets files through by, one of its `-g` or an ignore
+/// file's `!` line, could take in a secret it would leave out as hidden.
+fn takes_in_secret(glob: &str) -> bool {
+    // A file is taken in when its name fits the last part; a hidden folder
+    // is entered only when a glob names it.
+    let last = last_part(glob);
+    glob.contains('{')
+        || crate::tools::secret(Path::new(&last))
+        || HIDDEN_SECRETS.iter().any(|name| fits(&last, name))
+}
+
+/// The part of a glob a file or folder name is matched against, lowercase.
+fn last_part(glob: &str) -> String {
+    let glob = glob.trim_end_matches('/');
+    glob.rsplit('/').next().unwrap_or(glob).to_lowercase()
+}
+
+/// Whether an ignore file `rg` with `args` reads lets a secret through: a
+/// `!` line there that could take in `.env` or the like, which rg then
+/// searches though it is hidden. It looks in every folder above where rg
+/// searches and walks the folders below as rg would, past those an ignore
+/// file beside them names outright and hidden ones nothing lets in, and
+/// says yes past `GLOB_ENTRIES` entries.
+fn ignores_let_in_secrets(args: &[String], places: &Places) -> bool {
+    let Some(dir) = &places.dir else {
+        return true;
+    };
+    // Any word may be a folder to search, and rg searches here without one.
+    let roots = args
+        .iter()
+        .filter(|a| !a.starts_with('-'))
+        .map(|a| dir.join(a))
+        .filter(|path| path.is_dir())
+        .chain([dir.clone()]);
+    // A glob of rg's own enters any folder it names, ignored or hidden.
+    let mut lets_in: Vec<String> = globs(args).into_iter().map(last_part).collect();
+    let mut budget = GLOB_ENTRIES;
+    for root in roots {
+        // What is not there searches nothing.
+        let Ok(root) = std::fs::canonicalize(root) else {
+            continue;
+        };
+        let in_repo = root.ancestors().any(|folder| git_dir(folder).is_some());
+        let mut folders = vec![root.clone()];
+        for folder in root.ancestors().skip(1) {
+            if ignore_rules(folder, in_repo, &mut lets_in).is_none() {
+                return true;
+            }
+        }
+        while let Some(folder) = folders.pop() {
+            let Some(skipped) = ignore_rules(&folder, in_repo, &mut lets_in) else {
+                return true;
+            };
+            // A folder that cannot be read has nothing rg can search.
+            let Ok(entries) = std::fs::read_dir(&folder) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Some(left) = budget.checked_sub(1) else {
+                    return true;
+                };
+                budget = left;
+                let name = entry.file_name().to_string_lossy().to_lowercase();
+                let named = |globs: &[String]| globs.iter().any(|glob| fits(glob, &name));
+                let hidden = name.starts_with('.') && !named(&lets_in);
+                let ignored = skipped.contains(&name) && !named(&lets_in);
+                if entry.file_type().is_ok_and(|t| t.is_dir()) && !hidden && !ignored {
+                    folders.push(entry.path());
+                }
+            }
+        }
+    }
+    false
+}
+
+/// The rules of the ignore files rg reads in `folder`: the last part of
+/// each `!` line goes into `lets_in`, and the names they ignore outright
+/// come back, a `.gitignore`'s only in a repository; None when a `!` line
+/// could take in a secret.
+fn ignore_rules(folder: &Path, in_repo: bool, lets_in: &mut Vec<String>) -> Option<Vec<String>> {
+    let exclude = git_dir(folder).map(|git| (git.join("info").join("exclude"), true));
+    let files = [
+        (".rgignore", false),
+        (".ignore", false),
+        (".gitignore", true),
+    ]
+    .map(|(name, git)| (folder.join(name), git));
+    let mut skipped = Vec::new();
+    for (file, git) in files.into_iter().chain(exclude) {
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        for line in text.lines().map(str::trim) {
+            if let Some(glob) = line.strip_prefix('!') {
+                if takes_in_secret(glob) {
+                    return None;
+                }
+                lets_in.push(last_part(glob));
+                continue;
+            }
+            let name = line.trim_start_matches('/').trim_end_matches('/');
+            if (in_repo || !git)
+                && !name.is_empty()
+                && !name.contains(['/', '*', '?', '[', '\\', '#'])
+            {
+                skipped.push(name.to_lowercase());
+            }
+        }
+    }
+    Some(skipped)
+}
+
+/// Whether `git` with `args` only reads: a subcommand on `GIT_READERS`,
+/// and no option before it that could run a program, such as `-c`.
+fn git_reads(args: &[String]) -> bool {
+    let mut at = 0;
+    while let Some(arg) = args.get(at) {
+        match arg.as_str() {
+            "-C" => at += 2,
+            "--no-pager" | "-P" | "--no-optional-locks" => at += 1,
+            _ if arg.starts_with('-') => return false,
+            _ => break,
+        }
+    }
+    let Some(sub) = args
+        .get(at)
+        .filter(|sub| GIT_READERS.contains(&sub.as_str()))
+    else {
+        return false;
+    };
+    let rest = &args[at + 1..];
+    // Checking a signature runs gpg, or whatever the user set up for it.
+    if rest
+        .iter()
+        .any(|a| a == "--show-signature" || a.contains("%G"))
+    {
+        return false;
+    }
+    match sub.as_str() {
+        // These write a file for `--output` and run a program for
+        // `--ext-diff`; `--no-index` prints every file of a folder it is
+        // given, `.env` too.
+        "log" | "diff" | "show" => !rest.iter().any(|a| {
+            a == "-o"
+                || a.starts_with("--output")
+                || a.starts_with("--ext-diff")
+                || a == "--no-index"
+        }),
+        "branch" => lists_branches(rest),
+        _ => true,
+    }
+}
+
+/// Whether `git branch` with `args` lists branches rather than creating,
+/// moving or deleting one; a plain word names a branch to create unless
+/// `--list` makes it a pattern.
+fn lists_branches(args: &[String]) -> bool {
+    let list = args.iter().any(|a| a == "--list");
+    args.iter().all(|a| {
+        if a.starts_with("--") {
+            let flag = a.split('=').next().unwrap_or(a);
+            return BRANCH_LISTING.contains(&flag);
+        }
+        match a.strip_prefix('-') {
+            Some(short) => !short.is_empty() && short.chars().all(|c| "arvi".contains(c)),
+            None => list,
+        }
+    })
+}
+
+/// Whether the repository `git` with `args` works in has its own config
+/// name a program a read may run, which no guard turns off; an unknown
+/// folder counts as one.
+fn repo_runs_programs(args: &[String], places: &Places) -> bool {
+    let Some((_, start)) = git_start(args, places) else {
+        return true;
+    };
+    // Git fails in a folder that is not there, running nothing.
+    let Ok(start) = std::fs::canonicalize(start) else {
+        return false;
+    };
+    let Some(git) = start.ancestors().find_map(git_dir) else {
+        return false;
+    };
+    let common = std::fs::read_to_string(git.join("commondir"))
+        .map_or_else(|_| git.clone(), |common| git.join(common.trim()));
+    [common.join("config"), git.join("config.worktree")]
+        .iter()
+        .any(|file| std::fs::read_to_string(file).is_ok_and(|text| names_programs(&text)))
+}
+
+/// The folder `git` with `args` starts in, as a path from the folder the
+/// command runs in and as the file system spells it, or None when that
+/// cannot be told.
+fn git_start(args: &[String], places: &Places) -> Option<(PathBuf, PathBuf)> {
+    let mut start = places.dir.clone()?;
+    let mut from_here = PathBuf::new();
+    // `-C` is the one option before the subcommand `git_reads` lets by.
+    let mut words = args.iter();
+    while let Some(word) = words.next().filter(|w| w.starts_with('-')) {
+        if word == "-C" {
+            let dir = words.next()?;
+            start.push(dir);
+            from_here.push(dir);
+        }
+    }
+    Some((from_here, start))
+}
+
+/// Where a path git reads from its repository lies, as a path from the
+/// folder the command runs in: `./x` and `../x` from where git starts,
+/// anything else from the top of the repository; None when that top
+/// cannot be found.
+fn repo_path(path: &str, args: &[String], places: &Places) -> Option<String> {
+    let (mut from_here, start) = git_start(args, places)?;
+    let relative = matches!(path, "." | "..") || path.starts_with("./") || path.starts_with("../");
+    if !relative {
+        let start = std::fs::canonicalize(start).ok()?;
+        let up = start
+            .ancestors()
+            .position(|folder| git_dir(folder).is_some())?;
+        from_here.extend(std::iter::repeat_n("..", up));
+    }
+    Some(from_here.join(path).to_string_lossy().into_owned())
+}
+
+/// The path in the repository a git argument names by a colon, if it does:
+/// what follows the rev in `HEAD:x` and `:1:x`, or a pathspec's `:(top)`
+/// or `:/` magic in `:/x`; a colon in a date such as `@{10:00}` is the
+/// rev's own.
+fn in_repo(arg: &str) -> Option<&str> {
+    let mut depth = 0_usize;
+    let at = arg.char_indices().find_map(|(at, c)| {
+        match c {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            ':' if depth == 0 => return Some(at),
+            _ => {}
+        }
+        None
+    })?;
+    let path = &arg[at + 1..];
+    if at > 0 {
+        return Some(path);
+    }
+    let path = path
+        .strip_prefix(['0', '1', '2', '3'])
+        .and_then(|rest| rest.strip_prefix(':'))
+        .unwrap_or(path);
+    Some(match path.strip_prefix('(') {
+        Some(magic) => magic.split_once(')').map_or("", |(_, path)| path),
+        None => path.trim_start_matches(['/', '!', '^']),
+    })
+}
+
+/// The git folder that git finds in `folder`: a `.git` folder, the one a
+/// `.git` file points to, or `folder` itself when it is a bare repository.
+fn git_dir(folder: &Path) -> Option<PathBuf> {
+    let dot = folder.join(".git");
+    if dot.is_dir() {
+        return Some(dot);
+    }
+    if let Ok(text) = std::fs::read_to_string(&dot) {
+        let target = text.trim().strip_prefix("gitdir:")?;
+        return Some(folder.join(target.trim()));
+    }
+    let bare = folder.join("HEAD").is_file()
+        && folder.join("objects").is_dir()
+        && folder.join("refs").is_dir();
+    bare.then(|| folder.to_path_buf())
+}
+
+/// Whether the git config `text` names a program a read may run: a
+/// filter's `clean`, `smudge` or `process`, a diff driver's `textconv` or
+/// `command`, `diff.external`, an fsmonitor that is not off, or an include
+/// that could hold any of these. What this reading could get wrong, a
+/// value run on to the next line or a key after a header, asks instead.
+fn names_programs(text: &str) -> bool {
+    let mut section = String::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.ends_with('\\') {
+            return true;
+        }
+        if let Some(header) = line.strip_prefix('[') {
+            let after = header.split_once(']').map_or("", |(_, after)| after.trim());
+            if !(after.is_empty() || after.starts_with(['#', ';'])) {
+                return true;
+            }
+            section = config_word(header);
+            continue;
+        }
+        let key = config_word(line);
+        let value = line[key.len()..].trim_start().strip_prefix('=');
+        let runs = match (section.as_str(), key.as_str()) {
+            ("filter", "clean" | "smudge" | "process") => true,
+            ("diff", "textconv" | "command" | "external") => true,
+            ("core", "fsmonitor") => value.is_none_or(|value| {
+                let value = value.split(['#', ';']).next().unwrap_or(value);
+                let value = value.trim().trim_matches('"').to_lowercase();
+                !matches!(value.as_str(), "" | "false" | "no" | "off" | "0")
+            }),
+            ("include" | "includeif", key) => !key.is_empty(),
+            _ => false,
+        };
+        if runs {
+            return true;
+        }
+    }
+    false
+}
+
+/// The name a git config line starts with, lowercase, as git compares it.
+fn config_word(text: &str) -> String {
+    text.chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect::<String>()
+        .to_lowercase()
+}
+
+/// Whether every file a reader is given, as an argument or its input, lies
+/// where a read needs no yes: in the folder it runs in, which for a line
+/// that only reads is the workspace, out of Letronna's own folder, and not
+/// a secret file the file tools refuse, both as written and where links
+/// lead, with a content reader's globs matched against what is there, and
+/// git's `HEAD:x` found from the top of its repository. Any other word is
+/// taken as a path too, so an odd pattern only means asking.
+fn in_reach(
+    name: &str,
+    args: &[String],
+    simple: &Simple,
+    dialect: Dialect,
+    places: &Places,
+) -> bool {
+    let Some(root) = &places.cwd else {
+        return false;
+    };
+    // Outside sh, `find` is find.exe, which prints the lines that match.
+    let contents = CONTENTS.contains(&name) || name == "find" && dialect != Dialect::Sh;
+    // PowerShell hands a reader the files the command before it found, as
+    // in `Get-ChildItem -Recurse | Select-String key`, so what it reads
+    // cannot be told.
+    if contents && simple.piped && dialect == Dialect::PowerShell {
+        return false;
+    }
+    // `findstr /s` looks for its files in every folder below as well, and
+    // `/d:` in the folders it names.
+    let deep = contents
+        && dialect == Dialect::Cmd
+        && args.iter().any(|a| {
+            a.strip_prefix('/')
+                .and_then(|flag| flag.split(':').next())
+                .is_some_and(|flag| flag.to_lowercase().contains(['s', 'd']))
+        });
+    // A short option's value may be glued to any of its letters, as in
+    // `-f/etc/passwd`, so where one with a slash in it reads cannot be told.
+    let glued = args.iter().any(|a| {
+        a.starts_with('-')
+            && !a.starts_with("--")
+            && operand(a, dialect).is_none()
+            && a.contains(['/', '\\'])
+    });
+    if glued {
+        return false;
+    }
+    // The shell follows links, so what each path opens is judged where it
+    // really is too, as `tools::resolve` judges a file tool's path.
+    let real_root = places
+        .dir
+        .as_deref()
+        .and_then(|dir| std::fs::canonicalize(dir).ok())
+        .and_then(|dir| places.path(&dir.to_string_lossy()));
+    let really = |path: &Path, secret_too: bool| {
+        let Ok(real) = std::fs::canonicalize(path) else {
+            // What is not there opens nothing.
+            return true;
+        };
+        let parts = places.path(&real.to_string_lossy());
+        let inside = real_root
+            .as_ref()
+            .zip(parts)
+            .is_some_and(|(root, parts)| within(&parts, root) && !places.own(&parts));
+        inside && !(secret_too && crate::tools::secret(&real))
+    };
+    let opens_in_reach = |raw: &str| {
+        let Some(path) = places.real(raw, dialect) else {
+            return false;
+        };
+        if !really(&path, true) {
+            return false;
+        }
+        if !(glob(raw) || deep) {
+            return true;
+        }
+        // A lister only names a secret its glob matches, but lists a linked
+        // folder where it leads.
+        expand(&path, deep).is_some_and(|found| found.iter().all(|p| really(p, contents)))
+    };
+    let git = name == "git";
+    // Outside a repository `git diff` compares any two files or folders,
+    // as `--no-index` does.
+    let outside_repo = || {
+        git_start(args, places)
+            .and_then(|(_, start)| std::fs::canonicalize(start).ok())
+            .is_some_and(|start| !start.ancestors().any(|folder| git_dir(folder).is_some()))
+    };
+    if git && args.iter().any(|a| a == "diff") && outside_repo() {
+        return false;
+    }
+    let inputs = simple.reads.iter().map(|w| Some(w.text.clone()));
+    // findstr searches the folders `/d:` names, split by `;`, for patterns
+    // from the file `/g:` names.
+    let switches = args
+        .iter()
+        .filter(|_| dialect == Dialect::Cmd)
+        .filter_map(|a| {
+            let flag = a.get(..3)?.to_lowercase();
+            matches!(flag.as_str(), "/d:" | "/g:").then(|| &a[3..])
+        })
+        .flat_map(|list| list.split(';'))
+        .map(|path| Some(path.to_owned()));
+    args.iter()
+        .filter_map(|a| Some((a, operand(a, dialect)?)))
+        // Git reads `HEAD:x` and `:x` from its repository, which may reach
+        // past the folder it runs in; None is a path that cannot be told.
+        .map(
+            |(a, raw)| match in_repo(raw).filter(|_| git && !a.starts_with('-')) {
+                Some(path) => repo_path(path, args, places),
+                None => Some(raw.to_owned()),
+            },
+        )
+        .chain(inputs)
+        .chain(switches)
+        .all(|raw| {
+            let Some(raw) = raw.as_deref() else {
+                return false;
+            };
+            // `~name` is another user's home, and PowerShell's `env:` and
+            // `HKCU:` are drives of settings and keys rather than files.
+            let tilde = raw
+                .strip_prefix('~')
+                .is_some_and(|rest| !rest.is_empty() && !rest.starts_with(['/', '\\']));
+            let provider = dialect == Dialect::PowerShell && raw.find(':').is_some_and(|at| at > 1);
+            let reached = !tilde
+                && !provider
+                && !(dialect != Dialect::Sh && windows_alias(raw))
+                && places.path(raw).is_some_and(|path| {
+                    within(&path, root)
+                        && !places.own(&path)
+                        && !crate::tools::secret(&path.iter().collect::<PathBuf>())
+                });
+            let hidden = contents && dialect == Dialect::Sh && dotted(raw);
+            reached && !hidden && opens_in_reach(raw)
+        })
+}
+
+/// Whether Windows could open `raw` as a file of another name: a colon past
+/// the drive opens a file's stream, as `.env::$DATA` does, a name's trailing
+/// dots and spaces are dropped, and a glob with `~` can match a short name
+/// such as `ENV~1`.
+fn windows_alias(raw: &str) -> bool {
+    let trailing = raw
+        .split(['/', '\\'])
+        .any(|part| !matches!(part, "." | "..") && part.ends_with(['.', ' ']));
+    raw.find(':').is_some_and(|at| at > 1) || trailing || glob(raw) && raw.contains('~')
+}
+
+/// The part of an argument that may name a file: all of a plain word, the
+/// value of `--option=value` or PowerShell's `-Option:value`, and nothing
+/// of a bare option or a cmd switch.
+fn operand(arg: &str, dialect: Dialect) -> Option<&str> {
+    if dialect == Dialect::Cmd && arg.starts_with('/') {
+        return None;
+    }
+    if !arg.starts_with('-') {
+        return Some(arg);
+    }
+    let value = match dialect {
+        Dialect::PowerShell => arg.split_once([':', '=']),
+        _ => arg.split_once('='),
+    };
+    value.map(|(_, value)| value)
+}
+
+/// Whether a glob in the last part of `raw` could match a dot file such as
+/// `.env.local`. With their default options sh, bash and zsh match a
+/// leading dot only with a literal `.`, never with `*`, `?` or `[...]`;
+/// the matches `expand` finds are checked on top of this.
+fn dotted(raw: &str) -> bool {
+    let last = raw.rsplit('/').next().unwrap_or(raw);
+    glob(last) && last.starts_with('.')
+}
+
+/// Whether `raw` holds a wildcard that some shell matches against files.
+fn glob(raw: &str) -> bool {
+    raw.contains(['*', '?', '['])
+}
+
+/// The files `path` names once each part with a wildcard is matched against
+/// what is there, the last part in every folder below as well when `deep`;
+/// None when that means looking at more than `GLOB_ENTRIES` entries.
+fn expand(path: &Path, deep: bool) -> Option<Vec<PathBuf>> {
+    let parts: Vec<_> = path.components().collect();
+    let mut budget = GLOB_ENTRIES;
+    let mut found = vec![PathBuf::new()];
+    for (at, part) in parts.iter().enumerate() {
+        let name = part.as_os_str().to_string_lossy();
+        let last = at + 1 == parts.len();
+        if !glob(&name) && !(deep && last) {
+            found.iter_mut().for_each(|f| f.push(part));
+            continue;
+        }
+        let mut folders = std::mem::take(&mut found);
+        let mut next = 0;
+        while let Some(folder) = folders.get(next).cloned() {
+            next += 1;
+            // A folder that cannot be read has nothing the shell can match.
+            let Ok(entries) = std::fs::read_dir(&folder) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                budget = budget.checked_sub(1)?;
+                let path = entry.path();
+                if fits(&name, &entry.file_name().to_string_lossy()) {
+                    found.push(path.clone());
+                }
+                if deep && last && path.is_dir() {
+                    folders.push(path);
+                }
+            }
+        }
+    }
+    Some(found)
+}
+
+/// Whether `name` fits the wildcard `pattern`, loosely enough to take in
+/// every shell's matches: without case, with `*` and `?` taking a leading
+/// dot too, and all from the first `[` to the last `]` taken as `*`.
+fn fits(pattern: &str, name: &str) -> bool {
+    let pattern = pattern.to_lowercase();
+    let pattern = match (pattern.find('['), pattern.rfind(']')) {
+        (Some(open), Some(close)) if open < close => {
+            format!("{}*{}", &pattern[..open], &pattern[close + 1..])
+        }
+        _ => pattern,
+    };
+    let p: Vec<char> = pattern.chars().collect();
+    let n: Vec<char> = name.to_lowercase().chars().collect();
+    // Where the last `*` was, to come back to with one more character in it.
+    let mut star: Option<(usize, usize)> = None;
+    let (mut i, mut j) = (0, 0);
+    while j < n.len() {
+        match p.get(i) {
+            Some('*') => {
+                star = Some((i + 1, j));
+                i += 1;
+            }
+            Some(&c) if c == '?' || c == n[j] => {
+                i += 1;
+                j += 1;
+            }
+            _ => {
+                let Some((after, taken)) = star else {
+                    return false;
+                };
+                star = Some((after, taken + 1));
+                (i, j) = (after, taken + 1);
+            }
+        }
+    }
+    p[i..].iter().all(|c| *c == '*')
 }
 
 /// Whether `path` is a disk itself rather than a file on one, so writing to
@@ -1364,12 +2234,14 @@ mod tests {
             data: bare.path(r"C:\Users\ada\AppData\Local\Letronna"),
             exe: bare.path(r"C:\Users\ada\AppData\Local\Programs\Letronna\bin\letronna.exe"),
             cwd: bare.path(r"C:\Users\ada\code\app"),
+            dir: Some(r"C:\Users\ada\code\app".into()),
             vars: vec![
                 ("home", r"C:\Users\ada".into()),
                 ("userprofile", r"C:\Users\ada".into()),
                 ("localappdata", r"C:\Users\ada\AppData\Local".into()),
                 ("systemdrive", "C:".into()),
             ],
+            ..Places::default()
         }
     }
 
@@ -1381,7 +2253,9 @@ mod tests {
             data: bare.path("/home/ada/.local/share/Letronna"),
             exe: bare.path("/home/ada/.local/bin/letronna"),
             cwd: bare.path("/home/ada/code/app"),
+            dir: Some("/home/ada/code/app".into()),
             vars: vec![("home", "/home/ada".into())],
+            ..Places::default()
         }
     }
 
@@ -1706,7 +2580,7 @@ mod tests {
         );
         exactly(
             Dialect::Sh,
-            Risk::ReadOnly,
+            Risk::Plain,
             &["cat /dev/urandom | head -c 16 > /dev/null"],
         );
     }
@@ -1834,21 +2708,28 @@ mod tests {
             &[
                 "ls -la",
                 "cat README.md | head -n 5",
-                "grep -rn TODO src 2>/dev/null | wc -l",
+                "rg -n TODO src 2>/dev/null | wc -l",
+                "tail -n 20 notes.txt",
+                "find src -name '*.rs' -type f",
+                "ls > /dev/null",
+                "grep -n TODO src/main.rs",
+                "cat .env.example",
             ],
         );
         exactly(
             Dialect::PowerShell,
             Risk::ReadOnly,
             &[
-                "Get-ChildItem -Recurse src | Select-String TODO",
+                "Get-ChildItem -Recurse src",
                 "type .\\notes.txt",
+                "Get-Content -Path README.md",
+                "Select-String TODO *.rs",
             ],
         );
         exactly(
             Dialect::Cmd,
             Risk::ReadOnly,
-            &["dir /s /b", "findstr /s TODO *.rs"],
+            &["dir /s /b", "findstr /s TODO *.rs", "type notes.txt > nul"],
         );
         exactly(
             Dialect::Sh,
@@ -1857,12 +2738,752 @@ mod tests {
                 "ls > files.txt",
                 "ls >& files.txt",
                 "cat notes.txt && rm notes.txt",
-                "rg --pre ./unpack.sh secret",
+                "cat notes.txt | sort -o sorted.txt",
                 "cat $FILE",
-                // A repository's own config can run a program for git status.
-                "git status",
             ],
         );
         exactly(Dialect::PowerShell, Risk::Plain, &["ls \\\\server\\share"]);
+    }
+
+    #[test]
+    fn a_reader_with_an_option_that_acts_or_writes_is_not_read_only() {
+        exactly(
+            Dialect::Sh,
+            Risk::Plain,
+            &[
+                "find . -name '*.tmp' -exec rm {} ;",
+                "find . -execdir cat {} +",
+                "find . -name '*.log' -delete",
+                "find . -fprint files.txt",
+                "rg --pre ./unpack.sh secret",
+                "git log --output=log.txt",
+                "git diff -o changes.diff",
+                "git diff --ext-diff",
+            ],
+        );
+    }
+
+    #[test]
+    fn git_reads_only_through_its_listed_subcommands_and_no_options_that_run_programs() {
+        exactly(
+            Dialect::Sh,
+            Risk::ReadOnly,
+            &[
+                "git status",
+                "git status --short",
+                "git log --oneline -5",
+                "git diff HEAD~1 -- src",
+                "git show HEAD",
+                "git branch --list",
+                "git branch -a -v",
+                "git branch --list 'fix-*'",
+                "git -C crates status",
+                "git --no-pager log",
+                "git rev-parse --show-toplevel",
+            ],
+        );
+        exactly(
+            Dialect::Sh,
+            Risk::Plain,
+            &[
+                "git -c core.pager=less log",
+                "git --exec-path=/tmp log",
+                "git --git-dir=elsewhere status",
+                // An alias could stand for anything.
+                "git st",
+                "git branch new-feature",
+                "git branch -m old new",
+                "git fetch",
+                "git commit -m wip",
+            ],
+        );
+    }
+
+    #[test]
+    fn a_read_outside_the_project_or_of_a_secret_file_is_not_read_only() {
+        exactly(
+            Dialect::Sh,
+            Risk::Plain,
+            &[
+                "cat /etc/passwd",
+                "cat < /etc/passwd",
+                "cat ../other/notes.txt",
+                "ls ~",
+                "cat ~other/notes.txt",
+                "cat .env",
+                "cat config/.env.local",
+                "head .e*",
+                "cat ~/.local/share/Letronna/settings.json",
+                // Searching every file, or the hidden ones, takes in `.env`.
+                "grep -rn TODO src",
+                "grep -R key .",
+                "rg --hidden key",
+                "rg -uu key",
+            ],
+        );
+        exactly(
+            Dialect::PowerShell,
+            Risk::Plain,
+            &[
+                "Get-Content env:PATH",
+                "type HKCU:\\Software\\app",
+                "Get-Content ~\\.ssh\\id_rsa",
+                // Files can come down the pipe, so what it reads is unknown.
+                "Get-ChildItem -Recurse src | Select-String TODO",
+                "git log --oneline | Select-String fix",
+            ],
+        );
+    }
+
+    #[test]
+    fn a_variable_a_wrapper_or_a_path_before_a_reader_makes_it_plain() {
+        exactly(
+            Dialect::Sh,
+            Risk::Plain,
+            &[
+                "PAGER=./run.sh git log",
+                "LD_PRELOAD=./hook.so cat notes.txt",
+                "env cat notes.txt",
+                "ls | xargs cat",
+                "./ls",
+                "bin/cat notes.txt",
+            ],
+        );
+    }
+
+    #[test]
+    fn a_word_sh_expands_braces_in_makes_a_reader_plain() {
+        exactly(
+            Dialect::Sh,
+            Risk::Plain,
+            &[
+                "cat {/home/ada/.s,}sh/id_rsa",
+                "cat .e{n,}v",
+                "cat {/etc/passwd,}",
+                "cat {~/.s,}sh/id_rsa",
+                "ls {/,}",
+                "cat notes{1..3}.txt",
+                "sh -c 'cat .e{n,}v'",
+            ],
+        );
+        // Quoted or escaped, or with nothing to list, braces are plain text.
+        exactly(
+            Dialect::Sh,
+            Risk::ReadOnly,
+            &[
+                "cat '{a,b}.txt'",
+                "cat \"{.e,}nv\"",
+                "cat \\{a,b}.txt",
+                "cat a{b}.txt",
+            ],
+        );
+    }
+
+    #[test]
+    fn a_reader_told_to_follow_links_is_not_read_only() {
+        exactly(
+            Dialect::Sh,
+            Risk::Plain,
+            &[
+                "rg -L KEY",
+                "rg --follow KEY",
+                "rg -nL KEY",
+                "find -L .",
+                "find . -follow -name '*.md'",
+                "ls -L",
+                "ls -lL src",
+                "ls --dereference src",
+            ],
+        );
+        exactly(
+            Dialect::PowerShell,
+            Risk::Plain,
+            &["Get-ChildItem -Recurse -FollowSymlink src"],
+        );
+    }
+
+    #[test]
+    fn a_glob_that_could_match_a_dot_file_keeps_a_content_reader_plain() {
+        exactly(
+            Dialect::Sh,
+            Risk::Plain,
+            &[
+                "cat .*.local",
+                "cat .[e]nv.local",
+                "head .e*.production",
+                "cat config/.*.local",
+            ],
+        );
+        // Names and counts are not contents.
+        exactly(
+            Dialect::Sh,
+            Risk::ReadOnly,
+            &[
+                "cat notes*.txt",
+                "head -n 5 src/m?in.rs",
+                "ls .*",
+                "wc -l *",
+            ],
+        );
+    }
+
+    #[test]
+    fn a_glob_that_starts_with_a_wildcard_reads_a_clean_folder_without_asking() {
+        let work = folder("clean-glob");
+        for file in ["notes.md", "main.rs"] {
+            std::fs::write(work.join(file), "text").unwrap();
+        }
+        exactly_in(
+            &work,
+            Dialect::Sh,
+            Risk::ReadOnly,
+            &["cat *.md", "grep x *.rs", "grep key ?otes.md", "cat [nm]*"],
+        );
+        exactly_in(
+            &work,
+            Dialect::Sh,
+            Risk::Plain,
+            &["cat .*.local", "cat .[e]nv.local", "head .e*.production"],
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// A fresh folder for a test to lay files out in, named for `test`.
+    fn folder(test: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("letronna-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn exactly_in(dir: &Path, dialect: Dialect, want: Risk, lines: &[&str]) {
+        let places = Places::here(Some(dir));
+        for line in lines {
+            assert_eq!(assess_in(line, dialect, &places, 0).risk, want, "{line:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_is_judged_by_where_it_leads() {
+        use std::os::unix::fs::symlink;
+        let top = folder("links");
+        let (work, out) = (top.join("work"), top.join("out"));
+        for dir in [work.join("docs"), out.join(".ssh"), out.join("sub")] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        for file in [work.join(".env"), work.join("notes.txt"), out.join("x")] {
+            std::fs::write(file, "text").unwrap();
+        }
+        std::fs::write(out.join(".ssh/id_rsa"), "key").unwrap();
+        symlink(".env", work.join("settings.txt")).unwrap();
+        symlink(out.join(".ssh/id_rsa"), work.join("docs/key.md")).unwrap();
+        symlink(out.join("sub"), work.join("link")).unwrap();
+        symlink("notes.txt", work.join("inside.txt")).unwrap();
+        exactly_in(
+            &work,
+            Dialect::Sh,
+            Risk::Plain,
+            &[
+                "cat settings.txt",
+                "cat < settings.txt",
+                "cat docs/key.md",
+                "cat docs/*.md",
+                "cat docs/k*.md",
+                "cat d*/key.md",
+                "cat link/../x",
+                "wc -c docs/key.md",
+                "ls l*",
+                "wc -c *",
+            ],
+        );
+        exactly_in(
+            &work,
+            Dialect::Sh,
+            Risk::ReadOnly,
+            &[
+                "cat notes.txt",
+                "cat inside.txt",
+                "cat n*.txt",
+                "ls docs",
+                "ls d*",
+            ],
+        );
+        let _ = std::fs::remove_dir_all(&top);
+    }
+
+    #[test]
+    fn a_powershell_or_cmd_glob_asks_when_it_matches_a_secret_file() {
+        let work = folder("dotted");
+        std::fs::create_dir_all(work.join("sub")).unwrap();
+        for file in [".env.local", ".env.production", "main.rs", "sub/.env"] {
+            std::fs::write(work.join(file), "text").unwrap();
+        }
+        exactly_in(
+            &work,
+            Dialect::PowerShell,
+            Risk::Plain,
+            &[
+                "Select-String key *.local",
+                "Get-Content *.production",
+                "Get-Content *",
+                "cmd /c findstr /s key *.local",
+            ],
+        );
+        exactly_in(
+            &work,
+            Dialect::Cmd,
+            Risk::Plain,
+            &[
+                "findstr key *.local",
+                "type *.production",
+                "findstr /s key *nv",
+            ],
+        );
+        exactly_in(
+            &work,
+            Dialect::PowerShell,
+            Risk::ReadOnly,
+            &["Select-String key *.rs"],
+        );
+        exactly_in(
+            &work,
+            Dialect::Cmd,
+            Risk::ReadOnly,
+            &["findstr key *nv", "findstr /s key *.rs"],
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn a_git_line_that_checks_signatures_is_not_read_only() {
+        exactly(
+            Dialect::Sh,
+            Risk::Plain,
+            &[
+                "git log --show-signature",
+                "git show --show-signature HEAD",
+                "git log --format=%G? -5",
+                "git log '--format=%h %GS'",
+                "git show --pretty=format:%GK HEAD",
+            ],
+        );
+        exactly(
+            Dialect::Sh,
+            Risk::ReadOnly,
+            &["git log --format=%h -5", "git log --format=%gd"],
+        );
+    }
+
+    #[test]
+    fn the_git_guards_turn_off_hooks_and_signature_programs_and_count_every_key() {
+        let get = |name: &str| GUARDS.iter().find(|(key, _)| *key == name).map(|g| g.1);
+        let keys: Vec<&str> = GUARDS
+            .iter()
+            .filter(|(key, _)| key.starts_with("GIT_CONFIG_KEY_"))
+            .map(|g| g.1)
+            .collect();
+        for key in [
+            "core.fsmonitor",
+            "core.pager",
+            "core.hooksPath",
+            "gpg.program",
+            "gpg.ssh.program",
+            "gpg.x509.program",
+            "log.showSignature",
+        ] {
+            assert!(keys.contains(&key), "{key}");
+        }
+        let count = keys.len().to_string();
+        assert_eq!(get("GIT_CONFIG_COUNT"), Some(count.as_str()));
+        for at in 0..keys.len() {
+            for part in ["KEY", "VALUE"] {
+                let name = format!("GIT_CONFIG_{part}_{at}");
+                assert!(get(&name).is_some(), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_repository_whose_own_config_names_a_program_keeps_git_lines_plain() {
+        let work = folder("git-config");
+        std::fs::create_dir_all(work.join(".git")).unwrap();
+        std::fs::create_dir_all(work.join("sub")).unwrap();
+        let lines = ["git status", "git diff", "git -C sub log -p"];
+        let runs = [
+            "[filter \"f\"]\n\tclean = ./run",
+            "[filter \"f\"]\n\tsmudge = ./run",
+            "[filter.f]\n\tprocess = ./run",
+            "[diff \"t\"]\n\ttextconv = ./run",
+            "[diff \"t\"]\n\tcommand = ./run",
+            "[diff]\n\texternal = ./run",
+            "[core]\n\tfsmonitor = ./run",
+            "[core]\n\tfsmonitor",
+            "[include]\n\tpath = more",
+            "[includeIf \"gitdir:~/\"]\n\tpath = more",
+            "[FILTER \"f\"]\n\tClean = ./run",
+            "[core] bare = false\n[filter \"f\"] clean = ./run",
+            "[core]\n\tbare = false \\\n[filter \"f\"]\n\tclean = ./run",
+        ];
+        for config in runs {
+            std::fs::write(work.join(".git/config"), config).unwrap();
+            exactly_in(&work, Dialect::Sh, Risk::Plain, &lines);
+        }
+        let plain = "[core]\n\tbare = false\n\tfsmonitor = false\n\
+                     [remote \"origin\"]\n\turl = ./clean\n[branch \"main\"]\n\tremote = origin";
+        std::fs::write(work.join(".git/config"), plain).unwrap();
+        exactly_in(&work, Dialect::Sh, Risk::ReadOnly, &lines);
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn a_worktree_is_judged_by_the_config_its_git_file_leads_to() {
+        let top = folder("git-worktree");
+        let (work, common) = (top.join("work"), top.join("main.git"));
+        let own = common.join("worktrees/work");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::write(work.join(".git"), format!("gitdir: {}\n", own.display())).unwrap();
+        std::fs::write(own.join("commondir"), "../..\n").unwrap();
+        std::fs::write(common.join("config"), "[core]\n\tbare = false\n").unwrap();
+        exactly_in(&work, Dialect::Sh, Risk::ReadOnly, &["git status"]);
+        std::fs::write(common.join("config"), "[diff]\n\texternal = ./run\n").unwrap();
+        exactly_in(&work, Dialect::Sh, Risk::Plain, &["git status"]);
+        let _ = std::fs::remove_dir_all(&top);
+    }
+
+    #[test]
+    fn grep_counts_any_start_of_a_recursive_long_option_and_its_own_short_flags_everywhere() {
+        exactly(
+            Dialect::Sh,
+            Risk::Plain,
+            &[
+                "grep --rec KEY .",
+                "grep --recursiv KEY .",
+                "grep --dereference-rec KEY .",
+                "grep --dir=rec KEY .",
+                "grep -d rec KEY .",
+            ],
+        );
+        for dialect in [Dialect::PowerShell, Dialect::Cmd] {
+            exactly(dialect, Risk::Plain, &["grep -rn KEY .", "grep -Rn KEY ."]);
+        }
+        exactly(
+            Dialect::Sh,
+            Risk::ReadOnly,
+            &[
+                "grep --count KEY notes.txt",
+                "grep -n --regexp=KEY notes.txt",
+            ],
+        );
+        exactly(
+            Dialect::PowerShell,
+            Risk::ReadOnly,
+            &["Select-String -Pattern TODO -Path notes.txt"],
+        );
+    }
+
+    #[test]
+    fn rg_is_not_read_only_with_hidden_files_a_host_program_or_a_glob_that_takes_in_secrets() {
+        exactly(
+            Dialect::Sh,
+            Risk::Plain,
+            &[
+                "rg -u -u KEY",
+                "rg -u -nu KEY",
+                "rg --hostname-bin=./x.sh --hyperlink-format=default KEY",
+                "rg --hostname-bin ./x.sh KEY",
+                "rg -L KEY",
+                "rg --follow KEY",
+                "rg --pre ./x.sh KEY",
+                "rg --pre-glob '*.gz' KEY",
+                "rg -g .env KEY",
+                "rg -g '*' KEY",
+                "rg --glob='.env*' KEY",
+                "rg --iglob '*.local' KEY",
+                "rg -ig '{.env,x}' KEY",
+                "rg -g .ssh -g id_rsa KEY",
+                "rg -g=.env KEY",
+            ],
+        );
+        exactly(
+            Dialect::Sh,
+            Risk::ReadOnly,
+            &[
+                "rg -u KEY",
+                "rg -n -i KEY src",
+                "rg -g '*.rs' KEY",
+                "rg -g '!.env' KEY",
+                "rg --glob-case-insensitive -t rust KEY",
+                "rg -z KEY",
+            ],
+        );
+    }
+
+    #[test]
+    fn only_the_null_device_of_its_own_dialect_counts_as_writing_nowhere() {
+        exactly(
+            Dialect::Sh,
+            Risk::Plain,
+            &[
+                "ls > nul",
+                "cat notes.txt > nul",
+                "ls > '$null'",
+                "ls >/dev/null 2>nul",
+                "ls > /DEV/NULL",
+            ],
+        );
+        exactly(Dialect::Sh, Risk::ReadOnly, &["ls >/dev/null 2>/dev/null"]);
+        exactly(
+            Dialect::PowerShell,
+            Risk::ReadOnly,
+            &["Get-ChildItem > $null", "type notes.txt 2>nul", "ls > NUL"],
+        );
+        exactly(Dialect::PowerShell, Risk::Plain, &["ls > /dev/null"]);
+        exactly(
+            Dialect::Cmd,
+            Risk::ReadOnly,
+            &["dir > nul", "type notes.txt 2>NUL"],
+        );
+        exactly(
+            Dialect::Cmd,
+            Risk::Plain,
+            &["dir > $null", "dir > /dev/null"],
+        );
+    }
+
+    #[test]
+    fn a_git_path_after_a_rev_or_a_colon_is_judged_from_the_top_of_the_repository() {
+        let top = folder("git-paths");
+        let work = top.join("work");
+        std::fs::create_dir_all(top.join(".git")).unwrap();
+        std::fs::create_dir_all(work.join("src")).unwrap();
+        exactly_in(
+            &top,
+            Dialect::Sh,
+            Risk::Plain,
+            &[
+                "git show HEAD:.env",
+                "git show :.env",
+                "git show :1:.env",
+                "git show HEAD:work/.env",
+                "git show HEAD:./.env",
+                "git show HEAD:../x",
+                "git show 'HEAD@{10:00}:.env'",
+                "git log -p -- ':(top).env'",
+                "git log -p -- :/.env",
+                "git diff HEAD -- .env",
+            ],
+        );
+        exactly_in(
+            &top,
+            Dialect::Sh,
+            Risk::ReadOnly,
+            &[
+                "git show HEAD:work/src/main.rs",
+                "git show :README.md",
+                "git log -p",
+                "git diff",
+                "git log --format=%h:%s",
+            ],
+        );
+        // Inside the repository, the workspace reaches none of the rest.
+        exactly_in(
+            &work,
+            Dialect::Sh,
+            Risk::Plain,
+            &[
+                "git show HEAD:README.md",
+                "git show HEAD:../README.md",
+                "git show :/README.md",
+            ],
+        );
+        exactly_in(
+            &work,
+            Dialect::Sh,
+            Risk::ReadOnly,
+            &[
+                "git show HEAD:work/src/main.rs",
+                "git show HEAD:./src/main.rs",
+                "git status",
+            ],
+        );
+        let _ = std::fs::remove_dir_all(&top);
+    }
+
+    #[test]
+    fn git_diff_comparing_any_two_files_is_not_read_only() {
+        let work = folder("git-no-index");
+        std::fs::create_dir_all(work.join("a")).unwrap();
+        std::fs::create_dir_all(work.join("b")).unwrap();
+        exactly_in(&work, Dialect::Sh, Risk::Plain, &["git diff a b"]);
+        std::fs::create_dir_all(work.join(".git")).unwrap();
+        exactly_in(
+            &work,
+            Dialect::Sh,
+            Risk::Plain,
+            &["git diff --no-index a b"],
+        );
+        exactly_in(&work, Dialect::Sh, Risk::ReadOnly, &["git diff a b"]);
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn rg_is_not_read_only_when_an_ignore_file_lets_a_secret_through() {
+        let top = folder("rg-ignores");
+        let work = top.join("work");
+        for dir in [".git/info", "target", ".cache", "sub"] {
+            std::fs::create_dir_all(work.join(dir)).unwrap();
+        }
+        let write = |file: &str, text: &str| std::fs::write(work.join(file), text).unwrap();
+        // What rg never reads cannot let anything through.
+        write(".gitignore", "/target\n!.env.example\n!.gitkeep\n");
+        write("target/.gitignore", "!.env\n");
+        write(".cache/.ignore", "!.env\n");
+        exactly_in(
+            &work,
+            Dialect::Sh,
+            Risk::ReadOnly,
+            &["rg KEY", "rg KEY sub"],
+        );
+        exactly_in(
+            &work,
+            Dialect::Sh,
+            Risk::Plain,
+            &["rg -g 'targ*' KEY", "rg KEY .cache", "rg KEY target"],
+        );
+        for (file, rule) in [
+            (".gitignore", "!.env"),
+            (".gitignore", "!/.env.production"),
+            (".ignore", "!**/.ssh/"),
+            (".ignore", "!.codex"),
+            ("sub/.rgignore", "!*"),
+            (".git/info/exclude", "!.env*"),
+            ("../.ignore", "!.env"),
+        ] {
+            write(file, rule);
+            exactly_in(
+                &work,
+                Dialect::Sh,
+                Risk::Plain,
+                &["rg KEY", "rg -n KEY sub"],
+            );
+            write(file, "");
+        }
+        exactly(Dialect::Sh, Risk::Plain, &["rg --ignore-file rules KEY"]);
+        let _ = std::fs::remove_dir_all(&top);
+    }
+
+    #[test]
+    fn a_reader_that_follows_a_file_forever_is_not_read_only() {
+        exactly(
+            Dialect::Sh,
+            Risk::Plain,
+            &[
+                "tail -f notes.txt",
+                "tail -F notes.txt",
+                "tail -5f notes.txt",
+                "tail --follow=name notes.txt",
+                "tail --pid=1 notes.txt",
+            ],
+        );
+        exactly(
+            Dialect::PowerShell,
+            Risk::Plain,
+            &["Get-Content -Wait notes.txt", "gc notes.txt -wa"],
+        );
+        exactly(Dialect::Sh, Risk::ReadOnly, &["tail -n 5 notes.txt"]);
+        exactly(
+            Dialect::PowerShell,
+            Risk::ReadOnly,
+            &["Get-Content notes.txt -Tail 5"],
+        );
+    }
+
+    #[test]
+    fn a_path_glued_to_a_short_option_is_not_read_only() {
+        exactly(
+            Dialect::Sh,
+            Risk::Plain,
+            &[
+                "grep -f/etc/passwd x notes.txt",
+                "rg -f/etc/passwd x",
+                "git diff -O/etc/passwd",
+                "grep -nf../../keys x notes.txt",
+            ],
+        );
+        exactly(
+            Dialect::Sh,
+            Risk::ReadOnly,
+            &["head -n5 notes.txt", "grep -n5 x notes.txt"],
+        );
+    }
+
+    #[test]
+    fn a_windows_name_that_opens_another_file_is_not_read_only() {
+        exactly(
+            Dialect::PowerShell,
+            Risk::Plain,
+            &[
+                "Get-Content '.env '",
+                "Get-Content .env.",
+                "Get-Content ENV~*",
+                "Get-Content notes.txt:hidden",
+            ],
+        );
+        exactly(
+            Dialect::Cmd,
+            Risk::Plain,
+            &[
+                "type .env::$DATA",
+                "type .env.",
+                "findstr /d:..\\.. key *",
+                "findstr /d:src;..\\x key *.rs",
+                "findstr /g:..\\..\\x key notes.txt",
+            ],
+        );
+        exactly(
+            Dialect::Cmd,
+            Risk::ReadOnly,
+            &["type ..\\app\\notes.txt", "findstr /d:src key *.rs"],
+        );
+    }
+
+    #[test]
+    fn find_outside_sh_prints_lines_so_its_glob_is_judged_like_cat() {
+        let work = folder("find-exe");
+        std::fs::create_dir_all(work.join("sub")).unwrap();
+        for file in [".env", "notes.txt", "sub/.env.work"] {
+            std::fs::write(work.join(file), "text").unwrap();
+        }
+        let lines = ["find \"KEY\" *", "find \"KEY\" .en*"];
+        exactly_in(&work, Dialect::Cmd, Risk::Plain, &lines);
+        exactly_in(&work, Dialect::PowerShell, Risk::Plain, &lines);
+        exactly_in(
+            &work,
+            Dialect::PowerShell,
+            Risk::Plain,
+            &["cmd /c find \"KEY\" *"],
+        );
+        // `/d:` searches the folders it names for the glob.
+        exactly_in(
+            &work,
+            Dialect::Cmd,
+            Risk::Plain,
+            &["findstr /d:sub key *.work"],
+        );
+        exactly_in(
+            &work,
+            Dialect::Cmd,
+            Risk::ReadOnly,
+            &["find \"KEY\" n*", "findstr key *.work"],
+        );
+        exactly_in(
+            &work,
+            Dialect::Sh,
+            Risk::ReadOnly,
+            &["find . -name '*.txt'"],
+        );
+        let _ = std::fs::remove_dir_all(&work);
     }
 }

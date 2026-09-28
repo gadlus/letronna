@@ -12,8 +12,10 @@
 //! listed, and their tools appear once they answer; only a question asked
 //! once waits for them, as it goes out at once.
 //! Every call asks the user first unless the config's `autoApprove` names the
-//! tool: a server is somebody else's code, and it alone says what its tools
-//! do. They are never offered where other people can read the replies.
+//! tool, or a server run here marks it read-only, not destructive and
+//! closed to the world: a server is somebody else's code, and it alone says
+//! what its tools do. They are never offered where other people can read the
+//! replies.
 //!
 //! A server that runs elsewhere is given by its `url` instead of a command,
 //! with any `headers` it needs, such as a key. It is spoken to over HTTP as
@@ -442,7 +444,10 @@ fn connect(
                     tool["description"].as_str().unwrap_or(own)
                 )),
                 schema: schema(&tool["inputSchema"]),
-                ask: !config.auto_approve.iter().any(|t| t == own),
+                // A server elsewhere is only its word, and a tool that
+                // reaches other machines can send what it is given there.
+                ask: !config.auto_approve.iter().any(|t| t == own)
+                    && !(config.url.trim().is_empty() && only_looks(&tool["annotations"])),
                 read_only: tool["annotations"]["readOnlyHint"].as_bool() == Some(true),
             }));
         }
@@ -452,6 +457,14 @@ fn connect(
         }
     }
     Ok(tools)
+}
+
+/// Whether a tool's `annotations` say it only looks, as `read_file` does:
+/// read-only, not destructive, and explicitly reaching no other machine.
+fn only_looks(annotations: &Value) -> bool {
+    annotations["readOnlyHint"].as_bool() == Some(true)
+        && annotations["destructiveHint"].as_bool() != Some(true)
+        && annotations["openWorldHint"].as_bool() == Some(false)
 }
 
 /// One running server, as seen from this side of its pipes.
@@ -714,7 +727,8 @@ mod tests {
                     Some("tools/list") => reply(
                         &mut to_client,
                         json!({"jsonrpc": "2.0", "id": id, "result": {"tools": [
-                            {"name": "look up", "annotations": {"readOnlyHint": true}}]}}),
+                            {"name": "look up",
+                             "annotations": {"readOnlyHint": true, "openWorldHint": false}}]}}),
                     ),
                     Some("tools/call") => {
                         let text = message["params"]["arguments"]["text"]
@@ -946,6 +960,57 @@ mod tests {
             echo.run(&json!({"text": "fail"}), &ctx).unwrap_err(),
             "echo: fail\n[image/png, 3 bytes]"
         );
+    }
+
+    #[test]
+    fn a_tool_its_server_marks_read_only_and_closed_to_the_world_runs_without_asking() {
+        for (auto_approve, echo_asks) in [(vec![], true), (vec!["echo".into()], false)] {
+            let (from_client, to_server) = std::io::pipe().unwrap();
+            let (from_server, to_client) = std::io::pipe().unwrap();
+            scripted_server(from_client, to_client);
+            let config = ServerConfig {
+                auto_approve,
+                ..Default::default()
+            };
+            let tools = connect("demo", &config, from_server, to_server).unwrap();
+            let (echo, look_up) = (&tools[0], &tools[1]);
+            assert_eq!(echo.needs_approval(), echo_asks);
+            assert!(!look_up.needs_approval() && !look_up.mutates());
+        }
+    }
+
+    #[test]
+    fn a_read_only_tool_that_may_reach_other_machines_or_destroy_still_asks() {
+        for annotations in [
+            json!({"readOnlyHint": true}),
+            json!({"readOnlyHint": true, "openWorldHint": true}),
+            json!({"readOnlyHint": true, "openWorldHint": false, "destructiveHint": true}),
+            json!({"readOnlyHint": false, "openWorldHint": false}),
+            json!({"readOnlyHint": "true", "openWorldHint": false}),
+        ] {
+            assert!(!only_looks(&annotations), "{annotations}");
+        }
+        assert!(only_looks(
+            &json!({"readOnlyHint": true, "openWorldHint": false, "destructiveHint": false})
+        ));
+    }
+
+    #[test]
+    fn a_remote_servers_read_only_tool_asks_unless_auto_approve_lists_it() {
+        for (auto_approve, asks) in [(vec![], true), (vec!["look up".into()], false)] {
+            let (from_client, to_server) = std::io::pipe().unwrap();
+            let (from_server, to_client) = std::io::pipe().unwrap();
+            scripted_server(from_client, to_client);
+            let config = ServerConfig {
+                url: "https://example.com/mcp".into(),
+                auto_approve,
+                ..Default::default()
+            };
+            let tools = connect("demo", &config, from_server, to_server).unwrap();
+            let look_up = &tools[1];
+            assert_eq!(look_up.needs_approval(), asks);
+            assert!(!look_up.mutates());
+        }
     }
 
     #[test]

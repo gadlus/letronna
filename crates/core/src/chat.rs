@@ -251,7 +251,7 @@ fn body(connection: &Connection, messages: &[Message], summary: Option<&str>) ->
         system.push_str(" You have no tools or filesystem access on this gateway.");
     }
     if connection.plan && !shared {
-        system.push_str(" Plan mode is on: you can read, search and ask, but you cannot write files or run commands, and those tools are unavailable. Work out what you would do and lay out the plan, then let the user turn plan mode off to carry it out.");
+        system.push_str(" Plan mode is on: you can read, search and ask, and run commands that only read inside the project, such as ls, cat, rg or git status, but you cannot write files or run anything else, and the tools that would are unavailable. Work out what you would do and lay out the plan, then let the user turn plan mode off to carry it out.");
     }
     // Without this the model takes "the conversation" to mean something on
     // disk, and goes looking for it there.
@@ -1099,10 +1099,12 @@ mod tests {
         let full = names(false);
         assert!(full.contains(&"read_file".to_owned()));
         assert!(full.contains(&"write_file".to_owned()));
-        // Plan mode offers the same tools minus everything that acts.
+        // Plan mode offers the same tools minus everything that acts, but
+        // for `run_command`, which the gate lets run a command that only reads.
         let planning = names(true);
         assert!(planning.contains(&"read_file".to_owned()));
-        for blocked in ["write_file", "edit_file", "run_command", "stop_job"] {
+        assert!(planning.contains(&"run_command".to_owned()));
+        for blocked in ["write_file", "edit_file", "stop_job"] {
             assert!(
                 !planning.contains(&blocked.to_owned()),
                 "{blocked} in plan mode"

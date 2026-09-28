@@ -187,7 +187,8 @@ pub fn preview(name: &str, args: &str, ctx: &ToolContext) -> String {
 }
 
 /// The `tools` array for a chat completion request. In plan mode the tools
-/// that change things are left out entirely, so the model cannot try them;
+/// that change things are left out entirely, so the model cannot try them,
+/// but for `run_command`, which the gate lets run a command that only reads;
 /// where other people read the replies, so is everything that touches this
 /// computer; and `read_chat` exists only where there is a chat to read.
 pub fn specs(connection: &Connection) -> Vec<Value> {
@@ -198,7 +199,7 @@ pub fn specs(connection: &Connection) -> Vec<Value> {
         .is_some_and(|r| r.history.is_some());
     all()
         .iter()
-        .filter(|t| !connection.plan || !t.mutates())
+        .filter(|t| !connection.plan || !t.mutates() || t.name() == "run_command")
         .filter(|t| !shared || !t.machine())
         .filter(|t| history || !t.needs_history())
         .map(|t| {
@@ -328,6 +329,12 @@ pub fn shell(command: &str, cwd: Option<&Path>) -> std::process::Command {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    // A line that only reads runs without asking, so a repository cannot be
+    // left to pick a program for its `git status` to run.
+    let risk = crate::command::assess(command, crate::command::Dialect::here(), cwd).risk;
+    if risk == crate::command::Risk::ReadOnly {
+        cmd.envs(crate::command::GUARDS.iter().copied());
     }
     cmd
 }
@@ -866,7 +873,7 @@ const SECRETS: &[&str] = &[
 
 /// Whether `path` is or lies in one of `SECRETS`, or is a `.env` file other
 /// than the example and sample ones that projects commit.
-fn secret(path: &Path) -> bool {
+pub(crate) fn secret(path: &Path) -> bool {
     // Without case, because Windows and macOS open `.SSH` as `.ssh`.
     let names: Vec<&std::ffi::OsStr> = path.iter().collect();
     let listed = SECRETS.iter().any(|entry| {
@@ -1421,11 +1428,35 @@ World"
         }
         assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "hello");
         assert!(!dir.join("b.txt").exists() && !dir.join("c.txt").exists());
-        // Looking is still allowed.
+        // Looking is still allowed, by a command that only reads too.
         assert_eq!(
             run("read_file", r#"{"path":"a.txt"}"#, &ctx).unwrap(),
             "hello"
         );
+        let out = run("run_command", r#"{"command":"cat a.txt"}"#, &ctx).unwrap();
+        assert!(out.trim_start().starts_with("hello"), "{out}");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn only_a_command_that_only_reads_runs_with_the_git_guards() {
+        let dir = std::env::temp_dir().join(format!("letronna-guards-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        use std::ffi::OsStr;
+        // How many of the guards the line runs with, each with its value.
+        let guards = |line: &str| {
+            let cmd = shell(line, Some(&dir));
+            let set: Vec<_> = cmd.get_envs().collect();
+            crate::command::GUARDS
+                .iter()
+                .filter(|(key, value)| set.contains(&(OsStr::new(key), Some(OsStr::new(value)))))
+                .count()
+        };
+        let all = crate::command::GUARDS.len();
+        assert_eq!(guards("git status"), all);
+        assert_eq!(guards("git log --oneline | head -n 3"), all);
+        assert_eq!(guards("git commit -m wip"), 0);
+        assert_eq!(guards("git status > status.txt"), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
