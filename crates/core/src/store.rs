@@ -12,7 +12,7 @@
 
 use crate::chat::{self as backend, Message};
 use serde::{Deserialize, Serialize};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 #[derive(Default, Serialize, Deserialize)]
@@ -260,8 +260,15 @@ impl Conversation {
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
+            .read(true)
             .open(&path)?;
         let mut out = String::new();
+        // A crash part way through a line leaves the file without its last
+        // newline. Appending straight after it would glue the next record to
+        // the torn one and lose both; ending the torn line first loses one.
+        if torn(&mut file)? {
+            out.push('\n');
+        }
         if fresh {
             push(
                 &mut out,
@@ -295,11 +302,26 @@ fn push(out: &mut String, record: &Record) {
     }
 }
 
+/// Whether the file stops part way through a line, as a write cut short leaves it.
+fn torn(file: &mut std::fs::File) -> std::io::Result<bool> {
+    if file.metadata()?.len() == 0 {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0u8];
+    file.read_exact(&mut last)?;
+    Ok(last[0] != b'\n')
+}
+
 /// Rebuild a session by replaying its file. A line that will not parse is
 /// skipped rather than failing the session: losing one message is better than
 /// losing the conversation it was part of.
 fn replay(path: &std::path::Path) -> Option<Conversation> {
-    let text = std::fs::read_to_string(path).ok()?;
+    // Read leniently: a write cut part way through a character leaves bytes
+    // that are not UTF-8, which would otherwise fail the whole file rather
+    // than the one line they are on.
+    let bytes = std::fs::read(path).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
     let mut conversation = Conversation::default();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         match serde_json::from_str::<Record>(line) {
@@ -318,6 +340,11 @@ fn replay(path: &std::path::Path) -> Option<Conversation> {
             Ok(Record::Rewind { to }) => conversation.messages.truncate(to),
             Err(_) => continue,
         }
+    }
+    // A crash in the first save can tear the head line itself. The file is
+    // named after the session, so its id survives that.
+    if conversation.id == 0 {
+        conversation.id = path.file_stem()?.to_str()?.parse().ok()?;
     }
     if conversation.id == 0 {
         return None;
@@ -348,7 +375,8 @@ pub fn summaries() -> Vec<Summary> {
     let mut out: Vec<Summary> = session_ids()
         .into_iter()
         .filter_map(|id| {
-            let text = std::fs::read_to_string(session_path(id)).ok()?;
+            let bytes = std::fs::read(session_path(id)).ok()?;
+            let text = String::from_utf8_lossy(&bytes);
             let mut summary = Summary {
                 id,
                 title: String::new(),
@@ -423,16 +451,20 @@ fn search_in(dir: &std::path::Path, query: &str, limit: usize) -> Vec<Hit> {
         if path.extension().is_none_or(|e| e != "jsonl") {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        let Ok(bytes) = std::fs::read(&path) else {
             continue;
         };
+        let text = String::from_utf8_lossy(&bytes);
         // Most sessions never mention it, which the whole file says at once.
         // Quotes and backslashes are escaped on disk, so a query holding
         // either cannot be checked that way and reads the messages instead.
         if !query.contains(['"', '\\']) && !text.to_lowercase().contains(&query) {
             continue;
         }
-        let (mut id, mut title, mut updated) = (0, String::new(), 0);
+        // The file's name gives the id when the head line is torn, as in
+        // `replay`, so a hit still says which session to open.
+        let named = path.file_stem().and_then(|s| s.to_str()?.parse().ok());
+        let (mut id, mut title, mut updated) = (named.unwrap_or(0), String::new(), 0);
         // Each hit keeps its message's place, and the cap waits for the end
         // of the file: a rewind further down can take the first hits back
         // and leave later ones standing.
@@ -1000,6 +1032,80 @@ mod tests {
         // The half-written line is dropped; the ones either side survive.
         assert_eq!(back.messages.len(), 2);
         assert_eq!(back.messages[1].content, "three");
+    }
+
+    #[test]
+    fn a_torn_last_line_is_sealed_before_the_next_append() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("torn-tail");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        store.conversations.push(numbered(2));
+        store.save().unwrap();
+        let path = dir.join("sessions/1.jsonl");
+        // A write cut short: half a record and no newline after it.
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str("{\"type\":\"message\",\"role\":\"us");
+        std::fs::write(&path, text).unwrap();
+
+        store.conversations[0].messages.push(said("user", "again"));
+        store.save().unwrap();
+        let back = replay(&path).unwrap();
+        let contents: Vec<&str> = back.messages.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, ["0", "1", "again"]);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_bad_byte_costs_one_line() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("bad-byte");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let sessions = dir.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join("7.jsonl");
+        // The third line was cut in the middle of the two bytes of an é.
+        let mut bytes = b"{\"type\":\"head\",\"id\":7,\"created\":5}\n\
+            {\"type\":\"meta\",\"title\":\"kept\",\"updated\":5,\"pinned\":false,\"workspace\":null,\"todos\":[]}\n\
+            {\"type\":\"message\",\"role\":\"user\",\"content\":\"one\"}\n\
+            {\"type\":\"message\",\"role\":\"user\",\"content\":\"caf"
+            .to_vec();
+        bytes.push(0xC3);
+        bytes.extend_from_slice(
+            b"\n{\"type\":\"message\",\"role\":\"user\",\"content\":\"three\"}\n",
+        );
+        std::fs::write(&path, bytes).unwrap();
+
+        let back = replay(&path).unwrap();
+        let contents: Vec<&str> = back.messages.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, ["one", "three"]);
+        let listed = summaries();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].title, "kept");
+        assert_eq!(search_in(&sessions, "three", 10).len(), 1);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_session_with_a_broken_head_keeps_its_id() {
+        let dir = scratch("broken-head");
+        let path = dir.join("7.jsonl");
+        std::fs::write(
+            &path,
+            "{\"type\":\"head\",\"id\":7,\"cr\n\
+             {\"type\":\"meta\",\"title\":\"kept\",\"updated\":5,\"pinned\":false,\"workspace\":null,\"todos\":[]}\n\
+             {\"type\":\"message\",\"role\":\"user\",\"content\":\"hello\"}\n",
+        )
+        .unwrap();
+        let back = replay(&path).unwrap();
+        assert_eq!(back.id, 7);
+        assert_eq!(back.title, "kept");
+        assert_eq!(back.messages.len(), 1);
+        let hits = search_in(&dir, "hello", 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, 7);
     }
 
     #[test]
