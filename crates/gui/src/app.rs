@@ -1488,7 +1488,7 @@ impl Render for Chat {
                         .w_full()
                         .gap_3()
                         .when(span.yours && n > 0, |group| {
-                            group.border_t_1().border_color(cx.theme().border).pt_6()
+                            group.border_t_1().border_color(cx.theme().border).pt_5()
                         })
                         .children(turn);
                     if live_turn == Some(n) {
@@ -1530,7 +1530,7 @@ impl Render for Chat {
                                     .flex_shrink_0()
                                     .px_6()
                                     .py_6()
-                                    .gap_6()
+                                    .gap_5()
                                     .children(rows),
                             ),
                         ),

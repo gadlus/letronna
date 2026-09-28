@@ -57,7 +57,7 @@ impl Chat {
         } else {
             message.model.clone()
         };
-        let leading = px(26.);
+        let leading = px(24.);
         let cx_muted = cx.theme().muted_foreground;
         let md = self.row_id("md", index);
         // Not while a dialog is up: the text view starts a selection on any
@@ -139,7 +139,9 @@ impl Chat {
         };
         v_flex()
             .w_full()
-            .gap_2p5()
+            // Closer to its own text than the turn's rows are to each other,
+            // so a label reads as the head of what follows it.
+            .gap_1p5()
             // Your prompt is a plain row under its own label, its buttons at
             // the label's end; the line keeps their height so nothing moves
             // when they show.
