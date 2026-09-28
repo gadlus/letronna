@@ -111,6 +111,11 @@ impl Runner {
         let busy = crate::title::Busy::start();
         let answer = self.work(&mut turn, session);
         drop(busy);
+        // Stopping is not a go-ahead for what was queued: it goes back in
+        // the box rather than being sent, as it does in the window.
+        if self.stopped {
+            self.bar.hand_back();
+        }
         self.bar.working(false);
         answer
     }
@@ -127,16 +132,30 @@ impl Runner {
                 self.stopped = true;
                 return Ok(String::new());
             };
+            // A reply cut short to send what was queued has nothing to run:
+            // what was typed goes in after it, and the model is asked again.
+            let hurried = self.bar.hurried();
             let answer = reply.content.clone();
             let calls = reply.tool_calls.clone();
             self.store.conversations[session].updated = chat::now();
-            self.store.conversations[session].messages.push(reply);
+            // Cut before a word came, it holds nothing to keep, and some
+            // providers refuse an empty reply.
+            if !hurried || !answer.trim().is_empty() {
+                self.store.conversations[session].messages.push(reply);
+            }
             self.persist();
 
-            if !turn.begin(calls) {
+            if !hurried && !turn.begin(calls) {
                 return Ok(answer);
             }
-            if !self.work_through(turn, session)? {
+            if !hurried && !self.work_through(turn, session)? {
+                self.stopped = true;
+                return Ok(answer);
+            }
+            // Asked to leave, by ctrl-c while a tool ran, which stopped only
+            // that tool, or by ctrl-d: the turn ends here, so nothing queued
+            // is sent and the model is not asked again.
+            if self.bar.finished() {
                 self.stopped = true;
                 return Ok(answer);
             }
@@ -146,7 +165,8 @@ impl Runner {
             self.take_notices(session, false);
             // What was typed while it worked goes in after the results, so
             // the model reads it before carrying on rather than once the turn
-            // is over. It is on the screen already, echoed when entered.
+            // is over. It waited above the box until now, and the box puts
+            // it into the conversation as it is taken.
             let typed = self.bar.take_typed();
             if !typed.is_empty() {
                 self.store.conversations[session]
@@ -186,6 +206,14 @@ impl Runner {
                 self.bar.wait_line(false);
                 out.end();
                 return Ok(None);
+            }
+            // Sent now, what was queued goes in after as much of the reply as
+            // came. Any calls it asked for were never run, so they are left out.
+            if self.bar.hurried() {
+                self.bar.wait_line(false);
+                out.end();
+                turn.live.calls.clear();
+                break;
             }
             let event = match receiver.try_recv() {
                 Ok(event) => event,
