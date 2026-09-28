@@ -7,8 +7,10 @@
 //! instead of growing two that slowly disagree.
 
 pub mod agent;
+pub mod approvals;
 pub mod auth;
 pub mod browser;
+pub mod cancel;
 mod cdp;
 pub mod chat;
 pub mod compact;
