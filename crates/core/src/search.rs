@@ -239,6 +239,9 @@ impl Tool for SearchWeb {
     fn needs_approval(&self) -> bool {
         true
     }
+    fn concurrent(&self) -> bool {
+        true
+    }
     fn preview(&self, args: &Value, _: &ToolContext) -> String {
         let query = args["query"].as_str().unwrap_or_default();
         match usable(&choice(), &crate::store::load_keys()) {

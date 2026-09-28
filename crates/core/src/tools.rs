@@ -72,6 +72,12 @@ pub trait Tool: Send + Sync {
     fn needs_history(&self) -> bool {
         false
     }
+    /// Whether it may run at the same time as other such calls from one reply,
+    /// off unless a tool opts in so one that writes, waits or drives the
+    /// browser never runs beside another.
+    fn concurrent(&self) -> bool {
+        false
+    }
     /// What the approval card shows: a diff, the file body, the command line.
     fn preview(&self, args: &Value, ctx: &ToolContext) -> String {
         let _ = ctx;
@@ -180,6 +186,11 @@ pub fn parse_args(args: &str) -> Result<Value, String> {
 
 pub fn needs_approval(name: &str) -> bool {
     find(name).is_some_and(|t| t.needs_approval())
+}
+
+/// Whether a call to `name` may run beside the other such calls from its reply.
+pub fn concurrent(name: &str) -> bool {
+    find(name).is_some_and(|t| t.concurrent())
 }
 
 pub fn preview(name: &str, args: &str, ctx: &ToolContext) -> String {
@@ -552,6 +563,9 @@ impl Tool for Sessions {
     fn name(&self) -> &'static str {
         "list_sessions"
     }
+    fn concurrent(&self) -> bool {
+        true
+    }
     fn description(&self) -> &'static str {
         "List the user's earlier Letronna sessions: id, title, when they were last used, how many messages, and which project folder. Use this when asked about past sessions or which one to pick up. It returns no conversation text. The user opens one with the /resume command, or `letronna --resume <id>`."
     }
@@ -613,6 +627,9 @@ impl Tool for SearchSessions {
     fn name(&self) -> &'static str {
         "search_sessions"
     }
+    fn concurrent(&self) -> bool {
+        true
+    }
     fn description(&self) -> &'static str {
         "Search what was said in the user's earlier Letronna sessions for a word or phrase, ignoring case. Returns the matching lines with each session's id, title and age, newest sessions first. Use it when the user refers to something from an earlier conversation, or when an earlier session may already hold the answer."
     }
@@ -657,6 +674,9 @@ struct ReadJob;
 impl Tool for ReadJob {
     fn name(&self) -> &'static str {
         "read_job"
+    }
+    fn concurrent(&self) -> bool {
+        true
     }
     fn description(&self) -> &'static str {
         "Read what a background job has printed so far, and whether it is still running. Pass offset and limit to read a long log a page of lines at a time."
@@ -895,6 +915,9 @@ impl Tool for ReadFile {
     fn name(&self) -> &'static str {
         "read_file"
     }
+    fn concurrent(&self) -> bool {
+        true
+    }
     fn description(&self) -> &'static str {
         "Read a text file. Paths are relative to the workspace."
     }
@@ -931,6 +954,9 @@ impl Tool for ListDir {
     fn name(&self) -> &'static str {
         "list_dir"
     }
+    fn concurrent(&self) -> bool {
+        true
+    }
     fn description(&self) -> &'static str {
         "List the entries of a folder. Folders end with a slash."
     }
@@ -958,6 +984,9 @@ struct Search;
 impl Tool for Search {
     fn name(&self) -> &'static str {
         "search"
+    }
+    fn concurrent(&self) -> bool {
+        true
     }
     fn description(&self) -> &'static str {
         "Case-insensitive text search across files under a folder. Returns path:line: text."

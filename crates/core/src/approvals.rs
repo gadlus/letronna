@@ -107,6 +107,11 @@ pub fn serve() -> Receiver<Request> {
     served
 }
 
+/// Whether run `run` was already allowed every call of `name`, asking nobody.
+pub(crate) fn granted(run: u64, name: &str) -> bool {
+    lock(&ASKS).granted.contains(&(run, name.to_owned()))
+}
+
 /// Whether `call` may run, waiting for the frontend's answer unless the agent is stopped first.
 pub(crate) fn ask(root: u64, run: u64, label: &str, call: &ToolCall, ctx: &ToolContext) -> bool {
     let (reply, answer) = mpsc::channel();
@@ -161,12 +166,12 @@ pub(crate) fn ask(root: u64, run: u64, label: &str, call: &ToolCall, ctx: &ToolC
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::time::Duration;
 
-    /// Held by every test here, since requests go to one frontend at a time.
-    static SERVING: Mutex<()> = Mutex::new(());
+    /// Held by every test that serves, since requests go to one frontend at a time.
+    pub(crate) static SERVING: Mutex<()> = Mutex::new(());
     /// Far longer than any answer takes, so only a hang fails a test.
     const WAIT: Duration = Duration::from_secs(30);
     /// Ample for a thread to start and reach its wait, so a request it raised
@@ -250,6 +255,8 @@ mod tests {
         let again = asking(1903, call("b", "run_command"), ToolContext::default());
         assert_eq!(again.recv_timeout(WAIT), Ok(true));
         assert!(requests.try_recv().is_err(), "the same tool asked again");
+        assert!(granted(1903, "run_command"));
+        assert!(!granted(1904, "run_command") && !granted(1903, "write_file"));
 
         let other_run = asking(1904, call("c", "run_command"), ToolContext::default());
         let request = requests.recv_timeout(WAIT).unwrap();
