@@ -11,6 +11,15 @@
 //! from the inbox after each batch of results and before the run counts as
 //! done.
 //!
+//! A run given a schema answers through one more tool, `structured_output`,
+//! offered after the rest so the tools before it keep their cached bytes. Its
+//! call is checked with `structured` rather than run, and an answer that fits
+//! ends the run with the answer on the report. One that does not gets back its
+//! problems and nothing more, twice at most, since past that a model starts
+//! dropping fields it had right while fixing the rest; an agent that ends in
+//! prose is reminded once. Past either, the run fails with no answer and says
+//! why.
+//!
 //! Nothing here polls. Each wait -- for the model, for a tool, for an
 //! approval -- is a blocking receive that a stop closes, so a stop is heard at
 //! once, and the stop and the budget are checked again before every model
@@ -22,11 +31,13 @@ use crate::approvals;
 use crate::budget::Budget;
 use crate::cancel::Cancel;
 use crate::chat::{self, Connection, Event, Extra, Message, ToolCall};
-use crate::inbox::{self, Notice};
+use crate::inbox::{self, Notice, When};
 use crate::limits::{self, Permit};
 use crate::store::{Todo, Transcript};
+use crate::structured;
 use crate::tasks::{self, Key};
 use crate::tools::{self, Caller, ToolContext};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -49,6 +60,20 @@ const NOT_APPROVED: &str = "This was not approved, so it did not run. Do not try
 /// again: rests of 2, 4 and 8 s ride out a burst, and a provider still
 /// refusing after three is out of quota, which asking again will not fix.
 const RETRIES: usize = 3;
+
+/// The tool a run with a schema gives its answer through.
+const STRUCTURED_OUTPUT: &str = "structured_output";
+
+/// Answers turned down after the first before the run gives up: more
+/// corrections than two make a model drop fields it had right.
+const CORRECTIONS: usize = 2;
+
+/// What an agent with a schema is told when it ends without giving its answer.
+const REMINDER: &str = "You ended without calling structured_output, so your answer has not been given. Call structured_output now, once, with your final answer.";
+
+/// What an answer cut off at the reply's token cap gets back, in place of the
+/// usual advice to send a file in parts, which would leave an answer short.
+const CUT_OFF: &str = "Your answer was cut off before it was complete, so it was not taken. Call structured_output again with the whole answer, worded more briefly: an answer cannot be sent in parts.";
 
 /// Which tools an agent may call, before the deny set is taken out.
 pub enum Allow {
@@ -79,6 +104,9 @@ pub struct Spec {
     pub status: Arc<Status>,
     /// How many helpers deep the agent is: 0 for a session's own, 1 for its helper.
     pub depth: u8,
+    /// The shape its answer must have, given through `structured_output`
+    /// instead of in prose; None for an answer in prose.
+    pub schema: Option<Value>,
 }
 
 /// How a run is getting on, in atomics a frontend reads while the run writes them.
@@ -100,6 +128,8 @@ pub struct Report {
     pub status: Outcome,
     /// Its answer, or when it did not finish, the last thing it said.
     pub text: String,
+    /// Its answer in the shape its schema asks for, once checked.
+    pub value: Option<Value>,
     /// Tool rounds it ran.
     pub rounds: usize,
     /// Input tokens over the whole run, cached ones included.
@@ -122,7 +152,8 @@ pub enum Outcome {
     RoundLimit,
     /// Somebody stopped it.
     Stopped,
-    /// A model call failed, or its transcript could not be written.
+    /// A model call failed, its transcript could not be written, or it never
+    /// gave an answer in the shape its schema asks for.
     Failed(String),
     /// Its budget, or one above it, was spent.
     OverBudget,
@@ -138,6 +169,7 @@ pub fn run(mut spec: Spec) -> Report {
     let mut report = Report {
         status: Outcome::Done,
         text: String::new(),
+        value: None,
         rounds: 0,
         input: 0,
         cached: 0,
@@ -189,6 +221,23 @@ pub fn spawn(spec: Spec, then: impl FnOnce(&Report) + Send + 'static) -> Result<
 
 /// Calls the model and works through what it asks for, round after round, until the run ends.
 fn steps(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result<Outcome, String> {
+    // Before any call, since a schema that strays turns down every answer
+    // with problems no agent can fix.
+    if let Some(schema) = &spec.schema
+        && let Err(problems) = structured::check_schema(schema)
+    {
+        return Ok(Outcome::Failed(format!(
+            "The answer's schema cannot be checked: {}",
+            problems.join("; ")
+        )));
+    }
+    // Nor could it answer on a connection that offers no tools at all.
+    if spec.schema.is_some() && !spec.connection.tools {
+        return Ok(Outcome::Failed(
+            "The model runs without tools here, so it cannot give its answer through structured_output.".into(),
+        ));
+    }
+    let mut reminded = false;
     loop {
         if spec.cancel.is_set() {
             return Ok(Outcome::Stopped);
@@ -217,7 +266,22 @@ fn steps(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result<Outcom
         if calls.is_empty() {
             // Mail that came while it worked may change the answer, so it
             // carries the run on rather than going unread.
-            let mail = inbox::fold(&inbox::take(spec.id, true));
+            let mut mail = inbox::fold(&inbox::take(spec.id, true));
+            if mail.is_none() && spec.schema.is_some() {
+                if reminded {
+                    return Ok(Outcome::Failed(
+                        "It ended without giving its answer through structured_output, even when reminded.".into(),
+                    ));
+                }
+                // An answer in prose is not the one asked for, so the run
+                // goes on once more for it.
+                reminded = true;
+                mail = inbox::fold(&[Notice {
+                    from: "Letronna".into(),
+                    when: When::Next,
+                    text: REMINDER.into(),
+                }]);
+            }
             let answered = mail.is_none();
             spec.transcript.conversation.messages.extend(mail);
             save(&mut spec.transcript)?;
@@ -228,11 +292,14 @@ fn steps(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result<Outcom
         }
         save(&mut spec.transcript)?;
         if !turn.begin(calls) {
-            return Ok(Outcome::RoundLimit);
+            return at_limit(spec, report);
         }
         report.rounds += 1;
         spec.status.rounds.store(report.rounds, Ordering::Relaxed);
         work_through(spec, turn, report)?;
+        if let Some(outcome) = settled(spec, report) {
+            return Ok(outcome);
+        }
     }
 }
 
@@ -263,10 +330,17 @@ fn work_through(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result
         let outcome = match turn.next(gate) {
             Next::Done => return Ok(()),
             Next::Ask => {
-                let messages = &mut spec.transcript.conversation.messages;
-                messages.extend(turn.take_results());
-                // After the results, which have to follow the calls they answer.
-                messages.extend(inbox::fold(&inbox::take(spec.id, false)));
+                spec.transcript
+                    .conversation
+                    .messages
+                    .extend(turn.take_results());
+                // After the results, which have to follow the calls they
+                // answer, and only if the run goes on: mail a run ending here
+                // would never read is left for its owner.
+                if settled(spec, report).is_none() {
+                    let mail = inbox::fold(&inbox::take(spec.id, false));
+                    spec.transcript.conversation.messages.extend(mail);
+                }
                 return save(&mut spec.transcript);
             }
             Next::Run(call) => dispatch(spec, &call, report),
@@ -293,6 +367,12 @@ fn dispatch(
     call: &ToolCall,
     report: &mut Report,
 ) -> Option<Result<String, String>> {
+    // Ahead of the allow list, which names only the tools that really run.
+    if call.name == STRUCTURED_OUTPUT
+        && let Some(schema) = &spec.schema
+    {
+        return Some(answer(schema, &call.arguments, report));
+    }
     if let Some(refused) = refusal(&spec.allow, &call.name) {
         return Some(Err(refused));
     }
@@ -436,9 +516,9 @@ fn ask_in_line(spec: &Spec, turn: &mut Turn) -> Result<Option<Message>, String> 
 /// stop ended it first.
 fn ask(spec: &Spec, turn: &mut Turn, permit: Permit) -> Result<Option<Message>, String> {
     let extra = Extra {
+        tools: spec.schema.iter().map(answer_tool).collect(),
         cancel: spec.cancel.clone(),
         guard: Some(Box::new(permit)),
-        ..Extra::default()
     };
     let events = chat::start_with(
         spec.connection.clone(),
@@ -485,6 +565,106 @@ fn checklist(transcript: &mut Transcript, arguments: &str) -> Result<String, Str
     // Written with the batch's results, like everything else the batch changed.
     transcript.conversation.todos = todos;
     Ok(format!("Checklist updated: {done} of {total} done."))
+}
+
+/// Keeps the answer a `structured_output` call gives on the report when it
+/// fits `schema`, and otherwise gives back only what is wrong with it.
+fn answer(schema: &Value, arguments: &str, report: &mut Report) -> Result<String, String> {
+    let mut args = tools::parse_args(arguments).map_err(|problem| {
+        match serde_json::from_str::<Value>(arguments) {
+            Err(e) if e.is_eof() => CUT_OFF.to_owned(),
+            _ => problem,
+        }
+    })?;
+    structured::check(&parameters(schema), &args).map_err(|problems| problems.join("\n"))?;
+    report.value = Some(if wrapped(schema) {
+        args.get_mut("answer").map(Value::take).unwrap_or_default()
+    } else {
+        args
+    });
+    Ok("Answer received.".into())
+}
+
+/// How a run with a schema ends after a round's results, when they settle its
+/// answer: given, or turned down once more than it may be corrected.
+fn settled(spec: &Spec, report: &Report) -> Option<Outcome> {
+    spec.schema.as_ref()?;
+    if report.value.is_some() {
+        return Some(Outcome::Done);
+    }
+    let turned_down: Vec<&str> = spec
+        .transcript
+        .conversation
+        .messages
+        .iter()
+        .filter(|m| m.role == "tool" && m.name == STRUCTURED_OUTPUT && m.is_error)
+        .map(|m| m.content.as_str())
+        .collect();
+    match turned_down.last() {
+        Some(last) if turned_down.len() > CORRECTIONS => Some(Outcome::Failed(format!(
+            "Its answer still did not fit the schema after {CORRECTIONS} corrections:\n{last}"
+        ))),
+        _ => None,
+    }
+}
+
+/// How a run ends at its round limit: one with a schema still takes an answer
+/// from the reply the limit turned away, since giving it starts no more work
+/// and the answer is what the run is for.
+fn at_limit(spec: &mut Spec, report: &mut Report) -> Result<Outcome, String> {
+    let reply = spec.transcript.conversation.messages.last();
+    let call = reply.and_then(|reply| {
+        reply
+            .tool_calls
+            .iter()
+            .find(|call| call.name == STRUCTURED_OUTPUT)
+    });
+    let (Some(schema), Some(call)) = (&spec.schema, call.cloned()) else {
+        return Ok(Outcome::RoundLimit);
+    };
+    let (content, is_error) = match answer(schema, &call.arguments, report) {
+        Ok(received) => (received, false),
+        Err(problems) => (problems, true),
+    };
+    // Answered on the transcript, as a call in a round is; the reply's other
+    // calls are left without results, as at any limit.
+    spec.transcript.conversation.messages.push(Message {
+        role: "tool".into(),
+        content,
+        tool_call_id: call.id,
+        name: call.name,
+        args: call.arguments,
+        is_error,
+        ..Default::default()
+    });
+    save(&mut spec.transcript)?;
+    Ok(match report.value {
+        Some(_) => Outcome::Done,
+        None => Outcome::RoundLimit,
+    })
+}
+
+/// The tool an agent with `schema` gives its answer through.
+fn answer_tool(schema: &Value) -> Value {
+    json!({"type": "function", "function": {
+        "name": STRUCTURED_OUTPUT,
+        "description": "Gives your final answer, in the shape the parameters describe, and ends your work: an answer written anywhere else is not read. Call it exactly once, when the task is done, with the whole answer. If it replies with problems, call it again with them fixed.",
+        "parameters": parameters(schema),
+    }})
+}
+
+/// `schema` as the tool's parameters, which providers take only as an object,
+/// so an answer of any other shape is asked for as the field `answer`.
+fn parameters(schema: &Value) -> Value {
+    if !wrapped(schema) {
+        return schema.clone();
+    }
+    json!({"type": "object", "required": ["answer"], "properties": {"answer": schema}})
+}
+
+/// Whether an answer to `schema` comes as the field `answer`, not being an object.
+fn wrapped(schema: &Value) -> bool {
+    schema.get("type").and_then(Value::as_str) != Some("object")
 }
 
 /// Passes mail that came too late to be read on to the owner, who can still act on it.
@@ -583,6 +763,7 @@ mod tests {
             budget: None,
             status: Arc::default(),
             depth: 1,
+            schema: None,
         }
     }
 
@@ -1070,5 +1251,238 @@ mod tests {
 
         assert_eq!(report.text, "Done after the rest.");
         assert_eq!(limits::gate(&endpoint).throttled(), 1);
+    }
+
+    /// The shape of a vote on a claim: whether it holds, and why.
+    fn vote() -> Value {
+        json!({"type": "object", "required": ["real", "reason"], "properties": {
+            "real": {"type": "boolean"},
+            "reason": {"type": "string"},
+        }})
+    }
+
+    fn answering(answer: Value) -> (&'static str, Value) {
+        ("structured_output", answer)
+    }
+
+    #[test]
+    fn a_good_answer_ends_the_run_with_the_checked_json() {
+        let dir = scratch("answer");
+        let given = json!({"real": true, "reason": "the notes say hello"});
+        // Two replies only: a third call would find nobody and fail the run.
+        let (endpoint, provider) = provider(vec![
+            reply("", &[read_notes()]),
+            reply("", &[answering(given.clone())]),
+        ]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 110);
+        spec.schema = Some(vote());
+        // The answer is taken whatever the list names.
+        spec.allow = Allow::Only(vec!["read_file".into()]);
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        let sent = provider.sent();
+
+        assert_eq!(report.value, Some(given));
+        let offered = sent[0]["tools"].as_array().unwrap().last().unwrap();
+        assert_eq!(offered["function"]["name"], "structured_output");
+        assert_eq!(offered["function"]["parameters"], vote());
+        // Answered on the transcript, so a resume finds no call left hanging.
+        let last = written(&dir.join("helper.jsonl")).pop().unwrap();
+        assert_eq!(
+            (last["name"].as_str(), last["content"].as_str()),
+            (Some("structured_output"), Some("Answer received."))
+        );
+    }
+
+    #[test]
+    fn a_bad_answer_gets_two_corrections_then_null() {
+        let dir = scratch("corrections");
+        // Three replies only: a fourth call would fail the run another way.
+        let (endpoint, provider) = provider(vec![
+            reply("", &[answering(json!({"real": "yes"}))]),
+            reply("", &[answering(json!({"real": true}))]),
+            reply("", &[answering(json!({"real": true, "reason": 7}))]),
+        ]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 120);
+        spec.schema = Some(vote());
+        let report = finished(spec);
+        let sent = provider.sent();
+
+        assert_eq!(report.value, None);
+        assert_eq!(
+            report.status,
+            Outcome::Failed(
+                "Its answer still did not fit the schema after 2 corrections:\nreason: expected string"
+                    .into()
+            )
+        );
+        // Each correction carries what was wrong and nothing more.
+        let problems = ["reason: missing\nreal: expected boolean", "reason: missing"];
+        for (request, problems) in sent[1..].iter().zip(problems) {
+            let last = messages(request).last().unwrap();
+            assert_eq!(
+                (last["role"].as_str(), last["content"].as_str()),
+                (Some("tool"), Some(problems))
+            );
+        }
+    }
+
+    #[test]
+    fn a_helper_that_never_calls_it_is_nudged_once() {
+        let dir = scratch("reminded");
+        let (endpoint, provider) = provider(vec![
+            reply("It is real: the notes say hello.", &[]),
+            reply("As I said, it is real.", &[]),
+        ]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 130);
+        spec.schema = Some(vote());
+        let report = finished(spec);
+        let sent = provider.sent();
+
+        assert_eq!(report.value, None);
+        assert_eq!(
+            report.status,
+            Outcome::Failed(
+                "It ended without giving its answer through structured_output, even when reminded."
+                    .into()
+            )
+        );
+        assert_eq!(report.text, "As I said, it is real.");
+        let reminder = messages(&sent[1]).last().unwrap();
+        assert_eq!(reminder["role"], "user");
+        let reminder = reminder["content"].as_str().unwrap();
+        assert!(
+            reminder.starts_with("[Letronna notice") && reminder.contains(REMINDER),
+            "{reminder}"
+        );
+    }
+
+    #[test]
+    fn an_answer_that_is_not_an_object_comes_in_an_answer_field() {
+        let dir = scratch("wrapped");
+        let files = json!({"type": "array", "items": {"type": "string"}});
+        let (endpoint, provider) = provider(vec![reply(
+            "",
+            &[answering(json!({"answer": ["notes.txt"]}))],
+        )]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 140);
+        spec.schema = Some(files.clone());
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        let sent = provider.sent();
+
+        assert_eq!(report.value, Some(json!(["notes.txt"])));
+        // Providers take only an object as a tool's parameters.
+        let offered = sent[0]["tools"].as_array().unwrap().last().unwrap();
+        let parameters = &offered["function"]["parameters"];
+        assert_eq!(parameters["type"], "object");
+        assert_eq!(parameters["properties"]["answer"], files);
+    }
+
+    #[test]
+    fn a_schema_it_cannot_check_fails_before_any_call() {
+        let dir = scratch("unchecked");
+        let (endpoint, provider) = provider(Vec::new());
+        let mut spec = spec(endpoint, &dir, AGENTS + 150);
+        spec.schema = Some(json!({"type": "integer", "minimum": 1}));
+        let report = finished(spec);
+        assert!(provider.sent().is_empty());
+
+        assert_eq!(
+            report.status,
+            Outcome::Failed(
+                "The answer's schema cannot be checked: unsupported keyword \"minimum\"".into()
+            )
+        );
+    }
+
+    #[test]
+    fn a_model_without_tools_fails_before_any_call() {
+        let dir = scratch("toolless");
+        let (endpoint, provider) = provider(Vec::new());
+        let mut spec = spec(endpoint, &dir, AGENTS + 160);
+        spec.schema = Some(vote());
+        spec.connection.tools = false;
+        let report = finished(spec);
+        assert!(provider.sent().is_empty());
+
+        assert_eq!(
+            report.status,
+            Outcome::Failed(
+                "The model runs without tools here, so it cannot give its answer through structured_output."
+                    .into()
+            )
+        );
+    }
+
+    #[test]
+    fn an_answer_at_the_round_limit_is_still_taken() {
+        let dir = scratch("limit");
+        let given = json!({"real": true, "reason": "the notes say hello"});
+        let (endpoint, provider) = provider(vec![
+            reply("", &[read_notes()]),
+            reply("", &[answering(given.clone())]),
+        ]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 170);
+        spec.schema = Some(vote());
+        spec.rounds = 1;
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        provider.sent();
+
+        assert_eq!((report.value, report.rounds), (Some(given), 1));
+        let last = written(&dir.join("helper.jsonl")).pop().unwrap();
+        assert_eq!(
+            (last["name"].as_str(), last["content"].as_str()),
+            (Some("structured_output"), Some("Answer received."))
+        );
+    }
+
+    #[test]
+    fn an_answer_cut_off_is_asked_for_again_whole() {
+        let dir = scratch("cut-off");
+        let given = json!({"real": true, "reason": "the notes say hello"});
+        let cut = json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call-0",
+            "function": {"name": "structured_output",
+                "arguments": r#"{"real": true, "reason": "the no"#}}]}}]});
+        let (endpoint, provider) = provider(vec![
+            format!("data: {cut}\n\ndata: [DONE]\n\n"),
+            reply("", &[answering(given.clone())]),
+        ]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 180);
+        spec.schema = Some(vote());
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        let sent = provider.sent();
+
+        assert_eq!(report.value, Some(given));
+        assert_eq!(results(&sent[1]), [CUT_OFF]);
+    }
+
+    #[test]
+    fn mail_in_the_answers_round_goes_to_the_owner() {
+        let _bell = crate::inbox::tests::DOORBELL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("answer-mail");
+        let (endpoint, provider) = provider(vec![reply(
+            "",
+            &[answering(json!({"real": true, "reason": "it says hello"}))],
+        )]);
+        let id = AGENTS + 190;
+        let mut spec = spec(endpoint, &dir, id);
+        spec.schema = Some(vote());
+        inbox::push(id, notice("main", When::Next, "also check the tests"));
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        provider.sent();
+
+        // Not folded into a transcript the finished run would never read on.
+        let forwarded = inbox::take(id + 1, true);
+        let texts: Vec<&str> = forwarded.iter().map(|n| n.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            ["helper ended before it read this, from main:\nalso check the tests"]
+        );
     }
 }
