@@ -13,6 +13,7 @@ mod cdp;
 pub mod chat;
 pub mod compact;
 pub mod gateway;
+pub mod inbox;
 pub mod jobs;
 pub mod mcp;
 pub mod media;
