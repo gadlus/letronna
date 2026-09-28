@@ -128,6 +128,13 @@ pub struct Settings {
     /// when it uses the browser, though it can still be opened to look.
     #[serde(default)]
     pub browse_unseen: bool,
+    /// The most tokens a request carries besides the reply, its system prompt
+    /// and tools included, however much the model could take; 0 keeps the
+    /// default of 64,000, and set however low the conversation still gets
+    /// 6,000. Edited by hand with Letronna closed, since an open window or
+    /// terminal saves over it.
+    #[serde(default)]
+    pub context_cap: u64,
 }
 
 #[derive(Default)]
@@ -631,7 +638,7 @@ pub fn fill(conversation: &mut Conversation) {
     }
 }
 
-fn settings() -> Settings {
+pub(crate) fn settings() -> Settings {
     let mut s: Settings = std::fs::read(settings_path())
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
