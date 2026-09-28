@@ -171,7 +171,8 @@ pub(crate) struct Chat {
     /// Selected row on the Messaging page.
     pub(crate) channel: usize,
     pub(crate) skills: Vec<letronna_core::skills::Skill>,
-    /// Why the skills could not be read, shown in place of the list.
+    /// Why the skills, or the old skills.json, could not be read; shown
+    /// above the list.
     pub(crate) skills_error: Option<String>,
     /// The name of the skill being edited, or empty for a new one.
     pub(crate) editing_skill: Option<String>,
@@ -183,6 +184,8 @@ pub(crate) struct Chat {
     pub(crate) adding_skills: bool,
     /// What the last add or removal of skills came to, or why it failed.
     pub(crate) skills_note: Option<Result<String, String>>,
+    /// The skills the last add left out, each with why.
+    pub(crate) skills_refused: Vec<String>,
     /// Your message being changed in place, by session id and place.
     pub(crate) editing_message: Option<(u64, usize)>,
     /// The box a message is changed in.
@@ -365,11 +368,12 @@ impl Chat {
                 }
             }),
         ];
-        // An empty list and the message when the old skills.json will not
-        // parse; a copy of it has already been kept.
+        // The message when the old skills.json will not move across, or the
+        // skills cannot be read at all; the Skills page shows it too.
         let workspace = store.conversations[store.active].workspace.as_deref();
+        let moved = letronna_core::skills::migrate();
         let (skills, skills_error) = match letronna_core::skills::list(workspace) {
-            Ok(skills) => (skills, None),
+            Ok(skills) => (skills, moved.err()),
             Err(why) => (Vec::new(), Some(why)),
         };
         let mut this = Self {
@@ -444,6 +448,7 @@ impl Chat {
             skill_source,
             adding_skills: false,
             skills_note: None,
+            skills_refused: Vec::new(),
             editing_message: None,
             edit_message,
             thinking_open: std::collections::HashSet::new(),

@@ -3,7 +3,12 @@
 //! for it, and Use puts its instructions in the composer.
 
 use crate::prelude::*;
-use letronna_core::skills::{self, Source};
+use letronna_core::skills::{self, Installed, Source};
+
+/// Skills an add left out that are listed under the box, each with why; the
+/// rest are counted. A whole repository clashing is the user's to sort out
+/// in the list, not to read here.
+const REFUSALS_SHOWN: usize = 3;
 
 impl Chat {
     /// Read the skills again, as the active session's project sees them.
@@ -11,8 +16,11 @@ impl Chat {
         let workspace = self.store.conversations[self.store.active]
             .workspace
             .clone();
+        // An old skills.json that will not move across is said above the
+        // skills already in folders, which are listed all the same.
+        let moved = skills::migrate();
         (self.skills, self.skills_error) = match skills::list(workspace.as_deref()) {
-            Ok(list) => (list, None),
+            Ok(list) => (list, moved.err()),
             Err(why) => (Vec::new(), Some(why)),
         };
     }
@@ -26,6 +34,7 @@ impl Chat {
         }
         self.adding_skills = true;
         self.skills_note = None;
+        self.skills_refused.clear();
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let added = cx
@@ -38,9 +47,10 @@ impl Chat {
                     this.skill_source
                         .update(cx, |input, cx| input.set_value("", window, cx));
                 }
-                this.skills_note = Some(added.map(|names| match names.as_slice() {
-                    [one] => format!("Added {one}"),
-                    names => format!("Added {} skills", names.len()),
+                this.skills_note = Some(added.map(|installed| {
+                    let note = install_note(&installed);
+                    this.skills_refused = installed.refused;
+                    note
                 }));
                 this.reload_skills();
                 cx.notify();
@@ -125,6 +135,7 @@ impl Chat {
                     skills::remove(&name)
                         .map(|place| format!("Moved {name} to {}", place.display())),
                 );
+                this.skills_refused.clear();
                 this.reload_skills();
                 cx.notify();
             })
@@ -384,30 +395,55 @@ impl Chat {
             .as_ref()
             .is_some_and(String::is_empty)
             .then(|| self.skill_editor(cx).into_any_element());
-        let note = self.skills_note.as_ref().map(|note| {
+        let mut notes: Vec<Div> = Vec::new();
+        if let Some(note) = &self.skills_note {
             let (text, color) = match note {
                 Ok(text) => (text.clone(), cx.theme().muted_foreground),
                 Err(why) => (why.clone(), cx.theme().danger),
             };
-            div().text_sm().text_color(color).child(text)
-        });
-        let on = self.skills.iter().filter(|s| s.enabled).count();
-        let summary = match &self.skills_error {
-            Some(why) => div()
+            notes.push(div().text_color(color).child(text));
+        }
+        for why in self.skills_refused.iter().take(REFUSALS_SHOWN) {
+            notes.push(div().text_color(cx.theme().warning).child(why.clone()));
+        }
+        if let Some(more) = self
+            .skills_refused
+            .len()
+            .checked_sub(REFUSALS_SHOWN)
+            .filter(|more| *more > 0)
+        {
+            notes.push(
+                div()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!("and {more} more left out")),
+            );
+        }
+        let problem = self.skills_error.as_ref().map(|why| {
+            div()
                 .text_sm()
                 .text_color(cx.theme().danger)
-                .child(why.clone()),
-            None if self.skills.is_empty() => div()
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child(
-                    "No skills yet. Add a GitHub repository of them, such as anthropics/skills, \
-                     or write your own.",
-                ),
-            None => div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(format!("{on} of {} on", self.skills.len())),
+                .child(why.clone())
+        });
+        let on = self.skills.iter().filter(|s| s.enabled).count();
+        let summary = if !self.skills.is_empty() {
+            Some(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!("{on} of {} on", self.skills.len())),
+            )
+        } else if problem.is_none() {
+            Some(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(
+                        "No skills yet. Add a GitHub repository of them, such as \
+                         anthropics/skills, or write your own.",
+                    ),
+            )
+        } else {
+            None
         };
         v_flex()
             .flex_1()
@@ -455,9 +491,17 @@ impl Chat {
                             ),
                     ),
             )
-            .child(v_flex().gap_2().child(self.skill_adder(cx)).children(note))
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(self.skill_adder(cx))
+                    .when(!notes.is_empty(), |this| {
+                        this.child(v_flex().gap_1().text_sm().children(notes))
+                    }),
+            )
             .children(new_skill)
-            .child(summary)
+            .children(problem)
+            .children(summary)
             .child(
                 // A column itself, so a row with little to say still
                 // stretches the full width.
@@ -469,5 +513,72 @@ impl Chat {
                     .gap_2()
                     .children(rows),
             )
+    }
+}
+
+/// What an add did, in a line: "Added 18 skills, updated 2 skills", and
+/// where the copies it replaced went.
+fn install_note(installed: &Installed) -> String {
+    let count = |n: usize, one: &str| match n {
+        1 => one.to_owned(),
+        n => format!("{n} skills"),
+    };
+    let added = installed
+        .added
+        .first()
+        .map(|one| count(installed.added.len(), one));
+    let updated = installed
+        .updated
+        .first()
+        .map(|(one, _)| count(installed.updated.len(), one));
+    let mut note = match (added, updated) {
+        (Some(added), Some(updated)) => format!("Added {added}, updated {updated}"),
+        (Some(added), None) => format!("Added {added}"),
+        (None, Some(updated)) => format!("Updated {updated}"),
+        (None, None) => "Nothing was added".to_owned(),
+    };
+    if let Some((_, kept)) = installed.updated.first() {
+        let archive = kept.parent().unwrap_or(kept);
+        note.push_str(&format!(
+            "; the copies replaced are kept in {}",
+            archive.display()
+        ));
+    }
+    note
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
+    // would shadow the built-in attribute.
+    use super::install_note;
+    use letronna_core::skills::Installed;
+    use std::path::PathBuf;
+
+    #[test]
+    fn an_install_note_counts_what_came_and_names_a_single_one() {
+        let names = |n: usize| (0..n).map(|i| format!("skill-{i}")).collect::<Vec<_>>();
+        let kept = |name: &str| (name.to_owned(), PathBuf::from("archive").join(name));
+        let many = Installed {
+            added: names(18),
+            updated: vec![kept("pdf"), kept("docx")],
+            refused: Vec::new(),
+        };
+        let note = install_note(&many);
+        assert!(
+            note.starts_with("Added 18 skills, updated 2 skills; "),
+            "{note}"
+        );
+        assert!(note.ends_with("archive"), "{note}");
+        let one = Installed {
+            added: vec!["haiku".into()],
+            ..Default::default()
+        };
+        assert_eq!(install_note(&one), "Added haiku");
+        let again = Installed {
+            updated: vec![kept("pdf")],
+            ..Default::default()
+        };
+        assert!(install_note(&again).starts_with("Updated pdf; "));
     }
 }
