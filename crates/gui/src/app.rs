@@ -174,6 +174,14 @@ pub(crate) struct Chat {
     pub(crate) editing_skill: Option<u64>,
     pub(crate) skill_name: Entity<InputState>,
     pub(crate) skill_prompt: Entity<InputState>,
+    /// What you sent while a reply was running in its session, oldest
+    /// first. It goes in at the reply's next step, as Claude Code does, or
+    /// as the next prompt if the reply ends first.
+    pub(crate) follow_ups: Vec<String>,
+    /// Queued text a stopped or failed reply never took, on its way back
+    /// into the box; set where there is no window to hand, put there when
+    /// the window next draws.
+    pub(crate) returned_follow_ups: Option<String>,
     /// Your message being changed in place, by session id and place.
     pub(crate) editing_message: Option<(u64, usize)>,
     /// The box a message is changed in.
@@ -416,6 +424,8 @@ impl Chat {
             editing_skill: None,
             skill_name,
             skill_prompt,
+            follow_ups: Vec::new(),
+            returned_follow_ups: None,
             editing_message: None,
             edit_message,
             thinking_open: std::collections::HashSet::new(),
@@ -549,10 +559,13 @@ impl Chat {
     }
 
     pub(crate) fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let prompt = self.composer.read(cx).value().trim().to_owned();
+        if self.busy && !prompt.is_empty() {
+            return self.queue_follow_up(prompt, window, cx);
+        }
         if self.busy {
             return;
         }
-        let prompt = self.composer.read(cx).value().trim().to_owned();
         if prompt.is_empty() {
             self.composer
                 .update(cx, |input, cx| input.set_value("", window, cx));
@@ -817,7 +830,18 @@ impl Chat {
                     .map(|turn| turn.take_results())
                     .unwrap_or_default();
                 if let Some(ix) = self.streaming_id.and_then(|id| self.store.index_of(id)) {
-                    self.store.conversations[ix].messages.extend(results);
+                    let conversation = &mut self.store.conversations[ix];
+                    conversation.messages.extend(results);
+                    // What you sent while it worked goes in now: after the
+                    // tool results, before the model is asked again, so it
+                    // reads it before going on.
+                    conversation
+                        .messages
+                        .extend(self.follow_ups.drain(..).map(|text| Message {
+                            role: "user".into(),
+                            content: text,
+                            ..Default::default()
+                        }));
                     self.save();
                     self.run_turn(cx);
                 } else {
@@ -1230,6 +1254,9 @@ impl Chat {
             return;
         }
         self.generation += 1;
+        // Stopping is not a go-ahead for what was queued: it goes back in
+        // the box rather than being sent.
+        self.return_follow_ups();
         self.remote_waiting = None;
         if let Some(id) = self.streaming_id {
             if let Some(source) = self.remote.remove(&id) {
@@ -1268,11 +1295,104 @@ impl Chat {
     fn finish(&mut self, cx: &mut Context<Self>) {
         self.answer_remote(cx);
         self.report_scheduled(cx);
+        let session = self.streaming_id;
         self.busy = false;
         self.streaming_id = None;
         self.turn = None;
         plugins::emit(cx, plugins::AppEvent::ChatIdle);
+        self.send_follow_ups(session, cx);
         cx.notify();
+    }
+
+    /// Queue what was typed while a reply runs, for its next step. Only in
+    /// the session that is working: elsewhere it would land in the wrong
+    /// conversation.
+    fn queue_follow_up(&mut self, prompt: String, window: &mut Window, cx: &mut Context<Self>) {
+        let here = self.store.conversations[self.store.active].id;
+        let refused = if self.streaming_id != Some(here) {
+            Some("Another session is working. Send this when it is done, or stop it first.")
+        } else if prompt.chars().count() > 12_000 {
+            Some("Please keep each message under 12,000 characters.")
+        } else {
+            None
+        };
+        if let Some(why) = refused {
+            // Kept as typed, without the line Enter added.
+            self.composer
+                .update(cx, |input, cx| input.set_value(prompt, window, cx));
+            self.error = Some(why.into());
+            cx.notify();
+            return;
+        }
+        self.follow_ups.push(prompt);
+        self.composer
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.follow();
+        cx.notify();
+    }
+
+    /// A reply that ended before a step could take what was queued: send it
+    /// as the next prompt, in the session it was written for, whichever one
+    /// is on screen now.
+    fn send_follow_ups(&mut self, session: Option<u64>, cx: &mut Context<Self>) {
+        if self.follow_ups.is_empty() {
+            return;
+        }
+        // A reply that failed would most likely fail again.
+        let Some(ix) = session
+            .and_then(|id| self.store.index_of(id))
+            .filter(|_| self.error.is_none())
+        else {
+            return self.return_follow_ups();
+        };
+        let text = self.follow_ups.drain(..).collect::<Vec<_>>().join("\n\n");
+        let viewing = self.store.active;
+        self.store.active = ix;
+        let sent = self.dispatch(text.clone(), None, cx).is_ok();
+        self.store.active = viewing;
+        if !sent {
+            self.returned_follow_ups = Some(text);
+        }
+    }
+
+    /// Take a queued message back before it goes: into the box to change it,
+    /// or away altogether.
+    pub(crate) fn unqueue(
+        &mut self,
+        n: usize,
+        to_box: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if n >= self.follow_ups.len() {
+            return;
+        }
+        let text = self.follow_ups.remove(n);
+        if to_box {
+            self.composer.update(cx, |input, cx| {
+                let typed = input.value().trim().to_owned();
+                let value = if typed.is_empty() {
+                    text
+                } else {
+                    format!("{text}\n\n{typed}")
+                };
+                input.set_value(value, window, cx);
+            });
+            self.focus_composer(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Put what was queued back where it was written, for the next draw.
+    fn return_follow_ups(&mut self) {
+        if self.follow_ups.is_empty() {
+            return;
+        }
+        let text = self.follow_ups.drain(..).collect::<Vec<_>>().join("\n\n");
+        self.returned_follow_ups = Some(match self.returned_follow_ups.take() {
+            Some(earlier) => format!("{earlier}\n\n{text}"),
+            None => text,
+        });
     }
 }
 
@@ -1285,6 +1405,19 @@ impl Render for Chat {
             letronna_core::browser::show_conversation(on_screen);
         }
         self.keep_following();
+        // What a stopped or failed reply did not take goes back in the box,
+        // ahead of anything typed since.
+        if let Some(text) = self.returned_follow_ups.take() {
+            self.composer.update(cx, |input, cx| {
+                let typed = input.value().trim().to_owned();
+                let value = if typed.is_empty() {
+                    text
+                } else {
+                    format!("{text}\n\n{typed}")
+                };
+                input.set_value(value, window, cx);
+            });
+        }
         // A job starting or exiting happens off the UI thread, so the footer
         // chips need a poll while any of them is alive. It stops on its own.
         if !self.job_tick && letronna_core::jobs::list().iter().any(|job| job.running) {
@@ -1476,6 +1609,9 @@ impl Render for Chat {
                 }
                 if let Some(card) = self.approval_card(window, cx) {
                     rows_here.push(card);
+                }
+                for (n, text) in self.follow_ups.iter().enumerate() {
+                    rows_here.push(self.queued_row(n, text, cx));
                 }
             }
             let rows: Vec<AnyElement> = turns

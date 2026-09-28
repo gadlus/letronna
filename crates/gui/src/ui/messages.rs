@@ -235,6 +235,59 @@ impl Chat {
             .into_any_element()
     }
 
+    /// A message sent while the reply runs, waiting for the reply's next
+    /// step: your card, faded, with a way to take it back first.
+    pub(crate) fn queued_row(&self, n: usize, text: &str, cx: &mut Context<Self>) -> AnyElement {
+        v_flex()
+            .w_full()
+            .gap_1()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .text_xs()
+                    .font_family(HEADING_FONT)
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Queued · goes in after this step")
+                    .child(
+                        h_flex()
+                            .gap_0p5()
+                            .child(
+                                Button::new(("queued-back", n))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(Icon::new(AppIcon::Pencil))
+                                    .tooltip("Back to the box")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.unqueue(n, true, window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new(("queued-drop", n))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(Icon::new(IconName::Close))
+                                    .tooltip("Don't send")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.unqueue(n, false, window, cx)
+                                    })),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .px_4()
+                    .py_3()
+                    .rounded(cx.theme().radius_lg)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .text_color(cx.theme().muted_foreground)
+                    .child(text.to_owned()),
+            )
+            .into_any_element()
+    }
+
     /// A tool result: one quiet line, click to see the output.
     fn tool_row(
         &self,

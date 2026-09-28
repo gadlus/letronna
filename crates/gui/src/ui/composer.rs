@@ -510,24 +510,33 @@ impl Chat {
                     .icon(Icon::new(AppIcon::Mic))
                     .tooltip("Voice input, coming soon"),
             )
-            .child(if self.busy {
+            .when(self.busy, |row| {
                 // A turn can wait on a slow tool or a card nobody answers;
                 // this is the way out that does not need a restart.
-                Button::new("stop")
-                    .primary()
-                    .xsmall()
-                    .rounded_full()
-                    .icon(Icon::new(IconName::CircleX))
-                    .tooltip_with_action("Stop", &Dismiss, None)
-                    .on_click(cx.listener(|this, _, _, cx| this.stop_turn(cx)))
-            } else {
+                row.child(
+                    Button::new("stop")
+                        .ghost()
+                        .xsmall()
+                        .rounded_full()
+                        .icon(Icon::new(IconName::CircleX))
+                        .tooltip_with_action("Stop", &Dismiss, None)
+                        .on_click(cx.listener(|this, _, _, cx| this.stop_turn(cx))),
+                )
+            })
+            // While a reply runs, sending queues the message for its next
+            // step, as in Claude Code, rather than doing nothing.
+            .child(
                 Button::new("send")
                     .primary()
                     .xsmall()
                     .rounded_full()
                     .icon(Icon::new(IconName::ArrowUp))
-                    .tooltip("Send (Enter)")
-                    .on_click(cx.listener(|this, _, window, cx| this.send(window, cx)))
-            })
+                    .tooltip(if self.busy {
+                        "Send after this step (Enter)"
+                    } else {
+                        "Send (Enter)"
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
+            )
     }
 }
