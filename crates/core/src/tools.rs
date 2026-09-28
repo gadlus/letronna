@@ -309,13 +309,19 @@ pub fn shell(command: &str, cwd: Option<&Path>) -> std::process::Command {
     use std::process::Command;
     let mut cmd = if cfg!(windows) {
         let mut c = Command::new("powershell");
-        c.args(["-NoProfile", "-NonInteractive", "-Command", command]);
+        c.args(["-NoProfile", "-NonInteractive", "-Command"])
+            .arg(with_utf8_output(command));
         c
     } else {
         let mut c = Command::new("sh");
         c.args(["-c", command]);
         c
     };
+    // Output is read back as UTF-8, and Python writes to a pipe in the
+    // locale's encoding, which on Windows is not. An encoding on its own
+    // would make Python strict, and a file name holding bytes that are not
+    // UTF-8 would then raise instead of printing.
+    cmd.env("PYTHONIOENCODING", "utf-8:surrogateescape");
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
@@ -331,8 +337,45 @@ pub fn shell(command: &str, cwd: Option<&Path>) -> std::process::Command {
     cmd
 }
 
+/// Switches Windows PowerShell's output to UTF-8 where the session allows it.
+const UTF8_PRELUDE: &str = "if ($ExecutionContext.SessionState.LanguageMode -eq 'FullLanguage') { \
+     try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); \
+     $OutputEncoding = [Console]::OutputEncoding } catch {} }\n";
+
+/// The command behind a prelude that makes Windows PowerShell print UTF-8.
+fn with_utf8_output(command: &str) -> String {
+    // Windows PowerShell writes to a pipe in the console's code page, so an
+    // accented letter arrives as a byte that is not UTF-8. ConstrainedLanguage
+    // mode refuses the switch, hence the check in the prelude, and its
+    // encoding writes no BOM, which would otherwise start the output. The
+    // command starts a line of its own, so an error in it points at its own
+    // columns. A script that opens with param( or using must keep it first,
+    // so it runs as it is.
+    let head = command.trim_start().to_ascii_lowercase();
+    let must_lead = head
+        .strip_prefix("param")
+        .is_some_and(|rest| rest.trim_start().starts_with('('))
+        || head
+            .strip_prefix("using")
+            .is_some_and(|rest| rest.starts_with(char::is_whitespace));
+    if must_lead {
+        return command.to_owned();
+    }
+    format!("{UTF8_PRELUDE}{command}")
+}
+
+/// Everything a pipe gives until it closes, with any byte that is not UTF-8
+/// replaced.
+fn read_lossy(mut pipe: impl std::io::Read) -> String {
+    // read_to_string keeps nothing at all after one bad byte. Decoding once
+    // at the end, not per read, keeps a character that arrives in two reads
+    // whole.
+    let mut bytes = Vec::new();
+    let _ = pipe.read_to_end(&mut bytes);
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 fn run_shell(command: &str, cwd: Option<&Path>) -> Result<String, String> {
-    use std::io::Read;
     use std::process::Stdio;
     let mut child = shell(command, cwd)
         .stdin(Stdio::null())
@@ -340,18 +383,10 @@ fn run_shell(command: &str, cwd: Option<&Path>) -> Result<String, String> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Cannot start the shell: {e}"))?;
-    let mut stdout = child.stdout.take().unwrap();
-    let mut stderr = child.stderr.take().unwrap();
-    let out = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = stdout.read_to_string(&mut s);
-        s
-    });
-    let err = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = stderr.read_to_string(&mut s);
-        s
-    });
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let out = std::thread::spawn(move || read_lossy(stdout));
+    let err = std::thread::spawn(move || read_lossy(stderr));
     let started = std::time::Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
@@ -1182,6 +1217,56 @@ World"
             "some.txt:3: The Needle\nsome.txt:5: needle again"
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_multibyte_character_split_across_reads_survives() {
+        use std::io::Read;
+        // The é (0xC3 0xA9) comes in two reads, as it can from a pipe.
+        let pipe = (&b"caf\xc3"[..]).chain(&b"\xa9 done"[..]);
+        assert_eq!(read_lossy(pipe), "café done");
+    }
+
+    #[test]
+    fn invalid_bytes_become_replacement_characters_not_an_error() {
+        // 0xE9 is é in Latin-1 and Windows-1252; alone it is not UTF-8.
+        let print = if cfg!(windows) {
+            "[Console]::OpenStandardOutput().Write([byte[]](0x63,0x61,0x66,0xE9,0x0A), 0, 5); \
+             [Console]::OpenStandardError().Write([byte[]](0x62,0x61,0x64,0xE9,0x0A), 0, 5)"
+        } else {
+            r"printf 'caf\351\n'; printf 'bad\351\n' >&2"
+        };
+        let out = run_shell(print, None).unwrap();
+        assert_eq!(out, "caf\u{FFFD}\n\n[stderr]\nbad\u{FFFD}\n");
+    }
+
+    #[test]
+    fn commands_are_asked_for_utf8_output() {
+        let print = if cfg!(windows) {
+            r#"Write-Output "café $env:PYTHONIOENCODING""#
+        } else {
+            r#"printf 'café %s\n' "$PYTHONIOENCODING""#
+        };
+        let out = run_shell(print, None).unwrap();
+        assert_eq!(out.trim_end(), "café utf-8:surrogateescape");
+    }
+
+    #[test]
+    fn a_script_that_must_open_with_param_or_using_runs_as_it_is() {
+        for kept in [
+            "param($name) Write-Output $name",
+            "  PARAM ($name) $name",
+            "using namespace System.Text\n[StringBuilder]::new()",
+        ] {
+            assert_eq!(with_utf8_output(kept), kept);
+        }
+        for led in ["Get-ChildItem", "parameters.ps1", "usingcmd"] {
+            let script = with_utf8_output(led);
+            assert!(
+                script.starts_with(UTF8_PRELUDE) && script.ends_with(led),
+                "{script}"
+            );
+        }
     }
 
     #[test]
