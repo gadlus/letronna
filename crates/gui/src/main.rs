@@ -60,6 +60,10 @@ fn main() {
                 gpui_component::input::Enter { secondary: true },
                 Some("Input"),
             ),
+            // Bound after the input's own Ctrl+Enter, a new line, so it is
+            // tried first and can hand the key back when there is nothing
+            // to send now.
+            KeyBinding::new("secondary-enter", SendNow, Some("Composer > Input")),
             // On the browser's page, Tab moves through the page, not the
             // window.
             KeyBinding::new("tab", ui::browser::PageTab, Some("Browser")),
