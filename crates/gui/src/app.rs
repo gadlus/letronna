@@ -124,7 +124,7 @@ pub(crate) struct Chat {
     /// Tools the user allowed for the rest of this run of the app, by the
     /// session they were allowed in. Keyed like `unattended`: "stop asking"
     /// about a tool in one chat is not a yes to it in every other chat.
-    pub(crate) session_allow: std::collections::HashMap<u64, std::collections::HashSet<String>>,
+    pub(crate) session_allow: letronna_core::gate::Grants,
     /// Sessions running an unattended schedule, which run tools without
     /// asking. Keyed by session so the grant cannot reach the user's own
     /// chats: a job saying "do not ask me at 9am" is not permission to stop
@@ -392,7 +392,7 @@ impl Chat {
             turn: None,
             streaming_id: None,
             asking: None,
-            session_allow: std::collections::HashMap::new(),
+            session_allow: letronna_core::gate::Grants::new(),
             unattended: std::collections::HashSet::new(),
             answer,
             job_tick: false,
@@ -802,8 +802,7 @@ impl Chat {
         let Some(turn) = self.turn.as_ref() else {
             return;
         };
-        let gate = |name: &str| self.needs_user(name);
-        let next = turn.next(gate);
+        let next = turn.next(|call| self.decide(call));
         self.asking = match &next {
             agent::Next::AskUser(call) => Some(call.id.clone()),
             _ => None,
@@ -821,6 +820,7 @@ impl Chat {
                 self.apply_todo(&call.arguments.clone(), cx)
             }
             agent::Next::Run(call) => self.execute_call(call, cx),
+            agent::Next::Refuse(_, why) => self.record_result(Err(why), cx),
             agent::Next::Ask => {
                 let results = self
                     .turn
@@ -1079,19 +1079,24 @@ impl Chat {
         self.tell_remote(&source, &reply, cx);
     }
 
-    /// Whether this call has to wait for the user. `ask_user` does unless the
-    /// session is unattended: it is a question, not an action to permit.
-    pub(crate) fn needs_user(&self, name: &str) -> bool {
+    /// What becomes of `call` in the session running now, from the window's
+    /// settings and grants.
+    fn decide(&self, call: &backend::ToolCall) -> letronna_core::gate::Outcome {
         let unattended = self
             .streaming_id
             .is_some_and(|id| self.unattended.contains(&id));
-        let none = std::collections::HashSet::new();
-        agent::needs_user(
-            name,
+        let ctx = self
+            .turn
+            .as_ref()
+            .map(|turn| letronna_core::tools::ToolContext::of(&turn.connection))
+            .unwrap_or_default();
+        let gate = letronna_core::gate::Gate::for_window(
+            &ctx,
+            &self.session_allow,
             self.store.settings.skip_approvals,
-            allowed_in(&self.session_allow, self.streaming_id).unwrap_or(&none),
             unattended,
-        )
+        );
+        letronna_core::gate::decide(call, &gate)
     }
 
     /// Store the model's checklist on the session so the composer can show it.
@@ -1486,10 +1491,10 @@ impl Render for Chat {
                 let (rows_here, _) = turns.last_mut().unwrap();
                 // While tools are queued the card below speaks for the turn;
                 // showing a half-built reply as well would be two spinners.
-                let idle = self
-                    .turn
-                    .as_ref()
-                    .is_some_and(|turn| matches!(turn.next(|_| false), agent::Next::Done));
+                let idle = self.turn.as_ref().is_some_and(|turn| {
+                    let next = turn.next(|_| letronna_core::gate::Outcome::Run);
+                    matches!(next, agent::Next::Done)
+                });
                 if let Some(live) = self.turn.as_ref().filter(|_| idle).map(|turn| Message {
                     role: "assistant".into(),
                     content: turn.live.content.clone(),
@@ -1641,26 +1646,17 @@ pub(crate) fn parse_todos(arguments: &str) -> std::result::Result<Vec<Todo>, Str
         .collect())
 }
 
-/// The tools the user stopped being asked about in `session`, and none when
-/// no session is running.
-fn allowed_in(
-    session_allow: &std::collections::HashMap<u64, std::collections::HashSet<String>>,
-    session: Option<u64>,
-) -> Option<&std::collections::HashSet<String>> {
-    session.and_then(|id| session_allow.get(&id))
-}
-
 /// The call at the front of the queue, and whether the approval card is up
 /// for it rather than it running.
 pub(crate) fn front_call(
     turn: &agent::Turn,
     asking: Option<&str>,
 ) -> Option<(backend::ToolCall, bool)> {
-    // `true` shows whatever is at the front, running or not. Which of the two
+    // `Ask` shows whatever is at the front, running or not. Which of the two
     // it is was decided when the queue stopped on it: asking the settings
     // again here showed a waiting call as running once approvals were
     // switched off, and nothing ever ran it.
-    match turn.next(|_| true) {
+    match turn.next(|_| letronna_core::gate::Outcome::Ask) {
         agent::Next::AskUser(call) => {
             let waiting = asking == Some(call.id.as_str());
             Some((call, waiting))
@@ -1673,10 +1669,11 @@ pub(crate) fn front_call(
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
-    use super::{allowed_in, front_call};
-    use letronna_core::agent::{Next, Turn, needs_user};
+    use super::front_call;
+    use letronna_core::agent::{Next, Turn};
     use letronna_core::chat::{Connection, ToolCall};
-    use std::collections::{HashMap, HashSet};
+    use letronna_core::gate::{Gate, Grants, decide};
+    use letronna_core::tools::ToolContext;
 
     /// A turn whose queue holds one `write_file` call.
     fn writing() -> Turn {
@@ -1690,32 +1687,26 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_allowed_in_one_session_is_still_asked_about_in_another() {
-        let mut session_allow = HashMap::new();
-        session_allow.insert(1, HashSet::from(["write_file".to_owned()]));
-        let allowed = |session| {
-            allowed_in(&session_allow, session).is_some_and(|tools| tools.contains("write_file"))
-        };
-        assert!(allowed(Some(1)));
-        assert!(!allowed(Some(2)));
-        assert!(!allowed(None));
-    }
-
-    #[test]
     fn a_card_stays_up_when_approvals_are_switched_off_until_the_call_is_decided_again() {
         let turn = writing();
-        let none = HashSet::new();
-        let Next::AskUser(asked) = turn.next(|name| needs_user(name, false, &none, false)) else {
+        let (ctx, none) = (ToolContext::default(), Grants::new());
+        let decided = |skip_approvals| {
+            let gate = Gate {
+                ctx: &ctx,
+                skip_approvals,
+                grants: &none,
+                human: true,
+            };
+            turn.next(|call| decide(call, &gate))
+        };
+        let Next::AskUser(asked) = decided(false) else {
             panic!("write_file should wait for the user while approvals are on");
         };
         // The card keeps its buttons rather than showing a call as running
         // that nothing started.
         assert!(front_call(&turn, Some(&asked.id)).is_some_and(|(_, waiting)| waiting));
         // Deciding again with approvals off runs it.
-        assert!(matches!(
-            turn.next(|name| needs_user(name, true, &none, false)),
-            Next::Run(_)
-        ));
+        assert!(matches!(decided(true), Next::Run(_)));
     }
 
     #[test]

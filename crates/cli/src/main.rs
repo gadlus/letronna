@@ -25,6 +25,7 @@ use banner::{banner, folder_name, footer, replay};
 use commands::{Flow, command, resume};
 use letronna_core::{store, update};
 use session::Runner;
+use std::io::IsTerminal;
 
 /// How often a session start quietly asks whether there is a newer version.
 const LOOK_FOR_UPDATES: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
@@ -67,6 +68,10 @@ fn main() {
         store: store::load_listing(),
         allowed: Default::default(),
         yes: args.yes,
+        // With the question piped in or the answer piped out, a card would be
+        // drawn or read where nobody sees it, and wait forever.
+        human: args.prompt.is_none()
+            || (std::io::stdin().is_terminal() && std::io::stdout().is_terminal()),
         plan: args.plan,
         bar: bar::Bar::new(String::new()),
     };

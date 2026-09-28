@@ -13,8 +13,8 @@
 //! needs next and stops, and the caller comes back when it has it.
 
 use crate::chat::{Connection, Event, Message, ToolCall};
-use crate::tools;
-use std::collections::{HashSet, VecDeque};
+use crate::gate::Outcome;
+use std::collections::VecDeque;
 
 /// Tool rounds per user message. Enough for a real investigation, small
 /// enough that a looping model stops on its own.
@@ -29,6 +29,9 @@ pub enum Next {
     Run(ToolCall),
     /// This call needs the user: an approval, or a question to answer.
     AskUser(ToolCall),
+    /// This call may not run, and the reason goes back to the model as its
+    /// result with no card shown.
+    Refuse(ToolCall, String),
     /// The turn is over.
     Done,
 }
@@ -118,13 +121,19 @@ impl Turn {
         true
     }
 
-    /// What to do next, given whether the user has to be consulted first.
-    pub fn next(&self, gate: impl Fn(&str) -> bool) -> Next {
-        match self.queue.front() {
-            None if self.results.is_empty() => Next::Done,
-            None => Next::Ask,
-            Some(call) if gate(&call.name) => Next::AskUser(call.clone()),
-            Some(call) => Next::Run(call.clone()),
+    /// What to do next, given what the gate makes of the call in front.
+    pub fn next(&self, gate: impl Fn(&ToolCall) -> Outcome) -> Next {
+        let Some(call) = self.queue.front() else {
+            return if self.results.is_empty() {
+                Next::Done
+            } else {
+                Next::Ask
+            };
+        };
+        match gate(call) {
+            Outcome::Run => Next::Run(call.clone()),
+            Outcome::Ask => Next::AskUser(call.clone()),
+            Outcome::Refuse(why) => Next::Refuse(call.clone(), why),
         }
     }
 
@@ -155,25 +164,10 @@ impl Turn {
     }
 }
 
-/// Whether a call has to wait for the user.
-///
-/// `ask_user` does, whatever else is permitted: it is a question, not an
-/// action to allow. The exception is an unattended run, where nobody would
-/// ever answer and the run would wait forever, so the tool answers instead.
-/// Everything else is a matter of who has already said yes, and how widely.
-pub fn needs_user(name: &str, skip_all: bool, allowed: &HashSet<String>, unattended: bool) -> bool {
-    if !tools::needs_approval(name) {
-        return false;
-    }
-    if name == tools::ASK_USER {
-        return !unattended;
-    }
-    !(skip_all || unattended || allowed.contains(name))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools;
 
     fn call(name: &str) -> ToolCall {
         ToolCall {
@@ -224,7 +218,7 @@ mod tests {
     #[test]
     fn runs_a_batch_then_asks_the_model_again() {
         let mut turn = turn();
-        let never = |_: &str| false;
+        let never = |_: &ToolCall| Outcome::Run;
         assert_eq!(turn.next(never), Next::Done);
 
         assert!(turn.begin(vec![call("read_file"), call("list_dir")]));
@@ -248,7 +242,10 @@ mod tests {
     fn stops_at_a_call_the_user_must_answer() {
         let mut turn = turn();
         turn.begin(vec![call("write_file")]);
-        let gate = |name: &str| name == "write_file";
+        let gate = |queued: &ToolCall| match queued.name.as_str() {
+            "write_file" => Outcome::Ask,
+            _ => Outcome::Run,
+        };
         assert_eq!(turn.next(gate), Next::AskUser(call("write_file")));
         // Still waiting: asking twice must not skip it.
         assert_eq!(turn.next(gate), Next::AskUser(call("write_file")));
@@ -269,36 +266,5 @@ mod tests {
         // An empty batch ends the turn rather than looping on nothing.
         let mut empty = Turn::new(turn.connection.clone());
         assert!(!empty.begin(Vec::new()));
-    }
-
-    #[test]
-    fn who_gets_asked_and_who_does_not() {
-        let none = HashSet::new();
-        // Reading never asks.
-        assert!(!needs_user("read_file", false, &none, false));
-        // Writing does, until somebody says otherwise.
-        assert!(needs_user("write_file", false, &none, false));
-        assert!(!needs_user("write_file", true, &none, false));
-        assert!(!needs_user("write_file", false, &none, true));
-        let allowed = HashSet::from(["write_file".to_owned()]);
-        assert!(!needs_user("write_file", false, &allowed, false));
-        // A question is never auto-answered, however wide the permission,
-        // unless nobody is there to answer it.
-        assert!(needs_user(tools::ASK_USER, true, &allowed, false));
-        assert!(!needs_user(tools::ASK_USER, false, &none, true));
-    }
-
-    #[test]
-    fn an_unattended_question_is_answered_by_the_tool() {
-        let mut turn = turn();
-        turn.begin(vec![call(tools::ASK_USER)]);
-        let none = HashSet::new();
-        let unattended = |name: &str| needs_user(name, false, &none, true);
-        assert_eq!(turn.next(unattended), Next::Run(call(tools::ASK_USER)));
-        let answer = tools::run(tools::ASK_USER, "{}", &tools::ToolContext::default()).unwrap();
-        assert!(
-            answer.starts_with("Nobody is available to answer"),
-            "{answer}"
-        );
     }
 }

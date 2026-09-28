@@ -4,11 +4,11 @@
 //! that differ in a terminal: waiting on a blocking channel rather than a
 //! frame, and asking the user by reading a line rather than drawing a card.
 
-use letronna_core::agent::{self, Next, Turn};
+use letronna_core::agent::{Next, Turn};
 use letronna_core::chat::{self, Connection, Event, Message};
+use letronna_core::gate::{self, Gate, Grants};
 use letronna_core::store::{Conversation, Store};
 use letronna_core::tools;
-use std::collections::HashSet;
 
 use crate::bar::Bar;
 
@@ -19,10 +19,13 @@ const DETAIL_LINES: usize = 12;
 
 pub struct Runner {
     pub store: Store,
-    /// Tools approved for the rest of this run.
-    pub allowed: HashSet<String>,
+    /// Tools approved for the rest of this run, by session.
+    pub allowed: Grants,
     /// Approve everything, for `--yes`.
     pub yes: bool,
+    /// Someone can see a card and answer it; false for `-p` with no
+    /// terminal on either end.
+    pub human: bool,
     /// Read and search only; no writing, no running.
     pub plan: bool,
     /// The box at the foot of the window, pumped while a reply streams so
@@ -196,8 +199,9 @@ impl Runner {
     /// the user stopped the turn.
     fn work_through(&mut self, turn: &mut Turn, session: usize) -> Result<bool, String> {
         loop {
-            let gate = |name: &str| agent::needs_user(name, self.yes, &self.allowed, false);
-            match turn.next(gate) {
+            let ctx = tools::ToolContext::of(&turn.connection);
+            let gate = Gate::for_terminal(&ctx, &self.allowed, self.yes, self.human);
+            match turn.next(|call| gate::decide(call, &gate)) {
                 Next::Done => return Ok(true),
                 Next::Ask => {
                     let results = turn.take_results();
@@ -206,6 +210,12 @@ impl Runner {
                     return Ok(true);
                 }
                 Next::Run(call) => self.run_call(turn, call),
+                Next::Refuse(call, why) => {
+                    let summary = tools::summary(&call.name, &call.arguments);
+                    render::blank();
+                    render::tool(&call.name, &summary, &tools::one_line(&why), true);
+                    turn.finish_call(Err(why));
+                }
                 Next::AskUser(call) => {
                     if !self.consult(turn, call)? {
                         return Ok(false);
@@ -374,7 +384,10 @@ impl Runner {
                 Ok(true)
             }
             Some(1) => {
-                self.allowed.insert(call.name.clone());
+                self.allowed
+                    .entry(turn.connection.conversation)
+                    .or_default()
+                    .insert(call.name.clone());
                 self.run_call(turn, call);
                 Ok(true)
             }

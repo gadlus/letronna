@@ -733,7 +733,9 @@ fn privacy_page(
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
                         .child(
-                            "Let the agent write files and run commands without asking each time.",
+                            "Let the agent write files and run commands without asking each time. \
+                             Some commands that are hard to undo, such as recursive deletes and \
+                             force pushes, still ask.",
                         ),
                 ),
         )
