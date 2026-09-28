@@ -26,6 +26,7 @@ use crate::tools::one_line;
 use serde::Deserialize;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The file that makes a folder a skill.
 const SKILL_FILE: &str = "SKILL.md";
@@ -41,6 +42,9 @@ const DESCRIPTION_CHARS: usize = 200;
 /// A bigger SKILL.md is not instructions anybody wrote, and reading it on
 /// every list would stall whoever asked.
 const SKILL_BYTES: u64 = 1_000_000;
+/// Skill folders looked at in one folder of them. A checkout can hold any
+/// number, and reading them all is how one would stall every list.
+const ROOT_SKILLS: usize = 200;
 
 /// Where a skill comes from.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -52,6 +56,7 @@ pub enum Source {
     Project,
 }
 
+/// A skill as the list shows it.
 #[derive(Clone, Debug)]
 pub struct Skill {
     /// What the list shows and a skill is asked for by.
@@ -101,6 +106,7 @@ pub fn find<'a>(skills: &'a [Skill], name: &str) -> Option<&'a Skill> {
     skills.iter().find(|s| same(&s.name, name))
 }
 
+/// Names compare without case, the way they are asked for.
 fn same(a: &str, b: &str) -> bool {
     a.to_lowercase() == b.to_lowercase()
 }
@@ -182,8 +188,8 @@ fn edit_in(
         return Err(format!("You already have a skill called \"{new_name}\"."));
     }
     let file = skill.folder.join(SKILL_FILE);
-    let text = std::fs::read_to_string(&file)
-        .map_err(|e| format!("Could not read {}: {e}", file.display()))?;
+    let text = read_text(&file, SKILL_BYTES)
+        .ok_or_else(|| format!("Could not read {}.", file.display()))?;
     let (entries, old_body) = split(&text);
     let written = field(&entries, "description").filter(|d| *d != summary_of(&old_body));
     let description = match description.map(one_line) {
@@ -197,15 +203,21 @@ fn edit_in(
             !e.key.eq_ignore_ascii_case("name") && !e.key.eq_ignore_ascii_case("description")
         })
         .collect();
+    // The switch goes with the skill. The new name is switched off before
+    // the skill takes it, so a failure between the two leaves it off rather
+    // than on.
+    let mut off = switched_off(data)?;
+    let moving = !same(name, &new_name) && off.iter().any(|n| same(n, name));
+    if moving {
+        off.push(new_name.clone());
+        save_off(data, &off)?;
+    }
     write_skill(
         &skill.folder,
         &render(&new_name, &description, &kept, &body),
     )?;
-    // The switch goes with the skill.
-    let mut off = switched_off(data)?;
-    if !same(name, &new_name) && off.iter().any(|n| same(n, name)) {
+    if moving {
         off.retain(|n| !same(n, name));
-        off.push(new_name);
         save_off(data, &off)?;
     }
     loaded(data, &skill.folder)
@@ -222,15 +234,19 @@ fn remove_in(data: &Path, name: &str) -> Result<PathBuf, String> {
     let Some(skill) = find(&mine, name) else {
         return Err(not_yours(name));
     };
-    // Or a new skill of the same name would start off.
     let mut off = switched_off(data)?;
+    let archived = archive(data, &skill.folder)?;
+    // Only once it is gone, or a failed move would leave it switched on.
+    // Forgotten, since a new skill of the same name should start on.
     if off.iter().any(|n| same(n, name)) {
         off.retain(|n| !same(n, name));
-        save_off(data, &off)?;
+        save_off(data, &off)
+            .map_err(|why| format!("Moved \"{name}\" to {}, but: {why}", archived.display()))?;
     }
-    archive(data, &skill.folder)
+    Ok(archived)
 }
 
+/// The error for a name that is none of the user's own skills.
 fn not_yours(name: &str) -> String {
     format!(
         "None of your skills is called \"{name}\". A skill that comes with a project is changed \
@@ -268,13 +284,17 @@ fn roots(data: &Path, workspace: Option<&Path>) -> Vec<(PathBuf, Source)> {
     roots
 }
 
-/// The skills in one folder of them, in the order of their folders' names.
+/// The skills in one folder of them, in the order of their folders' names,
+/// from the first `ROOT_SKILLS` folders. A project's skill folder that is a
+/// link is passed over, so a repository's skills are read from inside it;
+/// the user's own may be links they made.
 fn read_root(root: &Path, source: Source) -> Vec<Skill> {
     let Ok(entries) = std::fs::read_dir(root) else {
         return Vec::new();
     };
     let mut folders: Vec<PathBuf> = entries
         .flatten()
+        .filter(|entry| source == Source::User || entry.file_type().is_ok_and(|kind| kind.is_dir()))
         .map(|entry| entry.path())
         .filter(|path| {
             !path
@@ -285,6 +305,7 @@ fn read_root(root: &Path, source: Source) -> Vec<Skill> {
     folders.sort();
     folders
         .iter()
+        .take(ROOT_SKILLS)
         .filter_map(|folder| read_skill(folder, source))
         .collect()
 }
@@ -292,14 +313,11 @@ fn read_root(root: &Path, source: Source) -> Vec<Skill> {
 /// The skill in `folder`, if it holds a SKILL.md that can be read. A missing
 /// name is the folder's; a missing description, the start of the body.
 fn read_skill(folder: &Path, source: Source) -> Option<Skill> {
-    let file = folder.join(SKILL_FILE);
-    if std::fs::metadata(&file).ok()?.len() > SKILL_BYTES {
-        return None;
-    }
-    let text = std::fs::read_to_string(&file).ok()?;
+    let text = read_text(&folder.join(SKILL_FILE), SKILL_BYTES)?;
     let (entries, body) = split(&text);
     let name = field(&entries, "name")
-        .or_else(|| Some(folder.file_name()?.to_string_lossy().into_owned()))?;
+        .or_else(|| Some(printable(&folder.file_name()?.to_string_lossy())))
+        .filter(|name| !name.is_empty())?;
     let description = field(&entries, "description").unwrap_or_else(|| summary_of(&body));
     Some(Skill {
         name,
@@ -309,6 +327,33 @@ fn read_skill(folder: &Path, source: Source) -> Option<Skill> {
         source,
         enabled: true,
     })
+}
+
+/// A file's text, when it is a regular file of at most `cap` bytes. Checked
+/// before it is opened and bounded while it is read: a SKILL.md that links to
+/// a device such as /dev/zero would otherwise never finish.
+fn read_text(path: &Path, cap: u64) -> Option<String> {
+    use std::io::Read;
+    if !std::fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(cap + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > cap {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// Text for one line of a list or the model's index: whitespace collapsed and
+/// control characters dropped, so a name cannot start new lines or send a
+/// terminal escape.
+fn printable(text: &str) -> String {
+    one_line(text).chars().filter(|c| !c.is_control()).collect()
 }
 
 /// One top-level entry of the frontmatter: its key, and its lines as written,
@@ -352,12 +397,13 @@ fn split(text: &str) -> (Vec<Entry>, String) {
     (entries, lines[end + 2..].join("\n").trim().to_owned())
 }
 
-/// An entry's value on one line, or None when it is missing or empty.
+/// An entry's value on one printable line, or None when it is missing or
+/// empty.
 fn field(entries: &[Entry], key: &str) -> Option<String> {
     entries
         .iter()
         .find(|e| e.key.eq_ignore_ascii_case(key))
-        .map(|e| one_line(&value(e)))
+        .map(|e| printable(&value(e)))
         .filter(|v| !v.is_empty())
 }
 
@@ -440,11 +486,23 @@ fn render(name: &str, description: &str, kept: &[Entry], body: &str) -> String {
 /// Write SKILL.md beside itself and move it over, so a crash cannot leave
 /// half of one.
 fn write_skill(folder: &Path, text: &str) -> Result<(), String> {
-    let temp = folder.join("SKILL.md.tmp");
+    let file = folder.join(SKILL_FILE);
+    let temp = temp_beside(&file);
     std::fs::create_dir_all(folder)
         .and_then(|()| std::fs::write(&temp, text))
-        .and_then(|()| std::fs::rename(&temp, folder.join(SKILL_FILE)))
+        .and_then(|()| std::fs::rename(&temp, &file))
         .map_err(|e| format!("Could not save the skill in {}: {e}", folder.display()))
+}
+
+/// A name to write beside `path` before moving over it, this process's and
+/// this call's own, so two saves at once never move each other's half-written
+/// file into place. Hidden, so one left by a crash is not read as part of a
+/// skill.
+fn temp_beside(path: &Path) -> PathBuf {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let n = COUNT.fetch_add(1, Ordering::Relaxed);
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    path.with_file_name(format!(".{name}.{}-{n}.tmp", std::process::id()))
 }
 
 /// Instructions as they are kept: trimmed, with Windows line ends made plain
@@ -461,7 +519,7 @@ fn summary_of(body: &str) -> String {
         .find(|p| !p.starts_with('#'))
         .or_else(|| paragraphs().next())
         .unwrap_or_default();
-    let first = one_line(first.trim_start_matches('#'));
+    let first = printable(first.trim_start_matches('#'));
     if first.chars().count() <= DESCRIPTION_CHARS {
         return first;
     }
@@ -547,9 +605,10 @@ fn switched_off(data: &Path) -> Result<Vec<String>, String> {
     })
 }
 
+/// Write the names switched off beside the file and move them over it.
 fn save_off(data: &Path, off: &[String]) -> Result<(), String> {
     let path = data.join(OFF_FILE);
-    let temp = path.with_extension("tmp");
+    let temp = temp_beside(&path);
     let bytes = serde_json::to_vec_pretty(off)
         .map_err(|e| format!("Could not save which skills are off: {e}"))?;
     std::fs::create_dir_all(data)
@@ -721,7 +780,9 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("letronna-skills-{name}"));
+        // The process's id too, so two checkouts testing at once keep apart.
+        let dir =
+            std::env::temp_dir().join(format!("letronna-skills-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -1079,5 +1140,83 @@ mod tests {
         assert_eq!(slug("!!!"), "skill");
         assert_eq!(slug("Über"), "über");
         assert_eq!(slug(&"a".repeat(100)).len(), 64);
+        // Lowercasing can change a name's length in bytes.
+        assert_eq!(slug("\u{212a}elvin"), "kelvin");
+        assert_eq!(slug("İstanbul."), "i-stanbul");
+        assert_eq!(slug(&"é".repeat(100)).chars().count(), 64);
+    }
+
+    #[test]
+    fn a_skill_file_that_is_not_a_plain_file_is_passed_over() {
+        let data = scratch("not-a-file");
+        std::fs::create_dir_all(data.join("skills/folder/SKILL.md")).unwrap();
+        write(
+            &data.join("skills/big/SKILL.md"),
+            &"x".repeat(super::SKILL_BYTES as usize + 1),
+        );
+        write(&data.join("skills/fine/SKILL.md"), "Fine.");
+        #[cfg(unix)]
+        {
+            std::fs::create_dir_all(data.join("skills/device")).unwrap();
+            std::os::unix::fs::symlink("/dev/zero", data.join("skills/device/SKILL.md")).unwrap();
+        }
+        assert_eq!(names(&list_in(&data, None).unwrap()), ["fine"]);
+    }
+
+    #[test]
+    fn names_cannot_carry_new_lines_or_escapes() {
+        let data = scratch("printable");
+        write(
+            &data.join("skills/x/SKILL.md"),
+            "---\nname: \"two\\nlines\"\ndescription: \"red \u{1b}[31mtext\"\n---\nBody",
+        );
+        let skills = list_in(&data, None).unwrap();
+        assert_eq!(skills[0].name, "two lines");
+        assert_eq!(skills[0].description, "red [31mtext");
+    }
+
+    #[test]
+    fn a_project_skill_folder_that_is_a_link_is_passed_over() {
+        let data = scratch("linked");
+        let project = data.join("project");
+        write(
+            &data.join("elsewhere/SKILL.md"),
+            "---\nname: linked\n---\nBody",
+        );
+        write(
+            &project.join(".agents/skills/real/SKILL.md"),
+            "---\nname: real\n---\nBody",
+        );
+        // Built part by part: mklink reads a `/` as the start of a switch.
+        let link = project.join(".agents").join("skills").join("linked");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(data.join("elsewhere"), &link).unwrap();
+        #[cfg(windows)]
+        {
+            // A junction needs no privilege, unlike a symbolic link.
+            let made = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&link)
+                .arg(data.join("elsewhere"))
+                .output()
+                .unwrap();
+            assert!(made.status.success(), "{made:?}");
+        }
+        assert!(link.join("SKILL.md").is_file());
+        let listed = list_in(&data, Some(&project)).unwrap();
+        assert!(names(&listed).contains(&"real"));
+        assert!(!names(&listed).contains(&"linked"));
+    }
+
+    #[test]
+    fn a_skill_that_cannot_be_moved_away_keeps_its_switch() {
+        let data = scratch("stuck");
+        create_in(&data, "Keep", "", "Body").unwrap();
+        set_enabled_in(&data, "Keep", false).unwrap();
+        // The archive cannot be made where a file already is.
+        std::fs::write(data.join("skills-archive"), "").unwrap();
+        assert!(remove_in(&data, "Keep").is_err());
+        let listed = list_in(&data, None).unwrap();
+        assert!(listed.iter().any(|s| s.name == "Keep" && !s.enabled));
     }
 }
