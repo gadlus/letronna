@@ -181,6 +181,8 @@ pub(crate) struct Chat {
     /// The video playing in the chat, if one is, and its newest frame.
     pub(crate) video: Option<crate::platform::video::Playing>,
     pub(crate) video_frame: Option<std::sync::Arc<RenderImage>>,
+    /// The right panel's state: shown or hidden, its width and its tabs.
+    pub(crate) panel: crate::ui::panel::Panel,
     /// The browser the agent uses, shown beside the chat while it does, and
     /// the session whose browser it shows: each session has its own.
     pub(crate) browser: Entity<crate::ui::browser::BrowserView>,
@@ -419,6 +421,7 @@ impl Chat {
             thinking_open: std::collections::HashSet::new(),
             video: None,
             video_frame: None,
+            panel: Default::default(),
             browser: cx.new(|cx| crate::ui::browser::BrowserView::new(window, cx)),
             browser_for: 0,
             error,
@@ -429,6 +432,8 @@ impl Chat {
             followed_offset: px(0.),
             _subscriptions: subscriptions,
         };
+        let widen = this.follow_browser_layout(window, cx);
+        this._subscriptions.push(widen);
         this.load_models(window, cx);
         // Directly, not through `focus_composer`: the window's root does
         // not exist yet to ask about dialogs, and there can be none.
@@ -1361,8 +1366,8 @@ impl Render for Chat {
             } else {
                 px(0.)
             }
-            // Beside the docked browser, less again.
-            - self.browser.read(cx).docked_width(window);
+            // Beside the docked panel, less again.
+            - self.panel_width(window, cx);
         let column = pane.min(COLUMN).max(px(0.));
 
         let body: AnyElement = if self.page == Page::Jobs {
@@ -1579,6 +1584,20 @@ impl Render for Chat {
                     this.open_settings(window, cx)
                 }
             }))
+            .on_action(
+                cx.listener(|this, _: &crate::ui::panel::TogglePanel, window, cx| {
+                    if !window.has_active_dialog(cx) && !this.settings_open {
+                        this.toggle_panel(window, cx)
+                    }
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::ui::panel::BrowserTab, window, cx| {
+                    if !window.has_active_dialog(cx) && !this.settings_open {
+                        this.show_tab(crate::ui::panel::PanelTab::Browser, window, cx)
+                    }
+                }),
+            )
             .child(self.title_bar(window, cx))
             .child(
                 h_flex()
@@ -1586,9 +1605,7 @@ impl Render for Chat {
                     .min_h_0()
                     .when(self.sidebar_open, |this| this.child(self.sidebar(cx)))
                     .child(main)
-                    .when(self.page == Page::Chat, |row| {
-                        row.child(self.browser.clone())
-                    }),
+                    .children(self.right_panel(window, cx)),
             )
             .children(self.settings_overlay(window, cx))
             .children(Root::render_dialog_layer(window, cx))

@@ -55,6 +55,8 @@ fn main() {
             // with no context above every other, which took escape away
             // from dialogs and menus. Inside the chat, theirs go first.
             KeyBinding::new("escape", Dismiss, Some("Chat")),
+            KeyBinding::new("secondary-j", ui::panel::TogglePanel, Some("Chat")),
+            KeyBinding::new("secondary-shift-l", ui::panel::BrowserTab, Some("Chat")),
             KeyBinding::new(
                 "shift-enter",
                 gpui_component::input::Enter { secondary: true },
