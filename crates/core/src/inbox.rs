@@ -148,6 +148,33 @@ pub fn take(to: u64, idle: bool) -> Vec<Notice> {
     taken
 }
 
+/// Whether a notice from `from` is still waiting for a session or helper.
+pub(crate) fn holds(to: u64, from: &str) -> bool {
+    inbox().lock().is_ok_and(|inbox| {
+        inbox.mailboxes.get(&to).is_some_and(|mailbox| {
+            mailbox
+                .waiting
+                .iter()
+                .any(|(_, notice)| notice.from == from)
+        })
+    })
+}
+
+/// Take back what `from` left for a session or helper that nobody has read.
+pub(crate) fn withdraw(to: u64, from: &str) {
+    let Ok(mut inbox) = inbox().lock() else {
+        return;
+    };
+    let Some(mailbox) = inbox.mailboxes.get_mut(&to) else {
+        return;
+    };
+    mailbox.waiting.retain(|(_, notice)| notice.from != from);
+    // Kept while it owes a count of dropped notices to whoever reads next.
+    if mailbox.waiting.is_empty() && mailbox.dropped == 0 {
+        inbox.mailboxes.remove(&to);
+    }
+}
+
 /// Frame notices as one message the model reads as the user's turn, or
 /// nothing when there are none.
 pub fn fold(notices: &[Notice]) -> Option<Message> {

@@ -9,6 +9,7 @@ use letronna_core::chat::{self, Connection, Event, Message};
 use letronna_core::inbox;
 use letronna_core::store::{Conversation, Store};
 use letronna_core::tools;
+use letronna_core::wake;
 use std::collections::HashSet;
 
 use crate::bar::Bar;
@@ -112,6 +113,16 @@ impl Runner {
         let answer = self.work(&mut turn, session);
         drop(busy);
         self.bar.working(false);
+        // The session's loop goes round again from the turn that took its
+        // tick, and a stop ends it.
+        let id = self.store.conversations[session].id;
+        let ended = (!self.stopped).then(|| answer.as_deref().unwrap_or_default());
+        if let Some(said) = wake::turn_ended(id, ended) {
+            render::blank();
+            render::line(&render::dim(&said));
+            // Nothing else paints until the next key.
+            crate::screen::settle();
+        }
         answer
     }
 

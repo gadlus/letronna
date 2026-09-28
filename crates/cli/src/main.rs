@@ -161,8 +161,11 @@ fn main() {
         let bar::Waited::Line(line) = waited else {
             // Notices came for the open session while it sat idle, and it
             // takes them as a turn of its own -- unless the user stopped the
-            // last one, when they wait to go in ahead of the next prompt.
-            if !runner.stopped
+            // last one, when they wait to go in ahead of the next prompt. A
+            // loop's tick is the user's standing order, which a stop does
+            // not hold back, or the loop would stall until they typed.
+            let id = runner.store.conversations[session].id;
+            if (!runner.stopped || letronna_core::wake::waiting(id))
                 && let Err(error) = runner.resume(session)
             {
                 render::blank();

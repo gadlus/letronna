@@ -128,6 +128,10 @@ pub fn command(
             jobs(rest);
             Flow::Handled
         }
+        "/loop" | "/heartbeat" => {
+            looping(runner, *session, line, rest);
+            Flow::Handled
+        }
         "/skills" => {
             skills(runner, rest);
             Flow::Handled
@@ -657,6 +661,19 @@ fn take_back(
     // After the redraw, so a failure to save is not cleared off the screen.
     runner.persist();
     Some(prompt)
+}
+
+/// Start, stop or show the open session's loop.
+fn looping(runner: &Runner, session: usize, name: &str, rest: &str) {
+    let id = runner.store.conversations[session].id;
+    let Some(done) = letronna_core::wake::command(id, name, rest) else {
+        return;
+    };
+    render::blank();
+    match done {
+        Ok(said) => render::line(&render::dim(&said)),
+        Err(why) => render::line(&render::red(&why)),
+    }
 }
 
 /// Where the last thing you said sits among `messages`, and what it said.

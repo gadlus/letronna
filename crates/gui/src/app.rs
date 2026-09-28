@@ -211,6 +211,8 @@ pub(crate) struct Chat {
     pub(crate) updating: crate::ui::update::Updating,
     /// A new version to announce, the next time the window draws.
     pub(crate) update_note: Option<String>,
+    /// How a session's loop ended, to say the next time the window draws.
+    pub(crate) loop_note: Option<String>,
     pub(crate) scroll: ScrollHandle,
     /// Whether the chat keeps to its newest message as more arrives.
     pub(crate) following: bool,
@@ -450,6 +452,7 @@ impl Chat {
             error,
             updating: Default::default(),
             update_note: None,
+            loop_note: None,
             scroll: ScrollHandle::new(),
             following: true,
             followed_offset: px(0.),
@@ -575,6 +578,43 @@ impl Chat {
 
     pub(crate) fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let prompt = self.composer.read(cx).value().trim().to_owned();
+        // `/loop` and `/heartbeat` are for Letronna, not the model, and are
+        // taken while a reply runs too: `/loop stop` most of all.
+        let (name, rest) = prompt
+            .split_once(char::is_whitespace)
+            .unwrap_or((prompt.as_str(), ""));
+        let here = self.store.conversations[self.store.active].id;
+        // A chat app's session is woken only by its next message, which
+        // would carry the ticks, and what they did, into the chat.
+        let done = if matches!(name, "/loop" | "/heartbeat")
+            && self.remote_session.values().any(|&s| s == here)
+        {
+            Some(Err(
+                "A chat app's session wakes only for its messages, so a loop there would never come round.".to_owned(),
+            ))
+        } else {
+            letronna_core::wake::command(here, name, rest)
+        };
+        if let Some(done) = done {
+            match done {
+                Ok(said) => {
+                    self.composer
+                        .update(cx, |input, cx| input.set_value("", window, cx));
+                    window.push_notification(
+                        gpui_component::notification::Notification::info(said),
+                        cx,
+                    );
+                }
+                Err(why) => {
+                    // Kept as typed, without the line Enter added.
+                    self.composer
+                        .update(cx, |input, cx| input.set_value(prompt, window, cx));
+                    self.error = Some(why);
+                }
+            }
+            cx.notify();
+            return;
+        }
         if self.busy && !prompt.is_empty() {
             return self.queue_follow_up(prompt, window, cx);
         }
@@ -1391,6 +1431,19 @@ impl Chat {
         self.answer_remote(cx);
         self.report_scheduled(cx);
         let session = self.streaming_id;
+        // The session's loop goes round again from the turn that took its
+        // tick, and a stop ends it.
+        if let Some(id) = session {
+            let answer = self
+                .store
+                .index_of(id)
+                .and_then(|ix| self.store.conversations[ix].messages.last())
+                .filter(|m| m.role == "assistant")
+                .map_or("", |m| m.content.as_str());
+            if let Some(said) = letronna_core::wake::turn_ended(id, (!stopped).then_some(answer)) {
+                self.loop_note = Some(said);
+            }
+        }
         self.busy = false;
         self.streaming_id = None;
         self.turn = None;
@@ -1398,7 +1451,14 @@ impl Chat {
         self.send_follow_ups(session, cx);
         // Stop means stop, and after a failure the next turn would most
         // likely fail too: what is waiting goes in at the next ring or prompt.
-        if !stopped && self.error.is_none() {
+        // A loop's tick is the user's standing order, which a stop does not
+        // hold back, or the loop would stall with no ring to come.
+        let ticking = || {
+            inbox::pending()
+                .into_iter()
+                .any(letronna_core::wake::waiting)
+        };
+        if (!stopped || ticking()) && self.error.is_none() {
             self.wake_idle(cx);
         }
         cx.notify();
@@ -1591,6 +1651,9 @@ impl Render for Chat {
             .detach();
         }
         if let Some(note) = self.update_note.take() {
+            window.push_notification(gpui_component::notification::Notification::info(note), cx);
+        }
+        if let Some(note) = self.loop_note.take() {
             window.push_notification(gpui_component::notification::Notification::info(note), cx);
         }
         if let Some(error) = self.error.take() {

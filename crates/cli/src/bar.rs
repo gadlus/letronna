@@ -83,6 +83,14 @@ pub const COMMANDS: &[Command] = &[
         blurb: "commands still running in the background",
     },
     Command {
+        name: "/loop",
+        blurb: "run a prompt every so often, or at the model's pace; /loop stop ends it",
+    },
+    Command {
+        name: "/heartbeat",
+        blurb: "look in on this session every so many minutes",
+    },
+    Command {
         name: "/skills",
         blurb: "saved instructions you can hand the model",
     },

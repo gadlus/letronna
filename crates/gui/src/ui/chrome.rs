@@ -253,6 +253,31 @@ impl Chat {
         )
     }
 
+    /// The loop in the session on screen, if it has one, with a stop button.
+    fn loop_chip(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let session = self.store.conversations[self.store.active].id;
+        let about = letronna_core::wake::looping(session)?;
+        Some(
+            Button::new("loop")
+                .ghost()
+                .xsmall()
+                .text_color(cx.theme().muted_foreground)
+                .tooltip(format!("{about} — click to stop"))
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(Icon::new(AppIcon::Reload).size_3())
+                        .child("Loop")
+                        .child(Icon::new(IconName::Close).size_3()),
+                )
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    letronna_core::wake::stop(session);
+                    cx.notify();
+                })),
+        )
+    }
+
     pub(crate) fn status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .h(px(20.))
@@ -264,6 +289,7 @@ impl Chat {
             .child(self.gateway_chip(cx))
             .child(self.workspace_chip(cx))
             .child(self.job_chips(cx))
+            .children(self.loop_chip(cx))
             .child(div().flex_1())
             .children(self.update_chip(cx))
             .child(concat!("v", env!("CARGO_PKG_VERSION")))
