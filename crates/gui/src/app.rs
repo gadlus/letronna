@@ -116,6 +116,8 @@ pub(crate) struct Chat {
     pub(crate) busy: bool,
     /// The turn in flight, if any. Owns the streamed reply and the tool queue.
     pub(crate) turn: Option<agent::Turn>,
+    /// Stops the tool the turn in flight is running, when set.
+    pub(crate) turn_stop: letronna_core::cancel::Cancel,
     /// The session id currently receiving a streamed reply, if any.
     pub(crate) streaming_id: Option<u64>,
     /// Tools the user allowed for the rest of this run of the app.
@@ -146,9 +148,9 @@ pub(crate) struct Chat {
     /// The session each remote chat is talking in, so a follow-up keeps its
     /// context. `/new` from the chat starts another.
     pub(crate) remote_session: std::collections::HashMap<letronna_core::messaging::Source, u64>,
-    /// Bumped when a turn is stopped. The stream and tool threads of the
-    /// stopped turn cannot be interrupted, so they run on; what they send
-    /// back carries the old number and is dropped.
+    /// Bumped when a turn is stopped. The stream thread of the stopped turn
+    /// cannot be interrupted, and a tool that does not listen to `turn_stop`
+    /// runs on; what they send back carries the old number and is dropped.
     pub(crate) generation: u64,
     /// A remote chat that has been sent the card the turn is waiting on, and
     /// the call it is about. Its next message answers it.
@@ -385,6 +387,7 @@ impl Chat {
             rename,
             busy: false,
             turn: None,
+            turn_stop: Default::default(),
             streaming_id: None,
             session_allow: std::collections::HashSet::new(),
             unattended: std::collections::HashSet::new(),
@@ -829,11 +832,12 @@ impl Chat {
 
     /// Run one call off the UI thread and continue the queue when it returns.
     fn execute_call(&mut self, call: backend::ToolCall, cx: &mut Context<Self>) {
-        let ctx = self
+        let mut ctx = self
             .turn
             .as_ref()
             .map(|turn| letronna_core::tools::ToolContext::of(&turn.connection))
             .unwrap_or_default();
+        ctx.cancel = self.turn_stop.clone();
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
             let _ = tx.send_blocking(letronna_core::tools::run(&call.name, &call.arguments, &ctx));
@@ -1230,6 +1234,9 @@ impl Chat {
             return;
         }
         self.generation += 1;
+        // Reaches the running tool, so a wait or a command ends now rather
+        // than running on unseen. Taken, so the next turn starts unstopped.
+        std::mem::take(&mut self.turn_stop).set();
         self.remote_waiting = None;
         if let Some(id) = self.streaming_id {
             if let Some(source) = self.remote.remove(&id) {
