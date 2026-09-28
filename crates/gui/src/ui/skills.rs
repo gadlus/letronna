@@ -1,37 +1,36 @@
-//! The Skills page: saved prompts, loaded into the composer on demand.
+//! The Skills page: skill folders, whose instructions load into the composer
+//! on demand.
 
 use crate::prelude::*;
-use letronna_core::skills::{self, Skill};
+use letronna_core::skills;
 
 impl Chat {
-    fn save_skills(&mut self, cx: &mut Context<Self>) {
-        if let Err(why) = skills::save(&self.skills) {
-            self.error = Some(why);
+    /// Read the skills again, as the active session's project sees them.
+    pub(crate) fn reload_skills(&mut self) {
+        let workspace = self.store.conversations[self.store.active]
+            .workspace
+            .clone();
+        match skills::list(workspace.as_deref()) {
+            Ok(list) => self.skills = list,
+            Err(why) => self.error = Some(why),
+        }
+    }
+
+    fn new_skill(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.editing_skill = Some(String::new());
+        for input in [&self.skill_name, &self.skill_prompt] {
+            input.update(cx, |input, cx| input.set_value("", window, cx));
         }
         cx.notify();
     }
 
-    fn new_skill(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let skill = Skill {
-            id: skills::next_id(&self.skills),
-            name: String::new(),
-            prompt: String::new(),
-        };
-        self.editing_skill = Some(skill.id);
-        self.skills.push(skill);
-        for input in [&self.skill_name, &self.skill_prompt] {
-            input.update(cx, |input, cx| input.set_value("", window, cx));
-        }
-        self.save_skills(cx);
-    }
-
-    /// Put the skill's prompt in the composer of the active chat, ready to
-    /// adjust. Sending it is left to the user.
-    fn use_skill(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(skill) = self.skills.iter().find(|s| s.id == id) else {
+    /// Put the skill's instructions in the composer of the active chat, ready
+    /// to adjust. Sending them is left to the user.
+    fn use_skill(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(skill) = skills::find(&self.skills, name) else {
             return;
         };
-        let prompt = skill.prompt.clone();
+        let prompt = skill.body.clone();
         self.page = Page::Chat;
         self.composer
             .update(cx, |input, cx| input.set_value(prompt, window, cx));
@@ -40,34 +39,41 @@ impl Chat {
         cx.notify();
     }
 
-    fn delete_skill(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(skill) = self.skills.iter().find(|s| s.id == id) else {
+    fn delete_skill(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(skill) = skills::find(&self.skills, name) else {
             return;
         };
-        let body = format!("\"{}\" will be removed from this device.", skill.name);
+        let name = skill.name.clone();
+        let body = format!("\"{name}\" will be moved to the skills archive on this device.");
         let chat = cx.entity();
         crate::ui::confirm_delete("Delete skill", body, window, cx, move |_, cx| {
             chat.update(cx, |this, cx| {
-                this.skills.retain(|s| s.id != id);
-                this.save_skills(cx);
+                if let Err(why) = skills::remove(&name) {
+                    this.error = Some(why);
+                }
+                this.reload_skills();
+                cx.notify();
             })
         });
     }
 
-    fn edit_skill(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(skill) = self.skills.iter().find(|s| s.id == id) else {
+    fn edit_skill(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(skill) = skills::find(&self.skills, name) else {
             return;
         };
-        let (name, prompt) = (skill.name.clone(), skill.prompt.clone());
+        let (name, prompt) = (skill.name.clone(), skill.body.clone());
         self.skill_name
-            .update(cx, |input, cx| input.set_value(name, window, cx));
+            .update(cx, |input, cx| input.set_value(name.clone(), window, cx));
         self.skill_prompt
             .update(cx, |input, cx| input.set_value(prompt, window, cx));
-        self.editing_skill = Some(id);
+        self.editing_skill = Some(name);
         cx.notify();
     }
 
-    fn commit_skill(&mut self, id: u64, cx: &mut Context<Self>) {
+    fn commit_skill(&mut self, cx: &mut Context<Self>) {
+        let Some(editing) = self.editing_skill.clone() else {
+            return;
+        };
         let name = self.skill_name.read(cx).value().trim().to_owned();
         let prompt = self.skill_prompt.read(cx).value().trim().to_owned();
         if prompt.is_empty() {
@@ -75,19 +81,25 @@ impl Chat {
             cx.notify();
             return;
         }
-        if let Some(skill) = self.skills.iter_mut().find(|s| s.id == id) {
-            skill.name = if name.is_empty() {
-                prompt.chars().take(40).collect()
-            } else {
-                name
-            };
-            skill.prompt = prompt;
+        let name = if name.is_empty() {
+            prompt.chars().take(40).collect()
+        } else {
+            name
+        };
+        let saved = if editing.is_empty() {
+            skills::create(&name, "", &prompt)
+        } else {
+            skills::edit(&editing, &name, None, &prompt)
+        };
+        match saved {
+            Ok(_) => self.editing_skill = None,
+            Err(why) => self.error = Some(why),
         }
-        self.editing_skill = None;
-        self.save_skills(cx);
+        self.reload_skills();
+        cx.notify();
     }
 
-    fn skill_editor(&self, id: u64, cx: &mut Context<Self>) -> impl IntoElement {
+    fn skill_editor(&self, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .w_full()
             .gap_3()
@@ -126,7 +138,7 @@ impl Chat {
                             .primary()
                             .small()
                             .label("Save")
-                            .on_click(cx.listener(move |this, _, _, cx| this.commit_skill(id, cx))),
+                            .on_click(cx.listener(move |this, _, _, cx| this.commit_skill(cx))),
                     )
                     .child(
                         Button::new("cancel-skill")
@@ -134,10 +146,8 @@ impl Chat {
                             .small()
                             .label("Cancel")
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                // Never given a prompt means never really made.
-                                this.skills.retain(|s| s.id != id || !s.prompt.is_empty());
                                 this.editing_skill = None;
-                                this.save_skills(cx);
+                                cx.notify();
                             })),
                     ),
             )
@@ -145,7 +155,8 @@ impl Chat {
 
     fn skill_row(&self, index: usize, cx: &mut Context<Self>) -> impl IntoElement {
         let skill = &self.skills[index];
-        let id = skill.id;
+        let name = skill.name.clone();
+        let (edit_name, delete_name) = (name.clone(), name.clone());
         h_flex()
             .w_full()
             .items_center()
@@ -171,7 +182,7 @@ impl Chat {
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
                             .truncate()
-                            .child(letronna_core::tools::one_line(&skill.prompt)),
+                            .child(skill.description.clone()),
                     ),
             )
             .child(
@@ -184,7 +195,7 @@ impl Chat {
                             .xsmall()
                             .label("Use")
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.use_skill(id, window, cx)
+                                this.use_skill(&name, window, cx)
                             })),
                     )
                     .child(
@@ -194,7 +205,7 @@ impl Chat {
                             .icon(Icon::new(AppIcon::Pencil))
                             .tooltip("Edit")
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.edit_skill(id, window, cx)
+                                this.edit_skill(&edit_name, window, cx)
                             })),
                     )
                     .child(
@@ -204,23 +215,27 @@ impl Chat {
                             .icon(Icon::new(AppIcon::Trash))
                             .tooltip("Delete")
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.delete_skill(id, window, cx)
+                                this.delete_skill(&delete_name, window, cx)
                             })),
                     ),
             )
     }
 
     pub(crate) fn skills_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let rows: Vec<AnyElement> = (0..self.skills.len())
+        let mut rows: Vec<AnyElement> = (0..self.skills.len())
             .map(|index| {
-                if self.editing_skill == Some(self.skills[index].id) {
-                    self.skill_editor(self.skills[index].id, cx)
-                        .into_any_element()
+                if self.editing_skill.as_ref() == Some(&self.skills[index].name) {
+                    self.skill_editor(cx).into_any_element()
                 } else {
                     self.skill_row(index, cx).into_any_element()
                 }
             })
             .collect();
+        // A new skill is written only once it is saved, so its editor stands
+        // at the top until then.
+        if self.editing_skill.as_ref().is_some_and(String::is_empty) {
+            rows.insert(0, self.skill_editor(cx).into_any_element());
+        }
         v_flex()
             .flex_1()
             .min_h_0()

@@ -171,7 +171,8 @@ pub(crate) struct Chat {
     /// Selected row on the Messaging page.
     pub(crate) channel: usize,
     pub(crate) skills: Vec<letronna_core::skills::Skill>,
-    pub(crate) editing_skill: Option<u64>,
+    /// The name of the skill being edited, or empty for a new one.
+    pub(crate) editing_skill: Option<String>,
     pub(crate) skill_name: Entity<InputState>,
     pub(crate) skill_prompt: Entity<InputState>,
     /// Your message being changed in place, by session id and place.
@@ -348,10 +349,10 @@ impl Chat {
                 }
             }),
         ];
-        // An empty list rather than the defaults, which the next save would
-        // write over the file; load has already kept a copy of one that will
-        // not parse.
-        let (skills, skills_error) = match letronna_core::skills::load() {
+        // An empty list and the message when the old skills.json will not
+        // parse; a copy of it has already been kept.
+        let workspace = store.conversations[store.active].workspace.as_deref();
+        let (skills, skills_error) = match letronna_core::skills::list(workspace) {
             Ok(skills) => (skills, None),
             Err(why) => (Vec::new(), Some(why)),
         };
