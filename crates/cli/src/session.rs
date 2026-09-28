@@ -295,7 +295,7 @@ impl Runner {
         call: letronna_core::chat::ToolCall,
     ) -> Result<bool, String> {
         if call.name == tools::ASK_USER {
-            let args = tools::parse_args(&call.arguments).unwrap_or_default();
+            let args = tools::parse_args_for(&call.name, &call.arguments).unwrap_or_default();
             let question = args["question"].as_str().unwrap_or("").to_owned();
             let options: Vec<String> = args["options"]
                 .as_array()

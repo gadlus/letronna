@@ -171,13 +171,136 @@ pub fn parse_args(args: &str) -> Result<Value, String> {
     })
 }
 
+/// The file tools, which other agents' models all call with a file path.
+const FILE_TOOLS: &[&str] = &["read_file", "write_file", "edit_file"];
+
+/// Parameter names other agents use, as (theirs, ours, the tools it applies
+/// to), since a model used to one of them reaches for its names first.
+const ALIASES: &[(&str, &str, &[&str])] = &[
+    ("file_path", "path", FILE_TOOLS),
+    ("filepath", "path", FILE_TOOLS),
+    ("absolute_path", "path", FILE_TOOLS),
+    ("file", "path", FILE_TOOLS),
+    ("file_text", "content", &["write_file"]),
+    ("file_content", "content", &["write_file"]),
+    ("contents", "content", &["write_file"]),
+    ("old_string", "old", &["edit_file"]),
+    ("old_str", "old", &["edit_file"]),
+    ("new_string", "new", &["edit_file"]),
+    ("new_str", "new", &["edit_file"]),
+    ("dir_path", "path", &["list_dir", "search"]),
+    ("directory", "path", &["list_dir", "search"]),
+    ("cmd", "command", &["run_command"]),
+    ("run_in_background", "background", &["run_command"]),
+    ("is_background", "background", &["run_command"]),
+    ("job_id", "id", &["read_job", "stop_job"]),
+    ("bash_id", "id", &["read_job"]),
+    ("shell_id", "id", &["stop_job"]),
+    ("job_id", "job", &["wait"]),
+];
+
+/// Renames another agent's name for a parameter of tool `name` to Letronna's,
+/// unless the call already has Letronna's; returns what was renamed.
+pub fn rename_aliases(name: &str, args: &mut Value) -> Vec<String> {
+    let mut changed = Vec::new();
+    let Some(object) = args.as_object_mut() else {
+        return changed;
+    };
+    for (theirs, ours, tools) in ALIASES {
+        // A key already there, the call's own or an earlier row's, stands.
+        if !tools.contains(&name) || object.contains_key(*ours) {
+            continue;
+        }
+        let Some(value) = object.remove(*theirs) else {
+            continue;
+        };
+        object.insert((*ours).to_owned(), value);
+        changed.push(format!("`{theirs}` as `{ours}`"));
+    }
+    changed
+}
+
+/// Parses a top-level string the schema wants as another type, such as
+/// `"true"` for a boolean or `"[1, 2]"` for an array, and returns what it
+/// changed.
+fn coerce(schema: &Value, args: &mut Value) -> Vec<String> {
+    let mut changed = Vec::new();
+    let (Some(properties), Some(object)) = (schema["properties"].as_object(), args.as_object_mut())
+    else {
+        return changed;
+    };
+    for (key, value) in object.iter_mut() {
+        let Some(kind) = properties.get(key).and_then(|p| p["type"].as_str()) else {
+            continue;
+        };
+        let Value::String(text) = value else {
+            continue;
+        };
+        let Ok(parsed) = serde_json::from_str::<Value>(text.trim()) else {
+            continue;
+        };
+        let fits = match kind {
+            "boolean" => parsed.is_boolean(),
+            "integer" => parsed.is_i64() || parsed.is_u64(),
+            "number" => parsed.is_number(),
+            "array" => parsed.is_array(),
+            "object" => parsed.is_object(),
+            _ => false,
+        };
+        if fits {
+            *value = parsed;
+            let article = if matches!(kind, "integer" | "array" | "object") {
+                "an"
+            } else {
+                "a"
+            };
+            changed.push(format!("`{key}` as {article} {kind}"));
+        }
+    }
+    changed
+}
+
+/// Renames aliases, then coerces values to the tool's schema, and returns
+/// what was reinterpreted.
+fn repair(tool: &dyn Tool, args: &mut Value) -> Vec<String> {
+    let mut changed = rename_aliases(tool.name(), args);
+    changed.extend(coerce(&tool.parameters(), args));
+    changed
+}
+
+/// Parses a call's arguments as tool `name` runs them, renamed and coerced,
+/// for a frontend that reads them itself, such as the todo checklist.
+pub fn parse_args_for(name: &str, args: &str) -> Result<Value, String> {
+    let mut args = parse_args(args)?;
+    if let Some(tool) = find(name) {
+        repair(&*tool, &mut args);
+    }
+    Ok(args)
+}
+
+/// The note that ends a result whose arguments were reinterpreted, so the
+/// model uses the right ones next time; empty when none were.
+fn reinterpreted(changed: &[String]) -> String {
+    if changed.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\n[Read {}. Use the tool's own parameter names and types.]",
+        changed.join(", ")
+    )
+}
+
 pub fn needs_approval(name: &str) -> bool {
     find(name).is_some_and(|t| t.needs_approval())
 }
 
 pub fn preview(name: &str, args: &str, ctx: &ToolContext) -> String {
     match (find(name), parse_args(args)) {
-        (Some(t), Ok(v)) => t.preview(&v, ctx),
+        (Some(t), Ok(mut v)) => {
+            // The card shows what will run, under the names the tool reads.
+            repair(&*t, &mut v);
+            t.preview(&v, ctx)
+        }
         _ => args.to_owned(),
     }
 }
@@ -217,13 +340,16 @@ pub fn run(name: &str, args: &str, ctx: &ToolContext) -> Result<String, String> 
              nothing on this computer is in reach."
         ));
     }
-    let args = parse_args(args)?;
-    let mut out = tool.run(&args, ctx)?;
+    let mut args = parse_args(args)?;
+    let note = reinterpreted(&repair(&*tool, &mut args));
+    let mut out = tool.run(&args, ctx).map_err(|e| e + &note)?;
     if out.len() > MAX_OUTPUT {
         let cut = out.floor_char_boundary(MAX_OUTPUT);
         out.truncate(cut);
         out.push_str("\n… [truncated]");
     }
+    // After the cut, so the note is never the part that gets lost.
+    out.push_str(&note);
     Ok(out)
 }
 
@@ -241,7 +367,8 @@ pub fn clamp_lines(text: &str, max: usize) -> String {
 
 /// The argument the UI shows next to a tool name.
 pub fn summary(name: &str, args: &str) -> String {
-    let v: Value = serde_json::from_str(args).unwrap_or(Value::Null);
+    let mut v: Value = serde_json::from_str(args).unwrap_or(Value::Null);
+    rename_aliases(name, &mut v);
     let text = match name {
         "search" | "search_sessions" => v["query"]
             .as_str()
@@ -1276,5 +1403,134 @@ World"
         };
         let refused = run("read_file", r#"{"path": "x"}"#, &shared).unwrap_err();
         assert!(refused.contains("not available here"), "{refused}");
+    }
+
+    /// A workspace of its own for a test, holding `a.txt` with `text` in it.
+    fn workspace_with(label: &str, text: &str) -> (PathBuf, ToolContext) {
+        let dir = std::env::temp_dir().join(format!("letronna-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), text).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        (dir, ctx)
+    }
+
+    #[test]
+    fn a_claude_style_file_path_reaches_path() {
+        let (dir, ctx) = workspace_with("aliases", "");
+        run(
+            "write_file",
+            r#"{"file_path":"a.txt","file_text":"one two"}"#,
+            &ctx,
+        )
+        .unwrap();
+        let edit = r#"{"file_path":"a.txt","old_string":"two","new_string":"three"}"#;
+        // The approval shows the same call the tool will run.
+        assert_eq!(summary("edit_file", edit), "a.txt");
+        assert_eq!(preview("edit_file", edit, &ctx), "- two\n+ three\n");
+        run("edit_file", edit, &ctx).unwrap();
+        let read = run("read_file", r#"{"file_path":"a.txt"}"#, &ctx).unwrap();
+        assert!(read.starts_with("one three\n\n"), "{read}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn string_numbers_and_booleans_are_coerced_by_the_schema() {
+        let schema = json!({"type": "object", "properties": {
+            "background": {"type": "boolean"},
+            "id": {"type": "integer"},
+            "seconds": {"type": "number"},
+            "options": {"type": "array"},
+            "command": {"type": "string"}
+        }});
+        let mut args = json!({"background": "true", "id": " 3 ", "seconds": "2.5",
+            "options": "[\"a\", \"b\"]", "command": "42", "other": "1"});
+        assert_eq!(coerce(&schema, &mut args).len(), 4);
+        assert_eq!(
+            args,
+            json!({"background": true, "id": 3, "seconds": 2.5,
+                "options": ["a", "b"], "command": "42", "other": "1"})
+        );
+        // What does not read as the type is left for the tool to refuse.
+        let mut wrong = json!({"background": "yes", "id": "2.5", "options": "a"});
+        assert!(coerce(&schema, &mut wrong).is_empty());
+        assert_eq!(wrong["id"], "2.5");
+        // And through a real tool: a string of seconds is waited, not 10s.
+        let out = run("wait", r#"{"seconds": "0"}"#, &ToolContext::default()).unwrap();
+        assert!(out.starts_with("Waited 0s."), "{out}");
+    }
+
+    #[test]
+    fn a_present_key_is_never_overwritten_by_an_alias() {
+        let mut args = json!({"path": "a.txt", "file_path": "b.txt", "old_string": "x"});
+        let changed = rename_aliases("edit_file", &mut args);
+        assert_eq!(changed, ["`old_string` as `old`"]);
+        assert_eq!(
+            args,
+            json!({"path": "a.txt", "file_path": "b.txt", "old": "x"})
+        );
+        let (dir, ctx) = workspace_with("present", "kept");
+        let both = r#"{"path":"a.txt","file_path":"missing.txt"}"#;
+        assert_eq!(run("read_file", both, &ctx).unwrap(), "kept");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_result_says_what_was_reinterpreted() {
+        let (dir, ctx) = workspace_with("note", "hello");
+        assert_eq!(
+            run("read_file", r#"{"file_path":"a.txt"}"#, &ctx).unwrap(),
+            "hello\n\n[Read `file_path` as `path`. Use the tool's own parameter names and types.]"
+        );
+        let out = run("wait", r#"{"seconds": "0"}"#, &ctx).unwrap();
+        assert!(
+            out.ends_with(
+                "[Read `seconds` as a number. Use the tool's own parameter names and types.]"
+            ),
+            "{out}"
+        );
+        // A failure carries the note too, since the model reads that as well.
+        let missing = r#"{"file_path":"a.txt","old_string":"zzz","new_string":""}"#;
+        let err = run("edit_file", missing, &ctx).unwrap_err();
+        assert!(
+            err.contains("`file_path` as `path`, `old_string` as `old`, `new_string` as `new`"),
+            "{err}"
+        );
+        // A call in the tool's own terms gets no note.
+        assert_eq!(
+            run("read_file", r#"{"path":"a.txt"}"#, &ctx).unwrap(),
+            "hello"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn every_alias_leads_from_a_name_its_tool_lacks_to_one_it_has() {
+        for (theirs, ours, names) in ALIASES {
+            for name in *names {
+                let tool = find(name).unwrap_or_else(|| panic!("{name} missing"));
+                let properties = &tool.parameters()["properties"];
+                assert!(properties.get(*ours).is_some(), "{name} has no `{ours}`");
+                assert!(properties.get(*theirs).is_none(), "{name} has `{theirs}`");
+            }
+        }
+    }
+
+    #[test]
+    fn a_frontend_reads_the_arguments_the_tool_runs_with() {
+        let todo = r#"{"items": "[{\"text\": \"a\", \"status\": \"doing\"}]"}"#;
+        let args = parse_args_for(TODO, todo).unwrap();
+        assert_eq!(args["items"][0]["status"], "doing");
+        let ask = r#"{"question": "Which?", "options": "[\"a\", \"b\"]"}"#;
+        assert_eq!(
+            parse_args_for(ASK_USER, ask).unwrap()["options"],
+            json!(["a", "b"])
+        );
+        // A tool it does not know is parsed as sent.
+        let unknown = parse_args_for("nope", r#"{"id": "3"}"#).unwrap();
+        assert_eq!(unknown, json!({"id": "3"}));
     }
 }

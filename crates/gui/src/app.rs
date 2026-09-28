@@ -1587,7 +1587,7 @@ impl Render for Chat {
 
 /// The checklist a `todo` call sets, from its arguments.
 pub(crate) fn parse_todos(arguments: &str) -> std::result::Result<Vec<Todo>, String> {
-    let args = letronna_core::tools::parse_args(arguments)?;
+    let args = letronna_core::tools::parse_args_for(letronna_core::tools::TODO, arguments)?;
     let items = args["items"]
         .as_array()
         .ok_or_else(|| "`items` is required.".to_owned())?;
