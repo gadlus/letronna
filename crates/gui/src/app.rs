@@ -1564,7 +1564,7 @@ impl Render for Chat {
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .font(text_font(cx))
+            .font_family(BODY_FONT)
             .text_sm()
             .relative()
             .key_context("Chat")

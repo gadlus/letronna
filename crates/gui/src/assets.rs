@@ -1,18 +1,5 @@
 use crate::prelude::*;
 
-/// letronna.ai's faces, unmodified, under the SIL Open Font License
-/// (assets/fonts/OFL.txt): Barlow for text, Barlow Condensed for titles and
-/// labels, DM Mono for micro labels and data. About 0.68 MB in all.
-pub(crate) const FONTS: &[&[u8]] = &[
-    include_bytes!("../assets/fonts/Barlow-Regular.ttf"),
-    include_bytes!("../assets/fonts/Barlow-Italic.ttf"),
-    include_bytes!("../assets/fonts/Barlow-Medium.ttf"),
-    include_bytes!("../assets/fonts/Barlow-SemiBold.ttf"),
-    include_bytes!("../assets/fonts/BarlowCondensed-ExtraLight.ttf"),
-    include_bytes!("../assets/fonts/BarlowCondensed-Medium.ttf"),
-    include_bytes!("../assets/fonts/DMMono-Regular.ttf"),
-];
-
 pub(crate) struct Assets;
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
@@ -86,9 +73,7 @@ impl AssetSource for Assets {
                 "circle",
                 "list-filter",
                 "envelope",
-                "eye",
-                "brand-star",
-                "wordmark"
+                "eye"
             ),
             ("telegram", "discord", "slack", "whatsapp")
         ))
@@ -168,128 +153,5 @@ impl IconNamed for AppIcon {
             AppIcon::Branch => "icons/git-branch.svg",
         }
         .into()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::FONTS;
-    use crate::theme::{EM, EMBEDDED};
-
-    /// A big-endian number `bytes` long at `at`, as font files store them.
-    fn number(data: &[u8], at: usize, bytes: usize) -> Option<usize> {
-        let field = data.get(at..at + bytes)?;
-        Some(field.iter().fold(0, |n, &b| (n << 8) | usize::from(b)))
-    }
-
-    /// The table tagged `tag`, found through the file's table directory.
-    fn table<'a>(font: &'a [u8], tag: &[u8]) -> Option<&'a [u8]> {
-        (0..number(font, 4, 2)?).find_map(|i| {
-            let record = 12 + 16 * i;
-            if font.get(record..record + 4)? != tag {
-                return None;
-            }
-            let start = number(font, record + 8, 4)?;
-            font.get(start..start + number(font, record + 12, 4)?)
-        })
-    }
-
-    /// The typographic family a font is looked up by, in Windows' English
-    /// names: name 16 where it has one, else name 1.
-    fn family(font: &[u8]) -> Option<String> {
-        let names = table(font, b"name")?;
-        let strings = number(names, 4, 2)?;
-        let named = |id: usize| {
-            (0..number(names, 2, 2)?).find_map(|i| {
-                let record = 6 + 12 * i;
-                let key: Option<Vec<usize>> =
-                    (0..4).map(|f| number(names, record + 2 * f, 2)).collect();
-                // Platform 3 (Windows), encoding 1 (UTF-16), US English.
-                if key? != [3, 1, 0x409, id] {
-                    return None;
-                }
-                let at = strings + number(names, record + 10, 2)?;
-                let units: Option<Vec<u16>> = (0..number(names, record + 8, 2)? / 2)
-                    .map(|u| number(names, at + 2 * u, 2).map(|n| n as u16))
-                    .collect();
-                String::from_utf16(&units?).ok()
-            })
-        };
-        named(16).or_else(|| named(1))
-    }
-
-    /// The advance of `ch` in the font's own units, found through its Unicode
-    /// map (cmap format 4) and its horizontal metrics.
-    fn advance(font: &[u8], ch: char) -> Option<usize> {
-        let cmap = table(font, b"cmap")?;
-        let map = (0..number(cmap, 2, 2)?).find_map(|i| {
-            let record = 4 + 8 * i;
-            // Platform 3 (Windows), encoding 1 (Unicode's first plane).
-            if number(cmap, record, 4)? != 0x0003_0001 {
-                return None;
-            }
-            cmap.get(number(cmap, record + 4, 4)?..)
-        })?;
-        assert_eq!(number(map, 0, 2), Some(4), "cmap format");
-        let (code, segments) = (ch as usize, number(map, 6, 2)? / 2);
-        let segment =
-            (0..segments).find(|&s| number(map, 14 + 2 * s, 2).is_some_and(|end| end >= code))?;
-        // After the end codes and a pad: start codes, deltas, range offsets.
-        let row = |r: usize| 16 + 2 * (r * segments + segment);
-        let start = number(map, row(1), 2)?;
-        let (delta, range) = (number(map, row(2), 2)?, number(map, row(3), 2)?);
-        if code < start {
-            return None;
-        }
-        let glyph = match range {
-            0 => code,
-            _ => number(map, row(3) + range + 2 * (code - start), 2)?,
-        };
-        let glyph = (glyph + delta) & 0xffff;
-        // Glyphs past the last metric share its advance.
-        let metrics = number(table(font, b"hhea")?, 34, 2)?;
-        number(table(font, b"hmtx")?, 4 * glyph.min(metrics - 1), 2)
-    }
-
-    #[test]
-    fn every_embedded_font_is_a_font_file() {
-        for font in FONTS {
-            // TrueType outlines, as every static file in google/fonts has.
-            assert_eq!(number(font, 0, 4), Some(0x0001_0000));
-            for tag in [
-                "cmap", "glyf", "head", "hhea", "hmtx", "loca", "maxp", "name", "OS/2",
-            ] {
-                assert!(table(font, tag.as_bytes()).is_some(), "no {tag} table");
-            }
-            let head = table(font, b"head").unwrap_or_default();
-            assert_eq!(
-                number(head, 12, 4),
-                Some(0x5f0f_3cf5),
-                "head's magic number"
-            );
-            // The startup check knows each file by its em and its "a".
-            assert_eq!(number(head, 18, 2), Some(EM as usize), "the em");
-            let (family, a) = (family(font).unwrap_or_default(), advance(font, 'a'));
-            assert!(
-                EMBEDDED.iter().any(|embedded| embedded.family == family
-                    && embedded
-                        .files
-                        .iter()
-                        .any(|&(_, _, known)| Some(usize::from(known)) == a)),
-                "{family:?} with an \"a\" of {a:?} is not a face theme.rs checks"
-            );
-        }
-        for embedded in &EMBEDDED {
-            for &(_, _, wanted) in embedded.files {
-                assert!(
-                    FONTS.iter().any(|&font| {
-                        family(font).as_deref() == Some(embedded.family)
-                            && advance(font, 'a') == Some(usize::from(wanted))
-                    }),
-                    "no {} file with an \"a\" of {wanted}",
-                    embedded.family
-                );
-            }
-        }
     }
 }

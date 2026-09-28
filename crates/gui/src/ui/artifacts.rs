@@ -161,16 +161,30 @@ impl Chat {
             .px_8()
             .py_6()
             .gap_4()
-            .child(crate::ui::page_header(
-                "Artifacts",
-                if rows.is_empty() {
-                    "Files Letronna writes will be listed here, newest first. Nothing yet."
-                } else {
-                    "Files Letronna has written, newest first. The list comes from the sessions \
-                     themselves, so removing a session removes its files from here too."
-                },
-                cx,
-            ))
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xl()
+                            .font_family(HEADING_FONT)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Artifacts"),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if rows.is_empty() {
+                                "Files Letronna writes will be listed here, newest first. \
+                                 Nothing yet."
+                            } else {
+                                "Files Letronna has written, newest first. The list comes \
+                                 from the sessions themselves, so removing a session removes \
+                                 its files from here too."
+                            }),
+                    ),
+            )
             .child(
                 div()
                     .id("artifact-list")

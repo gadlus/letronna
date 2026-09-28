@@ -1,7 +1,6 @@
 //! The Messaging page: a channel list beside the setup for the selected one.
 
 use crate::prelude::*;
-use crate::ui::section;
 use letronna_core::messaging;
 
 struct Channel {
@@ -281,6 +280,7 @@ impl Chat {
                                             .child(
                                                 div()
                                                     .text_base()
+                                                    .font_family(HEADING_FONT)
                                                     .font_weight(FontWeight::SEMIBOLD)
                                                     .child("Telegram"),
                                             )
@@ -444,11 +444,25 @@ impl Chat {
         v_flex()
             .flex_1()
             .min_h_0()
-            .child(div().px_8().py_6().child(crate::ui::page_header(
-                Page::Messaging.title(),
-                Page::Messaging.blurb(),
-                cx,
-            )))
+            .child(
+                v_flex()
+                    .px_8()
+                    .py_6()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xl()
+                            .font_family(HEADING_FONT)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(Page::Messaging.title()),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(Page::Messaging.blurb()),
+                    ),
+            )
             .child(
                 h_flex()
                     .flex_1()
@@ -492,6 +506,15 @@ fn pill(text: &'static str, colour: Hsla, cx: &App) -> impl IntoElement {
         .text_color(cx.theme().muted_foreground)
         .child(div().size(px(5.)).rounded_full().bg(colour))
         .child(text)
+}
+
+fn section(text: &'static str, cx: &App) -> impl IntoElement {
+    div()
+        .text_xs()
+        .font_family(HEADING_FONT)
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(cx.theme().muted_foreground)
+        .child(text.to_uppercase())
 }
 
 fn help(text: &str, cx: &App) -> Div {
@@ -639,6 +662,7 @@ impl Chat {
                                             .child(
                                                 div()
                                                     .text_base()
+                                                    .font_family(HEADING_FONT)
                                                     .font_weight(FontWeight::SEMIBOLD)
                                                     .child(channel.name),
                                             )

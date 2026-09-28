@@ -395,19 +395,29 @@ impl Chat {
                     .justify_between()
                     .gap_4()
                     .child(
-                        crate::ui::page_header(
-                            "Scheduled jobs",
-                            if self.schedules.is_empty() {
-                                "A prompt that runs on a timer. Each run opens its own session, \
-                                 and works while the window is hidden in the tray."
-                            } else {
-                                "Each run opens its own session, and works while the window is \
-                                 hidden in the tray."
-                            },
-                            cx,
-                        )
-                        .flex_1()
-                        .min_w_0(),
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xl()
+                                    .font_family(HEADING_FONT)
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Scheduled jobs"),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(if self.schedules.is_empty() {
+                                        "A prompt that runs on a timer. Each run opens its own \
+                                         session, and works while the window is hidden in the tray."
+                                    } else {
+                                        "Each run opens its own session, and works while the \
+                                         window is hidden in the tray."
+                                    }),
+                            ),
                     )
                     .child(
                         Button::new("add-job")

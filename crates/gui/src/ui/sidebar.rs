@@ -22,6 +22,7 @@ impl Chat {
             .items_center()
             .rounded(cx.theme().radius)
             .cursor_pointer()
+            .font_family(HEADING_FONT)
             .font_weight(FontWeight::MEDIUM)
             .text_color(cx.theme().sidebar_foreground)
             .when(active, |this| this.bg(cx.theme().sidebar_accent))
@@ -38,6 +39,18 @@ impl Chat {
                     cx.notify();
                 }))
             })
+    }
+
+    pub(crate) fn section(&self, label: &'static str, cx: &Context<Self>) -> Div {
+        div()
+            .mt_3()
+            .mb_1()
+            .px_2()
+            .text_xs()
+            .font_family(HEADING_FONT)
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(cx.theme().muted_foreground)
+            .child(label)
     }
 
     pub(crate) fn session_row(
@@ -135,7 +148,16 @@ impl Chat {
             let b = bucket(self.store.conversations[i].updated, now);
             if b != last_bucket {
                 last_bucket = b;
-                sessions = sessions.child(crate::ui::micro(b, cx).mt_2().mb_0p5().px_2());
+                sessions = sessions.child(
+                    div()
+                        .mt_2()
+                        .mb_0p5()
+                        .px_2()
+                        .text_xs()
+                        .font_family(HEADING_FONT)
+                        .text_color(cx.theme().muted_foreground)
+                        .child(b),
+                );
             }
             sessions = sessions.child(self.session_row(i, now, cx));
         }
@@ -232,7 +254,7 @@ impl Chat {
                     .min_h_0()
                     .overflow_y_scroll()
                     .px_2()
-                    .child(crate::ui::micro("Sessions", cx).mt_3().mb_1().px_2())
+                    .child(self.section("Sessions", cx))
                     .child(sessions),
             )
     }

@@ -119,55 +119,61 @@ impl Chat {
         };
         let preview = tools::preview(&call.name, &call.arguments, &ctx);
         Some(
-            card.child(div().text_sm().font_weight(FontWeight::MEDIUM).child(title))
-                .child(
-                    // Scrolls only once the preview is long, so a one-line command
-                    // does not sit in a tall empty panel.
-                    div()
-                        .p_2()
-                        .min_w_0()
-                        .rounded(cx.theme().radius)
-                        .bg(cx.theme().background)
-                        .child(crate::ui::code_block(
-                            "preview",
-                            tools::clamp_lines(&preview, 400),
-                            px(240.),
-                            window,
-                            cx,
-                        )),
-                )
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .child(
-                            Button::new("allow")
-                                .primary()
-                                .small()
-                                .label("Allow")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.resolve_call(Verdict::Allow { remember: false }, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new("allow-session")
-                                .framed(cx)
-                                .small()
-                                .label("Allow for this session")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.resolve_call(Verdict::Allow { remember: true }, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new("deny")
-                                .plain(cx)
-                                .small()
-                                .label("Deny")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.resolve_call(Verdict::Deny, cx)
-                                })),
-                        ),
-                )
-                .into_any_element(),
+            card.child(
+                div()
+                    .text_sm()
+                    .font_family(HEADING_FONT)
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(title),
+            )
+            .child(
+                // Scrolls only once the preview is long, so a one-line command
+                // does not sit in a tall empty panel.
+                div()
+                    .p_2()
+                    .min_w_0()
+                    .rounded(cx.theme().radius)
+                    .bg(cx.theme().background)
+                    .child(crate::ui::code_block(
+                        "preview",
+                        tools::clamp_lines(&preview, 400),
+                        px(240.),
+                        window,
+                        cx,
+                    )),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("allow")
+                            .primary()
+                            .small()
+                            .label("Allow")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.resolve_call(Verdict::Allow { remember: false }, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("allow-session")
+                            .framed(cx)
+                            .small()
+                            .label("Allow for this session")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.resolve_call(Verdict::Allow { remember: true }, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("deny")
+                            .plain(cx)
+                            .small()
+                            .label("Deny")
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.resolve_call(Verdict::Deny, cx)),
+                            ),
+                    ),
+            )
+            .into_any_element(),
         )
     }
 }

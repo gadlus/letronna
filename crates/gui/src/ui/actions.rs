@@ -192,7 +192,7 @@ impl Chat {
         window.open_dialog(cx, move |dialog, _, cx| {
             let (chat, back) = (chat.clone(), back.clone());
             dialog
-                .title(crate::ui::section("Rewind to here", cx))
+                .title(div().font_family(HEADING_FONT).child("Rewind to here"))
                 .w(px(420.))
                 .confirm()
                 .button_props(

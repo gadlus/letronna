@@ -150,7 +150,14 @@ impl Chat {
                         .items_center()
                         .justify_between()
                         .gap_2()
-                        .child(crate::ui::micro("You", cx))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_family(HEADING_FONT)
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(cx.theme().primary)
+                                .child("You"),
+                        )
                         .children(on_label),
                 )
             })
@@ -159,26 +166,28 @@ impl Chat {
                     h_flex()
                         .items_center()
                         .gap_2()
-                        .child(crate::ui::micro(&label, cx))
-                        // The site's star, a quarter turn a beat on its
-                        // expo-out: quick to move, long to settle, and whole
-                        // again after each turn. Signal, as the brand's blue
-                        // is too dark on night for a mark this small.
+                        .text_xs()
+                        .font_family(HEADING_FONT)
+                        .child(
+                            div()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(cx.theme().primary)
+                                .child(label),
+                        )
                         .when(streaming, |this| {
                             this.child(
-                                svg()
-                                    .path("icons/brand-star.svg")
-                                    .size(px(10.))
-                                    .text_color(cx.theme().link)
+                                div()
+                                    .size(px(6.))
+                                    .rounded_full()
+                                    .bg(cx.theme().primary)
                                     .with_animation(
-                                        "star",
-                                        Animation::new(std::time::Duration::from_millis(1200))
+                                        "pulse",
+                                        Animation::new(std::time::Duration::from_millis(1000))
                                             .repeat()
-                                            .with_easing(expo_out),
-                                        |star, turn| {
-                                            star.with_transformation(Transformation::rotate(
-                                                percentage(turn / 4.),
-                                            ))
+                                            .with_easing(ease_in_out),
+                                        |dot, delta| {
+                                            let wave = 1.0 - (delta * 2.0 - 1.0).abs();
+                                            dot.opacity(0.25 + 0.75 * wave)
                                         },
                                     ),
                             )
@@ -221,7 +230,8 @@ impl Chat {
             .children(under)
             .with_animation(
                 self.row_id("appear", index),
-                Animation::new(std::time::Duration::from_millis(260)).with_easing(expo_out),
+                Animation::new(std::time::Duration::from_millis(260))
+                    .with_easing(gpui::ease_out_quint()),
                 |el, delta| el.opacity(delta).mt(px(10. * (1. - delta))),
             )
             .into_any_element()
@@ -285,6 +295,7 @@ impl Chat {
                     .rounded(cx.theme().radius)
                     .cursor_pointer()
                     .text_xs()
+                    .font_family(HEADING_FONT)
                     .text_color(cx.theme().muted_foreground)
                     .active(|s| s.bg(cx.theme().secondary.opacity(0.5)))
                     .child(
@@ -365,6 +376,7 @@ impl Chat {
                     .rounded(cx.theme().radius)
                     .cursor_pointer()
                     .text_xs()
+                    .font_family(HEADING_FONT)
                     .text_color(cx.theme().muted_foreground)
                     .active(|s| s.bg(cx.theme().secondary.opacity(0.5)))
                     .child(
@@ -416,11 +428,19 @@ impl Chat {
             .items_center()
             .justify_center()
             .gap_2()
-            .child(crate::ui::wordmark(px(32.), cx))
             .child(
-                crate::ui::display(self.greeting, px(56.), cx)
-                    .mt_6()
-                    .text_center(),
+                div()
+                    .font_family(WORDMARK_FONT)
+                    .italic()
+                    .text_size(px(72.))
+                    .line_height(px(80.))
+                    .child(BRAND),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(self.greeting),
             )
             .when(no_project, |this| {
                 this.child(
@@ -436,11 +456,11 @@ impl Chat {
                 )
             })
             .child(
-                crate::ui::micro(
-                    "Enter to send  ·  Shift+Enter for a new line  ·  Esc to stop",
-                    cx,
-                )
-                .mt_4(),
+                div()
+                    .mt_4()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground.opacity(0.7))
+                    .child("Enter to send  ·  Shift+Enter for a new line  ·  Esc to stop"),
             )
     }
 
@@ -449,7 +469,20 @@ impl Chat {
             .flex_1()
             .px_8()
             .py_6()
-            .child(crate::ui::page_header(page.title(), page.blurb(), cx))
+            .gap_2()
+            .child(
+                div()
+                    .text_xl()
+                    .font_family(HEADING_FONT)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(page.title()),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(page.blurb()),
+            )
     }
 
     /// Play a video a tool made, in the chat; where it cannot play here, in
