@@ -118,8 +118,10 @@ pub(crate) struct Chat {
     pub(crate) turn: Option<agent::Turn>,
     /// The session id currently receiving a streamed reply, if any.
     pub(crate) streaming_id: Option<u64>,
-    /// Tools the user allowed for the rest of this run of the app.
-    pub(crate) session_allow: std::collections::HashSet<String>,
+    /// Tools the user allowed for the rest of this run of the app, by the
+    /// session they were allowed in. Keyed like `unattended`: "stop asking"
+    /// about a tool in one chat is not a yes to it in every other chat.
+    pub(crate) session_allow: std::collections::HashMap<u64, std::collections::HashSet<String>>,
     /// Sessions started by an unattended schedule, which run tools without
     /// asking. Keyed by session so the grant cannot reach the user's own
     /// chats: a job saying "do not ask me at 9am" is not permission to stop
@@ -386,7 +388,7 @@ impl Chat {
             busy: false,
             turn: None,
             streaming_id: None,
-            session_allow: std::collections::HashSet::new(),
+            session_allow: std::collections::HashMap::new(),
             unattended: std::collections::HashSet::new(),
             answer,
             job_tick: false,
@@ -1074,10 +1076,11 @@ impl Chat {
         let unattended = self
             .streaming_id
             .is_some_and(|id| self.unattended.contains(&id));
+        let none = std::collections::HashSet::new();
         agent::needs_user(
             name,
             self.store.settings.skip_approvals,
-            &self.session_allow,
+            allowed_in(&self.session_allow, self.streaming_id).unwrap_or(&none),
             unattended,
         )
     }
@@ -1148,8 +1151,11 @@ impl Chat {
             Verdict::Answer(text) => self.record_result(Ok(text), cx),
             Verdict::Deny => self.record_result(Err(letronna_core::tools::DECLINED.into()), cx),
             Verdict::Allow { remember } => {
-                if remember {
-                    self.session_allow.insert(call.name.clone());
+                if remember && let Some(id) = self.streaming_id {
+                    self.session_allow
+                        .entry(id)
+                        .or_default()
+                        .insert(call.name.clone());
                 }
                 self.execute_call(call, cx);
             }
@@ -1599,4 +1605,33 @@ pub(crate) fn parse_todos(arguments: &str) -> std::result::Result<Vec<Todo>, Str
         })
         .filter(|todo| !todo.text.is_empty())
         .collect())
+}
+
+/// The tools the user stopped being asked about in `session`, and none when
+/// no session is running.
+fn allowed_in(
+    session_allow: &std::collections::HashMap<u64, std::collections::HashSet<String>>,
+    session: Option<u64>,
+) -> Option<&std::collections::HashSet<String>> {
+    session.and_then(|id| session_allow.get(&id))
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
+    // would shadow the built-in attribute.
+    use super::allowed_in;
+    use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn a_tool_allowed_in_one_session_is_still_asked_about_in_another() {
+        let mut session_allow = HashMap::new();
+        session_allow.insert(1, HashSet::from(["write_file".to_owned()]));
+        let allowed = |session| {
+            allowed_in(&session_allow, session).is_some_and(|tools| tools.contains("write_file"))
+        };
+        assert!(allowed(Some(1)));
+        assert!(!allowed(Some(2)));
+        assert!(!allowed(None));
+    }
 }
