@@ -176,17 +176,22 @@ const PHRASES: &[(&str, FailureKind)] = &[
     ("not found", FailureKind::NotFound),
 ];
 
-/// The wait `Retry-After` asks for, read in seconds only: the date form needs
-/// a calendar, and a wait not known is no worse than none asked for.
+/// The wait `Retry-After` asks for, from now.
 fn retry_after(headers: &HeaderMap) -> Option<Duration> {
-    let seconds: f64 = headers
-        .get(RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    Duration::try_from_secs_f64(seconds).ok()
+    let value = headers.get(RETRY_AFTER)?.to_str().ok()?;
+    wait_asked(value, chrono::Utc::now())
+}
+
+/// The wait a `Retry-After` value asks for at `now`, given in seconds or as
+/// the date to come back; a date already gone asks for none.
+fn wait_asked(value: &str, now: chrono::DateTime<chrono::Utc>) -> Option<Duration> {
+    let value = value.trim();
+    if let Ok(seconds) = value.parse::<f64>() {
+        return Duration::try_from_secs_f64(seconds).ok();
+    }
+    // HTTP dates are RFC 2822's, always in GMT.
+    let date = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    date.signed_duration_since(now).to_std().ok()
 }
 
 /// What the user is told, word for word as before: the provider's own
@@ -495,11 +500,26 @@ mod tests {
         };
         assert_eq!(wait("7"), Some(Duration::from_secs(7)));
         assert_eq!(wait("1.5"), Some(Duration::from_millis(1500)));
-        assert_eq!(wait("Wed, 21 Oct 2026 07:28:00 GMT"), None);
         assert_eq!(wait("-3"), None);
         assert_eq!(
             classify(Some(429), &HeaderMap::new(), &Value::Null).retry_after,
             None
         );
+    }
+
+    #[test]
+    fn a_wait_asked_for_as_a_date_counts_from_now() {
+        let now = chrono::DateTime::parse_from_rfc2822("Wed, 21 Oct 2026 07:27:30 GMT")
+            .unwrap()
+            .to_utc();
+        let wait = |value| wait_asked(value, now);
+        assert_eq!(
+            wait("Wed, 21 Oct 2026 07:28:00 GMT"),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(wait("Wed, 21 Oct 2026 07:27:30 GMT"), Some(Duration::ZERO));
+        assert_eq!(wait("Wed, 21 Oct 2026 07:27:00 GMT"), None);
+        assert_eq!(wait(" 12 "), Some(Duration::from_secs(12)));
+        assert_eq!(wait("soon"), None);
     }
 }

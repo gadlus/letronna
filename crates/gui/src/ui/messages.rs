@@ -107,7 +107,13 @@ impl Chat {
                         .xsmall()
                         .color(cx.theme().primary),
                 )
-                .child("Thinking…")
+                .child(
+                    self.turn
+                        .as_ref()
+                        .and_then(|turn| turn.live.retrying)
+                        .filter(|_| streaming)
+                        .map_or_else(|| "Thinking…".to_owned(), |retry| retry.to_string()),
+                )
                 .into_any_element()
         } else {
             TextView::markdown(md, message.content.clone(), window, cx)

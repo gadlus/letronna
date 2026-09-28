@@ -51,6 +51,7 @@ impl Runner {
             effort: settings.effort.clone(),
             search: settings.search,
             conversation: self.store.conversations[session].id,
+            unattended: false,
         }
     }
 
@@ -124,6 +125,7 @@ impl Runner {
         let mut out = Stream::opening_with(render::bullet());
         let mut opened = false;
         let mut thought = false;
+        let mut retrying = false;
         self.bar.wait_line(true);
         loop {
             // Keys first, then whatever the model has sent: the pump waits a
@@ -144,6 +146,16 @@ impl Runner {
                     return Err("The model connection closed unexpectedly.".to_owned());
                 }
             };
+            // The waiting line says why while a failed try waits to be made
+            // again, and goes back to waiting once the new try answers,
+            // which may be with thinking that is not shown.
+            if let Event::Retrying(retry) = &event {
+                self.bar.wait_line_about(&retry.to_string());
+                retrying = true;
+            } else if retrying {
+                self.bar.wait_line(true);
+                retrying = false;
+            }
             if let Event::Reasoning(text) = &event
                 && self.store.settings.thinking
             {
