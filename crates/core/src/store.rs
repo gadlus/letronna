@@ -529,7 +529,7 @@ impl Lock {
     /// Wait for the lock, but not forever. A process that died holding one
     /// would otherwise keep every other process out of that session for good,
     /// so a lock nobody has touched for a while is taken anyway.
-    fn take(path: &std::path::Path) -> Self {
+    pub(crate) fn take(path: &std::path::Path) -> Self {
         let lock = path.with_extension("lock");
         for _ in 0..40 {
             if std::fs::OpenOptions::new()
