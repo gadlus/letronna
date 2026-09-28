@@ -79,13 +79,15 @@ pub fn dir() -> PathBuf {
 
 /// Every skill a session in `workspace` can see, by name, after moving any
 /// old skills.json across. Skills with the same name as an earlier one are
-/// left out.
+/// left out. A skills.json that cannot be moved does not stop the list;
+/// `migrate` says why.
 pub fn list(workspace: Option<&Path>) -> Result<Vec<Skill>, String> {
     list_in(&backend::data_dir(), workspace)
 }
 
 fn list_in(data: &Path, workspace: Option<&Path>) -> Result<Vec<Skill>, String> {
-    migrate(data)?;
+    // Reported by `migrate`; the skills already in folders are fine.
+    let _ = migrate_in(data);
     let off = switched_off(data)?;
     let mut skills: Vec<Skill> = Vec::new();
     for (root, source) in roots(data, workspace) {
@@ -140,7 +142,9 @@ fn create_in(data: &Path, name: &str, description: &str, body: &str) -> Result<S
     if body.is_empty() {
         return Err("A skill needs instructions.".into());
     }
-    migrate(data)?;
+    // First, so a skill made now cannot keep the built-in ones or the old
+    // skills.json from arriving; a failure is `migrate`'s to report.
+    let _ = migrate_in(data);
     let root = data.join(SKILLS_DIR);
     if find(&read_root(&root, Source::User), &name).is_some() {
         return Err(format!("You already have a skill called \"{name}\"."));
@@ -629,12 +633,31 @@ struct Saved {
     prompt: String,
 }
 
+/// Move the old skills.json across if it is still there, and say why when it
+/// cannot be. Listing and making skills go on without it, so this is where a
+/// skills.json that will not parse is reported.
+pub fn migrate() -> Result<(), String> {
+    migrate_in(&backend::data_dir())
+}
+
 /// Move skills.json's prompts into folders, once, then set the file aside as
 /// skills.json.migrated rather than delete it. On a first run, with neither,
 /// the built-in skills are written the same way so the page is not empty.
-fn migrate(data: &Path) -> Result<(), String> {
+///
+/// They arrive switched off. They were written to be put in the composer and
+/// sent as they are, and a model that loaded "Run the tests" by itself would
+/// follow its "do not change anything yet" when asked to fix what fails.
+fn migrate_in(data: &Path) -> Result<(), String> {
     let old = data.join("skills.json");
     let root = data.join(SKILLS_DIR);
+    if !old.exists() && root.exists() {
+        return Ok(());
+    }
+    // Someone else is moving it: the window and the terminal started at once.
+    let Some(_lock) = Lock::take(data)? else {
+        return Ok(());
+    };
+    // Looked at again under the lock, which the other may just have let go.
     let saved = match std::fs::read(&old) {
         Ok(bytes) => parse_saved(&old, &bytes)?,
         Err(e) if e.kind() == ErrorKind::NotFound && root.exists() => return Ok(()),
@@ -649,28 +672,52 @@ fn migrate(data: &Path) -> Result<(), String> {
     // Made even for no skills at all, or the defaults would come back.
     std::fs::create_dir_all(&root)
         .map_err(|e| format!("Could not make {}: {e}", root.display()))?;
-    let mut have = read_root(&root, Source::User);
+    let have = read_root(&root, Source::User);
+    let mut taken: Vec<String> = have.iter().map(|s| s.name.clone()).collect();
+    let mut moving: Vec<(String, String)> = Vec::new();
     for Saved { name, prompt } in saved {
         let prompt = clean(&prompt);
         if prompt.is_empty() {
             continue;
         }
-        let name = match one_line(&name) {
+        let name = match printable(&name) {
             name if name.is_empty() => prompt.chars().take(40).collect(),
             name => name,
         };
+        if prompt.len() as u64 > SKILL_BYTES {
+            return Err(format!(
+                "Your saved skill \"{name}\" is over {SKILL_BYTES} bytes, too long for a skill. \
+                 Shorten it in {}, or move the file away to go on without it.",
+                old.display()
+            ));
+        }
         // Moved already, and skills.json written again since by an older
-        // copy of the app.
-        if have
+        // copy of the app; perhaps under a number, when its name was taken.
+        let moved = have
             .iter()
-            .any(|s| same(&s.name, &name) && s.body == prompt)
-        {
+            .any(|s| s.body == prompt && numbered(&s.name, &name))
+            || moving
+                .iter()
+                .any(|(other, body)| *body == prompt && numbered(other, &name));
+        if moved {
             continue;
         }
-        let name = unique_name(&have, &name);
-        let folder = free_folder(&root, &slug(&name));
-        write_skill(&folder, &render(&name, &summary_of(&prompt), &[], &prompt))?;
-        have.extend(read_skill(&folder, Source::User));
+        let name = unique_name(&taken, &name);
+        taken.push(name.clone());
+        moving.push((name, prompt));
+    }
+    // Switched off before they exist, so a crash between the two cannot
+    // leave one on.
+    if !moving.is_empty() {
+        let mut off = switched_off(data)?;
+        off.extend(moving.iter().map(|(name, _)| name.clone()));
+        off.sort_by_key(|n| n.to_lowercase());
+        off.dedup_by(|a, b| same(a, b));
+        save_off(data, &off)?;
+    }
+    for (name, prompt) in &moving {
+        let folder = free_folder(&root, &slug(name));
+        write_skill(&folder, &render(name, &summary_of(prompt), &[], prompt))?;
     }
     if old.exists() {
         // Numbered rather than over an earlier one, which a rename replaces.
@@ -686,15 +733,68 @@ fn migrate(data: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// `name`, or `name (2)` and so on when a skill already has it.
-fn unique_name(skills: &[Skill], name: &str) -> String {
+/// `name`, or `name (2)` and so on when one of `taken` already has it.
+fn unique_name(taken: &[String], name: &str) -> String {
     let mut unique = name.to_owned();
     let mut n = 2;
-    while find(skills, &unique).is_some() {
+    while taken.iter().any(|t| same(t, &unique)) {
         unique = format!("{name} ({n})");
         n += 1;
     }
     unique
+}
+
+/// Whether `candidate` is `name`, or `name` given a number by `unique_name`.
+fn numbered(candidate: &str, name: &str) -> bool {
+    let (candidate, name) = (candidate.to_lowercase(), name.to_lowercase());
+    candidate == name
+        || candidate
+            .strip_prefix(&name)
+            .and_then(|rest| rest.strip_prefix(" ("))
+            .and_then(|rest| rest.strip_suffix(')'))
+            .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Held while skills.json moves across, so two copies of the app starting
+/// together do not both move it. One left by a crash is taken over after a
+/// minute.
+struct Lock(PathBuf);
+
+impl Lock {
+    /// The lock, or None while someone else holds it.
+    fn take(data: &Path) -> Result<Option<Lock>, String> {
+        let path = data.join("skills.lock");
+        std::fs::create_dir_all(data)
+            .map_err(|e| format!("Could not make {}: {e}", data.display()))?;
+        for _ in 0..2 {
+            let made = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path);
+            match made {
+                Ok(_) => return Ok(Some(Lock(path))),
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                    let stale = std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|at| at.elapsed().ok())
+                        .is_some_and(|age| age > std::time::Duration::from_secs(60));
+                    if !stale {
+                        return Ok(None);
+                    }
+                    let _ = std::fs::remove_file(&path);
+                }
+                Err(e) => return Err(format!("Could not make {}: {e}", path.display())),
+            }
+        }
+        Ok(None)
+    }
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// skills.json's skills, or an error naming the copy kept of a file that
@@ -774,8 +874,8 @@ mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
     use super::{
-        Skill, Source, create_in, defaults, edit_in, list_in, remove_in, scalar, set_enabled_in,
-        slug, split, value,
+        Skill, Source, create_in, defaults, edit_in, list_in, migrate_in, remove_in, scalar,
+        set_enabled_in, slug, split, value,
     };
     use std::path::{Path, PathBuf};
 
@@ -812,7 +912,8 @@ mod tests {
         assert_eq!(skills.len(), defaults().len());
         for skill in &skills {
             assert_eq!(skill.source, Source::User);
-            assert!(skill.enabled);
+            // Off for the model until the user switches them on.
+            assert!(!skill.enabled);
             assert!(skill.folder.join("SKILL.md").is_file());
             assert!(!skill.description.is_empty());
         }
@@ -837,6 +938,7 @@ mod tests {
         assert_eq!(names(&skills), ["Mine", "Nameless prompt"]);
         assert_eq!(skills[0].body, "Keep me\nwhole");
         assert_eq!(skills[0].description, "Keep me whole");
+        assert!(skills.iter().all(|s| !s.enabled));
         assert!(!data.join("skills.json").exists());
         assert_eq!(
             std::fs::read(data.join("skills.json.migrated")).unwrap(),
@@ -864,6 +966,60 @@ mod tests {
             names(&list_in(&data, None).unwrap()),
             ["Mine", "Mine (2)", "Nameless prompt"]
         );
+        // And written again, it is not numbered once more.
+        std::fs::write(
+            data.join("skills.json"),
+            br#"[{"id": 1, "name": "Mine", "prompt": "Something else"}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            names(&list_in(&data, None).unwrap()),
+            ["Mine", "Mine (2)", "Nameless prompt"]
+        );
+    }
+
+    #[test]
+    fn two_migrations_at_once_move_each_prompt_once() {
+        let data = scratch("race");
+        let prompts: Vec<String> = (0..60)
+            .map(|n| format!(r#"{{"id": {n}, "name": "Prompt {n}", "prompt": "Do {n}."}}"#))
+            .collect();
+        std::fs::write(data.join("skills.json"), format!("[{}]", prompts.join(","))).unwrap();
+        let racers: Vec<_> = (0..2)
+            .map(|_| {
+                let data = data.clone();
+                std::thread::spawn(move || list_in(&data, None).map(|_| ()))
+            })
+            .collect();
+        for racer in racers {
+            racer.join().unwrap().unwrap();
+        }
+        let folders = std::fs::read_dir(data.join("skills")).unwrap().count();
+        assert_eq!(folders, 60);
+        assert!(!data.join("skills.lock").exists());
+    }
+
+    #[test]
+    fn a_broken_skills_json_does_not_stop_skills_being_listed_or_made() {
+        let data = scratch("broken-goes-on");
+        std::fs::write(data.join("skills.json"), b"not json").unwrap();
+        write(&data.join("skills/mine/SKILL.md"), "Mine.");
+        assert_eq!(names(&list_in(&data, None).unwrap()), ["mine"]);
+        create_in(&data, "Another", "", "Body").unwrap();
+        assert!(migrate_in(&data).unwrap_err().contains("skills.json"));
+        assert!(data.join("skills.json").exists());
+    }
+
+    #[test]
+    fn a_prompt_too_long_for_a_skill_keeps_skills_json_where_it_is() {
+        let data = scratch("too-long");
+        let long = "x".repeat(super::SKILL_BYTES as usize + 1);
+        let old = format!(r#"[{{"id": 1, "name": "Big", "prompt": "{long}"}}]"#);
+        std::fs::write(data.join("skills.json"), &old).unwrap();
+        let error = migrate_in(&data).unwrap_err();
+        assert!(error.contains("\"Big\""), "{error}");
+        assert!(data.join("skills.json").exists());
+        assert!(!data.join("skills").join("big").exists());
     }
 
     #[test]
@@ -873,7 +1029,7 @@ mod tests {
         let broken = b"[{\"id\": 1, \"name\": \"Mine\", \"prompt\": \"Keep me\",}]";
         std::fs::write(&path, broken).unwrap();
 
-        let Err(error) = list_in(&data, None) else {
+        let Err(error) = migrate_in(&data) else {
             panic!("a broken file loaded");
         };
         let kept = kept_copies(&data);
@@ -893,7 +1049,7 @@ mod tests {
         let earlier = data.join("skills.json.bad.1");
         std::fs::write(&earlier, b"not json").unwrap();
 
-        let Err(error) = list_in(&data, None) else {
+        let Err(error) = migrate_in(&data) else {
             panic!("a broken file loaded");
         };
         assert!(error.contains(&earlier.display().to_string()), "{error}");
@@ -1024,19 +1180,21 @@ mod tests {
     fn switched_off_skills_stay_listed_and_new_ones_start_on() {
         let data = scratch("switches");
         list_in(&data, None).unwrap();
-        set_enabled_in(&data, "run the tests", false).unwrap();
+        set_enabled_in(&data, "run the tests", true).unwrap();
         let skills = list_in(&data, None).unwrap();
-        let off: Vec<&str> = skills
+        let on: Vec<&str> = skills
             .iter()
-            .filter(|s| !s.enabled)
+            .filter(|s| s.enabled)
             .map(|s| s.name.as_str())
             .collect();
-        assert_eq!(off, ["Run the tests"]);
+        assert_eq!(on, ["Run the tests"]);
 
         let made = create_in(&data, "Deploy", "", "Ship it.").unwrap();
         assert!(made.enabled);
 
-        set_enabled_in(&data, "Run the tests", true).unwrap();
+        for name in ["Explain this project", "Review these changes"] {
+            set_enabled_in(&data, name, true).unwrap();
+        }
         assert!(list_in(&data, None).unwrap().iter().all(|s| s.enabled));
         assert_eq!(
             std::fs::read_to_string(data.join("skills-off.json")).unwrap(),
