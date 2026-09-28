@@ -313,6 +313,12 @@ impl Chat {
         if window.has_active_dialog(cx) {
             return;
         }
+        // A page without the composer takes the keys instead; a composer
+        // that is not drawn would take them nowhere, shortcuts included.
+        if self.page != Page::Chat {
+            window.focus(&self.page_focus);
+            return;
+        }
         self.composer
             .update(cx, |input, cx| input.focus(window, cx));
     }
