@@ -15,7 +15,7 @@
 //!
 //! Each skill can be switched off. What is kept is the names that are off, in
 //! `skills-off.json`, so a skill that is new, installed or brought by a
-//! project starts on.
+//! project starts on. `install` adds skills from GitHub, a link or a folder.
 //!
 //! The model is shown the skills switched on, a line each, and loads one with
 //! the `skill` tool when a task matches it. That tool also serves the files
@@ -32,6 +32,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
+
+mod install;
+pub use install::install;
 
 /// The file that makes a folder a skill.
 const SKILL_FILE: &str = "SKILL.md";

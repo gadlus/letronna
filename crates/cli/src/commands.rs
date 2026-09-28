@@ -1,6 +1,7 @@
 //! The slash commands: everything you can ask of Letronna itself rather
 //! than of the model.
 
+use letronna_core::skills::{Skill, Source};
 use letronna_core::store;
 
 use crate::banner::{banner, folder_name, footer, replay};
@@ -516,12 +517,21 @@ fn jobs(rest: &str) {
     render::line(&render::dim("/jobs stop <id> to stop one"));
 }
 
-/// The saved instructions, and a way to use one.
+/// The skills: list them, use one, switch one on or off, or add some.
 ///
 /// Skills are written in the window and were unreachable from here, which
 /// made them a feature of one half of the same program.
 fn skills(runner: &mut Runner, rest: &str, workspace: Option<&std::path::Path>) {
     render::blank();
+    // `/skills add <source>` and `/skills on|off <name>`; anything else names
+    // a skill to use.
+    let (verb, target) = rest
+        .split_once(' ')
+        .map_or((rest, ""), |(verb, target)| (verb, target.trim()));
+    if verb == "add" {
+        add_skills(runner, target);
+        return;
+    }
     let saved = match letronna_core::skills::list(workspace) {
         Ok(saved) => saved,
         Err(why) => {
@@ -529,23 +539,21 @@ fn skills(runner: &mut Runner, rest: &str, workspace: Option<&std::path::Path>) 
             return;
         }
     };
+    if matches!(verb, "on" | "off") && !target.is_empty() {
+        switch_skill(&saved, target, verb == "on");
+        return;
+    }
     if saved.is_empty() {
-        render::said(&render::blue("●"), &render::bold("No skills saved"));
-        render::line(&render::dim("The window writes them; they show up here."));
+        render::said(&render::blue("●"), &render::bold("No skills yet"));
+        render::line(&render::dim(
+            "/skills add <owner/repo, link or path> to add some",
+        ));
         return;
     }
 
     // Named, it goes to the model as the next thing said.
     if !rest.is_empty() {
-        let wanted = rest.to_lowercase();
-        match saved
-            .iter()
-            .find(|s| s.name.to_lowercase() == wanted)
-            .or_else(|| {
-                saved
-                    .iter()
-                    .find(|s| s.name.to_lowercase().contains(&wanted))
-            }) {
+        match pick_skill(&saved, rest) {
             Some(skill) => {
                 render::said(&render::blue("●"), &render::bold(&skill.name));
                 runner.bar.say(&skill.body);
@@ -557,13 +565,95 @@ fn skills(runner: &mut Runner, rest: &str, workspace: Option<&std::path::Path>) 
 
     render::said(&render::blue("●"), &render::bold("Skills"));
     for skill in &saved {
+        let state = if skill.enabled {
+            render::green("on ")
+        } else {
+            render::dim("off")
+        };
+        let source = match skill.source {
+            Source::User => "yours",
+            Source::Project => "project",
+        };
+        // A line each: descriptions are written for the model, and run long.
+        let about = format!("{source} · {}", skill.description);
+        let room = render::width().saturating_sub(skill.name.chars().count() + 12);
+        let about = if about.chars().count() > room {
+            let cut: String = about.chars().take(room.saturating_sub(1)).collect();
+            format!("{cut}…")
+        } else {
+            about
+        };
         render::line(&format!(
-            "{}  {}",
+            "{state}  {}  {}",
             render::bold(&skill.name),
-            render::dim(&skill.description)
+            render::dim(&about)
         ));
     }
-    render::line(&render::dim("/skills <name> to use one"));
+    render::line(&render::dim(
+        "/skills <name> to use one · /skills on|off <name> · /skills add <owner/repo, link or path>",
+    ));
+}
+
+/// The skill called `wanted`, or else the first whose name contains it.
+fn pick_skill<'a>(saved: &'a [Skill], wanted: &str) -> Option<&'a Skill> {
+    let wanted = wanted.to_lowercase();
+    saved
+        .iter()
+        .find(|s| s.name.to_lowercase() == wanted)
+        .or_else(|| {
+            saved
+                .iter()
+                .find(|s| s.name.to_lowercase().contains(&wanted))
+        })
+}
+
+/// Switch a skill on or off: only the ones on are offered to the model.
+fn switch_skill(saved: &[Skill], wanted: &str, on: bool) {
+    let Some(skill) = pick_skill(saved, wanted) else {
+        render::line(&render::dim(&format!("No skill matching \"{wanted}\".")));
+        return;
+    };
+    match letronna_core::skills::set_enabled(&skill.name, on) {
+        Ok(()) => render::said(
+            &render::blue("●"),
+            &render::bold(&format!(
+                "{} is {}",
+                skill.name,
+                if on {
+                    "on: the model can load it"
+                } else {
+                    "off: the model no longer sees it"
+                }
+            )),
+        ),
+        Err(why) => render::line(&render::red(&why)),
+    }
+}
+
+/// Add skills from GitHub, a link or a path, and say which arrived.
+fn add_skills(runner: &mut Runner, source: &str) {
+    if source.is_empty() {
+        render::said(
+            &render::blue("●"),
+            &render::bold("Add from where? /skills add <owner/repo, link or path>"),
+        );
+        return;
+    }
+    let from = source.to_owned();
+    match runner.bar.busy("adding skills", move || {
+        letronna_core::skills::install(&from)
+    }) {
+        Ok(names) => {
+            render::said(
+                &render::blue("●"),
+                &render::bold(&format!("Added {}", names.join(", "))),
+            );
+            render::line(&render::dim(
+                "Switched on, so the model can load them. /skills off <name> to switch one off.",
+            ));
+        }
+        Err(why) => render::line(&render::red(&why)),
+    }
 }
 
 /// Sessions offered at once. Older ones are still on disk and still open in
