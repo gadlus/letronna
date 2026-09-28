@@ -36,7 +36,7 @@ const TOO_LONG: u64 = 120;
 
 /// The wait, in the units a person would use. Ninety seconds is a minute and
 /// a half to everyone except a computer.
-fn spell(seconds: u64) -> String {
+pub fn spell(seconds: u64) -> String {
     match (seconds / 60, seconds % 60) {
         (0, s) => format!("{s}s"),
         (m, 0) => format!("{m}m"),

@@ -177,6 +177,10 @@ fn main() {
         }
         if line.starts_with('/') {
             let flow = command(&mut runner, &line, &mut session, workspace.as_deref());
+            // Every turn follows its own session's helpers; this is for the
+            // footer's count once a command has opened another.
+            let open = runner.store.conversations[session].id;
+            runner.bar.show_helpers_of(open);
             if let Flow::Unknown = flow {
                 let name = line.split_whitespace().next().unwrap_or(&line);
                 render::line(&render::dim(&match bar::closest(name) {

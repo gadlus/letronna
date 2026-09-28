@@ -537,6 +537,20 @@ pub fn visible(text: &str) -> usize {
     width
 }
 
+/// Plain text cut to `width` columns, ending in an ellipsis where it was
+/// cut, for a row that must not wrap.
+pub fn clip(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_owned();
+    }
+    let Some(room) = width.checked_sub(1) else {
+        return String::new();
+    };
+    let mut cut: String = text.chars().take(room).collect();
+    cut.push('…');
+    cut
+}
+
 /// A tool call: what ran and on what, then how it went on the line under it.
 /// Two lines rather than one because the second is where its output goes, and
 /// a result that hangs off the end of the first line is easy to miss.
