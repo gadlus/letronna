@@ -267,6 +267,23 @@ fn body(connection: &Connection, messages: &[Message], summary: Option<&str>) ->
     // Memory first: it changes rarely, so the prompt's start stays cacheable;
     // the summary of dropped turns changes as the conversation grows.
     system.push_str(&crate::memory::context(connection));
+    // Models reckon "today" from their training and guess who they are. The
+    // date alone changes once a day, so the prefix above stays cached; the OS
+    // says something about this computer, so a shared chat goes without it.
+    system.push_str(&format!(
+        "\n\nToday is {}.",
+        chrono::Local::now().format("%A %Y-%m-%d")
+    ));
+    if !shared {
+        let os = match std::env::consts::OS {
+            "windows" => "Windows",
+            "macos" => "macOS",
+            "linux" => "Linux",
+            other => other,
+        };
+        system.push_str(&format!(" This computer runs {os}."));
+    }
+    system.push_str(&format!(" The model behind you is {}.", connection.model));
     if let Some(summary) = summary {
         system.push_str(&format!(
             "\n\nEarlier in this conversation, summarized because it no longer fits:\n{summary}"
@@ -436,7 +453,10 @@ fn explain(message: &str) -> String {
     let tool_history_unsupported = message.contains("thought_signature")
         || (message.contains("tool_calls") && message.contains("to be populated"));
     if tool_history_unsupported {
-        return "This model cannot carry tool calls back into the conversation, so it                 stops as soon as it uses one. That is the route, not the request. Pick                 another model with /model -- the deepseek and claude routes handle                 tools."
+        return "This model cannot carry tool calls back into the conversation, so it \
+                stops as soon as it uses one. That is the route, not the request. Pick \
+                another model with /model -- the deepseek and claude routes handle \
+                tools."
             .to_owned();
     }
     message.chars().take(400).collect()
@@ -697,7 +717,9 @@ fn stream(
             let code = status.as_u16();
             if transient(status) {
                 format!(
-                    "The gateway is having trouble right now (HTTP {code}). This is at                      the provider's end, not your settings. Try again in a moment, or                      switch gateway in Settings."
+                    "The gateway is having trouble right now (HTTP {code}). This is at \
+                     the provider's end, not your settings. Try again in a moment, or \
+                     switch gateway in Settings."
                 )
             } else {
                 format!("Provider returned HTTP {code}. Check connection settings and quota.")
@@ -995,6 +1017,7 @@ mod tests {
         let gemini =
             super::explain("Function call is missing a thought_signature in functionCall parts.");
         assert!(google.contains("/model"));
+        assert!(!google.contains("  "), "{google}");
         assert_eq!(google, gemini);
         // Anything else is passed through as the provider wrote it.
         let other = super::explain("You have exceeded your quota.");
@@ -1142,6 +1165,40 @@ mod tests {
         });
         assert!(telegram.contains("home folder"));
         assert!(!telegram.contains("read_chat"));
+    }
+    #[test]
+    fn the_model_is_told_the_date_the_computer_and_who_it_is() {
+        let day = || chrono::Local::now().format("%A %Y-%m-%d").to_string();
+        let system = |connection: &Connection| -> String {
+            body(connection, &[], None)["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        // Taken either side, so a run across midnight still finds one of them.
+        let before = day();
+        let here = system(&connection());
+        let after = day();
+        assert!(
+            here.contains(&format!("Today is {before}."))
+                || here.contains(&format!("Today is {after}.")),
+            "{here}"
+        );
+        assert!(here.contains("This computer runs "), "{here}");
+        assert!(here.contains("The model behind you is test-model."));
+
+        // A shared chat keeps the date and the model but not the computer.
+        let shared = system(&Connection {
+            remote: Some(Remote {
+                place: "#general in a Discord server".into(),
+                shared: true,
+                history: None,
+            }),
+            ..connection()
+        });
+        assert!(shared.contains("Today is "));
+        assert!(shared.contains("The model behind you is test-model."));
+        assert!(!shared.contains("This computer runs"), "{shared}");
     }
     #[test]
     fn window_holds_still_so_the_cache_prefix_survives() {

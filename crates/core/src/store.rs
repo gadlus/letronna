@@ -693,10 +693,7 @@ pub fn load() -> Store {
         .filter_map(|id| replay(&session_path(id)))
         .collect();
     conversations.sort_by_key(|c| c.updated);
-    let settings: Settings = std::fs::read(settings_path())
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
+    let settings = settings();
     let active = conversations
         .iter()
         .position(|c| c.id == settings.active_id)
@@ -831,7 +828,9 @@ mod tests {
     // would shadow the built-in attribute.
     #[cfg(unix)]
     use super::write_private;
-    use super::{Conversation, Store, Todo, fill, load_listing, replay, search_in, summaries};
+    use super::{
+        Conversation, Store, Todo, fill, load, load_listing, replay, search_in, summaries,
+    };
     use crate::chat::Message;
 
     /// Held by every test that points `AGENT_DATA_DIR` somewhere: it is one
@@ -978,6 +977,26 @@ mod tests {
         fill(&mut listed.conversations[0]);
         listed.save().unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_retired_gateway_moves_to_letronna_in_the_window_too() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("retired");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"gateway":"Retired","endpoint":"https://retired.example/v1","model":"retired/some-model"}"#,
+        )
+        .unwrap();
+
+        // The window reads everything with `load`, the terminal with
+        // `load_listing`; both must see the same gateway.
+        let window = load().settings;
+        assert_eq!(window.gateway, "Letronna");
+        assert!(window.model.is_empty());
+        assert_eq!(load_listing().settings.gateway, window.gateway);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 
