@@ -500,7 +500,8 @@ impl Tool for RunCommand {
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
             "command": {"type": "string"},
-            "background": {"type": "boolean", "description": "Leave the command running and return a job number straight away. A notice comes when it exits; read its output meanwhile with read_job, and end it with stop_job."}
+            "background": {"type": "boolean", "description": "Leave the command running and return a job number straight away. A notice comes when it exits; read its output meanwhile with read_job, and end it with stop_job."},
+            "notify_on": {"type": "array", "items": {"type": "string"}, "description": "With background: a notice when an output line contains one of these, such as \"ready\" or \"error\". At most one notice every 15 s; exiting always sends one."}
         }, "required": ["command"]})
     }
     fn needs_approval(&self) -> bool {
@@ -515,22 +516,38 @@ impl Tool for RunCommand {
             .workspace
             .as_deref()
             .ok_or("No project folder is attached. Ask the user to attach one first.")?;
+        let notify_on = notify_on(args)?;
         if !args["background"].as_bool().unwrap_or(false) {
+            if !notify_on.is_empty() {
+                return Err("`notify_on` needs background: true. A command that runs \
+                            in the foreground returns all of its output anyway."
+                    .into());
+            }
             return run_shell(command, Some(cwd), &ctx.cancel);
         }
-        let id = crate::jobs::start_for(command, cwd, ctx.conversation)?;
+        let id = crate::jobs::start_watching(command, cwd, ctx.conversation, &notify_on)?;
         // Give it a moment to fail or announce a port, so the first reply says
         // something more useful than "started". A stop cuts the moment short,
         // but the job runs on either way, so it is still reported.
         ctx.cancel.sleep(SETTLE);
-        let log = crate::jobs::log(id).unwrap_or_default();
+        // Read this way, what the reply shows never comes again as a notice.
+        let log = crate::jobs::first_output(id).unwrap_or_default();
         let state = if crate::jobs::running(id).unwrap_or(false) {
             "running"
         } else {
             "already exited"
         };
+        let watching = if notify_on.is_empty() {
+            String::new()
+        } else {
+            let quoted: Vec<String> = notify_on.iter().map(|text| format!("\"{text}\"")).collect();
+            format!(
+                "\nWatching for {}: a notice comes on a matching line, and when it exits.",
+                quoted.join(", ")
+            )
+        };
         Ok(format!(
-            "Started as job #{id} ({state}). First output:\n{}",
+            "Started as job #{id} ({state}). First output:\n{}{watching}",
             if log.trim().is_empty() {
                 "[nothing yet]"
             } else {
@@ -795,6 +812,25 @@ fn job_id(args: &Value) -> Result<u64, String> {
     args["id"]
         .as_u64()
         .ok_or_else(|| "`id` is required and must be a job number.".to_owned())
+}
+
+/// The text a background command's output is watched for, from `notify_on`.
+fn notify_on(args: &Value) -> Result<Vec<String>, String> {
+    let bad = "`notify_on` must be a list of text to look for, such as [\"ready\", \"error\"].";
+    let list = match &args["notify_on"] {
+        Value::Null => return Ok(Vec::new()),
+        Value::Array(list) => list,
+        _ => return Err(bad.into()),
+    };
+    // An empty string is in every line, so it would watch for nothing in particular.
+    list.iter()
+        .map(|text| {
+            text.as_str()
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| bad.to_owned())
+        })
+        .collect()
 }
 
 /// Answered in the chat, not here.
