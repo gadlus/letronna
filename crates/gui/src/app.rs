@@ -171,10 +171,18 @@ pub(crate) struct Chat {
     /// Selected row on the Messaging page.
     pub(crate) channel: usize,
     pub(crate) skills: Vec<letronna_core::skills::Skill>,
+    /// Why the skills could not be read, shown in place of the list.
+    pub(crate) skills_error: Option<String>,
     /// The name of the skill being edited, or empty for a new one.
     pub(crate) editing_skill: Option<String>,
     pub(crate) skill_name: Entity<InputState>,
     pub(crate) skill_prompt: Entity<InputState>,
+    /// Where to add skills from: a GitHub repository, a link or a path.
+    pub(crate) skill_source: Entity<InputState>,
+    /// Skills are being added, which waits on the network.
+    pub(crate) adding_skills: bool,
+    /// What the last add or removal of skills came to, or why it failed.
+    pub(crate) skills_note: Option<Result<String, String>>,
     /// Your message being changed in place, by session id and place.
     pub(crate) editing_message: Option<(u64, usize)>,
     /// The box a message is changed in.
@@ -308,6 +316,9 @@ impl Chat {
                 .auto_grow(3, 10)
                 .placeholder("What should Letronna do?")
         });
+        let skill_source = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("GitHub repo, link to a SKILL.md, or a folder")
+        });
         let job_prompt = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
@@ -346,6 +357,11 @@ impl Chat {
             cx.subscribe_in(&answer, window, |this, _, event, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
                     this.submit_answer(window, cx);
+                }
+            }),
+            cx.subscribe_in(&skill_source, window, |this, _, event, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.add_skills(window, cx);
                 }
             }),
         ];
@@ -421,9 +437,13 @@ impl Chat {
             discord_bot_name: None,
             channel: 0,
             skills,
+            skills_error: skills_error.clone(),
             editing_skill: None,
             skill_name,
             skill_prompt,
+            skill_source,
+            adding_skills: false,
+            skills_note: None,
             editing_message: None,
             edit_message,
             thinking_open: std::collections::HashSet::new(),
