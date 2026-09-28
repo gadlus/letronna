@@ -42,6 +42,7 @@ use crate::inbox::{self, LINE_BREAKS, Notice, When};
 use crate::store::Transcript;
 use crate::tasks::{self, Key, State, Task};
 use crate::tools::{self, Caller, Tool, ToolContext};
+use crate::worktree::{self, Worktree};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -147,7 +148,7 @@ struct Sidecar {
     plan: bool,
     workspace: Option<PathBuf>,
     /// A git worktree of its own to work in, in place of its session's folder.
-    worktree: Option<PathBuf>,
+    worktree: Option<Worktree>,
     /// The session or helper that started it.
     parent: u64,
     depth: u8,
@@ -261,7 +262,8 @@ impl Tool for Agent {
             "type": {"type": "string", "description": "general (default), explore (read-only, cheaper), plan, or review. Other types this project defines are named in your instructions."},
             "name": {"type": "string", "description": "A handle for the agents tool. Defaults to the type."},
             "model": {"type": "string", "description": "A model id on this gateway. Default: the type's, then Settings, then yours."},
-            "background": {"type": "boolean", "description": "Default true in the window and terminal: return now and get a notice when it finishes. false waits for the report."}
+            "background": {"type": "boolean", "description": "Default true in the window and terminal: return now and get a notice when it finishes. false waits for the report."},
+            "isolation": {"type": "string", "enum": ["worktree"], "description": "worktree: it works in a new git worktree of this repository, on a branch of its own made from HEAD, so your uncommitted edits are not in it. Its file tools stay inside it; its commands are not confined. The worktree is removed if it changed nothing, else its path and branch are in the report."}
         }, "required": ["description", "prompt"]})
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
@@ -328,6 +330,10 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
     let kind = text(args, "type").unwrap_or("general");
     let wanted = text(args, "name").unwrap_or(kind);
     check_name(wanted)?;
+    let isolated = worktree::asked(&args["isolation"])?;
+    if isolated && parent.workspace.is_none() {
+        return Err("A worktree needs a project folder, and none is attached.".into());
+    }
     let def = agent_defs::find(kind, parent.workspace.as_deref())?;
     let owner = caller.agent.unwrap_or(caller.root);
     let background = in_background(args, inbox::listened(), caller.depth, parent);
@@ -335,10 +341,20 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
     let waiting = if background { 0 } else { owner };
     let cancel = cancel_for(background, ctx);
     let slot = reserve(caller.root, waiting, wanted, limits.at_once, cancel.clone())?;
-    let connection = child(parent, &def, text(args, "model"), limits, slot.id);
+    let mut connection = child(parent, &def, text(args, "model"), limits, slot.id);
     let tools = usable(&connection, &def);
-    let (n, mut transcript) =
-        Transcript::create(caller.root, &slot.name, parent.workspace.clone())?;
+    let worktree = match (isolated, parent.workspace.as_deref()) {
+        (true, Some(workspace)) => Some(worktree::create(workspace, &slot.name)?),
+        _ => None,
+    };
+    // After the worktree, so a refused one leaves no conversation behind.
+    let (n, mut transcript) = Transcript::create(caller.root, &slot.name, parent.workspace.clone())
+        .inspect_err(|_| {
+            leave(worktree.as_ref(), &[], None);
+        })?;
+    if let Some(tree) = &worktree {
+        connection.workspace = Some(tree.workspace());
+    }
     transcript
         .conversation
         .messages
@@ -350,13 +366,16 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
         model: connection.model.clone(),
         plan: connection.plan,
         workspace: parent.workspace.clone(),
-        worktree: None,
+        worktree: worktree.clone(),
         parent: owner,
         depth: caller.depth + 1,
         description: text(args, "description").unwrap_or_default().to_owned(),
         stopped_by_user: false,
     }
-    .write(&sidecar)?;
+    .write(&sidecar)
+    .inspect_err(|_| {
+        leave(worktree.as_ref(), &[], None);
+    })?;
     let run = Run::new(owner, background);
     let spec = Spec {
         connection,
@@ -390,29 +409,49 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
          wait for it. Carry on, or end your turn.",
         slot.name, def.name
     );
-    launch(spec, slot, background, &def.name, started)
+    launch(spec, slot, background, &def.name, started, worktree)
 }
 
 /// Sets a helper to work in the place `slot` holds: in the background, where
 /// the call's answer is `started` and a notice follows, or while the call
-/// waits, where the answer is its report.
+/// waits, where the answer is its report. The `worktree` it works in, if any,
+/// is finished as it ends.
 fn launch(
     spec: Spec,
     slot: Slot,
     background: bool,
     kind: &str,
     started: String,
+    worktree: Option<Worktree>,
 ) -> Result<String, String> {
     let rounds = spec.rounds;
+    // Seen before it runs, since it may make its session's folder itself.
+    let at_top = (worktree.as_ref())
+        .zip(spec.connection.workspace.as_deref())
+        .and_then(|(tree, given)| tree.at_top(given));
     if background {
-        set_off(spec, slot, kind, rounds)?;
+        set_off(spec, slot, kind, rounds, worktree, at_top)?;
         return Ok(started);
     }
     let report = driver::run(spec);
+    let left = leave(worktree.as_ref(), &report.jobs, at_top);
     let share = MAX_REPORT / slot.together.load(Ordering::Relaxed).max(1);
     let name = slot.name.clone();
     close(slot, &report, |_| ());
-    answer(&name, &report, rounds, share)
+    answer(&name, &report, rounds, share, left.as_deref())
+}
+
+/// Finishes the worktree a helper worked in, if it had one, keeping it while
+/// any of the `jobs` it left runs, and gives the lines of its report saying
+/// what became of it, after the one saying it worked `at_top`, if it did.
+fn leave(worktree: Option<&Worktree>, jobs: &[u64], at_top: Option<String>) -> Option<String> {
+    let kept = worktree?.finish(jobs);
+    let kept =
+        kept.unwrap_or_else(|| "It changed nothing in its worktree, which was removed.".into());
+    Some(match at_top {
+        Some(line) => format!("{line} {kept}"),
+        None => kept,
+    })
 }
 
 /// Which tools a helper of type `def` may call, of the `tools` it is offered.
@@ -443,15 +482,24 @@ fn cancel_for(background: bool, ctx: &ToolContext) -> Cancel {
 
 /// Starts a helper on a thread of its own; when it ends, its owner hears how
 /// it went in a notice.
-fn set_off(spec: Spec, slot: Slot, kind: &str, rounds: usize) -> Result<(), String> {
+fn set_off(
+    spec: Spec,
+    slot: Slot,
+    kind: &str,
+    rounds: usize,
+    worktree: Option<Worktree>,
+    at_top: Option<String>,
+) -> Result<(), String> {
     let (id, key) = (slot.id, Key::Agent(slot.id));
     let name = slot.name.clone();
     // Registered before it runs, so one that ends at once still has an owner to tell.
     tasks::register(Task::new(key, spec.owner, None, &name));
     let about = kind.to_owned();
+    let unstarted = worktree.clone();
     let started = driver::spawn(spec, move |report| {
+        let left = leave(worktree.as_ref(), &report.jobs, at_top);
         close(slot, report, |by_user| {
-            let (state, notice) = ended(&name, &about, report, rounds, by_user);
+            let (state, notice) = ended(&name, &about, report, rounds, by_user, left.as_deref());
             tasks::finish(&key, state, notice);
         });
     });
@@ -460,6 +508,7 @@ fn set_off(spec: Spec, slot: Slot, kind: &str, rounds: usize) -> Result<(), Stri
         if let Some(helper) = registry().helpers.iter_mut().find(|h| h.id == id) {
             helper.ended = Some("failed".into());
         }
+        leave(unstarted.as_ref(), &[], None);
         return Err(error);
     }
     Ok(())
@@ -705,8 +754,15 @@ fn task(def: &AgentDef, tools: &[String], prompt: &str) -> Message {
 }
 
 /// What the agent that started a helper hears back: how it went, what it
-/// changed, and its report cut to `share` characters, keeping both ends.
-fn answer(name: &str, report: &Report, rounds: usize, share: usize) -> Result<String, String> {
+/// changed, what became of its worktree as `left` says, and its report cut to
+/// `share` characters, keeping both ends.
+fn answer(
+    name: &str,
+    report: &Report,
+    rounds: usize,
+    share: usize,
+    left: Option<&str>,
+) -> Result<String, String> {
     let mut out = match &report.status {
         Outcome::Done => format!("{name} finished: {}.", stats(report)),
         Outcome::RoundLimit => {
@@ -724,6 +780,10 @@ fn answer(name: &str, report: &Report, rounds: usize, share: usize) -> Result<St
             report.files.join(", ")
         ));
     }
+    if let Some(left) = left {
+        out.push('\n');
+        out.push_str(left);
+    }
     if let Some(jobs) = left_running(&report.jobs) {
         out.push('\n');
         out.push_str(&jobs);
@@ -739,13 +799,15 @@ fn answer(name: &str, report: &Report, rounds: usize, share: usize) -> Result<St
 }
 
 /// How a helper that ran in the background ended, and the notice that tells
-/// its owner so, or none when the user stopped it, since the user knows.
+/// its owner so, with what became of its worktree as `left` says, or none
+/// when the user stopped it, since the user knows.
 fn ended(
     name: &str,
     kind: &str,
     report: &Report,
     rounds: usize,
     by_user: bool,
+    left: Option<&str>,
 ) -> (State, Option<Notice>) {
     let ran = match report.rounds {
         1 => "1 round".to_owned(),
@@ -790,6 +852,10 @@ fn ended(
             "\nChanged (re-read before editing): {}",
             report.files.join(", ")
         ));
+    }
+    if let Some(left) = left {
+        text.push('\n');
+        text.push_str(left);
     }
     if let Some(jobs) = left_running(&report.jobs) {
         text.push('\n');
@@ -1047,7 +1113,7 @@ fn resume(
     let Some(sender) = caller.connection.as_deref() else {
         return Err("A helper can only be picked back up from a conversation.".into());
     };
-    let what = Sidecar::read(sidecar)?;
+    let mut what = Sidecar::read(sidecar)?;
     if what.stopped_by_user {
         return Err(user_stopped(name));
     }
@@ -1076,14 +1142,39 @@ fn resume(
         limits.at_once,
         notice,
     );
-    let Some(slot) = claimed? else {
-        return Ok(queued(name));
+    let Ok(Some(slot)) = claimed else {
+        return claimed.map(|_| queued(name));
     };
+    // Looked at only now that it has ended, since its end can take the
+    // worktree away. One that changed nothing lost it so; it gets a new one,
+    // since it was asked to keep out of the project folder.
+    let reopened = (what.worktree.clone())
+        .map(|tree| tree.reopen(what.workspace.as_deref()))
+        .transpose();
+    let worktree = match reopened {
+        Ok(worktree) => worktree,
+        Err(error) => {
+            // Ended again, as a failed start leaves it, so it can be tried later.
+            if let Some(helper) = registry().helpers.iter_mut().find(|h| h.id == slot.id) {
+                helper.ended = Some("failed".into());
+            }
+            return Err(error);
+        }
+    };
+    let made = worktree != what.worktree;
+    if made {
+        what.worktree = worktree.clone();
+        // Kept from its old base, a later end counts more commits, never
+        // fewer, so a record that could not be written loses no work.
+        let _ = what.write(sidecar);
+    }
     let connection = Connection {
         model: what.model,
         // Only ever narrowed, as when it started.
         plan: sender.plan || what.plan,
-        workspace: what.worktree.or_else(|| sender.workspace.clone()),
+        workspace: (worktree.as_ref())
+            .map(Worktree::workspace)
+            .or_else(|| sender.workspace.clone()),
         conversation: slot.id,
         ..sender.clone()
     };
@@ -1107,7 +1198,7 @@ fn resume(
         "{name} had finished; it is carrying on from where it stopped, with your message. A \
          notice comes when it is done."
     );
-    launch(spec, slot, background, &def.name, started)
+    launch(spec, slot, background, &def.name, started, worktree)
 }
 
 /// Takes a place for helper `name` of session `root` to carry on in as `run`
@@ -1540,6 +1631,7 @@ mod tests {
             &report(Outcome::Done, &long),
             ROUNDS,
             MAX_REPORT,
+            None,
         )
         .unwrap();
         let mut lines = out.splitn(3, '\n');
@@ -1568,10 +1660,12 @@ mod tests {
             &report(Outcome::Done, &long),
             ROUNDS,
             MAX_REPORT / together,
+            None,
         );
         assert!(halved.unwrap().len() < out.len() - MAX_REPORT / 3);
 
-        let partial = answer("a", &report(Outcome::RoundLimit, "So far."), 50, MAX_REPORT);
+        let so_far = report(Outcome::RoundLimit, "So far.");
+        let partial = answer("a", &so_far, 50, MAX_REPORT, None);
         assert!(
             partial
                 .unwrap()
@@ -1582,6 +1676,7 @@ mod tests {
             &report(Outcome::Failed("No key.".into()), ""),
             50,
             MAX_REPORT,
+            None,
         );
         assert!(failed.unwrap_err().starts_with("a failed: No key."));
     }
@@ -2011,6 +2106,72 @@ mod tests {
         assert_eq!(lines[1], "The tests pass too.");
         let page = json!({"action": "report", "to": "resumed", "offset": 4});
         assert_eq!(talk(ctx, page), Ok("tests pass too.".into()));
+    }
+
+    #[test]
+    fn a_helper_that_changed_nothing_in_its_worktree_leaves_none_behind() {
+        let session = Session::new("tree-gone");
+        crate::worktree::tests::repo(&session.work);
+        let (endpoint, provider) = Stub::start(vec![
+            reply("", Some(("read_file", json!({"path": "readme.txt"})))),
+            reply("It is a repository.", None),
+        ]);
+        let args = json!({"description": "Read the readme", "name": "tree-gone",
+            "background": false, "isolation": "worktree", "prompt": "Read readme.txt."});
+        let out = call(session.context(endpoint), args).unwrap();
+        let sent = provider.sent();
+
+        assert_eq!(results(&sent[1]), ["a repository"]);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines[1..],
+            [
+                "It changed nothing in its worktree, which was removed.",
+                "It is a repository."
+            ]
+        );
+        assert!(!session.work.join(".letronna/worktrees/tree-gone").exists());
+        let refused = json!({"description": "d", "prompt": "p", "isolation": "copy"});
+        let said = call(session.context("http://127.0.0.1:9/v1".into()), refused).unwrap_err();
+        assert!(said.starts_with("isolation \"copy\" is not one"), "{said}");
+    }
+
+    #[test]
+    fn a_resumed_helper_carries_on_in_the_worktree_it_kept() {
+        let session = Session::new("tree-kept");
+        crate::worktree::tests::repo(&session.work);
+        let top = std::fs::canonicalize(&session.work).unwrap();
+        let tree = top.join(".letronna/worktrees/tree-kept");
+        let inside = tree.clone();
+        // What it wrote lands in its worktree while it waits for its answer.
+        let (endpoint, provider) = Stub::held(vec![reply("Wrote it.", None)], move |_| {
+            std::fs::write(inside.join("scratch.txt"), "from the helper").unwrap();
+        });
+        let args = json!({"description": "Write a file", "name": "tree-kept",
+            "background": false, "isolation": "worktree", "prompt": "Write scratch.txt."});
+        let out = call(session.context(endpoint), args).unwrap();
+        provider.sent();
+        let (again, provider) = Stub::start(vec![
+            reply("", Some(("read_file", json!({"path": "scratch.txt"})))),
+            reply("It is from the helper.", None),
+        ]);
+        let message = json!({"action": "send", "to": "tree-kept", "background": false,
+            "message": "Read it back."});
+        let resumed = talk(session.context(again), message).unwrap();
+        let sent = provider.sent();
+
+        let kept = format!(
+            "Its worktree is kept at {} on branch letronna/tree-kept (no commits, uncommitted \
+             changes).",
+            tree.display()
+        );
+        assert_eq!(out.lines().nth(1), Some(kept.as_str()), "{out}");
+        assert!(!session.work.join("scratch.txt").exists());
+        let recorded = &sidecar(&session, 1)["worktree"];
+        assert_eq!(recorded["path"], json!(tree));
+        assert_eq!(recorded["branch"], "letronna/tree-kept");
+        assert_eq!(results(&sent[1]), ["from the helper"]);
+        assert_eq!(resumed.lines().nth(1), Some(kept.as_str()), "{resumed}");
     }
 
     #[test]

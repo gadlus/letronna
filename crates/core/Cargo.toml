@@ -23,6 +23,11 @@ tungstenite = { version = "0.30", default-features = false, features = ["handsha
 # needs. It can be stopped from outside and held to a heap and a stack.
 rquickjs = { version = "0.14", optional = true }
 
+[target.'cfg(unix)'.dependencies]
+# Stops a git that ran past its time together with what it started; already
+# in the lock file under several crates.
+libc = "0.2"
+
 [features]
 default = ["workflows"]
 # Orchestration scripts that run many agents at once. On by default, so CI
