@@ -544,7 +544,7 @@ fn skills(runner: &mut Runner, rest: &str, workspace: Option<&std::path::Path>) 
             return;
         }
     };
-    if matches!(verb, "on" | "off") && !target.is_empty() {
+    if matches!(verb, "on" | "off") {
         switch_skill(&saved, target, verb == "on");
         return;
     }
@@ -559,11 +559,11 @@ fn skills(runner: &mut Runner, rest: &str, workspace: Option<&std::path::Path>) 
     // Named, it goes to the model as the next thing said.
     if !rest.is_empty() {
         match pick_skill(&saved, rest) {
-            Some(skill) => {
+            Ok(skill) => {
                 render::said(&render::blue("●"), &render::bold(&skill.name));
                 runner.bar.say(&skill.body);
             }
-            None => render::line(&render::dim(&format!("No skill matching \"{rest}\"."))),
+            Err(why) => render::line(&render::dim(&why)),
         }
         return;
     }
@@ -599,24 +599,48 @@ fn skills(runner: &mut Runner, rest: &str, workspace: Option<&std::path::Path>) 
     ));
 }
 
-/// The skill called `wanted`, or else the first whose name contains it.
-fn pick_skill<'a>(saved: &'a [Skill], wanted: &str) -> Option<&'a Skill> {
-    let wanted = wanted.to_lowercase();
-    saved
+/// The skill called `wanted`, or else the one whose name contains it. When
+/// several do, none is guessed at: switching off the wrong one is a mistake
+/// nobody sees.
+fn pick_skill<'a>(saved: &'a [Skill], wanted: &str) -> Result<&'a Skill, String> {
+    let lower = wanted.to_lowercase();
+    if let Some(skill) = saved.iter().find(|s| s.name.to_lowercase() == lower) {
+        return Ok(skill);
+    }
+    let close: Vec<&Skill> = saved
         .iter()
-        .find(|s| s.name.to_lowercase() == wanted)
-        .or_else(|| {
-            saved
+        .filter(|s| s.name.to_lowercase().contains(&lower))
+        .collect();
+    match close.as_slice() {
+        [one] => Ok(one),
+        [] => Err(format!("No skill matching \"{wanted}\".")),
+        several => Err(format!(
+            "Which one? {}",
+            several
                 .iter()
-                .find(|s| s.name.to_lowercase().contains(&wanted))
-        })
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
 }
 
 /// Switch a skill on or off: only the ones on are offered to the model.
 fn switch_skill(saved: &[Skill], wanted: &str, on: bool) {
-    let Some(skill) = pick_skill(saved, wanted) else {
-        render::line(&render::dim(&format!("No skill matching \"{wanted}\".")));
+    if wanted.is_empty() {
+        let verb = if on { "on" } else { "off" };
+        render::said(
+            &render::blue("●"),
+            &render::bold(&format!("Which one? /skills {verb} <name>")),
+        );
         return;
+    }
+    let skill = match pick_skill(saved, wanted) {
+        Ok(skill) => skill,
+        Err(why) => {
+            render::line(&render::dim(&why));
+            return;
+        }
     };
     match letronna_core::skills::set_enabled(&skill.name, on) {
         Ok(()) => render::said(
@@ -635,7 +659,8 @@ fn switch_skill(saved: &[Skill], wanted: &str, on: bool) {
     }
 }
 
-/// Add skills from GitHub, a link or a path, and say which arrived.
+/// Add skills from GitHub, a link or a path, and say what arrived, what it
+/// replaced and what was left out.
 fn add_skills(runner: &mut Runner, source: &str) {
     if source.is_empty() {
         render::said(
@@ -648,13 +673,32 @@ fn add_skills(runner: &mut Runner, source: &str) {
     match runner.bar.busy("adding skills", move || {
         letronna_core::skills::install(&from)
     }) {
-        Ok(names) => {
-            render::said(
-                &render::blue("●"),
-                &render::bold(&format!("Added {}", names.join(", "))),
-            );
+        Ok(installed) => {
+            let mut done = Vec::new();
+            if !installed.added.is_empty() {
+                done.push(format!("Added {}", installed.added.join(", ")));
+            }
+            if !installed.updated.is_empty() {
+                let names: Vec<&str> = installed
+                    .updated
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect();
+                done.push(format!("Updated {}", names.join(", ")));
+            }
+            render::said(&render::blue("●"), &render::bold(&done.join("; ")));
+            for (name, kept) in &installed.updated {
+                render::line(&render::dim(&format!(
+                    "The earlier {name} is kept in {}",
+                    kept.display()
+                )));
+            }
+            for why in &installed.refused {
+                render::line(&render::amber(why));
+            }
             render::line(&render::dim(
-                "Switched on, so the model can load them. /skills off <name> to switch one off.",
+                "New skills start switched on, and an updated one keeps its switch. \
+                 /skills off <name> to switch one off.",
             ));
         }
         Err(why) => render::line(&render::red(&why)),

@@ -35,7 +35,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod install;
-pub use install::install;
+pub use install::{Installed, install};
 
 /// The file that makes a folder a skill.
 const SKILL_FILE: &str = "SKILL.md";
