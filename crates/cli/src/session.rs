@@ -328,6 +328,9 @@ impl Runner {
             turn.finish_call(Ok(reply));
             return Ok(true);
         }
+        if call.name == tools::EXIT_PLAN {
+            return Ok(self.put_plan(turn, &call));
+        }
 
         let ctx = tools::ToolContext::of(&turn.connection);
         let summary = tools::summary(&call.name, &call.arguments);
@@ -385,6 +388,56 @@ impl Runner {
                 Ok(true)
             }
         }
+    }
+
+    /// Print the plan made in plan mode and ask whether to carry it out.
+    /// False means the user ended the turn.
+    fn put_plan(&mut self, turn: &mut Turn, call: &letronna_core::chat::ToolCall) -> bool {
+        // A plan that did not come through whole goes back to the model;
+        // approving it would lift plan mode for nothing.
+        let plan = match tools::plan_of(&call.arguments) {
+            Ok(plan) => plan,
+            Err(error) => {
+                render::blank();
+                render::tool(&call.name, "", &tools::one_line(&error), true);
+                turn.finish_call(Err(error));
+                return true;
+            }
+        };
+        render::blank();
+        let mut shown = Stream::opening_with(render::bullet());
+        shown.push(&plan);
+        shown.end();
+        let picked = self.bar.choose(
+            "Carry out this plan?",
+            Vec::new(),
+            &[
+                "Yes, carry it out",
+                "No, keep planning",
+                "No, and stop here",
+            ],
+        );
+        let approved = match picked {
+            Some(0) => true,
+            Some(1) => false,
+            _ => return false,
+        };
+        // Off for the session, not only this turn: the next prompt's
+        // connection is built from it, and the footer says so.
+        if approved {
+            self.plan = false;
+            let note = crate::banner::footer(self);
+            self.bar.set_footer(note);
+        }
+        turn.answer_plan(approved);
+        render::blank();
+        let outcome = if approved {
+            "approved; plan mode is off"
+        } else {
+            "keep planning"
+        };
+        render::tool(&call.name, "", outcome, false);
+        true
     }
 
     pub fn persist(&mut self) {

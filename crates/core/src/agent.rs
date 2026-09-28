@@ -153,19 +153,37 @@ impl Turn {
     pub fn take_results(&mut self) -> Vec<Message> {
         std::mem::take(&mut self.results)
     }
+
+    /// Record the user's answer to the `exit_plan` call at the front of the
+    /// queue; approving turns plan mode off for the rest of the turn, so the
+    /// tools that carry the plan out are offered and allowed again.
+    pub fn answer_plan(&mut self, approved: bool) {
+        let answer = if approved {
+            self.connection.plan = false;
+            tools::PLAN_APPROVED
+        } else {
+            tools::KEEP_PLANNING
+        };
+        self.finish_call(Ok(answer.to_owned()));
+    }
 }
 
 /// Whether a call has to wait for the user.
 ///
 /// `ask_user` always does, whatever else is permitted: it is a question, not
-/// an action to allow. Everything else is a matter of who has already said
-/// yes, and how widely.
+/// an action to allow. `exit_plan` does whenever someone is there to answer,
+/// since no standing permission can approve a plan on the user's behalf; with
+/// nobody there it goes on to run, and is refused. Everything else is a matter
+/// of who has already said yes, and how widely.
 pub fn needs_user(name: &str, skip_all: bool, allowed: &HashSet<String>, unattended: bool) -> bool {
     if !tools::needs_approval(name) {
         return false;
     }
     if name == tools::ASK_USER {
         return true;
+    }
+    if name == tools::EXIT_PLAN {
+        return !unattended;
     }
     !(skip_all || unattended || allowed.contains(name))
 }
@@ -283,5 +301,45 @@ mod tests {
         assert!(!needs_user("write_file", false, &allowed, false));
         // A question is never auto-answered, however wide the permission.
         assert!(needs_user(tools::ASK_USER, true, &allowed, true));
+    }
+
+    #[test]
+    fn approving_a_plan_ends_plan_mode_and_declining_keeps_it() {
+        let plan = HashSet::from([tools::EXIT_PLAN.to_owned()]);
+        // No standing permission approves a plan; with nobody there it runs,
+        // which refuses it.
+        assert!(needs_user(tools::EXIT_PLAN, true, &plan, false));
+        assert!(!needs_user(tools::EXIT_PLAN, false, &plan, true));
+
+        let offers = |turn: &Turn, name: &str| {
+            tools::specs(&turn.connection)
+                .iter()
+                .any(|t| t["function"]["name"] == name)
+        };
+        let gate = |name: &str| needs_user(name, false, &HashSet::new(), false);
+        let mut turn = turn();
+        turn.connection.plan = true;
+        assert!(offers(&turn, tools::EXIT_PLAN) && !offers(&turn, "write_file"));
+
+        turn.begin(vec![call(tools::EXIT_PLAN)]);
+        assert_eq!(turn.next(gate), Next::AskUser(call(tools::EXIT_PLAN)));
+        turn.answer_plan(false);
+        assert!(turn.connection.plan);
+        let kept = turn.take_results();
+        assert_eq!(
+            kept[0].content,
+            "Keep planning: the user wants changes. Ask what to change, or refine the plan."
+        );
+        assert!(!kept[0].is_error);
+
+        turn.begin(vec![call(tools::EXIT_PLAN)]);
+        turn.answer_plan(true);
+        assert!(!turn.connection.plan);
+        assert_eq!(
+            turn.take_results()[0].content,
+            "The user approved this plan. Plan mode is off; carry it out now."
+        );
+        // The rest of the turn can act on the plan, and has no plan to hand over.
+        assert!(offers(&turn, "write_file") && !offers(&turn, tools::EXIT_PLAN));
     }
 }

@@ -803,6 +803,13 @@ impl Chat {
         match next {
             agent::Next::Done => self.finish(cx),
             agent::Next::AskUser(call) => {
+                // A plan that did not come through whole goes back to the
+                // model; approving it would lift plan mode for nothing.
+                if call.name == letronna_core::tools::EXIT_PLAN
+                    && let Err(error) = letronna_core::tools::plan_of(&call.arguments)
+                {
+                    return self.record_result(Err(error), cx);
+                }
                 self.ask_remote(call, cx);
                 cx.notify()
             }
@@ -1074,11 +1081,18 @@ impl Chat {
         let unattended = self
             .streaming_id
             .is_some_and(|id| self.unattended.contains(&id));
+        // A chat app is kept in plan mode by its owner's setting, which nobody
+        // on the far end may lift, so nobody there can approve a plan either.
+        let chat_app = name == letronna_core::tools::EXIT_PLAN
+            && self
+                .turn
+                .as_ref()
+                .is_some_and(|turn| turn.connection.remote.is_some());
         agent::needs_user(
             name,
             self.store.settings.skip_approvals,
             &self.session_allow,
-            unattended,
+            unattended || chat_app,
         )
     }
 
@@ -1144,6 +1158,19 @@ impl Chat {
         else {
             return;
         };
+        if call.name == letronna_core::tools::EXIT_PLAN {
+            let approved = matches!(verdict, Verdict::Allow { .. });
+            // The Plan switch goes off with it, so the next message carries
+            // on out of plan mode too.
+            if approved {
+                self.plan_mode = false;
+            }
+            if let Some(turn) = self.turn.as_mut() {
+                turn.answer_plan(approved);
+            }
+            self.advance_tools(cx);
+            return;
+        }
         match verdict {
             Verdict::Answer(text) => self.record_result(Ok(text), cx),
             Verdict::Deny => self.record_result(Err(letronna_core::tools::DECLINED.into()), cx),

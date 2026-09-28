@@ -77,8 +77,14 @@ pub trait Tool: Send + Sync {
 
 pub const ASK_USER: &str = "ask_user";
 pub const TODO: &str = "todo";
+pub const EXIT_PLAN: &str = "exit_plan";
 /// The tool result the model gets when the user denies a call.
 pub const DECLINED: &str = "The user declined this action. Ask before trying a different approach.";
+/// The tool result the model gets when the user approves its plan.
+pub const PLAN_APPROVED: &str = "The user approved this plan. Plan mode is off; carry it out now.";
+/// The tool result the model gets when the user wants the plan changed.
+pub const KEEP_PLANNING: &str =
+    "Keep planning: the user wants changes. Ask what to change, or refine the plan.";
 const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 /// A search stops after this long or this many files, and says so, rather
 /// than walking a whole home folder while the session waits on it.
@@ -123,6 +129,7 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(StopJob),
         Arc::new(Wait),
         Arc::new(AskUser),
+        Arc::new(ExitPlan),
         Arc::new(Todo),
         Arc::new(crate::messaging::ReadChat),
         Arc::new(Sessions),
@@ -185,10 +192,27 @@ pub fn preview(name: &str, args: &str, ctx: &ToolContext) -> String {
     }
 }
 
+/// The plan an `exit_plan` call puts to the user, or why the call cannot be
+/// put to them: arguments that were cut off or carry no plan.
+pub fn plan_of(args: &str) -> Result<String, String> {
+    let args = parse_args(args)?;
+    match args["plan"].as_str() {
+        Some(plan) if !plan.trim().is_empty() => Ok(plan.to_owned()),
+        _ => Err("No plan came with the call: put the whole plan, in markdown, in `plan`.".into()),
+    }
+}
+
+/// Whether `exit_plan` is offered: in plan mode, and only at the terminal or
+/// the window, since a chat app's plan mode is its owner's to lift.
+pub fn offers_plan(connection: &Connection) -> bool {
+    connection.plan && connection.remote.is_none()
+}
+
 /// The `tools` array for a chat completion request. In plan mode the tools
 /// that change things are left out entirely, so the model cannot try them;
 /// where other people read the replies, so is everything that touches this
-/// computer; and `read_chat` exists only where there is a chat to read.
+/// computer; `read_chat` exists only where there is a chat to read, and
+/// `exit_plan` only where there is a plan to hand over and someone to take it.
 pub fn specs(connection: &Connection) -> Vec<Value> {
     let shared = connection.remote.as_ref().is_some_and(|r| r.shared);
     let history = connection
@@ -198,6 +222,7 @@ pub fn specs(connection: &Connection) -> Vec<Value> {
     all()
         .iter()
         .filter(|t| !connection.plan || !t.mutates())
+        .filter(|t| t.name() != EXIT_PLAN || offers_plan(connection))
         .filter(|t| !shared || !t.machine())
         .filter(|t| history || !t.needs_history())
         .map(|t| {
@@ -265,6 +290,13 @@ pub fn summary(name: &str, args: &str) -> String {
             _ => format!("{}s", v["seconds"].as_f64().unwrap_or(10.)),
         },
         ASK_USER => v["question"].as_str().unwrap_or_default().to_owned(),
+        // The whole plan is too long for a row; its first line names it.
+        EXIT_PLAN => v["plan"]
+            .as_str()
+            .and_then(|plan| plan.lines().find(|line| !line.trim().is_empty()))
+            .unwrap_or_default()
+            .trim_start_matches(['#', ' '])
+            .to_owned(),
         "make_image" => v["prompt"].as_str().unwrap_or_default().to_owned(),
         "make_video" => v["prompt"]
             .as_str()
@@ -786,6 +818,44 @@ impl Tool for AskUser {
     }
     fn run(&self, _: &Value, _: &ToolContext) -> Result<String, String> {
         Err("ask_user is answered by the user.".into())
+    }
+}
+
+/// The plan made in plan mode, put to the user. Like `ask_user` it is
+/// answered by the user (see `Turn::answer_plan`), so it only runs when
+/// nobody could be asked, and then it refuses.
+struct ExitPlan;
+impl Tool for ExitPlan {
+    fn name(&self) -> &'static str {
+        EXIT_PLAN
+    }
+    fn description(&self) -> &'static str {
+        "Put your finished plan to the user for approval, written in markdown. If they approve, plan mode turns off and you carry the plan out straight away; if not, keep planning. Use it once the plan is ready, instead of asking whether to go ahead."
+    }
+    fn parameters(&self) -> Value {
+        json!({"type": "object", "properties": {
+            "plan": {"type": "string", "description": "The plan in markdown: what will change, where, and how it will be checked."}
+        }, "required": ["plan"]})
+    }
+    fn needs_approval(&self) -> bool {
+        true
+    }
+    fn preview(&self, args: &Value, _: &ToolContext) -> String {
+        args["plan"].as_str().unwrap_or_default().to_owned()
+    }
+    fn run(&self, _: &Value, ctx: &ToolContext) -> Result<String, String> {
+        // A chat app is in plan mode because its owner left it there, which
+        // nobody on the far end may undo.
+        let advice = if ctx.remote.is_some() {
+            "A plan cannot be approved from a chat app, so plan mode stays on. \
+             Give the plan as your answer; to carry it out from here, the owner \
+             can switch on \"Let messages use tools\" on Letronna's Messaging page."
+        } else {
+            "Nobody is here to approve a plan, so plan mode stays on. Give the \
+             plan as your answer and stop there, so the user can read it and \
+             decide."
+        };
+        Err(advice.into())
     }
 }
 
@@ -1314,5 +1384,66 @@ World"
             "hello"
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_plan_is_offered_only_in_plan_mode_and_refused_when_nobody_can_answer() {
+        let offered = |plan: bool, remote: Option<Remote>| {
+            specs(&Connection {
+                tools: true,
+                plan,
+                remote,
+                ..Default::default()
+            })
+            .iter()
+            .any(|t| t["function"]["name"] == EXIT_PLAN)
+        };
+        assert!(offered(true, None));
+        assert!(!offered(false, None));
+        // A chat app's DMs stay in plan mode by default, and nobody there can
+        // approve a plan.
+        assert!(!offered(true, Some(Remote::default())));
+        assert!(needs_approval(EXIT_PLAN));
+
+        // Reaching `run` means nobody was asked: it refuses, and says what to do.
+        let args = r#"{"plan":"Rename the thing"}"#;
+        let unattended = ToolContext {
+            plan: true,
+            ..Default::default()
+        };
+        let refused = run(EXIT_PLAN, args, &unattended).unwrap_err();
+        assert!(refused.contains("Nobody is here"), "{refused}");
+        assert!(refused.contains("Give the plan"), "{refused}");
+        let chat_app = ToolContext {
+            remote: Some(Remote::default()),
+            ..unattended.clone()
+        };
+        let refused = run(EXIT_PLAN, args, &chat_app).unwrap_err();
+        assert!(refused.contains("chat app"), "{refused}");
+        assert!(refused.contains("Let messages use tools"), "{refused}");
+
+        // The card and the row show the plan, not its JSON.
+        let plan = json!({"plan": "## Rename the thing\n\n1. Edit a.rs"}).to_string();
+        assert_eq!(
+            preview(EXIT_PLAN, &plan, &unattended),
+            "## Rename the thing\n\n1. Edit a.rs"
+        );
+        assert_eq!(summary(EXIT_PLAN, &plan), "Rename the thing");
+    }
+
+    #[test]
+    fn a_plan_that_is_cut_off_or_missing_goes_back_to_the_model() {
+        let plan = json!({"plan": "## Rename the thing\n\n1. Edit a.rs"}).to_string();
+        assert_eq!(
+            plan_of(&plan).unwrap(),
+            "## Rename the thing\n\n1. Edit a.rs"
+        );
+        // A long plan can run into the output limit mid-string.
+        let cut = plan_of(r#"{"plan":"Rename the thing\n\n1. Ed"#).unwrap_err();
+        assert!(cut.contains("cut off"), "{cut}");
+        for empty in ["{}", "", r#"{"plan":"  \n"}"#, r#"{"plan":3}"#] {
+            let missing = plan_of(empty).unwrap_err();
+            assert!(missing.contains("No plan came"), "{empty}: {missing}");
+        }
     }
 }
