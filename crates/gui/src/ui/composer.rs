@@ -72,7 +72,7 @@ impl Chat {
                             .child(
                                 div()
                                     .truncate()
-                                    .when(active, |d| d.text_color(cx.theme().primary))
+                                    .when(active, |d| d.text_color(cx.theme().link))
                                     .child(id),
                             )
                             .child(
@@ -240,7 +240,7 @@ impl Chat {
                                 .child(
                                     div()
                                         .truncate()
-                                        .when(active, |d| d.text_color(cx.theme().primary))
+                                        .when(active, |d| d.text_color(cx.theme().link))
                                         .child(name),
                                 )
                                 .child(
@@ -455,7 +455,7 @@ impl Chat {
                         "Plan mode off. Click to stop it writing or running anything."
                     })
                     .text_color(if self.plan_mode {
-                        cx.theme().primary
+                        cx.theme().link
                     } else {
                         cx.theme().muted_foreground
                     })
@@ -484,7 +484,7 @@ impl Chat {
                         "Web search off. Click to let it look things up."
                     })
                     .text_color(if self.store.settings.search {
-                        cx.theme().primary
+                        cx.theme().link
                     } else {
                         cx.theme().muted_foreground
                     })

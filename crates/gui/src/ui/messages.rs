@@ -157,7 +157,7 @@ impl Chat {
                                 .text_xs()
                                 .font_family(HEADING_FONT)
                                 .font_weight(FontWeight::MEDIUM)
-                                .text_color(cx.theme().primary)
+                                .text_color(cx.theme().link)
                                 .child("You"),
                         )
                         .children(on_label),
@@ -173,7 +173,7 @@ impl Chat {
                         .child(
                             div()
                                 .font_weight(FontWeight::MEDIUM)
-                                .text_color(cx.theme().primary)
+                                .text_color(cx.theme().link)
                                 .child(label),
                         )
                         .when(streaming, |this| {
