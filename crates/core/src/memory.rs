@@ -40,7 +40,8 @@ pub fn soul() -> Option<String> {
 }
 
 /// What follows the built-in lines of the prompt: memory, the project's own
-/// instructions, and how to use them. Nothing where others read the replies.
+/// instructions, the helper types files define, and how to use them. Nothing
+/// where others read the replies.
 pub fn context(connection: &Connection) -> String {
     context_in(&crate::chat::data_dir(), connection)
 }
@@ -75,6 +76,11 @@ fn context_in(dir: &Path, connection: &Connection) -> String {
         out.push_str(&format!(
             "\n\nThe project's instructions, from {name}:\n{text}"
         ));
+    }
+    if connection.tools
+        && let Some(types) = crate::agent_defs::advert_in(dir, connection.workspace.as_deref())
+    {
+        out.push_str(&format!("\n\n{types}"));
     }
     out
 }
@@ -342,6 +348,13 @@ mod tests {
             "Works late.\r\n§\r\nLikes tables.\r\n",
         )
         .unwrap();
+        let agents = project.join(".letronna").join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("docs.md"),
+            "---\ndescription: Writes docs.\n---\n",
+        )
+        .unwrap();
         let connection = Connection {
             tools: true,
             workspace: Some(project),
@@ -357,6 +370,10 @@ mod tests {
         );
         assert!(!text.contains("USER.md,"), "an empty store is left out");
         assert!(text.contains("from AGENTS.md:\nRun cargo test before committing."));
+        assert!(
+            text.ends_with("agent tool's type: docs (Writes docs)."),
+            "{text}"
+        );
 
         let shared = Connection {
             remote: Some(Remote {
