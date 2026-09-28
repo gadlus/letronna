@@ -39,9 +39,18 @@ pub fn of(name: &str, args: &str, ctx: &ToolContext) -> Option<Vec<String>> {
             Some(render_diff(&old, new))
         }
         "edit_file" => {
-            let old = args["old"].as_str().unwrap_or_default();
-            let new = args["new"].as_str().unwrap_or_default();
-            Some(render_diff(old, new))
+            // Edits sent as a list are shown too, or they would be approved
+            // unseen.
+            let listed = args["edits"].as_array().into_iter().flatten();
+            let mut rows = Vec::new();
+            for edit in std::iter::once(&args).chain(listed) {
+                let Some(old) = edit["old"].as_str() else {
+                    continue;
+                };
+                let new = edit["new"].as_str().unwrap_or_default();
+                rows.extend(render_diff(old, new));
+            }
+            Some(rows)
         }
         _ => None,
     }
@@ -202,7 +211,7 @@ fn clip(text: &str, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Row, compare, fold};
+    use super::{Row, ToolContext, compare, fold, of};
 
     fn rows(text: &[&str]) -> Vec<String> {
         text.iter().map(|t| (*t).to_owned()).collect()
@@ -231,6 +240,20 @@ mod tests {
         let diff = compare(&[], &after);
         assert!(diff.iter().all(|r| matches!(r, Row::New(_))));
         assert_eq!(diff.len(), 2);
+    }
+
+    #[test]
+    fn every_edit_in_a_list_is_shown() {
+        let args = r#"{"path": "a.rs", "edits": [
+            {"old": "one", "new": "two"},
+            {"old": "three", "new": "four"}
+        ]}"#;
+        let shown = of("edit_file", args, &ToolContext::default())
+            .unwrap()
+            .join("\n");
+        for text in ["- one", "+ two", "- three", "+ four"] {
+            assert!(shown.contains(text), "{shown}");
+        }
     }
 
     #[test]

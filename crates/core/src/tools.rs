@@ -423,47 +423,79 @@ impl Tool for EditFile {
         "edit_file"
     }
     fn description(&self) -> &'static str {
-        "Replace one exact occurrence of `old` with `new` in a file. `old` must match exactly once."
+        "Replace `old` with `new` in a file. `old` must match exactly once, unless replace_all is set to change every match. Line endings, trailing spaces, indentation and curly quotes need not match; the file keeps its own. For several changes to one file, pass `edits` instead: they are made in order, and if one fails none is made."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
             "path": {"type": "string"},
             "old": {"type": "string"},
-            "new": {"type": "string"}
-        }, "required": ["path", "old", "new"]})
+            "new": {"type": "string"},
+            "replace_all": {"type": "boolean", "description": "Change every match of `old`, not just one."},
+            "edits": {"type": "array", "description": "Several replacements, instead of `old` and `new`.", "items": {
+                "type": "object", "properties": {
+                    "old": {"type": "string"},
+                    "new": {"type": "string"},
+                    "replace_all": {"type": "boolean"}
+                }, "required": ["old", "new"]
+            }}
+        }, "required": ["path"]})
     }
     fn needs_approval(&self) -> bool {
         true
     }
     fn preview(&self, args: &Value, _: &ToolContext) -> String {
-        let old = args["old"].as_str().unwrap_or_default();
-        let new = args["new"].as_str().unwrap_or_default();
         let mut out = String::new();
-        for line in old.lines() {
-            out.push_str("- ");
-            out.push_str(line);
-            out.push('\n');
-        }
-        for line in new.lines() {
-            out.push_str("+ ");
-            out.push_str(line);
-            out.push('\n');
+        for edit in edits(args).unwrap_or_default() {
+            for line in edit.old.lines() {
+                out.push_str("- ");
+                out.push_str(line);
+                out.push('\n');
+            }
+            for line in edit.new.lines() {
+                out.push_str("+ ");
+                out.push_str(line);
+                out.push('\n');
+            }
         }
         out
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         let path = resolve_write(path_arg(args), ctx)?;
-        let old = args["old"].as_str().ok_or("`old` is required.")?;
-        let new = args["new"].as_str().ok_or("`new` is required.")?;
+        let edits = edits(args)?;
         let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        match text.matches(old).count() {
-            0 => return Err("`old` was not found in the file.".into()),
-            1 => {}
-            n => return Err(format!("`old` matches {n} times; include more context.")),
+        let done = crate::edit::apply(&text, &edits)?;
+        if done.replaced == 0 {
+            return Ok("Already applied; nothing changed.".into());
         }
-        std::fs::write(&path, text.replacen(old, new, 1)).map_err(|e| e.to_string())?;
-        Ok("Edited.".into())
+        std::fs::write(&path, done.text).map_err(|e| e.to_string())?;
+        Ok(match (done.replaced, done.already) {
+            (1, 0) => "Edited.".into(),
+            (n, 0) => format!("Edited {n} places."),
+            (_, n) => format!(
+                "Edited. Already applied, so left alone: {n} of {} edits.",
+                edits.len()
+            ),
+        })
     }
+}
+
+/// The replacements an edit_file call asks for: its own `old` and `new`
+/// first, then each of `edits`.
+fn edits(args: &Value) -> Result<Vec<crate::edit::Edit<'_>>, String> {
+    let own = std::iter::once(args).filter(|a| !a["old"].is_null());
+    let listed = args["edits"].as_array().into_iter().flatten();
+    let mut edits = Vec::new();
+    for edit in own.chain(listed) {
+        edits.push(crate::edit::Edit {
+            old: edit["old"].as_str().ok_or("`old` is required.")?,
+            new: edit["new"].as_str().ok_or("`new` is required.")?,
+            all: edit["replace_all"].as_bool().unwrap_or(false),
+        });
+    }
+    if edits.is_empty() {
+        return Err("`old` and `new` are required, or `edits`.".into());
+    }
+    Ok(edits)
 }
 
 struct RunCommand;
@@ -1212,6 +1244,49 @@ World"
         };
         let out = ReadFile.run(&json!({"path": "long.txt"}), &ctx).unwrap();
         assert_eq!(out.len(), READ_BYTES as usize - 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn edit_file_makes_every_edit_or_none_and_keeps_the_file_as_it_was_written() {
+        let dir = std::env::temp_dir().join(format!("letronna-edit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.rs");
+        std::fs::write(&file, "\u{FEFF}fn a() {\r\n    one();\r\n}\r\n").unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let edit = |args: Value| EditFile.run(&args, &ctx);
+        let both = json!({"path": "a.rs", "edits": [
+            {"old": "one();\n}", "new": "two();\n}"},
+            {"old": "fn a()", "new": "fn b()"}
+        ]});
+        let preview = EditFile.preview(&both, &ctx);
+        assert!(
+            preview.contains("- fn a()") && preview.contains("+ two();"),
+            "{preview}"
+        );
+        assert_eq!(edit(both).unwrap(), "Edited 2 places.");
+        let written = "\u{FEFF}fn b() {\r\n    two();\r\n}\r\n";
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), written);
+
+        let again = json!({"path": "a.rs", "old": "one();", "new": "two();"});
+        assert_eq!(edit(again).unwrap(), "Already applied; nothing changed.");
+        let half = json!({"path": "a.rs", "edits": [
+            {"old": "fn b", "new": "fn c"},
+            {"old": "missing", "new": "x"}
+        ]});
+        assert!(edit(half).is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), written);
+
+        let every = json!({"path": "a.rs", "old": "()", "new": "(x)", "replace_all": true});
+        assert_eq!(edit(every).unwrap(), "Edited 2 places.");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "\u{FEFF}fn b(x) {\r\n    two(x);\r\n}\r\n"
+        );
+        assert!(edit(json!({"path": "a.rs"})).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

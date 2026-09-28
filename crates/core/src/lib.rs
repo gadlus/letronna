@@ -12,6 +12,7 @@ pub mod browser;
 mod cdp;
 pub mod chat;
 pub mod compact;
+mod edit;
 pub mod gateway;
 pub mod jobs;
 pub mod mcp;
