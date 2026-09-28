@@ -532,6 +532,11 @@ fn skills(runner: &mut Runner, rest: &str, workspace: Option<&std::path::Path>) 
         add_skills(runner, target);
         return;
     }
+    // An old skills.json that will not move across is said, and the skills
+    // already in folders are listed all the same.
+    if let Err(why) = letronna_core::skills::migrate() {
+        render::line(&render::red(&why));
+    }
     let saved = match letronna_core::skills::list(workspace) {
         Ok(saved) => saved,
         Err(why) => {

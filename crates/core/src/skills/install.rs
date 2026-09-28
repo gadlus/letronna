@@ -12,7 +12,7 @@
 //! rather than overwritten. Nothing that arrives is run.
 
 use super::{
-    FILE_BYTES, SKILL_FILE, SKILLS_DIR, Source, archive, field, find, free_folder, migrate,
+    FILE_BYTES, SKILL_FILE, SKILLS_DIR, Source, archive, field, find, free_folder, migrate_in,
     read_root, read_skill, same, slug, split,
 };
 use crate::chat as backend;
@@ -65,8 +65,8 @@ pub fn install(source: &str) -> Result<Vec<String>, String> {
 
 pub(super) fn install_in(data: &Path, source: &str) -> Result<Vec<String>, String> {
     // So a first install does not stop the built-in skills or an old
-    // skills.json from ever arriving.
-    migrate(data)?;
+    // skills.json from ever arriving; a failure is `migrate`'s to report.
+    let _ = migrate_in(data);
     let staging = staging_folder(data);
     let placed = fetch(data, source, &staging).and_then(|folders| place(data, &folders));
     // Whatever is left is a copy of what came in, so a failure to tidy it
