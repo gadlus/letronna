@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io::{BufRead, BufReader},
     path::PathBuf,
     sync::{Mutex, OnceLock},
@@ -466,19 +466,65 @@ struct Chunk {
     prompt_tokens: Option<u64>,
     cached_tokens: Option<u64>,
     /// Fragments of `(index, id, name, arguments)`; the stream assembles them.
-    tool_calls: Vec<(usize, String, String, String)>,
+    tool_calls: Vec<(Option<usize>, String, String, String)>,
 }
 
-/// Merge streamed fragments into whole calls, ordered by index.
-fn merge_tool_calls(calls: &mut Vec<ToolCall>, chunk: &Chunk) {
-    for (index, id, name, arguments) in &chunk.tool_calls {
-        while calls.len() <= *index {
-            calls.push(ToolCall::default());
+/// Streamed fragments put together into whole calls, in the order they began.
+///
+/// Gateways disagree on the shape. OpenAI sends the id and name once and then
+/// the arguments in pieces. Some resend the id and the whole name with every
+/// piece, so adding them up made `read_fileread_file`. Ollama sends several
+/// calls whole, all at index zero, told apart only by their ids, and some
+/// gateways send no index at all. So only the arguments are added up: an id
+/// or a name replaces what was there, and an id or a name unlike the call's
+/// own starts a new call.
+#[derive(Default)]
+struct Assembler {
+    calls: Vec<ToolCall>,
+    /// The call each index the gateway used is feeding now.
+    slots: HashMap<usize, usize>,
+    /// The call the last fragment fed, which one with no index carries on.
+    active: Option<usize>,
+}
+
+impl Assembler {
+    /// Add each fragment of a chunk to the call it belongs to.
+    fn add(&mut self, chunk: &Chunk) {
+        for (position, (index, id, name, arguments)) in chunk.tool_calls.iter().enumerate() {
+            let open = match index {
+                Some(index) => self.slots.get(index).copied(),
+                // One array never holds two pieces of the same call, so only
+                // the first can carry on the call before it.
+                None if position == 0 => self.active,
+                None => None,
+            };
+            // No gateway renames a call partway, so another name is another
+            // call even when no id says so.
+            let open = open.filter(|&slot| {
+                let own = &self.calls[slot].name;
+                name.is_empty() || own.is_empty() || own == name
+            });
+            let slot = match open {
+                Some(slot) if id.is_empty() || self.calls[slot].id.is_empty() => slot,
+                Some(slot) if self.calls[slot].id == *id => slot,
+                _ => {
+                    self.calls.push(ToolCall::default());
+                    self.calls.len() - 1
+                }
+            };
+            if let Some(index) = index {
+                self.slots.insert(*index, slot);
+            }
+            self.active = Some(slot);
+            let call = &mut self.calls[slot];
+            if !id.is_empty() {
+                call.id.clone_from(id);
+            }
+            if !name.is_empty() {
+                call.name.clone_from(name);
+            }
+            call.arguments.push_str(arguments);
         }
-        let call = &mut calls[*index];
-        call.id.push_str(id);
-        call.name.push_str(name);
-        call.arguments.push_str(arguments);
     }
 }
 
@@ -545,12 +591,16 @@ fn parse_event(data: &str) -> Result<Chunk, String> {
         .map(|calls| {
             calls
                 .iter()
-                .enumerate()
-                .map(|(i, c)| {
+                .map(|c| {
                     let text = |v: &Value| v.as_str().unwrap_or_default().to_owned();
+                    // Some gateways number their calls rather than name them.
+                    let id = match &c["id"] {
+                        Value::Number(n) => n.to_string(),
+                        v => text(v),
+                    };
                     (
-                        c["index"].as_u64().map(|n| n as usize).unwrap_or(i),
-                        text(&c["id"]),
+                        c["index"].as_u64().map(|n| n as usize),
+                        id,
                         text(&c["function"]["name"]),
                         text(&c["function"]["arguments"]),
                     )
@@ -729,7 +779,7 @@ fn stream(
     let mut completion_tokens = 0u64;
     let mut prompt_tokens = 0u64;
     let mut cached_tokens = 0u64;
-    let mut calls: Vec<ToolCall> = Vec::new();
+    let mut assembler = Assembler::default();
     let began = std::time::Instant::now();
     for line in BufReader::new(response).lines() {
         let line =
@@ -751,7 +801,7 @@ fn stream(
         if let Some(n) = chunk.cached_tokens {
             cached_tokens = n;
         }
-        merge_tool_calls(&mut calls, &chunk);
+        assembler.add(&chunk);
         if let Some(text) = chunk.reasoning {
             sender
                 .send_blocking(Event::Reasoning(text))
@@ -778,6 +828,7 @@ fn stream(
             "The provider closed the stream early or does not support SSE chat completions.".into(),
         );
     }
+    let mut calls = assembler.calls;
     calls.retain(|c| !c.name.is_empty());
     name_unnamed(&mut calls);
     name_as_offered(&mut calls);
@@ -1066,16 +1117,169 @@ mod tests {
         assert_eq!(wired["tool_calls"][0]["function"]["arguments"], "{}");
     }
 
+    /// The calls a stream of `data:` payloads comes to.
+    fn assemble(events: &[&str]) -> Vec<ToolCall> {
+        let mut assembler = Assembler::default();
+        for data in events {
+            assembler.add(&parse_event(data).unwrap());
+        }
+        assembler.calls
+    }
+
+    fn call(id: &str, name: &str, arguments: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: arguments.into(),
+        }
+    }
+
+    #[test]
+    fn parallel_calls_each_at_their_own_index_come_out_in_order() {
+        // OpenAI names a call in a piece of its own; llama.cpp starts the
+        // arguments in the same piece.
+        let openai = [
+            r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"read_file","arguments":""}}]},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":"}}]},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a.rs\"}"}}]},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"list_dir","arguments":""}}]},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"path\":\".\"}"}}]},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ];
+        assert_eq!(
+            assemble(&openai),
+            [
+                call("call_a", "read_file", r#"{"path":"a.rs"}"#),
+                call("call_b", "list_dir", r#"{"path":"."}"#),
+            ]
+        );
+        let llama_cpp = [
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"Yq1u6lXIrXqZ5wD8","type":"function","function":{"name":"read_file","arguments":"{\"path\":"}}]},"finish_reason":null}],"object":"chat.completion.chunk"}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a.rs\"}"}}]},"finish_reason":null}],"object":"chat.completion.chunk"}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"Pm2kD9vQe7LwZx4N","type":"function","function":{"name":"list_dir","arguments":"{\"path\":\".\"}"}}]},"finish_reason":null}],"object":"chat.completion.chunk"}"#,
+        ];
+        assert_eq!(
+            assemble(&llama_cpp),
+            [
+                call("Yq1u6lXIrXqZ5wD8", "read_file", r#"{"path":"a.rs"}"#),
+                call("Pm2kD9vQe7LwZx4N", "list_dir", r#"{"path":"."}"#),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_name_and_id_sent_again_with_every_piece_are_not_doubled() {
+        // MiniMax through NVIDIA NIM repeats both, which once made
+        // `read_fileread_file` and failed as an unknown tool.
+        let calls = assemble(&[
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"chatcmpl-tool-5c","type":"function","function":{"name":"read_file","arguments":"{\"path\":"}}]}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"chatcmpl-tool-5c","type":"function","function":{"name":"read_file","arguments":"\"a.rs\"}"}}]}}]}"#,
+        ]);
+        assert_eq!(
+            calls,
+            [call("chatcmpl-tool-5c", "read_file", r#"{"path":"a.rs"}"#)]
+        );
+    }
+
+    #[test]
+    fn a_second_call_at_index_zero_with_a_new_id_is_its_own_call() {
+        // Ollama sends each call whole at index zero, and Gemini relayed by a
+        // gateway (the envelope here is OpenRouter's) can do the same. Two
+        // reads of one tool used to glue into `{..}{..}`.
+        let ollama = [
+            r#"{"id":"chatcmpl-812","object":"chat.completion.chunk","model":"qwen3:8b","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"role":"assistant","content":"","tool_calls":[{"id":"call_4bq0x2mf","index":0,"type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"chatcmpl-812","object":"chat.completion.chunk","model":"qwen3:8b","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"role":"assistant","content":"","tool_calls":[{"id":"call_9zt1c7ka","index":0,"type":"function","function":{"name":"read_file","arguments":"{\"path\":\"b.rs\"}"}}]},"finish_reason":null}]}"#,
+        ];
+        assert_eq!(
+            assemble(&ollama),
+            [
+                call("call_4bq0x2mf", "read_file", r#"{"path":"a.rs"}"#),
+                call("call_9zt1c7ka", "read_file", r#"{"path":"b.rs"}"#),
+            ]
+        );
+        let gemini = [
+            r#"{"id":"gen-1","provider":"Google","model":"google/gemini-2.5-flash","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning_details":[{"type":"reasoning.encrypted","data":"CiQB0e2Kb3Jk","id":"tool_0_read_file_Qm9v","format":"google-gemini-v1","index":0}],"tool_calls":[{"index":0,"id":"tool_0_read_file_Qm9v","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}}]},"finish_reason":null}]}"#,
+            r#"{"id":"gen-1","provider":"Google","model":"google/gemini-2.5-flash","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"","tool_calls":[{"index":0,"id":"tool_1_read_file_YmFy","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"b.rs\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+        ];
+        assert_eq!(
+            assemble(&gemini),
+            [
+                call("tool_0_read_file_Qm9v", "read_file", r#"{"path":"a.rs"}"#),
+                call("tool_1_read_file_YmFy", "read_file", r#"{"path":"b.rs"}"#),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_second_call_with_another_name_at_the_same_index_is_its_own_call() {
+        // Calls sent one to a chunk with no id, at a shared index or at none,
+        // must not let the second tool run with the first call's arguments.
+        let expected = [
+            call("", "read_file", r#"{"path":"a.rs"}"#),
+            call("", "list_dir", r#"{"path":"."}"#),
+        ];
+        let shared_index = assemble(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"type":"function","function":{"name":"list_dir","arguments":""}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":\".\"}"}}]}}]}"#,
+        ]);
+        assert_eq!(shared_index, expected);
+        let no_index = assemble(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"type":"function","function":{"name":"list_dir","arguments":""}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"{\"path\":\".\"}"}}]}}]}"#,
+        ]);
+        assert_eq!(no_index, expected);
+    }
+
+    #[test]
+    fn whole_calls_in_one_array_without_an_index_stay_apart() {
+        // Google's own OpenAI-compatible endpoint sends every call at once on
+        // the finishing chunk, with no index and at times no id.
+        let calls = assemble(&[
+            r#"{"choices":[{"delta":{"role":"assistant","tool_calls":[{"type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}},{"type":"function","function":{"name":"read_file","arguments":"{\"path\":\"b.rs\"}"}}]},"finish_reason":"tool_calls","index":0}]}"#,
+        ]);
+        assert_eq!(
+            calls,
+            [
+                call("", "read_file", r#"{"path":"a.rs"}"#),
+                call("", "read_file", r#"{"path":"b.rs"}"#),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_piece_without_an_index_carries_on_the_call_before_it() {
+        let calls = assemble(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"id":"call_a","type":"function","function":{"name":"read_file","arguments":"{\"path\":"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"\"a.rs\"}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"id":"call_b","type":"function","function":{"name":"list_dir","arguments":"{}"}}]}}]}"#,
+        ]);
+        assert_eq!(
+            calls,
+            [
+                call("call_a", "read_file", r#"{"path":"a.rs"}"#),
+                call("call_b", "list_dir", "{}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_numeric_id_survives() {
+        let calls = assemble(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":7,"type":"function","function":{"name":"read_file","arguments":"{\"path\":"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":7,"function":{"arguments":"\"a.rs\"}"}}]}}]}"#,
+        ]);
+        assert_eq!(calls, [call("7", "read_file", r#"{"path":"a.rs"}"#)]);
+    }
+
     #[test]
     fn assembles_streamed_tool_calls() {
-        let mut calls = Vec::new();
-        for data in [
+        let calls = assemble(&[
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"read_file","arguments":""}}]}}]}"#,
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":"}}]}}]}"#,
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a.rs\"}"}}]}}]}"#,
-        ] {
-            merge_tool_calls(&mut calls, &parse_event(data).unwrap());
-        }
+        ]);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id, "c1");
         assert_eq!(calls[0].name, "read_file");
