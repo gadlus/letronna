@@ -168,7 +168,7 @@ impl Chat {
         let enabled = config.telegram.enabled;
         let allow_tools = config.telegram.allow_tools;
 
-        let mut pills = h_flex().gap_1p5().items_center();
+        let mut pills = h_flex().flex_wrap().gap_1p5().items_center();
         pills = pills.child(pill(
             if enabled && has_token {
                 "Enabled"
@@ -274,6 +274,7 @@ impl Chat {
                                     .gap_1p5()
                                     .child(
                                         h_flex()
+                                            .flex_wrap()
                                             .gap_2p5()
                                             .items_center()
                                             .child(badge(&CHANNELS[0]))
@@ -354,15 +355,17 @@ impl Chat {
                                             .items_center()
                                             .justify_between()
                                             .gap_4()
-                                            .child(field(
+                                            // The hint takes what the switch leaves, or
+                                            // it shrinks to a letter per line.
+                                            .child(div().flex_1().min_w_0().child(field(
                                                 "Let messages use tools",
                                                 "Off, a message can read and search but not write \
                                                  or run anything, because nobody on the other end \
                                                  can answer an approval card.",
                                                 cx,
-                                            ))
+                                            )))
                                             .child(
-                                                div().cursor_pointer().child(
+                                                div().flex_shrink_0().cursor_pointer().child(
                                                     gpui_component::switch::Switch::new(
                                                         "allow-remote-tools",
                                                     )
@@ -383,18 +386,21 @@ impl Chat {
             .child(
                 h_flex()
                     .w_full()
+                    .flex_wrap()
                     .items_center()
                     .justify_between()
+                    .gap_2()
                     .px_6()
                     .py_3()
                     .border_t_1()
                     .border_color(cx.theme().border)
                     .child(
                         h_flex()
+                            .min_w_0()
                             .gap_2p5()
                             .items_center()
                             .child(
-                                div().cursor_pointer().child(
+                                div().flex_shrink_0().cursor_pointer().child(
                                     gpui_component::switch::Switch::new("messaging-enabled")
                                         .checked(enabled)
                                         .disabled(!has_token)
@@ -406,6 +412,7 @@ impl Chat {
                             )
                             .child(
                                 div()
+                                    .min_w_0()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
                                     .child(if has_token {
@@ -615,6 +622,7 @@ impl Chat {
         let allow_tools = config.allow_tools;
 
         let pills = h_flex()
+            .flex_wrap()
             .gap_1p5()
             .items_center()
             .child(pill(
@@ -656,6 +664,7 @@ impl Chat {
                                     .gap_1p5()
                                     .child(
                                         h_flex()
+                                            .flex_wrap()
                                             .gap_2p5()
                                             .items_center()
                                             .child(badge(channel))
@@ -753,15 +762,17 @@ impl Chat {
                                             .items_center()
                                             .justify_between()
                                             .gap_4()
-                                            .child(field(
+                                            // The hint takes what the switch leaves, or
+                                            // it shrinks to a letter per line.
+                                            .child(div().flex_1().min_w_0().child(field(
                                                 "Let messages use tools",
                                                 "Off, a message can read and search but not write \
                                                  or run anything, because nobody on the other end \
                                                  can answer an approval card.",
                                                 cx,
-                                            ))
+                                            )))
                                             .child(
-                                                div().cursor_pointer().child(
+                                                div().flex_shrink_0().cursor_pointer().child(
                                                     gpui_component::switch::Switch::new(
                                                         "discord-allow-tools",
                                                     )
@@ -802,18 +813,21 @@ impl Chat {
             .child(
                 h_flex()
                     .w_full()
+                    .flex_wrap()
                     .items_center()
                     .justify_between()
+                    .gap_2()
                     .px_6()
                     .py_3()
                     .border_t_1()
                     .border_color(cx.theme().border)
                     .child(
                         h_flex()
+                            .min_w_0()
                             .gap_2p5()
                             .items_center()
                             .child(
-                                div().cursor_pointer().child(
+                                div().flex_shrink_0().cursor_pointer().child(
                                     gpui_component::switch::Switch::new("discord-enabled")
                                         .checked(enabled)
                                         .disabled(!has_hook && !has_bot)
@@ -825,6 +839,7 @@ impl Chat {
                             )
                             .child(
                                 div()
+                                    .min_w_0()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
                                     .child(if has_bot {
