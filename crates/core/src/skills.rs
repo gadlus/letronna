@@ -543,16 +543,34 @@ fn slug(name: &str) -> String {
     }
     let out: String = out.chars().take(64).collect();
     let out = out.trim_end_matches('-');
-    // Windows will not make a folder with a device's name.
-    let device = matches!(out, "con" | "prn" | "aux" | "nul")
-        || (out.len() == 4
-            && (out.starts_with("com") || out.starts_with("lpt"))
-            && out.ends_with(|c: char| c.is_ascii_digit()));
     match out {
         "" => "skill".to_owned(),
-        out if device => format!("{out}-skill"),
+        // Windows will not make a folder with a device's name.
+        out if device(out) => format!("{out}-skill"),
         out => out.to_owned(),
     }
+}
+
+/// Whether Windows takes `name` for a device, which it does whatever
+/// extension follows: CON, PRN, AUX, NUL, CONIN$, CONOUT$, and COM or LPT
+/// with a digit, superscripts included.
+fn device(name: &str) -> bool {
+    let base = name.split('.').next().unwrap_or_default().trim_end();
+    let base = base.to_lowercase();
+    let numbered = |prefix: &str| {
+        base.strip_prefix(prefix).is_some_and(|rest| {
+            let mut chars = rest.chars();
+            matches!(
+                (chars.next(), chars.next()),
+                (Some('0'..='9' | '¹' | '²' | '³'), None)
+            )
+        })
+    };
+    matches!(
+        base.as_str(),
+        "con" | "prn" | "aux" | "nul" | "conin$" | "conout$"
+    ) || numbered("com")
+        || numbered("lpt")
 }
 
 /// `root/slug`, or with a number after it when that is taken.
@@ -1295,6 +1313,10 @@ mod tests {
         assert_eq!(slug("  C++ / Rust!  "), "c-rust");
         assert_eq!(slug("CON"), "con-skill");
         assert_eq!(slug("com1"), "com1-skill");
+        assert_eq!(slug("COM\u{b9}"), "com\u{b9}-skill");
+        assert_eq!(slug("lpt0"), "lpt0-skill");
+        assert_eq!(slug("com10"), "com10");
+        assert!(super::device("Aux.md") && super::device("con .txt") && !super::device("console"));
         assert_eq!(slug("!!!"), "skill");
         assert_eq!(slug("Über"), "über");
         assert_eq!(slug(&"a".repeat(100)).len(), 64);
