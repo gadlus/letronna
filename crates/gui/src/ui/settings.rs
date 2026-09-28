@@ -1028,24 +1028,24 @@ fn model_page(model: &Entity<InputState>, chat: &Entity<Chat>, cx: &App) -> Div 
 /// How hard the model thinks, whether that thinking is shown, and whether it
 /// may look things up.
 ///
-/// A model that cannot be told how hard to think ignores the setting, so
-/// there is nothing here that has to be matched against a capability list --
-/// and no list to match against, since the gateway does not publish one.
+/// The effort levels are the ones the model in use offers, from its gateway's
+/// model list, or low, medium and high when the list does not say. The one
+/// marked is what the next request sends, which for a level picked on another
+/// model is the nearest this one offers.
 fn thinking_page(chat: &Entity<Chat>, settings: &Settings, cx: &App) -> Div {
-    const LEVELS: [(&str, &str); 4] = [
-        ("", "Whatever the model likes"),
-        ("low", "Low — quick answers"),
-        ("medium", "Medium"),
-        ("high", "High — slower, and it shows"),
-    ];
+    let endpoint = base_url(&settings.gateway, &settings.custom_endpoint);
+    let offered = letronna_core::models::efforts(&endpoint, &settings.model);
+    let sent = letronna_core::models::clamp(&offered, &settings.effort).map(|level| &*level.id);
+    let auto = ("", "Whatever the model likes");
+    let choices = offered.iter().map(|level| (&*level.id, &*level.label));
 
     let mut levels = v_flex().gap_2();
-    for (value, text) in LEVELS {
-        let active = settings.effort == value;
-        let chat = chat.clone();
+    for (at, (value, text)) in std::iter::once(auto).chain(choices).enumerate() {
+        let active = sent.unwrap_or_default() == value;
+        let (chat, value) = (chat.clone(), value.to_owned());
         levels = levels.child(
             h_flex()
-                .id(if value.is_empty() { "auto" } else { value })
+                .id(("effort", at))
                 .cursor_pointer()
                 .items_center()
                 .gap_2p5()
@@ -1057,10 +1057,10 @@ fn thinking_page(chat: &Entity<Chat>, settings: &Settings, cx: &App) -> Div {
                 } else {
                     cx.theme().border
                 })
-                .child(div().text_sm().child(text))
+                .child(div().text_sm().child(text.to_owned()))
                 .on_click(move |_, _, cx| {
                     chat.update(cx, |this, cx| {
-                        this.store.settings.effort = value.to_string();
+                        this.store.settings.effort = value.clone();
                         this.save();
                         cx.notify();
                     })

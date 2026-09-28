@@ -321,11 +321,13 @@ fn body(connection: &Connection, messages: &[Message], summary: Option<&str>) ->
         }
         body["tools"] = Value::Array(tools);
     }
-    // Models that cannot be told how hard to think ignore this, which is why
-    // it is safe to send to all of them. Measured on one that can: sixty-four
-    // reasoning tokens at low against seven hundred at high.
-    if !connection.effort.is_empty() {
-        body["reasoning_effort"] = connection.effort.clone().into();
+    // Measured on a model that can be told how hard to think: sixty-four
+    // reasoning tokens at low against seven hundred at high. A level saved on
+    // another model goes to the nearest this one offers, since a gateway may
+    // turn down one it does not know, and a model offering none is sent none.
+    let levels = crate::models::efforts(&connection.endpoint, &connection.model);
+    if let Some(level) = crate::models::clamp(&levels, &connection.effort) {
+        body["reasoning_effort"] = level.id.clone().into();
     }
     body
 }
@@ -656,8 +658,12 @@ fn stream(
     // The facts about a model come from its gateway's list, which the window
     // reads when it opens and the terminal only for /model and /gateways, so
     // the first request to a host whose list is not known asks for it. This
-    // request does not wait for it.
-    crate::models::ask_for_list(&endpoint, &connection.key);
+    // request does not wait for it, unless it sets an effort, which is sent
+    // as a level the list says the model has.
+    let asked = crate::models::ask_for_list(&endpoint, &connection.key);
+    if let Some(asked) = asked.filter(|_| !connection.effort.is_empty()) {
+        crate::models::wait_for_list(asked);
+    }
     // What the window no longer holds goes in as a summary rather than not at
     // all. It is made here, on the worker, so the wait is part of the reply's.
     let dropped = &messages[..window_start(messages)];
@@ -993,6 +999,36 @@ mod tests {
         let without = body(&connection(), &messages, None);
         let plain = without["messages"][0]["content"].as_str().unwrap();
         assert!(!plain.contains("summarized"));
+    }
+    #[test]
+    fn a_model_listing_no_levels_gets_no_effort_parameter() {
+        let endpoint = "https://effortless.test/v1";
+        let list = json!([
+            {"id": "plain-model", "reasoning_efforts": []},
+            // As the hosted gateway lists a model that cannot reason.
+            {"id": "hy-mt2-7b", "capabilities": {"tool_calling": false, "reasoning": false}},
+            {"id": "thinking-model", "reasoning_efforts": [
+                {"effort": "low", "label": "Light"}, {"effort": "xhigh", "label": "Extra high"}
+            ]}
+        ]);
+        crate::models::remember(endpoint, list.as_array().unwrap());
+        let messages = [Message {
+            role: "user".into(),
+            content: "Hi".into(),
+            ..Default::default()
+        }];
+        let sent = |model: &str| {
+            let c = Connection {
+                endpoint: endpoint.into(),
+                model: model.into(),
+                effort: "max".into(),
+                ..connection()
+            };
+            body(&c, &messages, None).get("reasoning_effort").cloned()
+        };
+        assert_eq!(sent("plain-model"), None);
+        assert_eq!(sent("hy-mt2-7b"), None);
+        assert_eq!(sent("thinking-model"), Some("xhigh".into()));
     }
     #[test]
     fn the_two_ways_a_route_says_it_cannot_do_tools_read_the_same() {

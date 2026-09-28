@@ -105,7 +105,8 @@ pub struct Settings {
     /// Run write and command tools without asking.
     #[serde(default)]
     pub skip_approvals: bool,
-    /// How hard the model should think: empty, or low, medium or high.
+    /// How hard the model should think: empty, or a level such as low or max;
+    /// a model without that level is sent the nearest one it has.
     #[serde(default)]
     pub effort: String,
     /// Show the model's thinking as it arrives, rather than only its answer.

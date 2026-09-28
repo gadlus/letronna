@@ -31,15 +31,20 @@ pub struct Runner {
 }
 
 impl Runner {
-    fn connection(&self, session: usize) -> Connection {
-        let workspace = self.store.conversations[session].workspace.clone();
+    /// Where requests go and the key or sign-in token they carry.
+    pub fn route(&self) -> (String, String) {
         let settings = &self.store.settings;
         let saved = letronna_core::store::load_keys()
             .get(letronna_core::gateway::key_slot(&settings.gateway))
             .cloned()
             .unwrap_or_default();
-        let (endpoint, key) =
-            letronna_core::gateway::resolve(&settings.gateway, &settings.custom_endpoint, &saved);
+        letronna_core::gateway::resolve(&settings.gateway, &settings.custom_endpoint, &saved)
+    }
+
+    fn connection(&self, session: usize) -> Connection {
+        let workspace = self.store.conversations[session].workspace.clone();
+        let settings = &self.store.settings;
+        let (endpoint, key) = self.route();
         Connection {
             endpoint,
             model: settings.model.clone(),

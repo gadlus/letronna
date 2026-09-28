@@ -52,11 +52,20 @@ pub const GATEWAYS: &[Gateway] = &[
 pub fn resolve(name: &str, custom: &str, key: &str) -> (String, String) {
     if name == LETRONNA {
         let token = crate::auth::account().map(|a| a.token).unwrap_or_default();
-        return (crate::auth::hosted_base(), token);
+        return (base_url(name, custom), token);
+    }
+    (base_url(name, custom), key.to_owned())
+}
+
+/// Where `resolve` sends a gateway's requests, without reading the account
+/// file for its token, so a page can ask on every frame.
+pub fn base_url(name: &str, custom: &str) -> String {
+    if name == LETRONNA {
+        return crate::auth::hosted_base();
     }
     let base = gateway(name).base;
     let base = if base.is_empty() { custom } else { base };
-    (base.to_owned(), key.to_owned())
+    base.to_owned()
 }
 
 /// Every gateway set up on this computer, as (name, base URL, key): Letronna
