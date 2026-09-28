@@ -18,7 +18,9 @@ use crossterm::event::{
     MouseEventKind,
 };
 use crossterm::terminal;
+use letronna_core::approvals::{self, Request};
 use std::collections::VecDeque;
+use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 use crate::edit::Line;
@@ -131,6 +133,12 @@ const MAX_ROWS: usize = 8;
 /// enough that typing feels immediate, long enough not to spin.
 const TICK: Duration = Duration::from_millis(20);
 
+/// How long a question that came up on its own has to have been up, and the
+/// typing under it to have stopped, before an enter or a digit answers it:
+/// longer than the gap between keys in a word, shorter than reading the
+/// question takes.
+const STILL: Duration = Duration::from_millis(500);
+
 fn matches(text: &str) -> Vec<&'static Command> {
     if !text.starts_with('/') || text.contains(char::is_whitespace) {
         return Vec::new();
@@ -218,6 +226,8 @@ pub enum Waited {
     Line(String),
     /// The doorbell rang for notices that came while the session sat idle.
     Rang,
+    /// A helper asked for a yes, which `asked` hands over.
+    Asked,
 }
 
 /// A setting with a natural order, picked by sliding along a track rather
@@ -270,6 +280,14 @@ pub struct Bar {
     ticked: std::time::Instant,
     /// The doorbell for notices, once the conversation listens for them.
     bell: Option<async_channel::Receiver<()>>,
+    /// Helpers' requests for a yes, once the terminal answers them.
+    asks: Option<Receiver<Request>>,
+    /// A request taken but not yet answered: one that ended a wait at the
+    /// prompt, or one put back to be asked later. `asked` hands it over first.
+    held: Option<Request>,
+    /// While a question that came up on its own is open, when it came up or
+    /// when a letter was last typed under it, whichever is later.
+    guard: Option<std::time::Instant>,
 }
 
 impl Bar {
@@ -297,6 +315,9 @@ impl Bar {
             waiting: None,
             ticked: std::time::Instant::now(),
             bell: None,
+            asks: None,
+            held: None,
+            guard: None,
         }
     }
 
@@ -341,8 +362,31 @@ impl Bar {
         }
     }
 
-    /// Wait at the prompt for a whole line, or for the doorbell. `None` when
-    /// the user is done.
+    /// Take helpers' requests for a yes from now on, to put to the user in the
+    /// box. False, taking nothing, when the box is not up.
+    pub fn serve(&mut self) -> bool {
+        if !self.live {
+            return false;
+        }
+        self.asks = Some(approvals::serve());
+        true
+    }
+
+    /// The next helper's request waiting for an answer, taken without waiting.
+    pub fn asked(&mut self) -> Option<Request> {
+        self.held
+            .take()
+            .or_else(|| self.asks.as_ref()?.try_recv().ok())
+    }
+
+    /// Put back a request that is better asked later, for `asked` to hand
+    /// over first.
+    pub fn hold(&mut self, request: Request) {
+        self.held = Some(request);
+    }
+
+    /// Wait at the prompt for a whole line, for the doorbell, or for a
+    /// helper's request. `None` when the user is done.
     pub fn wait(&mut self) -> Option<Waited> {
         loop {
             if self.done {
@@ -358,12 +402,20 @@ impl Bar {
         }
     }
 
-    /// A line already entered, or else a ring, taken without waiting for
-    /// either: what the user typed goes first, and the notices it rang for
-    /// go in ahead of it anyway.
+    /// A line already entered, a helper's request, or else a ring, taken
+    /// without waiting for any: what the user typed goes first, and the
+    /// notices it rang for go in ahead of it anyway.
     fn waited(&mut self) -> Option<Waited> {
         if let Some(line) = self.queued.pop_front() {
             return Some(Waited::Line(line));
+        }
+        // A receiver cannot be looked into without taking what it holds, so
+        // the request is kept here until `asked` hands it over.
+        if self.held.is_none() {
+            self.held = self.asks.as_ref().and_then(|asks| asks.try_recv().ok());
+        }
+        if self.held.is_some() {
+            return Some(Waited::Asked);
         }
         let bell = self.bell.as_ref()?;
         bell.try_recv().ok().map(|()| Waited::Rang)
@@ -427,6 +479,21 @@ impl Bar {
             }
             self.pump();
         }
+    }
+
+    /// `choose`, for a question nobody at the keyboard asked for. It can come
+    /// up under someone typing, so an enter or a digit counts only after
+    /// `STILL`: the end of a line, or a digit in it, is not taken for a yes.
+    pub fn interject(
+        &mut self,
+        question: &str,
+        detail: Vec<String>,
+        options: &[&str],
+    ) -> Option<usize> {
+        self.guard = Some(std::time::Instant::now());
+        let picked = self.choose(question, detail, options);
+        self.guard = None;
+        picked
     }
 
     /// Ask for a line of text, with `hint` as the question at the top of the box.
@@ -875,6 +942,16 @@ impl Bar {
     /// one outright, and escape is the same as picking the last answer, which
     /// is always the one that does nothing.
     fn pick(&mut self, key: KeyEvent) {
+        // Letters are typing, not answering, and each one puts an answer off
+        // again; an answer that comes too soon is dropped rather than put off,
+        // so pressing it again a moment later takes.
+        if let Some(since) = self.guard.as_mut() {
+            match key.code {
+                KeyCode::Enter | KeyCode::Char('0'..='9') if since.elapsed() < STILL => return,
+                KeyCode::Char(_) | KeyCode::Backspace => *since = std::time::Instant::now(),
+                _ => {}
+            }
+        }
         let Some(choice) = self.choice.as_mut() else {
             return;
         };
@@ -884,7 +961,13 @@ impl Bar {
             KeyCode::Down => choice.picked = (choice.picked + 1) % choice.options.len(),
             KeyCode::Enter => self.answer = Some(choice.picked),
             KeyCode::Esc => self.answer = Some(last),
-            KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => self.done = true,
+            KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
+                // A helper's question can come up while a call runs, and
+                // leaving there stops the turn, as Ctrl-C does anywhere else
+                // in one.
+                self.interrupt = self.working;
+                self.done = true;
+            }
             KeyCode::Char(digit) if digit.is_ascii_digit() => {
                 if let Some(index) = digit.to_digit(10).and_then(|d| (d as usize).checked_sub(1))
                     && index < choice.options.len()
@@ -1189,8 +1272,11 @@ fn track(stops: &[String], at: usize, room: usize) -> (String, String, usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Bar, MENU_LIMIT, Slider, Waited, closest, matches, menu_top, stops_at, track};
+    use super::{
+        Bar, Choice, MENU_LIMIT, STILL, Slider, Waited, closest, matches, menu_top, stops_at, track,
+    };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::time::Instant;
 
     fn press(bar: &mut Bar, code: KeyCode) {
         bar.nudge(KeyEvent::new(code, KeyModifiers::NONE));
@@ -1356,5 +1442,31 @@ mod tests {
         bar.listen();
         assert!(bar.bell.is_none());
         assert!(!letronna_core::inbox::listened());
+    }
+
+    #[test]
+    fn an_enter_typed_as_a_helper_asks_is_not_taken_for_yes() {
+        let mut bar = Bar::new(String::new());
+        bar.choice = Some(Choice {
+            question: "Helper general wants to run a command".into(),
+            detail: Vec::new(),
+            options: vec!["Yes".into(), "No".into()],
+            picked: 0,
+        });
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        // Just after the question came up, neither answers.
+        bar.guard = Some(Instant::now());
+        bar.pick(key(KeyCode::Enter));
+        bar.pick(key(KeyCode::Char('1')));
+        assert_eq!(bar.answer, None);
+        // Nor just after a letter, however long it has been up.
+        bar.guard = Instant::now().checked_sub(STILL);
+        bar.pick(key(KeyCode::Char('k')));
+        bar.pick(key(KeyCode::Enter));
+        assert_eq!(bar.answer, None);
+        // Once it has been up a moment with nothing typed, enter takes it.
+        bar.guard = Instant::now().checked_sub(STILL);
+        bar.pick(key(KeyCode::Enter));
+        assert_eq!(bar.answer, Some(0));
     }
 }

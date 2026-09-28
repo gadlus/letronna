@@ -5,6 +5,7 @@
 //! frame, and asking the user by reading a line rather than drawing a card.
 
 use letronna_core::agent::{self, Next, Turn};
+use letronna_core::approvals::{self, Decision, Request};
 use letronna_core::chat::{self, Connection, Event, Message};
 use letronna_core::inbox;
 use letronna_core::store::{Conversation, Store};
@@ -187,6 +188,10 @@ impl Runner {
                 out.end();
                 return Ok(None);
             }
+            // Helpers working in the background ask while the model talks
+            // too. Only the rules answer here: a question left open would
+            // hold up the reply, which has a deadline of its own.
+            self.answer_helpers(false);
             let event = match receiver.try_recv() {
                 Ok(event) => event,
                 Err(async_channel::TryRecvError::Empty) => continue,
@@ -326,6 +331,9 @@ impl Runner {
                     call.name
                 ));
             }
+            // A helper started by this call asks for its yes while the call
+            // waits on it, so unanswered here the two would wait on each other.
+            self.answer_helpers(true);
             match receiver.try_recv() {
                 Ok(outcome) => break outcome,
                 Err(async_channel::TryRecvError::Empty) => continue,
@@ -437,6 +445,53 @@ impl Runner {
         }
     }
 
+    /// Start answering helpers' requests for a yes: in the box's loops when it
+    /// is up, and otherwise on a thread of its own, so that a helper is heard
+    /// however the main thread waits on the call it runs under. `terminal`
+    /// says whether there is someone to ask without the box.
+    pub fn serve_helpers(&mut self, terminal: bool) {
+        if self.bar.serve() {
+            return;
+        }
+        let yes = self.yes;
+        let requests = approvals::serve();
+        std::thread::spawn(move || {
+            // The session's grants are kept on the main thread, so here only
+            // `--yes` answers for the user.
+            let none = HashSet::new();
+            for request in requests {
+                let decision = match settled(&request.call.name, yes, &none, terminal) {
+                    Some(Decision::Deny) => {
+                        declined(&request);
+                        Decision::Deny
+                    }
+                    Some(decision) => decision,
+                    // A bar that was never installed asks on the line, as the
+                    // session's own cards are asked without the box.
+                    None => ask_about(&mut Bar::new(String::new()), &request),
+                };
+                request.answer(decision);
+            }
+        });
+    }
+
+    /// Answer every helper waiting on a yes that the session's own rules
+    /// settle, and ask the user about the rest -- or, when `ask` is false,
+    /// keep the first of those back for a later call to ask.
+    pub fn answer_helpers(&mut self, ask: bool) {
+        while let Some(request) = self.bar.asked() {
+            let decision = match settled(&request.call.name, self.yes, &self.allowed, true) {
+                Some(decision) => decision,
+                None if ask => ask_about(&mut self.bar, &request),
+                None => {
+                    self.bar.hold(request);
+                    return;
+                }
+            };
+            request.answer(decision);
+        }
+    }
+
     pub fn persist(&mut self) {
         if self.store.save().is_err() {
             render::line(&render::red("Could not write the session to disk."));
@@ -521,6 +576,58 @@ fn intent(name: &str, summary: &str) -> String {
     }
 }
 
+/// What the session's own rules say to a helper's call, or `None` when only
+/// the user can say: its grants and `--yes` allow, and with no terminal to
+/// ask on, anything else is declined.
+fn settled(name: &str, yes: bool, allowed: &HashSet<String>, terminal: bool) -> Option<Decision> {
+    if !agent::needs_user(name, yes, allowed, false) {
+        return Some(Decision::Once);
+    }
+    (!terminal).then_some(Decision::Deny)
+}
+
+/// Put a helper's request to the user: in the box when `bar` is up, on the
+/// line when not.
+fn ask_about(bar: &mut Bar, request: &Request) -> Decision {
+    let call = &request.call;
+    let summary = tools::summary(&call.name, &call.arguments);
+    let question = format!(
+        "Helper {} wants to {}",
+        request.label,
+        intent(&call.name, &summary)
+    );
+    let detail = request
+        .preview
+        .lines()
+        .take(DETAIL_LINES)
+        .map(str::to_owned)
+        .collect();
+    let picked = bar.interject(
+        &question,
+        detail,
+        &["Yes", "Yes, and stop asking it for this", "No"],
+    );
+    match picked {
+        Some(0) => Decision::Once,
+        Some(1) => Decision::ForRun,
+        _ => Decision::Deny,
+    }
+}
+
+/// Say under the tool that a helper's call was declined for want of anyone
+/// to ask, since nothing else would show why the helper came back without
+/// what it went for.
+fn declined(request: &Request) {
+    let call = &request.call;
+    let summary = tools::summary(&call.name, &call.arguments);
+    let why = format!(
+        "declined for helper {}: -p and pipes never ask (--yes allows it)",
+        request.label
+    );
+    render::blank();
+    render::tool(&call.name, &summary, &why, true);
+}
+
 fn usage(reply: &Message) -> String {
     let mut parts = vec![format!("{} out", reply.tokens)];
     if reply.per_second > 0. {
@@ -534,4 +641,27 @@ fn usage(reply: &Message) -> String {
         }
     }
     parts.join(" · ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::settled;
+    use letronna_core::approvals::Decision;
+    use std::collections::HashSet;
+
+    #[test]
+    fn yes_approves_and_a_pipe_declines() {
+        let none = HashSet::new();
+        let allowed = HashSet::from(["run_command".to_owned()]);
+        let (once, deny) = (Some(Decision::Once), Some(Decision::Deny));
+        // `--yes` answers for the user, whether or not there is a terminal.
+        assert_eq!(settled("run_command", true, &none, false), once);
+        assert_eq!(settled("run_command", true, &none, true), once);
+        // So does "stop asking for this", given for the session's own call.
+        assert_eq!(settled("run_command", false, &allowed, false), once);
+        // Anything else is the user's to answer, and with nobody to ask it is a no.
+        assert_eq!(settled("run_command", false, &none, true), None);
+        assert_eq!(settled("run_command", false, &none, false), deny);
+        assert_eq!(settled("write_file", false, &allowed, false), deny);
+    }
 }
