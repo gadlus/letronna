@@ -51,6 +51,7 @@ pub struct Turn {
     pub connection: Connection,
     pub live: Live,
     rounds: usize,
+    limit: usize,
     queue: VecDeque<ToolCall>,
     /// Tool results for the batch being worked through.
     results: Vec<Message>,
@@ -62,8 +63,17 @@ impl Turn {
             connection,
             live: Live::default(),
             rounds: 0,
+            limit: MAX_ROUNDS,
             queue: VecDeque::new(),
             results: Vec::new(),
+        }
+    }
+
+    /// A turn that may run `rounds` tool rounds instead of `MAX_ROUNDS`.
+    pub fn with_limit(connection: Connection, rounds: usize) -> Self {
+        Self {
+            limit: rounds,
+            ..Self::new(connection)
         }
     }
 
@@ -109,7 +119,7 @@ impl Turn {
     /// Queue the calls the model asked for. False when the turn should stop
     /// instead: nothing to run, or it has gone round too many times.
     pub fn begin(&mut self, calls: Vec<ToolCall>) -> bool {
-        if calls.is_empty() || self.rounds >= MAX_ROUNDS {
+        if calls.is_empty() || self.rounds >= self.limit {
             return false;
         }
         self.rounds += 1;
@@ -197,6 +207,19 @@ mod tests {
         })
     }
 
+    /// Counts the rounds a turn runs before it refuses another, giving up at
+    /// 1,000 so a turn that never stops fails the test instead of hanging it.
+    fn rounds_before_stopping(mut turn: Turn) -> usize {
+        for round in 0..1_000 {
+            if !turn.begin(vec![call("read_file")]) {
+                return round;
+            }
+            turn.finish_call(Ok("again".into()));
+            turn.take_results();
+        }
+        1_000
+    }
+
     #[test]
     fn streams_a_reply_then_clears_for_the_next_one() {
         let mut turn = turn();
@@ -268,6 +291,17 @@ mod tests {
         // An empty batch ends the turn rather than looping on nothing.
         let mut empty = Turn::new(turn.connection.clone());
         assert!(!empty.begin(Vec::new()));
+    }
+
+    #[test]
+    fn a_turn_with_a_higher_limit_goes_further() {
+        let turn = Turn::with_limit(turn().connection, 60);
+        assert_eq!(rounds_before_stopping(turn), 60);
+    }
+
+    #[test]
+    fn a_new_turn_still_stops_at_twenty_five() {
+        assert_eq!(rounds_before_stopping(turn()), 25);
     }
 
     #[test]
