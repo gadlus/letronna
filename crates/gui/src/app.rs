@@ -1345,7 +1345,7 @@ impl Chat {
         else {
             return self.return_follow_ups();
         };
-        let text = self.follow_ups.drain(..).collect::<Vec<_>>().join("\n\n");
+        let text = std::mem::take(&mut self.follow_ups).join("\n\n");
         let viewing = self.store.active;
         self.store.active = ix;
         let sent = self.dispatch(text.clone(), None, cx).is_ok();
@@ -1388,7 +1388,7 @@ impl Chat {
         if self.follow_ups.is_empty() {
             return;
         }
-        let text = self.follow_ups.drain(..).collect::<Vec<_>>().join("\n\n");
+        let text = std::mem::take(&mut self.follow_ups).join("\n\n");
         self.returned_follow_ups = Some(match self.returned_follow_ups.take() {
             Some(earlier) => format!("{earlier}\n\n{text}"),
             None => text,
