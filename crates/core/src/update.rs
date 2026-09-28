@@ -513,7 +513,7 @@ fn destinations() -> Vec<(Part, PathBuf)> {
 
 /// `Letronna.exe` becomes `Letronna.new.exe` and `letronna` becomes
 /// `letronna.new`: the extension stays last, so Windows still sees a program.
-fn beside(dest: &Path, tag: &str) -> PathBuf {
+pub(crate) fn beside(dest: &Path, tag: &str) -> PathBuf {
     let stem = dest
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
