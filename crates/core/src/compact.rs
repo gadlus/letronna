@@ -67,7 +67,7 @@ fn summary_in(
     // messages and ends on a user turn. Only what came after it is new.
     let earlier = (1..dropped.len())
         .rev()
-        .filter(|&at| dropped[at].role == "user")
+        .filter(|&at| crate::chat::opens_turn(&dropped[at]))
         .find_map(|at| known(keys[at]).flatten().map(|text| (at, text)));
     let (from, earlier) = match &earlier {
         Some((at, text)) => (*at, Some(text.as_str())),

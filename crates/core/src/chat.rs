@@ -44,6 +44,10 @@ pub struct Message {
     /// user's turn.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub notice: bool,
+    /// Set on a user message that went into a turn already running, such as a
+    /// follow-up typed while its tools ran, rather than starting a turn.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub folded: bool,
 }
 
 impl Message {
@@ -216,12 +220,14 @@ const COMPACT_STEP: usize = 16;
 ///
 /// The latest user turn always goes in whatever its size: dropping it (a single
 /// huge tool result can exceed the budget by itself) would leave the model with
-/// no prompt at all, and it answers by introducing itself.
+/// no prompt at all, and it answers by introducing itself. A message folded into
+/// a running turn is part of it, so a follow-up never pushes the turn's own
+/// request out into the summary.
 ///
 /// This is deliberately stateless: the same message list always yields the same
 /// start, so nothing needs saving and two requests over the same history agree.
 fn window_start(messages: &[Message]) -> usize {
-    let last_user = messages.iter().rposition(|m| m.role == "user").unwrap_or(0);
+    let last_user = messages.iter().rposition(opens_turn).unwrap_or(0);
     let mut start = 0;
     while start < last_user
         && (budget(&messages[start..]) > CONTEXT_CHARS || messages.len() - start > MAX_MESSAGES)
@@ -230,10 +236,17 @@ fn window_start(messages: &[Message]) -> usize {
         // never begins midway through a tool exchange.
         let next = (start + COMPACT_STEP).min(last_user);
         start = (next..=last_user)
-            .find(|i| messages[*i].role == "user")
+            .find(|i| opens_turn(&messages[*i]))
             .unwrap_or(last_user);
     }
     start
+}
+
+/// Whether a message starts a turn: the user's, and not folded into one running.
+pub(crate) fn opens_turn(message: &Message) -> bool {
+    // Roles alone cannot tell a follow-up folded in after tool results from a
+    // prompt sent after a step was stopped or failed, which follows them too.
+    message.role == "user" && !message.folded
 }
 
 /// The request with nothing extra, as a call without extras sends it.
@@ -1261,6 +1274,64 @@ mod tests {
             assert_eq!(messages[*start].role, "user", "start {start} is not a turn");
         }
         assert!(budget(&messages[*starts.last().unwrap()..]) <= CONTEXT_CHARS);
+    }
+
+    #[test]
+    fn a_follow_up_during_a_long_turn_never_drops_the_turns_first_request() {
+        let said = |role: &str, text: &str| Message {
+            role: role.into(),
+            content: text.into(),
+            ..Default::default()
+        };
+        let folded = |text: &str| Message {
+            folded: true,
+            ..said("user", text)
+        };
+        // A tool round big enough that a few of them outgrow the budget.
+        let round = |i: usize| {
+            [
+                Message {
+                    role: "assistant".into(),
+                    tool_calls: vec![ToolCall {
+                        id: format!("call {i}"),
+                        name: "read_file".into(),
+                        arguments: "{}".into(),
+                    }],
+                    ..Default::default()
+                },
+                Message {
+                    role: "tool".into(),
+                    tool_call_id: format!("call {i}"),
+                    content: "x".repeat(MAX_TOOL_CHARS),
+                    ..Default::default()
+                },
+            ]
+        };
+        let mut messages = vec![
+            said("user", "an earlier question"),
+            said("assistant", "an earlier answer"),
+            said("user", "the turn's first request"),
+        ];
+        messages.extend((0..8).flat_map(round));
+        // Typed while the tools ran, and folded in after their results.
+        messages.push(folded("a follow-up typed mid-turn"));
+        messages.push(folded("another folded in with it"));
+        messages.extend((8..10).flat_map(round));
+        // Sent while a reply was still coming in, which it cut short.
+        messages.push(said("assistant", "I will now rewrite the whole"));
+        messages.push(folded("leave the tests alone"));
+        messages.extend((10..12).flat_map(round));
+
+        assert_eq!(window_start(&messages), 2);
+        let payload = body(&connection(), &messages, None);
+        let context = payload["messages"].as_array().unwrap();
+        assert_eq!(context[1]["content"], "the turn's first request");
+
+        // Stopped, or failed, before the model answered its last results, the
+        // turn is still over: the next prompt starts one of its own, and the
+        // window moves on to it rather than to the follow-ups before it.
+        messages.push(said("user", "the next request"));
+        assert_eq!(window_start(&messages), messages.len() - 1);
     }
 
     #[test]
