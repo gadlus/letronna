@@ -6,6 +6,7 @@
 
 use letronna_core::agent::{self, Next, Turn};
 use letronna_core::chat::{self, Connection, Event, Message};
+use letronna_core::inbox;
 use letronna_core::store::{Conversation, Store};
 use letronna_core::tools;
 use std::collections::HashSet;
@@ -28,6 +29,9 @@ pub struct Runner {
     /// The box at the foot of the window, pumped while a reply streams so
     /// that typing carries on through an answer.
     pub bar: Bar,
+    /// Whether the user stopped the last turn, which keeps a ring from
+    /// starting another before they say something.
+    pub stopped: bool,
 }
 
 impl Runner {
@@ -66,15 +70,41 @@ impl Runner {
                 conversation.title = prompt.chars().take(40).collect();
             }
             conversation.updated = chat::now();
-            conversation.messages.push(Message {
-                role: "user".into(),
-                content: prompt.to_owned(),
-                ..Default::default()
-            });
         }
+        // What came meanwhile goes in ahead of the prompt, so the user's
+        // words are the last thing the model reads.
+        self.take_notices(session, true);
+        self.store.conversations[session].messages.push(Message {
+            role: "user".into(),
+            content: prompt.to_owned(),
+            ..Default::default()
+        });
         self.persist();
 
+        self.run(connection, session)
+    }
+
+    /// Run a turn on the notices waiting for an idle session, with nothing
+    /// typed. Returns the final answer, or an error worth showing; nothing
+    /// runs when no notices are waiting.
+    pub fn resume(&mut self, session: usize) -> Result<String, String> {
+        // Looked for before the connection is checked: a ring can outlive
+        // the notices it rang for, taken in the middle of a turn, and a
+        // session opened with none waiting has no reason to hear about its
+        // connection.
+        if !inbox::pending().contains(&self.store.conversations[session].id) {
+            return Ok(String::new());
+        }
+        let connection = self.connection(session);
+        chat::validate(&connection)?;
+        self.take_notices(session, true);
+        self.run(connection, session)
+    }
+
+    /// Run the agent to completion on the conversation as it stands.
+    fn run(&mut self, connection: Connection, session: usize) -> Result<String, String> {
         let mut turn = Turn::new(connection);
+        self.stopped = false;
         self.bar.working(true);
         // The tab says so too, for whoever has switched away to something
         // else while this runs.
@@ -94,6 +124,7 @@ impl Runner {
                     render::blank();
                     render::said(&render::dim("●"), &render::dim("Stopped."));
                 }
+                self.stopped = true;
                 return Ok(String::new());
             };
             let answer = reply.content.clone();
@@ -106,8 +137,13 @@ impl Runner {
                 return Ok(answer);
             }
             if !self.work_through(turn, session)? {
+                self.stopped = true;
                 return Ok(answer);
             }
+            // Notices go in after the results, which have to follow the
+            // calls they answer, and before what was typed, so the user's
+            // words are still read last.
+            self.take_notices(session, false);
             // What was typed while it worked goes in after the results, so
             // the model reads it before carrying on rather than once the turn
             // is over. It is on the screen already, echoed when entered.
@@ -326,7 +362,7 @@ impl Runner {
             let reply = if options.is_empty() {
                 render::blank();
                 render::said(&render::blue("●"), &bold_question(&question));
-                self.bar.wait().ok_or("No answer given.")?
+                self.bar.reply().ok_or("No answer given.")?
             } else {
                 let choices: Vec<&str> = options.iter().map(String::as_str).collect();
                 let picked = self
@@ -405,6 +441,19 @@ impl Runner {
         if self.store.save().is_err() {
             render::line(&render::red("Could not write the session to disk."));
         }
+    }
+
+    /// Put a session's waiting notices into its conversation as one message
+    /// and on the screen: mid-turn only those that cannot wait, and all of
+    /// them when it is idle.
+    fn take_notices(&mut self, session: usize, idle: bool) {
+        let id = self.store.conversations[session].id;
+        let Some(notices) = inbox::fold(&inbox::take(id, idle)) else {
+            return;
+        };
+        render::notice(&notices.content);
+        self.store.conversations[session].messages.push(notices);
+        self.persist();
     }
 
     /// Start a session, reusing the most recent one when asked to resume.
