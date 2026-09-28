@@ -1,7 +1,9 @@
 //! The card the chat shows when a tool needs the user: approve a write or a
-//! command, or answer an `ask_user` question.
+//! command, or answer an `ask_user` question. A helper's call gets the same
+//! card under the helper's name, with the answers a helper can be given.
 
 use crate::prelude::*;
+use letronna_core::approvals::Decision;
 use letronna_core::tools;
 
 impl Chat {
@@ -45,14 +47,7 @@ impl Chat {
         }
 
         let args = tools::parse_args(&call.arguments).unwrap_or_default();
-        let card = v_flex()
-            .w_full()
-            .gap_3()
-            .p_3()
-            .rounded(cx.theme().radius_lg)
-            .border_1()
-            .border_color(cx.theme().primary.opacity(0.5))
-            .bg(cx.theme().secondary.opacity(0.3));
+        let card = frame(cx);
 
         if call.name == tools::ASK_USER {
             let question = args["question"].as_str().unwrap_or_default().to_owned();
@@ -104,40 +99,11 @@ impl Chat {
             );
         }
 
-        let title = match call.name.as_str() {
-            "write_file" => format!("Letronna wants to write {summary}"),
-            "edit_file" => format!("Letronna wants to edit {summary}"),
-            "run_command" => "Letronna wants to run a command".to_owned(),
-            "browse" | "use_page" => format!("Letronna wants to {summary}"),
-            "search_web" => "Letronna wants to search the web".to_owned(),
-            other => format!("Letronna wants to use {other}"),
-        };
+        let title = wants(BRAND, &call.name, &summary);
         let preview = tools::preview(&call.name, &call.arguments, &ctx);
+        let card = permission(card, "preview", title, &preview, window, cx);
         Some(
             card.child(
-                div()
-                    .text_sm()
-                    .font_family(HEADING_FONT)
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(title),
-            )
-            .child(
-                // Scrolls only once the preview is long, so a one-line command
-                // does not sit in a tall empty panel.
-                div()
-                    .p_2()
-                    .min_w_0()
-                    .rounded(cx.theme().radius)
-                    .bg(cx.theme().background)
-                    .child(crate::ui::code_block(
-                        "preview",
-                        tools::clamp_lines(&preview, 400),
-                        px(240.),
-                        window,
-                        cx,
-                    )),
-            )
-            .child(
                 h_flex()
                     .gap_2()
                     .child(
@@ -165,4 +131,127 @@ impl Chat {
             .into_any_element(),
         )
     }
+
+    /// The card for the first helper's call waiting on the user in session
+    /// `root`, or `None` when no helper there is waiting.
+    pub(crate) fn helper_card(
+        &self,
+        root: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let request = self
+            .agent_asks
+            .iter()
+            .find(|request| request.root == root)?;
+        let call = &request.call;
+        let summary = tools::summary(&call.name, &call.arguments);
+        let title = wants(&format!("Helper {}", request.label), &call.name, &summary);
+        let answer = |decision: Decision| {
+            let (label, id) = (request.label.clone(), call.id.clone());
+            cx.listener(move |this, _, _, cx| this.answer_agent(root, &label, &id, decision, cx))
+        };
+        let (once, for_run, deny) = (
+            answer(Decision::Once),
+            answer(Decision::ForRun),
+            answer(Decision::Deny),
+        );
+        let card = permission(
+            frame(cx),
+            "helper-preview",
+            title,
+            &request.preview,
+            window,
+            cx,
+        );
+        Some(
+            card.child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("helper-allow")
+                            .primary()
+                            .small()
+                            .label("Allow")
+                            .on_click(once),
+                    )
+                    .child(
+                        // Core remembers this for the tool, for the helper
+                        // and the helpers it starts, so they ask no more.
+                        Button::new("helper-allow-run")
+                            .outline()
+                            .small()
+                            .label("Allow for this run")
+                            .on_click(for_run),
+                    )
+                    .child(
+                        Button::new("helper-deny")
+                            .ghost()
+                            .small()
+                            .label("Deny")
+                            .on_click(deny),
+                    ),
+            )
+            .into_any_element(),
+        )
+    }
+}
+
+/// The box an approval card sits in.
+fn frame(cx: &App) -> Div {
+    v_flex()
+        .w_full()
+        .gap_3()
+        .p_3()
+        .rounded(cx.theme().radius_lg)
+        .border_1()
+        .border_color(cx.theme().primary.opacity(0.5))
+        .bg(cx.theme().secondary.opacity(0.3))
+}
+
+/// What a card says `who` wants to do with a call of `name`.
+fn wants(who: &str, name: &str, summary: &str) -> String {
+    match name {
+        "write_file" => format!("{who} wants to write {summary}"),
+        "edit_file" => format!("{who} wants to edit {summary}"),
+        "run_command" => format!("{who} wants to run a command"),
+        "browse" | "use_page" => format!("{who} wants to {summary}"),
+        "search_web" => format!("{who} wants to search the web"),
+        other => format!("{who} wants to use {other}"),
+    }
+}
+
+/// `card` with what a call wants and the tool's preview of it, ready for its
+/// answers; `id` keeps the preview's scrolling apart from another card's.
+fn permission(
+    card: Div,
+    id: &'static str,
+    title: String,
+    preview: &str,
+    window: &mut Window,
+    cx: &mut App,
+) -> Div {
+    card.child(
+        div()
+            .text_sm()
+            .font_family(HEADING_FONT)
+            .font_weight(FontWeight::MEDIUM)
+            .child(title),
+    )
+    .child(
+        // Scrolls only once the preview is long, so a one-line command
+        // does not sit in a tall empty panel.
+        div()
+            .p_2()
+            .min_w_0()
+            .rounded(cx.theme().radius)
+            .bg(cx.theme().background)
+            .child(crate::ui::code_block(
+                id,
+                tools::clamp_lines(preview, 400),
+                px(240.),
+                window,
+                cx,
+            )),
+    )
 }

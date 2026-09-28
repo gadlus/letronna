@@ -111,6 +111,9 @@ impl Chat {
                     // must not start out with what was allowed here.
                     this.session_allow
                         .remove(&this.store.conversations[index].id);
+                    // Nor show its helpers' cards; dropped, they are declined.
+                    let id = this.store.conversations[index].id;
+                    this.agent_asks.retain(|request| request.root != id);
                     this.store.remove(index);
                     if this.store.conversations.is_empty() {
                         this.new_chat(window, cx);

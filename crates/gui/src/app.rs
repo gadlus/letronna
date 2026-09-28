@@ -1,5 +1,5 @@
 use crate::prelude::*;
-use letronna_core::{agent, inbox};
+use letronna_core::{agent, approvals, inbox};
 
 pub(crate) const BRAND: &str = "Letronna";
 
@@ -130,6 +130,9 @@ pub(crate) struct Chat {
     /// chats: a job saying "do not ask me at 9am" is not permission to stop
     /// asking everywhere else.
     pub(crate) unattended: std::collections::HashSet<u64>,
+    /// Helpers' calls waiting on the user, oldest first, each shown as a card
+    /// in its own session. One dropped unanswered is declined.
+    pub(crate) agent_asks: std::collections::VecDeque<approvals::Request>,
     /// Text field on the `ask_user` card.
     pub(crate) answer: Entity<InputState>,
     /// Whether the footer is already polling background jobs.
@@ -408,6 +411,7 @@ impl Chat {
             asking: None,
             session_allow: std::collections::HashMap::new(),
             unattended: std::collections::HashSet::new(),
+            agent_asks: std::collections::VecDeque::new(),
             answer,
             job_tick: false,
             plan_mode: false,
@@ -463,6 +467,7 @@ impl Chat {
         Self::watch_schedules(cx);
         Self::watch_updates(cx);
         Self::watch_inbox(cx);
+        Self::serve_approvals(cx);
         this.restart_messaging(cx);
         if this.store.settings.presence == "off" {
             plugins::set_enabled(cx, plugins::DISCORD, false);
@@ -713,12 +718,133 @@ impl Chat {
         let doorbell = inbox::listen();
         cx.spawn(async move |this, cx| {
             while doorbell.recv().await.is_ok() {
-                if this.update(cx, |this, cx| this.wake_idle(cx)).is_err() {
+                // A helper that ended rings too, and its card goes with it.
+                let rang = this.update(cx, |this, cx| {
+                    this.drop_ended_asks(cx);
+                    this.wake_idle(cx)
+                });
+                if rang.is_err() {
                     break;
                 }
             }
         })
         .detach();
+    }
+
+    /// Take helpers' approval requests for as long as the window is open.
+    fn serve_approvals(cx: &mut Context<Self>) {
+        let served = approvals::serve();
+        let (tx, rx) = async_channel::unbounded();
+        // `serve` hands back a blocking receiver, so a thread of its own
+        // carries each request over rather than one of the executor's.
+        std::thread::spawn(move || {
+            while let Ok(request) = served.recv() {
+                if tx.send_blocking(request).is_err() {
+                    break;
+                }
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            while let Ok(request) = rx.recv().await {
+                if this
+                    .update(cx, |this, cx| this.on_agent_ask(request, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// A helper's call waiting on a yes: answered at once where its session's
+    /// rules already decide it, otherwise put up as a card in that session.
+    fn on_agent_ask(&mut self, request: approvals::Request, cx: &mut Context<Self>) {
+        // Core has one request out per run and tool at a time, so a card
+        // still up for the same was given up on: its helper stopped waiting.
+        self.agent_asks
+            .retain(|queued| queued.run != request.run || queued.call.name != request.call.name);
+        cx.notify();
+        // With its session gone no card could show; dropped, it is declined.
+        let Some(ix) = self.store.index_of(request.root) else {
+            return;
+        };
+        // Its run may have ended before it got here, since the doorbell that
+        // says so comes by another way.
+        if run_ended(request.root, request.run) {
+            return;
+        }
+        if let Some(decision) = self.decided(&request.call.name, request.root) {
+            request.answer(decision);
+            return;
+        }
+        // Nobody in a chat app sees a helper's card, and one waiting here
+        // would hold up the chat's answer until someone came to the window.
+        if self.remote_session.values().any(|&id| id == request.root) {
+            return;
+        }
+        if !(self.page == Page::Chat && self.store.active == ix) {
+            let title = &self.store.conversations[ix].title;
+            self.error = Some(format!(
+                "Helper {} in \"{title}\" is waiting for your answer.",
+                request.label
+            ));
+        }
+        self.agent_asks.push_back(request);
+    }
+
+    /// What session `root`'s own rules say to a helper's call of `name`, or
+    /// None when only the user can say.
+    fn decided(&self, name: &str, root: u64) -> Option<approvals::Decision> {
+        let none = std::collections::HashSet::new();
+        settled(
+            name,
+            self.store.settings.skip_approvals,
+            allowed_in(&self.session_allow, Some(root)).unwrap_or(&none),
+            self.unattended.contains(&root),
+        )
+    }
+
+    /// Answer the helpers' cards their sessions' rules now decide, after a
+    /// rule changed under them.
+    fn decide_agent_asks(&mut self, cx: &mut Context<Self>) {
+        for request in std::mem::take(&mut self.agent_asks) {
+            match self.decided(&request.call.name, request.root) {
+                Some(decision) => request.answer(decision),
+                None => self.agent_asks.push_back(request),
+            }
+        }
+        cx.notify();
+    }
+
+    /// Take down the cards of helpers that have ended, since nothing waits
+    /// for their answers any more.
+    fn drop_ended_asks(&mut self, cx: &mut Context<Self>) {
+        let before = self.agent_asks.len();
+        self.agent_asks
+            .retain(|request| !run_ended(request.root, request.run));
+        if self.agent_asks.len() != before {
+            cx.notify();
+        }
+    }
+
+    /// The user answered helper `label`'s card for call `call_id` in session
+    /// `root`, if it is still up.
+    pub(crate) fn answer_agent(
+        &mut self,
+        root: u64,
+        label: &str,
+        call_id: &str,
+        decision: approvals::Decision,
+        cx: &mut Context<Self>,
+    ) {
+        let at = self.agent_asks.iter().position(|request| {
+            request.root == root && request.label == label && request.call.id == call_id
+        });
+        if let Some(request) = at.and_then(|at| self.agent_asks.remove(at)) {
+            request.answer(decision);
+        }
+        cx.notify();
     }
 
     fn run_due(&mut self, cx: &mut Context<Self>) {
@@ -1248,6 +1374,8 @@ impl Chat {
                         .entry(id)
                         .or_default()
                         .insert(call.name.clone());
+                    // Its helpers waiting on the same tool are allowed too.
+                    self.decide_agent_asks(cx);
                 }
                 self.execute_call(call, cx);
             }
@@ -1257,6 +1385,7 @@ impl Chat {
     /// Decide the call the card is up for again after an approval setting
     /// changed, so it runs at once if it no longer needs the user.
     pub(crate) fn approvals_changed(&mut self, cx: &mut Context<Self>) {
+        self.decide_agent_asks(cx);
         let waiting = self
             .turn
             .as_ref()
@@ -1662,7 +1791,11 @@ impl Render for Chat {
             self.messaging_page(cx).into_any_element()
         } else if self.page != Page::Chat {
             self.page_view(self.page, cx).into_any_element()
-        } else if conversation.messages.is_empty() && !streaming_here {
+        } else if conversation.messages.is_empty()
+            && !streaming_here
+            // A helper's card needs the chat body even with nothing said.
+            && !self.agent_asks.iter().any(|ask| ask.root == conversation.id)
+        {
             self.empty_state(cx).into_any_element()
         } else {
             // One turn per prompt, like Claude Code: the user's message, then
@@ -1767,7 +1900,7 @@ impl Render for Chat {
                     rows_here.push(self.queued_row(n, text, cx));
                 }
             }
-            let rows: Vec<AnyElement> = turns
+            let mut rows: Vec<AnyElement> = turns
                 .into_iter()
                 .enumerate()
                 // No min_w_0 or clipping here: both break list layout in the
@@ -1787,6 +1920,8 @@ impl Render for Chat {
                         .into_any_element()
                 })
                 .collect();
+            // Last, where the eye is: a helper does not wait on a turn.
+            rows.extend(self.helper_card(conversation.id, window, cx));
             // The scrollbar must sit outside the scrolling element, or it
             // scrolls away with the content. The scrolling box spans the
             // pane, so the bar is at its edge and the wheel works over the
@@ -1910,6 +2045,28 @@ fn allowed_in(
     session.and_then(|id| session_allow.get(&id))
 }
 
+/// What a helper's call of `name` gets from its session's rules alone, or
+/// None when only the user can say: a call the session itself would not be
+/// asked about goes ahead.
+fn settled(
+    name: &str,
+    skip_all: bool,
+    allowed: &std::collections::HashSet<String>,
+    unattended: bool,
+) -> Option<approvals::Decision> {
+    (!agent::needs_user(name, skip_all, allowed, unattended)).then_some(approvals::Decision::Once)
+}
+
+/// Whether the helper heading run `run` in session `root` has ended, which
+/// stops every helper under it. Only helpers in the background are listed,
+/// so the card of one a turn waits on stays until it is answered.
+fn run_ended(root: u64, run: u64) -> bool {
+    use letronna_core::tasks::{self, Key, State};
+    tasks::list(root).iter().any(|task| {
+        task.key == Key::Agent(run) && !matches!(task.state, State::Running | State::Idle)
+    })
+}
+
 /// The call at the front of the queue, and whether the approval card is up
 /// for it rather than it running.
 pub(crate) fn front_call(
@@ -1933,8 +2090,9 @@ pub(crate) fn front_call(
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
-    use super::{allowed_in, front_call, woken};
+    use super::{allowed_in, front_call, run_ended, settled, woken};
     use letronna_core::agent::{Next, Turn, needs_user};
+    use letronna_core::approvals::Decision;
     use letronna_core::chat::{Connection, ToolCall};
     use std::collections::{HashMap, HashSet};
 
@@ -1994,5 +2152,33 @@ mod tests {
         assert_eq!(woken(3, &[3, 7, 5], |id| id != 3), Some(7));
         assert_eq!(woken(3, &[3], |id| id != 3), None);
         assert_eq!(woken(3, &[], any), None);
+    }
+
+    #[test]
+    fn a_tool_the_session_already_allowed_is_approved_without_a_card() {
+        let allowed = HashSet::from(["write_file".to_owned()]);
+        let none = HashSet::new();
+        let once = Some(Decision::Once);
+        assert_eq!(settled("write_file", false, &allowed, false), once);
+        // Where it was not allowed, only the user can say.
+        assert_eq!(settled("write_file", false, &none, false), None);
+        // Nor is anyone asked with approvals off, or in an unattended session.
+        assert_eq!(settled("write_file", true, &none, false), once);
+        assert_eq!(settled("write_file", false, &none, true), once);
+        // What the session is never asked about, its helpers are not either.
+        assert_eq!(settled("read_file", false, &none, false), once);
+    }
+
+    #[test]
+    fn a_card_goes_when_the_helper_heading_its_run_ends() {
+        use letronna_core::tasks::{self, Key, State, Task};
+        // Far from any session or helper id another test uses.
+        let (root, run) = (9_101, (1 << 40) + 9_101);
+        tasks::register(Task::new(Key::Agent(run), root, None, "helper"));
+        assert!(!run_ended(root, run));
+        tasks::finish(&Key::Agent(run), State::Stopped, None);
+        assert!(run_ended(root, run));
+        // A run with nothing listed, as one a turn waits on, never looks ended.
+        assert!(!run_ended(root, run + 1));
     }
 }
