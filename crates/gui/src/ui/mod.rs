@@ -1,5 +1,6 @@
 pub(crate) mod account;
 pub(crate) mod actions;
+pub(crate) mod activity;
 pub(crate) mod approval;
 pub(crate) mod artifacts;
 pub(crate) mod browser;

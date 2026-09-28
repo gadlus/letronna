@@ -99,6 +99,8 @@ struct Helper {
     root: u64,
     name: String,
     kind: String,
+    /// What the agent that started it said it is for, as the window shows it.
+    description: String,
     /// Its transcript's number among its session's helpers.
     n: u32,
     /// Where what it is was written, beside its transcript.
@@ -378,6 +380,7 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
         root: caller.root,
         name: slot.name.clone(),
         kind: def.name.clone(),
+        description: text(args, "description").unwrap_or_default().to_owned(),
         n,
         sidecar,
         run,
@@ -635,6 +638,59 @@ pub fn stop(id: AgentId) -> bool {
     // Set outside the lock, since a stop runs whatever the helper waits on.
     cancel.set();
     true
+}
+
+/// A helper as a front end shows it, with its run's live counts.
+pub struct Seen {
+    pub id: AgentId,
+    /// The session it works for.
+    pub session: u64,
+    pub name: String,
+    pub kind: String,
+    pub description: String,
+    /// Its transcript's number, for `Transcript::open`.
+    pub n: u32,
+    /// How its last run ended, or None while it runs.
+    pub ended: Option<String>,
+    /// When its last run started.
+    pub started: Instant,
+    pub status: Arc<Status>,
+}
+
+/// Every helper started since Letronna opened, oldest first.
+pub fn seen() -> Vec<Seen> {
+    let registry = registry();
+    (registry.helpers.iter())
+        .map(|helper| Seen {
+            id: helper.id,
+            session: helper.root,
+            name: helper.name.clone(),
+            kind: helper.kind.clone(),
+            description: helper.description.clone(),
+            n: helper.n,
+            ended: helper.ended.clone(),
+            started: helper.run.started,
+            status: helper.run.status.clone(),
+        })
+        .collect()
+}
+
+/// Leaves the user's `message` for helper `id` to read at its next step, and
+/// says whether it was running to read it.
+pub fn steer(id: AgentId, message: &str) -> bool {
+    // Under the lock its run's close takes, as an agent's message is, so a
+    // run that ends now still passes it on.
+    let registry = registry();
+    let running = (registry.helpers.iter()).any(|h| h.id == id && h.ended.is_none());
+    if running {
+        let notice = Notice {
+            from: "user".into(),
+            when: When::Next,
+            text: format!("message from the user:\n{message}"),
+        };
+        inbox::push(id, notice);
+    }
+    running
 }
 
 /// The connection a helper works on: its parent's, under the helper's own id,
@@ -1488,6 +1544,7 @@ mod tests {
             root,
             name: name.into(),
             kind: kind.into(),
+            description: String::new(),
             n: 1,
             sidecar: PathBuf::new(),
             run: Run::new(owner, true),
@@ -2250,5 +2307,43 @@ mod tests {
         let sizes: Vec<usize> = pages.iter().map(|page| page.chars().count()).collect();
         assert_eq!(sizes, [7_500, 6_125, 1_375]);
         assert!(pages.concat() == long, "the pages are not the report");
+    }
+
+    #[test]
+    fn the_users_message_reaches_only_a_helper_still_running() {
+        let _running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+        let _bell = crate::inbox::tests::DOORBELL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let slot = reserve(9_601, 9_601, "worker", AT_ONCE, Cancel::default()).unwrap();
+        let id = slot.id;
+        let mut working = known(id, 9_601, 9_601, "worker", "general");
+        working.ended = None;
+        let ended = known(96_012, 9_601, 9_601, "done", "explore");
+        registry().helpers.extend([working, ended]);
+
+        assert!(steer(id, "Look at the tests first."));
+        assert!(!steer(96_012, "Too late."));
+        let heard = inbox::take(id, false);
+        let heard: Vec<&str> = heard.iter().map(|n| n.text.as_str()).collect();
+        assert_eq!(heard, ["message from the user:\nLook at the tests first."]);
+        assert!(inbox::take(96_012, true).is_empty());
+        let seen: Vec<(String, Option<String>)> = (seen().into_iter())
+            .filter(|helper| helper.session == 9_601)
+            .map(|helper| (helper.name, helper.ended))
+            .collect();
+        let finished = Some("finished".to_owned());
+        assert_eq!(seen, [("worker".into(), None), ("done".into(), finished)]);
+
+        // One that ends before its next step passes it on to its owner.
+        assert!(steer(id, "And the docs."));
+        close(slot, &report(Outcome::Done, "Done."), |_| ());
+        let passed: Vec<String> = (inbox::take(9_601, true).into_iter())
+            .map(|notice| notice.text)
+            .collect();
+        let text =
+            "worker ended before it read this, from user:\nmessage from the user:\nAnd the docs.";
+        assert_eq!(passed, [text]);
+        assert!(!steer(id, "Gone."));
     }
 }
