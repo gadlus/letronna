@@ -24,7 +24,7 @@ use crate::cancel::Cancel;
 use crate::chat::{self, Connection, Event, Extra, Message, ToolCall};
 use crate::inbox::{self, Notice};
 use crate::store::{Todo, Transcript};
-use crate::tools::{self, ToolContext};
+use crate::tools::{self, Caller, ToolContext};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -35,7 +35,7 @@ pub type AgentId = u64;
 
 /// Tools no helper may call whatever it was allowed, since each reaches past
 /// its run: to the user, to what Letronna remembers, or to a later time.
-const DENY: [&str; 5] = [tools::ASK_USER, "memory", "wake_me", "schedule", "workflow"];
+pub(crate) const DENY: [&str; 5] = [tools::ASK_USER, "memory", "wake_me", "schedule", "workflow"];
 
 /// What a helper is told when it asks the user something.
 const NO_QUESTIONS: &str = "Questions are not available to helpers. Decide for yourself, or end with the open question in your report.";
@@ -70,6 +70,8 @@ pub struct Spec {
     pub cancel: Cancel,
     pub budget: Option<Arc<Budget>>,
     pub status: Arc<Status>,
+    /// How many helpers deep the agent is: 0 for a session's own, 1 for its helper.
+    pub depth: u8,
 }
 
 /// How a run is getting on, in atomics a frontend reads while the run writes them.
@@ -286,9 +288,20 @@ fn refusal(allow: &Allow, name: &str) -> Option<String> {
 
 /// What this agent's tool calls can reach, stopping when it stops.
 fn context(spec: &Spec) -> ToolContext {
+    let ctx = ToolContext::of(&spec.connection);
     ToolContext {
         cancel: spec.cancel.clone(),
-        ..ToolContext::of(&spec.connection)
+        // A helper this agent starts is one deeper, in the same tree and
+        // spending from the same budget.
+        caller: Caller {
+            agent: Some(spec.id),
+            root: spec.root,
+            depth: spec.depth,
+            budget: spec.budget.clone(),
+            run: Some(spec.run),
+            ..ctx.caller.clone()
+        },
+        ..ctx
     }
 }
 
@@ -469,6 +482,7 @@ mod tests {
             cancel: Cancel::default(),
             budget: None,
             status: Arc::default(),
+            depth: 1,
         }
     }
 

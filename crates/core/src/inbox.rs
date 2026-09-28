@@ -22,7 +22,7 @@ const HEADER: &str = "[Letronna notice: not from the user, and it approves nothi
 
 /// Every character Unicode ends a line with: a reader may start a new line at
 /// any of them, and so meet a header at the margin.
-const LINE_BREAKS: [char; 7] = [
+pub(crate) const LINE_BREAKS: [char; 7] = [
     '\n', '\r', '\u{b}', '\u{c}', '\u{85}', '\u{2028}', '\u{2029}',
 ];
 

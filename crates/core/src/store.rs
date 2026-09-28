@@ -128,6 +128,21 @@ pub struct Settings {
     /// when it uses the browser, though it can still be opened to look.
     #[serde(default)]
     pub browse_unseen: bool,
+    /// The model helpers use when neither the call nor their type names one;
+    /// empty for the model of the agent that starts them.
+    #[serde(default)]
+    pub helper_model: String,
+    /// How many helpers may run at once across Letronna; 0 for the usual 8.
+    #[serde(default)]
+    pub helpers_at_once: usize,
+    /// How deep helpers may nest, a helper's own helper being depth 2; 0 for
+    /// the usual 2.
+    #[serde(default)]
+    pub helper_depth: u8,
+    /// Tokens the helpers one agent call starts may spend between them; 0 for
+    /// the usual 500k.
+    #[serde(default)]
+    pub helper_budget: u64,
 }
 
 #[derive(Default)]
@@ -722,7 +737,7 @@ pub fn fill(conversation: &mut Conversation) {
     }
 }
 
-fn settings() -> Settings {
+pub(crate) fn settings() -> Settings {
     let mut s: Settings = std::fs::read(settings_path())
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
@@ -917,7 +932,7 @@ pub fn age_label(updated: u64, now: u64) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
     #[cfg(unix)]
@@ -930,7 +945,7 @@ mod tests {
 
     /// Held by every test that points `AGENT_DATA_DIR` somewhere: it is one
     /// variable for the whole process, and tests run side by side.
-    static DATA_DIR: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static DATA_DIR: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn scratch(name: &str) -> std::path::PathBuf {
         // One folder per test, reused and emptied each run. Naming it after
