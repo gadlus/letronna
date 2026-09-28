@@ -248,6 +248,7 @@ impl Chat {
         self.page = Page::Chat;
         self.editing_message = None;
         self.save();
+        self.swap_draft(window, cx);
         self.composer.update(cx, |input, cx| {
             input.set_value(back.unwrap_or_default(), window, cx)
         });

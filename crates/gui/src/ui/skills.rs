@@ -24,15 +24,25 @@ impl Chat {
     }
 
     /// Put the skill's prompt in the composer of the active chat, ready to
-    /// adjust. Sending it is left to the user.
+    /// adjust, after anything already typed there. Sending it is left to
+    /// the user.
     fn use_skill(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(skill) = self.skills.iter().find(|s| s.id == id) else {
             return;
         };
         let prompt = skill.prompt.clone();
         self.page = Page::Chat;
-        self.composer
-            .update(cx, |input, cx| input.set_value(prompt, window, cx));
+        self.composer.update(cx, |input, cx| {
+            let typed = input.value().trim_end().to_owned();
+            let value = if typed.is_empty() {
+                prompt
+            } else {
+                format!("{typed}\n\n{prompt}")
+            };
+            // With the caret after it, where adjusting it starts.
+            input.set_value("", window, cx);
+            input.insert(value, window, cx);
+        });
         self.composer
             .update(cx, |input, cx| input.focus(window, cx));
         cx.notify();

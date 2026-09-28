@@ -317,6 +317,28 @@ impl Chat {
             .update(cx, |input, cx| input.focus(window, cx));
     }
 
+    /// Keep what was typed for the session the composer was showing, and
+    /// bring back what was typed for the one on screen now.
+    pub(crate) fn swap_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let on_screen = self.store.conversations[self.store.active].id;
+        if self.draft_for == on_screen {
+            return;
+        }
+        let draft = self.composer.read(cx).value().to_string();
+        // Unless that session was just deleted.
+        if !draft.trim().is_empty() && self.store.index_of(self.draft_for).is_some() {
+            self.drafts.insert(self.draft_for, draft);
+        }
+        self.draft_for = on_screen;
+        let draft = self.drafts.remove(&on_screen).unwrap_or_default();
+        self.composer.update(cx, |input, cx| {
+            // Inserted rather than set, so the caret is after it and typing
+            // carries on where it left off.
+            input.set_value("", window, cx);
+            input.insert(draft, window, cx);
+        });
+    }
+
     pub(crate) fn insert(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.composer.update(cx, |input, cx| {
             let mut value = input.value().to_string();

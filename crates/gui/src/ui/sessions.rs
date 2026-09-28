@@ -105,8 +105,10 @@ impl Chat {
                         return;
                     }
                     // Through the store, so the session's file goes too,
-                    // and its private browser with it.
-                    letronna_core::browser::forget(this.store.conversations[index].id);
+                    // and its private browser and draft with it.
+                    let id = this.store.conversations[index].id;
+                    letronna_core::browser::forget(id);
+                    this.drafts.remove(&id);
                     this.store.remove(index);
                     if this.store.conversations.is_empty() {
                         this.new_chat(window, cx);

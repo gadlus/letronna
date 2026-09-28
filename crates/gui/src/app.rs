@@ -185,6 +185,10 @@ pub(crate) struct Chat {
     /// the session whose browser it shows: each session has its own.
     pub(crate) browser: Entity<crate::ui::browser::BrowserView>,
     pub(crate) browser_for: u64,
+    /// The composer holds the draft of the session `draft_for`; the other
+    /// sessions' drafts wait here, by session id.
+    pub(crate) drafts: std::collections::HashMap<u64, String>,
+    pub(crate) draft_for: u64,
     pub(crate) error: Option<String>,
     /// Where updating stands, for the About page and the status bar.
     pub(crate) updating: crate::ui::update::Updating,
@@ -346,6 +350,7 @@ impl Chat {
                 }
             }),
         ];
+        let draft_for = store.conversations[store.active].id;
         let mut this = Self {
             page: Page::Chat,
             sidebar_open: true,
@@ -421,6 +426,8 @@ impl Chat {
             video_frame: None,
             browser: cx.new(|cx| crate::ui::browser::BrowserView::new(window, cx)),
             browser_for: 0,
+            drafts: std::collections::HashMap::new(),
+            draft_for,
             error,
             updating: Default::default(),
             update_note: None,
@@ -539,8 +546,7 @@ impl Chat {
         self.store.active = self.store.conversations.len() - 1;
         self.error = None;
         self.page = Page::Chat;
-        self.composer
-            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.swap_draft(window, cx);
         self.focus_composer(window, cx);
         self.save();
         cx.notify();
@@ -1281,6 +1287,9 @@ impl Render for Chat {
             self.browser_for = on_screen;
             letronna_core::browser::show_conversation(on_screen);
         }
+        // And the composer holds its draft, however the session was switched
+        // to: a click, a schedule, or a message from a chat app.
+        self.swap_draft(window, cx);
         self.keep_following();
         // A job starting or exiting happens off the UI thread, so the footer
         // chips need a poll while any of them is alive. It stops on its own.
