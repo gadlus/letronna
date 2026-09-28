@@ -17,6 +17,8 @@ pub mod cancel;
 mod cdp;
 pub mod chat;
 pub mod compact;
+#[cfg(feature = "workflows")]
+pub mod crew;
 pub mod driver;
 pub mod gateway;
 pub mod inbox;

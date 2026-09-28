@@ -180,6 +180,8 @@ struct Running {
     /// The session or helper whose call waits for it, or 0 for a helper in the
     /// background, which no call waits for.
     owner: u64,
+    /// The session whose Crew cap it started under, if any.
+    crew: Option<u64>,
     /// How many of its owner's helpers have run side by side with it, itself included.
     together: Arc<AtomicUsize>,
     /// Its stop, kept here since nothing else reaches one in the background.
@@ -216,19 +218,40 @@ impl Drop for Slot {
 struct Limits {
     /// The model for helpers whose call and type name none; empty for their parent's.
     model: String,
-    at_once: usize,
+    at_once: Cap,
     depth: u8,
     budget: u64,
 }
 
+/// How many helpers may run at once, and which of them count: those started
+/// under the same cap.
+#[derive(Clone, Copy)]
+struct Cap {
+    most: usize,
+    /// The session whose cap Crew raised, which counts only the helpers it
+    /// started under it and takes no place under Settings' cap; None for
+    /// Settings' cap, which every other session shares.
+    crew: Option<u64>,
+}
+
 impl Limits {
-    fn read() -> Self {
+    /// What Settings allows the helpers of session `root`, where Crew may let
+    /// more run at once.
+    fn read(root: u64) -> Self {
         let settings = crate::store::settings();
+        let most = match settings.helpers_at_once {
+            0 => AT_ONCE,
+            n => n,
+        };
+        #[cfg(feature = "workflows")]
+        let raised = crate::crew::helpers_at_once(root, most);
+        #[cfg(not(feature = "workflows"))]
+        let raised = most;
         Self {
             model: settings.helper_model,
-            at_once: match settings.helpers_at_once {
-                0 => AT_ONCE,
-                n => n,
+            at_once: Cap {
+                most: raised,
+                crew: (raised > most).then_some(root),
             },
             depth: match settings.helper_depth {
                 0 => DEPTH,
@@ -265,7 +288,7 @@ impl Tool for Agent {
         }, "required": ["description", "prompt"]})
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
-        start(args, ctx, &Limits::read())
+        start(args, ctx, &Limits::read(ctx.caller.root))
     }
 }
 
@@ -297,7 +320,7 @@ impl Tool for Agents {
         let to = || text(args, "to").ok_or_else(|| "`to` is required: a helper's name.".to_owned());
         match args["action"].as_str().unwrap_or_default() {
             "list" => Ok(list(&ctx.caller)),
-            "send" => send(args, ctx, &Limits::read()),
+            "send" => send(args, ctx, &Limits::read(ctx.caller.root)),
             "stop" => stop_by_name(&ctx.caller, to()?),
             "report" => report(
                 &ctx.caller,
@@ -575,13 +598,12 @@ fn check_name(name: &str) -> Result<(), String> {
 
 /// Takes a place for a helper of `owner` in session `root` that `cancel`
 /// stops, named `wanted`, or `wanted` with the first free number after it when
-/// a helper of the session had that name; refused when `at_once` are running
-/// already.
+/// a helper of the session had that name; refused when `at_once` is reached.
 fn reserve(
     root: u64,
     owner: u64,
     wanted: &str,
-    at_once: usize,
+    at_once: Cap,
     cancel: Cancel,
 ) -> Result<Slot, String> {
     let mut registry = registry();
@@ -595,12 +617,17 @@ fn reserve(
     }
     given.push(name.clone());
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    Ok(occupy(&mut registry, id, name, owner, cancel))
+    Ok(occupy(&mut registry, id, name, owner, at_once, cancel))
 }
 
-/// Refuses another helper when `at_once` are running already.
-fn full(registry: &Registry, at_once: usize) -> Result<(), String> {
-    if registry.running.len() >= at_once {
+/// Refuses another helper when `at_once` is reached by the helpers started
+/// under it.
+fn full(registry: &Registry, at_once: Cap) -> Result<(), String> {
+    let running = (registry.running.iter())
+        .filter(|helper| helper.crew == at_once.crew)
+        .count();
+    let at_once = at_once.most;
+    if running >= at_once {
         return Err(format!(
             "{at_once} helpers are already running, the most at once. Do not retry now: do this \
              part yourself, or wait for a notice. The user can raise this in Settings › Agents."
@@ -609,9 +636,16 @@ fn full(registry: &Registry, at_once: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// Puts helper `id` in the running list, as one of `owner`'s side by side that
-/// `cancel` stops.
-fn occupy(registry: &mut Registry, id: AgentId, name: String, owner: u64, cancel: Cancel) -> Slot {
+/// Puts helper `id` in the running list under `at_once`, as one of `owner`'s
+/// side by side that `cancel` stops.
+fn occupy(
+    registry: &mut Registry,
+    id: AgentId,
+    name: String,
+    owner: u64,
+    at_once: Cap,
+    cancel: Cancel,
+) -> Slot {
     let together = registry
         .running
         .iter()
@@ -621,6 +655,7 @@ fn occupy(registry: &mut Registry, id: AgentId, name: String, owner: u64, cancel
     registry.running.push(Running {
         id,
         owner,
+        crew: at_once.crew,
         together: together.clone(),
         cancel,
     });
@@ -1128,7 +1163,7 @@ fn claim(
     run: Run,
     waiting: u64,
     cancel: Cancel,
-    at_once: usize,
+    at_once: Cap,
     notice: Notice,
 ) -> Result<Option<Slot>, String> {
     let mut registry = registry();
@@ -1152,7 +1187,7 @@ fn claim(
     let id = helper.id;
     helper.run = run;
     helper.ended = None;
-    let slot = occupy(&mut registry, id, name.to_owned(), waiting, cancel);
+    let slot = occupy(&mut registry, id, name.to_owned(), waiting, at_once, cancel);
     Ok(Some(slot))
 }
 
@@ -1292,10 +1327,15 @@ mod tests {
     fn usual() -> Limits {
         Limits {
             model: String::new(),
-            at_once: AT_ONCE,
+            at_once: cap(AT_ONCE),
             depth: DEPTH,
             budget: BUDGET,
         }
+    }
+
+    /// Settings' cap of `most`, as a session without Crew has.
+    fn cap(most: usize) -> Cap {
+        Cap { most, crew: None }
     }
 
     fn report(status: Outcome, text: &str) -> Report {
@@ -1573,9 +1613,9 @@ mod tests {
 
         // Helpers of one caller running side by side split the allowance.
         let _running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
-        let first = reserve(9_201, 9_201, "a", AT_ONCE, Cancel::default()).unwrap();
-        let second = reserve(9_201, 9_201, "b", AT_ONCE, Cancel::default()).unwrap();
-        let apart = reserve(9_202, 9_202, "c", AT_ONCE, Cancel::default()).unwrap();
+        let first = reserve(9_201, 9_201, "a", cap(AT_ONCE), Cancel::default()).unwrap();
+        let second = reserve(9_201, 9_201, "b", cap(AT_ONCE), Cancel::default()).unwrap();
+        let apart = reserve(9_202, 9_202, "c", cap(AT_ONCE), Cancel::default()).unwrap();
         let together = first.together.load(Ordering::Relaxed);
         assert_eq!(together, second.together.load(Ordering::Relaxed));
         assert_eq!((together, apart.together.load(Ordering::Relaxed)), (2, 1));
@@ -1605,8 +1645,8 @@ mod tests {
     #[test]
     fn names_get_a_number_when_taken() {
         let _running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
-        let first = reserve(9_101, 9_101, "explore", AT_ONCE, Cancel::default()).unwrap();
-        let second = reserve(9_101, 9_101, "explore", AT_ONCE, Cancel::default()).unwrap();
+        let first = reserve(9_101, 9_101, "explore", cap(AT_ONCE), Cancel::default()).unwrap();
+        let second = reserve(9_101, 9_101, "explore", cap(AT_ONCE), Cancel::default()).unwrap();
         assert_eq!(
             (first.name.as_str(), second.name.as_str()),
             ("explore", "explore-2")
@@ -1614,8 +1654,8 @@ mod tests {
         let first_id = first.id;
         drop(first);
         // A name stays with the helper that had it after that one ends.
-        let third = reserve(9_101, 9_101, "explore", AT_ONCE, Cancel::default()).unwrap();
-        let elsewhere = reserve(9_102, 9_102, "explore", AT_ONCE, Cancel::default()).unwrap();
+        let third = reserve(9_101, 9_101, "explore", cap(AT_ONCE), Cancel::default()).unwrap();
+        let elsewhere = reserve(9_102, 9_102, "explore", cap(AT_ONCE), Cancel::default()).unwrap();
         assert_eq!(
             (third.name.as_str(), elsewhere.name.as_str()),
             ("explore-3", "explore")
@@ -1690,10 +1730,10 @@ mod tests {
     #[test]
     fn the_cap_refuses_rather_than_queues() {
         let _running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
-        let first = reserve(9_001, 9_001, "explore", 2, Cancel::default()).unwrap();
-        let _second = reserve(9_001, 9_001, "explore", 2, Cancel::default()).unwrap();
+        let first = reserve(9_001, 9_001, "explore", cap(2), Cancel::default()).unwrap();
+        let _second = reserve(9_001, 9_001, "explore", cap(2), Cancel::default()).unwrap();
         // Refused at once, however long the two running take, and in any session.
-        let Err(refused) = reserve(9_002, 9_002, "review", 2, Cancel::default()) else {
+        let Err(refused) = reserve(9_002, 9_002, "review", cap(2), Cancel::default()) else {
             panic!("a third helper started past a cap of two");
         };
         assert_eq!(
@@ -1702,8 +1742,33 @@ mod tests {
              yourself, or wait for a notice. The user can raise this in Settings › Agents."
         );
         drop(first);
-        let third = reserve(9_002, 9_002, "review", 2, Cancel::default()).unwrap();
+        let third = reserve(9_002, 9_002, "review", cap(2), Cancel::default()).unwrap();
         assert_eq!(third.name, "review");
+    }
+
+    #[cfg(feature = "workflows")]
+    #[test]
+    fn crew_lets_its_session_run_more_helpers_without_taking_other_sessions_places() {
+        let _session = Session::new("crew-cap");
+        let (crew, other) = (9_401, 9_402);
+        crate::crew::set(crew, true);
+        let start = |root| {
+            let limits = Limits::read(root);
+            reserve(root, root, "worker", limits.at_once, Cancel::default())
+        };
+        // A ninth in the Crew session, past Settings' usual 8.
+        let crews: Vec<Slot> = (0..9).map(|_| start(crew).unwrap()).collect();
+        let others: Vec<Slot> = (0..AT_ONCE).map(|_| start(other).unwrap()).collect();
+        let Err(refused) = start(other) else {
+            panic!("a ninth helper started in a session without Crew");
+        };
+        assert!(refused.starts_with("8 helpers are already running"));
+        // Crew's 32 counts only its own session's helpers.
+        let more: Vec<Slot> = (9..32).map(|_| start(crew).unwrap()).collect();
+        assert!(start(crew).is_err());
+        crate::crew::set(crew, false);
+        drop((crews, others, more));
+        assert!(registry().running.is_empty());
     }
 
     #[test]
@@ -1910,7 +1975,7 @@ mod tests {
     fn a_running_helper_can_be_stopped_by_its_id() {
         let _running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
         let cancel = Cancel::default();
-        let slot = reserve(9_301, 0, "worker", AT_ONCE, cancel.clone()).unwrap();
+        let slot = reserve(9_301, 0, "worker", cap(AT_ONCE), cancel.clone()).unwrap();
         let id = slot.id;
 
         assert!(stop(id));

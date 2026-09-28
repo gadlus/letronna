@@ -143,6 +143,10 @@ pub struct Settings {
     /// the usual 500k.
     #[serde(default)]
     pub helper_budget: u64,
+    /// How big a workflow Crew suggests: small, medium or large; empty for
+    /// medium.
+    #[serde(default)]
+    pub crew: String,
 }
 
 #[derive(Default)]

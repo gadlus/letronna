@@ -82,8 +82,8 @@ static TYPED: Mutex<BTreeMap<u64, String>> = Mutex::new(BTreeMap::new());
 /// report them.
 static RUNS: Mutex<Vec<Live>> = Mutex::new(Vec::new());
 
-/// Offers the `workflow` tool to `session` until `opt_out`, as Crew and saved
-/// workflows do; a run's notice ends in a resume call, which needs it still on.
+/// Offers the `workflow` tool to `session` until `opt_out`, beside what Crew
+/// offers; a run's notice ends in a resume call, which needs it still on.
 pub fn opt_in(session: u64) {
     opted().insert(session);
 }
@@ -159,7 +159,8 @@ impl Tool for Workflow {
         true
     }
     fn offered(&self, connection: &Connection) -> bool {
-        opted_in(connection.conversation)
+        let session = connection.conversation;
+        opted_in(session) || crate::crew::offers(session)
     }
     fn preview(&self, args: &Value, ctx: &ToolContext) -> String {
         let connection = ctx.caller.connection.as_deref().cloned();
