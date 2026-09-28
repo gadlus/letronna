@@ -7,6 +7,7 @@
 
 use crate::chat::{Connection, Remote};
 use serde_json::{Value, json};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -81,11 +82,24 @@ const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120)
 /// than walking a whole home folder while the session waits on it.
 const SEARCH_TIME: Duration = Duration::from_secs(15);
 const SEARCH_FILES: usize = 20_000;
-/// Bigger files are skipped by search and cut short by read_file: neither
-/// can show more than `MAX_OUTPUT`, and reading gigabytes to find that out
-/// is how a tool hangs.
+/// Bigger files are skipped by search: it cannot show more than
+/// `MAX_OUTPUT`, and reading gigabytes to find that out is how a tool hangs.
 const SEARCH_FILE_BYTES: u64 = 1_000_000;
-const READ_BYTES: u64 = 256 * 1024;
+/// How much of a file one read shows, in bytes, which is never more
+/// characters: under the chat's cap on a tool result with room for the
+/// footer, so a page reaches the model whole instead of losing its middle.
+const PAGE_BYTES: usize = crate::chat::MAX_TOOL_CHARS - 1_000;
+/// A line of a file longer than this, in characters, is cut, so a minified
+/// file on one line still leaves room in a page for the lines around it.
+const LINE_CHARS: usize = 1_000;
+/// The footer counts the lines after a page only this far: at disk speed that
+/// is well under a second, where counting a log of many gigabytes would hold
+/// the session up.
+const COUNT_BYTES: u64 = 64 * 1024 * 1024;
+/// A UTF-16 file is decoded whole, its line breaks being two bytes wide, so
+/// only this much of one is read. Such files are exports and redirected shell
+/// output, far smaller than this.
+const UTF16_BYTES: u64 = 16 * 1024 * 1024;
 /// How long a background command gets to print something before the tool
 /// replies, so the first message can carry a port or an early crash.
 const SETTLE: std::time::Duration = std::time::Duration::from_millis(1200);
@@ -885,34 +899,216 @@ impl Tool for ReadFile {
         "read_file"
     }
     fn description(&self) -> &'static str {
-        "Read a text file. Paths are relative to the workspace."
+        "Read a text file. Paths are relative to the workspace. Each line is shown as `N|text`, N being its line number; the `N|` is not part of the file. A long file comes a page at a time, and the page ends with the offset to continue from."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
-            "path": {"type": "string"}
+            "path": {"type": "string"},
+            "offset": {"type": "integer", "description": "The line to start at, counting from 1."},
+            "limit": {"type": "integer", "description": "How many lines to show at most."}
         }, "required": ["path"]})
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
-        use std::io::Read;
-        let path = resolve(path_arg(args), ctx)?;
-        let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
-        let mut bytes = Vec::new();
-        file.take(READ_BYTES)
-            .read_to_end(&mut bytes)
-            .map_err(|e| e.to_string())?;
-        let cut = bytes.len() as u64 == READ_BYTES;
-        match String::from_utf8(bytes) {
-            Ok(text) => Ok(text),
-            // A cut can split the last character; anything else is binary.
-            Err(e) if cut && e.utf8_error().error_len().is_none() => {
-                let valid = e.utf8_error().valid_up_to();
-                let mut bytes = e.into_bytes();
-                bytes.truncate(valid);
-                String::from_utf8(bytes).map_err(|_| "Not a text file.".into())
-            }
-            Err(_) => Err("Not a text file.".into()),
+        let raw = path_arg(args);
+        let path = resolve(raw, ctx).map_err(|e| e + &similar(raw, ctx))?;
+        let offset = args["offset"].as_u64().unwrap_or(1).max(1) as usize;
+        let limit = args["limit"].as_u64().unwrap_or(u64::MAX).max(1) as usize;
+        let (mut text, cut) = open_text(&path)?;
+        page(&mut text, offset, limit, cut)
+    }
+}
+
+/// A file's text as UTF-8, without a byte order mark and with UTF-16 decoded,
+/// and whether it stops at `UTF16_BYTES`; a NUL byte near the start marks a
+/// binary file, which is refused.
+fn open_text(path: &Path) -> Result<(Box<dyn BufRead>, bool), String> {
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(file);
+    let start = reader.fill_buf().map_err(|e| e.to_string())?;
+    let unit: fn([u8; 2]) -> u16 = match start {
+        [0xFF, 0xFE, ..] => u16::from_le_bytes,
+        [0xFE, 0xFF, ..] => u16::from_be_bytes,
+        [0xEF, 0xBB, 0xBF, ..] => {
+            reader.consume(3);
+            return Ok((Box::new(reader), false));
+        }
+        _ if start.contains(&0) => return Err("Not a text file.".into()),
+        _ => return Ok((Box::new(reader), false)),
+    };
+    reader.consume(2);
+    let mut bytes = Vec::new();
+    // One byte past the cap tells a file cut there from one that fits it.
+    reader
+        .take(UTF16_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    let cut = bytes.len() as u64 > UTF16_BYTES;
+    bytes.truncate(UTF16_BYTES as usize);
+    let units = bytes.as_chunks::<2>().0.iter().map(|&pair| unit(pair));
+    let text: String = char::decode_utf16(units)
+        .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect();
+    Ok((Box::new(std::io::Cursor::new(text.into_bytes())), cut))
+}
+
+/// Lines from `offset` on, numbered, until `limit` of them or `PAGE_BYTES`,
+/// with a footer saying where the rest starts and a note on every page of a
+/// `cut` file.
+fn page(
+    reader: &mut impl BufRead,
+    offset: usize,
+    limit: usize,
+    cut: bool,
+) -> Result<String, String> {
+    let mut out = String::new();
+    let mut line = Vec::new();
+    let (mut n, mut lossy, mut more) = (0, false, false);
+    while next_line(reader, &mut line)? {
+        n += 1;
+        if n < offset {
+            continue;
+        }
+        if n - offset == limit {
+            more = true;
+            break;
+        }
+        let text = String::from_utf8_lossy(&line);
+        let shown = match text.char_indices().nth(LINE_CHARS) {
+            Some((at, _)) => format!("{n}|{} … [line cut]\n", &text[..at]),
+            None => format!("{n}|{text}\n"),
+        };
+        if !out.is_empty() && out.len() + shown.len() > PAGE_BYTES {
+            more = true;
+            break;
+        }
+        // A bad byte shows only before the cut, as the character after the
+        // valid ones; one past it, or a character split where `next_line`
+        // stopped, is never seen.
+        lossy |= std::str::from_utf8(&line)
+            .is_err_and(|e| text[..e.valid_up_to()].chars().count() < LINE_CHARS);
+        out.push_str(&shown);
+    }
+    if n == 0 {
+        return Ok("The file is empty.".into());
+    }
+    let mb = UTF16_BYTES / (1024 * 1024);
+    if out.is_empty() {
+        let file = if cut {
+            format!("The first {mb} MB of this UTF-16 file, which is all that is read,")
+        } else {
+            "The file".into()
+        };
+        return Err(format!(
+            "{file} has {n} lines, so offset {offset} is past its end."
+        ));
+    }
+    out.pop();
+    if lossy {
+        out.push_str("\n\n[Some bytes are not UTF-8 and show as \u{FFFD}.]");
+    }
+    // Without this a cut file's last page would read as the end of the file.
+    if cut {
+        out.push_str(&format!(
+            "\n\n[Only the first {mb} MB of this UTF-16 file is read.]"
+        ));
+    }
+    // Line `n` was read to find there is more, and is where the next page
+    // starts. Past a cut there are lines that cannot be counted.
+    if more {
+        let rest = if cut { None } else { lines_left(reader) };
+        let of = rest
+            .map(|rest| format!(" of {}", n + rest))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "\n\nLines {offset}-{}{of}. Continue with offset={n}.",
+            n - 1
+        ));
+    }
+    Ok(out)
+}
+
+/// Reads the next line into `line`, without its line break and only as much
+/// of it as a page could show; false at the end of the file.
+fn next_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> Result<bool, String> {
+    // One character more than a line shows, at up to four bytes each, so a
+    // line stopped short here still reads as too long and is marked cut.
+    let keep = 4 * (LINE_CHARS as u64 + 1);
+    line.clear();
+    let read = reader
+        .by_ref()
+        .take(keep)
+        .read_until(b'\n', line)
+        .map_err(|e| e.to_string())?;
+    if line.last() == Some(&b'\n') {
+        line.pop();
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+    } else if read as u64 == keep {
+        reader.skip_until(b'\n').map_err(|e| e.to_string())?;
+    }
+    Ok(read > 0)
+}
+
+/// How many lines are left in `reader`, or `None` once it runs past
+/// `COUNT_BYTES`.
+fn lines_left(reader: &mut impl BufRead) -> Option<usize> {
+    let (mut lines, mut read, mut last) = (0, 0, b'\n');
+    loop {
+        let buf = reader.fill_buf().ok()?;
+        let Some(&end) = buf.last() else {
+            return Some(lines + usize::from(last != b'\n'));
+        };
+        lines += buf.iter().filter(|&&b| b == b'\n').count();
+        last = end;
+        let len = buf.len();
+        reader.consume(len);
+        read += len as u64;
+        if read > COUNT_BYTES {
+            return None;
         }
     }
+}
+
+/// Up to five names beside a missing `raw` that start like it, as a sentence
+/// to add to the error, or nothing.
+fn similar(raw: &str, ctx: &ToolContext) -> String {
+    let wanted = Path::new(raw);
+    let Some(file_name) = wanted.file_name() else {
+        return String::new();
+    };
+    // Through `resolve`, so no name is given from a folder that may not be
+    // read, and none for a path that is there but refused.
+    let parent = wanted.parent().and_then(Path::to_str);
+    let Ok(dir) = resolve(parent.filter(|p| !p.is_empty()).unwrap_or("."), ctx) else {
+        return String::new();
+    };
+    if dir.join(file_name).exists() {
+        return String::new();
+    }
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return String::new();
+    };
+    let name = file_name.to_string_lossy().to_lowercase();
+    let stem = match name.rsplit_once('.') {
+        Some((stem, _)) if !stem.is_empty() => stem,
+        _ => name.as_str(),
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.to_lowercase().starts_with(stem))
+        .collect();
+    if names.is_empty() {
+        return String::new();
+    }
+    names.sort();
+    let names: Vec<String> = names
+        .iter()
+        .take(5)
+        .map(|n| format!("`{}`", wanted.with_file_name(n).display()))
+        .collect();
+    format!(" Did you mean {}?", names.join(", "))
 }
 
 struct ListDir;
@@ -1079,7 +1275,7 @@ mod tests {
         };
         assert_eq!(
             run("read_file", r#"{"path":"src/a.txt"}"#, &ctx).unwrap(),
-            "hello\nWorld"
+            "1|hello\n2|World"
         );
         assert_eq!(run("list_dir", "{}", &ctx).unwrap(), "src/");
         assert_eq!(
@@ -1161,8 +1357,7 @@ mod tests {
         assert_eq!(run("extra", "{}", &ctx).unwrap(), "from a plugin");
         assert_eq!(
             run("read_file", r#"{"path":"src/a.txt"}"#, &ctx).unwrap(),
-            "hello
-World"
+            "1|hello\n2|World"
         );
         set_plugin_tools(Vec::new());
         assert!(run("extra", "{}", &ctx).is_err());
@@ -1232,18 +1427,168 @@ World"
     }
 
     #[test]
-    fn read_file_stops_at_its_limit() {
+    fn read_file_pages_through_a_long_file_by_line() {
         let dir = std::env::temp_dir().join(format!("letronna-read-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        // A two-byte character straddles the cut, which must not read as binary.
-        let text = format!("{}é{}", "a".repeat(READ_BYTES as usize - 1), "b".repeat(10));
-        std::fs::write(dir.join("long.txt"), text).unwrap();
+        let lines: Vec<String> = (1..=3000).map(|n| format!("line {n}")).collect();
+        std::fs::write(dir.join("long.txt"), lines.join("\r\n") + "\r\n").unwrap();
         let ctx = ToolContext {
             workspace: Some(dir.clone()),
             ..Default::default()
         };
-        let out = ReadFile.run(&json!({"path": "long.txt"}), &ctx).unwrap();
-        assert_eq!(out.len(), READ_BYTES as usize - 1);
+        let read = |args: Value| ReadFile.run(&args, &ctx);
+
+        // A page stops under the wire's cap and says where the rest starts.
+        let first = read(json!({"path": "long.txt"})).unwrap();
+        assert!(first.starts_with("1|line 1\n2|line 2\n"), "{first}");
+        assert!(first.len() < crate::chat::MAX_TOOL_CHARS, "{}", first.len());
+        let (body, footer) = first.rsplit_once("\n\n").unwrap();
+        let last = body.lines().count();
+        assert_eq!(
+            footer,
+            format!("Lines 1-{last} of 3000. Continue with offset={}.", last + 1)
+        );
+        let next = read(json!({"path": "long.txt", "offset": last + 1})).unwrap();
+        assert!(
+            next.starts_with(&format!("{0}|line {0}\n", last + 1)),
+            "{next}"
+        );
+
+        assert_eq!(
+            read(json!({"path": "long.txt", "offset": 10, "limit": 2})).unwrap(),
+            "10|line 10\n11|line 11\n\nLines 10-11 of 3000. Continue with offset=12."
+        );
+        // The last page needs no footer, and past it there is nothing to read.
+        assert_eq!(
+            read(json!({"path": "long.txt", "offset": 2999})).unwrap(),
+            "2999|line 2999\n3000|line 3000"
+        );
+        let past = read(json!({"path": "long.txt", "offset": 3001})).unwrap_err();
+        assert!(past.contains("3000 lines"), "{past}");
+
+        // A line too long to show whole is cut on a character, and says so.
+        let wide = format!("{}\nend", "é".repeat(5 * LINE_CHARS));
+        std::fs::write(dir.join("wide.txt"), wide).unwrap();
+        assert_eq!(
+            read(json!({"path": "wide.txt"})).unwrap(),
+            format!("1|{} … [line cut]\n2|end", "é".repeat(LINE_CHARS))
+        );
+        // A character split where the read stopped, or a bad byte past the
+        // cut, is never shown, so it gets no note.
+        let split = format!("{}\nend", "中".repeat(3 * LINE_CHARS));
+        std::fs::write(dir.join("split.txt"), split).unwrap();
+        assert_eq!(
+            read(json!({"path": "split.txt"})).unwrap(),
+            format!("1|{} … [line cut]\n2|end", "中".repeat(LINE_CHARS))
+        );
+        let bad = [&b"a".repeat(2 * LINE_CHARS)[..], b"\xFF\nend"].concat();
+        std::fs::write(dir.join("bad.txt"), bad).unwrap();
+        assert_eq!(
+            read(json!({"path": "bad.txt"})).unwrap(),
+            format!("1|{} … [line cut]\n2|end", "a".repeat(LINE_CHARS))
+        );
+        std::fs::write(dir.join("empty.txt"), "").unwrap();
+        assert_eq!(
+            read(json!({"path": "empty.txt"})).unwrap(),
+            "The file is empty."
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn read_file_drops_a_byte_order_mark_and_decodes_utf16() {
+        let dir = std::env::temp_dir().join(format!("letronna-read-bom-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let read = |path: &str| ReadFile.run(&json!({"path": path}), &ctx);
+        let text = "\u{FEFF}é\r\nz";
+        let utf16 =
+            |unit: fn(u16) -> [u8; 2]| -> Vec<u8> { text.encode_utf16().flat_map(unit).collect() };
+        std::fs::write(dir.join("bom.txt"), text).unwrap();
+        std::fs::write(dir.join("le.txt"), utf16(u16::to_le_bytes)).unwrap();
+        std::fs::write(dir.join("be.txt"), utf16(u16::to_be_bytes)).unwrap();
+        for path in ["bom.txt", "le.txt", "be.txt"] {
+            assert_eq!(read(path).unwrap(), "1|é\n2|z", "{path}");
+        }
+
+        // Text that is not UTF-8 still reads, with a note; a NUL means binary.
+        std::fs::write(dir.join("latin1.txt"), b"caf\xE9").unwrap();
+        let latin1 = read("latin1.txt").unwrap();
+        assert!(latin1.starts_with("1|caf\u{FFFD}\n\n["), "{latin1}");
+        std::fs::write(dir.join("bin.dat"), b"a\0b").unwrap();
+        assert_eq!(read("bin.dat").unwrap_err(), "Not a text file.");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn read_file_says_it_reads_only_the_start_of_a_large_utf16_file() {
+        let dir = std::env::temp_dir().join(format!("letronna-read-cut-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let read = |args: Value| ReadFile.run(&args, &ctx);
+        // Each line is 16 bytes in UTF-16, so the cap falls on a line's end.
+        let kept = UTF16_BYTES as usize / 16;
+        let write = |lines: usize| {
+            let text = format!("\u{FEFF}{}", "line 01\n".repeat(lines));
+            let bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            std::fs::write(dir.join("big.txt"), bytes).unwrap();
+        };
+
+        // Every page of a cut file says so, and none counts its lines.
+        write(kept + 100);
+        let note = "[Only the first 16 MB of this UTF-16 file is read.]";
+        assert_eq!(
+            read(json!({"path": "big.txt", "limit": 2})).unwrap(),
+            format!("1|line 01\n2|line 01\n\n{note}\n\nLines 1-2. Continue with offset=3.")
+        );
+        assert_eq!(
+            read(json!({"path": "big.txt", "offset": kept})).unwrap(),
+            format!("{kept}|line 01\n\n{note}")
+        );
+        let past = read(json!({"path": "big.txt", "offset": kept + 1})).unwrap_err();
+        assert!(past.starts_with("The first 16 MB"), "{past}");
+
+        // A file that fills the cap exactly is read whole.
+        write(kept);
+        assert_eq!(
+            read(json!({"path": "big.txt", "offset": kept})).unwrap(),
+            format!("{kept}|line 01")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn read_file_suggests_names_like_a_missing_one() {
+        let dir = std::env::temp_dir().join(format!("letronna-read-near-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        for name in ["tools.rs", "toolbox.rs", "other.rs"] {
+            std::fs::write(dir.join("src").join(name), "").unwrap();
+        }
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let missing = |path: &str| ReadFile.run(&json!({"path": path}), &ctx).unwrap_err();
+        assert_eq!(
+            missing("src/tool.rs"),
+            "`src/tool.rs` does not exist. Did you mean `src\\toolbox.rs`, `src\\tools.rs`?"
+                .replace("src\\", &format!("src{}", std::path::MAIN_SEPARATOR))
+        );
+        assert_eq!(missing("src/zzz.rs"), "`src/zzz.rs` does not exist.");
+        assert_eq!(
+            missing("nowhere/tool.rs"),
+            "`nowhere/tool.rs` does not exist."
+        );
+        // A folder outside the workspace and home is never listed, though
+        // its root has a name that starts this way.
+        let outside = if cfg!(windows) { "/Windo" } else { "/us" };
+        assert_eq!(missing(outside), format!("`{outside}` does not exist."));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
