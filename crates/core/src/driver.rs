@@ -24,7 +24,8 @@ use crate::cancel::Cancel;
 use crate::chat::{self, Connection, Event, Extra, Message, ToolCall};
 use crate::inbox::{self, Notice};
 use crate::store::{Todo, Transcript};
-use crate::tools::{self, ToolContext};
+use crate::tasks::{self, Key};
+use crate::tools::{self, Caller, ToolContext};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -35,7 +36,7 @@ pub type AgentId = u64;
 
 /// Tools no helper may call whatever it was allowed, since each reaches past
 /// its run: to the user, to what Letronna remembers, or to a later time.
-const DENY: [&str; 5] = [tools::ASK_USER, "memory", "wake_me", "schedule", "workflow"];
+pub(crate) const DENY: [&str; 5] = [tools::ASK_USER, "memory", "wake_me", "schedule", "workflow"];
 
 /// What a helper is told when it asks the user something.
 const NO_QUESTIONS: &str = "Questions are not available to helpers. Decide for yourself, or end with the open question in your report.";
@@ -70,6 +71,8 @@ pub struct Spec {
     pub cancel: Cancel,
     pub budget: Option<Arc<Budget>>,
     pub status: Arc<Status>,
+    /// How many helpers deep the agent is: 0 for a session's own, 1 for its helper.
+    pub depth: u8,
 }
 
 /// How a run is getting on, in atomics a frontend reads while the run writes them.
@@ -100,6 +103,8 @@ pub struct Report {
     pub seconds: u64,
     /// Files it wrote or edited, as it named them, each once.
     pub files: Vec<String>,
+    /// Jobs it left running, which are its owner's now.
+    pub jobs: Vec<u64>,
 }
 
 /// Why a run ended.
@@ -133,6 +138,7 @@ pub fn run(mut spec: Spec) -> Report {
         output: 0,
         seconds: 0,
         files: Vec::new(),
+        jobs: Vec::new(),
     };
     let status = steps(&mut spec, &mut turn, &mut report)
         .and_then(|status| {
@@ -146,6 +152,15 @@ pub fn run(mut spec: Spec) -> Report {
             Ok(status)
         })
         .unwrap_or_else(Outcome::Failed);
+    // Before the unread mail is passed on, so a job that exits from here on
+    // tells the owner itself, and one that exited already goes with the mail.
+    report.jobs = tasks::reown(spec.id, spec.owner)
+        .into_iter()
+        .filter_map(|key| match key {
+            Key::Job(id) => Some(id),
+            _ => None,
+        })
+        .collect();
     forward_unread(&spec);
     report.status = status;
     report.text = last_said(&spec.transcript.conversation.messages);
@@ -153,11 +168,16 @@ pub fn run(mut spec: Spec) -> Report {
     report
 }
 
-/// Runs the agent on a thread of its own, named for it.
-pub fn spawn(spec: Spec) -> Result<Handle, String> {
+/// Runs the agent on a thread of its own, named for it, and hands its report
+/// to `then` on that thread as it ends.
+pub fn spawn(spec: Spec, then: impl FnOnce(&Report) + Send + 'static) -> Result<Handle, String> {
     std::thread::Builder::new()
         .name(format!("agent-{}", spec.id))
-        .spawn(move || run(spec))
+        .spawn(move || {
+            let report = run(spec);
+            then(&report);
+            report
+        })
         .map_err(|e| format!("Could not start the helper: {e}"))
 }
 
@@ -286,9 +306,20 @@ fn refusal(allow: &Allow, name: &str) -> Option<String> {
 
 /// What this agent's tool calls can reach, stopping when it stops.
 fn context(spec: &Spec) -> ToolContext {
+    let ctx = ToolContext::of(&spec.connection);
     ToolContext {
         cancel: spec.cancel.clone(),
-        ..ToolContext::of(&spec.connection)
+        // A helper this agent starts is one deeper, in the same tree and
+        // spending from the same budget.
+        caller: Caller {
+            agent: Some(spec.id),
+            root: spec.root,
+            depth: spec.depth,
+            budget: spec.budget.clone(),
+            run: Some(spec.run),
+            ..ctx.caller.clone()
+        },
+        ..ctx
     }
 }
 
@@ -392,7 +423,7 @@ fn forward_unread(spec: &Spec) {
 }
 
 /// The last thing the agent said, which is its answer when it finished.
-fn last_said(messages: &[Message]) -> String {
+pub(crate) fn last_said(messages: &[Message]) -> String {
     messages
         .iter()
         .rev()
@@ -469,6 +500,7 @@ mod tests {
             cancel: Cancel::default(),
             budget: None,
             status: Arc::default(),
+            depth: 1,
         }
     }
 
@@ -580,7 +612,7 @@ mod tests {
     /// Runs `spec` the way `spawn` does and waits for its report.
     fn finished(spec: Spec) -> Report {
         let name = format!("agent-{}", spec.id);
-        let handle = spawn(spec).unwrap();
+        let handle = spawn(spec, |_| ()).unwrap();
         assert_eq!(handle.thread().name(), Some(name.as_str()));
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
