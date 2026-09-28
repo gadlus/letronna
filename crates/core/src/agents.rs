@@ -372,6 +372,7 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
         budget: Some(Arc::new(Budget::new(limits.budget, caller.budget.clone()))),
         status: run.status.clone(),
         depth: caller.depth + 1,
+        schema: None,
     };
     registry().helpers.push(Helper {
         id: slot.id,
@@ -1102,6 +1103,7 @@ fn resume(
         budget: Some(Arc::new(Budget::new(limits.budget, caller.budget.clone()))),
         status,
         depth: caller.depth + 1,
+        schema: None,
     };
     let started = format!(
         "{name} had finished; it is carrying on from where it stopped, with your message. A \
@@ -1287,6 +1289,7 @@ mod tests {
         Report {
             status,
             text: text.into(),
+            value: None,
             rounds: 7,
             input: 41_000,
             cached: 32_800,

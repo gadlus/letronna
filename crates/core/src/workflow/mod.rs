@@ -434,6 +434,7 @@ impl Run {
             budget: Some(charged.clone()),
             status: Arc::default(),
             depth: 1,
+            schema: None,
         };
         let owed = Owed {
             arrivals: self.arrivals.0.clone(),
@@ -934,6 +935,7 @@ mod tests {
         Report {
             status,
             text: text.into(),
+            value: None,
             rounds: 1,
             input: 1_000,
             cached: 0,
