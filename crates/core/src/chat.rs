@@ -264,9 +264,11 @@ fn body(connection: &Connection, messages: &[Message], summary: Option<&str>) ->
             system.push_str(" Other people in this chat can read your replies. Nothing on this computer is reachable from here: no files, folders or commands.");
         }
     }
-    // Memory first: it changes rarely, so the prompt's start stays cacheable;
-    // the summary of dropped turns changes as the conversation grows.
+    // Memory and skills first: they change rarely, so the prompt's start
+    // stays cacheable; the summary of dropped turns changes as the
+    // conversation grows.
     system.push_str(&crate::memory::context(connection));
+    system.push_str(&crate::skills::context(connection));
     if let Some(summary) = summary {
         system.push_str(&format!(
             "\n\nEarlier in this conversation, summarized because it no longer fits:\n{summary}"
