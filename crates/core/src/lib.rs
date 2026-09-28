@@ -28,6 +28,7 @@ pub mod schedule;
 pub mod search;
 pub mod skills;
 pub mod store;
+pub mod tasks;
 pub mod timers;
 pub mod tools;
 pub mod update;
