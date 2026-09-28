@@ -289,6 +289,11 @@ impl Tool for Agents {
         }, "required": ["action"]})
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
+        // A workflow run is stopped and reported by its name, as a helper is.
+        #[cfg(feature = "workflows")]
+        if let Some(done) = crate::workflow::tool::control(args, &ctx.caller) {
+            return done;
+        }
         let to = || text(args, "to").ok_or_else(|| "`to` is required: a helper's name.".to_owned());
         match args["action"].as_str().unwrap_or_default() {
             "list" => Ok(list(&ctx.caller)),
@@ -870,6 +875,8 @@ fn list(caller: &Caller) -> String {
         ]);
     }
     drop(registry);
+    #[cfg(feature = "workflows")]
+    rows.extend(crate::workflow::tool::rows(caller));
     if rows.len() == 1 {
         return "You have started no helpers.".into();
     }
@@ -1194,6 +1201,12 @@ fn report(caller: &Caller, to: &str, offset: usize) -> Result<String, String> {
         return Err(format!("{name}'s conversation could not be read."));
     };
     let said = driver::last_said(&transcript.conversation.messages);
+    page(&name, &said, offset)
+}
+
+/// A page of `said`, the last thing `name` said, from character `offset` on,
+/// ending with the call for the next page when there is more.
+pub(crate) fn page(name: &str, said: &str, offset: usize) -> Result<String, String> {
     let total = said.chars().count();
     if total == 0 {
         return Ok(format!("{name} has said nothing yet."));
@@ -1240,7 +1253,7 @@ fn types(ctx: &ToolContext) -> Result<String, String> {
 }
 
 /// How long a helper has run, as the list shows it: 38s, 1m12s, 2h05m.
-fn took(seconds: u64) -> String {
+pub(crate) fn took(seconds: u64) -> String {
     match seconds {
         0..60 => format!("{seconds}s"),
         60..3_600 => format!("{}m{:02}s", seconds / 60, seconds % 60),

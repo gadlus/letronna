@@ -181,6 +181,8 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(crate::agents::Agent),
         Arc::new(crate::agents::Agents),
     ];
+    #[cfg(feature = "workflows")]
+    tools.push(Arc::new(crate::workflow::tool::Workflow));
     // The user's own search service, once one is set up.
     if crate::search::ready() {
         tools.push(Arc::new(crate::search::SearchWeb));
@@ -349,6 +351,8 @@ pub fn summary(name: &str, args: &str) -> String {
             v["action"].as_str().unwrap_or_default(),
             v["target"].as_str().unwrap_or_default()
         ),
+        #[cfg(feature = "workflows")]
+        "workflow" => crate::workflow::tool::summary(&v),
         _ => v["path"].as_str().unwrap_or(".").to_owned(),
     };
     one_line(&text)
