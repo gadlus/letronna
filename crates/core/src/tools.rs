@@ -89,6 +89,11 @@ const READ_BYTES: u64 = 256 * 1024;
 /// How long a background command gets to print something before the tool
 /// replies, so the first message can carry a port or an early crash.
 const SETTLE: std::time::Duration = std::time::Duration::from_millis(1200);
+/// How long a command's output pipes get to close after its shell exits. A
+/// child it left running, like `sleep 100 &` or a daemon, holds them open
+/// for as long as it lives; 300 ms is plenty for output still in flight and
+/// too short to feel.
+const PIPE_GRACE: Duration = Duration::from_millis(300);
 
 const MAX_OUTPUT: usize = 24_000;
 const SKIP_DIRS: &[&str] = &[".git", "node_modules", "target", ".next", "dist", "build"];
@@ -332,7 +337,6 @@ pub fn shell(command: &str, cwd: Option<&Path>) -> std::process::Command {
 }
 
 fn run_shell(command: &str, cwd: Option<&Path>) -> Result<String, String> {
-    use std::io::Read;
     use std::process::Stdio;
     let mut child = shell(command, cwd)
         .stdin(Stdio::null())
@@ -340,18 +344,13 @@ fn run_shell(command: &str, cwd: Option<&Path>) -> Result<String, String> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Cannot start the shell: {e}"))?;
-    let mut stdout = child.stdout.take().unwrap();
-    let mut stderr = child.stderr.take().unwrap();
-    let out = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = stdout.read_to_string(&mut s);
-        s
-    });
-    let err = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = stderr.read_to_string(&mut s);
-        s
-    });
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        let _ = child.kill();
+        return Err("Cannot read the command's output.".into());
+    };
+    let (sender, chunks) = std::sync::mpsc::channel();
+    forward(stdout, false, sender.clone());
+    forward(stderr, true, sender);
     let started = std::time::Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
@@ -368,8 +367,9 @@ fn run_shell(command: &str, cwd: Option<&Path>) -> Result<String, String> {
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
-    let mut text = out.join().unwrap_or_default();
-    let err = err.join().unwrap_or_default();
+    let (out, err, held_open) = collect(&chunks);
+    let mut text = String::from_utf8_lossy(&out).into_owned();
+    let err = String::from_utf8_lossy(&err);
     if !err.trim().is_empty() {
         text.push_str("\n[stderr]\n");
         text.push_str(&err);
@@ -377,7 +377,66 @@ fn run_shell(command: &str, cwd: Option<&Path>) -> Result<String, String> {
     if !status.success() {
         text.push_str(&format!("\n[exit code {}]", status.code().unwrap_or(-1)));
     }
+    if held_open {
+        // First, so the cut `run` makes to a long result cannot drop it.
+        text.insert_str(
+            0,
+            "[the command started something that is still running and holds \
+             its output open; output after the command exited was not \
+             collected. To follow a process like that, run it with \
+             background: true]\n",
+        );
+    }
     Ok(text)
+}
+
+/// Send what `pipe` yields over `chunks`, marked as stderr or not, until it
+/// closes, dropping everything past `MAX_OUTPUT`.
+fn forward(
+    mut pipe: impl std::io::Read + Send + 'static,
+    stderr: bool,
+    chunks: std::sync::mpsc::Sender<(bool, Vec<u8>)>,
+) {
+    std::thread::spawn(move || {
+        let mut block = [0u8; 4096];
+        let mut sent = 0;
+        loop {
+            match pipe.read(&mut block) {
+                Ok(0) => break,
+                Ok(n) => {
+                    // `run` shows no more than `MAX_OUTPUT` and a chatty child
+                    // can print gigabytes, so the rest is dropped; reading on
+                    // anyway keeps a child left behind from blocking on a full
+                    // pipe, or dying of a broken one.
+                    if sent <= MAX_OUTPUT {
+                        sent += n;
+                        let _ = chunks.send((stderr, block[..n].to_vec()));
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+/// A finished command's stdout and stderr, and whether a pipe was still open
+/// when `PIPE_GRACE` ran out.
+fn collect(chunks: &std::sync::mpsc::Receiver<(bool, Vec<u8>)>) -> (Vec<u8>, Vec<u8>, bool) {
+    use std::sync::mpsc::RecvTimeoutError;
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let deadline = Instant::now() + PIPE_GRACE;
+    loop {
+        // A chunk already waiting is taken even past the deadline; this still
+        // ends, because `forward` stops sending past `MAX_OUTPUT`.
+        let left = deadline.saturating_duration_since(Instant::now());
+        match chunks.recv_timeout(left) {
+            Ok((true, bytes)) => err.extend(bytes),
+            Ok((false, bytes)) => out.extend(bytes),
+            Err(RecvTimeoutError::Timeout) => return (out, err, true),
+            Err(RecvTimeoutError::Disconnected) => return (out, err, false),
+        }
+    }
 }
 
 struct WriteFile;
@@ -1276,5 +1335,39 @@ World"
         };
         let refused = run("read_file", r#"{"path": "x"}"#, &shared).unwrap_err();
         assert!(refused.contains("not available here"), "{refused}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_background_child_holding_the_pipe_does_not_hang_the_command() {
+        let started = Instant::now();
+        let out = run_shell("echo before; sleep 30 & echo $!", None).unwrap();
+        let took = started.elapsed();
+        let lines: Vec<&str> = out.lines().collect();
+        if let Some(pid) = lines.get(2) {
+            let _ = std::process::Command::new("kill").arg(pid).status();
+        }
+        // Waiting on the pipe would take the whole 30 s the child sleeps.
+        assert!(took < Duration::from_secs(10), "took {took:?}");
+        let note = lines.first().copied().unwrap_or_default();
+        assert!(note.contains("was not collected"), "{out}");
+        assert_eq!(lines.get(1), Some(&"before"), "{out}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_written_before_exit_is_kept() {
+        // Several chunks' worth, then stderr, right as the shell ends, with a
+        // child still holding both pipes so only the grace can end the wait.
+        let out = run_shell(
+            "sleep 2 & head -c 20000 /dev/zero | tr '\\0' a; echo; echo warned >&2; exit 3",
+            None,
+        )
+        .unwrap();
+        let (note, rest) = out.split_once('\n').unwrap();
+        assert!(note.contains("was not collected"), "{out}");
+        let (body, rest) = rest.split_once('\n').unwrap();
+        assert_eq!(body, "a".repeat(20_000));
+        assert_eq!(rest, "\n[stderr]\nwarned\n\n[exit code 3]");
     }
 }
