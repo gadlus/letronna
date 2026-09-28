@@ -15,8 +15,8 @@ impl Chat {
         self.resolve_call(Verdict::Answer(text), cx);
     }
 
-    /// The row under the messages while tools run: a progress line, or the
-    /// card waiting on the user. `None` when nothing is queued.
+    /// The row under the messages while tools run: a line per running call,
+    /// or the card waiting on the user. `None` when nothing is queued.
     pub(crate) fn approval_card(
         &self,
         window: &mut Window,
@@ -27,21 +27,29 @@ impl Chat {
         let ctx = tools::ToolContext::of(&turn.connection);
         let summary = tools::summary(&call.name, &call.arguments);
         if !waiting {
-            return Some(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(
-                        gpui_component::spinner::Spinner::new()
-                            .xsmall()
-                            .color(cx.theme().primary),
-                    )
-                    .child(call.name.clone())
-                    .child(div().font_family(MONO_FONT).child(summary))
-                    .into_any_element(),
-            );
+            // Calls from one reply that run together get a line each, which
+            // goes as its result comes back.
+            let lines = running_calls(turn, self.outstanding)
+                .into_iter()
+                .map(|call| {
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(
+                            gpui_component::spinner::Spinner::new()
+                                .xsmall()
+                                .color(cx.theme().primary),
+                        )
+                        .child(call.name.clone())
+                        .child(
+                            div()
+                                .font_family(MONO_FONT)
+                                .child(tools::summary(&call.name, &call.arguments)),
+                        )
+                });
+            return Some(v_flex().gap_1().children(lines).into_any_element());
         }
 
         let args = tools::parse_args(&call.arguments).unwrap_or_default();

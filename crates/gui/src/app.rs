@@ -155,6 +155,9 @@ pub(crate) struct Chat {
     /// stopped turn cannot be interrupted, so they run on; what they send
     /// back carries the old number and is dropped.
     pub(crate) generation: u64,
+    /// Calls the turn in flight started that have not come back. The queue
+    /// moves on only once none are, so a batch finishes before the next step.
+    pub(crate) outstanding: usize,
     /// A remote chat that has been sent the card the turn is waiting on, and
     /// the call it is about. Its next message answers it.
     pub(crate) remote_waiting: Option<(
@@ -421,6 +424,7 @@ impl Chat {
             remote: std::collections::HashMap::new(),
             remote_session: std::collections::HashMap::new(),
             generation: 0,
+            outstanding: 0,
             remote_waiting: None,
             messaging_stop: None,
             token_input,
@@ -850,12 +854,28 @@ impl Chat {
         }
     }
 
-    /// Run the next queued call, or stop on one that needs the user.
+    /// Run the next queued calls, together where they may, or stop on one
+    /// that needs the user.
     pub(crate) fn advance_tools(&mut self, cx: &mut Context<Self>) {
+        // What comes after a batch waits until every call of it is back.
+        if self.outstanding > 0 {
+            return;
+        }
         let Some(turn) = self.turn.as_ref() else {
             return;
         };
         let gate = |name: &str| self.needs_user(name);
+        // A call that needs asking ends the batch, and is asked about below
+        // once the batch is back.
+        let batch = until_repeated_id(turn.next_batch(gate, agent::MAX_BATCH));
+        if !batch.is_empty() {
+            self.asking = None;
+            for call in batch {
+                self.execute_call(call, cx);
+            }
+            cx.notify();
+            return;
+        }
         let next = turn.next(gate);
         self.asking = match &next {
             agent::Next::AskUser(call) => Some(call.id.clone()),
@@ -920,28 +940,47 @@ impl Chat {
         }
     }
 
-    /// Run one call off the UI thread and continue the queue when it returns.
+    /// Run one call on a thread of its own, and record it by its id when it
+    /// comes back.
     fn execute_call(&mut self, call: backend::ToolCall, cx: &mut Context<Self>) {
         let ctx = self
             .turn
             .as_ref()
             .map(|turn| letronna_core::tools::ToolContext::of(&turn.connection))
             .unwrap_or_default();
+        let (id, name) = (call.id.clone(), call.name.clone());
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
             let _ = tx.send_blocking(letronna_core::tools::run(&call.name, &call.arguments, &ctx));
         });
+        self.outstanding += 1;
         let generation = self.generation;
         cx.spawn(async move |this, cx| {
-            if let Ok(result) = rx.recv().await {
-                let _ = this.update(cx, |this, cx| {
-                    if this.generation == generation {
-                        this.record_result(result, cx)
-                    }
-                });
-            }
+            // A tool that panicked still comes back, or the rest of its
+            // batch would wait for it forever.
+            let result = rx
+                .recv()
+                .await
+                .unwrap_or_else(|_| Err(format!("`{name}` stopped without finishing.")));
+            let _ = this.update(cx, |this, cx| {
+                if this.generation == generation {
+                    this.record_ran(&id, result, cx)
+                }
+            });
         })
         .detach();
+    }
+
+    /// Record the outcome of a call that ran, and move on once the rest of
+    /// its batch is back too.
+    fn record_ran(&mut self, id: &str, result: Result<String, String>, cx: &mut Context<Self>) {
+        self.outstanding = self.outstanding.saturating_sub(1);
+        if let Some(turn) = self.turn.as_mut() {
+            turn.finish_id(id, result);
+        }
+        // The calls still running are drawn from the queue, which just lost one.
+        cx.notify();
+        self.advance_tools(cx);
     }
 
     /// Record the outcome of the current call and move on.
@@ -1394,6 +1433,9 @@ impl Chat {
         self.busy = false;
         self.streaming_id = None;
         self.turn = None;
+        // Calls a stop left running come back to a generation that is gone,
+        // so the next turn must not wait for them.
+        self.outstanding = 0;
         plugins::emit(cx, plugins::AppEvent::ChatIdle);
         self.send_follow_ups(session, cx);
         // Stop means stop, and after a failure the next turn would most
@@ -1929,12 +1971,41 @@ pub(crate) fn front_call(
     }
 }
 
+/// The calls of `batch` before the first whose id an earlier one shares.
+fn until_repeated_id(mut batch: Vec<backend::ToolCall>) -> Vec<backend::ToolCall> {
+    // Results come back by id, and nothing makes a reply's ids unique, so
+    // two calls that share one would each have the other's result filed
+    // under them. The later one waits for the next batch.
+    let repeated =
+        (1..batch.len()).find(|&at| batch[..at].iter().any(|call| call.id == batch[at].id));
+    if let Some(at) = repeated {
+        batch.truncate(at);
+    }
+    batch
+}
+
+/// The calls running while `outstanding` have not come back, in the order
+/// the model made them.
+pub(crate) fn running_calls(turn: &agent::Turn, outstanding: usize) -> Vec<backend::ToolCall> {
+    // A batch is the leading run of the queue, and each call leaves the
+    // queue as it comes back, so those still out are the first left.
+    let batch = turn.next_batch(|_| false, outstanding);
+    if !batch.is_empty() {
+        return batch;
+    }
+    // A call that may not run beside others only ever runs alone, at the front.
+    front_call(turn, None)
+        .map(|(call, _)| call)
+        .into_iter()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
-    use super::{allowed_in, front_call, woken};
-    use letronna_core::agent::{Next, Turn, needs_user};
+    use super::{allowed_in, front_call, running_calls, until_repeated_id, woken};
+    use letronna_core::agent::{MAX_BATCH, Next, Turn, needs_user};
     use letronna_core::chat::{Connection, ToolCall};
     use std::collections::{HashMap, HashSet};
 
@@ -1947,6 +2018,15 @@ mod tests {
             arguments: "{}".into(),
         }]);
         turn
+    }
+
+    /// A call to `name` with its own id.
+    fn call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: "{}".into(),
+        }
     }
 
     #[test]
@@ -1994,5 +2074,80 @@ mod tests {
         assert_eq!(woken(3, &[3, 7, 5], |id| id != 3), Some(7));
         assert_eq!(woken(3, &[3], |id| id != 3), None);
         assert_eq!(woken(3, &[], any), None);
+    }
+
+    #[test]
+    fn calls_that_run_together_show_until_each_comes_back() {
+        let reads = [
+            call("a", "read_file"),
+            call("b", "list_dir"),
+            call("c", "search"),
+        ];
+        let write = call("d", "write_file");
+        let mut turn = Turn::new(Connection::default());
+        turn.begin([reads.to_vec(), vec![write.clone()]].concat());
+        let batch = turn.next_batch(|_| false, MAX_BATCH);
+        assert_eq!(batch, reads);
+        assert_eq!(running_calls(&turn, batch.len()), reads);
+
+        // The middle one comes back first; the other two still show, in order.
+        turn.finish_id("b", Ok("listed".into()));
+        assert_eq!(
+            running_calls(&turn, 2),
+            [reads[0].clone(), reads[2].clone()]
+        );
+        turn.finish_id("c", Ok("found".into()));
+        turn.finish_id("a", Ok("read".into()));
+        // The write never joined them, and shows alone once it runs.
+        assert!(turn.next_batch(|_| false, MAX_BATCH).is_empty());
+        assert_eq!(running_calls(&turn, 1), [write]);
+        turn.finish_id("d", Ok("written".into()));
+
+        // However they came back, the model reads the results in its own order.
+        assert_eq!(turn.next(|_| false), Next::Ask);
+        let order: Vec<String> = turn
+            .take_results()
+            .into_iter()
+            .map(|result| result.tool_call_id)
+            .collect();
+        assert_eq!(order, ["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn calls_that_share_an_id_run_one_after_the_other() {
+        let first = ToolCall {
+            arguments: r#"{"path":"x.rs"}"#.into(),
+            ..call("same", "read_file")
+        };
+        let second = ToolCall {
+            arguments: r#"{"path":"y.rs"}"#.into(),
+            ..call("same", "read_file")
+        };
+        let mut turn = Turn::new(Connection::default());
+        turn.begin(vec![first.clone(), second.clone(), call("c", "list_dir")]);
+        let batch = until_repeated_id(turn.next_batch(|_| false, MAX_BATCH));
+        assert_eq!(running_calls(&turn, batch.len()), batch);
+        assert_eq!(batch, [first]);
+        turn.finish_id("same", Ok("x".into()));
+
+        // The second goes out once the first is back, with what follows it.
+        let batch = until_repeated_id(turn.next_batch(|_| false, MAX_BATCH));
+        assert_eq!(batch, [second, call("c", "list_dir")]);
+        turn.finish_id("c", Ok("listed".into()));
+        turn.finish_id("same", Ok("y".into()));
+        assert_eq!(turn.next(|_| false), Next::Ask);
+        let results: Vec<(String, String)> = turn
+            .take_results()
+            .into_iter()
+            .map(|result| (result.args, result.content))
+            .collect();
+        assert_eq!(
+            results,
+            [
+                (r#"{"path":"x.rs"}"#.to_owned(), "x".to_owned()),
+                (r#"{"path":"y.rs"}"#.to_owned(), "y".to_owned()),
+                ("{}".to_owned(), "listed".to_owned()),
+            ]
+        );
     }
 }
