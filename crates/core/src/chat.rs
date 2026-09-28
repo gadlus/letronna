@@ -743,6 +743,12 @@ fn stream(
         }
     };
     let status = response.status();
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        crate::limits::backoff(
+            &connection.endpoint,
+            crate::limits::retry_after(response.headers()),
+        );
+    }
     if !status.is_success() {
         // A model that cannot take pictures turns the whole request down,
         // each provider in words of its own. Send it again without the

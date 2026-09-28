@@ -23,6 +23,7 @@ use crate::budget::Budget;
 use crate::cancel::Cancel;
 use crate::chat::{self, Connection, Event, Extra, Message, ToolCall};
 use crate::inbox::{self, Notice};
+use crate::limits::{self, Permit};
 use crate::store::{Todo, Transcript};
 use crate::tools::{self, ToolContext};
 use std::sync::Arc;
@@ -42,6 +43,11 @@ const NO_QUESTIONS: &str = "Questions are not available to helpers. Decide for y
 
 /// What a helper is told when a call it needed a yes for did not get one.
 const NOT_APPROVED: &str = "This was not approved, so it did not run. Do not try to get the same result another way: leave it, and say in your report what you could not do.";
+
+/// How many times a round the provider turned away with a 429 is asked
+/// again: rests of 2, 4 and 8 s ride out a burst, and a provider still
+/// refusing after three is out of quota, which asking again will not fix.
+const RETRIES: usize = 3;
 
 /// Which tools an agent may call, before the deny set is taken out.
 pub enum Allow {
@@ -174,7 +180,7 @@ fn steps(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result<Outcom
         {
             return Ok(Outcome::OverBudget);
         }
-        let Some(reply) = ask(spec, turn)? else {
+        let Some(reply) = ask_in_line(spec, turn)? else {
             return Ok(Outcome::Stopped);
         };
         report.input += reply.input_tokens();
@@ -320,11 +326,42 @@ fn off_thread(call: &ToolCall, ctx: &ToolContext) -> Option<Result<String, Strin
     }
 }
 
+/// Waits for a turn on the provider, then calls the model, asking again after
+/// a 429 once the provider has had its rest.
+fn ask_in_line(spec: &Spec, turn: &mut Turn) -> Result<Option<Message>, String> {
+    let gate = limits::gate(&spec.connection.endpoint);
+    let mut retries = 0;
+    loop {
+        let Some(permit) = gate.acquire(&spec.cancel) else {
+            return Ok(None);
+        };
+        let throttled = gate.throttled();
+        let error = match ask(spec, turn, permit) {
+            Ok(Some(reply)) => {
+                gate.answered();
+                return Ok(Some(reply));
+            }
+            Ok(None) => return Ok(None),
+            Err(error) => error,
+        };
+        // The error does not say which call a 429 was for, so one on this
+        // provider while the call ran counts; that costs a call at most.
+        if gate.throttled() == throttled || retries == RETRIES {
+            return Err(error);
+        }
+        retries += 1;
+        // Whatever came before the failure goes, so the next try starts clean.
+        turn.take_reply(&spec.connection.model);
+    }
+}
+
 /// Calls the model with the conversation so far and reads the reply to its
-/// end, or gives None when a stop ended it first.
-fn ask(spec: &Spec, turn: &mut Turn) -> Result<Option<Message>, String> {
+/// end, holding `permit` as long as the stream lasts, or gives None when a
+/// stop ended it first.
+fn ask(spec: &Spec, turn: &mut Turn, permit: Permit) -> Result<Option<Message>, String> {
     let extra = Extra {
         cancel: spec.cancel.clone(),
+        guard: Some(Box::new(permit)),
         ..Extra::default()
     };
     let events = chat::start_with(
@@ -831,5 +868,29 @@ mod tests {
             .rfind(|record| record["type"] == "meta")
             .unwrap();
         assert_eq!(meta["todos"], items);
+    }
+
+    #[test]
+    fn a_round_turned_away_with_a_429_is_asked_again_after_the_rest() {
+        let dir = scratch("throttled");
+        let (server, endpoint) = listen();
+        let address = server.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut first, _) = server.accept().unwrap();
+            let asked = request(&mut first);
+            // A rest of nothing, so the test does not sit out a real one.
+            write!(first, "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            let (mut second, _) = server.accept().unwrap();
+            let asked_again = request(&mut second);
+            answer(&mut second, &reply("Done after the rest.", &[]));
+            vec![asked, asked_again]
+        });
+        let provider = Stub { address, worker };
+        let report = finished(spec(endpoint.clone(), &dir, AGENTS + 80));
+        assert_eq!(report.status, Outcome::Done);
+        provider.sent();
+
+        assert_eq!(report.text, "Done after the rest.");
+        assert_eq!(limits::gate(&endpoint).throttled(), 1);
     }
 }
