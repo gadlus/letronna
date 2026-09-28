@@ -569,6 +569,8 @@ fn session_ids() -> Vec<u64> {
     };
     entries
         .filter_map(Result::ok)
+        // A lock left by a crash shares its session's stem.
+        .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
         .filter_map(|e| {
             e.path()
                 .file_stem()
@@ -1191,6 +1193,23 @@ mod tests {
         listed.save().unwrap();
         let back = replay(&dir.join("sessions/1.jsonl")).unwrap();
         assert!(back.messages.is_empty());
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_leftover_lock_file_does_not_list_a_session_twice() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("leftover-lock");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        store.conversations.push(numbered(2));
+        store.save().unwrap();
+        // What a process that died part way through a save leaves behind.
+        std::fs::write(dir.join("sessions/1.lock"), "").unwrap();
+
+        assert_eq!(summaries().len(), 1);
+        assert_eq!(super::load().conversations.len(), 1);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 }
