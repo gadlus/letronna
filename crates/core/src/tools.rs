@@ -3,7 +3,8 @@
 //!
 //! Read-only tools run without asking. Tools that change the workspace or
 //! run a command return `needs_approval`, and the chat shows a card first.
-//! `ask_user` is answered by the user, never run here.
+//! `ask_user` is answered by the user, and only runs here when nobody is there
+//! to answer it.
 
 use crate::chat::{Connection, Remote};
 use serde_json::{Value, json};
@@ -754,7 +755,7 @@ fn job_id(args: &Value) -> Result<u64, String> {
         .ok_or_else(|| "`id` is required and must be a job number.".to_owned())
 }
 
-/// Answered in the chat, not here.
+/// Answered in the chat, and run only in an unattended session to say nobody will.
 struct AskUser;
 impl Tool for AskUser {
     fn name(&self) -> &'static str {
@@ -776,7 +777,7 @@ impl Tool for AskUser {
         false
     }
     fn run(&self, _: &Value, _: &ToolContext) -> Result<String, String> {
-        Err("ask_user is answered by the user.".into())
+        Ok("Nobody is available to answer; decide for yourself and say what you assumed.".into())
     }
 }
 

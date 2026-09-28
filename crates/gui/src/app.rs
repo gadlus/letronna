@@ -120,7 +120,7 @@ pub(crate) struct Chat {
     pub(crate) streaming_id: Option<u64>,
     /// Tools the user allowed for the rest of this run of the app.
     pub(crate) session_allow: std::collections::HashSet<String>,
-    /// Sessions started by an unattended schedule, which run tools without
+    /// Sessions running an unattended schedule, which run tools without
     /// asking. Keyed by session so the grant cannot reach the user's own
     /// chats: a job saying "do not ask me at 9am" is not permission to stop
     /// asking everywhere else.
@@ -707,6 +707,7 @@ impl Chat {
             // The gateway is not usable, so the run never started and
             // `finish` will not come round to report it.
             self.scheduled.remove(&session);
+            self.unattended.remove(&session);
             let error = self.error.clone().unwrap_or_default();
             self.send_report(schedule.name.clone(), format!("Did not start: {error}"), cx);
         }
@@ -1068,8 +1069,8 @@ impl Chat {
         self.tell_remote(&source, &reply, cx);
     }
 
-    /// Whether this call has to wait for the user. `ask_user` always does:
-    /// it is a question, not an action to permit.
+    /// Whether this call has to wait for the user. `ask_user` does unless the
+    /// session is unattended: it is a question, not an action to permit.
     pub(crate) fn needs_user(&self, name: &str) -> bool {
         let unattended = self
             .streaming_id
@@ -1268,6 +1269,11 @@ impl Chat {
     fn finish(&mut self, cx: &mut Context<Self>) {
         self.answer_remote(cx);
         self.report_scheduled(cx);
+        // The grant is for the run, not the session: a follow-up typed there
+        // has someone watching, and a deleted session's id is handed out again.
+        if let Some(id) = self.streaming_id {
+            self.unattended.remove(&id);
+        }
         self.busy = false;
         self.streaming_id = None;
         self.turn = None;
