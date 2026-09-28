@@ -5,6 +5,7 @@ pub(crate) mod artifacts;
 pub(crate) mod browser;
 pub(crate) mod chrome;
 pub(crate) mod composer;
+pub(crate) mod grain;
 pub(crate) mod messages;
 pub(crate) mod messaging;
 pub(crate) mod schedules;

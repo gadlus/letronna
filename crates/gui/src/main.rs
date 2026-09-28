@@ -33,7 +33,6 @@ fn main() {
     }
     Application::new().with_assets(Assets).run(|cx| {
         gpui_component::init(cx);
-        theme::apply(cx);
         plugins::init(
             cx,
             vec![
@@ -104,7 +103,6 @@ fn main() {
                 },
             )
             .expect("Could not open native application window");
-        let _ = window.update(cx, |_, window, _| platform::window::use_dark_chrome(window));
         // With a tray to bring it back, closing the window tucks the app
         // away; without one that would strand it, so let it close.
         if platform::tray::available() {

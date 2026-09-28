@@ -176,6 +176,7 @@ impl Chat {
             .w(SIDEBAR_WIDTH)
             .h_full()
             .flex_shrink_0()
+            .relative()
             .bg(cx.theme().sidebar)
             .text_color(cx.theme().sidebar_foreground)
             .border_r(px(3.))
@@ -257,5 +258,6 @@ impl Chat {
                     .child(self.section("Sessions", cx))
                     .child(sessions),
             )
+            .children(self.grain(&self.grains.sidebar))
     }
 }
