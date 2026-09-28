@@ -325,6 +325,56 @@ impl Chat {
         });
     }
 
+    /// The session a reply is running in, when that is not the one on screen.
+    pub(crate) fn busy_elsewhere(&self) -> Option<u64> {
+        let on_screen = self.store.conversations[self.store.active].id;
+        self.streaming_id.filter(|&id| self.busy && id != on_screen)
+    }
+
+    /// While a reply runs in another session this one cannot send, so say
+    /// where it is and whether it waits on the user, with a way there.
+    pub(crate) fn busy_note(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let id = self.busy_elsewhere()?;
+        let title = &self.store.conversations[self.store.index_of(id)?].title;
+        let waiting = self.turn.as_ref().is_some_and(|turn| {
+            matches!(turn.next(|_| true),
+                letronna_core::agent::Next::AskUser(call) if self.needs_user(&call.name))
+        });
+        let text = if waiting {
+            format!("\u{201c}{title}\u{201d} is waiting on you. Answer it there, then send here.")
+        } else {
+            format!("Letronna is replying in \u{201c}{title}\u{201d}. Send here once it is done.")
+        };
+        Some(
+            h_flex()
+                .gap_2()
+                .items_center()
+                .pb_2()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(div().flex_1().min_w_0().truncate().child(text))
+                .child(
+                    Button::new("open-busy")
+                        .plain(cx)
+                        .xsmall()
+                        .label("Open it")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            // Looked up again: sessions may have moved since.
+                            let Some(index) = this.store.index_of(id) else {
+                                return;
+                            };
+                            this.store.active = index;
+                            this.error = None;
+                            this.page = Page::Chat;
+                            this.follow();
+                            this.focus_composer(window, cx);
+                            this.save();
+                            cx.notify();
+                        })),
+                ),
+        )
+    }
+
     /// The model's checklist, above the composer while work is outstanding.
     /// It disappears on its own once everything is done.
     pub(crate) fn todo_panel(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
@@ -509,7 +559,9 @@ impl Chat {
                     .icon(Icon::new(AppIcon::Mic))
                     .tooltip("Voice input, coming soon"),
             )
-            .child(if self.busy {
+            // Stop only where the reply is: in another session it would end
+            // a reply that is not on screen.
+            .child(if self.busy && self.busy_elsewhere().is_none() {
                 // A turn can wait on a slow tool or a card nobody answers;
                 // this is the way out that does not need a restart.
                 Button::new("stop")
@@ -526,6 +578,7 @@ impl Chat {
                     .rounded_full()
                     .icon(Icon::new(IconName::ArrowUp))
                     .tooltip("Send (Enter)")
+                    .disabled(self.busy)
                     .on_click(cx.listener(|this, _, window, cx| this.send(window, cx)))
             })
     }
