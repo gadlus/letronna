@@ -39,6 +39,8 @@ pub mod update;
 pub mod wake;
 pub mod watch;
 pub mod web;
+#[cfg(feature = "workflows")]
+pub mod workflow;
 
 /// The name the app goes by, used in paths and on screen.
 pub const BRAND: &str = "Letronna";
