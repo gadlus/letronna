@@ -378,7 +378,7 @@ fn shows_picture(connection: &Connection, messages: &[Message]) -> bool {
 }
 
 /// Keep both ends of an oversized tool result; the middle is rarely the point.
-fn trim(text: &str, max: usize) -> String {
+pub(crate) fn trim(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_owned();
     }
