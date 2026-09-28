@@ -118,13 +118,102 @@ impl Chat {
             other => format!("Letronna wants to use {other}"),
         };
         let preview = tools::preview(&call.name, &call.arguments, &ctx);
+        // These work in the project folder. Without one, Allow could only
+        // fail, so the card asks for the folder first.
+        let folder = self
+            .streaming_id
+            .and_then(|id| self.store.index_of(id))
+            .and_then(|ix| self.store.conversations[ix].workspace.clone());
+        let in_folder = matches!(
+            call.name.as_str(),
+            "run_command" | "write_file" | "edit_file"
+        );
+        let answers = if in_folder && folder.is_none() {
+            h_flex()
+                .gap_2()
+                .items_center()
+                .child(
+                    Button::new("approval-folder")
+                        .primary()
+                        .small()
+                        .icon(Icon::new(AppIcon::Folder))
+                        .label("Choose a project folder")
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.attach_workspace(window, cx)),
+                        ),
+                )
+                .child(
+                    Button::new("deny")
+                        .plain(cx)
+                        .small()
+                        .label("Deny")
+                        .on_click(
+                            cx.listener(|this, _, _, cx| this.resolve_call(Verdict::Deny, cx)),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("No project folder is attached yet."),
+                )
+        } else {
+            h_flex()
+                .gap_2()
+                .child(
+                    Button::new("allow")
+                        .primary()
+                        .small()
+                        .label("Allow")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.resolve_call(Verdict::Allow { remember: false }, cx)
+                        })),
+                )
+                .child(
+                    Button::new("allow-session")
+                        .framed(cx)
+                        .small()
+                        .label("Allow for this session")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.resolve_call(Verdict::Allow { remember: true }, cx)
+                        })),
+                )
+                .child(
+                    Button::new("deny")
+                        .plain(cx)
+                        .small()
+                        .label("Deny")
+                        .on_click(
+                            cx.listener(|this, _, _, cx| this.resolve_call(Verdict::Deny, cx)),
+                        ),
+                )
+        };
         Some(
             card.child(
-                div()
-                    .text_sm()
-                    .font_family(HEADING_FONT)
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(title),
+                v_flex()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_family(HEADING_FONT)
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(title),
+                    )
+                    // Where a command runs, which its text does not say.
+                    .when_some(
+                        folder.filter(|_| call.name == "run_command"),
+                        |this, folder| {
+                            this.child(
+                                div()
+                                    .text_xs()
+                                    .truncate()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("In {}", folder.display())),
+                            )
+                        },
+                    ),
             )
             .child(
                 // Scrolls only once the preview is long, so a one-line command
@@ -142,37 +231,7 @@ impl Chat {
                         cx,
                     )),
             )
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(
-                        Button::new("allow")
-                            .primary()
-                            .small()
-                            .label("Allow")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.resolve_call(Verdict::Allow { remember: false }, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("allow-session")
-                            .framed(cx)
-                            .small()
-                            .label("Allow for this session")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.resolve_call(Verdict::Allow { remember: true }, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("deny")
-                            .plain(cx)
-                            .small()
-                            .label("Deny")
-                            .on_click(
-                                cx.listener(|this, _, _, cx| this.resolve_call(Verdict::Deny, cx)),
-                            ),
-                    ),
-            )
+            .child(answers)
             .into_any_element(),
         )
     }
