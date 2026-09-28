@@ -23,15 +23,10 @@ impl Chat {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let turn = self.turn.as_ref()?;
-        // `true` here means "show me whatever is at the front", running or
-        // not; the gate below decides which of the two this is.
-        let call = match turn.next(|_| true) {
-            letronna_core::agent::Next::AskUser(call) => call,
-            _ => return None,
-        };
+        let (call, waiting) = front_call(turn, self.asking.as_deref())?;
         let ctx = tools::ToolContext::of(&turn.connection);
         let summary = tools::summary(&call.name, &call.arguments);
-        if !self.needs_user(&call.name) {
+        if !waiting {
             return Some(
                 h_flex()
                     .gap_2()
