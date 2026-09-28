@@ -26,6 +26,8 @@ pub(crate) enum Verdict {
     Allow {
         remember: bool,
     },
+    /// Allow, and keep a rule allowing calls like it in this project.
+    AllowHere,
     Deny,
     /// The reply to an `ask_user` question.
     Answer(String),
@@ -121,10 +123,21 @@ pub(crate) struct Chat {
     /// The id of the queued call the approval card is up for, decided once
     /// when the queue stopped on it.
     pub(crate) asking: Option<String>,
+    /// The rule "Always allow" keeps for the call the card is up for, worked
+    /// out once when the card came up rather than on every frame.
+    pub(crate) offer: Option<letronna_core::permissions::Rule>,
     /// Tools the user allowed for the rest of this run of the app, by the
     /// session they were allowed in. Keyed like `unattended`: "stop asking"
     /// about a tool in one chat is not a yes to it in every other chat.
     pub(crate) session_allow: letronna_core::gate::Grants,
+    /// The rules file error last shown, so that one is shown once.
+    pub(crate) rules_trouble: Option<String>,
+    /// The user's rules as last read.
+    pub(crate) rules: Result<Vec<letronna_core::permissions::Rule>, String>,
+    /// The user's and the project's rules files' modified times when `rules`
+    /// was read, so that the queue moving reads them again only once one
+    /// changed.
+    pub(crate) rules_read: Option<[Option<std::time::SystemTime>; 2]>,
     /// Sessions running an unattended schedule, which run tools without
     /// asking. Keyed by session so the grant cannot reach the user's own
     /// chats: a job saying "do not ask me at 9am" is not permission to stop
@@ -392,7 +405,11 @@ impl Chat {
             turn: None,
             streaming_id: None,
             asking: None,
+            offer: None,
             session_allow: letronna_core::gate::Grants::new(),
+            rules_trouble: None,
+            rules: Ok(Vec::new()),
+            rules_read: None,
             unattended: std::collections::HashSet::new(),
             answer,
             job_tick: false,
@@ -797,16 +814,54 @@ impl Chat {
         }
     }
 
+    /// Reads the rules files again where either changed since last time,
+    /// which the terminal may have done, and shows a new error in them once.
+    fn read_rules(&mut self) {
+        let user = letronna_core::permissions::user_file();
+        let workspace = self.call_context().workspace;
+        let project = workspace
+            .as_deref()
+            .map(|folder| folder.join(letronna_core::permissions::PROJECT_FILE));
+        let modified = |file: &std::path::Path| {
+            std::fs::metadata(file)
+                .and_then(|meta| meta.modified())
+                .ok()
+        };
+        let read = Some([modified(&user), project.as_deref().and_then(modified)]);
+        if read == self.rules_read {
+            return;
+        }
+        self.rules = letronna_core::permissions::load(&user);
+        self.rules_read = read;
+        let trouble = letronna_core::permissions::trouble(&self.rules, workspace.as_deref());
+        if trouble != self.rules_trouble {
+            if let Some(error) = &trouble {
+                self.error = Some(error.clone());
+            }
+            self.rules_trouble = trouble;
+        }
+    }
+
     /// Run the next queued call, or stop on one that needs the user.
     pub(crate) fn advance_tools(&mut self, cx: &mut Context<Self>) {
+        self.read_rules();
         let Some(turn) = self.turn.as_ref() else {
             return;
         };
-        let next = turn.next(|call| self.decide(call));
-        self.asking = match &next {
+        let next = turn.next(|call| self.decide(call, &self.rules));
+        let asking = match &next {
             agent::Next::AskUser(call) => Some(call.id.clone()),
             _ => None,
         };
+        if asking != self.asking {
+            self.offer = match &next {
+                agent::Next::AskUser(call) => {
+                    letronna_core::permissions::suggest(call, &self.call_context())
+                }
+                _ => None,
+            };
+        }
+        self.asking = asking;
         if let agent::Next::AskUser(call) | agent::Next::Run(call) = &next {
             self.show_browser(&call.name, cx);
         }
@@ -819,7 +874,7 @@ impl Chat {
             agent::Next::Run(call) if call.name == letronna_core::tools::TODO => {
                 self.apply_todo(&call.arguments.clone(), cx)
             }
-            agent::Next::Run(call) => self.execute_call(call, cx),
+            agent::Next::Run(call) => self.execute_call(call, false, cx),
             agent::Next::Refuse(_, why) => self.record_result(Err(why), cx),
             agent::Next::Ask => {
                 let results = self
@@ -838,13 +893,13 @@ impl Chat {
         }
     }
 
-    /// Run one call off the UI thread and continue the queue when it returns.
-    fn execute_call(&mut self, call: backend::ToolCall, cx: &mut Context<Self>) {
-        let ctx = self
-            .turn
-            .as_ref()
-            .map(|turn| letronna_core::tools::ToolContext::of(&turn.connection))
-            .unwrap_or_default();
+    /// Run one call off the UI thread and continue the queue when it returns;
+    /// `approved` when the user said yes to it on its card.
+    fn execute_call(&mut self, call: backend::ToolCall, approved: bool, cx: &mut Context<Self>) {
+        let ctx = letronna_core::tools::ToolContext {
+            approved,
+            ..self.call_context()
+        };
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
             let _ = tx.send_blocking(letronna_core::tools::run(&call.name, &call.arguments, &ctx));
@@ -1079,9 +1134,21 @@ impl Chat {
         self.tell_remote(&source, &reply, cx);
     }
 
+    /// The context tools of the session running now are called in.
+    fn call_context(&self) -> letronna_core::tools::ToolContext {
+        self.turn
+            .as_ref()
+            .map(|turn| letronna_core::tools::ToolContext::of(&turn.connection))
+            .unwrap_or_default()
+    }
+
     /// What becomes of `call` in the session running now, from the window's
-    /// settings and grants.
-    fn decide(&self, call: &backend::ToolCall) -> letronna_core::gate::Outcome {
+    /// settings, grants and `rules`.
+    fn decide(
+        &self,
+        call: &backend::ToolCall,
+        rules: &Result<Vec<letronna_core::permissions::Rule>, String>,
+    ) -> letronna_core::gate::Outcome {
         let unattended = self
             .streaming_id
             .is_some_and(|id| self.unattended.contains(&id));
@@ -1093,6 +1160,7 @@ impl Chat {
         let gate = letronna_core::gate::Gate::for_window(
             &ctx,
             &self.session_allow,
+            rules,
             self.store.settings.skip_approvals,
             unattended,
         );
@@ -1161,6 +1229,7 @@ impl Chat {
         // Answered, so a second click or a late reply from a chat cannot run
         // the call again while it is still running.
         self.asking = None;
+        let offer = self.offer.take();
         cx.notify();
         match verdict {
             Verdict::Answer(text) => self.record_result(Ok(text), cx),
@@ -1172,7 +1241,17 @@ impl Chat {
                         .or_default()
                         .insert(call.name.clone());
                 }
-                self.execute_call(call, cx);
+                self.execute_call(call, true, cx);
+            }
+            Verdict::AllowHere => {
+                // Into the user's own rules, held to this project: the
+                // project's file may not allow anything.
+                let file = letronna_core::permissions::user_file();
+                let kept = offer.map(|rule| letronna_core::permissions::keep(&file, rule));
+                if let Some(Err(error)) = kept {
+                    self.error = Some(error);
+                }
+                self.execute_call(call, true, cx);
             }
         }
     }
@@ -1695,6 +1774,8 @@ mod tests {
                 ctx: &ctx,
                 skip_approvals,
                 grants: &none,
+                rules: &[],
+                broken: None,
                 human: true,
             };
             turn.next(|call| decide(call, &gate))

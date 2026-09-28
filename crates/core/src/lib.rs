@@ -21,6 +21,7 @@ pub mod media;
 pub mod memory;
 pub mod messaging;
 mod page;
+pub mod permissions;
 pub mod schedule;
 pub mod search;
 pub mod skills;

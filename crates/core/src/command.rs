@@ -218,6 +218,14 @@ pub enum Risk {
 pub struct Command {
     pub argv: Vec<String>,
     pub risk: Risk,
+    /// Where `argv` reaches the command itself, past `sudo`, `env X=1` and
+    /// the like.
+    pub at: usize,
+    /// The commands of the line it hands to another shell, as `sh -c` does.
+    pub nested: Vec<Command>,
+    /// The files its output is written to after `>` and `>>`, leaving out
+    /// those that go nowhere, such as `/dev/null`.
+    pub writes: Vec<String>,
 }
 
 /// A line judged: each command in it, and the worst of them.
@@ -944,6 +952,7 @@ impl Scanner<'_> {
 fn judge(simple: &Simple, dialect: Dialect, places: &Places, depth: u8) -> Command {
     let argv: Vec<String> = simple.words.iter().map(|w| w.text.clone()).collect();
     let (at, least) = peel(&argv, dialect);
+    let mut nested = Vec::new();
     let mut risk = match argv.get(at) {
         Some(word) => classify(
             &name_of(word),
@@ -952,6 +961,7 @@ fn judge(simple: &Simple, dialect: Dialect, places: &Places, depth: u8) -> Comma
             dialect,
             places,
             depth,
+            &mut nested,
         ),
         None => Risk::Plain,
     }
@@ -977,7 +987,18 @@ fn judge(simple: &Simple, dialect: Dialect, places: &Places, depth: u8) -> Comma
             "reaches the cloud machine's own credentials",
         ));
     }
-    Command { argv, risk }
+    Command {
+        argv,
+        risk,
+        at,
+        nested,
+        writes: simple
+            .writes
+            .iter()
+            .filter(|w| !nowhere(w))
+            .map(|w| w.text.clone())
+            .collect(),
+    }
 }
 
 /// Steps past what only sets a command up -- `sudo`, `env X=1`, `timeout 5`,
@@ -1013,6 +1034,12 @@ fn peel(argv: &[String], dialect: Dialect) -> (usize, Risk) {
                 at += 1;
                 break;
             }
+            // `env -S` splits its value into a command line of its own.
+            let split = word.starts_with("--split-string")
+                || (word.starts_with('-') && !word.starts_with("--") && word.contains('S'));
+            if name == "env" && split {
+                return (argv.len(), least.max(Risk::Opaque));
+            }
             if word.starts_with('-') {
                 at += 1 + usize::from(values.contains(&word.as_str()));
             } else if assignment(word) || word.starts_with(|c: char| c.is_ascii_digit()) {
@@ -1036,7 +1063,7 @@ fn assignment(word: &str) -> bool {
 
 /// A command's name as the tables know it: no folder, no `.exe`, lowercase,
 /// and aliases resolved.
-fn name_of(word: &str) -> String {
+pub(crate) fn name_of(word: &str) -> String {
     let base = word
         .rsplit(['/', '\\'])
         .next()
@@ -1061,6 +1088,7 @@ fn classify(
     dialect: Dialect,
     places: &Places,
     depth: u8,
+    nested: &mut Vec<Command>,
 ) -> Risk {
     let lower: Vec<String> = args.iter().map(|a| a.to_lowercase()).collect();
     let any = |test: &dyn Fn(&str) -> bool| lower.iter().any(|a| test(a));
@@ -1084,11 +1112,11 @@ fn classify(
         "shutdown" => POWER,
         "init" if has("0") || has("6") => POWER,
         "systemctl" if ["poweroff", "reboot", "halt"].into_iter().any(has) => POWER,
-        "cmd" => cmd(args, places, depth),
-        "powershell" => powershell(args, places, depth),
-        "sh" => sh(args, simple.piped, places, depth),
-        "eval" => inner(&args.join(" "), dialect, places, depth),
-        "su" | "runuser" => su(args, places, depth).max(ADMIN),
+        "cmd" => cmd(args, places, depth, nested),
+        "powershell" => powershell(args, places, depth, nested),
+        "sh" => sh(args, simple.piped, places, depth, nested),
+        "eval" => inner(&args.join(" "), dialect, places, depth, nested),
+        "su" | "runuser" => su(args, places, depth, nested).max(ADMIN),
         "iex" => Risk::Dangerous("runs a string as code, such as a downloaded script"),
         "git" => git(args),
         "chmod" if has("777") => Risk::Dangerous("lets anyone change the files"),
@@ -1169,17 +1197,23 @@ fn recurses(flag: &str, dialect: Dialect) -> bool {
 }
 
 /// `cmd /c` runs the words after its switch as a line of its own.
-fn cmd(args: &[String], places: &Places, depth: u8) -> Risk {
+fn cmd(args: &[String], places: &Places, depth: u8, nested: &mut Vec<Command>) -> Risk {
     let switch = |a: &String| matches!(a.to_lowercase().as_str(), "/c" | "/k" | "/r");
     match args.iter().position(switch) {
-        Some(at) => inner(&args[at + 1..].join(" "), Dialect::Cmd, places, depth),
+        Some(at) => inner(
+            &args[at + 1..].join(" "),
+            Dialect::Cmd,
+            places,
+            depth,
+            nested,
+        ),
         None => Risk::Plain,
     }
 }
 
 /// `powershell` runs the words after `-Command`, or from its first plain
 /// word on, as a line of its own; an encoded command cannot be read.
-fn powershell(args: &[String], places: &Places, depth: u8) -> Risk {
+fn powershell(args: &[String], places: &Places, depth: u8, nested: &mut Vec<Command>) -> Risk {
     const VALUES: &[&str] = &[
         "executionpolicy",
         "ep",
@@ -1197,7 +1231,13 @@ fn powershell(args: &[String], places: &Places, depth: u8) -> Risk {
     let mut at = 0;
     while let Some(arg) = args.get(at) {
         let Some(flag) = arg.strip_prefix(['-', '/']).map(str::to_lowercase) else {
-            return inner(&args[at..].join(" "), Dialect::PowerShell, places, depth);
+            return inner(
+                &args[at..].join(" "),
+                Dialect::PowerShell,
+                places,
+                depth,
+                nested,
+            );
         };
         if "command".starts_with(&flag) {
             return inner(
@@ -1205,6 +1245,7 @@ fn powershell(args: &[String], places: &Places, depth: u8) -> Risk {
                 Dialect::PowerShell,
                 places,
                 depth,
+                nested,
             );
         }
         if "encodedcommand".starts_with(&flag) || flag == "ec" {
@@ -1221,13 +1262,13 @@ fn powershell(args: &[String], places: &Places, depth: u8) -> Risk {
 
 /// `sh -c` runs its next word as a line; with no script to run, a shell runs
 /// whatever comes in on its input.
-fn sh(args: &[String], piped: bool, places: &Places, depth: u8) -> Risk {
+fn sh(args: &[String], piped: bool, places: &Places, depth: u8, nested: &mut Vec<Command>) -> Risk {
     let mut at = 0;
     while let Some(arg) = args.get(at) {
         if arg.starts_with('-') && !arg.starts_with("--") && arg.contains('c') {
-            return args
-                .get(at + 1)
-                .map_or(Risk::Plain, |line| inner(line, Dialect::Sh, places, depth));
+            return args.get(at + 1).map_or(Risk::Plain, |line| {
+                inner(line, Dialect::Sh, places, depth, nested)
+            });
         }
         if !arg.starts_with(['-', '+']) {
             return Risk::Plain;
@@ -1243,27 +1284,36 @@ fn sh(args: &[String], piped: bool, places: &Places, depth: u8) -> Risk {
 
 /// `su -c` and `runuser -c` run their value as a line of sh, as another user;
 /// between their options sits the user's name.
-fn su(args: &[String], places: &Places, depth: u8) -> Risk {
+fn su(args: &[String], places: &Places, depth: u8, nested: &mut Vec<Command>) -> Risk {
     for (at, arg) in args.iter().enumerate() {
         if let Some(line) = arg.strip_prefix("--command=") {
-            return inner(line, Dialect::Sh, places, depth);
+            return inner(line, Dialect::Sh, places, depth, nested);
         }
         let short = arg.starts_with('-') && !arg.starts_with("--") && arg.contains('c');
         if short || arg == "--command" {
-            return args
-                .get(at + 1)
-                .map_or(Risk::Plain, |line| inner(line, Dialect::Sh, places, depth));
+            return args.get(at + 1).map_or(Risk::Plain, |line| {
+                inner(line, Dialect::Sh, places, depth, nested)
+            });
         }
     }
     Risk::Plain
 }
 
-/// What a line handed to another shell would do, down to `DEPTH` shells.
-fn inner(line: &str, dialect: Dialect, places: &Places, depth: u8) -> Risk {
+/// What a line handed to another shell would do, down to `DEPTH` shells;
+/// its commands go into `nested`.
+fn inner(
+    line: &str,
+    dialect: Dialect,
+    places: &Places,
+    depth: u8,
+    nested: &mut Vec<Command>,
+) -> Risk {
     if depth >= DEPTH {
         return Risk::Opaque;
     }
-    assess_in(line, dialect, places, depth + 1).risk
+    let line = assess_in(line, dialect, places, depth + 1);
+    nested.extend(line.commands);
+    line.risk
 }
 
 /// The git commands that throw work away or rewrite what others have.
@@ -1300,10 +1350,14 @@ fn git(args: &[String]) -> Risk {
     }
 }
 
+/// Whether a write to `word` goes nowhere, as one to `/dev/null` does.
+fn nowhere(word: &Word) -> bool {
+    NOWHERE.contains(&word.text.to_lowercase().as_str())
+}
+
 /// Whether a reader stays one: every word known, and nothing written but to
 /// nowhere, no program run for it and no other machine's share read.
 fn reads_only(simple: &Simple) -> bool {
-    let nowhere = |w: &Word| NOWHERE.contains(&w.text.to_lowercase().as_str());
     simple.writes.iter().all(nowhere)
         && simple.words.iter().all(|w| {
             !w.var
@@ -1757,6 +1811,8 @@ mod tests {
                 "echo $(date)",
                 "echo `date`",
                 "python -c 'print(1)'",
+                "env -S 'git push'",
+                "env --split-string='git push'",
                 "echo 'unclosed",
                 "for f in *.txt; do echo $f; done",
                 "cat <<EOF > notes.md\nrm -rf / is a bad idea\nEOF",

@@ -12,12 +12,14 @@
 //! allowed, then asking.
 //!
 //! It is plain code with no network and nothing slow, so the window calls it
-//! on its UI thread each time the queue moves. Later layers -- rules by
-//! argument, known read-only commands, the modes, the judge -- slot in at
-//! the places marked below, in the order the comments give.
+//! on its UI thread each time the queue moves; it reads the project's small
+//! rules file, and its caller hands it the user's. Later layers -- known read-only commands,
+//! the modes, the judge -- slot in at the places marked below, in the order
+//! the comments give.
 
 use crate::chat::ToolCall;
 use crate::command::{self, Dialect, Risk};
+use crate::permissions::{self, Rule};
 use crate::tools::{self, Tool, ToolContext};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -47,6 +49,12 @@ pub struct Gate<'a> {
     pub skip_approvals: bool,
     /// What the user allowed; only the call's own session counts.
     pub grants: &'a Grants,
+    /// The user's rules by argument, for every project; `decide` passes
+    /// over those for other projects and adds the project's own file.
+    pub rules: &'a [Rule],
+    /// Why the user's rules file could not be read, if it could not: what it
+    /// denies is unknown, so no approval is taken as given.
+    pub broken: Option<&'a str>,
     /// Someone can answer right now; false for an unattended schedule and
     /// for `-p` with no terminal to answer in.
     pub human: bool,
@@ -58,6 +66,7 @@ impl<'a> Gate<'a> {
     pub fn for_window(
         ctx: &'a ToolContext,
         grants: &'a Grants,
+        rules: &'a Result<Vec<Rule>, String>,
         skip_setting: bool,
         unattended: bool,
     ) -> Self {
@@ -65,6 +74,8 @@ impl<'a> Gate<'a> {
             ctx,
             skip_approvals: skip_setting || unattended,
             grants,
+            rules: rules.as_deref().unwrap_or_default(),
+            broken: rules.as_ref().err().map(String::as_str),
             human: !unattended,
         }
     }
@@ -74,6 +85,7 @@ impl<'a> Gate<'a> {
     pub fn for_terminal(
         ctx: &'a ToolContext,
         grants: &'a Grants,
+        rules: &'a Result<Vec<Rule>, String>,
         yes: bool,
         answerable: bool,
     ) -> Self {
@@ -81,6 +93,8 @@ impl<'a> Gate<'a> {
             ctx,
             skip_approvals: yes,
             grants,
+            rules: rules.as_deref().unwrap_or_default(),
+            broken: rules.as_ref().err().map(String::as_str),
             human: answerable,
         }
     }
@@ -103,15 +117,34 @@ pub fn decide(call: &ToolCall, gate: &Gate) -> Outcome {
     // that is hard to take back needs a person's yes even when approvals are
     // skipped or the tool is allowed.
     let risk = risk(tool.name(), &args, gate.ctx);
-    match risk {
-        Some(Risk::Hardline(why)) => return Outcome::Refuse(never(why)),
-        Some(Risk::Dangerous(why)) => return dangerous(why, gate),
-        _ => {}
+    if let Some(Risk::Hardline(why)) = risk {
+        return Outcome::Refuse(never(why));
+    }
+    // Layer 2, rules by argument. A deny comes before the floor's asking
+    // too, since a yes on that card would let the call run.
+    let ruling = permissions::check(gate.rules, tool.as_ref(), &args, gate.ctx);
+    if let Some(rule) = &ruling.deny {
+        return Outcome::Refuse(denied(rule));
+    }
+    // A line the floor cannot read, such as `git $(echo push)`, could be
+    // what a deny rule names, so a person looks at it as at a risky one.
+    if let (Some(Risk::Opaque), Some(rule)) = (risk, &ruling.denies) {
+        return dangerous(&unreadable(rule), gate);
+    }
+    if let Some(Risk::Dangerous(why)) = risk {
+        return dangerous(why, gate);
+    }
+    // Reading keys or passwords sends them to the model's provider, so the
+    // floor asks about it too.
+    if let Some(why) = secret(tool.as_ref(), &args, gate.ctx) {
+        return sensitive(&why, gate);
+    }
+    if let Some(rule) = &ruling.ask {
+        return asked(rule, gate);
     }
     // What the floor cannot see into, such as `python -c` or `$(...)`, could
     // be anything, so a yes to other commands does not cover it.
     let opaque = matches!(risk, Some(Risk::Opaque));
-    // Layer 2, deny and ask rules by argument, goes here.
     if !tool.needs_approval() {
         return Outcome::Run;
     }
@@ -124,15 +157,22 @@ pub fn decide(call: &ToolCall, gate: &Gate) -> Outcome {
             Outcome::Run
         };
     }
+    // A rules file that cannot be read could deny this call, so no setting,
+    // grant or allow answers for it.
+    if let Some(why) = gate.broken.or(ruling.broken.as_deref()) {
+        return held(why, tool.name(), gate);
+    }
     // Layer 3, the mode's refusals, goes here; skipping approvals is what
     // the mode ladder will call Bypass.
     if gate.skip_approvals {
         return Outcome::Run;
     }
-    // Layer 4: what the user allowed in this session. Allow rules by
-    // argument join the grants here.
-    let granted = gate.grants.get(&gate.ctx.conversation);
-    if !opaque && granted.is_some_and(|tools| tools.contains(tool.name())) {
+    // Layer 4: what the user allowed in this session or by rule.
+    let granted = gate
+        .grants
+        .get(&gate.ctx.conversation)
+        .is_some_and(|tools| tools.contains(tool.name()));
+    if !opaque && (granted || ruling.allow) {
         return Outcome::Run;
     }
     // Layers 5 (known read-only commands), 6 (edits inside the workspace)
@@ -219,6 +259,84 @@ fn dangerous(why: &str, gate: &Gate) -> Outcome {
     Outcome::Ask
 }
 
+/// Why reading what `args` names needs the user's yes, as it holds keys,
+/// passwords or tokens; `None` for any other call.
+fn secret(tool: &dyn Tool, args: &Value, ctx: &ToolContext) -> Option<String> {
+    // A write stays in the project, where `resolve_write` keeps it; it is
+    // the reads through `tools::resolve` that could carry a key away.
+    if matches!(tool.name(), "write_file" | "edit_file") {
+        return None;
+    }
+    let raw = args["path"].as_str()?;
+    tools::holds_secrets(raw, ctx).then(|| format!("`{raw}` holds keys, passwords or tokens"))
+}
+
+/// Asks the user at this computer before a read of keys or passwords, or
+/// refuses it when they cannot be asked, as `dangerous` does.
+fn sensitive(why: &str, gate: &Gate) -> Outcome {
+    if !gate.human || gate.ctx.remote.is_some() {
+        return Outcome::Refuse(format!(
+            "Refused: {why}, and only the user at the computer can allow \
+             reading it. Ask the user to paste what you need from it."
+        ));
+    }
+    Outcome::Ask
+}
+
+/// The refusal for a call a permission rule denies.
+fn denied(rule: &Rule) -> String {
+    format!(
+        "Refused: a permission rule denies {}. Do not look for another way to \
+         do it; say in your answer what was left undone.",
+        described(rule)
+    )
+}
+
+/// What a line that cannot be read does while a permission rule denies some
+/// of what its tool can do, as `dangerous` words it.
+fn unreadable(rule: &Rule) -> String {
+    format!(
+        "holds a part only known when it runs, which could be what a \
+         permission rule denies ({})",
+        described(rule)
+    )
+}
+
+/// Asks about a call a permission rule says to ask about, or refuses it when
+/// nobody can answer.
+fn asked(rule: &Rule, gate: &Gate) -> Outcome {
+    if gate.human {
+        return Outcome::Ask;
+    }
+    Outcome::Refuse(format!(
+        "Refused: a permission rule asks the user first about {}, and nobody \
+         is here to answer. Carry on without it and say what was left undone.",
+        described(rule)
+    ))
+}
+
+/// Asks about `tool`'s call while a rules file cannot be read, or refuses it
+/// when nobody can answer.
+fn held(why: &str, tool: &str, gate: &Gate) -> Outcome {
+    if gate.human {
+        return Outcome::Ask;
+    }
+    Outcome::Refuse(format!(
+        "Refused: {why}, so `{tool}` needs the user's yes until it is fixed, \
+         and nobody is here to give it. Carry on without it and say what was \
+         left undone."
+    ))
+}
+
+/// A rule's tool and pattern as a refusal names them.
+fn described(rule: &Rule) -> String {
+    if rule.whole() {
+        format!("`{}`", rule.tool)
+    } else {
+        format!("`{}` for `{}`", rule.tool, rule.pattern)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,6 +409,8 @@ mod tests {
                             ctx: &ctx,
                             skip_approvals,
                             grants,
+                            rules: &[],
+                            broken: None,
                             human,
                         };
                         let Outcome::Refuse(why) = decide(&command(HARDLINE), &gate) else {
@@ -313,6 +433,8 @@ mod tests {
                 ctx: &ctx,
                 skip_approvals,
                 grants,
+                rules: &[],
+                broken: None,
                 human: true,
             };
             assert_eq!(decide(&command(DANGEROUS), &gate), Outcome::Ask);
@@ -325,6 +447,8 @@ mod tests {
             ctx: &ctx,
             skip_approvals: false,
             grants: &granted,
+            rules: &[],
+            broken: None,
             human: true,
         };
         assert_eq!(decide(&command(DANGEROUS), &gate), Outcome::Ask);
@@ -342,12 +466,16 @@ mod tests {
             ctx: &here,
             skip_approvals,
             grants: &none,
+            rules: &[],
+            broken: None,
             human: false,
         };
         let from_a_chat = Gate {
             ctx: &chat,
             skip_approvals: true,
             grants: &none,
+            rules: &[],
+            broken: None,
             human: true,
         };
         for (gate, reason) in [
@@ -371,6 +499,8 @@ mod tests {
             ctx: &chat,
             skip_approvals: false,
             grants: &none,
+            rules: &[],
+            broken: None,
             human: true,
         };
         assert_eq!(decide(&write(), &gate), Outcome::Ask);
@@ -389,6 +519,8 @@ mod tests {
             ctx: &ctx,
             skip_approvals: true,
             grants: &none,
+            rules: &[],
+            broken: None,
             human: true,
         };
         let mut turn = Turn::new(Connection::default());
@@ -418,6 +550,8 @@ mod tests {
                 ctx: &ctx,
                 skip_approvals,
                 grants: &granted,
+                rules: &[],
+                broken: None,
                 human,
             };
             decide(&command(OPAQUE), &gate)
@@ -432,6 +566,8 @@ mod tests {
             ctx: &ctx,
             skip_approvals: false,
             grants: &granted,
+            rules: &[],
+            broken: None,
             human: true,
         };
         assert_eq!(decide(&command("cargo test"), &gate), Outcome::Run);
@@ -449,6 +585,8 @@ mod tests {
                 ctx: &ctx,
                 skip_approvals: false,
                 grants: &grants,
+                rules: &[],
+                broken: None,
                 human,
             };
             decide(&write(), &gate)
@@ -477,7 +615,7 @@ mod tests {
             HashSet::from(["write_file".to_owned(), "run_command".to_owned()]),
         )]);
         let none = Grants::new();
-        let ctx = ToolContext::default();
+        let (ctx, rules) = (ToolContext::default(), Ok(Vec::new()));
         for grants in [&none, &granted] {
             // Asking as usual; "Skip tool approvals" and --yes; and an
             // unattended schedule and `-p --yes` fed from a pipe.
@@ -486,8 +624,8 @@ mod tests {
                 (true, false, true, true),
                 (false, true, true, false),
             ] {
-                let window = Gate::for_window(&ctx, grants, skip, unattended);
-                let terminal = Gate::for_terminal(&ctx, grants, yes, answerable);
+                let window = Gate::for_window(&ctx, grants, &rules, skip, unattended);
+                let terminal = Gate::for_terminal(&ctx, grants, &rules, yes, answerable);
                 for queued in &calls {
                     let mut turn = Turn::new(Connection::default());
                     turn.begin(vec![queued.clone()]);
@@ -532,6 +670,8 @@ mod tests {
                 ctx: &ctx,
                 skip_approvals,
                 grants,
+                rules: &[],
+                broken: None,
                 human,
             };
             let outcome = match decide(queued, &gate) {
@@ -555,6 +695,8 @@ mod tests {
             ctx: &ctx,
             skip_approvals: true,
             grants: &none,
+            rules: &[],
+            broken: None,
             human: false,
         };
         let question = call(tools::ASK_USER, serde_json::json!({ "question": "Which?" }));
@@ -569,5 +711,170 @@ mod tests {
             answer.starts_with("Nobody is available to answer"),
             "{answer}"
         );
+    }
+
+    #[test]
+    fn a_deny_rule_beats_a_session_grant() {
+        let rules = [Rule {
+            tool: "run_command".into(),
+            pattern: "git push".into(),
+            effect: permissions::Effect::Deny,
+            project: None,
+        }];
+        let ctx = ToolContext::default();
+        let grants = commands_granted();
+        for skip_approvals in [false, true] {
+            let gate = Gate {
+                ctx: &ctx,
+                skip_approvals,
+                grants: &grants,
+                rules: &rules,
+                broken: None,
+                human: true,
+            };
+            for line in [
+                "git push origin main",
+                "cargo test; git push",
+                "sh -c 'git push'",
+            ] {
+                let outcome = decide(&command(line), &gate);
+                assert!(matches!(outcome, Outcome::Refuse(_)), "{line}: {outcome:?}");
+            }
+            assert_eq!(decide(&command("git status"), &gate), Outcome::Run);
+        }
+    }
+
+    #[test]
+    fn a_deny_rule_holds_through_git_options_and_unreadable_lines() {
+        let rules = [Rule {
+            tool: "run_command".into(),
+            pattern: "git push".into(),
+            effect: permissions::Effect::Deny,
+            project: None,
+        }];
+        let (here, chat) = (ToolContext::default(), chat());
+        let none = Grants::new();
+        // Lines that could be what the rule denies, the last risky as well.
+        let unreadable = [
+            "env -S 'git push'",
+            "git $(echo push)",
+            "g=git; $g push",
+            OPAQUE,
+            "git reset --hard HEAD~1; git $(echo push)",
+        ];
+        for skip_approvals in [false, true] {
+            // Someone at the computer, nobody, and a yes from a chat.
+            for (ctx, human, answered) in [
+                (&here, true, true),
+                (&here, false, false),
+                (&chat, true, false),
+            ] {
+                let gate = Gate {
+                    ctx,
+                    skip_approvals,
+                    grants: &none,
+                    rules: &rules,
+                    broken: None,
+                    human,
+                };
+                for line in ["git -C . push", "git --no-pager push"] {
+                    let outcome = decide(&command(line), &gate);
+                    assert!(matches!(outcome, Outcome::Refuse(_)), "{line}: {outcome:?}");
+                }
+                // Asked about as a risky line is, even with approvals skipped.
+                for line in unreadable {
+                    let outcome = decide(&command(line), &gate);
+                    let fits = if answered {
+                        outcome == Outcome::Ask
+                    } else {
+                        matches!(outcome, Outcome::Refuse(_))
+                    };
+                    assert!(fits, "{line} ({answered}): {outcome:?}");
+                }
+            }
+        }
+        // With no deny on the tool, skipped approvals run it as before.
+        let free = Gate {
+            ctx: &here,
+            skip_approvals: true,
+            grants: &none,
+            rules: &[],
+            broken: None,
+            human: true,
+        };
+        assert_eq!(decide(&command(OPAQUE), &free), Outcome::Run);
+    }
+
+    #[test]
+    fn a_secret_file_asks_instead_of_refusing() {
+        let dir = std::env::temp_dir().join(format!("letronna-gate-secret-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".env"), "TOKEN=x").unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let read = call("read_file", serde_json::json!({ "path": ".env" }));
+        let none = Grants::new();
+        let gate = |skip_approvals, human| Gate {
+            ctx: &ctx,
+            skip_approvals,
+            grants: &none,
+            rules: &[],
+            broken: None,
+            human,
+        };
+        // Skipping approvals does not skip this one: the key would leave.
+        assert_eq!(decide(&read, &gate(false, true)), Outcome::Ask);
+        assert_eq!(decide(&read, &gate(true, true)), Outcome::Ask);
+        assert!(matches!(
+            decide(&read, &gate(true, false)),
+            Outcome::Refuse(_)
+        ));
+        // Only the yes on the card lets the read through.
+        assert!(tools::run(&read.name, &read.arguments, &ctx).is_err());
+        let approved = ToolContext {
+            approved: true,
+            ..ctx.clone()
+        };
+        let out = tools::run(&read.name, &read.arguments, &approved).unwrap();
+        assert!(out.contains("TOKEN=x"), "{out}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_broken_rules_file_holds_every_approval_for_a_person() {
+        let granted = commands_granted();
+        let broken = Err("permissions.json is not a list of rules".to_owned());
+        let dir = std::env::temp_dir().join(format!("letronna-gate-broken-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".letronna")).unwrap();
+        std::fs::write(dir.join(".letronna/permissions.json"), "[{").unwrap();
+        let (here, project) = (
+            ToolContext::default(),
+            ToolContext {
+                workspace: Some(dir.clone()),
+                ..Default::default()
+            },
+        );
+        // The user's file broken, then the project's.
+        for (ctx, rules) in [(&here, &broken), (&project, &Ok(Vec::new()))] {
+            // Asking as usual, approvals skipped, and an unattended schedule.
+            for (skip, unattended) in [(false, false), (true, false), (false, true)] {
+                let gate = Gate::for_window(ctx, &granted, rules, skip, unattended);
+                let outcome = decide(&command("cargo test"), &gate);
+                if unattended {
+                    let Outcome::Refuse(why) = outcome else {
+                        panic!("ran with nobody there: {outcome:?}");
+                    };
+                    assert!(why.contains("permissions.json"), "{why}");
+                } else {
+                    assert_eq!(outcome, Outcome::Ask);
+                }
+                // A tool that never needs a yes still runs.
+                let listing = call("list_dir", serde_json::json!({ "path": "." }));
+                assert_eq!(decide(&listing, &gate), Outcome::Run);
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

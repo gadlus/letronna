@@ -25,6 +25,9 @@ pub struct ToolContext {
     pub conversation: u64,
     /// Plan mode, in which a tool that changes things is refused when named.
     pub plan: bool,
+    /// The user said yes to this very call on its card, which lets a read
+    /// the gate asked about reach a file of keys.
+    pub approved: bool,
 }
 
 impl ToolContext {
@@ -34,6 +37,7 @@ impl ToolContext {
             remote: connection.remote.clone(),
             conversation: connection.conversation,
             plan: connection.plan,
+            approved: false,
         }
     }
 
@@ -833,14 +837,21 @@ pub(crate) fn resolve(raw: &str, ctx: &ToolContext) -> Result<PathBuf, String> {
             "`{raw}` is in Letronna's own folder, with the keys and sign-in; it stays out of reach."
         ));
     }
-    // Refused rather than asked about: the approval gate sees a tool's name,
-    // not the path it was given, so it cannot tell this read from any other.
-    if secret(&path) {
+    // The gate asks before such a read; a call that reached here without
+    // that yes, such as a helper's, is refused as before.
+    if secret(&path) && !ctx.approved {
         return Err(format!(
             "`{raw}` holds keys, passwords or tokens, so it stays out of reach. Ask the user to paste what you need from it."
         ));
     }
     Ok(path)
+}
+
+/// Whether `raw` names a file or folder that holds keys, passwords or
+/// tokens, links followed, as `resolve` would find it.
+pub(crate) fn holds_secrets(raw: &str, ctx: &ToolContext) -> bool {
+    let base = ctx.workspace.clone().or_else(home).unwrap_or_default();
+    std::fs::canonicalize(base.join(raw)).is_ok_and(|path| secret(&path))
 }
 
 /// Whether `path` lies in Letronna's own folder, `data`, which holds the API
@@ -888,7 +899,7 @@ fn secret(path: &Path) -> bool {
             .is_some_and(|rest| !matches!(rest, "example" | "sample"))
 }
 
-fn path_arg(args: &Value) -> &str {
+pub(crate) fn path_arg(args: &Value) -> &str {
     args["path"].as_str().unwrap_or(".")
 }
 
