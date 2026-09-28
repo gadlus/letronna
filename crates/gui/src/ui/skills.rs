@@ -5,7 +5,9 @@ use letronna_core::skills::{self, Skill};
 
 impl Chat {
     fn save_skills(&mut self, cx: &mut Context<Self>) {
-        skills::save(&self.skills);
+        if let Err(why) = skills::save(&self.skills) {
+            self.error = Some(why);
+        }
         cx.notify();
     }
 
