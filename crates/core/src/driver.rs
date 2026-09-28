@@ -423,7 +423,7 @@ fn forward_unread(spec: &Spec) {
 }
 
 /// The last thing the agent said, which is its answer when it finished.
-fn last_said(messages: &[Message]) -> String {
+pub(crate) fn last_said(messages: &[Message]) -> String {
     messages
         .iter()
         .rev()

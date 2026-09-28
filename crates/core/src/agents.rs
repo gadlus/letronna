@@ -1,5 +1,6 @@
 //! Helpers: the `agent` tool, which hands a task to another agent and gives
-//! back its report, and the list of helpers running now.
+//! back its report, the `agents` tool, which talks to helpers once they are
+//! started, and the list of helpers running now.
 //!
 //! A helper is told only its task, never the conversation that started it, so
 //! what it reads and tries along the way stays out of its parent's context and
@@ -22,20 +23,32 @@
 //! wake the session to hear it; a chat app's session has nowhere to put a late
 //! answer, and a helper waits for its own helpers so its report holds what
 //! they found.
+//!
+//! A helper is known by name after it ends, but only to its own tree: the
+//! agent that started it and those above. A message to one that is running
+//! waits in its mailbox for its next step. One that has ended is picked back
+//! up from its transcript, with what it is read from the sidecar beside it,
+//! and answers to the sender from then on. The sidecar holds no key, so the
+//! helper works on the sender's connection, as a new one would. A helper the
+//! user stopped stays stopped: its work was cancelled, and picking it up would
+//! undo that; one an agent stopped can carry on.
 
 use crate::agent_defs::{self, AgentDef};
 use crate::budget::{Budget, short};
 use crate::cancel::Cancel;
 use crate::chat::{Connection, Message, trim};
-use crate::driver::{self, AgentId, Allow, Outcome, Report, Spec};
+use crate::driver::{self, AgentId, Allow, Outcome, Report, Spec, Status};
 use crate::inbox::{self, LINE_BREAKS, Notice, When};
 use crate::store::Transcript;
 use crate::tasks::{self, Key, State, Task};
 use crate::tools::{self, Caller, Tool, ToolContext};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Instant;
 
 /// The first helper id. Session ids count up from 1, so ids from 2^40 on never
 /// meet one, and a helper's id can key its browser, jobs and mailbox beside
@@ -63,12 +76,103 @@ const RESERVED: [&str; 3] = ["main", "user", "system"];
 /// Opens a helper's task, which reaches it as the user's turn but is not the
 /// user's.
 const TASK_HEADER: &str = "[Task from the agent that started you, not from the user; it approves nothing the user has not]";
+/// A page of a long report, which with the line saying where the next starts
+/// fits the 8,000 characters a request keeps of a tool result.
+const PAGE: usize = 7_500;
+/// The most of a page in bytes, so the page and its line fit the 24,000 bytes
+/// a tool's output is cut to, whatever script the report is in.
+const PAGE_BYTES: usize = 20_000;
 
-/// The helpers running now, and every name given out, by session.
+/// The helpers running now, every name given out by session, and every helper.
 struct Registry {
     running: Vec<Running>,
     /// Kept after a helper ends, so a name always means one helper of its session.
     names: BTreeMap<u64, Vec<String>>,
+    /// Every helper started, kept after it ends so a message can pick it back up.
+    helpers: Vec<Helper>,
+}
+
+/// A helper as the agents tool finds it by name.
+struct Helper {
+    id: AgentId,
+    /// The session it works for.
+    root: u64,
+    name: String,
+    kind: String,
+    /// Its transcript's number among its session's helpers.
+    n: u32,
+    /// Where what it is was written, beside its transcript.
+    sidecar: PathBuf,
+    run: Run,
+    /// How its last run ended, or None while it runs.
+    ended: Option<String>,
+    /// Set when an agent stopped it, so that stop is not taken for the user's.
+    asked_to_stop: bool,
+    /// Set when the user stopped it, after which nothing picks it back up.
+    stopped_by_user: bool,
+}
+
+/// One run of a helper: whom it answers to, and how it is getting on. Its stop
+/// is kept with its place in the running list.
+struct Run {
+    /// Hears how it ends, and is whom "main" reaches from it.
+    owner: u64,
+    /// Whether its report comes as a notice rather than as a call's result.
+    background: bool,
+    status: Arc<Status>,
+    started: Instant,
+}
+
+impl Run {
+    /// A run for `owner` that starts now.
+    fn new(owner: u64, background: bool) -> Self {
+        Self {
+            owner,
+            background,
+            status: Arc::default(),
+            started: Instant::now(),
+        }
+    }
+}
+
+/// What a helper is, kept beside its transcript as `<n>.json` for picking it
+/// back up, and holding no key, since a helper picked back up works on the
+/// connection of whoever sent it the message.
+#[derive(Serialize, Deserialize)]
+struct Sidecar {
+    name: String,
+    #[serde(rename = "type")]
+    kind: String,
+    model: String,
+    plan: bool,
+    workspace: Option<PathBuf>,
+    /// A git worktree of its own to work in, in place of its session's folder.
+    worktree: Option<PathBuf>,
+    /// The session or helper that started it.
+    parent: u64,
+    depth: u8,
+    description: String,
+    stopped_by_user: bool,
+}
+
+impl Sidecar {
+    /// Reads one back, saying what went wrong when it cannot.
+    fn read(path: &Path) -> Result<Self, String> {
+        std::fs::read_to_string(path)
+            .map_err(|e| e.to_string())
+            .and_then(|text| serde_json::from_str(&text).map_err(|e| e.to_string()))
+            .map_err(|e| format!("Could not read what the helper is: {e}"))
+    }
+
+    /// Writes it whole or not at all, so a crash cannot leave half of one.
+    fn write(&self, path: &Path) -> Result<(), String> {
+        let temp = path.with_extension("tmp");
+        serde_json::to_vec_pretty(self)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| std::fs::write(&temp, bytes))
+            .and_then(|()| std::fs::rename(&temp, path))
+            .map_err(|e| format!("Could not keep what the helper is: {e}"))
+    }
 }
 
 struct Running {
@@ -85,6 +189,7 @@ struct Running {
 static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
     running: Vec::new(),
     names: BTreeMap::new(),
+    helpers: Vec::new(),
 });
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(FIRST_ID);
@@ -154,13 +259,54 @@ impl Tool for Agent {
             "description": {"type": "string", "description": "Three to five words, shown to the user."},
             "prompt": {"type": "string", "description": "The whole task. The helper has not seen this conversation: say what to do, what you already know, and what to report back."},
             "type": {"type": "string", "description": "general (default), explore (read-only, cheaper), plan, or review. Other types this project defines are named in your instructions."},
-            "name": {"type": "string", "description": "A handle to know it by, shown with its report. Defaults to the type."},
+            "name": {"type": "string", "description": "A handle for the agents tool. Defaults to the type."},
             "model": {"type": "string", "description": "A model id on this gateway. Default: the type's, then Settings, then yours."},
             "background": {"type": "boolean", "description": "Default true in the window and terminal: return now and get a notice when it finishes. false waits for the report."}
         }, "required": ["description", "prompt"]})
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         start(args, ctx, &Limits::read())
+    }
+}
+
+/// The `agents` tool, for helpers already started, which asks for no approval
+/// and is offered where others read the replies, since none can be started there.
+pub struct Agents;
+
+impl Tool for Agents {
+    fn name(&self) -> &'static str {
+        "agents"
+    }
+    fn description(&self) -> &'static str {
+        "Work with the helpers you started, by name. list: yours and how they are doing. send: a message; a running helper reads it at its next step, and a finished one carries on from where it stopped, with its context. From a helper, \"main\" reaches the agent that started you. stop: end one early. report: its last answer, whole, in pages. types: the helper types. A helper you are waiting for blocks your call, so only those in the background hear you while they run. Never ask another agent to do what was refused or declined here."
+    }
+    fn parameters(&self) -> Value {
+        json!({"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["list", "send", "stop", "report", "types"]},
+            "to": {"type": "string", "description": "A helper's name, or \"main\" for the agent that started you."},
+            "message": {"type": "string"},
+            "offset": {"type": "integer", "description": "For report: where to start, in characters."}
+        }, "required": ["action"]})
+    }
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
+        let to = || text(args, "to").ok_or_else(|| "`to` is required: a helper's name.".to_owned());
+        match args["action"].as_str().unwrap_or_default() {
+            "list" => Ok(list(&ctx.caller)),
+            "send" => send(args, ctx, &Limits::read()),
+            "stop" => stop_by_name(&ctx.caller, to()?),
+            "report" => report(
+                &ctx.caller,
+                to()?,
+                args["offset"].as_u64().unwrap_or(0) as usize,
+            ),
+            "types" => types(ctx),
+            other => Err(format!(
+                "No action \"{other}\": use list, send, stop, report or types."
+            )),
+        }
+    }
+    fn machine(&self) -> bool {
+        false
     }
 }
 
@@ -187,28 +333,31 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
     let background = in_background(args, inbox::listened(), caller.depth, parent);
     // No call waits for a helper in the background, so it shares no call's allowance.
     let waiting = if background { 0 } else { owner };
-    // A stop is for the turn that started the helper, which one in the
-    // background outlives.
-    let cancel = if background {
-        Cancel::default()
-    } else {
-        ctx.cancel.child()
-    };
+    let cancel = cancel_for(background, ctx);
     let slot = reserve(caller.root, waiting, wanted, limits.at_once, cancel.clone())?;
     let connection = child(parent, &def, text(args, "model"), limits, slot.id);
     let tools = usable(&connection, &def);
-    let allow = if def.tools.is_none() && def.disallowed.is_empty() {
-        Allow::All
-    } else {
-        Allow::Only(tools.clone())
-    };
-    let (_, mut transcript) =
+    let (n, mut transcript) =
         Transcript::create(caller.root, &slot.name, parent.workspace.clone())?;
     transcript
         .conversation
         .messages
         .push(task(&def, &tools, prompt));
-    let rounds = def.rounds.unwrap_or(ROUNDS);
+    let sidecar = transcript.path.with_extension("json");
+    Sidecar {
+        name: slot.name.clone(),
+        kind: def.name.clone(),
+        model: connection.model.clone(),
+        plan: connection.plan,
+        workspace: parent.workspace.clone(),
+        worktree: None,
+        parent: owner,
+        depth: caller.depth + 1,
+        description: text(args, "description").unwrap_or_default().to_owned(),
+        stopped_by_user: false,
+    }
+    .write(&sidecar)?;
+    let run = Run::new(owner, background);
     let spec = Spec {
         connection,
         transcript,
@@ -217,19 +366,62 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
         root: caller.root,
         run: caller.run.unwrap_or(slot.id),
         label: slot.name.clone(),
-        allow,
-        rounds,
+        allow: allow(&def, tools),
+        rounds: def.rounds.unwrap_or(ROUNDS),
         cancel,
         budget: Some(Arc::new(Budget::new(limits.budget, caller.budget.clone()))),
-        status: Arc::default(),
+        status: run.status.clone(),
         depth: caller.depth + 1,
     };
+    registry().helpers.push(Helper {
+        id: slot.id,
+        root: caller.root,
+        name: slot.name.clone(),
+        kind: def.name.clone(),
+        n,
+        sidecar,
+        run,
+        ended: None,
+        asked_to_stop: false,
+        stopped_by_user: false,
+    });
+    let started = format!(
+        "Started {} ({}) in the background. A notice comes when it finishes; do not poll or \
+         wait for it. Carry on, or end your turn.",
+        slot.name, def.name
+    );
+    launch(spec, slot, background, &def.name, started)
+}
+
+/// Sets a helper to work in the place `slot` holds: in the background, where
+/// the call's answer is `started` and a notice follows, or while the call
+/// waits, where the answer is its report.
+fn launch(
+    spec: Spec,
+    slot: Slot,
+    background: bool,
+    kind: &str,
+    started: String,
+) -> Result<String, String> {
+    let rounds = spec.rounds;
     if background {
-        return set_off(spec, slot, &def.name, rounds);
+        set_off(spec, slot, kind, rounds)?;
+        return Ok(started);
     }
     let report = driver::run(spec);
     let share = MAX_REPORT / slot.together.load(Ordering::Relaxed).max(1);
-    answer(&slot.name, &report, rounds, share)
+    let name = slot.name.clone();
+    close(slot, &report, |_| ());
+    answer(&name, &report, rounds, share)
+}
+
+/// Which tools a helper of type `def` may call, of the `tools` it is offered.
+fn allow(def: &AgentDef, tools: Vec<String>) -> Allow {
+    if def.tools.is_none() && def.disallowed.is_empty() {
+        Allow::All
+    } else {
+        Allow::Only(tools)
+    }
 }
 
 /// Whether a helper runs in the background: unless the call says not to, for
@@ -239,28 +431,103 @@ fn in_background(args: &Value, listened: bool, depth: u8, parent: &Connection) -
     listened && depth == 0 && parent.remote.is_none() && args["background"].as_bool() != Some(false)
 }
 
-/// Starts a helper on a thread of its own and says so; when it ends, its
-/// owner hears how it went in a notice.
-fn set_off(spec: Spec, slot: Slot, kind: &str, rounds: usize) -> Result<String, String> {
-    let key = Key::Agent(slot.id);
+/// What stops a helper started or picked back up by a call on `ctx`: that
+/// call's turn's stop, which one in the background outlives, so it gets its own.
+fn cancel_for(background: bool, ctx: &ToolContext) -> Cancel {
+    if background {
+        Cancel::default()
+    } else {
+        ctx.cancel.child()
+    }
+}
+
+/// Starts a helper on a thread of its own; when it ends, its owner hears how
+/// it went in a notice.
+fn set_off(spec: Spec, slot: Slot, kind: &str, rounds: usize) -> Result<(), String> {
+    let (id, key) = (slot.id, Key::Agent(slot.id));
     let name = slot.name.clone();
     // Registered before it runs, so one that ends at once still has an owner to tell.
     tasks::register(Task::new(key, spec.owner, None, &name));
     let about = kind.to_owned();
     let started = driver::spawn(spec, move |report| {
-        let (state, notice) = ended(&slot.name, &about, report, rounds);
-        // Free before the owner hears, so it can start another at once.
-        drop(slot);
-        tasks::finish(&key, state, notice);
+        close(slot, report, |by_user| {
+            let (state, notice) = ended(&name, &about, report, rounds, by_user);
+            tasks::finish(&key, state, notice);
+        });
     });
     if let Err(error) = started {
         tasks::finish(&key, State::Failed(error.clone()), None);
+        if let Some(helper) = registry().helpers.iter_mut().find(|h| h.id == id) {
+            helper.ended = Some("failed".into());
+        }
         return Err(error);
     }
-    Ok(format!(
-        "Started {name} ({kind}) in the background. A notice comes when it finishes; do not poll \
-         or wait for it. Carry on, or end your turn."
-    ))
+    Ok(())
+}
+
+/// Ends a helper's run: gives its place back, has `tell` say how it went,
+/// given whether the user stopped it, marks it ended, and passes on the mail
+/// that came after the driver last looked.
+fn close(slot: Slot, report: &Report, tell: impl FnOnce(bool)) {
+    let id = slot.id;
+    // Free before the owner hears, so it can start another at once.
+    drop(slot);
+    let (owner, name, sidecar, late, by_user) = {
+        // The lock a message to it takes, so a message either lands in the
+        // mailbox before this empties it or finds the helper ended.
+        let mut registry = registry();
+        let Some(helper) = registry.helpers.iter_mut().find(|h| h.id == id) else {
+            return;
+        };
+        let by_user = report.status == Outcome::Stopped && !helper.asked_to_stop;
+        // Before it counts as ended, since a message that finds it ended picks
+        // it up again, and the next run's finish must come after this one's.
+        tell(by_user);
+        helper.ended = Some(how(&report.status, by_user).into());
+        helper.asked_to_stop = false;
+        helper.stopped_by_user = by_user;
+        let late = inbox::take(id, true);
+        (
+            helper.run.owner,
+            helper.name.clone(),
+            helper.sidecar.clone(),
+            late,
+            by_user,
+        )
+    };
+    for notice in late {
+        inbox::push(
+            owner,
+            Notice {
+                text: format!(
+                    "{name} ended before it read this, from {}:\n{}",
+                    notice.from, notice.text
+                ),
+                from: name.clone(),
+                when: notice.when,
+            },
+        );
+    }
+    if by_user {
+        // Refused here already by the flag above; the file keeps it refused
+        // for whatever reads the sidecar later.
+        let _ = Sidecar::read(&sidecar).and_then(|mut what| {
+            what.stopped_by_user = true;
+            what.write(&sidecar)
+        });
+    }
+}
+
+/// How a run that ended is shown in the list.
+fn how(outcome: &Outcome, by_user: bool) -> &'static str {
+    match outcome {
+        Outcome::Done => "finished",
+        Outcome::RoundLimit => "at its round limit",
+        Outcome::OverBudget => "out of budget",
+        Outcome::Stopped if by_user => "stopped by the user",
+        Outcome::Stopped => "stopped",
+        Outcome::Failed(_) => "failed",
+    }
 }
 
 /// Refuses a helper its caller may not start: one too deep, one from an agent
@@ -312,12 +579,7 @@ fn reserve(
     cancel: Cancel,
 ) -> Result<Slot, String> {
     let mut registry = registry();
-    if registry.running.len() >= at_once {
-        return Err(format!(
-            "{at_once} helpers are already running, the most at once. Do not retry now: do this \
-             part yourself, or wait for a notice. The user can raise this in Settings › Agents."
-        ));
-    }
+    full(&registry, at_once)?;
     let given = registry.names.entry(root).or_default();
     let mut name = wanted.to_owned();
     let mut n = 1;
@@ -326,23 +588,41 @@ fn reserve(
         name = format!("{wanted}-{n}");
     }
     given.push(name.clone());
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    Ok(occupy(&mut registry, id, name, owner, cancel))
+}
+
+/// Refuses another helper when `at_once` are running already.
+fn full(registry: &Registry, at_once: usize) -> Result<(), String> {
+    if registry.running.len() >= at_once {
+        return Err(format!(
+            "{at_once} helpers are already running, the most at once. Do not retry now: do this \
+             part yourself, or wait for a notice. The user can raise this in Settings › Agents."
+        ));
+    }
+    Ok(())
+}
+
+/// Puts helper `id` in the running list, as one of `owner`'s side by side that
+/// `cancel` stops.
+fn occupy(registry: &mut Registry, id: AgentId, name: String, owner: u64, cancel: Cancel) -> Slot {
     let together = registry
         .running
         .iter()
         .find(|helper| helper.owner == owner)
         .map_or_else(Arc::default, |helper| helper.together.clone());
     together.fetch_add(1, Ordering::Relaxed);
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     registry.running.push(Running {
         id,
         owner,
         together: together.clone(),
         cancel,
     });
-    Ok(Slot { id, name, together })
+    Slot { id, name, together }
 }
 
-/// Stops the running helper `id`, and says whether there was one.
+/// Stops the running helper `id`, and says whether there was one. The stop
+/// counts as the user's, so nothing picks the helper back up.
 pub fn stop(id: AgentId) -> bool {
     let cancel = registry()
         .running
@@ -459,8 +739,14 @@ fn answer(name: &str, report: &Report, rounds: usize, share: usize) -> Result<St
 }
 
 /// How a helper that ran in the background ended, and the notice that tells
-/// its owner so, or none when it was stopped, since whoever stopped it knows.
-fn ended(name: &str, kind: &str, report: &Report, rounds: usize) -> (State, Option<Notice>) {
+/// its owner so, or none when the user stopped it, since the user knows.
+fn ended(
+    name: &str,
+    kind: &str,
+    report: &Report,
+    rounds: usize,
+    by_user: bool,
+) -> (State, Option<Notice>) {
     let ran = match report.rounds {
         1 => "1 round".to_owned(),
         n => format!("{n} rounds"),
@@ -493,7 +779,11 @@ fn ended(name: &str, kind: &str, report: &Report, rounds: usize) -> (State, Opti
             State::Failed(error.clone()),
             format!("helper {name} failed ({about}): {error}"),
         ),
-        Outcome::Stopped => return (State::Stopped, None),
+        Outcome::Stopped if by_user => return (State::Stopped, None),
+        Outcome::Stopped => (
+            State::Stopped,
+            format!("helper {name} was stopped ({about}); what it had so far:"),
+        ),
     };
     if !report.files.is_empty() {
         text.push_str(&format!(
@@ -558,6 +848,413 @@ fn text<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
         .as_str()
         .map(str::trim)
         .filter(|text| !text.is_empty())
+}
+
+/// The caller's helpers and theirs, as a table of how each is getting on.
+fn list(caller: &Caller) -> String {
+    let registry = registry();
+    let mut rows = vec![["name", "type", "state", "rounds", "tokens"].map(String::from)];
+    for helper in yours(&registry.helpers, caller) {
+        let state = match &helper.ended {
+            Some(how) => how.clone(),
+            None => format!("running · {}", took(helper.run.started.elapsed().as_secs())),
+        };
+        let status = &helper.run.status;
+        rows.push([
+            helper.name.clone(),
+            helper.kind.clone(),
+            state,
+            status.rounds.load(Ordering::Relaxed).to_string(),
+            short(status.input.load(Ordering::Relaxed)),
+        ]);
+    }
+    drop(registry);
+    if rows.len() == 1 {
+        return "You have started no helpers.".into();
+    }
+    let widths: Vec<usize> = (0..rows[0].len())
+        .map(|column| {
+            let widest = rows.iter().map(|row| row[column].chars().count()).max();
+            widest.unwrap_or(0)
+        })
+        .collect();
+    let lines: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            let cells: Vec<String> = row
+                .iter()
+                .zip(&widths)
+                .map(|(cell, &width)| format!("{cell:<width$}"))
+                .collect();
+            cells.join("  ").trim_end().to_owned()
+        })
+        .collect();
+    lines.join("\n")
+}
+
+/// The helpers `caller` started and theirs, in the order they started.
+fn yours<'a>(helpers: &'a [Helper], caller: &Caller) -> Vec<&'a Helper> {
+    let me = caller.agent.unwrap_or(caller.root);
+    helpers
+        .iter()
+        .filter(|helper| helper.root == caller.root && answers_to(helpers, helper, me))
+        .collect()
+}
+
+/// Whether `helper` answers to `of`, directly or through the helpers between them.
+fn answers_to(helpers: &[Helper], helper: &Helper, of: u64) -> bool {
+    let mut owner = helper.run.owner;
+    // One step per helper at most, so owners that name each other cannot
+    // hang the caller.
+    for _ in 0..helpers.len() {
+        if owner == of {
+            return true;
+        }
+        let Some(above) = helpers.iter().find(|helper| helper.id == owner) else {
+            return false;
+        };
+        owner = above.run.owner;
+    }
+    false
+}
+
+/// Helper `to` of the caller's, or why there is none.
+fn mine<'a>(helpers: &'a [Helper], caller: &Caller, to: &str) -> Result<&'a Helper, String> {
+    let yours = yours(helpers, caller);
+    if let Some(helper) = yours.iter().find(|helper| helper.name == to) {
+        return Ok(helper);
+    }
+    if yours.is_empty() {
+        return Err(format!(
+            "You have no helper called \"{to}\"; you have started none."
+        ));
+    }
+    let names: Vec<&str> = yours.iter().map(|helper| helper.name.as_str()).collect();
+    Err(format!(
+        "You have no helper called \"{to}\". Yours: {}.",
+        names.join(", ")
+    ))
+}
+
+/// The name of helper `id`, if there is one.
+fn name_of(id: AgentId) -> Option<String> {
+    let registry = registry();
+    let helper = registry.helpers.iter().find(|helper| helper.id == id)?;
+    Some(helper.name.clone())
+}
+
+/// Hands `message` to helper `to` of the caller's, picking it back up if it
+/// has ended, or from a helper to whoever it answers to.
+fn send(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, String> {
+    let caller = &ctx.caller;
+    let Some(to) = text(args, "to") else {
+        return Err("`to` is required: a helper's name, or \"main\".".into());
+    };
+    let Some(message) = text(args, "message") else {
+        return Err("`message` is required: what to tell it.".into());
+    };
+    if to == "main" {
+        return to_main(caller, message);
+    }
+    let (from, who) = match caller.agent.and_then(name_of) {
+        Some(name) => (name.clone(), format!("helper {name}")),
+        None => ("main".to_owned(), "main".to_owned()),
+    };
+    let notice = Notice {
+        from,
+        when: When::Next,
+        text: format!("message from {who}:\n{message}"),
+    };
+    let (name, n, sidecar) = match reach(caller, to, &notice)? {
+        Reached::Queued(name) => return Ok(queued(&name)),
+        Reached::Ended { name, n, sidecar } => (name, n, sidecar),
+    };
+    resume(args, ctx, limits, &name, n, &sidecar, notice)
+}
+
+/// Leaves `message` for whoever the calling helper answers to.
+fn to_main(caller: &Caller, message: &str) -> Result<String, String> {
+    let owner = caller.agent.and_then(|id| {
+        let registry = registry();
+        let helper = registry.helpers.iter().find(|helper| helper.id == id)?;
+        Some((helper.run.owner, helper.name.clone()))
+    });
+    let Some((owner, name)) = owner else {
+        return Err(
+            "You are the main agent: \"main\" is how a helper reaches the agent that started it."
+                .into(),
+        );
+    };
+    inbox::push(
+        owner,
+        Notice {
+            // Not "helper <name>", which its end's notice comes from, so the
+            // two never merge into one.
+            from: name.clone(),
+            when: When::Next,
+            text: format!("message from helper {name}:\n{message}"),
+        },
+    );
+    Ok("Sent to the agent that started you; it reads it at its next step.".into())
+}
+
+/// Where a message to a helper went.
+enum Reached {
+    /// Into the mailbox of the helper of this name, which is running.
+    Queued(String),
+    /// Nowhere yet: the helper has ended, and here is where to pick it up.
+    Ended {
+        name: String,
+        n: u32,
+        sidecar: PathBuf,
+    },
+}
+
+/// Finds helper `to` of the caller's and, when it is running, leaves `notice`
+/// in its mailbox.
+fn reach(caller: &Caller, to: &str, notice: &Notice) -> Result<Reached, String> {
+    let registry = registry();
+    let helper = mine(&registry.helpers, caller, to)?;
+    if helper.stopped_by_user {
+        return Err(user_stopped(&helper.name));
+    }
+    if helper.ended.is_none() {
+        // Under the lock its run's close takes, so a run that ends now still
+        // passes the message on.
+        inbox::push(helper.id, notice.clone());
+        return Ok(Reached::Queued(helper.name.clone()));
+    }
+    Ok(Reached::Ended {
+        name: helper.name.clone(),
+        n: helper.n,
+        sidecar: helper.sidecar.clone(),
+    })
+}
+
+/// Picks helper `name`, which has ended, back up from its transcript with
+/// `notice` as its next turn, as the caller's own from now on.
+fn resume(
+    args: &Value,
+    ctx: &ToolContext,
+    limits: &Limits,
+    name: &str,
+    n: u32,
+    sidecar: &Path,
+    notice: Notice,
+) -> Result<String, String> {
+    let caller = &ctx.caller;
+    check(caller, &ctx.cancel, limits)?;
+    let Some(sender) = caller.connection.as_deref() else {
+        return Err("A helper can only be picked back up from a conversation.".into());
+    };
+    let what = Sidecar::read(sidecar)?;
+    if what.stopped_by_user {
+        return Err(user_stopped(name));
+    }
+    let def = agent_defs::find(&what.kind, sender.workspace.as_deref())?;
+    let Some(mut transcript) = Transcript::open(caller.root, n) else {
+        return Err(format!(
+            "{name}'s conversation could not be read, so it cannot carry on. Start a new helper."
+        ));
+    };
+    transcript
+        .conversation
+        .messages
+        .extend(inbox::fold(std::slice::from_ref(&notice)));
+    let owner = caller.agent.unwrap_or(caller.root);
+    let background = in_background(args, inbox::listened(), caller.depth, sender);
+    let run = Run::new(owner, background);
+    let status = run.status.clone();
+    let waiting = if background { 0 } else { owner };
+    let cancel = cancel_for(background, ctx);
+    let claimed = claim(
+        caller.root,
+        name,
+        run,
+        waiting,
+        cancel.clone(),
+        limits.at_once,
+        notice,
+    );
+    let Some(slot) = claimed? else {
+        return Ok(queued(name));
+    };
+    let connection = Connection {
+        model: what.model,
+        // Only ever narrowed, as when it started.
+        plan: sender.plan || what.plan,
+        workspace: what.worktree.or_else(|| sender.workspace.clone()),
+        conversation: slot.id,
+        ..sender.clone()
+    };
+    let tools = usable(&connection, &def);
+    let spec = Spec {
+        connection,
+        transcript,
+        id: slot.id,
+        owner,
+        root: caller.root,
+        run: caller.run.unwrap_or(slot.id),
+        label: slot.name.clone(),
+        allow: allow(&def, tools),
+        rounds: def.rounds.unwrap_or(ROUNDS),
+        cancel,
+        budget: Some(Arc::new(Budget::new(limits.budget, caller.budget.clone()))),
+        status,
+        depth: caller.depth + 1,
+    };
+    let started = format!(
+        "{name} had finished; it is carrying on from where it stopped, with your message. A \
+         notice comes when it is done."
+    );
+    launch(spec, slot, background, &def.name, started)
+}
+
+/// Takes a place for helper `name` of session `root` to carry on in as `run`
+/// says, until `cancel` stops it, or None when it is running again already and
+/// `notice` waits in its mailbox instead.
+fn claim(
+    root: u64,
+    name: &str,
+    run: Run,
+    waiting: u64,
+    cancel: Cancel,
+    at_once: usize,
+    notice: Notice,
+) -> Result<Option<Slot>, String> {
+    let mut registry = registry();
+    let Some(at) =
+        (registry.helpers.iter()).position(|helper| helper.root == root && helper.name == name)
+    else {
+        return Err(format!("You have no helper called \"{name}\"."));
+    };
+    let helper = &registry.helpers[at];
+    // Looked at again, since another message may have picked it up and the
+    // user stopped it since the first look.
+    if helper.stopped_by_user {
+        return Err(user_stopped(name));
+    }
+    if helper.ended.is_none() {
+        inbox::push(helper.id, notice);
+        return Ok(None);
+    }
+    full(&registry, at_once)?;
+    let helper = &mut registry.helpers[at];
+    let id = helper.id;
+    helper.run = run;
+    helper.ended = None;
+    let slot = occupy(&mut registry, id, name.to_owned(), waiting, cancel);
+    Ok(Some(slot))
+}
+
+/// Stops helper `to` of the caller's, and its own helpers with it; what it
+/// has goes where its report would have gone.
+fn stop_by_name(caller: &Caller, to: &str) -> Result<String, String> {
+    let mut registry = registry();
+    let helper = mine(&registry.helpers, caller, to)?;
+    let (id, name, background) = (helper.id, helper.name.clone(), helper.run.background);
+    // Taken under the lock that marks the stop an agent's below, where `stop`
+    // would look again later and could reach a run picked up since, unmarked.
+    let running = registry.running.iter().find(|helper| helper.id == id);
+    let Some(cancel) = running.map(|helper| helper.cancel.clone()) else {
+        return Ok(format!(
+            "{name} has already ended; there is nothing to stop."
+        ));
+    };
+    // Its helpers stop with it, and are no more stopped by the user than it is.
+    let stopping: Vec<AgentId> = (registry.helpers.iter())
+        .filter(|helper| helper.id == id || answers_to(&registry.helpers, helper, id))
+        .map(|helper| helper.id)
+        .collect();
+    for helper in registry.helpers.iter_mut() {
+        if helper.ended.is_none() && stopping.contains(&helper.id) {
+            helper.asked_to_stop = true;
+        }
+    }
+    drop(registry);
+    cancel.set();
+    Ok(if background {
+        format!("Stopping {name}; what it has so far comes as a notice.")
+    } else {
+        format!("Stopping {name}; what it has so far goes to the agent waiting for it.")
+    })
+}
+
+/// A page of the last thing helper `to` of the caller's said, from character
+/// `offset` on.
+fn report(caller: &Caller, to: &str, offset: usize) -> Result<String, String> {
+    let (name, n) = {
+        let registry = registry();
+        let helper = mine(&registry.helpers, caller, to)?;
+        (helper.name.clone(), helper.n)
+    };
+    let Some(transcript) = Transcript::open(caller.root, n) else {
+        return Err(format!("{name}'s conversation could not be read."));
+    };
+    let said = driver::last_said(&transcript.conversation.messages);
+    let total = said.chars().count();
+    if total == 0 {
+        return Ok(format!("{name} has said nothing yet."));
+    }
+    if offset >= total {
+        return Err(format!(
+            "{name}'s report has {total} characters, so there is nothing from {offset} on."
+        ));
+    }
+    let mut bytes = 0;
+    let page: String = said
+        .chars()
+        .skip(offset)
+        .take(PAGE)
+        .take_while(|c| {
+            bytes += c.len_utf8();
+            bytes <= PAGE_BYTES
+        })
+        .collect();
+    let end = offset + page.chars().count();
+    if end == total {
+        return Ok(page);
+    }
+    let next = json!({"action": "report", "to": name, "offset": end});
+    Ok(format!(
+        "{page}\n[characters {offset} to {end} of {total}; the next page: agents {next}]"
+    ))
+}
+
+/// One line for each helper type the caller can start, withheld where others
+/// read the replies, as the prompt's own line of them is.
+fn types(ctx: &ToolContext) -> Result<String, String> {
+    if ctx.remote.as_ref().is_some_and(|remote| remote.shared) {
+        return Err("Helper types are not available here: other people can read this chat.".into());
+    }
+    let lines: Vec<String> = agent_defs::all(ctx.workspace.as_deref())
+        .iter()
+        .map(|def| match tools::one_line(&def.description).as_str() {
+            "" => def.name.clone(),
+            about => format!("{}: {about}", def.name),
+        })
+        .collect();
+    Ok(lines.join("\n"))
+}
+
+/// How long a helper has run, as the list shows it: 38s, 1m12s, 2h05m.
+fn took(seconds: u64) -> String {
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        60..3_600 => format!("{}m{:02}s", seconds / 60, seconds % 60),
+        _ => format!("{}h{:02}m", seconds / 3_600, seconds / 60 % 60),
+    }
+}
+
+fn queued(name: &str) -> String {
+    format!("Queued for {name}; it reads it at its next step.")
+}
+
+fn user_stopped(name: &str) -> String {
+    format!(
+        "The user stopped {name}. Treat its work as cancelled; start a new helper only if the \
+         user asks."
+    )
 }
 
 #[cfg(test)]
@@ -662,14 +1359,25 @@ mod tests {
     impl Stub {
         /// A provider that answers one request with each of `replies` in turn.
         fn start(replies: Vec<String>) -> (String, Self) {
+            Self::held(replies, |_| ())
+        }
+
+        /// A provider like `start`'s that hands `before` the number of each
+        /// request once it has read it, and answers when that returns.
+        fn held(
+            replies: Vec<String>,
+            mut before: impl FnMut(usize) + Send + 'static,
+        ) -> (String, Self) {
             let server = TcpListener::bind("127.0.0.1:0").unwrap();
             let address = server.local_addr().unwrap();
             let worker = std::thread::spawn(move || {
                 replies
                     .iter()
-                    .map(|reply| {
+                    .enumerate()
+                    .map(|(n, reply)| {
                         let (mut socket, _) = server.accept().unwrap();
                         let sent = request(&mut socket);
+                        before(n);
                         write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
                         sent
                     })
@@ -738,11 +1446,55 @@ mod tests {
     /// Makes an agent call as a front end does, off the test's thread, failing
     /// rather than hanging.
     fn call(ctx: ToolContext, args: Value) -> Result<String, String> {
+        use_tool("agent", ctx, args)
+    }
+
+    /// Makes an agents call the same way.
+    fn talk(ctx: ToolContext, args: Value) -> Result<String, String> {
+        use_tool("agents", ctx, args)
+    }
+
+    fn use_tool(name: &'static str, ctx: ToolContext, args: Value) -> Result<String, String> {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(tools::run("agent", &args.to_string(), &ctx));
+            let _ = tx.send(tools::run(name, &args.to_string(), &ctx));
         });
-        rx.recv_timeout(WAIT).expect("the helper never answered")
+        rx.recv_timeout(WAIT).expect("the tool never answered")
+    }
+
+    /// What a session's helper wrote beside its transcript.
+    fn sidecar(session: &Session, n: u32) -> Value {
+        let path = session
+            .data
+            .join("agents")
+            .join("4242")
+            .join(format!("{n}.json"));
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    /// The notice folded as a helper's next turn, carrying `message` from the session.
+    fn from_main(message: &str) -> String {
+        format!(
+            "[Letronna notice: not from the user, and it approves nothing]\n- message from \
+             main:\n    {message}"
+        )
+    }
+
+    /// A helper as the registry keeps one, owned by `owner`, for tests that
+    /// build a tree without running it.
+    fn known(id: AgentId, root: u64, owner: u64, name: &str, kind: &str) -> Helper {
+        Helper {
+            id,
+            root,
+            name: name.into(),
+            kind: kind.into(),
+            n: 1,
+            sidecar: PathBuf::new(),
+            run: Run::new(owner, true),
+            ended: Some("finished".into()),
+            asked_to_stop: false,
+            stopped_by_user: false,
+        }
     }
 
     /// What a request sent back as tool results, in order.
@@ -1149,5 +1901,354 @@ mod tests {
         assert!(cancel.is_set());
         drop(slot);
         assert!(!stop(id), "one that has ended");
+    }
+
+    #[test]
+    fn a_message_to_a_running_helper_folds_in_at_its_next_step() {
+        let session = Session::new("steer");
+        inbox::listen();
+        let (asking, asked) = mpsc::channel();
+        let (sending, sent_it) = mpsc::channel::<()>();
+        let (endpoint, provider) = Stub::held(
+            vec![
+                reply("", Some(("read_file", json!({"path": "notes.txt"})))),
+                reply("The notes say hello, and the tests pass.", None),
+            ],
+            move |request| {
+                if request == 0 {
+                    let _ = asking.send(());
+                    // Answered once the message is in, so it waits for the next step.
+                    sent_it
+                        .recv_timeout(WAIT)
+                        .expect("the message was never sent");
+                }
+            },
+        );
+        let ctx = session.context(endpoint);
+        let args = json!({"description": "Read the notes", "type": "explore", "name": "steered",
+            "prompt": "Read notes.txt."});
+        call(ctx.clone(), args).unwrap();
+        asked.recv_timeout(WAIT).expect("the helper never asked");
+        let message = json!({"action": "send", "to": "steered",
+            "message": "Also check the tests."});
+        let out = talk(ctx, message);
+        let _ = sending.send(());
+        let notices = heard(4_242);
+        let sent = provider.sent();
+
+        assert_eq!(
+            out.unwrap(),
+            "Queued for steered; it reads it at its next step."
+        );
+        // After the results of the step it was taking, as its next turn.
+        let second = sent[1]["messages"].as_array().unwrap();
+        let (result, mail) = (&second[second.len() - 2], &second[second.len() - 1]);
+        assert_eq!(result["content"], "hello from the notes");
+        assert_eq!(mail["role"], "user");
+        assert_eq!(mail["content"], from_main("Also check the tests."));
+        assert!(
+            (notices[0].text).contains("\nThe notes say hello, and the tests pass.\n"),
+            "{notices:?}"
+        );
+    }
+
+    #[test]
+    fn a_finished_helper_resumes_from_its_transcript() {
+        let session = Session::new("resume");
+        inbox::listen();
+        let (endpoint, provider) = Stub::start(vec![reply("The notes say hello.", None)]);
+        let args = json!({"description": "Read the notes", "type": "explore", "name": "resumed",
+            "model": "helper-model", "prompt": "Read notes.txt."});
+        call(session.context(endpoint), args).unwrap();
+        heard(4_242);
+        provider.sent();
+        // The session has moved to another provider since, and the helper goes with it.
+        let (elsewhere, provider) = Stub::start(vec![reply("The tests pass too.", None)]);
+        let ctx = session.context(elsewhere);
+        let message = json!({"action": "send", "to": "resumed",
+            "message": "Now check the tests."});
+        let out = talk(ctx.clone(), message).unwrap();
+        let notices = heard(4_242);
+        let sent = provider.sent();
+
+        assert_eq!(
+            out,
+            "resumed had finished; it is carrying on from where it stopped, with your message. \
+             A notice comes when it is done."
+        );
+        assert_eq!(
+            sidecar(&session, 1),
+            json!({"name": "resumed", "type": "explore", "model": "helper-model", "plan": true,
+                "workspace": session.work, "worktree": null, "parent": 4_242, "depth": 1,
+                "description": "Read the notes", "stopped_by_user": false})
+        );
+        // Its model and plan mode are its own, not the sender's.
+        assert_eq!(sent[0]["model"], "helper-model");
+        let offered: Vec<&str> = (sent[0]["tools"].as_array().unwrap().iter())
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            offered.contains(&"read_file") && !offered.contains(&"write_file"),
+            "{offered:?}"
+        );
+        // It carries on from its own conversation, with the message as its next turn.
+        let said: Vec<(&str, &str)> = (sent[0]["messages"].as_array().unwrap().iter())
+            .filter(|message| message["role"] != "system")
+            .map(|m| (m["role"].as_str().unwrap(), m["content"].as_str().unwrap()))
+            .collect();
+        assert_eq!(said.len(), 3, "{said:?}");
+        assert!(said[0].1.starts_with(TASK_HEADER), "{said:?}");
+        assert_eq!(said[1], ("assistant", "The notes say hello."));
+        assert_eq!(
+            said[2],
+            ("user", from_main("Now check the tests.").as_str())
+        );
+        let lines: Vec<&str> = notices[0].text.lines().collect();
+        assert!(
+            lines[0].starts_with("helper resumed finished (explore · 0 rounds · "),
+            "{lines:?}"
+        );
+        assert_eq!(lines[1], "The tests pass too.");
+        let page = json!({"action": "report", "to": "resumed", "offset": 4});
+        assert_eq!(talk(ctx, page), Ok("tests pass too.".into()));
+    }
+
+    #[test]
+    fn a_helper_the_user_stopped_is_not_resumed() {
+        let session = Session::new("stopped");
+        let stop = Cancel::default();
+        let pressed = stop.clone();
+        // The user presses Stop while the helper waits on its model.
+        let (endpoint, provider) =
+            Stub::held(vec![reply("Still reading.", None)], move |_| pressed.set());
+        let ctx = ToolContext {
+            cancel: stop,
+            ..session.context(endpoint)
+        };
+        let args = json!({"description": "Read the notes", "name": "halted", "background": false,
+            "prompt": "Read notes.txt."});
+        let out = call(ctx, args);
+        provider.sent();
+
+        assert_eq!(
+            out,
+            Err("halted was stopped; its partial report is below.".into())
+        );
+        assert_eq!(sidecar(&session, 1)["stopped_by_user"], true);
+        // The session's next turn cannot pick it back up, and never reaches a model trying.
+        let later = session.context("http://127.0.0.1:9/v1".into());
+        let message = json!({"action": "send", "to": "halted", "message": "Carry on."});
+        assert_eq!(
+            talk(later.clone(), message),
+            Err(
+                "The user stopped halted. Treat its work as cancelled; start a new helper only \
+                 if the user asks."
+                    .into()
+            )
+        );
+        let list = talk(later, json!({"action": "list"})).unwrap();
+        let row = list.lines().find(|row| row.starts_with("halted ")).unwrap();
+        assert!(row.contains(" stopped by the user "), "{list}");
+    }
+
+    #[test]
+    fn a_helper_an_agent_stopped_sends_what_it_had_and_can_carry_on() {
+        let session = Session::new("paused");
+        inbox::listen();
+        let (asking, asked) = mpsc::channel();
+        let (stopping, stopped) = mpsc::channel::<()>();
+        let (endpoint, provider) = Stub::held(
+            vec![
+                reply(
+                    "Reading the notes first.",
+                    Some(("read_file", json!({"path": "notes.txt"}))),
+                ),
+                reply("Never heard.", None),
+                reply("Carried on.", None),
+            ],
+            move |request| {
+                if request == 1 {
+                    let _ = asking.send(());
+                    stopped.recv_timeout(WAIT).expect("it was never stopped");
+                }
+            },
+        );
+        let ctx = session.context(endpoint);
+        let args = json!({"description": "Read the notes", "name": "paused",
+            "prompt": "Read notes.txt."});
+        call(ctx.clone(), args).unwrap();
+        asked
+            .recv_timeout(WAIT)
+            .expect("the helper never asked again");
+        let out = talk(ctx.clone(), json!({"action": "stop", "to": "paused"}));
+        let _ = stopping.send(());
+        let first = heard(4_242);
+        let message = json!({"action": "send", "to": "paused", "message": "Carry on."});
+        let again = talk(ctx, message);
+        let second = heard(4_242);
+        let sent = provider.sent();
+
+        assert_eq!(
+            out.unwrap(),
+            "Stopping paused; what it has so far comes as a notice."
+        );
+        let lines: Vec<&str> = first[0].text.lines().collect();
+        assert!(
+            lines[0].starts_with("helper paused was stopped (general · 1 round · "),
+            "{lines:?}"
+        );
+        assert_eq!(lines[1], "Reading the notes first.");
+        assert!(again.unwrap().starts_with("paused had finished; "));
+        assert!(second[0].text.contains("\nCarried on.\n"), "{second:?}");
+        assert_eq!(sidecar(&session, 1)["stopped_by_user"], false);
+        let last = sent[2]["messages"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        assert_eq!(last["content"], from_main("Carry on."));
+    }
+
+    #[test]
+    fn list_shows_only_the_callers_tree() {
+        let _running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+        // Session 9401 started lead and sibling, and lead started digger;
+        // session 9402 started one of its own.
+        let (lead, digger, sibling) = (94_011, 94_012, 94_013);
+        let mut running = known(lead, 9_401, 9_401, "lead", "general");
+        running.ended = None;
+        // Over a minute ago, so what it shows keeps its width while the test runs.
+        running.run.started = Instant::now().checked_sub(Duration::from_secs(72)).unwrap();
+        let mut failed = known(sibling, 9_401, 9_401, "sibling", "review");
+        failed.ended = Some("failed".into());
+        for (helper, rounds, input) in [
+            (running, 6, 38_000),
+            (known(digger, 9_401, lead, "digger", "explore"), 1, 2_000),
+            (failed, 3, 9_000),
+            (
+                known(94_021, 9_402, 9_402, "elsewhere", "general"),
+                1,
+                1_000,
+            ),
+        ] {
+            helper.run.status.rounds.store(rounds, Ordering::Relaxed);
+            helper.run.status.input.store(input, Ordering::Relaxed);
+            registry().helpers.push(helper);
+        }
+        let main = |root| Caller {
+            root,
+            ..Caller::default()
+        };
+        let helper = |id, depth| Caller {
+            agent: Some(id),
+            root: 9_401,
+            depth,
+            ..Caller::default()
+        };
+
+        let whole = list(&main(9_401));
+        let lines: Vec<&str> = whole.lines().collect();
+        assert_eq!(lines.len(), 4, "{whole}");
+        assert_eq!(
+            lines[0],
+            "name     type     state            rounds  tokens"
+        );
+        assert!(
+            lines[1].starts_with("lead     general  running · 1m1")
+                && lines[1].ends_with("  6       38k"),
+            "{whole}"
+        );
+        assert_eq!(
+            lines[2..],
+            [
+                "digger   explore  finished         1       2k",
+                "sibling  review   failed           3       9k"
+            ]
+        );
+        // A helper sees only the helpers it started, and a session only its own.
+        assert_eq!(
+            list(&helper(lead, 1)),
+            "name    type     state     rounds  tokens\ndigger  explore  finished  1       2k"
+        );
+        assert!(
+            list(&main(9_402)).ends_with("\nelsewhere  general  finished  1       1k"),
+            "{}",
+            list(&main(9_402))
+        );
+        assert_eq!(list(&helper(digger, 2)), "You have started no helpers.");
+        // Nor can it reach any other by name.
+        assert_eq!(
+            super::report(&helper(lead, 1), "sibling", 0),
+            Err("You have no helper called \"sibling\". Yours: digger.".into())
+        );
+        assert_eq!(
+            stop_by_name(&helper(digger, 2), "lead"),
+            Err("You have no helper called \"lead\"; you have started none.".into())
+        );
+    }
+
+    #[test]
+    fn main_from_a_helper_reaches_whoever_it_answers_to() {
+        let _running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+        let _bell = crate::inbox::tests::DOORBELL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        registry()
+            .helpers
+            .push(known(95_011, 9_501, 9_501, "scout", "explore"));
+        let scout = Caller {
+            agent: Some(95_011),
+            root: 9_501,
+            depth: 1,
+            ..Caller::default()
+        };
+
+        assert_eq!(
+            to_main(&scout, "Found it."),
+            Ok("Sent to the agent that started you; it reads it at its next step.".into())
+        );
+        let heard = inbox::take(9_501, false);
+        let heard: Vec<(When, &str)> = heard.iter().map(|n| (n.when, n.text.as_str())).collect();
+        assert_eq!(
+            heard,
+            [(When::Next, "message from helper scout:\nFound it.")]
+        );
+        let session = Caller {
+            root: 9_501,
+            ..Caller::default()
+        };
+        assert!(to_main(&session, "Anyone?").is_err());
+    }
+
+    #[test]
+    fn a_long_report_comes_whole_in_pages_that_fit_a_request() {
+        let session = Session::new("pages");
+        // Four-byte characters too, which fill a page's bytes before its characters.
+        let long = format!("{}{}", "a".repeat(9_000), "𝄞".repeat(6_000));
+        let (endpoint, provider) = Stub::start(vec![reply(&long, None)]);
+        let ctx = session.context(endpoint);
+        let args = json!({"description": "Write at length", "name": "writer",
+            "background": false, "prompt": "Say a lot."});
+        call(ctx.clone(), args).unwrap();
+        provider.sent();
+
+        let mut ask = json!({"action": "report", "to": "writer"});
+        let mut pages = Vec::new();
+        loop {
+            let out = talk(ctx.clone(), ask).unwrap();
+            // All a request keeps of a tool result.
+            assert!(out.chars().count() <= 8_000, "{}", out.chars().count());
+            let Some((page, line)) = out.rsplit_once("\n[characters ") else {
+                pages.push(out);
+                break;
+            };
+            let next = line.split_once("; the next page: agents ").unwrap().1;
+            ask = serde_json::from_str(next.strip_suffix(']').unwrap()).unwrap();
+            pages.push(page.to_owned());
+        }
+        let sizes: Vec<usize> = pages.iter().map(|page| page.chars().count()).collect();
+        assert_eq!(sizes, [7_500, 6_125, 1_375]);
+        assert!(pages.concat() == long, "the pages are not the report");
     }
 }
