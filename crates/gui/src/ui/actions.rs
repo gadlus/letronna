@@ -138,8 +138,31 @@ impl Chat {
             cx.notify();
             return;
         }
-        self.cut_to(at);
+        self.back_to(at, window, cx);
         self.ask_again(text, window, cx);
+    }
+
+    /// Whether you asked anything after your message at `at`, which asking
+    /// that message again would take away.
+    pub(crate) fn asked_after(&self, at: usize) -> bool {
+        self.open_messages()
+            .iter()
+            .skip(at + 1)
+            .any(|m| m.role == "user")
+    }
+
+    /// Go back to just before your message at `at`, to ask it again. When
+    /// you asked more after it, that stays: the asking goes to a fork.
+    fn back_to(&mut self, at: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.asked_after(at) {
+            self.cut_to(at);
+            return;
+        }
+        self.fork_at(at);
+        window.push_notification(
+            Notification::info("Asked in a fork. The original keeps what came after."),
+            cx,
+        );
     }
 
     /// Ask the turn's prompt again, dropping what came of it last time.
@@ -153,12 +176,15 @@ impl Chat {
         let Some(text) = self.prompt_text(at) else {
             return;
         };
-        self.cut_to(at);
+        self.back_to(at, window, cx);
         self.ask_again(text, window, cx);
     }
 
     fn ask_again(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
-        if self.dispatch(text, None, cx).is_err() {
+        if self.dispatch(text.clone(), None, cx).is_err() {
+            // Not asked, so the text waits in the box rather than being lost.
+            self.composer
+                .update(cx, |input, cx| input.set_value(text, window, cx));
             self.open_settings(window, cx);
         }
     }
@@ -230,10 +256,21 @@ impl Chat {
     /// as it is. From your message, the copy stops before it and its text is
     /// in the box, ready to be asked differently.
     pub(crate) fn fork_turn(&mut self, span: Span, window: &mut Window, cx: &mut Context<Self>) {
-        let id = self.store.next_id();
         let back = span.yours.then(|| self.prompt_text(span.first)).flatten();
+        self.fork_at(span.keep());
+        self.composer.update(cx, |input, cx| {
+            input.set_value(back.unwrap_or_default(), window, cx)
+        });
+        self.focus_composer(window, cx);
+        cx.notify();
+    }
+
+    /// Open a copy of the session's first `keep` messages, leaving the
+    /// session itself as it is.
+    fn fork_at(&mut self, keep: usize) {
+        let id = self.store.next_id();
         let source = &self.store.conversations[self.store.active];
-        let messages = source.messages[..span.keep().min(source.messages.len())].to_vec();
+        let messages = source.messages[..keep.min(source.messages.len())].to_vec();
         let fork = Conversation {
             id,
             title: format!("{} (fork)", source.title),
@@ -248,12 +285,7 @@ impl Chat {
         self.page = Page::Chat;
         self.editing_message = None;
         self.save();
-        self.composer.update(cx, |input, cx| {
-            input.set_value(back.unwrap_or_default(), window, cx)
-        });
-        self.focus_composer(window, cx);
         self.follow();
-        cx.notify();
     }
 
     /// The right-click menu for a turn: the same actions as its buttons.
@@ -264,6 +296,7 @@ impl Chat {
     ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
         let chat = cx.entity();
         let (retry, rewind) = self.can_retry_and_rewind(span);
+        let retry_label = self.retry_label(span);
         move |menu, _, _| {
             let item = |label: &'static str, icon: Icon, enabled: bool, act: Act| {
                 let chat = chat.clone();
@@ -289,7 +322,7 @@ impl Chat {
                 ));
             }
             menu.item(item(
-                "Retry",
+                retry_label,
                 Icon::new(IconName::Redo),
                 retry,
                 Chat::retry_turn,
@@ -363,7 +396,7 @@ impl Chat {
             .child(button(
                 "retry",
                 Icon::new(IconName::Redo),
-                "Retry",
+                self.retry_label(span),
                 retry,
                 Chat::retry_turn,
             ))
@@ -393,6 +426,16 @@ impl Chat {
                 .is_some_and(|at| self.prompt_text(at).is_some());
         let rewind = !self.busy && (span.yours || self.open_messages().len() > span.keep());
         (retry, rewind)
+    }
+
+    /// What Retry does here: ask again in place, or in a fork when more was
+    /// asked after this turn.
+    fn retry_label(&self, span: Span) -> &'static str {
+        if span.prompt().is_some_and(|at| self.asked_after(at)) {
+            "Retry in a fork"
+        } else {
+            "Retry"
+        }
     }
 }
 
