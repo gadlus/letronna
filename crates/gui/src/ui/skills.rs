@@ -88,6 +88,8 @@ impl Chat {
     fn skill_editor(&self, id: u64, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .w_full()
+            // Clear of the hairlines of the rows either side.
+            .my_2()
             .gap_3()
             .p_3()
             .rounded(cx.theme().radius)
@@ -128,7 +130,7 @@ impl Chat {
                     )
                     .child(
                         Button::new("cancel-skill")
-                            .ghost()
+                            .plain(cx)
                             .small()
                             .label("Cancel")
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -149,9 +151,9 @@ impl Chat {
             .items_center()
             .justify_between()
             .gap_3()
-            .p_3()
-            .rounded(cx.theme().radius)
-            .bg(cx.theme().secondary.opacity(0.3))
+            .py_3()
+            .border_b_1()
+            .border_color(cx.theme().border)
             .child(
                 v_flex()
                     .flex_1()
@@ -178,7 +180,7 @@ impl Chat {
                     .items_center()
                     .child(
                         Button::new(("use", index))
-                            .ghost()
+                            .plain(cx)
                             .xsmall()
                             .label("Use")
                             .on_click(cx.listener(move |this, _, window, cx| {
@@ -187,7 +189,7 @@ impl Chat {
                     )
                     .child(
                         Button::new(("edit-skill", index))
-                            .ghost()
+                            .plain(cx)
                             .xsmall()
                             .icon(Icon::new(AppIcon::Pencil))
                             .tooltip("Edit")
@@ -197,7 +199,7 @@ impl Chat {
                     )
                     .child(
                         Button::new(("delete-skill", index))
-                            .ghost()
+                            .plain(cx)
                             .xsmall()
                             .icon(Icon::new(AppIcon::Trash))
                             .tooltip("Delete")
@@ -258,7 +260,7 @@ impl Chat {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .child(v_flex().gap_2().children(rows)),
+                    .child(v_flex().children(rows)),
             )
     }
 }

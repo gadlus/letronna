@@ -25,7 +25,7 @@ impl Chat {
                     .when(cfg!(target_os = "macos"), |bar| bar.pr_3())
                     .child(
                         Button::new("toggle-sidebar")
-                            .ghost()
+                            .plain(cx)
                             .small()
                             .icon(
                                 Icon::new(if self.sidebar_open {
@@ -60,7 +60,7 @@ impl Chat {
         let index = self.store.active;
         let title = self.store.conversations[index].title.clone();
         Button::new("session-title")
-            .ghost()
+            .plain(cx)
             .xsmall()
             .tooltip("Rename")
             .text_color(cx.theme().muted_foreground)
@@ -89,7 +89,7 @@ impl Chat {
         };
         let chat = cx.entity();
         Button::new("account")
-            .ghost()
+            .plain(cx)
             .small()
             .compact()
             .child(
@@ -179,7 +179,7 @@ impl Chat {
             })
         };
         Button::new("gateway")
-            .ghost()
+            .plain(cx)
             .xsmall()
             .text_color(cx.theme().muted_foreground)
             .tooltip(tip)
@@ -207,7 +207,7 @@ impl Chat {
             None => ("No project".into(), "Attach a project folder".into()),
         };
         Button::new("workspace")
-            .ghost()
+            .plain(cx)
             .xsmall()
             .text_color(cx.theme().muted_foreground)
             .tooltip(tip)
@@ -231,7 +231,7 @@ impl Chat {
                 .map(|job| {
                     let label = letronna_core::tools::one_line(&job.command);
                     Button::new(("job", job.id as usize))
-                        .ghost()
+                        .plain(cx)
                         .xsmall()
                         .text_color(cx.theme().muted_foreground)
                         .tooltip(format!("Job #{}: {label} — click to stop", job.id))

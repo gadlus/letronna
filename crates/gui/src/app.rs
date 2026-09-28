@@ -55,9 +55,7 @@ impl Page {
             Page::Skills => {
                 "Reusable playbooks Letronna can load into a session. Nothing installed yet."
             }
-            Page::Messaging => {
-                "Connect Telegram, Discord, Slack or email gateways. No channel configured yet."
-            }
+            Page::Messaging => "Message Letronna from a chat app, and get answers back there.",
             Page::Artifacts => "Files, images and links produced in sessions will collect here.",
             // Jobs renders its own page; this blurb is only a fallback.
             Page::Jobs => "Prompts that run on a timer.",
@@ -1211,7 +1209,6 @@ impl Chat {
                         // told apart from it.
                         .border_1()
                         .border_color(cx.theme().primary.opacity(0.5))
-                        .shadow_md()
                         .tooltip("Jump to latest")
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.follow();
@@ -1319,7 +1316,7 @@ impl Render for Chat {
                         let copied = window.use_keyed_state("copied-error", cx, |_, _| false);
                         let done = *copied.read(cx);
                         Button::new("copy-error")
-                            .ghost()
+                            .plain(cx)
                             .xsmall()
                             .icon(Icon::new(if done {
                                 IconName::Check
@@ -1384,9 +1381,9 @@ impl Render for Chat {
             // One turn per prompt, like Claude Code: the user's message, then
             // everything the model did in reply under a single label. Each
             // turn knows its place, which its buttons and menu work from.
-            use crate::ui::actions::Span;
+            use crate::ui::actions::{Span, shows_bar};
             let messages = &conversation.messages;
-            let mut turns: Vec<(Vec<AnyElement>, Span)> = Vec::new();
+            let mut turns: Vec<(Vec<AnyElement>, Span, FocusHandle)> = Vec::new();
             let mut assistant_turn = false;
             for (i, m) in messages.iter().enumerate() {
                 let is_user = m.role == "user";
@@ -1396,11 +1393,11 @@ impl Render for Chat {
                         last: i,
                         yours: is_user,
                     };
-                    turns.push((Vec::new(), span));
+                    turns.push((Vec::new(), span, self.turn_focus(i, window, cx)));
                 }
                 let labeled = is_user || !assistant_turn;
                 assistant_turn = !is_user;
-                let (rows, span) = turns.last_mut().unwrap();
+                let (rows, span, focus) = turns.last_mut().unwrap();
                 span.last = i;
                 // A reply that only asked for tools has nothing to show of
                 // its own; the tool rows speak for it. Kept only when it
@@ -1420,10 +1417,9 @@ impl Render for Chat {
                 let ends = messages.get(i + 1).is_none_or(|next| next.role == "user")
                     && !(streaming_here && i + 1 == messages.len());
                 let bar = (is_user || ends).then(|| {
-                    // The newest reply keeps its buttons in view; the rest
-                    // show them on hover.
-                    let newest = !is_user && i + 1 == messages.len();
-                    self.turn_bar(*span, newest, cx)
+                    let focused = focus.contains_focused(window, cx);
+                    let shown = shows_bar(*span, messages.len(), streaming_here, focused);
+                    self.turn_bar(*span, shown, cx)
                 });
                 rows.push(self.message_row(i, m, labeled, false, bar, window, cx));
             }
@@ -1438,12 +1434,13 @@ impl Render for Chat {
                             last: messages.len(),
                             yours: false,
                         },
+                        self.turn_focus(messages.len(), window, cx),
                     ));
                 }
                 turns.len() - 1
             });
             if streaming_here {
-                let (rows_here, _) = turns.last_mut().unwrap();
+                let (rows_here, _, _) = turns.last_mut().unwrap();
                 // While tools are queued the card below speaks for the turn;
                 // showing a half-built reply as well would be two spinners.
                 let idle = self
@@ -1484,15 +1481,28 @@ impl Render for Chat {
                 // No min_w_0 or clipping here: both break list layout in the
                 // markdown renderer, which sizes items against this width.
                 // Long lines are held in by the row and code-block widths.
-                .map(|(n, (turn, span))| {
-                    let group = v_flex().w_full().gap_3().group("turn").children(turn);
+                .map(|(n, (turn, span, focus))| {
+                    // A hairline before each of your prompts but the first
+                    // parts the exchanges, where a card used to.
+                    let group = v_flex()
+                        .w_full()
+                        .gap_3()
+                        .when(span.yours && n > 0, |group| {
+                            group.border_t_1().border_color(cx.theme().border).pt_6()
+                        })
+                        .children(turn);
                     if live_turn == Some(n) {
                         return group.into_any_element();
                     }
                     // Its own id, so each turn's menu keeps its own state.
+                    // Tab picks a turn out; a press on it does not, or
+                    // opening a tool's output would take the keys from the
+                    // composer (text inside still takes focus to select).
                     div()
                         .id(self.row_id("turn", span.first))
                         .w_full()
+                        .track_focus(&focus)
+                        .on_any_mouse_down(|_, window, _| window.prevent_default())
                         .child(group.context_menu(self.turn_menu(span, cx)))
                         .into_any_element()
                 })

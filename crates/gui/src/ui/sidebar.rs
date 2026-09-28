@@ -25,7 +25,7 @@ impl Chat {
             .font_weight(FontWeight::MEDIUM)
             .text_color(cx.theme().sidebar_foreground)
             .when(active, |this| this.bg(cx.theme().sidebar_accent))
-            .hover(|s| s.bg(cx.theme().sidebar_accent.opacity(0.6)))
+            .active(|s| s.bg(cx.theme().sidebar_accent.opacity(0.6)))
             .child(
                 Icon::new(icon)
                     .size_4()
@@ -59,7 +59,7 @@ impl Chat {
             .cursor_pointer()
             .text_sm()
             .when(active, |this| this.bg(cx.theme().sidebar_accent))
-            .hover(|s| s.bg(cx.theme().sidebar_accent.opacity(0.6)))
+            .active(|s| s.bg(cx.theme().sidebar_accent.opacity(0.6)))
             .child(if c.pinned {
                 Icon::new(AppIcon::Pin)
                     .size_3()

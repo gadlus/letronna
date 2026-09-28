@@ -241,7 +241,7 @@ mod windows_impl {
                 .items_center()
                 .rounded(cx.theme().radius)
                 .cursor_pointer()
-                .hover(|s| s.bg(cx.theme().secondary))
+                .active(|s| s.bg(cx.theme().secondary))
                 .child(label.into())
                 .on_click(move |_, window, cx| {
                     on_click(window, cx);
