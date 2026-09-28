@@ -469,6 +469,7 @@ impl Chat {
                     )
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.plan_mode = !this.plan_mode;
+                        letronna_core::agents::set_plan(this.plan_mode);
                         cx.notify();
                     })),
             )

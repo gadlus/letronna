@@ -5,6 +5,7 @@
 //! frame, and asking the user by reading a line rather than drawing a card.
 
 use letronna_core::agent::{self, Next, Turn};
+use letronna_core::agents;
 use letronna_core::chat::{self, Connection, Event, Message};
 use letronna_core::inbox;
 use letronna_core::store::{Conversation, Store};
@@ -103,6 +104,8 @@ impl Runner {
 
     /// Run the agent to completion on the conversation as it stands.
     fn run(&mut self, connection: Connection, session: usize) -> Result<String, String> {
+        // What the session's kept helpers wake on from now on.
+        agents::connected(&connection);
         let mut turn = Turn::new(connection);
         self.stopped = false;
         self.bar.working(true);

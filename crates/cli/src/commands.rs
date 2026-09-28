@@ -45,6 +45,7 @@ pub fn command(
         }
         "/plan" => {
             runner.plan = !runner.plan;
+            letronna_core::agents::set_plan(runner.plan);
             let note = footer(runner);
             runner.bar.set_footer(note);
             render::blank();
