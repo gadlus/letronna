@@ -25,6 +25,8 @@ pub struct ToolContext {
     pub conversation: u64,
     /// Stops this call and anything it started.
     pub cancel: Cancel,
+    /// Plan mode, in which a tool that changes things is refused when named.
+    pub plan: bool,
 }
 
 impl ToolContext {
@@ -34,6 +36,7 @@ impl ToolContext {
             remote: connection.remote.clone(),
             conversation: connection.conversation,
             cancel: Cancel::default(),
+            plan: connection.plan,
         }
     }
 
@@ -219,6 +222,12 @@ pub fn run(name: &str, args: &str, ctx: &ToolContext) -> Result<String, String> 
         return Err(format!(
             "`{name}` is not available here: other people can read this chat, so \
              nothing on this computer is in reach."
+        ));
+    }
+    if ctx.plan && tool.mutates() {
+        return Err(format!(
+            "`{name}` is not available in plan mode: it changes things, and plan \
+             mode can only look and propose. Describe the change instead."
         ));
     }
     let args = parse_args(args)?;
@@ -1348,6 +1357,34 @@ World"
         assert!(dir.join("started").exists(), "stopped before it ran");
         std::thread::sleep(Duration::from_secs(2));
         assert!(!dir.join("finished").exists(), "it ran on after the stop");
+    }
+
+    #[test]
+    fn plan_mode_refuses_a_tool_that_changes_things_even_when_named() {
+        let dir = std::env::temp_dir().join(format!("letronna-plan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "hello").unwrap();
+        let ctx = ToolContext::of(&Connection {
+            workspace: Some(dir.clone()),
+            plan: true,
+            ..Default::default()
+        });
+        for (name, args) in [
+            ("write_file", r#"{"path":"b.txt","content":"x"}"#),
+            ("edit_file", r#"{"path":"a.txt","old":"hello","new":"bye"}"#),
+            ("run_command", r#"{"command":"echo hi > c.txt"}"#),
+        ] {
+            let refused = run(name, args, &ctx).unwrap_err();
+            assert!(refused.contains("plan mode"), "{name}: {refused}");
+        }
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "hello");
+        assert!(!dir.join("b.txt").exists() && !dir.join("c.txt").exists());
+        // Looking is still allowed.
+        assert_eq!(
+            run("read_file", r#"{"path":"a.txt"}"#, &ctx).unwrap(),
+            "hello"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
