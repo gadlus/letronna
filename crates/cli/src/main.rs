@@ -116,6 +116,8 @@ fn main() {
         let asked = runner.ask(session, &prompt);
         // A browser with no window would outlive this run unseen.
         letronna_core::browser::close_hidden();
+        // So would a job left running in the background, a dev server say.
+        letronna_core::jobs::stop_all();
         match asked {
             Ok(_) => runner.persist(),
             Err(error) => {
@@ -189,6 +191,9 @@ fn main() {
         }
     }
     runner.bar.uninstall();
+    // A job's process is not ended with ours, so a dev server left running
+    // would carry on with nobody left to stop it.
+    letronna_core::jobs::stop_all();
     letronna_core::browser::close_hidden();
     render::title("");
     render::blank();
