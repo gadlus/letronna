@@ -166,7 +166,8 @@ impl Runner {
             // What was typed while it worked goes in after the results, so
             // the model reads it before carrying on rather than once the turn
             // is over. It waited above the box until now, and the box puts
-            // it into the conversation as it is taken.
+            // it into the conversation as it is taken. Folded into the turn,
+            // it never pushes the turn's own request out of the window.
             let typed = self.bar.take_typed();
             if !typed.is_empty() {
                 self.store.conversations[session]
@@ -174,6 +175,7 @@ impl Runner {
                     .extend(typed.into_iter().map(|content| Message {
                         role: "user".into(),
                         content,
+                        folded: true,
                         ..Default::default()
                     }));
                 self.persist();
@@ -476,9 +478,11 @@ impl Runner {
     /// them when it is idle.
     fn take_notices(&mut self, session: usize, idle: bool) {
         let id = self.store.conversations[session].id;
-        let Some(notices) = inbox::fold(&inbox::take(id, idle)) else {
+        let Some(mut notices) = inbox::fold(&inbox::take(id, idle)) else {
             return;
         };
+        // Mid-turn they join the turn running; idle, they start one.
+        notices.folded = !idle;
         render::notice(&notices.content);
         self.store.conversations[session].messages.push(notices);
         self.persist();

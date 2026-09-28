@@ -911,20 +911,13 @@ impl Chat {
     /// results or the reply cut short.
     fn fold_and_ask(&mut self, ix: usize, cx: &mut Context<Self>) {
         let conversation = &mut self.store.conversations[ix];
-        // After the results, which have to follow the calls they answer, and
-        // before what you typed, so yours is read last.
+        // After the results, which have to follow the calls they answer. What
+        // you sent while it worked goes in now too, before the model is asked
+        // again, so it reads it before going on.
+        let notices = inbox::fold(&inbox::take(conversation.id, false));
         conversation
             .messages
-            .extend(inbox::fold(&inbox::take(conversation.id, false)));
-        // What you sent while it worked goes in now, before the model is
-        // asked again, so it reads it before going on.
-        conversation
-            .messages
-            .extend(self.follow_ups.drain(..).map(|text| Message {
-                role: "user".into(),
-                content: text,
-                ..Default::default()
-            }));
+            .extend(folded_in(notices, self.follow_ups.drain(..)));
         self.save();
         self.run_turn(cx);
     }
@@ -1975,13 +1968,32 @@ pub(crate) fn cuts_in(turn: &agent::Turn) -> bool {
     matches!(turn.next(|_| false), agent::Next::Done)
 }
 
+/// What goes into a running turn when the model is asked again: the notices,
+/// then what you sent, so yours is read last, each folded into the turn.
+fn folded_in(
+    notices: Option<Message>,
+    sent: impl IntoIterator<Item = String>,
+) -> impl Iterator<Item = Message> {
+    let sent = sent.into_iter().map(|content| Message {
+        role: "user".into(),
+        content,
+        ..Default::default()
+    });
+    // None of them opens a turn of its own, so the context window keeps the
+    // turn's request rather than starting at one of them.
+    notices.into_iter().chain(sent).map(|message| Message {
+        folded: true,
+        ..message
+    })
+}
+
 #[cfg(test)]
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
-    use super::{allowed_in, cuts_in, front_call, woken};
+    use super::{allowed_in, cuts_in, folded_in, front_call, woken};
     use letronna_core::agent::{Next, Turn, needs_user};
-    use letronna_core::chat::{Connection, ToolCall};
+    use letronna_core::chat::{Connection, Message, ToolCall};
     use std::collections::{HashMap, HashSet};
 
     /// A turn whose queue holds one `write_file` call.
@@ -2057,5 +2069,28 @@ mod tests {
         assert!(!cuts_in(&turn), "its result is on the way to the model");
         turn.take_results();
         assert!(cuts_in(&turn), "the next reply is coming in");
+    }
+
+    #[test]
+    fn a_follow_up_folded_mid_turn_is_marked_folded() {
+        let folded: Vec<Message> = folded_in(None, ["also check the tests".to_owned()]).collect();
+        assert_eq!(folded.len(), 1);
+        assert_eq!(folded[0].role, "user");
+        assert_eq!(folded[0].content, "also check the tests");
+        assert!(folded[0].folded);
+    }
+
+    #[test]
+    fn a_notice_folded_mid_turn_goes_in_before_what_you_sent_and_both_are_marked() {
+        let notice = Message {
+            role: "user".into(),
+            content: "a job finished".into(),
+            notice: true,
+            ..Default::default()
+        };
+        let folded: Vec<(bool, bool)> = folded_in(Some(notice), ["and then this".to_owned()])
+            .map(|message| (message.notice, message.folded))
+            .collect();
+        assert_eq!(folded, [(true, true), (false, true)]);
     }
 }
