@@ -213,13 +213,14 @@ impl Store {
         std::fs::rename(temp, path)
     }
 
-    /// Forget a session and remove its file.
+    /// Forget a session and remove its file and its helpers' conversations.
     pub fn remove(&mut self, index: usize) {
         if index >= self.conversations.len() {
             return;
         }
         let gone = self.conversations.remove(index);
         let _ = std::fs::remove_file(session_path(gone.id));
+        let _ = std::fs::remove_dir_all(helpers_dir(gone.id));
     }
 }
 
@@ -237,6 +238,11 @@ impl Conversation {
     /// Append the head (first time), any rewind and new messages, and the
     /// descriptive fields if they have moved since the last write.
     fn flush(&mut self) -> std::io::Result<()> {
+        self.flush_to(&session_path(self.id))
+    }
+
+    /// Flush into the file at `path` rather than the session's own.
+    fn flush_to(&mut self, path: &std::path::Path) -> std::io::Result<()> {
         let meta = self.meta();
         let meta_changed = self.written.as_ref() != Some(&meta);
         // Every session is flushed on every save, and most have nothing new.
@@ -249,8 +255,7 @@ impl Conversation {
         {
             return Ok(());
         }
-        let path = session_path(self.id);
-        let _lock = Lock::take(&path);
+        let _lock = Lock::take(path);
         let fresh = !path.exists();
         if !fresh && self.flushed == self.messages.len() && self.rewound.is_none() && !meta_changed
         {
@@ -260,7 +265,7 @@ impl Conversation {
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&path)?;
+            .open(path)?;
         let mut out = String::new();
         if fresh {
             push(
@@ -325,6 +330,77 @@ fn replay(path: &std::path::Path) -> Option<Conversation> {
     conversation.flushed = conversation.messages.len();
     conversation.written = Some(conversation.meta());
     Some(conversation)
+}
+
+/// A helper's conversation, written in the same lines as a session but never
+/// listed or searched as one.
+pub struct Transcript {
+    pub path: PathBuf,
+    pub conversation: Conversation,
+}
+
+impl Transcript {
+    /// Start a conversation for a new helper of `session`, and say which
+    /// number it got there.
+    pub fn create(
+        session: u64,
+        title: &str,
+        workspace: Option<PathBuf>,
+    ) -> Result<(u32, Self), String> {
+        let dir = helpers_dir(session);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("Could not make a place for the helper's conversation: {e}"))?;
+        let conversation = Conversation {
+            id: session,
+            title: title.into(),
+            updated: backend::now(),
+            workspace,
+            ..Default::default()
+        };
+        for n in 1..=u32::MAX {
+            let path = dir.join(format!("{n}.jsonl"));
+            // Making the file is what claims the number: of two processes
+            // asking at once exactly one gets it, where counting and adding
+            // one, as `next_id` does, would hand both the same.
+            let mut file = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("Could not start the helper's conversation: {e}")),
+            };
+            // The head goes in here because flush writes one only into a file
+            // that is not there yet, and this one now is.
+            let mut head = String::new();
+            push(
+                &mut head,
+                &Record::Head {
+                    id: session,
+                    created: conversation.updated,
+                },
+            );
+            let mut transcript = Self { path, conversation };
+            file.write_all(head.as_bytes())
+                .and_then(|_| transcript.save())
+                .map_err(|e| format!("Could not start the helper's conversation: {e}"))?;
+            return Ok((n, transcript));
+        }
+        Err("This session has no numbers left for another helper.".into())
+    }
+
+    /// Read back helper `n` of `session`, if it is there.
+    pub fn open(session: u64, n: u32) -> Option<Self> {
+        let path = helpers_dir(session).join(format!("{n}.jsonl"));
+        let conversation = replay(&path)?;
+        Some(Self { path, conversation })
+    }
+
+    /// Append whatever is new, as saving a session does.
+    pub fn save(&mut self) -> std::io::Result<()> {
+        self.conversation.flush_to(&self.path)
+    }
 }
 
 /// What a session looks like from the outside: enough to recognise it by,
@@ -505,6 +581,13 @@ pub fn sessions_dir() -> PathBuf {
 
 fn session_path(id: u64) -> PathBuf {
     sessions_dir().join(format!("{id}.jsonl"))
+}
+
+/// Where the helpers of a session keep their conversations.
+fn helpers_dir(session: u64) -> PathBuf {
+    // Outside `sessions/`, where every file is taken for a session, and in
+    // the data folder, which no tool may read.
+    backend::data_dir().join("agents").join(session.to_string())
 }
 
 pub fn settings_path() -> PathBuf {
@@ -831,7 +914,10 @@ mod tests {
     // would shadow the built-in attribute.
     #[cfg(unix)]
     use super::write_private;
-    use super::{Conversation, Store, Todo, fill, load_listing, replay, search_in, summaries};
+    use super::{
+        Conversation, Store, Todo, Transcript, fill, load, load_listing, replay, search, search_in,
+        summaries,
+    };
     use crate::chat::Message;
 
     /// Held by every test that points `AGENT_DATA_DIR` somewhere: it is one
@@ -1191,6 +1277,160 @@ mod tests {
         listed.save().unwrap();
         let back = replay(&dir.join("sessions/1.jsonl")).unwrap();
         assert!(back.messages.is_empty());
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_transcript_replays_like_a_session() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("transcript");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let (n, mut helper) = Transcript::create(7, "explore", Some("work".into())).unwrap();
+        assert_eq!(
+            helper.path,
+            dir.join("agents").join("7").join(format!("{n}.jsonl"))
+        );
+        helper.conversation.messages = numbered(4).messages;
+        helper.conversation.todos = vec![Todo {
+            text: "look".into(),
+            status: "doing".into(),
+        }];
+        helper.save().unwrap();
+        helper.conversation.rewind(2);
+        helper
+            .conversation
+            .messages
+            .push(said("assistant", "again"));
+        helper.save().unwrap();
+
+        let mut back = Transcript::open(7, n).unwrap();
+        assert_eq!(back.path, helper.path);
+        assert_eq!(back.conversation.title, "explore");
+        assert_eq!(back.conversation.workspace, Some("work".into()));
+        assert_eq!(back.conversation.todos.len(), 1);
+        let contents: Vec<&str> = back
+            .conversation
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(contents, ["0", "1", "again"]);
+
+        // Opened again, it appends what is new rather than all of it.
+        let before = std::fs::read_to_string(&back.path).unwrap();
+        back.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&back.path).unwrap(), before);
+        back.conversation.messages.push(said("user", "more"));
+        back.save().unwrap();
+        let after = std::fs::read_to_string(&back.path).unwrap();
+        assert!(after.starts_with(&before));
+        assert_eq!(after.lines().count(), before.lines().count() + 1);
+        assert!(Transcript::open(7, n + 1).is_none());
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn listing_and_search_ignore_transcripts() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("transcript-listing");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        store.conversations.push(Conversation {
+            id: 1,
+            title: "the session".into(),
+            messages: vec![said("user", "a fig in the session")],
+            ..Default::default()
+        });
+        store.save().unwrap();
+        let (_, mut helper) = Transcript::create(1, "the helper", None).unwrap();
+        helper
+            .conversation
+            .messages
+            .push(said("user", "a fig in the helper"));
+        helper.save().unwrap();
+
+        let listed: Vec<u64> = summaries().iter().map(|s| s.id).collect();
+        assert_eq!(listed, [1]);
+        let loaded: Vec<String> = load().conversations.into_iter().map(|c| c.title).collect();
+        assert_eq!(loaded, ["the session"]);
+        assert_eq!(load_listing().conversations.len(), 1);
+        let found: Vec<String> = search("fig", 10).into_iter().map(|h| h.snippet).collect();
+        assert_eq!(found, ["a fig in the session"]);
+
+        let ctx = crate::tools::ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let listed = crate::tools::run("list_sessions", "{}", &ctx).unwrap();
+        assert!(
+            listed.contains("the session") && !listed.contains("the helper"),
+            "{listed}"
+        );
+        let found = crate::tools::run("search_sessions", r#"{"query":"fig"}"#, &ctx).unwrap();
+        assert!(
+            found.contains("in the session") && !found.contains("in the helper"),
+            "{found}"
+        );
+        // Nor can the model open the file by its path: it is in the data
+        // folder, even with that folder as the workspace.
+        let args = serde_json::json!({ "path": helper.path }).to_string();
+        let read = crate::tools::run("read_file", &args, &ctx);
+        assert!(
+            read.as_ref()
+                .is_err_and(|e| e.contains("Letronna's own folder")),
+            "{read:?}"
+        );
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn two_transcripts_made_at_once_get_different_numbers() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("transcript-race");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        // More than two, all let go together, to give a race every chance.
+        let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let makers: Vec<_> = (0..8)
+            .map(|_| {
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    Transcript::create(3, "helper", None).unwrap().0
+                })
+            })
+            .collect();
+        let mut numbers: Vec<u32> = makers.into_iter().map(|m| m.join().unwrap()).collect();
+        numbers.sort();
+        assert_eq!(numbers, (1..=8).collect::<Vec<u32>>());
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn removing_a_session_removes_its_helpers() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("transcript-remove");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        store.conversations.push(numbered(2));
+        store.conversations.push(Conversation {
+            id: 2,
+            ..numbered(1)
+        });
+        store.save().unwrap();
+        for session in [1, 1, 2] {
+            Transcript::create(session, "helper", None).unwrap();
+        }
+
+        store.remove(0);
+        assert!(!dir.join("sessions").join("1.jsonl").exists());
+        assert!(!dir.join("agents").join("1").exists());
+        assert!(Transcript::open(1, 1).is_none());
+        // Another session's helpers are its own.
+        assert!(Transcript::open(2, 1).is_some());
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 }
