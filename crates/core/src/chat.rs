@@ -181,20 +181,87 @@ pub fn validate(connection: &Connection) -> Result<String, String> {
     })
 }
 
-/// Character budget for the whole conversation window.
-const CONTEXT_CHARS: usize = 24_000;
+/// Budget for the whole conversation window, in estimated tokens: the 24,000
+/// characters it used to be, at four characters a token of English.
+const CONTEXT_TOKENS: usize = 6_000;
 /// A single tool result can be far larger than anything the model needs to
 /// read. The chat keeps the whole thing; the request gets the ends.
 const MAX_TOOL_CHARS: usize = 8_000;
+/// What a message costs beyond its text: the role and separators a chat
+/// template wraps it in, which OpenAI counts as three or four tokens.
+const MESSAGE_TOKENS: usize = 4;
+/// What the screenshot a request carries costs: a 1280×800 page -- browse
+/// takes none wider -- is about 1,400 tokens as Anthropic counts pictures
+/// (width × height / 750) and 1,100 as OpenAI does.
+const PICTURE_TOKENS: usize = 1_500;
 
-fn budget(messages: &[Message]) -> usize {
-    messages
-        .iter()
-        .map(|m| m.content.chars().count().min(MAX_TOOL_CHARS))
-        .sum()
+/// About how many tokens `text` is, without a tokenizer.
+///
+/// Tokenizers average about four bytes a token on English and code, which
+/// is also how they fare on two-byte letters such as Cyrillic or accented
+/// Latin. A character of three or four bytes -- CJK, kana, Hangul, Thai,
+/// Indic scripts, emoji -- is rarely merged with its neighbours, so each
+/// counts as a token by itself; at four bytes a token a page of Chinese
+/// would count for three quarters of what it costs. Symbols of three bytes
+/// count the same, which is more than a run of them costs: tokenizers merge
+/// box drawing, blocks and arrows, as in a `tree` listing or a progress bar.
+fn tokens(text: &str) -> usize {
+    if text.is_ascii() {
+        return text.len().div_ceil(4);
+    }
+    let (mut wide, mut narrow) = (0, text.len());
+    for byte in text.bytes() {
+        // Only the first byte of a three- or four-byte character is this high.
+        let width = match byte {
+            0xE0..=0xEF => 3,
+            0xF0..=0xFF => 4,
+            _ => continue,
+        };
+        wide += 1;
+        narrow -= width;
+    }
+    wide + narrow.div_ceil(4)
 }
 
-/// Messages in the window, whatever the character budget says. Guards against
+/// About what `m` costs in a request: its text as sent, the calls it makes
+/// with their arguments, and its role.
+fn message_tokens(m: &Message) -> usize {
+    // A long tool result goes out trimmed to its ends. A string never has
+    // fewer bytes than characters, so a short one is never trimmed.
+    let content = if m.role == "tool" && m.content.len() > MAX_TOOL_CHARS {
+        tokens(&trim(&m.content, MAX_TOOL_CHARS))
+    } else {
+        tokens(&m.content)
+    };
+    let calls: usize = m
+        .tool_calls
+        .iter()
+        .map(|c| tokens(&c.name) + tokens(&c.arguments))
+        .sum();
+    MESSAGE_TOKENS + content + calls
+}
+
+/// The estimate for every start of `messages`: `sums[n]` is the first `n`
+/// messages', so any stretch of them costs one subtraction.
+///
+/// The screenshot is counted where it would go, whether or not the model
+/// takes pictures, so the window does not move when one turns out not to.
+fn token_sums(messages: &[Message]) -> Vec<usize> {
+    let picture = screenshot(messages).map(|(after, _)| after);
+    let mut sums = Vec::with_capacity(messages.len() + 1);
+    let mut total = 0;
+    sums.push(total);
+    for (i, m) in messages.iter().enumerate() {
+        total += message_tokens(m);
+        if picture == Some(i) {
+            total += PICTURE_TOKENS;
+        }
+        sums.push(total);
+    }
+    sums
+}
+
+/// Messages in the window, whatever the token budget says. Guards against
 /// a long run of tiny messages.
 const MAX_MESSAGES: usize = 60;
 /// How much the window drops when it no longer fits, in messages. The start is
@@ -221,9 +288,11 @@ const COMPACT_STEP: usize = 16;
 /// start, so nothing needs saving and two requests over the same history agree.
 fn window_start(messages: &[Message]) -> usize {
     let last_user = messages.iter().rposition(opens_turn).unwrap_or(0);
+    let sums = token_sums(messages);
+    let total = sums[messages.len()];
     let mut start = 0;
     while start < last_user
-        && (budget(&messages[start..]) > CONTEXT_CHARS || messages.len() - start > MAX_MESSAGES)
+        && (total - sums[start] > CONTEXT_TOKENS || messages.len() - start > MAX_MESSAGES)
     {
         // Drop a fixed step, then round forward to a user turn so the window
         // never begins midway through a tool exchange.
@@ -242,8 +311,7 @@ pub(crate) fn opens_turn(message: &Message) -> bool {
     message.role == "user" && !message.folded
 }
 
-fn body(connection: &Connection, messages: &[Message], summary: Option<&str>) -> Value {
-    let start = window_start(messages);
+fn body(connection: &Connection, window: &[Message], summary: Option<&str>) -> Value {
     // The user's SOUL.md, when there is one, says who Letronna is instead.
     let mut system = crate::memory::soul().unwrap_or_else(|| {
         String::from("You are Letronna, a personal assistant. Be clear, concise, and honest.")
@@ -286,7 +354,6 @@ fn body(connection: &Connection, messages: &[Message], summary: Option<&str>) ->
         ));
     }
     let mut context = vec![json!({"role": "system", "content": system})];
-    let window = &messages[start..];
     let shot = screenshot(window)
         .filter(|_| sees_images(&connection.model))
         .and_then(|(after, path)| Some((after, crate::media::data_url(&path)?)));
@@ -379,10 +446,9 @@ fn forget_images(model: &str) {
     }
 }
 
-/// Whether a request for this conversation carries a picture.
-fn shows_picture(connection: &Connection, messages: &[Message]) -> bool {
-    sees_images(&connection.model)
-        && screenshot(&messages[window_start(messages)..]).is_some_and(|(_, path)| path.is_file())
+/// Whether a request for this window carries a picture.
+fn shows_picture(connection: &Connection, window: &[Message]) -> bool {
+    sees_images(&connection.model) && screenshot(window).is_some_and(|(_, path)| path.is_file())
 }
 
 /// Keep both ends of an oversized tool result; the middle is rarely the point.
@@ -654,7 +720,7 @@ pub fn list_models(base: &str, key: &str) -> Result<Vec<String>, String> {
 pub fn start(connection: Connection, messages: Vec<Message>) -> async_channel::Receiver<Event> {
     let (sender, receiver) = async_channel::bounded(64);
     std::thread::spawn(move || {
-        let result = stream(&connection, &messages, &sender);
+        let result = stream(&connection, &messages, window_start(&messages), &sender);
         let _ = sender.send_blocking(Event::Finished(result));
     });
     receiver
@@ -663,17 +729,18 @@ pub fn start(connection: Connection, messages: Vec<Message>) -> async_channel::R
 fn stream(
     connection: &Connection,
     messages: &[Message],
+    start: usize,
     sender: &async_channel::Sender<Event>,
 ) -> Result<(), String> {
     let endpoint = validate(connection)?;
     // What the window no longer holds goes in as a summary rather than not at
     // all. It is made here, on the worker, so the wait is part of the reply's.
-    let dropped = &messages[..window_start(messages)];
+    let (dropped, window) = messages.split_at(start);
     let summary = crate::compact::summary(connection, dropped);
     let mut request = client()?
         .post(endpoint)
         .timeout(Duration::from_secs(120))
-        .json(&body(connection, messages, summary.as_deref()));
+        .json(&body(connection, window, summary.as_deref()));
     if !connection.key.trim().is_empty() {
         request = request.bearer_auth(connection.key.trim());
     }
@@ -700,9 +767,9 @@ fn stream(
         // A model that cannot take pictures turns the whole request down,
         // each provider in words of its own. Send it again without the
         // screenshot, which that model is spared from then on.
-        if status.is_client_error() && shows_picture(connection, messages) {
+        if status.is_client_error() && shows_picture(connection, window) {
             forget_images(&connection.model);
-            return stream(connection, messages, sender);
+            return stream(connection, messages, start, sender);
         }
         let detail = response
             .json::<Value>()
@@ -944,7 +1011,7 @@ mod tests {
                 ..Default::default()
             })
             .collect();
-        let payload = body(&connection(), &messages, None);
+        let payload = body(&connection(), &messages[window_start(&messages)..], None);
         let context = payload["messages"].as_array().unwrap();
         assert_eq!(context.len(), 31);
         assert_eq!(context[1]["role"], "user");
@@ -954,7 +1021,8 @@ mod tests {
     fn huge_tool_result_keeps_the_prompt() {
         // A tool result larger than the whole budget used to push the window
         // past the end, leaving the model nothing but the system prompt, which
-        // it answered by introducing itself.
+        // it answered by introducing itself. In CJK even the ends that are
+        // sent are over the budget.
         let messages = vec![
             Message {
                 role: "user".into(),
@@ -973,11 +1041,12 @@ mod tests {
             Message {
                 role: "tool".into(),
                 tool_call_id: "a".into(),
-                content: "x".repeat(CONTEXT_CHARS * 3),
+                content: "字".repeat(CONTEXT_TOKENS * 12),
                 ..Default::default()
             },
         ];
-        let payload = body(&connection(), &messages, None);
+        assert!(message_tokens(&messages[2]) > CONTEXT_TOKENS);
+        let payload = body(&connection(), &messages[window_start(&messages)..], None);
         let context = payload["messages"].as_array().unwrap();
         assert_eq!(context.len(), 4);
         assert_eq!(context[1]["content"], "what is in the file?");
@@ -1197,7 +1266,8 @@ mod tests {
         for start in &starts {
             assert_eq!(messages[*start].role, "user", "start {start} is not a turn");
         }
-        assert!(budget(&messages[*starts.last().unwrap()..]) <= CONTEXT_CHARS);
+        let sums = token_sums(&messages);
+        assert!(sums[messages.len()] - sums[*starts.last().unwrap()] <= CONTEXT_TOKENS);
     }
 
     #[test]
@@ -1247,7 +1317,7 @@ mod tests {
         messages.extend((10..12).flat_map(round));
 
         assert_eq!(window_start(&messages), 2);
-        let payload = body(&connection(), &messages, None);
+        let payload = body(&connection(), &messages[window_start(&messages)..], None);
         let context = payload["messages"].as_array().unwrap();
         assert_eq!(context[1]["content"], "the turn's first request");
 
@@ -1537,5 +1607,156 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(beside.input_tokens(), 1933);
+    }
+
+    #[test]
+    fn ascii_counts_about_four_bytes_a_token() {
+        assert_eq!(tokens(""), 0);
+        assert_eq!(tokens("abcd"), 1);
+        assert_eq!(tokens("hello"), 2);
+        // The window's old budget of 24,000 characters is its new one.
+        assert_eq!(tokens(&"x".repeat(24_000)), CONTEXT_TOKENS);
+    }
+
+    #[test]
+    fn cjk_counts_every_character() {
+        assert_eq!(tokens("你好世界"), 4);
+        assert_eq!(tokens("こんにちは"), 5);
+        assert_eq!(tokens("안녕하세요"), 5);
+        assert_eq!(tokens("😀"), 1);
+        // Two characters, then nine bytes of ASCII at four a token.
+        assert_eq!(tokens("see 你好 here"), 2 + 3);
+        // Two-byte letters count by their bytes, as ASCII does.
+        assert_eq!(tokens("привет"), 3);
+    }
+
+    #[test]
+    fn a_message_counts_as_it_is_sent() {
+        let long = "x".repeat(40_000);
+        let said = Message {
+            role: "user".into(),
+            content: long.clone(),
+            ..Default::default()
+        };
+        let result = Message {
+            role: "tool".into(),
+            content: long,
+            ..Default::default()
+        };
+        // What the user wrote goes out whole, a tool result as its ends.
+        assert_eq!(message_tokens(&said), MESSAGE_TOKENS + 10_000);
+        let sent = message_tokens(&result) - MESSAGE_TOKENS;
+        assert!(sent.abs_diff(MAX_TOOL_CHARS / 4) < 16, "{sent}");
+    }
+
+    /// A turn that wrote a file bigger than the whole budget, then a new one.
+    fn a_big_write() -> Vec<Message> {
+        let arguments = format!(r#"{{"path":"big.txt","content":"{}"}}"#, "x".repeat(40_000));
+        vec![
+            Message {
+                role: "user".into(),
+                content: "write the big file".into(),
+                ..Default::default()
+            },
+            Message {
+                role: "assistant".into(),
+                tool_calls: vec![ToolCall {
+                    id: "a".into(),
+                    name: "write_file".into(),
+                    arguments,
+                }],
+                ..Default::default()
+            },
+            Message {
+                role: "tool".into(),
+                tool_call_id: "a".into(),
+                content: "Wrote big.txt".into(),
+                ..Default::default()
+            },
+            Message {
+                role: "assistant".into(),
+                content: "Done.".into(),
+                ..Default::default()
+            },
+            Message {
+                role: "user".into(),
+                content: "thanks".into(),
+                ..Default::default()
+            },
+        ]
+    }
+
+    #[test]
+    fn tool_call_arguments_count_toward_the_window() {
+        // A file written in one call goes out in full as the call's
+        // arguments, however little the messages around it say.
+        let messages = a_big_write();
+        assert!(message_tokens(&messages[1]) > 10_000);
+        // The turn that wrote it no longer fits, so the window moves on.
+        assert_eq!(window_start(&messages), 4);
+    }
+
+    #[test]
+    fn a_request_sends_its_window_and_a_summary_of_the_rest() {
+        use std::io::Write;
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1", server.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            // The summary of what fell out, then the reply.
+            let replies = [
+                (
+                    "application/json",
+                    r#"{"choices":[{"message":{"content":"A big file was written."}}]}"#,
+                ),
+                (
+                    "text/event-stream",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Welcome\"}}]}\n\ndata: [DONE]\n\n",
+                ),
+            ];
+            let mut bodies = Vec::new();
+            for (kind, reply) in replies {
+                let (mut socket, _) = server.accept().unwrap();
+                bodies.push(request_body(&mut socket));
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+            }
+            bodies
+        });
+        let c = Connection {
+            endpoint,
+            ..connection()
+        };
+        let rx = start(c, a_big_write());
+        assert!(matches!(rx.recv_blocking().unwrap(), Event::Delta(s) if s == "Welcome"));
+        assert!(matches!(
+            rx.recv_blocking().unwrap(),
+            Event::Finished(Ok(()))
+        ));
+        let bodies = worker.join().unwrap();
+        // The turn that no longer fits is summed up, and only the summary of
+        // it goes out with the window.
+        assert!(bodies[0].contains("write the big file"));
+        assert!(!bodies[1].contains("write the big file"));
+        assert!(bodies[1].contains("A big file was written."));
+        assert!(bodies[1].contains("thanks"));
+    }
+
+    #[test]
+    fn a_picture_counts_only_where_it_is_sent() {
+        let dir = std::env::temp_dir().join(format!("letronna-counted-{}", std::process::id()));
+        let messages = screenshots(&dir);
+        // Counted from the conversation alone, so the files need not be there.
+        std::fs::remove_dir_all(&dir).unwrap();
+        let sums = token_sums(&messages);
+        let pictured: Vec<usize> = (0..messages.len())
+            .filter(|&i| sums[i + 1] - sums[i] != message_tokens(&messages[i]))
+            .collect();
+        // The newer screenshot, after the last result of its batch; the
+        // older one is never sent, so it costs only its text.
+        let last = messages.len() - 1;
+        assert_eq!(pictured, [last]);
+        assert_eq!(
+            sums[last + 1] - sums[last],
+            message_tokens(&messages[last]) + PICTURE_TOKENS
+        );
     }
 }
