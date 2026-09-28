@@ -118,8 +118,13 @@ pub(crate) struct Chat {
     pub(crate) turn: Option<agent::Turn>,
     /// The session id currently receiving a streamed reply, if any.
     pub(crate) streaming_id: Option<u64>,
-    /// Tools the user allowed for the rest of this run of the app.
-    pub(crate) session_allow: std::collections::HashSet<String>,
+    /// The id of the queued call the approval card is up for, decided once
+    /// when the queue stopped on it.
+    pub(crate) asking: Option<String>,
+    /// Tools the user allowed for the rest of this run of the app, by the
+    /// session they were allowed in. Keyed like `unattended`: "stop asking"
+    /// about a tool in one chat is not a yes to it in every other chat.
+    pub(crate) session_allow: std::collections::HashMap<u64, std::collections::HashSet<String>>,
     /// Sessions started by an unattended schedule, which run tools without
     /// asking. Keyed by session so the grant cannot reach the user's own
     /// chats: a job saying "do not ask me at 9am" is not permission to stop
@@ -386,7 +391,8 @@ impl Chat {
             busy: false,
             turn: None,
             streaming_id: None,
-            session_allow: std::collections::HashSet::new(),
+            asking: None,
+            session_allow: std::collections::HashMap::new(),
             unattended: std::collections::HashSet::new(),
             answer,
             job_tick: false,
@@ -797,6 +803,10 @@ impl Chat {
         };
         let gate = |name: &str| self.needs_user(name);
         let next = turn.next(gate);
+        self.asking = match &next {
+            agent::Next::AskUser(call) => Some(call.id.clone()),
+            _ => None,
+        };
         if let agent::Next::AskUser(call) | agent::Next::Run(call) = &next {
             self.show_browser(&call.name, cx);
         }
@@ -1074,10 +1084,11 @@ impl Chat {
         let unattended = self
             .streaming_id
             .is_some_and(|id| self.unattended.contains(&id));
+        let none = std::collections::HashSet::new();
         agent::needs_user(
             name,
             self.store.settings.skip_approvals,
-            &self.session_allow,
+            allowed_in(&self.session_allow, self.streaming_id).unwrap_or(&none),
             unattended,
         )
     }
@@ -1134,25 +1145,48 @@ impl Chat {
     /// The user answered the approval card, here or from a chat.
     pub(crate) fn resolve_call(&mut self, verdict: Verdict, cx: &mut Context<Self>) {
         self.remote_waiting = None;
-        let Some(call) = self
+        let Some((call, true)) = self
             .turn
             .as_ref()
-            .and_then(|turn| match turn.next(|_| true) {
-                agent::Next::AskUser(call) => Some(call),
-                _ => None,
-            })
+            .and_then(|turn| front_call(turn, self.asking.as_deref()))
         else {
             return;
         };
+        // Answered, so a second click or a late reply from a chat cannot run
+        // the call again while it is still running.
+        self.asking = None;
+        cx.notify();
         match verdict {
             Verdict::Answer(text) => self.record_result(Ok(text), cx),
             Verdict::Deny => self.record_result(Err(letronna_core::tools::DECLINED.into()), cx),
             Verdict::Allow { remember } => {
-                if remember {
-                    self.session_allow.insert(call.name.clone());
+                if remember && let Some(id) = self.streaming_id {
+                    self.session_allow
+                        .entry(id)
+                        .or_default()
+                        .insert(call.name.clone());
                 }
                 self.execute_call(call, cx);
             }
+        }
+    }
+
+    /// Decide the call the card is up for again after an approval setting
+    /// changed, so it runs at once if it no longer needs the user.
+    pub(crate) fn approvals_changed(&mut self, cx: &mut Context<Self>) {
+        let waiting = self
+            .turn
+            .as_ref()
+            .and_then(|turn| front_call(turn, self.asking.as_deref()))
+            .is_some_and(|(_, waiting)| waiting);
+        // Advancing past a call that is already running would start it twice.
+        if !waiting {
+            return;
+        }
+        self.advance_tools(cx);
+        // The chat that was sent the card must not answer a call that ran.
+        if self.asking.is_none() {
+            self.remote_waiting = None;
         }
     }
 
@@ -1599,4 +1633,90 @@ pub(crate) fn parse_todos(arguments: &str) -> std::result::Result<Vec<Todo>, Str
         })
         .filter(|todo| !todo.text.is_empty())
         .collect())
+}
+
+/// The tools the user stopped being asked about in `session`, and none when
+/// no session is running.
+fn allowed_in(
+    session_allow: &std::collections::HashMap<u64, std::collections::HashSet<String>>,
+    session: Option<u64>,
+) -> Option<&std::collections::HashSet<String>> {
+    session.and_then(|id| session_allow.get(&id))
+}
+
+/// The call at the front of the queue, and whether the approval card is up
+/// for it rather than it running.
+pub(crate) fn front_call(
+    turn: &agent::Turn,
+    asking: Option<&str>,
+) -> Option<(backend::ToolCall, bool)> {
+    // `true` shows whatever is at the front, running or not. Which of the two
+    // it is was decided when the queue stopped on it: asking the settings
+    // again here showed a waiting call as running once approvals were
+    // switched off, and nothing ever ran it.
+    match turn.next(|_| true) {
+        agent::Next::AskUser(call) => {
+            let waiting = asking == Some(call.id.as_str());
+            Some((call, waiting))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
+    // would shadow the built-in attribute.
+    use super::{allowed_in, front_call};
+    use letronna_core::agent::{Next, Turn, needs_user};
+    use letronna_core::chat::{Connection, ToolCall};
+    use std::collections::{HashMap, HashSet};
+
+    /// A turn whose queue holds one `write_file` call.
+    fn writing() -> Turn {
+        let mut turn = Turn::new(Connection::default());
+        turn.begin(vec![ToolCall {
+            id: "call-1".into(),
+            name: "write_file".into(),
+            arguments: "{}".into(),
+        }]);
+        turn
+    }
+
+    #[test]
+    fn a_tool_allowed_in_one_session_is_still_asked_about_in_another() {
+        let mut session_allow = HashMap::new();
+        session_allow.insert(1, HashSet::from(["write_file".to_owned()]));
+        let allowed = |session| {
+            allowed_in(&session_allow, session).is_some_and(|tools| tools.contains("write_file"))
+        };
+        assert!(allowed(Some(1)));
+        assert!(!allowed(Some(2)));
+        assert!(!allowed(None));
+    }
+
+    #[test]
+    fn a_card_stays_up_when_approvals_are_switched_off_until_the_call_is_decided_again() {
+        let turn = writing();
+        let none = HashSet::new();
+        let Next::AskUser(asked) = turn.next(|name| needs_user(name, false, &none, false)) else {
+            panic!("write_file should wait for the user while approvals are on");
+        };
+        // The card keeps its buttons rather than showing a call as running
+        // that nothing started.
+        assert!(front_call(&turn, Some(&asked.id)).is_some_and(|(_, waiting)| waiting));
+        // Deciding again with approvals off runs it.
+        assert!(matches!(
+            turn.next(|name| needs_user(name, true, &none, false)),
+            Next::Run(_)
+        ));
+    }
+
+    #[test]
+    fn a_call_that_was_answered_or_never_asked_about_has_no_card() {
+        let turn = writing();
+        assert!(front_call(&turn, None).is_some_and(|(_, waiting)| !waiting));
+        assert!(front_call(&turn, Some("an-earlier-call")).is_some_and(|(_, waiting)| !waiting));
+        assert!(front_call(&Turn::new(Connection::default()), Some("call-1")).is_none());
+    }
 }
