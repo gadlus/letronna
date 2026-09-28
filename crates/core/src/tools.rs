@@ -74,6 +74,11 @@ pub trait Tool: Send + Sync {
         let _ = ctx;
         args.to_string()
     }
+    /// What the auto-mode judge is shown of a call: what decides whether it
+    /// is safe, whole, and nothing a page or file wrote.
+    fn judge_input(&self, args: &Value, ctx: &ToolContext) -> String {
+        self.preview(args, ctx)
+    }
 }
 
 pub const ASK_USER: &str = "ask_user";
@@ -404,6 +409,10 @@ impl Tool for WriteFile {
     fn preview(&self, args: &Value, _: &ToolContext) -> String {
         args["content"].as_str().unwrap_or_default().to_owned()
     }
+    fn judge_input(&self, args: &Value, _: &ToolContext) -> String {
+        let content = args["content"].as_str().unwrap_or_default();
+        format!("Write {}:\n{content}", path_arg(args))
+    }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         let path = resolve_write(path_arg(args), ctx)?;
         let content = args["content"].as_str().ok_or("`content` is required.")?;
@@ -452,6 +461,9 @@ impl Tool for EditFile {
         }
         out
     }
+    fn judge_input(&self, args: &Value, ctx: &ToolContext) -> String {
+        format!("Edit {}:\n{}", path_arg(args), self.preview(args, ctx))
+    }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         let path = resolve_write(path_arg(args), ctx)?;
         let old = args["old"].as_str().ok_or("`old` is required.")?;
@@ -493,6 +505,20 @@ impl Tool for RunCommand {
     }
     fn preview(&self, args: &Value, _: &ToolContext) -> String {
         args["command"].as_str().unwrap_or_default().to_owned()
+    }
+    fn judge_input(&self, args: &Value, ctx: &ToolContext) -> String {
+        // Never cut: the end of a command can undo whatever its start shows.
+        let line = args["command"].as_str().unwrap_or_default();
+        let folder = match &ctx.workspace {
+            Some(folder) => folder.display().to_string(),
+            None => "no folder".to_owned(),
+        };
+        let background = if args["background"].as_bool().unwrap_or(false) {
+            ", left running in the background"
+        } else {
+            ""
+        };
+        format!("Command, run in {folder}{background}:\n{line}")
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         let command = args["command"].as_str().ok_or("`command` is required.")?;

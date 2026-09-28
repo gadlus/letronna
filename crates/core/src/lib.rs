@@ -16,6 +16,7 @@ pub mod compact;
 pub mod gate;
 pub mod gateway;
 pub mod jobs;
+pub mod judge;
 pub mod mcp;
 pub mod media;
 pub mod memory;
