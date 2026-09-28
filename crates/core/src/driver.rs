@@ -24,6 +24,7 @@ use crate::cancel::Cancel;
 use crate::chat::{self, Connection, Event, Extra, Message, ToolCall};
 use crate::inbox::{self, Notice};
 use crate::store::{Todo, Transcript};
+use crate::tasks::{self, Key};
 use crate::tools::{self, Caller, ToolContext};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -102,6 +103,8 @@ pub struct Report {
     pub seconds: u64,
     /// Files it wrote or edited, as it named them, each once.
     pub files: Vec<String>,
+    /// Jobs it left running, which are its owner's now.
+    pub jobs: Vec<u64>,
 }
 
 /// Why a run ended.
@@ -135,6 +138,7 @@ pub fn run(mut spec: Spec) -> Report {
         output: 0,
         seconds: 0,
         files: Vec::new(),
+        jobs: Vec::new(),
     };
     let status = steps(&mut spec, &mut turn, &mut report)
         .and_then(|status| {
@@ -148,6 +152,15 @@ pub fn run(mut spec: Spec) -> Report {
             Ok(status)
         })
         .unwrap_or_else(Outcome::Failed);
+    // Before the unread mail is passed on, so a job that exits from here on
+    // tells the owner itself, and one that exited already goes with the mail.
+    report.jobs = tasks::reown(spec.id, spec.owner)
+        .into_iter()
+        .filter_map(|key| match key {
+            Key::Job(id) => Some(id),
+            _ => None,
+        })
+        .collect();
     forward_unread(&spec);
     report.status = status;
     report.text = last_said(&spec.transcript.conversation.messages);
@@ -155,11 +168,16 @@ pub fn run(mut spec: Spec) -> Report {
     report
 }
 
-/// Runs the agent on a thread of its own, named for it.
-pub fn spawn(spec: Spec) -> Result<Handle, String> {
+/// Runs the agent on a thread of its own, named for it, and hands its report
+/// to `then` on that thread as it ends.
+pub fn spawn(spec: Spec, then: impl FnOnce(&Report) + Send + 'static) -> Result<Handle, String> {
     std::thread::Builder::new()
         .name(format!("agent-{}", spec.id))
-        .spawn(move || run(spec))
+        .spawn(move || {
+            let report = run(spec);
+            then(&report);
+            report
+        })
         .map_err(|e| format!("Could not start the helper: {e}"))
 }
 
@@ -594,7 +612,7 @@ mod tests {
     /// Runs `spec` the way `spawn` does and waits for its report.
     fn finished(spec: Spec) -> Report {
         let name = format!("agent-{}", spec.id);
-        let handle = spawn(spec).unwrap();
+        let handle = spawn(spec, |_| ()).unwrap();
         assert_eq!(handle.thread().name(), Some(name.as_str()));
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
