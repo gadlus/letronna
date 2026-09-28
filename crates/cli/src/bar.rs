@@ -42,6 +42,10 @@ pub const COMMANDS: &[Command] = &[
         blurb: "read and search only, never write or run",
     },
     Command {
+        name: "/mode",
+        blurb: "show or change how much runs without asking",
+    },
+    Command {
         name: "/model",
         blurb: "show or change the model; add image, speech or video for those",
     },

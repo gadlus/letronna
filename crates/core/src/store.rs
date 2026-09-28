@@ -102,9 +102,10 @@ pub struct Settings {
     pub custom_endpoint: String,
     #[serde(default)]
     pub presence: String,
-    /// Run write and command tools without asking.
-    #[serde(default)]
-    pub skip_approvals: bool,
+    /// The mode a session starts in. Saves from before the modes kept
+    /// "Skip tool approvals" here, which reads as Bypass when it was on.
+    #[serde(default, alias = "skip_approvals")]
+    pub mode: crate::gate::Mode,
     /// How hard the model should think: empty, or low, medium or high.
     #[serde(default)]
     pub effort: String,
@@ -634,10 +635,17 @@ pub fn fill(conversation: &mut Conversation) {
 fn settings() -> Settings {
     let mut s: Settings = std::fs::read(settings_path())
         .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
+        .and_then(|b| read_settings(&b))
         .unwrap_or_default();
     retire_gateway(&mut s);
     s
+}
+
+/// Settings from their file's `bytes`, or `None` when those do not parse.
+pub(crate) fn read_settings(bytes: &[u8]) -> Option<Settings> {
+    let mut saved = serde_json::from_slice(bytes).ok()?;
+    crate::gate::keep_mode(&mut saved, "skip_approvals");
+    serde_json::from_value(saved).ok()
 }
 
 /// A gateway that is no longer offered moves to the Letronna account. Its
@@ -695,7 +703,7 @@ pub fn load() -> Store {
     conversations.sort_by_key(|c| c.updated);
     let settings: Settings = std::fs::read(settings_path())
         .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
+        .and_then(|b| read_settings(&b))
         .unwrap_or_default();
     let active = conversations
         .iter()
@@ -729,7 +737,7 @@ fn migrate() {
         #[serde(default)]
         presence: String,
         #[serde(default)]
-        skip_approvals: bool,
+        skip_approvals: crate::gate::Mode,
     }
     let Ok(bytes) = std::fs::read(&legacy) else {
         return;
@@ -748,7 +756,7 @@ fn migrate() {
             model: old.model,
             gateway: old.gateway,
             presence: old.presence,
-            skip_approvals: old.skip_approvals,
+            mode: old.skip_approvals,
             active_id: 0,
             // Settings that did not exist when the old file was written.
             ..Default::default()

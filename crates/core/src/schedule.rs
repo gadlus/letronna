@@ -63,10 +63,11 @@ pub struct Schedule {
     /// Epoch seconds of the last run; 0 if it has never run.
     #[serde(default)]
     pub last_run: u64,
-    /// Run tools without asking, for this schedule only. Off by default: an
-    /// approval card with nobody watching would stall the run forever.
-    #[serde(default)]
-    pub unattended: bool,
+    /// The mode a run decides in without the user, for this schedule only;
+    /// Default waits for the user at each card, as a chat does. Saves from
+    /// before the modes kept `unattended` here, which reads as Bypass.
+    #[serde(default, alias = "unattended")]
+    pub mode: crate::gate::Mode,
 }
 
 fn yes() -> bool {
@@ -141,8 +142,17 @@ pub fn path() -> PathBuf {
 pub fn load() -> Vec<Schedule> {
     std::fs::read(path())
         .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .and_then(|bytes| read(&bytes))
         .unwrap_or_default()
+}
+
+/// Schedules from their file's `bytes`, or `None` when those do not parse.
+pub(crate) fn read(bytes: &[u8]) -> Option<Vec<Schedule>> {
+    let mut saved: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    for schedule in saved.as_array_mut().into_iter().flatten() {
+        crate::gate::keep_mode(schedule, "unattended");
+    }
+    serde_json::from_value(saved).ok()
 }
 
 pub fn save(schedules: &[Schedule]) {
@@ -177,7 +187,7 @@ mod tests {
             trigger,
             enabled: true,
             last_run: 0,
-            unattended: false,
+            mode: Default::default(),
         }
     }
 

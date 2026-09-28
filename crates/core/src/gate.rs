@@ -13,16 +13,21 @@
 //!
 //! It is plain code with no network and nothing slow, so the window calls it
 //! on its UI thread each time the queue moves; it reads the project's small
-//! rules file, and its caller hands it the user's. Later layers -- known read-only commands,
-//! the modes, the judge -- slot in at the places marked below, in the order
+//! rules file, and its caller hands it the user's. The session's `Mode` sits
+//! between the rules and what the user allowed: Plan and Don't ask refuse,
+//! Bypass runs what the floor and the rules let through, and Accept edits
+//! runs changes to the project's own files. Later layers -- known read-only
+//! commands, the judge -- slot in at the places marked below, in the order
 //! the comments give.
 
 use crate::chat::ToolCall;
 use crate::command::{self, Dialect, Risk};
 use crate::permissions::{self, Rule};
 use crate::tools::{self, Tool, ToolContext};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 /// The tools the user stopped being asked about, by the session they said so
 /// in; they last until the program closes.
@@ -39,14 +44,184 @@ pub enum Outcome {
     Refuse(String),
 }
 
+/// How much a session lets run without asking, as its mode chip shows it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mode {
+    /// Asks before every change and command; what new installs start in.
+    #[default]
+    Default,
+    /// Runs edits to the project's own files unasked; commands still ask.
+    AcceptEdits,
+    /// Looks and proposes only: whatever changes things is refused.
+    Plan,
+    /// Accept edits with a judge for the rest; not offered until the judge
+    /// exists, so until then what it would judge asks.
+    Auto,
+    /// Refuses whatever would ask.
+    DontAsk,
+    /// Runs whatever the floor and the deny rules let through.
+    Bypass,
+}
+
+impl Mode {
+    /// The modes a person can pick, in the order they are listed.
+    pub const OFFERED: [Mode; 5] = [
+        Mode::Default,
+        Mode::AcceptEdits,
+        Mode::Plan,
+        Mode::DontAsk,
+        Mode::Bypass,
+    ];
+
+    /// The name `--mode`, `/mode` and the saved files use.
+    pub fn name(self) -> &'static str {
+        match self {
+            Mode::Default => "default",
+            Mode::AcceptEdits => "accept-edits",
+            Mode::Plan => "plan",
+            Mode::Auto => "auto",
+            Mode::DontAsk => "dont-ask",
+            Mode::Bypass => "bypass",
+        }
+    }
+
+    /// The word on the chip.
+    pub fn label(self) -> &'static str {
+        match self {
+            Mode::Default => "Ask",
+            Mode::AcceptEdits => "Edits",
+            Mode::Plan => "Plan",
+            Mode::Auto => "Auto",
+            Mode::DontAsk => "Don't ask",
+            Mode::Bypass => "Bypass",
+        }
+    }
+
+    /// What the mode does, in a few words.
+    pub fn about(self) -> &'static str {
+        match self {
+            Mode::Default => "asks before writing or running",
+            Mode::AcceptEdits => "edits in the project run; commands still ask",
+            Mode::Plan => "reads and searches only; never writes or runs",
+            Mode::Auto => "edits in the project run; the rest asks",
+            Mode::DontAsk => "runs only what is allowed; refuses what would ask",
+            Mode::Bypass => "runs without asking, bar risky calls and your rules",
+        }
+    }
+
+    /// The offered mode `text` names, by its name or its chip's word.
+    pub fn parse(text: &str) -> Result<Mode, String> {
+        let text = text.trim();
+        let named = |mode: &Mode| {
+            text.eq_ignore_ascii_case(mode.name()) || text.eq_ignore_ascii_case(mode.label())
+        };
+        if let Some(mode) = Mode::OFFERED.into_iter().find(named) {
+            return Ok(mode);
+        }
+        if named(&Mode::Auto) {
+            return Err("Auto mode is not available yet.".into());
+        }
+        let names: Vec<&str> = Mode::OFFERED.iter().map(|mode| mode.name()).collect();
+        Err(format!(
+            "There is no `{text}` mode; pick one of {}.",
+            names.join(", ")
+        ))
+    }
+
+    /// The mode a helper started from a session in `parent` runs in, when
+    /// it asks for `wanted`: never more than the parent lets through, and
+    /// the parent's own when one is Plan and the other Don't ask.
+    pub fn narrow(parent: Mode, wanted: Mode) -> Mode {
+        // Neither of those is inside the other: Plan asks for a fetch that
+        // Don't ask refuses, and Don't ask runs an allowed write that Plan
+        // refuses.
+        if matches!(
+            (parent, wanted),
+            (Mode::Plan, Mode::DontAsk) | (Mode::DontAsk, Mode::Plan)
+        ) {
+            return parent;
+        }
+        // Helpers run unseen, several at once, so they never bypass. A
+        // Bypass parent's are to run in Auto once the judge lands (auto-mode
+        // step 11); until then they run in Default.
+        let ceiling = if parent == Mode::Bypass {
+            Mode::Default
+        } else {
+            parent
+        };
+        if wanted.rank() < ceiling.rank() {
+            wanted
+        } else {
+            ceiling
+        }
+    }
+
+    /// Where the mode sits, from what lets the least through to the most.
+    fn rank(self) -> u8 {
+        match self {
+            Mode::Plan => 0,
+            Mode::DontAsk => 1,
+            Mode::Default => 2,
+            Mode::AcceptEdits => 3,
+            Mode::Auto => 4,
+            Mode::Bypass => 5,
+        }
+    }
+}
+
+impl Serialize for Mode {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.name())
+    }
+}
+
+impl<'de> Deserialize<'de> for Mode {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // The switches the mode replaced, "Skip tool approvals" and a
+        // schedule's `unattended`, were saved as true or false, and on meant
+        // what Bypass does. A name from a newer Letronna reads as Default
+        // rather than failing the whole file it is in, and so does null.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Saved {
+            Switch(bool),
+            Name(String),
+            Null,
+        }
+        Ok(match Saved::deserialize(deserializer)? {
+            Saved::Null => Mode::Default,
+            Saved::Switch(true) => Mode::Bypass,
+            Saved::Switch(false) => Mode::Default,
+            Saved::Name(name) => Mode::OFFERED
+                .into_iter()
+                .chain([Mode::Auto])
+                .find(|mode| mode.name() == name)
+                .unwrap_or_default(),
+        })
+    }
+}
+
+/// Drops `old`, the switch the mode replaced, from a saved `object` that
+/// also holds `mode`, which is the newer of the two.
+pub(crate) fn keep_mode(object: &mut Value, old: &str) {
+    // serde refuses a field given twice under its name and its alias, and
+    // a file that fails to read is started afresh, losing everything else.
+    if let Some(object) = object
+        .as_object_mut()
+        .filter(|object| object.contains_key("mode"))
+    {
+        object.remove(old);
+    }
+}
+
 /// Everything besides the call itself that decides it.
 pub struct Gate<'a> {
     /// The session the call is made in: its folder, plan mode and the chat
     /// app driving it, if one is.
     pub ctx: &'a ToolContext,
-    /// Every approval is taken as given: "Skip tool approvals", `--yes` or a
-    /// schedule set to run without asking.
-    pub skip_approvals: bool,
+    /// How much runs without asking: the session's chip, `--mode` or the
+    /// mode of the schedule it runs.
+    pub mode: Mode,
     /// What the user allowed; only the call's own session counts.
     pub grants: &'a Grants,
     /// The user's rules by argument, for every project; `decide` passes
@@ -61,37 +236,38 @@ pub struct Gate<'a> {
 }
 
 impl<'a> Gate<'a> {
-    /// The window's gate, where an unattended schedule skips every card and
-    /// has nobody to answer one.
+    /// The window's gate for a session in `mode`, or, while it runs a
+    /// schedule that decides without the user, in `unattended`'s mode with
+    /// nobody to answer.
     pub fn for_window(
         ctx: &'a ToolContext,
         grants: &'a Grants,
         rules: &'a Result<Vec<Rule>, String>,
-        skip_setting: bool,
-        unattended: bool,
+        mode: Mode,
+        unattended: Option<Mode>,
     ) -> Self {
         Self {
             ctx,
-            skip_approvals: skip_setting || unattended,
+            mode: unattended.unwrap_or(mode),
             grants,
             rules: rules.as_deref().unwrap_or_default(),
             broken: rules.as_ref().err().map(String::as_str),
-            human: !unattended,
+            human: unattended.is_none(),
         }
     }
 
-    /// The terminal's gate, from `--yes` and whether a card can be seen and
-    /// answered.
+    /// The terminal's gate, from its mode and whether a card can be seen
+    /// and answered.
     pub fn for_terminal(
         ctx: &'a ToolContext,
         grants: &'a Grants,
         rules: &'a Result<Vec<Rule>, String>,
-        yes: bool,
+        mode: Mode,
         answerable: bool,
     ) -> Self {
         Self {
             ctx,
-            skip_approvals: yes,
+            mode,
             grants,
             rules: rules.as_deref().unwrap_or_default(),
             broken: rules.as_ref().err().map(String::as_str),
@@ -102,6 +278,17 @@ impl<'a> Gate<'a> {
 
 /// Decides `call` from its tool, its arguments and `gate`, layer by layer.
 pub fn decide(call: &ToolCall, gate: &Gate) -> Outcome {
+    let outcome = ladder(call, gate);
+    // Layer 3's Don't ask turns every card into a refusal, the floor's too.
+    // A question is not an approval, so that one still asks.
+    if gate.mode == Mode::DontAsk && outcome == Outcome::Ask && call.name != tools::ASK_USER {
+        return Outcome::Refuse(unasked(&call.name));
+    }
+    outcome
+}
+
+/// `decide`'s layers, before Don't ask turns a card into a refusal.
+fn ladder(call: &ToolCall, gate: &Gate) -> Outcome {
     let Some(tool) = tools::find(&call.name) else {
         return Outcome::Refuse(format!("Unknown tool `{}`.", call.name));
     };
@@ -109,8 +296,11 @@ pub fn decide(call: &ToolCall, gate: &Gate) -> Outcome {
         Ok(args) => args,
         Err(error) => return Outcome::Refuse(error),
     };
-    // Layer 0: what this session cannot reach at all.
-    if let Some(why) = unavailable(tool.as_ref(), gate.ctx) {
+    // Layer 0: what this session cannot reach at all. Plan mode takes the
+    // tools that change things away as the plan flag does, so layer 3's
+    // refusal for it is made here.
+    let plan = gate.ctx.plan || gate.mode == Mode::Plan;
+    if let Some(why) = unavailable(tool.as_ref(), gate.ctx, plan) {
         return Outcome::Refuse(why);
     }
     // Layer 1, the floor. It comes before every setting and grant: a command
@@ -162,9 +352,9 @@ pub fn decide(call: &ToolCall, gate: &Gate) -> Outcome {
     if let Some(why) = gate.broken.or(ruling.broken.as_deref()) {
         return held(why, tool.name(), gate);
     }
-    // Layer 3, the mode's refusals, goes here; skipping approvals is what
-    // the mode ladder will call Bypass.
-    if gate.skip_approvals {
+    // Layer 3, the mode: Plan refused at layer 0 and Don't ask refuses in
+    // `decide`; Bypass runs whatever got this far.
+    if gate.mode == Mode::Bypass {
         return Outcome::Run;
     }
     // Layer 4: what the user allowed in this session or by rule.
@@ -175,8 +365,13 @@ pub fn decide(call: &ToolCall, gate: &Gate) -> Outcome {
     if !opaque && (granted || ruling.allow) {
         return Outcome::Run;
     }
-    // Layers 5 (known read-only commands), 6 (edits inside the workspace)
-    // and the judge go here, in that order.
+    // Layer 5, known read-only commands, goes here.
+    // Layer 6: an edit that stays among the project's own files.
+    let edits = matches!(gate.mode, Mode::AcceptEdits | Mode::Auto);
+    if edits && editable(tool.name(), &args, gate.ctx) {
+        return Outcome::Run;
+    }
+    // The judge goes here.
     if gate.human {
         return Outcome::Ask;
     }
@@ -190,7 +385,7 @@ pub fn decide(call: &ToolCall, gate: &Gate) -> Outcome {
 /// Why `tool` may not run with `args` in `ctx` whoever answers, or `None`.
 pub fn refusal(tool: &dyn Tool, args: &Value, ctx: &ToolContext) -> Option<String> {
     // `tools::run` asks too, for a call that reached it without the gate.
-    if let Some(why) = unavailable(tool, ctx) {
+    if let Some(why) = unavailable(tool, ctx, ctx.plan) {
         return Some(why);
     }
     match risk(tool.name(), args, ctx) {
@@ -199,8 +394,9 @@ pub fn refusal(tool: &dyn Tool, args: &Value, ctx: &ToolContext) -> Option<Strin
     }
 }
 
-/// Why the session cannot reach `tool` at all, or `None`.
-fn unavailable(tool: &dyn Tool, ctx: &ToolContext) -> Option<String> {
+/// Why the session cannot reach `tool` at all, or `None`; `plan` when it is
+/// in plan mode.
+fn unavailable(tool: &dyn Tool, ctx: &ToolContext, plan: bool) -> Option<String> {
     let name = tool.name();
     // Only fitting tools are offered, but the model can name any of them;
     // refuse here too rather than trust the offer.
@@ -210,7 +406,7 @@ fn unavailable(tool: &dyn Tool, ctx: &ToolContext) -> Option<String> {
              nothing on this computer is in reach."
         ));
     }
-    if ctx.plan && tool.mutates() {
+    if plan && tool.mutates() {
         return Some(format!(
             "`{name}` is not available in plan mode: it changes things, and plan \
              mode can only look and propose. Describe the change instead."
@@ -337,6 +533,165 @@ fn described(rule: &Rule) -> String {
     }
 }
 
+/// The refusal for a call that would have asked, in Don't ask mode.
+fn unasked(tool: &str) -> String {
+    format!(
+        "Refused: `{tool}` needs the user's yes, and this session is in Don't \
+         ask mode, which refuses instead of asking. Carry on without it and \
+         say what was left undone."
+    )
+}
+
+/// Paths in a project that an edit reaches only with a yes, as `SECRETS`
+/// are, matched without case as a run of names anywhere in the path, so
+/// that a folder covers everything in it; a trailing `*` takes any rest of
+/// the name. Git and its hook managers, CI, a build tool, an editor or
+/// launchd runs what they hold, or they hold Letronna's own rules, agents
+/// and workflows, other agents' settings (whose hooks run programs) and
+/// servers, or keys.
+const PROTECTED: &[&str] = &[
+    ".git",
+    ".gitmodules",
+    ".githooks",
+    ".husky",
+    "lefthook*",
+    ".lefthook*",
+    ".letronna",
+    ".claude",
+    ".cursor",
+    ".gemini",
+    ".codex",
+    ".continue",
+    ".windsurf",
+    ".mcp.json",
+    ".devcontainer",
+    ".github/workflows",
+    ".vscode",
+    ".idea",
+    ".cargo/config*",
+    ".npmrc",
+    ".yarnrc*",
+    "bunfig.toml",
+    ".pre-commit-config.yaml",
+    ".env*",
+    "Library/LaunchAgents",
+];
+
+/// Folders in the home folder's `Library` that cloud drives sync, where a
+/// project is as much the user's own as anywhere else.
+const SYNCED: &[&str] = &["mobile documents", "cloudstorage"];
+
+/// Whether `write_file` or `edit_file` may change what `args` names without
+/// asking: inside the project once links are followed, and neither on a
+/// protected path, in the home folder's own settings, nor in Letronna's own
+/// folder.
+fn editable(name: &str, args: &Value, ctx: &ToolContext) -> bool {
+    if !matches!(name, "write_file" | "edit_file") {
+        return false;
+    }
+    let (Some(workspace), Some(raw)) = (&ctx.workspace, args["path"].as_str()) else {
+        return false;
+    };
+    let (Ok(root), Some(path)) = (
+        std::fs::canonicalize(workspace),
+        landing(&workspace.join(raw)),
+    ) else {
+        return false;
+    };
+    let Ok(inside) = path.strip_prefix(&root) else {
+        return false;
+    };
+    let home = tools::home().and_then(|home| std::fs::canonicalize(home).ok());
+    !touches_home(&root, &path, home.as_deref())
+        && !protected(inside)
+        && !tools::private(&path, &crate::chat::data_dir())
+        && !linked(&path)
+}
+
+/// Whether `path` is a file that other names share, which may lie outside
+/// the project: the write changes the file in place, so it changes theirs.
+#[cfg(unix)]
+fn linked(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.nlink() > 1)
+}
+
+/// Whether `path` is a file that other names share; std's link count is
+/// unstable on Windows, so none is known there.
+#[cfg(not(unix))]
+fn linked(_path: &Path) -> bool {
+    false
+}
+
+/// Whether an edit to `path` in the project at `root` could change what the
+/// user's shell, Git, SSH, launchd or apps run: the project is `home`, a
+/// folder holding it or a filesystem root, or `path` is among `home`'s
+/// dotfiles and dot-folders or in its `Library`.
+fn touches_home(root: &Path, path: &Path, home: Option<&Path>) -> bool {
+    // Every file there would count as the project's own, `.zshrc` and
+    // `.ssh/authorized_keys` among them.
+    if root.parent().is_none() || home.is_some_and(|home| home.starts_with(root)) {
+        return true;
+    }
+    let Some(inside) = home.and_then(|home| path.strip_prefix(home).ok()) else {
+        return false;
+    };
+    let mut names = inside.iter().map(fold);
+    match names.next().as_deref() {
+        Some(first) if first.starts_with('.') => true,
+        Some("library") => !names
+            .next()
+            .is_some_and(|next| SYNCED.contains(&next.as_str())),
+        _ => false,
+    }
+}
+
+/// Where a write to `target` lands with every link followed, or `None` when
+/// that cannot be known: a link that points nowhere, which the write would
+/// follow, or a `..` after a folder that does not exist yet, which the write
+/// would make and then step back out of.
+fn landing(target: &Path) -> Option<PathBuf> {
+    let mut existing = target;
+    let mut rest = Vec::new();
+    // `symlink_metadata`, not `exists`, so that a dangling link counts as
+    // there and fails to resolve below rather than being written through.
+    while std::fs::symlink_metadata(existing).is_err() {
+        rest.push(existing.file_name()?);
+        existing = existing.parent()?;
+    }
+    let mut path = std::fs::canonicalize(existing).ok()?;
+    path.extend(rest.iter().rev());
+    Some(path)
+}
+
+/// Whether `path`, taken from the project folder, is or lies in one of
+/// `PROTECTED` or `SECRETS`.
+fn protected(path: &Path) -> bool {
+    let names: Vec<String> = path.iter().map(fold).collect();
+    PROTECTED.iter().chain(tools::SECRETS).any(|entry| {
+        let parts: Vec<String> = entry.split('/').map(str::to_ascii_lowercase).collect();
+        names.windows(parts.len()).any(|run| {
+            run.iter()
+                .zip(&parts)
+                .all(|(name, part)| match part.strip_suffix('*') {
+                    Some(start) => name.starts_with(start),
+                    None => name == part,
+                })
+        })
+    })
+}
+
+/// `name` as the file system finds it, for matching: without case, and
+/// without what Windows drops from the end of a name.
+fn fold(name: &std::ffi::OsStr) -> String {
+    // Lowering alone keeps `ſ` and the Kelvin sign, which macOS opens as
+    // `s` and `k`, so `.vscode/taſks.json` would pass for a new file.
+    let name = name.to_string_lossy().to_uppercase().to_lowercase();
+    // Windows opens `.npmrc.`, `.npmrc ` and `.npmrc::$DATA` as `.npmrc`.
+    let name = name.split(':').next().unwrap_or_default();
+    name.trim_end_matches(['.', ' ']).to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,6 +722,15 @@ mod tests {
             "write_file",
             serde_json::json!({ "path": "notes.txt", "content": "x" }),
         )
+    }
+
+    /// Bypass when approvals are skipped, as "Skip tool approvals" was.
+    fn bypass(skip_approvals: bool) -> Mode {
+        if skip_approvals {
+            Mode::Bypass
+        } else {
+            Mode::Default
+        }
     }
 
     /// `run_command` allowed in session 0, where the other tests' calls are made.
@@ -402,21 +766,27 @@ mod tests {
         let none = Grants::new();
         let granted = commands_granted();
         for ctx in [ToolContext::default(), chat()] {
-            for skip_approvals in [false, true] {
+            for mode in Mode::OFFERED.into_iter().chain([Mode::Auto]) {
                 for human in [false, true] {
                     for grants in [&none, &granted] {
                         let gate = Gate {
                             ctx: &ctx,
-                            skip_approvals,
+                            mode,
                             grants,
                             rules: &[],
                             broken: None,
                             human,
                         };
                         let Outcome::Refuse(why) = decide(&command(HARDLINE), &gate) else {
-                            panic!("ran or asked with skip {skip_approvals}, human {human}");
+                            panic!("ran or asked in {mode:?}, human {human}");
                         };
-                        assert!(why.contains("deletes the home folder"), "{why}");
+                        // Plan mode takes the tool away before the line is read.
+                        let reason = if mode == Mode::Plan {
+                            "plan mode"
+                        } else {
+                            "deletes the home folder"
+                        };
+                        assert!(why.contains(reason), "{why}");
                     }
                 }
             }
@@ -431,7 +801,7 @@ mod tests {
         for (skip_approvals, grants) in [(false, &none), (true, &none), (true, &granted)] {
             let gate = Gate {
                 ctx: &ctx,
-                skip_approvals,
+                mode: bypass(skip_approvals),
                 grants,
                 rules: &[],
                 broken: None,
@@ -445,7 +815,7 @@ mod tests {
         // "Stop asking" for the tool does not cover this command either.
         let gate = Gate {
             ctx: &ctx,
-            skip_approvals: false,
+            mode: Mode::Default,
             grants: &granted,
             rules: &[],
             broken: None,
@@ -464,7 +834,7 @@ mod tests {
         // --yes, and a chat app, where the yes would come from a message.
         let nobody = |skip_approvals| Gate {
             ctx: &here,
-            skip_approvals,
+            mode: bypass(skip_approvals),
             grants: &none,
             rules: &[],
             broken: None,
@@ -472,7 +842,7 @@ mod tests {
         };
         let from_a_chat = Gate {
             ctx: &chat,
-            skip_approvals: true,
+            mode: Mode::Bypass,
             grants: &none,
             rules: &[],
             broken: None,
@@ -497,7 +867,7 @@ mod tests {
         // A chat app still gets the card for an ordinary change.
         let gate = Gate {
             ctx: &chat,
-            skip_approvals: false,
+            mode: Mode::Default,
             grants: &none,
             rules: &[],
             broken: None,
@@ -517,7 +887,7 @@ mod tests {
         // refusal has to come from the gate, before anything runs.
         let gate = Gate {
             ctx: &ctx,
-            skip_approvals: true,
+            mode: Mode::Bypass,
             grants: &none,
             rules: &[],
             broken: None,
@@ -548,7 +918,7 @@ mod tests {
         let decided = |skip_approvals, human| {
             let gate = Gate {
                 ctx: &ctx,
-                skip_approvals,
+                mode: bypass(skip_approvals),
                 grants: &granted,
                 rules: &[],
                 broken: None,
@@ -564,7 +934,7 @@ mod tests {
         // The grant still covers a command the floor can read.
         let gate = Gate {
             ctx: &ctx,
-            skip_approvals: false,
+            mode: Mode::Default,
             grants: &granted,
             rules: &[],
             broken: None,
@@ -583,7 +953,7 @@ mod tests {
             };
             let gate = Gate {
                 ctx: &ctx,
-                skip_approvals: false,
+                mode: Mode::Default,
                 grants: &grants,
                 rules: &[],
                 broken: None,
@@ -617,22 +987,20 @@ mod tests {
         let none = Grants::new();
         let (ctx, rules) = (ToolContext::default(), Ok(Vec::new()));
         for grants in [&none, &granted] {
-            // Asking as usual; "Skip tool approvals" and --yes; and an
+            // Each mode, picked on the chip or typed after --mode; and an
             // unattended schedule and `-p --yes` fed from a pipe.
-            for (skip, unattended, yes, answerable) in [
-                (false, false, false, true),
-                (true, false, true, true),
-                (false, true, true, false),
-            ] {
-                let window = Gate::for_window(&ctx, grants, &rules, skip, unattended);
-                let terminal = Gate::for_terminal(&ctx, grants, &rules, yes, answerable);
+            let picked = Mode::OFFERED.map(|mode| (mode, None, mode, true));
+            let unattended = (Mode::Default, Some(Mode::Bypass), Mode::Bypass, false);
+            for (mode, unattended, typed, answerable) in picked.into_iter().chain([unattended]) {
+                let window = Gate::for_window(&ctx, grants, &rules, mode, unattended);
+                let terminal = Gate::for_terminal(&ctx, grants, &rules, typed, answerable);
                 for queued in &calls {
                     let mut turn = Turn::new(Connection::default());
                     turn.begin(vec![queued.clone()]);
                     assert_eq!(
                         turn.next(|call| decide(call, &window)),
                         turn.next(|call| decide(call, &terminal)),
-                        "{} with skip {skip}, unattended {unattended}",
+                        "{} in {mode:?}, unattended {unattended:?}",
                         queued.name
                     );
                 }
@@ -668,7 +1036,7 @@ mod tests {
         for (queued, skip_approvals, grants, human, expected) in table {
             let gate = Gate {
                 ctx: &ctx,
-                skip_approvals,
+                mode: bypass(skip_approvals),
                 grants,
                 rules: &[],
                 broken: None,
@@ -693,7 +1061,7 @@ mod tests {
         let none = Grants::new();
         let gate = Gate {
             ctx: &ctx,
-            skip_approvals: true,
+            mode: Mode::Bypass,
             grants: &none,
             rules: &[],
             broken: None,
@@ -726,7 +1094,7 @@ mod tests {
         for skip_approvals in [false, true] {
             let gate = Gate {
                 ctx: &ctx,
-                skip_approvals,
+                mode: bypass(skip_approvals),
                 grants: &grants,
                 rules: &rules,
                 broken: None,
@@ -771,7 +1139,7 @@ mod tests {
             ] {
                 let gate = Gate {
                     ctx,
-                    skip_approvals,
+                    mode: bypass(skip_approvals),
                     grants: &none,
                     rules: &rules,
                     broken: None,
@@ -796,7 +1164,7 @@ mod tests {
         // With no deny on the tool, skipped approvals run it as before.
         let free = Gate {
             ctx: &here,
-            skip_approvals: true,
+            mode: Mode::Bypass,
             grants: &none,
             rules: &[],
             broken: None,
@@ -818,7 +1186,7 @@ mod tests {
         let none = Grants::new();
         let gate = |skip_approvals, human| Gate {
             ctx: &ctx,
-            skip_approvals,
+            mode: bypass(skip_approvals),
             grants: &none,
             rules: &[],
             broken: None,
@@ -859,10 +1227,11 @@ mod tests {
         // The user's file broken, then the project's.
         for (ctx, rules) in [(&here, &broken), (&project, &Ok(Vec::new()))] {
             // Asking as usual, approvals skipped, and an unattended schedule.
-            for (skip, unattended) in [(false, false), (true, false), (false, true)] {
-                let gate = Gate::for_window(ctx, &granted, rules, skip, unattended);
+            let (asking, bypass) = (Mode::Default, Mode::Bypass);
+            for (mode, unattended) in [(asking, None), (bypass, None), (asking, Some(bypass))] {
+                let gate = Gate::for_window(ctx, &granted, rules, mode, unattended);
                 let outcome = decide(&command("cargo test"), &gate);
-                if unattended {
+                if unattended.is_some() {
                     let Outcome::Refuse(why) = outcome else {
                         panic!("ran with nobody there: {outcome:?}");
                     };
@@ -876,5 +1245,462 @@ mod tests {
             }
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A project folder for one test holding `notes.txt` and a `.git`
+    /// folder, with a file beside it outside the project.
+    fn project(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("letronna-gate-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("project/.git/hooks")).unwrap();
+        std::fs::write(dir.join("project/notes.txt"), "a").unwrap();
+        std::fs::write(dir.join("outside.txt"), "a").unwrap();
+        dir
+    }
+
+    fn edit(path: &str) -> ToolCall {
+        call(
+            "write_file",
+            serde_json::json!({ "path": path, "content": "x" }),
+        )
+    }
+
+    /// What `decide` makes of `call` in `mode` with someone there, as the
+    /// letter the ladder tests use: R runs, A asks, X is refused.
+    fn letter(call: &ToolCall, mode: Mode, ctx: &ToolContext, rules: &[Rule]) -> char {
+        let none = Grants::new();
+        let gate = Gate {
+            ctx,
+            mode,
+            grants: &none,
+            rules,
+            broken: None,
+            human: true,
+        };
+        match decide(call, &gate) {
+            Outcome::Run => 'R',
+            Outcome::Ask => 'A',
+            Outcome::Refuse(_) => 'X',
+        }
+    }
+
+    #[test]
+    fn each_mode_runs_asks_or_refuses_each_kind_of_call() {
+        let dir = project("ladder");
+        let ctx = ToolContext {
+            workspace: Some(dir.join("project")),
+            ..Default::default()
+        };
+        let rules = [Rule {
+            tool: "run_command".into(),
+            pattern: "git push".into(),
+            effect: permissions::Effect::Deny,
+            project: None,
+        }];
+        let changed = serde_json::json!({ "path": "notes.txt", "old": "a", "new": "b" });
+        // In the order of `Mode::OFFERED`: Default, Accept edits, Plan,
+        // Don't ask, Bypass. A read-only line asks until layer 5 lands.
+        let table = [
+            (command("ls"), "AAXXR"),
+            (command("cargo test"), "AAXXR"),
+            (edit("src/new.rs"), "ARXXR"),
+            (call("edit_file", changed), "ARXXR"),
+            (edit(".git/hooks/pre-commit"), "AAXXR"),
+            (edit("../outside.txt"), "AAXXR"),
+            (command(DANGEROUS), "AAXXA"),
+            (command("git push origin main"), "XXXXX"),
+        ];
+        for (queued, expected) in table {
+            let got: String = Mode::OFFERED
+                .into_iter()
+                .map(|mode| letter(&queued, mode, &ctx, &rules))
+                .collect();
+            assert_eq!(got, expected, "{}", queued.arguments);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn accept_edits_asks_before_every_protected_path() {
+        for path in [
+            ".git/config",
+            ".GIT/hooks/pre-commit",
+            "vendor/lib/.git/config",
+            ".git",
+            ".letronna/permissions.json",
+            ".claude/settings.json",
+            ".devcontainer/devcontainer.json",
+            ".github/workflows/ci.yml",
+            ".vscode/tasks.json",
+            ".cargo/config.toml",
+            ".npmrc",
+            ".npmrc.",
+            ".npmrc::$DATA",
+            ".yarnrc.yml",
+            "bunfig.toml",
+            ".pre-commit-config.yaml",
+            ".env",
+            "app/.env.local",
+            ".gitmodules",
+            ".githooks/pre-commit",
+            ".husky/pre-commit",
+            "lefthook.yml",
+            ".lefthook-local.yaml",
+            ".vscode/settings.json",
+            ".vscode/launch.json",
+            ".idea/workspace.xml",
+            ".mcp.json",
+            ".cursor/hooks.json",
+            ".gemini/settings.json",
+            ".codex/config.toml",
+            ".continue/config.yaml",
+            ".windsurf/rules/project.md",
+            "app/.claude/settings.json",
+            ".Cursor/mcp.json",
+            ".codex./config.toml",
+            ".gemini::$DATA",
+            ".ssh/authorized_keys",
+            ".aws/credentials",
+            "Library/LaunchAgents/agent.plist",
+        ] {
+            assert!(protected(Path::new(path)), "{path}");
+        }
+        for path in [
+            "src/main.rs",
+            "notes.txt",
+            ".github/dependabot.yml",
+            ".gitignore",
+            "docs/husky.md",
+            "cargo/config.toml",
+            "environment.md",
+            "docs/git/config",
+        ] {
+            assert!(!protected(Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn a_name_the_file_system_folds_to_a_protected_one_is_protected() {
+        // macOS opens `ſ` as `s` and the Kelvin sign as `k`, and neither is
+        // lowered to them by ASCII rules.
+        for path in [
+            ".vſcode/taſks.json",
+            ".github/workflowſ/ci.yml",
+            ".github/wor\u{212A}flows/ci.yml",
+            "lefthoo\u{212A}.yml",
+            "app/.windſurf/hooks.json",
+        ] {
+            assert!(protected(Path::new(path)), "{path}");
+        }
+    }
+
+    #[test]
+    fn accept_edits_asks_in_the_home_folder_above_it_and_among_its_settings() {
+        let home = Path::new("/home/user_a");
+        let at = |root: &str, file: &str| {
+            let root = Path::new(root);
+            touches_home(root, &root.join(file), Some(home))
+        };
+        for (root, file) in [
+            ("/home/user_a", "notes.txt"),
+            ("/home", "user_a/.zshrc"),
+            ("/", "etc/hosts"),
+            ("/home/user_a/.config/nvim", "init.lua"),
+            ("/home/user_a/.local/bin", "tool"),
+            ("/home/user_a/Library", "LaunchAgents/a.plist"),
+            (
+                "/home/user_a/Library/Application Support/app",
+                "settings.json",
+            ),
+        ] {
+            assert!(at(root, file), "{root} {file}");
+        }
+        for (root, file) in [
+            ("/home/user_a/project", ".zshrc"),
+            (
+                "/home/user_a/Library/CloudStorage/drive/project",
+                "notes.txt",
+            ),
+            (
+                "/home/user_a/Library/Mobile Documents/docs/project",
+                "notes.txt",
+            ),
+            ("/srv/project", "notes.txt"),
+        ] {
+            assert!(!at(root, file), "{root} {file}");
+        }
+        // Without a home folder, a filesystem root is still no project.
+        assert!(touches_home(Path::new("/"), Path::new("/notes.txt"), None));
+        assert!(!touches_home(Path::new("/srv"), Path::new("/srv/a"), None));
+    }
+
+    #[test]
+    fn accept_edits_asks_before_every_write_when_the_project_is_home() {
+        let Some(home) = tools::home() else {
+            return;
+        };
+        let ctx = ToolContext {
+            workspace: Some(home),
+            ..Default::default()
+        };
+        for path in [
+            "notes.txt",
+            ".zshrc",
+            ".bash_profile",
+            ".profile",
+            ".gitconfig",
+            ".ssh/authorized_keys",
+            ".ssh/config",
+            ".config/git/config",
+            "Library/LaunchAgents/agent.plist",
+        ] {
+            assert_eq!(
+                letter(&edit(path), Mode::AcceptEdits, &ctx, &[]),
+                'A',
+                "{path}"
+            );
+        }
+        let root = ToolContext {
+            workspace: Some(PathBuf::from("/")),
+            ..Default::default()
+        };
+        assert_eq!(
+            letter(&edit("notes.txt"), Mode::AcceptEdits, &root, &[]),
+            'A'
+        );
+    }
+
+    #[test]
+    fn accept_edits_asks_when_a_write_would_leave_the_project() {
+        let dir = project("links");
+        let inside = dir.join("project");
+        let ctx = ToolContext {
+            workspace: Some(inside.clone()),
+            ..Default::default()
+        };
+        // A folder made on the way and stepped back out of lands in `.git`.
+        assert_eq!(
+            letter(&edit("new/../.git/config"), Mode::AcceptEdits, &ctx, &[]),
+            'A'
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink(dir.join("outside.txt"), inside.join("out.txt")).unwrap();
+            symlink(&dir, inside.join("up")).unwrap();
+            symlink(dir.join("missing.txt"), inside.join("dangling.txt")).unwrap();
+            symlink(inside.join(".git"), inside.join("hidden")).unwrap();
+            // A hard link canonicalizes inside, but writing it changes the
+            // file outside in place.
+            std::fs::hard_link(dir.join("outside.txt"), inside.join("linked.txt")).unwrap();
+            for path in [
+                "out.txt",
+                "up/outside.txt",
+                "dangling.txt",
+                "hidden/config",
+                "linked.txt",
+            ] {
+                assert_eq!(
+                    letter(&edit(path), Mode::AcceptEdits, &ctx, &[]),
+                    'A',
+                    "{path}"
+                );
+            }
+        }
+        assert_eq!(
+            letter(&edit("notes.txt"), Mode::AcceptEdits, &ctx, &[]),
+            'R'
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn dont_ask_refuses_every_card_but_a_question() {
+        let ctx = ToolContext::default();
+        let granted = commands_granted();
+        let gate = Gate {
+            ctx: &ctx,
+            mode: Mode::DontAsk,
+            grants: &granted,
+            rules: &[],
+            broken: None,
+            human: true,
+        };
+        let Outcome::Refuse(why) = decide(&write(), &gate) else {
+            panic!("a write asked in Don't ask mode");
+        };
+        assert!(why.contains("Don't ask mode"), "{why}");
+        // What the user allowed still runs, and the floor still refuses.
+        assert_eq!(decide(&command("cargo test"), &gate), Outcome::Run);
+        assert!(matches!(
+            decide(&command(DANGEROUS), &gate),
+            Outcome::Refuse(_)
+        ));
+        let question = call(tools::ASK_USER, serde_json::json!({ "question": "Which?" }));
+        assert_eq!(decide(&question, &gate), Outcome::Ask);
+    }
+
+    #[test]
+    fn a_waiting_call_is_decided_again_in_the_new_mode() {
+        let dir = project("again");
+        let ctx = ToolContext {
+            workspace: Some(dir.join("project")),
+            ..Default::default()
+        };
+        let mut turn = Turn::new(Connection::default());
+        turn.begin(vec![edit("notes.txt")]);
+        let none = Grants::new();
+        let next = |mode| {
+            let gate = Gate {
+                ctx: &ctx,
+                mode,
+                grants: &none,
+                rules: &[],
+                broken: None,
+                human: true,
+            };
+            turn.next(|queued| decide(queued, &gate))
+        };
+        assert!(matches!(next(Mode::Default), Next::AskUser(_)));
+        // The card goes and the call runs, or it shows the refusal.
+        assert!(matches!(next(Mode::AcceptEdits), Next::Run(_)));
+        assert!(matches!(next(Mode::DontAsk), Next::Refuse(..)));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn old_switches_read_as_modes_and_modes_save_by_name() {
+        use crate::schedule::{Schedule, Trigger};
+        use crate::store::Settings;
+        let settings = |field: &str| {
+            let text = format!(r#"{{"endpoint": "", "model": ""{field}}}"#);
+            serde_json::from_str::<Settings>(&text).unwrap().mode
+        };
+        assert_eq!(settings(r#", "skip_approvals": true"#), Mode::Bypass);
+        assert_eq!(settings(r#", "skip_approvals": false"#), Mode::Default);
+        assert_eq!(settings(""), Mode::Default);
+        assert_eq!(settings(r#", "mode": "accept-edits""#), Mode::AcceptEdits);
+        // A mode from a newer Letronna does not cost the rest of the file.
+        assert_eq!(settings(r#", "mode": "sideways""#), Mode::Default);
+        let saved = serde_json::to_value(Settings {
+            mode: Mode::Bypass,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(saved["mode"], "bypass");
+        assert!(saved.get("skip_approvals").is_none());
+
+        let schedule = Schedule {
+            id: 1,
+            name: "nightly".into(),
+            prompt: "tidy up".into(),
+            workspace: None,
+            trigger: Trigger::Every { minutes: 5 },
+            enabled: true,
+            last_run: 0,
+            mode: Mode::DontAsk,
+        };
+        let mut saved = serde_json::to_value(&schedule).unwrap();
+        assert_eq!(saved["mode"], "dont-ask");
+        let old = saved.as_object_mut().unwrap();
+        old.remove("mode");
+        for (unattended, mode) in [(true, Mode::Bypass), (false, Mode::Default)] {
+            old.insert("unattended".into(), unattended.into());
+            let read: Schedule = serde_json::from_value(old.clone().into()).unwrap();
+            assert_eq!(read.mode, mode);
+        }
+        for mode in Mode::OFFERED.into_iter().chain([Mode::Auto]) {
+            let text = serde_json::to_string(&mode).unwrap();
+            assert_eq!(serde_json::from_str::<Mode>(&text).unwrap(), mode);
+        }
+    }
+
+    #[test]
+    fn a_file_with_the_mode_and_the_old_switch_keeps_the_mode_and_the_rest() {
+        use crate::{schedule, store};
+        for text in [
+            r#"{"endpoint": "", "model": "m1", "mode": "plan", "skip_approvals": true}"#,
+            r#"{"endpoint": "", "model": "m1", "skip_approvals": true, "mode": "plan"}"#,
+        ] {
+            let read = store::read_settings(text.as_bytes()).unwrap();
+            assert_eq!((read.model.as_str(), read.mode), ("m1", Mode::Plan));
+        }
+        let null = r#"{"endpoint": "", "model": "m1", "mode": null}"#;
+        let read = store::read_settings(null.as_bytes()).unwrap();
+        assert_eq!((read.model.as_str(), read.mode), ("m1", Mode::Default));
+        let old = r#"{"endpoint": "", "model": "m1", "skip_approvals": true}"#;
+        assert_eq!(
+            store::read_settings(old.as_bytes()).unwrap().mode,
+            Mode::Bypass
+        );
+
+        let job = |fields: &str| {
+            format!(
+                r#"{{"id": 1, "name": "nightly", "prompt": "tidy up", "workspace": null,
+                "trigger": {{"Every": {{"minutes": 5}}}}{fields}}}"#
+            )
+        };
+        let text = format!(
+            "[{}, {}, {}]",
+            job(r#", "unattended": true, "mode": "dont-ask""#),
+            job(r#", "mode": null"#),
+            job(r#", "unattended": true"#)
+        );
+        let read = schedule::read(text.as_bytes()).unwrap();
+        let modes: Vec<Mode> = read.iter().map(|job| job.mode).collect();
+        assert_eq!(modes, [Mode::DontAsk, Mode::Default, Mode::Bypass]);
+    }
+
+    #[test]
+    fn a_helper_never_runs_in_more_than_its_parent_nor_in_bypass() {
+        let every = Mode::OFFERED.into_iter().chain([Mode::Auto]);
+        for parent in every.clone() {
+            for wanted in every.clone() {
+                let narrowed = Mode::narrow(parent, wanted);
+                assert!(narrowed.rank() <= parent.rank(), "{parent:?} {wanted:?}");
+                // Plan and Don't ask are not ranked against each other.
+                let unranked = (parent, wanted) == (Mode::DontAsk, Mode::Plan);
+                assert!(
+                    unranked || narrowed.rank() <= wanted.rank(),
+                    "{parent:?} {wanted:?}"
+                );
+                assert_ne!(narrowed, Mode::Bypass);
+            }
+        }
+        // Auto is not offered yet, so a Bypass parent's helpers ask.
+        assert_eq!(Mode::narrow(Mode::Bypass, Mode::Bypass), Mode::Default);
+        assert_eq!(Mode::narrow(Mode::Bypass, Mode::Plan), Mode::Plan);
+        assert_eq!(
+            Mode::narrow(Mode::AcceptEdits, Mode::Bypass),
+            Mode::AcceptEdits
+        );
+        assert_eq!(Mode::narrow(Mode::Plan, Mode::AcceptEdits), Mode::Plan);
+        assert_eq!(Mode::narrow(Mode::DontAsk, Mode::Plan), Mode::DontAsk);
+        assert_eq!(Mode::narrow(Mode::Plan, Mode::DontAsk), Mode::Plan);
+    }
+
+    #[test]
+    fn a_schedule_runs_in_its_own_mode_whatever_the_chip_says() {
+        let (ctx, none, rules) = (ToolContext::default(), Grants::new(), Ok(Vec::new()));
+        for (chip, schedule) in [(Mode::Bypass, Mode::Plan), (Mode::Plan, Mode::Bypass)] {
+            let gate = Gate::for_window(&ctx, &none, &rules, chip, Some(schedule));
+            assert_eq!(gate.mode, schedule);
+            assert!(!gate.human);
+        }
+        let gate = Gate::for_window(&ctx, &none, &rules, Mode::DontAsk, None);
+        assert_eq!(gate.mode, Mode::DontAsk);
+        assert!(gate.human);
+    }
+
+    #[test]
+    fn a_mode_is_picked_by_its_name_or_its_chip_but_auto_is_not_offered() {
+        assert_eq!(Mode::parse("accept-edits"), Ok(Mode::AcceptEdits));
+        assert_eq!(Mode::parse("Edits"), Ok(Mode::AcceptEdits));
+        assert_eq!(Mode::parse(" don't ask "), Ok(Mode::DontAsk));
+        assert_eq!(Mode::parse("BYPASS"), Ok(Mode::Bypass));
+        assert_eq!(Mode::parse("ask"), Ok(Mode::Default));
+        assert!(Mode::parse("auto").unwrap_err().contains("not available"));
+        let unknown = Mode::parse("fast").unwrap_err();
+        assert!(unknown.contains("accept-edits, plan"), "{unknown}");
     }
 }

@@ -858,14 +858,14 @@ pub(crate) fn holds_secrets(raw: &str, ctx: &ToolContext) -> bool {
 /// keys, the sign-in token and the bot tokens. It sits under the home folder,
 /// and reading there needs no approval, so a chat or a file that talked the
 /// model into it would have had them read out.
-fn private(path: &Path, data: &Path) -> bool {
+pub(crate) fn private(path: &Path, data: &Path) -> bool {
     std::fs::canonicalize(data).is_ok_and(|data| path.starts_with(data))
 }
 
 /// Folders and files that hold keys, passwords or other agents' sign-in
 /// tokens, matched as a run of names anywhere in a path so that a folder
 /// covers everything in it; `_netrc` is what curl and Git read on Windows.
-const SECRETS: &[&str] = &[
+pub(crate) const SECRETS: &[&str] = &[
     ".ssh",
     ".aws",
     ".netrc",

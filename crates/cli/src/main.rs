@@ -60,6 +60,13 @@ fn main() {
         update_now();
         return;
     }
+    let mode = match &args.mode {
+        Ok(mode) => *mode,
+        Err(error) => {
+            render::line(&render::red(error));
+            std::process::exit(1);
+        }
+    };
     // MCP servers can take seconds to start; started now, their tools are
     // there by the first question.
     letronna_core::mcp::start();
@@ -67,13 +74,12 @@ fn main() {
     let mut runner = Runner {
         store: store::load_listing(),
         allowed: Default::default(),
-        yes: args.yes,
+        mode,
         // With the question piped in or the answer piped out, a card would be
         // drawn or read where nobody sees it, and wait forever.
         human: args.prompt.is_none()
             || (std::io::stdin().is_terminal() && std::io::stdout().is_terminal()),
         trouble: None,
-        plan: args.plan,
         bar: bar::Bar::new(String::new()),
     };
     letronna_core::browser::share_browser(runner.store.settings.browser_shared);

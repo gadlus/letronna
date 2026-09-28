@@ -1,5 +1,8 @@
 use crate::prelude::*;
 use gpui_component::Selectable;
+use letronna_core::gate::Mode;
+
+actions!(composer, [LeaveComposer]);
 
 impl Chat {
     /// The (gateway, model) pairs the picker shows for what is typed in its
@@ -378,6 +381,48 @@ impl Chat {
         )
     }
 
+    /// The session's mode, which opens the list of modes to pick from.
+    fn mode_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (chat, mode) = (cx.entity(), self.active_mode());
+        let icon = if mode == Mode::Plan {
+            AppIcon::Checklist
+        } else {
+            AppIcon::Shield
+        };
+        Button::new("mode")
+            .ghost()
+            .xsmall()
+            .tooltip(format!(
+                "{} mode: {}. Click to change.",
+                mode.label(),
+                mode.about()
+            ))
+            .text_color(if mode == Mode::Default {
+                cx.theme().muted_foreground
+            } else {
+                cx.theme().primary
+            })
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(Icon::new(icon).size_3())
+                    .child(mode.label()),
+            )
+            .dropdown_menu(move |menu, _, _| {
+                Mode::OFFERED.into_iter().fold(menu, |menu, choice| {
+                    let chat = chat.clone();
+                    menu.item(
+                        PopupMenuItem::new(choice.label())
+                            .checked(choice == mode)
+                            .on_click(move |_, _, cx| {
+                                chat.update(cx, |this, cx| this.set_mode(choice, cx))
+                            }),
+                    )
+                })
+            })
+    }
+
     pub(crate) fn composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let chat = cx.entity();
         let attach = Button::new("attach")
@@ -444,34 +489,15 @@ impl Chat {
                 div()
                     .flex_1()
                     .min_w_0()
+                    // Tab leaves the message box for the mode chip and the
+                    // buttons after it, rather than indenting the message.
+                    .key_context("Composer")
+                    .on_action(|_: &LeaveComposer, window, _| window.focus_next())
                     .child(Input::new(&self.composer).w_full().appearance(false)),
             )
-            .child(
-                Button::new("plan-mode")
-                    .ghost()
-                    .xsmall()
-                    .tooltip(if self.plan_mode {
-                        "Plan mode on: reads and asks only. Click to let it act."
-                    } else {
-                        "Plan mode off. Click to stop it writing or running anything."
-                    })
-                    .text_color(if self.plan_mode {
-                        cx.theme().primary
-                    } else {
-                        cx.theme().muted_foreground
-                    })
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .items_center()
-                            .child(Icon::new(AppIcon::Checklist).size_3())
-                            .child("Plan"),
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.plan_mode = !this.plan_mode;
-                        cx.notify();
-                    })),
-            )
+            // The session's mode sits where the message is written, since it
+            // decides what the reply may do without asking.
+            .child(self.mode_chip(cx))
             // Searching is a setting, but it changes what an answer is made
             // of, so it belongs where the answer is asked for rather than
             // three clicks away in a dialog.

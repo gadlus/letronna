@@ -6,7 +6,7 @@
 
 use letronna_core::agent::{Next, Turn};
 use letronna_core::chat::{self, Connection, Event, Message};
-use letronna_core::gate::{self, Gate, Grants};
+use letronna_core::gate::{self, Gate, Grants, Mode};
 use letronna_core::store::{Conversation, Store};
 use letronna_core::{permissions, tools};
 
@@ -21,15 +21,14 @@ pub struct Runner {
     pub store: Store,
     /// Tools approved for the rest of this run, by session.
     pub allowed: Grants,
-    /// Approve everything, for `--yes`.
-    pub yes: bool,
+    /// How much runs without asking: `--mode`, `--yes` or `--plan`, then
+    /// `/mode` and `/plan`.
+    pub mode: Mode,
     /// Someone can see a card and answer it; false for `-p` with no
     /// terminal on either end.
     pub human: bool,
     /// The rules file error last shown, so that one is shown once.
     pub trouble: Option<String>,
-    /// Read and search only; no writing, no running.
-    pub plan: bool,
     /// The box at the foot of the window, pumped while a reply streams so
     /// that typing carries on through an answer.
     pub bar: Bar,
@@ -51,7 +50,7 @@ impl Runner {
             key,
             tools: true,
             workspace,
-            plan: self.plan,
+            plan: self.mode == Mode::Plan,
             remote: None,
             effort: settings.effort.clone(),
             search: settings.search,
@@ -211,7 +210,7 @@ impl Runner {
                 }
                 self.trouble = trouble;
             }
-            let gate = Gate::for_terminal(&ctx, &self.allowed, &rules, self.yes, self.human);
+            let gate = Gate::for_terminal(&ctx, &self.allowed, &rules, self.mode, self.human);
             match turn.next(|call| gate::decide(call, &gate)) {
                 Next::Done => return Ok(true),
                 Next::Ask => {

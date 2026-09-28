@@ -1,5 +1,7 @@
 //! The opening screen, and putting a session's conversation back on it.
 
+use letronna_core::gate::Mode;
+
 use crate::render;
 use crate::session::Runner;
 
@@ -87,14 +89,8 @@ pub fn banner(runner: &Runner, folder: &str, session: usize) {
             },
         ),
         fact(
-            "tools",
-            if runner.plan {
-                "plan mode: reads and searches only"
-            } else if runner.yes {
-                "running without asking"
-            } else {
-                "asking before writing or running"
-            },
+            "mode",
+            &format!("{}: {}", runner.mode.label(), runner.mode.about()),
         ),
         String::new(),
         render::dim("type / for commands"),
@@ -139,10 +135,8 @@ pub fn banner(runner: &Runner, folder: &str, session: usize) {
 pub fn footer(runner: &Runner) -> String {
     let settings = &runner.store.settings;
     let mut parts = vec![settings.model.clone(), settings.gateway.clone()];
-    if runner.plan {
-        parts.push("plan mode".into());
-    } else if runner.yes {
-        parts.push("no approvals".into());
+    if runner.mode != Mode::Default {
+        parts.push(format!("{} mode", runner.mode.label().to_lowercase()));
     }
     if !settings.effort.is_empty() {
         parts.push(format!("thinking {}", settings.effort));
