@@ -31,7 +31,7 @@ pub struct Runner {
 }
 
 impl Runner {
-    fn connection(&self, session: usize) -> Connection {
+    pub fn connection(&self, session: usize) -> Connection {
         let workspace = self.store.conversations[session].workspace.clone();
         let settings = &self.store.settings;
         let saved = letronna_core::store::load_keys()
@@ -447,7 +447,7 @@ fn bold_question(text: &str) -> String {
     render::bold(text)
 }
 
-fn intent(name: &str, summary: &str) -> String {
+pub fn intent(name: &str, summary: &str) -> String {
     match name {
         "write_file" => format!("write {summary}"),
         "edit_file" => format!("edit {summary}"),

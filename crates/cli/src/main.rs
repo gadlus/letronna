@@ -3,6 +3,10 @@
 //! `letronna` on its own opens a conversation; `-p` asks one question and
 //! leaves. Sessions are the same files the window uses, so a conversation
 //! started here can be carried on there and the other way round.
+//!
+//! `-p` runs on core's driver rather than the conversation loop: nobody
+//! watches it stream, so it waits on the run and says what came of it at the
+//! end, as the answer alone or as JSON a script can read.
 
 mod args;
 mod banner;
@@ -20,20 +24,41 @@ mod spinner;
 mod syntax;
 mod title;
 
-use args::{HELP, Start, parse};
+use args::{Args, HELP, Output, Start, parse};
 use banner::{banner, folder_name, footer, replay};
 use commands::{Flow, command, resume};
-use letronna_core::{store, update};
+use letronna_core::approvals::{self, Decision, Request};
+use letronna_core::budget::Budget;
+use letronna_core::cancel::Cancel;
+use letronna_core::chat::{self, Message};
+use letronna_core::driver::{self, Allow, Outcome, Report, Spec, Status};
+use letronna_core::store::Transcript;
+use letronna_core::{agent, store, tools, update};
+use serde_json::{Value, json};
 use session::Runner;
+use std::io::Write;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, mpsc};
 
 /// How often a session start quietly asks whether there is a newer version.
 const LOOK_FOR_UPDATES: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 /// How long a question asked once waits for MCP servers still starting.
 const MCP_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+/// A frontend reads a run's status at most four times a second, and
+/// stream-json follows it no more often.
+const PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
+/// Lines of a call's preview shown above the question, as the conversation shows.
+const PREVIEW_LINES: usize = 12;
 
 fn main() {
     rescue_terminal();
-    let args = parse(std::env::args().skip(1));
+    let args = match parse(std::env::args().skip(1)) {
+        Ok(args) => args,
+        Err(error) => {
+            render::line(&render::red(&error));
+            std::process::exit(1);
+        }
+    };
     if args.help {
         print!("{HELP}");
         return;
@@ -77,9 +102,8 @@ fn main() {
     // question from a pipe cannot wait for answers, so that one stops here.
     let first_run = runner.store.settings.model.is_empty();
     if first_run && args.prompt.is_some() {
-        render::line(&render::red(
-            "Nothing is set up yet. Run `letronna setup` first.",
-        ));
+        let error = "Nothing is set up yet. Run `letronna setup` first.";
+        show(args.output, &failed(error.into()));
         std::process::exit(1);
     }
 
@@ -102,7 +126,10 @@ fn main() {
         Start::Named(id) => match runner.open_id(id) {
             Some(index) => index,
             None => {
-                render::line(&render::red(&format!("No session with the id {id}.")));
+                show(
+                    args.output,
+                    &failed(format!("No session with the id {id}.")),
+                );
                 std::process::exit(1);
             }
         },
@@ -110,18 +137,16 @@ fn main() {
     };
 
     // One question, one answer, no banner: this form gets piped.
-    if let Some(prompt) = args.prompt {
+    if let Some(prompt) = &args.prompt {
         // It goes out at once, so the MCP servers' tools would miss it.
         letronna_core::mcp::ready(MCP_WAIT);
-        let asked = runner.ask(session, &prompt);
-        // A browser with no window would outlive this run unseen.
+        let finished = ask_once(&mut runner, session, prompt, &args);
+        // A browser with no window, or a job started in the background, would
+        // outlive this run unseen.
         letronna_core::browser::close_hidden();
-        match asked {
-            Ok(_) => runner.persist(),
-            Err(error) => {
-                render::line(&render::red(&error));
-                std::process::exit(1);
-            }
+        letronna_core::jobs::stop_all();
+        if !finished {
+            std::process::exit(1);
         }
         return;
     }
@@ -192,6 +217,279 @@ fn main() {
     letronna_core::browser::close_hidden();
     render::title("");
     render::blank();
+}
+
+/// Runs one prompt on the driver and prints what came of it in the form
+/// asked for, saying whether it ended without failing.
+fn ask_once(runner: &mut Runner, session: usize, prompt: &str, args: &Args) -> bool {
+    let mut connection = runner.connection(session);
+    if let Some(model) = &args.model {
+        connection.model = model.clone();
+    }
+    if let Err(error) = chat::validate(&connection) {
+        show(args.output, &failed(error));
+        return false;
+    }
+    // Checked here rather than with the flags, since an MCP server's tools
+    // are only known once it has started.
+    if let Some(name) = args
+        .tools
+        .iter()
+        .flatten()
+        .find(|n| tools::find(n).is_none())
+    {
+        show(
+            args.output,
+            &failed(format!("There is no tool called `{name}`.")),
+        );
+        return false;
+    }
+    let conversation = &mut runner.store.conversations[session];
+    if conversation.messages.is_empty() && conversation.title.is_empty() {
+        conversation.title = prompt.chars().take(40).collect();
+    }
+    conversation.updated = chat::now();
+    conversation.messages.push(Message {
+        role: "user".into(),
+        content: prompt.to_owned(),
+        ..Default::default()
+    });
+    runner.persist();
+    // The run writes on into the session's own file, so the session is
+    // listed and can be continued as before. It leaves the store here and
+    // comes back only when the run is over, so that file has one writer.
+    let conversation = runner.store.conversations.remove(session);
+    let (id, before) = (conversation.id, conversation.messages.len());
+    let context = tools::ToolContext::of(&connection);
+    let spec = Spec {
+        connection,
+        transcript: Transcript {
+            path: store::sessions_dir().join(format!("{id}.jsonl")),
+            conversation,
+        },
+        id,
+        // Nobody started it but the person at the prompt, so mail it never
+        // read stays in its own box.
+        owner: id,
+        root: id,
+        run: id,
+        label: "Letronna".into(),
+        allow: args.tools.clone().map_or(Allow::All, Allow::Only),
+        rounds: args.max_rounds.unwrap_or(agent::MAX_ROUNDS),
+        cancel: Cancel::default(),
+        budget: args.budget.map(|limit| Arc::new(Budget::new(limit, None))),
+        status: Arc::default(),
+    };
+    // Served before the run starts, since a request with nobody serving is
+    // declined at once.
+    let keyboard = args.output == Output::Text && render::interactive();
+    answer_approvals(runner.yes, keyboard, context, spec.cancel.clone());
+    let (running, ended) = mpsc::channel::<()>();
+    let progress =
+        (args.output == Output::StreamJson).then(|| show_progress(spec.status.clone(), ended));
+    let mut report = driver::run(spec);
+    drop(running);
+    if let Some(progress) = progress {
+        let _ = progress.join();
+    }
+    // The report's text is the last thing said in the whole session, which
+    // after -c is an earlier answer when this run said nothing.
+    if let Some(said) = take_back(runner, session, id, before) {
+        report.text = said;
+    }
+    show(args.output, &report);
+    !matches!(report.status, Outcome::Failed(_))
+}
+
+/// Takes the session back into the store from the file the run wrote and
+/// saves it with the time the run ended, as a reply in the conversation
+/// does, giving the last thing said after its first `before` messages.
+fn take_back(runner: &mut Runner, session: usize, id: u64, before: usize) -> Option<String> {
+    let mut listing = store::load_listing();
+    let index = listing.index_of(id)?;
+    let mut conversation = listing.conversations.remove(index);
+    store::fill(&mut conversation);
+    let said = said_last(conversation.messages.get(before..)?);
+    conversation.updated = chat::now();
+    runner.store.conversations.insert(session, conversation);
+    runner.persist();
+    Some(said)
+}
+
+/// The last thing the model said among `messages`, or nothing.
+fn said_last(messages: &[Message]) -> String {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "assistant" && !message.content.is_empty())
+        .map(|message| message.content.clone())
+        .unwrap_or_default()
+}
+
+/// A run that failed before it began, having spent nothing.
+fn failed(error: String) -> Report {
+    Report {
+        status: Outcome::Failed(error),
+        text: String::new(),
+        rounds: 0,
+        input: 0,
+        cached: 0,
+        output: 0,
+        seconds: 0,
+        files: Vec::new(),
+    }
+}
+
+/// Prints how a run ended in the form asked for, so a script reading JSON
+/// gets JSON for a run that never began too.
+fn show(output: Output, report: &Report) {
+    match output {
+        Output::Text => print_answer(report),
+        Output::Json => {
+            emit(&as_json(report));
+        }
+        Output::StreamJson => {
+            let mut result = as_json(report);
+            result["type"] = "result".into();
+            emit(&result);
+        }
+    }
+}
+
+/// Writes one JSON line, saying whether it could: a reader that has gone
+/// away must end the lines, not the process before its jobs are stopped.
+fn emit(line: &Value) -> bool {
+    writeln!(std::io::stdout().lock(), "{line}").is_ok()
+}
+
+/// Answers the run's calls that need a yes: every one with `--yes`, by asking
+/// when there is a keyboard to ask at, and otherwise no, saying why.
+fn answer_approvals(yes: bool, keyboard: bool, context: tools::ToolContext, cancel: Cancel) {
+    let requests = approvals::serve();
+    std::thread::spawn(move || {
+        for request in requests {
+            let decision = if yes {
+                Decision::Once
+            } else if keyboard {
+                consult(&request, &context, &cancel)
+            } else {
+                eprintln!(
+                    "`{}` needs a yes and nobody is here to give it; run with --yes to allow it.",
+                    request.call.name
+                );
+                Decision::Deny
+            };
+            request.answer(decision);
+        }
+    });
+}
+
+/// Asks the person at the keyboard about one call, the way the conversation
+/// does, stopping the run when they say stop or leave the question.
+fn consult(request: &Request, context: &tools::ToolContext, cancel: &Cancel) -> Decision {
+    let call = &request.call;
+    let summary = tools::summary(&call.name, &call.arguments);
+    // A change to a file is shown as a diff, anything else as its preview.
+    match crate::diff::of(&call.name, &call.arguments, context) {
+        Some(rows) => rows.iter().for_each(|row| render::out(row, true)),
+        None => request
+            .preview
+            .lines()
+            .take(PREVIEW_LINES)
+            .for_each(|line| render::line(&render::dim(line))),
+    }
+    render::line(&render::bold(&format!(
+        "Letronna wants to {}",
+        session::intent(&call.name, &summary)
+    )));
+    let options = [
+        "Yes",
+        "Yes, and stop asking for this",
+        "No, tell it why not",
+        "No, and stop here",
+    ];
+    match input::menu(&options, 0) {
+        Some(0) => Decision::Once,
+        Some(1) => Decision::ForRun,
+        Some(2) => Decision::Deny,
+        _ => {
+            cancel.set();
+            Decision::Deny
+        }
+    }
+}
+
+/// Writes a stream-json progress line whenever the run's rounds or tokens
+/// have moved on, until `ended` hears that the run is over.
+fn show_progress(status: Arc<Status>, ended: mpsc::Receiver<()>) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut shown = progress(&status);
+        while let Err(mpsc::RecvTimeoutError::Timeout) = ended.recv_timeout(PROGRESS_EVERY) {
+            let now = progress(&status);
+            if now != shown {
+                if !emit(&now) {
+                    return;
+                }
+                shown = now;
+            }
+        }
+    })
+}
+
+/// A run's progress so far, as a stream-json line.
+fn progress(status: &Status) -> Value {
+    json!({
+        "type": "progress",
+        "rounds": status.rounds.load(Ordering::Relaxed),
+        "input": status.input.load(Ordering::Relaxed),
+        "cached": status.cached.load(Ordering::Relaxed),
+        "output": status.output.load(Ordering::Relaxed),
+    })
+}
+
+/// Prints the answer as the conversation would, and a line after it when the
+/// run did not finish.
+fn print_answer(report: &Report) {
+    if !report.text.is_empty() {
+        let mut out = render::Stream::opening_with(render::bullet());
+        out.push(&report.text);
+        out.end();
+    }
+    let note = match &report.status {
+        Outcome::Done => return,
+        Outcome::Failed(error) => render::red(error),
+        Outcome::RoundLimit => render::dim(
+            "Stopped: it used every tool round it was given, and --max-rounds allows more.",
+        ),
+        Outcome::OverBudget => render::dim("Stopped: the token budget is spent."),
+        Outcome::Stopped => render::dim("Stopped."),
+    };
+    render::line(&note);
+}
+
+/// What a run came to, as `--output json` prints it.
+fn as_json(report: &Report) -> Value {
+    let status = match &report.status {
+        Outcome::Done => "done",
+        Outcome::RoundLimit => "round_limit",
+        Outcome::Stopped => "stopped",
+        Outcome::Failed(_) => "failed",
+        Outcome::OverBudget => "over_budget",
+    };
+    let mut out = json!({
+        "answer": report.text,
+        "rounds": report.rounds,
+        "input": report.input,
+        "cached": report.cached,
+        "output": report.output,
+        "seconds": report.seconds,
+        "files": report.files,
+        "status": status,
+    });
+    if let Outcome::Failed(error) = &report.status {
+        out["error"] = error.as_str().into();
+    }
+    out
 }
 
 /// Hand the terminal back if we panic. Without this a crash leaves the
@@ -292,5 +590,74 @@ fn installed_name() -> &'static str {
         "Letronna.exe"
     } else {
         "letronna-gui"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn report(status: Outcome) -> Report {
+        Report {
+            status,
+            text: "The notes say hello.".into(),
+            rounds: 2,
+            input: 3_000,
+            cached: 1_000,
+            output: 150,
+            seconds: 4,
+            files: vec!["notes.txt".into()],
+        }
+    }
+
+    #[test]
+    fn json_output_carries_the_answer_rounds_and_tokens() {
+        let out = as_json(&report(Outcome::Done));
+        assert_eq!(
+            out,
+            json!({
+                "answer": "The notes say hello.",
+                "rounds": 2,
+                "input": 3_000,
+                "cached": 1_000,
+                "output": 150,
+                "seconds": 4,
+                "files": ["notes.txt"],
+                "status": "done",
+            })
+        );
+        // A run that ended short says how, and a failed one says why.
+        assert_eq!(
+            as_json(&report(Outcome::RoundLimit))["status"],
+            "round_limit"
+        );
+        assert_eq!(
+            as_json(&report(Outcome::OverBudget))["status"],
+            "over_budget"
+        );
+        let failed = as_json(&report(Outcome::Failed("The key was refused.".into())));
+        assert_eq!(
+            (&failed["status"], &failed["error"]),
+            (&json!("failed"), &json!("The key was refused."))
+        );
+        assert!(out.get("error").is_none());
+    }
+
+    #[test]
+    fn an_earlier_answer_is_not_taken_for_this_runs() {
+        let said = |role: &str, content: &str| Message {
+            role: role.into(),
+            content: content.into(),
+            ..Default::default()
+        };
+        let session = [
+            said("user", "What is in notes.txt?"),
+            said("assistant", "The notes say hello."),
+            said("user", "Fix the failing test."),
+            // A reply that only calls tools says nothing.
+            said("assistant", ""),
+        ];
+        assert_eq!(said_last(&session[2..]), "");
+        assert_eq!(said_last(&session), "The notes say hello.");
     }
 }
