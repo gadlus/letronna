@@ -233,6 +233,7 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(crate::browser::Browse),
         Arc::new(crate::browser::UsePage),
         Arc::new(crate::agents::Agent),
+        Arc::new(crate::agents::Agents),
     ];
     // The user's own search service, once one is set up.
     if crate::search::ready() {
@@ -655,6 +656,11 @@ pub fn summary(name: &str, args: &str) -> String {
             .to_owned(),
         "speak" => v["text"].as_str().unwrap_or_default().to_owned(),
         "agent" => v["description"].as_str().unwrap_or_default().to_owned(),
+        "agents" => format!(
+            "{} {}",
+            v["action"].as_str().unwrap_or_default(),
+            v["to"].as_str().unwrap_or_default()
+        ),
         crate::browser::BROWSE | "use_page" => crate::browser::summary(&v),
         TODO => {
             let items = v["items"].as_array().map(Vec::len).unwrap_or(0);
