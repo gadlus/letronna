@@ -709,12 +709,31 @@ fn search(reach: &Reach, query: &str, count: u64, options: &Options) -> Result<S
         true => usize::MAX,
         false => count as usize,
     };
-    let hits: Vec<Hit> = hits(service.name, &body, wider)
+    Ok(kept(
+        service.name,
+        query,
+        hits(service.name, &body, wider),
+        count,
+        options,
+    ))
+}
+
+/// The listing of the hits the filters keep, up to `count`. When the filters
+/// drop every one, it says so, so the model does not take a narrowed search
+/// for a subject nobody has written about.
+fn kept(service: &str, query: &str, found: Vec<Hit>, count: u64, options: &Options) -> String {
+    let any = !found.is_empty();
+    let hits: Vec<Hit> = found
         .into_iter()
         .filter(|hit| wanted(&hit.url, options))
         .take(count as usize)
         .collect();
-    Ok(listing(service.name, query, &hits))
+    if any && hits.is_empty() {
+        return format!(
+            "{service} found results for \"{query}\", but none from the sites allowed and not blocked."
+        );
+    }
+    listing(service, query, &hits)
 }
 
 /// Why a service turned a search down, in words the user can act on.
@@ -1160,6 +1179,30 @@ mod tests {
         assert!(wanted("https://other.org/", &blocked_only));
         assert!(!wanted("https://www.example.com/", &blocked_only));
         assert!(wanted("anything at all", &Options::default()));
+    }
+
+    #[test]
+    fn a_search_the_filters_empty_does_not_read_as_finding_nothing() {
+        let found = || {
+            vec![Hit {
+                title: "Elsewhere".into(),
+                url: "https://other.example/".into(),
+                snippet: String::new(),
+            }]
+        };
+        let docs = Options {
+            allowed: vec!["docs.rs".into()],
+            ..Options::default()
+        };
+        assert_eq!(
+            kept("Brave", "rust", found(), 5, &docs),
+            "Brave found results for \"rust\", but none from the sites allowed and not blocked."
+        );
+        assert_eq!(
+            kept("Brave", "rust", Vec::new(), 5, &docs),
+            "Brave found nothing for \"rust\"."
+        );
+        assert!(kept("Brave", "rust", found(), 5, &Options::default()).contains("1. Elsewhere"));
     }
 
     #[test]
