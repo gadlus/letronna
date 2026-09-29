@@ -10,7 +10,7 @@
 //! a tool created is as much a change as one it edited. What git prints is
 //! cut at a size, with a line saying so, rather than read whole.
 
-use std::io::Read;
+use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -189,9 +189,14 @@ fn run(folder: &Path, args: &[&str], cap: usize, fine: &[i32]) -> Result<(String
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("git could not be run: {e}"))?;
-    let Some(stdout) = child.stdout.take() else {
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        let _ = child.kill();
+        let _ = child.wait();
         return Err("git gave no output to read.".into());
     };
+    // Read beside the output, not after it: git can warn a line per file
+    // before it prints anything, and would wait on a full pipe for ever.
+    let errors = std::thread::spawn(move || why_failed(stderr));
     let mut bytes = Vec::new();
     let read = stdout.take(cap as u64 + 1).read_to_end(&mut bytes);
     let cut = bytes.len() > cap;
@@ -199,16 +204,13 @@ fn run(folder: &Path, args: &[&str], cap: usize, fine: &[i32]) -> Result<(String
         // The rest is not wanted, and git would wait on a full pipe for it.
         let _ = child.kill();
     }
-    let mut errors = String::new();
-    if let Some(mut stderr) = child.stderr.take() {
-        let _ = stderr.read_to_string(&mut errors);
-    }
     let status = child
         .wait()
         .map_err(|e| format!("git did not finish: {e}"))?;
+    let why = errors.join().unwrap_or_default();
     read.map_err(|e| format!("git's output could not be read: {e}"))?;
     if !cut && !status.code().is_some_and(|code| fine.contains(&code)) {
-        let why = errors.lines().next().unwrap_or("it failed").trim();
+        let why = why.as_deref().unwrap_or("it failed");
         return Err(format!("git {} failed: {why}", args[0]));
     }
     bytes.truncate(cap);
@@ -220,6 +222,25 @@ fn run(folder: &Path, args: &[&str], cap: usize, fine: &[i32]) -> Result<(String
         text.truncate(end);
     }
     Ok((text, cut))
+}
+
+/// The line of what git printed to `stderr` that says why it stopped: its
+/// fatal or error line past any warnings, else its first. Read to the end,
+/// keeping only that line, so a flood of warnings costs no memory.
+fn why_failed(stderr: impl Read) -> Option<String> {
+    let (mut first, mut fatal) = (None, None);
+    let mut reader = std::io::BufReader::new(stderr);
+    let mut bytes = Vec::new();
+    while reader.read_until(b'\n', &mut bytes).is_ok_and(|n| n > 0) {
+        let line = String::from_utf8_lossy(&bytes).trim().to_owned();
+        bytes.clear();
+        if fatal.is_none() && (line.starts_with("fatal:") || line.starts_with("error:")) {
+            fatal = Some(line);
+        } else if first.is_none() && !line.is_empty() {
+            first = Some(line);
+        }
+    }
+    fatal.or(first)
 }
 
 /// `text` without what a terminal would act on: a file's own escapes must
@@ -349,6 +370,31 @@ mod tests {
         setup(&folder, &["add", "a.txt"]);
         let diff = working_diff(&folder, None).unwrap();
         assert!(diff.patch.contains("+one"), "{}", diff.patch);
+    }
+
+    #[test]
+    fn a_flood_of_warnings_does_not_stall_the_diff() {
+        let folder = scratch("warnings");
+        setup(&folder, &["init", "-q"]);
+        for n in 0..1000 {
+            std::fs::write(folder.join(format!("f{n}.txt")), "a\n").unwrap();
+        }
+        setup(&folder, &["add", "."]);
+        setup(&folder, &["commit", "-q", "-m", "first"]);
+        // Each changed file then earns a line of warning, well past what a
+        // pipe holds before git waits for it to be read.
+        setup(&folder, &["config", "core.autocrlf", "true"]);
+        for n in 0..1000 {
+            std::fs::write(folder.join(format!("f{n}.txt")), "a\nb\n").unwrap();
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let asked = folder.clone();
+        std::thread::spawn(move || tx.send(working_diff(&asked, None)));
+        let diff = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the diff stalled")
+            .unwrap();
+        assert!(diff.stat.contains("1000 files changed"), "{}", diff.stat);
     }
 
     #[test]
