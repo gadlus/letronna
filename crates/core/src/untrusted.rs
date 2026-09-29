@@ -42,7 +42,7 @@ pub(crate) const FENCE_BYTES: usize = 2 * (TAG.len() + 8) + 9;
 /// `text`, which came from outside, cleaned and fenced, cut to fit in `max`
 /// bytes tags and all. It fails only when no id can be drawn: a fixed one
 /// would be a tag anyone could forge.
-pub(crate) fn fence(text: &str, max: usize) -> Result<String, String> {
+pub fn fence(text: &str, max: usize) -> Result<String, String> {
     let id = id()?;
     // Cut after cleaning, so what was cleaned away takes no room, and inside
     // the tags, so the cut can never take the closing one.

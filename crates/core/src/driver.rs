@@ -10,7 +10,10 @@
 //! used unseen, with no panel to open; and messages sent meanwhile are read
 //! from the inbox after each batch of results and before the run counts as
 //! done. A frontend that shows the run as it goes, as an editor does over
-//! ACP, gives it a `Watch`, which hears each step as it is made.
+//! ACP, gives it a `Watch`, which hears each step as it is made. A run that
+//! is a session's own turn, as an editor's is, gives it the session's whole
+//! gate as `Decide`, so the rules, the floor and the grants settle each call
+//! before anything asks; a helper's calls ask by the tool's name alone.
 //!
 //! A run given a schema answers through one more tool, `structured_output`,
 //! offered after the rest so the tools before it keep their cached bytes. Its
@@ -100,6 +103,9 @@ pub enum Step {
 /// Hears each step of a run on the run's own threads, so it must not block.
 pub type Watch = Arc<dyn Fn(Step) + Send + Sync>;
 
+/// Decides a call with the whole gate of the session a run speaks for.
+pub type Decide = Arc<dyn Fn(&ToolCall, &ToolContext) -> crate::gate::Outcome + Send + Sync>;
+
 /// Which tools an agent may call, before the deny set is taken out.
 #[derive(Clone, Default)]
 pub enum Allow {
@@ -140,6 +146,9 @@ pub struct Spec {
     pub schema: Option<Value>,
     /// Hears the run step by step; None when only the report is wanted.
     pub watch: Option<Watch>,
+    /// The session's own gate, for a run that is a session's turn rather
+    /// than a helper's; None asks about every call that needs a yes.
+    pub decide: Option<Decide>,
 }
 
 /// How a run is getting on, in atomics a frontend reads while the run writes them.
@@ -379,13 +388,20 @@ fn work_through(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result
         if spec.cancel.is_set() {
             return Ok(());
         }
-        // A tool allowed for the whole run would get its yes at once from
-        // `approvals::ask`, so it counts as allowed here and can join a batch.
+        let decide = |call: &ToolCall| {
+            let decide = spec.decide.as_ref()?;
+            Some(decide(call, &context(spec)))
+        };
+        // Without the session's gate, a tool allowed for the whole run would
+        // get its yes at once from `approvals::ask`, so it counts as allowed
+        // here and can join a batch.
         let batchable = |call: &ToolCall| {
             let name = call.name.as_str();
             refusal(&spec.allow, name).is_none()
-                && tools::needs_approval(name)
-                && !approvals::granted(spec.run, name)
+                && match decide(call) {
+                    Some(outcome) => outcome != crate::gate::Outcome::Run,
+                    None => tools::needs_approval(name) && !approvals::granted(spec.run, name),
+                }
         };
         let batch = turn.next_batch(batchable, MAX_BATCH);
         if !batch.is_empty() {
@@ -402,11 +418,16 @@ fn work_through(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result
         }
         // A call this helper may not make runs into its refusal in `dispatch`.
         let gate = |call: &ToolCall| {
-            if refusal(&spec.allow, &call.name).is_none() && tools::needs_approval(&call.name) {
-                crate::gate::Outcome::Ask
-            } else {
-                crate::gate::Outcome::Run
+            if refusal(&spec.allow, &call.name).is_some() {
+                return crate::gate::Outcome::Run;
             }
+            decide(call).unwrap_or_else(|| {
+                if tools::needs_approval(&call.name) {
+                    crate::gate::Outcome::Ask
+                } else {
+                    crate::gate::Outcome::Run
+                }
+            })
         };
         let outcome = match turn.next(gate) {
             Next::Done => return Ok(()),
@@ -887,6 +908,7 @@ mod tests {
             from: 0,
             schema: None,
             watch: None,
+            decide: None,
         }
     }
 
