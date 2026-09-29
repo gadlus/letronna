@@ -9,6 +9,7 @@
 
 use std::path::Path;
 
+use crate::permissions;
 use crate::tools::{self, ToolContext};
 
 /// What stands between the words typed and what the references attached, so
@@ -125,14 +126,32 @@ fn attach(written: &str, ctx: &ToolContext) -> Option<String> {
     }
     let header = format!("--- @{} ---", written.trim_end_matches('.'));
     let body = match tools::resolve(&raw, ctx) {
-        Ok(path) if path.is_dir() => listing(&path),
-        Ok(path) => read(&path, lines),
+        Ok(path) if path.is_dir() => denied("list_dir", &raw, ctx).and_then(|()| listing(&path)),
+        Ok(path) => denied("read_file", &raw, ctx).and_then(|()| read(&path, lines)),
         Err(why) => Err(why),
     };
     Some(match body {
         Ok(body) => format!("{header}\n{body}"),
         Err(why) => format!("{header}\nNot attached: {why}"),
     })
+}
+
+/// Err with the reason when a deny rule, the user's or the project's, keeps
+/// `tool` from `raw`: what the model may never read is not sent this way.
+fn denied(tool: &str, raw: &str, ctx: &ToolContext) -> Result<(), String> {
+    let Some(tool) = tools::find(tool) else {
+        return Ok(());
+    };
+    // A rules file that cannot be read stops no read_file call either.
+    let rules = permissions::load(&permissions::user_file()).unwrap_or_default();
+    let args = serde_json::json!({ "path": raw });
+    match permissions::check(&rules, tool.as_ref(), &args, ctx).deny {
+        Some(rule) => Err(format!(
+            "a deny rule on {} `{}` keeps it from the model.",
+            rule.tool, rule.pattern
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Whether `raw` names something on disk, as `resolve` would join it. A link
@@ -334,6 +353,29 @@ mod tests {
             "{sent}"
         );
         assert!(!sent.contains("sk-secret-value"), "{sent}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_path_a_deny_rule_keeps_from_read_file_is_not_attached() {
+        let dir = project("denied");
+        std::fs::create_dir_all(dir.join(".letronna")).unwrap();
+        std::fs::write(
+            dir.join(crate::permissions::PROJECT_FILE),
+            r#"[{"tool": "read_file", "pattern": "src/main.rs", "effect": "deny"},
+                {"tool": "list_dir", "pattern": "src/deep", "effect": "deny"}]"#,
+        )
+        .unwrap();
+        let sent = expand("@src/main.rs and @src/deep/", Some(&dir));
+        assert!(
+            sent.contains("--- @src/main.rs ---\nNot attached: a deny rule"),
+            "{sent}"
+        );
+        assert!(
+            sent.contains("--- @src/deep/ ---\nNot attached: a deny rule"),
+            "{sent}"
+        );
+        assert!(!sent.contains("line 1"), "{sent}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
