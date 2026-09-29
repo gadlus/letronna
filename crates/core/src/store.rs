@@ -220,6 +220,7 @@ impl Store {
         }
         let gone = self.conversations.remove(index);
         let _ = std::fs::remove_file(session_path(gone.id));
+        let _ = std::fs::remove_dir_all(crate::tools::results_dir(gone.id));
     }
 }
 
@@ -826,7 +827,7 @@ pub fn age_label(updated: u64, now: u64) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
     #[cfg(unix)]
@@ -836,7 +837,7 @@ mod tests {
 
     /// Held by every test that points `AGENT_DATA_DIR` somewhere: it is one
     /// variable for the whole process, and tests run side by side.
-    static DATA_DIR: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static DATA_DIR: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn scratch(name: &str) -> std::path::PathBuf {
         // One folder per test, reused and emptied each run. Naming it after
@@ -1191,6 +1192,26 @@ mod tests {
         listed.save().unwrap();
         let back = replay(&dir.join("sessions/1.jsonl")).unwrap();
         assert!(back.messages.is_empty());
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn removing_a_session_removes_the_outputs_saved_for_it() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("remove-results");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        store.conversations.push(numbered(2));
+        store.save().unwrap();
+        let (mine, other) = (crate::tools::results_dir(1), crate::tools::results_dir(2));
+        for results in [&mine, &other] {
+            std::fs::create_dir_all(results).unwrap();
+            std::fs::write(results.join("1-0.txt"), "saved").unwrap();
+        }
+        store.remove(0);
+        assert!(!mine.exists() && !dir.join("sessions/1.jsonl").exists());
+        assert!(other.join("1-0.txt").is_file());
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 }
