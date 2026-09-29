@@ -863,7 +863,8 @@ mod tests {
             ..Default::default()
         };
         let ruled = |effect| writing(&[on_writes("a/**", effect)], "a/missing/../x", &ctx);
-        assert!(!ruled(Effect::Allow).allow);
+        // Win32 works `..` out from the text, so there the call writes `a/x`.
+        assert_eq!(ruled(Effect::Allow).allow, cfg!(windows));
         assert!(ruled(Effect::Deny).deny.is_some());
         assert!(ruled(Effect::Ask).ask.is_some());
         std::fs::remove_dir_all(project).unwrap();
