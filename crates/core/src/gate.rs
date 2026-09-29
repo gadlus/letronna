@@ -1991,6 +1991,28 @@ mod tests {
     }
 
     #[test]
+    fn a_command_asks_where_the_system_cannot_sandbox_it() {
+        let dir = project_dir("unsandboxed");
+        let ctx = ToolContext {
+            workspace: Some(dir.join("project")),
+            ..Default::default()
+        };
+        let none = Grants::new();
+        let gate = Gate {
+            ctx: &ctx,
+            mode: Mode::AcceptEdits,
+            grants: &none,
+            human: true,
+            rules: &[],
+            broken: None,
+        };
+        let test = command("cargo test");
+        assert_eq!(decide_with(&test, &gate, None, true), Outcome::Sandboxed);
+        assert_eq!(decide_with(&test, &gate, None, false), Outcome::Ask);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn accept_edits_asks_before_every_protected_path() {
         for path in [
             ".git/config",
