@@ -100,12 +100,20 @@ impl Chat {
                     .into_any_element()
             })
             .child(div().flex_1().min_w_0().truncate().child(c.title.clone()))
-            .child(
+            // The session a reply is running in says so, on screen or not.
+            .child(if self.busy && self.streaming_id == Some(c.id) {
+                // In the age's colour: the primary is lost on the sidebar.
+                gpui_component::spinner::Spinner::new()
+                    .xsmall()
+                    .color(cx.theme().muted_foreground)
+                    .into_any_element()
+            } else {
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(age_label(c.updated, now)),
-            )
+                    .child(age_label(c.updated, now))
+                    .into_any_element()
+            })
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 if event.modifiers().shift {
                     this.store.conversations[index].pinned ^= true;

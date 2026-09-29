@@ -1421,7 +1421,8 @@ impl Chat {
             self.model_open = false;
             self.focus_composer(window, cx);
             cx.notify();
-        } else {
+        } else if self.busy_elsewhere().is_none() {
+            // Not a reply in another session, which nothing here shows.
             self.stop_turn(cx);
         }
     }
@@ -1834,6 +1835,7 @@ impl Render for Chat {
                         .mx_auto()
                         .px_6()
                         .pb_2()
+                        .children(self.busy_note(cx))
                         .children(self.todo_panel(cx))
                         .child(self.composer(cx)),
                 )
