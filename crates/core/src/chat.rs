@@ -194,7 +194,7 @@ pub fn validate(connection: &Connection) -> Result<String, String> {
 const CONTEXT_TOKENS: usize = 6_000;
 /// A single tool result can be far larger than anything the model needs to
 /// read. The chat keeps the whole thing; the request gets the ends.
-const MAX_TOOL_CHARS: usize = 8_000;
+pub(crate) const MAX_TOOL_CHARS: usize = 8_000;
 /// What a message costs beyond its text: the role and separators a chat
 /// template wraps it in, which OpenAI counts as three or four tokens.
 const MESSAGE_TOKENS: usize = 4;
