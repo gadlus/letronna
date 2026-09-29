@@ -848,11 +848,7 @@ fn body_with(
     if let Some(level) = crate::models::clamp(&levels, &connection.effort) {
         body["reasoning_effort"] = level.id.clone().into();
     }
-    for (quirk, _) in QUIRKS {
-        if has_quirk(connection, quirk) {
-            apply_quirk(&mut body, quirk);
-        }
-    }
+    fit_quirks(connection, &mut body);
     // OpenAI caches on its own but spreads one prefix over many machines; a
     // key per session keeps its requests on the ones that hold it. The id
     // says nothing about what is in the session.
@@ -1080,6 +1076,15 @@ fn reasons_on_openai(connection: &Connection) -> bool {
         && ["o1", "o3", "o4", "gpt-5"]
             .iter()
             .any(|family| model.starts_with(family))
+}
+
+/// Change `body` as every quirk known for this model asks.
+pub(crate) fn fit_quirks(connection: &Connection, body: &mut Value) {
+    for (quirk, _) in QUIRKS {
+        if has_quirk(connection, quirk) {
+            apply_quirk(body, quirk);
+        }
+    }
 }
 
 /// Change `body` as `quirk` asks, saying whether it carried the field.

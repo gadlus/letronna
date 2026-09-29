@@ -410,16 +410,7 @@ pub fn suggest(connection: &Connection, folder: &Path) -> Result<String, String>
         return Err("Nothing is staged to write a message for.".into());
     }
     let endpoint = crate::chat::validate(connection)?;
-    let body = json!({
-        "model": connection.model.trim(),
-        "messages": [
-            {"role": "system", "content": HOUSE_STYLE},
-            {"role": "user", "content": format!("Staged diff:\n{diff}")},
-        ],
-        "stream": false,
-        "max_tokens": 1500,
-        "reasoning_effort": "low",
-    });
+    let body = suggest_body(connection, &diff);
     // The shared client would give up on a slow reply after its idle wait.
     let mut request = crate::chat::client()?
         .post(endpoint)
@@ -442,6 +433,23 @@ pub fn suggest(connection: &Connection, folder: &Path) -> Result<String, String>
         return Err("The model gave no message; write one instead.".into());
     }
     Ok(message)
+}
+
+/// The request for a suggestion. It sends no effort, which a model that
+/// offers none may be refused for, and takes the fields this model is known
+/// to want in place of others, as a turn's request does.
+fn suggest_body(connection: &Connection, diff: &str) -> Value {
+    let mut body = json!({
+        "model": connection.model.trim(),
+        "messages": [
+            {"role": "system", "content": HOUSE_STYLE},
+            {"role": "user", "content": format!("Staged diff:\n{diff}")},
+        ],
+        "stream": false,
+        "max_tokens": 1500,
+    });
+    crate::chat::fit_quirks(connection, &mut body);
+    body
 }
 
 /// `text` as a commit message in the house style: the subject without a
@@ -1169,6 +1177,21 @@ mod tests {
         assert!(message.ends_with("\n\nSecond."), "{message}");
         // A colon in a real subject is not a prefix.
         assert_eq!(house_style("Say why: it failed"), "Say why: it failed");
+    }
+
+    #[test]
+    fn a_suggestion_asks_as_the_model_takes_it() {
+        let on = |endpoint: &str, model: &str| Connection {
+            endpoint: endpoint.into(),
+            model: model.into(),
+            ..Default::default()
+        };
+        let plain = suggest_body(&on("https://api.openai.com/v1", "gpt-4o"), "d");
+        assert!(plain.get("reasoning_effort").is_none(), "{plain}");
+        assert_eq!(plain["max_tokens"], 1500);
+        let reasoning = suggest_body(&on("https://api.openai.com/v1", "gpt-5"), "d");
+        assert!(reasoning.get("max_tokens").is_none(), "{reasoning}");
+        assert!(reasoning["max_completion_tokens"].is_u64(), "{reasoning}");
     }
 
     #[test]
