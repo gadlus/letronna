@@ -42,6 +42,7 @@ pub mod store;
 pub mod structured;
 pub mod timers;
 pub mod tools;
+pub mod untrusted;
 pub mod update;
 pub mod watch;
 pub mod web;

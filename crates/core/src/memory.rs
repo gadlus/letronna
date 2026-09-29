@@ -73,6 +73,9 @@ fn context_in(dir: &Path, connection: &Connection) -> String {
             .find_map(|name| read_capped(&workspace.join(name)).map(|text| (name, text)))
     });
     if let Some((name, text)) = project {
+        // A cloned repository's file is anyone's; one that looks planted is
+        // marked for the model rather than dropped.
+        let text = crate::untrusted::vetted("this file", &text);
         out.push_str(&format!(
             "\n\nThe project's instructions, from {name}:\n{text}"
         ));

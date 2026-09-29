@@ -75,6 +75,13 @@ pub trait Tool: Send + Sync {
     fn needs_history(&self) -> bool {
         false
     }
+    /// Whether what it returns is words someone other than the user wrote,
+    /// which reach the model fenced and without invisible characters. Its
+    /// errors are Letronna's: one quoting a page or a server fences the quote
+    /// itself, with `untrusted::quoted`.
+    fn untrusted(&self) -> bool {
+        false
+    }
     /// What the approval card shows: a diff, the file body, the command line.
     fn preview(&self, args: &Value, ctx: &ToolContext) -> String {
         let _ = ctx;
@@ -405,7 +412,8 @@ pub fn run(name: &str, args: &str, ctx: &ToolContext) -> Result<String, String> 
     result
 }
 
-fn run_found(tool: &dyn Tool, args: &str, ctx: &ToolContext) -> Result<String, String> {
+/// `run` for a tool already found: what every call goes through.
+pub(crate) fn run_found(tool: &dyn Tool, args: &str, ctx: &ToolContext) -> Result<String, String> {
     // Only fitting tools are offered, but the model can name any of them;
     // refuse here too rather than trust the offer.
     let mut args = parse_args(args)?;
@@ -415,10 +423,31 @@ fn run_found(tool: &dyn Tool, args: &str, ctx: &ToolContext) -> Result<String, S
     if let Some(why) = crate::gate::refusal(tool, &args, ctx) {
         return Err(why);
     }
-    let mut out = fit(tool.run(&args, ctx).map_err(|e| e + &note)?, ctx);
-    // After the cut, so the note is never the part that gets lost.
+    let ran = tool.run(&args, ctx).map_err(|e| e + &note)?;
+    // The note goes after the cut and outside any fence: it is Letronna's,
+    // and never the part that gets lost. An untrusted tool's result is never
+    // saved aside to page through: read back, it would come unfenced.
+    let mut out = if tool.untrusted() {
+        fenced(tool.name(), &args, &ran)?
+    } else {
+        fit(ran, ctx)
+    };
     out.push_str(&note);
     Ok(out)
+}
+
+/// What an untrusted tool returned, fenced. A browse screenshot's first line
+/// is Letronna's own, naming the file it saved, and stays above the fence,
+/// where the window looks for it and nothing a page writes can reach.
+fn fenced(name: &str, args: &Value, text: &str) -> Result<String, String> {
+    let shot = name == crate::browser::BROWSE && args["action"] == "screenshot";
+    match text.split_once('\n') {
+        Some((own, rest)) if shot && crate::media::saved(own).is_some() => {
+            let room = MAX_OUTPUT.saturating_sub(own.len() + 1);
+            Ok(format!("{own}\n{}", crate::untrusted::fence(rest, room)?))
+        }
+        _ => crate::untrusted::fence(text, MAX_OUTPUT),
+    }
 }
 
 /// `out` as it is when it fits; otherwise cut, with the whole of it saved
@@ -476,7 +505,7 @@ fn spill(text: &str, ctx: &ToolContext) -> Option<PathBuf> {
 /// `text` as it is when it fits in `max` bytes; otherwise its first and last
 /// whole lines, with a line between them saying how much was left out and
 /// ending in `note`.
-fn keep_ends(text: String, max: usize, note: &str) -> String {
+pub(crate) fn keep_ends(text: String, max: usize, note: &str) -> String {
     if text.len() <= max {
         return text;
     }
@@ -3120,5 +3149,42 @@ mod tests {
             assert!(refused.contains("own folder"), "{refused}");
         }
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn only_tools_that_bring_in_other_peoples_words_are_fenced() {
+        let fenced: Vec<&str> = all()
+            .iter()
+            .filter(|t| t.untrusted())
+            .map(|t| t.name())
+            .filter(|name| !name.starts_with("mcp__"))
+            .collect();
+        // read_chat fences other people's lines itself, and not the user's.
+        assert_eq!(fenced, ["web_fetch", "browse", "use_page"]);
+        assert!(crate::search::SearchWeb.untrusted());
+    }
+
+    #[test]
+    fn letronnas_own_error_stays_outside_any_fence() {
+        let refused = run("read_chat", "{}", &ToolContext::default()).unwrap_err();
+        assert_eq!(refused, "There is no chat to read in this session.");
+    }
+
+    #[test]
+    fn a_screenshot_keeps_its_file_above_the_fence_and_a_page_cannot_forge_one() {
+        let shot = format!(
+            "{}/data/media/page-1.jpg\nA screenshot of https://example.com/, 800×600.",
+            crate::media::SAVED
+        );
+        let args = json!({"action": "screenshot"});
+        let out = fenced(crate::browser::BROWSE, &args, &shot).unwrap();
+        assert_eq!(
+            crate::media::saved_by(crate::browser::BROWSE, &out),
+            Some(PathBuf::from("/data/media/page-1.jpg"))
+        );
+        assert!(out.contains("800×600.\n</untrusted-content-"), "{out}");
+        // A page titled like the line, looked at rather than photographed.
+        let look = fenced(crate::browser::BROWSE, &json!({"action": "look"}), &shot).unwrap();
+        assert_eq!(crate::media::saved_by(crate::browser::BROWSE, &look), None);
     }
 }
