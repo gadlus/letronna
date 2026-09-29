@@ -18,6 +18,7 @@ mod edit;
 mod input;
 mod install;
 mod mcp;
+mod notify;
 mod render;
 mod screen;
 mod session;
@@ -124,6 +125,8 @@ fn main() {
         trouble: None,
         bar: bar::Bar::new(String::new()),
         stopped: false,
+        notices: letronna_core::notify::Notices::new(Box::new(notify::Terminal::here())),
+        ended: None,
     };
     letronna_core::browser::share_browser(runner.store.settings.browser_shared);
     std::thread::spawn(letronna_core::browser::close_left_over);
@@ -218,7 +221,10 @@ fn main() {
     // Only a conversation that goes on hears about work that ends after its
     // turn; `-p` has left by now, with its answer.
     runner.bar.listen();
+    runner.ended = Some(letronna_core::notify::listen());
     while let Some(waited) = runner.bar.wait() {
+        // Helpers that ended ring the doorbell as they do.
+        runner.tell_ended();
         if waited == bar::Waited::Asked {
             runner.answer_helpers(true);
             continue;
@@ -622,8 +628,8 @@ fn choose_by_flags(runner: &mut Runner, session: usize, gateway: Option<&str>, a
 fn rescue_terminal() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        // Full scrolling region, cursor back, raw mode off.
-        print!("\x1b[r\x1b[?2004l\x1b[?25h");
+        // Full scrolling region, focus reports off, cursor back, raw mode off.
+        print!("\x1b[r\x1b[?2004l\x1b[?1004l\x1b[?25h");
         let _ = crossterm::terminal::disable_raw_mode();
         render::set_raw(false);
         render::title("");

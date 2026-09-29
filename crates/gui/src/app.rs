@@ -1,5 +1,5 @@
 use crate::prelude::*;
-use letronna_core::{agent, agents, approvals, inbox};
+use letronna_core::{agent, agents, approvals, inbox, notify};
 
 pub(crate) const BRAND: &str = "Letronna";
 
@@ -284,6 +284,10 @@ pub(crate) struct Chat {
     /// Sessions a notice woke, marked in the sidebar until they are next on
     /// screen.
     pub(crate) unseen: std::collections::HashSet<u64>,
+    /// What calls the user back while the window is hidden or behind others.
+    pub(crate) notices: notify::Notices,
+    /// Whether the window is the one in front, as it last said.
+    pub(crate) in_front: bool,
     /// Set by Stop for the `finish` it causes, so stopping does not start a
     /// turn for notices in the same moment.
     pub(crate) stopping: bool,
@@ -645,6 +649,8 @@ impl Chat {
             skills_refused: Vec::new(),
             aside: None,
             unseen: std::collections::HashSet::new(),
+            notices: notify::Notices::new(Box::new(crate::platform::notify::desktop())),
+            in_front: window.is_window_active(),
             stopping: false,
             helpers: Vec::new(),
             helper_tick: false,
@@ -677,6 +683,10 @@ impl Chat {
         };
         let widen = this.follow_browser_layout(window, cx);
         this._subscriptions.push(widen);
+        let front = cx.observe_window_activation(window, |this, window, _| {
+            this.in_front = window.is_window_active();
+        });
+        this._subscriptions.push(front);
         this.load_models(window, cx);
         // Directly, not through `focus_composer`: the window's root does
         // not exist yet to ask about dialogs, and there can be none.
@@ -686,6 +696,8 @@ impl Chat {
         Self::watch_updates(cx);
         Self::watch_inbox(cx);
         Self::serve_approvals(cx);
+        Self::watch_ended(cx);
+        Self::watch_clicks(window, cx);
         this.restart_messaging(cx);
         if this.store.settings.presence == "off" {
             plugins::set_enabled(cx, plugins::DISCORD, false);
@@ -1062,6 +1074,87 @@ impl Chat {
         .detach();
     }
 
+    /// Call the user back about the helpers and workflow runs that end.
+    fn watch_ended(cx: &mut Context<Self>) {
+        let ended = notify::listen();
+        cx.spawn(async move |this, cx| {
+            while let Ok(ended) = ended.recv().await {
+                let told = this.update(cx, |this, _| {
+                    this.tell(ended.session, notify::Why::Ended(&ended.what))
+                });
+                if told.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Bring the window back on the session a notification was about when
+    /// it is clicked.
+    fn watch_clicks(window: &mut Window, cx: &mut Context<Self>) {
+        let clicks = crate::platform::notify::clicks();
+        cx.spawn_in(window, async move |this, cx| {
+            while let Ok(id) = clicks.recv().await {
+                let opened = this.update_in(cx, |this, window, cx| this.open_told(id, window, cx));
+                if opened.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Show the window, on session `id` if it is still there.
+    fn open_told(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        crate::platform::window::show(window);
+        let Some(index) = self.store.index_of(id) else {
+            return;
+        };
+        self.store.active = index;
+        self.error = None;
+        self.page = Page::Chat;
+        self.follow();
+        self.focus_composer(window, cx);
+        self.save();
+        cx.notify();
+    }
+
+    /// Call the user back about session `id`, when the window is hidden or
+    /// behind others and they want to be. A chat app's session is answered
+    /// in the chat, and a deleted one has nothing to show.
+    fn tell(&mut self, id: u64, why: notify::Why) {
+        let remote =
+            self.remote.contains_key(&id) || self.remote_session.values().any(|&s| s == id);
+        let Some(ix) = self.store.index_of(id).filter(|_| !remote) else {
+            return;
+        };
+        let title = self.store.conversations[ix].title.clone();
+        let (on, away) = (self.store.settings.notifications, !self.in_front);
+        let now = std::time::Instant::now();
+        self.notices
+            .post(on, away, now, || notify::note(id, &title, why));
+    }
+
+    /// Call the user back about a turn in session `id` that ended by itself:
+    /// with its answer, or with what went wrong when it has none.
+    fn tell_ended_turn(&mut self, id: u64, scheduled: bool) {
+        let answer = self
+            .store
+            .index_of(id)
+            .and_then(|ix| self.store.conversations[ix].messages.last())
+            .filter(|last| last.role == "assistant" && !last.content.is_empty())
+            .map(|last| last.content.clone());
+        let error = self.error.clone();
+        let why = match (&answer, &error) {
+            (Some(answer), _) if scheduled => notify::Why::Scheduled(answer),
+            (Some(answer), _) => notify::Why::Finished(answer),
+            (None, Some(error)) => notify::Why::Failed(error),
+            (None, None) => notify::Why::Finished(""),
+        };
+        self.tell(id, why);
+    }
+
     /// A helper's call waiting on a yes: answered at once where its session's
     /// rules already decide it, otherwise put up as a card in that session.
     fn on_agent_ask(&mut self, request: approvals::Request, cx: &mut Context<Self>) {
@@ -1099,6 +1192,8 @@ impl Chat {
         ctx.conversation = request.root;
         ctx.workspace = self.store.conversations[ix].workspace.clone();
         letronna_core::hooks::card(ctx, &request.call.name);
+        let why = notify::Why::Waiting(&request.call, Some(&request.label));
+        self.tell(request.root, why);
         self.agent_asks.push_back(request);
     }
 
@@ -1441,6 +1536,7 @@ impl Chat {
             agent::Next::AskUser(call) => Some(call.id.clone()),
             _ => None,
         };
+        let fresh = asking.is_some() && asking != self.asking;
         if asking != self.asking {
             self.offer = match &next {
                 agent::Next::AskUser(call) => {
@@ -1469,6 +1565,9 @@ impl Chat {
                     && let Err(error) = letronna_core::tools::plan_of(&call.arguments)
                 {
                     return self.record_result(Err(error), cx);
+                }
+                if let Some(id) = self.streaming_id.filter(|_| fresh) {
+                    self.tell(id, notify::Why::Waiting(&call, None));
                 }
                 self.ask_remote(call, cx);
                 // The card shows only with its session on screen, and until
@@ -2363,11 +2462,16 @@ impl Chat {
 
     fn finish(&mut self, cx: &mut Context<Self>) {
         let stopped = std::mem::take(&mut self.stopping);
+        let session = self.streaming_id;
+        // Before the chat app is answered and the schedule reported, which
+        // forget that the session was theirs.
+        if let Some(id) = session.filter(|_| !stopped) {
+            self.tell_ended_turn(id, self.scheduled.contains(&id));
+        }
         self.answer_remote(cx);
         // The reply clears the indicator; nothing may raise it again.
         self.typing = None;
         self.report_scheduled(cx);
-        let session = self.streaming_id;
         // The grant is for the run, not the session: a follow-up typed there
         // has someone watching, and a deleted session's id is handed out again.
         if let Some(id) = self.streaming_id {

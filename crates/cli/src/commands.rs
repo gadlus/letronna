@@ -163,6 +163,19 @@ pub fn command(
             }));
             Flow::Handled
         }
+        "/notify" => {
+            let settings = &mut runner.store.settings;
+            settings.notifications = !settings.notifications;
+            let on = settings.notifications;
+            runner.persist();
+            render::blank();
+            render::line(&render::dim(if on {
+                "You are told when a reply ends or needs you while the terminal is in the background."
+            } else {
+                "Notifications off."
+            }));
+            Flow::Handled
+        }
         "/jobs" => {
             jobs(rest);
             Flow::Handled

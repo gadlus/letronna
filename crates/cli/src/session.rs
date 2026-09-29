@@ -11,6 +11,7 @@ use letronna_core::cancel::Cancel;
 use letronna_core::chat::{self, Connection, Event, Message, ToolCall};
 use letronna_core::gate::{self, Gate, Grants, Mode};
 use letronna_core::inbox;
+use letronna_core::notify::{self, Why};
 use letronna_core::store::{Conversation, Store};
 use letronna_core::{hooks, permissions, tools};
 use std::sync::mpsc;
@@ -41,6 +42,10 @@ pub struct Runner {
     /// Whether the user stopped the last turn, which keeps a ring from
     /// starting another before they say something.
     pub stopped: bool,
+    /// What calls the user back while the terminal is not looked at.
+    pub notices: letronna_core::notify::Notices,
+    /// Helpers and workflow runs that ended, once the box is up to say so.
+    pub ended: Option<async_channel::Receiver<letronna_core::notify::Ended>>,
 }
 
 impl Runner {
@@ -171,9 +176,43 @@ impl Runner {
         // the box rather than being sent, as it does in the window.
         if self.stopped {
             self.bar.hand_back();
+        } else {
+            let id = turn.connection.conversation;
+            match &answer {
+                Ok(text) => self.tell(id, Why::Finished(text)),
+                Err(error) => self.tell(id, Why::Failed(error)),
+            }
         }
+        self.tell_ended();
         self.bar.working(false);
         answer
+    }
+
+    /// Call the user back about session `id`, when they have looked away
+    /// from the terminal and want to be.
+    fn tell(&mut self, id: u64, why: Why) {
+        let title = self
+            .store
+            .index_of(id)
+            .map(|ix| self.store.conversations[ix].title.clone())
+            .unwrap_or_default();
+        let now = std::time::Instant::now();
+        let (on, away) = (self.store.settings.notifications, self.bar.away(now));
+        self.notices
+            .post(on, away, now, || notify::note(id, &title, why));
+    }
+
+    /// Call the user back about the helpers and workflow runs that ended
+    /// since last time.
+    pub fn tell_ended(&mut self) {
+        let ended: Vec<notify::Ended> = self
+            .ended
+            .as_ref()
+            .map(|ended| std::iter::from_fn(|| ended.try_recv().ok()).collect())
+            .unwrap_or_default();
+        for ended in ended {
+            self.tell(ended.session, Why::Ended(&ended.what));
+        }
     }
 
     fn work(&mut self, turn: &mut Turn, session: usize) -> Result<String, String> {
@@ -452,6 +491,11 @@ impl Runner {
                     // What holds every call for a yes, beside each card.
                     if let Some(error) = hooks::trouble() {
                         render::line(&render::red(&error));
+                    }
+                    // A plan that did not come through whole goes back to the
+                    // model without a question.
+                    if call.name != tools::EXIT_PLAN || tools::plan_of(&call.arguments).is_ok() {
+                        self.tell(turn.connection.conversation, Why::Waiting(&call, None));
                     }
                     hooks::card(ctx, &call.name);
                     let consulted = self.consult(turn, call)?;
@@ -856,7 +900,11 @@ impl Runner {
             let rules = letronna_core::permissions::load(&letronna_core::permissions::user_file());
             let decision = match settled(&request, self.mode, &self.allowed, &rules, true) {
                 Some(decision) => decision,
-                None if ask => ask_about(&mut self.bar, &request),
+                None if ask => {
+                    let why = Why::Waiting(&request.call, Some(&request.label));
+                    self.tell(request.root, why);
+                    ask_about(&mut self.bar, &request)
+                }
                 None => {
                     self.bar.hold(request);
                     return;
