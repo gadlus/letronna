@@ -36,6 +36,7 @@ pub enum Reason {
     /// The summary of the turns the window no longer holds.
     Summary,
     Tools,
+    /// The model, or the gateway it is reached through.
     Model,
     /// Nothing changed, but longer passed than the provider keeps a prefix.
     Expired,
@@ -54,7 +55,7 @@ impl Reason {
             Self::Skills => "the skills changed",
             Self::Summary => "the summary changed",
             Self::Tools => "the tools changed",
-            Self::Model => "the model changed",
+            Self::Model => "the model or gateway changed",
             Self::Expired => "over 5 minutes idle",
             Self::Unknown => "nothing changed that Letronna sends",
         }

@@ -730,7 +730,9 @@ fn body_hashed(
         prefix.set(Reason::Memory, &memory);
         prefix.set(Reason::Skills, &skills);
         prefix.set(Reason::Summary, summary);
-        prefix.set(Reason::Model, connection.model.trim());
+        // Another gateway holds no cache of this one's, whatever the model.
+        let route = (connection.endpoint.trim(), connection.model.trim());
+        prefix.set(Reason::Model, route);
     }
     system.push_str(&format!(" The model behind you is {}.", connection.model));
     if let Some(summary) = summary {
@@ -5169,6 +5171,23 @@ mod tests {
         // But no more than three quarters of what the reply leaves.
         let gpt = sized(Some(128_000), Some(16_384), 1_000_000, 5_000);
         assert_eq!(gpt.tokens, (128_000 - 16_384) / 4 * 3 - 5_000);
+    }
+
+    #[test]
+    fn another_gateway_for_the_same_model_changes_the_prefix() {
+        let hashed = |connection: &Connection| {
+            let mut prefix = crate::cache_miss::Prefix::default();
+            let budget = Budget::SMALL;
+            body_hashed(connection, &[], None, None, &budget, &[], Some(&mut prefix));
+            prefix
+        };
+        let here = connection();
+        let elsewhere = Connection {
+            endpoint: "http://localhost:8080/v1/".into(),
+            ..connection()
+        };
+        assert_eq!(hashed(&here), hashed(&connection()));
+        assert_ne!(hashed(&here), hashed(&elsewhere));
     }
 
     #[test]
