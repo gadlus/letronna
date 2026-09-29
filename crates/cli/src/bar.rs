@@ -80,6 +80,10 @@ pub const COMMANDS: &[Command] = &[
         blurb: "how hard the model should think",
     },
     Command {
+        name: "/style",
+        blurb: "list reply styles, or pick one: /style concise",
+    },
+    Command {
         name: "/thinking",
         blurb: "show the model's thinking, or hide it",
     },

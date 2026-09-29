@@ -133,6 +133,10 @@ pub fn command(
             effort(runner, *session, rest);
             Flow::Handled
         }
+        "/style" => {
+            style(runner, rest);
+            Flow::Handled
+        }
         "/thinking" => {
             runner.store.settings.thinking = !runner.store.settings.thinking;
             runner.persist();
@@ -626,6 +630,75 @@ fn effort(runner: &mut Runner, session: usize, rest: &str) {
         Some(level) if level == chosen => format!("Thinking {level}."),
         Some(level) => format!("Thinking {level}, the nearest {model} has to {chosen}."),
     }));
+}
+
+/// The reply styles with the chosen one marked, or `name` chosen.
+fn style(runner: &mut Runner, name: &str) {
+    use letronna_core::styles;
+    render::blank();
+    if !name.is_empty() {
+        let chosen = if name.eq_ignore_ascii_case(styles::DEFAULT) {
+            String::new()
+        } else {
+            let Some(style) = styles::find(name) else {
+                render::line(&render::red(&format!(
+                    "No style called {name}. /style lists them."
+                )));
+                return;
+            };
+            style.name
+        };
+        runner.store.settings.style = chosen.clone();
+        runner.persist();
+        render::line(&render::dim(&if chosen.is_empty() {
+            "Default style: replies as Letronna usually writes them.".to_owned()
+        } else {
+            format!("Replies in the {chosen} style from the next message.")
+        }));
+        return;
+    }
+    // A saved name whose file has gone reads as default, so it is marked so.
+    let current = styles::find(&runner.store.settings.style).map(|s| s.name);
+    let default = (
+        styles::DEFAULT.to_owned(),
+        "no style, as Letronna usually writes".to_owned(),
+        current.is_none(),
+    );
+    let rows: Vec<(String, String, bool)> = std::iter::once(default)
+        .chain(styles::all().into_iter().map(|style| {
+            let mut about = style.about;
+            if style.cut {
+                about.push_str(&format!(
+                    "{}cut at {} characters",
+                    if about.is_empty() { "" } else { " · " },
+                    styles::LIMIT
+                ));
+            }
+            let active = current.as_deref() == Some(style.name.as_str());
+            (style.name, about, active)
+        }))
+        .collect();
+    let width = rows
+        .iter()
+        .map(|(name, ..)| name.chars().count())
+        .max()
+        .unwrap_or(0);
+    for (name, about, active) in rows {
+        let mark = if active {
+            render::blue("●")
+        } else {
+            " ".into()
+        };
+        render::line(&format!(
+            "{mark} {}  {}",
+            render::bold(&format!("{name:<width$}")),
+            render::dim(&about)
+        ));
+    }
+    render::line(&render::dim(&format!(
+        "/style <name> to switch. Write your own in {}, one .md file each.",
+        styles::dir().display()
+    )));
 }
 
 /// What is still running, and a way to stop it.

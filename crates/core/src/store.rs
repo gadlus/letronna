@@ -202,6 +202,10 @@ pub struct Settings {
     /// a model without that level is sent the nearest one it has.
     #[serde(default)]
     pub effort: String,
+    /// The output style replies are written in, by name; empty, or a name
+    /// no style has, for none.
+    #[serde(default)]
+    pub style: String,
     /// Show the model's thinking as it arrives, rather than only its answer.
     #[serde(default)]
     pub thinking: bool,
@@ -276,6 +280,7 @@ impl Default for Settings {
             presence: String::new(),
             mode: crate::gate::Mode::Default,
             effort: String::new(),
+            style: String::new(),
             thinking: false,
             search: false,
             active_id: 0,
@@ -2944,6 +2949,24 @@ pub(crate) mod tests {
             let back = load().settings;
             assert_eq!((back.appearance.as_str(), back.grain), (appearance, grain));
         }
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_saved_style_comes_back_and_an_unknown_one_reads_as_none() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("style");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let old = super::read_settings(br#"{"endpoint": "", "model": "m"}"#).unwrap();
+        assert_eq!(old.style, "");
+        let mut store = Store::default();
+        store.settings.style = "teacher".into();
+        store.save().unwrap();
+        assert_eq!(load().settings.style, "teacher");
+        assert!(crate::styles::chosen().is_some());
+        store.settings.style = "gone".into();
+        store.save().unwrap();
+        assert_eq!(crate::styles::chosen(), None);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 

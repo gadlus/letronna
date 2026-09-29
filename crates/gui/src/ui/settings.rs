@@ -1193,6 +1193,54 @@ fn thinking_page(chat: &Entity<Chat>, store: &Store, cx: &App) -> Div {
         );
     }
 
+    // A saved name whose file has gone reads as default, so it is marked so.
+    let current = letronna_core::styles::find(&settings.style).map(|s| s.name);
+    let default = (
+        String::new(),
+        "Default — as Letronna usually writes".to_owned(),
+    );
+    let own = letronna_core::styles::all().into_iter().map(|style| {
+        let mut text = style.name.clone();
+        if !style.about.is_empty() {
+            text.push_str(&format!(" — {}", style.about));
+        }
+        if style.cut {
+            text.push_str(&format!(
+                " (cut at {} characters)",
+                letronna_core::styles::LIMIT
+            ));
+        }
+        (style.name, text)
+    });
+    let mut styles = v_flex().gap_2();
+    for (at, (value, text)) in std::iter::once(default).chain(own).enumerate() {
+        let active = current.as_deref().unwrap_or_default() == value;
+        let chat = chat.clone();
+        styles = styles.child(
+            h_flex()
+                .id(("style", at))
+                .cursor_pointer()
+                .items_center()
+                .gap_2p5()
+                .p_2p5()
+                .rounded(cx.theme().radius)
+                .border_1()
+                .border_color(if active {
+                    cx.theme().primary
+                } else {
+                    cx.theme().border
+                })
+                .child(div().text_sm().child(text))
+                .on_click(move |_, _, cx| {
+                    chat.update(cx, |this, cx| {
+                        this.store.settings.style = value.clone();
+                        this.save();
+                        cx.notify();
+                    })
+                }),
+        );
+    }
+
     let showing = settings.thinking;
     let show = toggle_row(
         "show-thinking",
@@ -1223,6 +1271,7 @@ fn thinking_page(chat: &Entity<Chat>, store: &Store, cx: &App) -> Div {
             cx,
         ))
         .child(v_flex().gap_1().child(label("Effort", cx)).child(levels))
+        .child(v_flex().gap_1().child(label("Style", cx)).child(styles))
         .child(show)
         .child(search)
 }

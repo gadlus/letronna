@@ -637,6 +637,13 @@ fn body_with(
     let mut system = crate::memory::soul().unwrap_or_else(|| {
         String::from("You are Letronna, a personal assistant. Be clear, concise, and honest.")
     });
+    // Right after who Letronna is, since a tone colours all that follows;
+    // choosing another moves the cached prefix, which a pick rarely does.
+    if let Some(style) = crate::styles::chosen() {
+        system.push_str(&format!(
+            "\n\nWrite your replies in this style:\n{style}\n\n"
+        ));
+    }
     let shared = connection.remote.as_ref().is_some_and(|r| r.shared);
     if connection.tools && !shared {
         // A chat app is not the terminal or the window, and /resume means
@@ -2569,6 +2576,38 @@ mod tests {
         let without = body(&connection(), &messages, None, None);
         let plain = without["messages"][0]["content"].as_str().unwrap();
         assert!(!plain.contains("summarized"));
+    }
+    #[test]
+    fn the_chosen_style_follows_right_after_who_letronna_is() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join("letronna-chat-style");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("styles")).unwrap();
+        std::fs::write(dir.join("styles").join("pirate.md"), "Say arr.").unwrap();
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let messages = [said("user", "hi")];
+        let system = |style: &str| {
+            let settings = serde_json::json!({"endpoint": "", "model": "m", "style": style});
+            std::fs::write(dir.join("settings.json"), settings.to_string()).unwrap();
+            body(&connection(), &messages, None, None)["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let styled = system("Pirate");
+        let identity = "Be clear, concise, and honest.";
+        assert!(
+            styled.contains(&format!(
+                "{identity}\n\nWrite your replies in this style:\nSay arr.\n\n"
+            )),
+            "{styled}"
+        );
+        for none in ["", "default", "no-such-style"] {
+            assert!(!system(none).contains("Write your replies"), "{none}");
+        }
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
     fn said(role: &str, content: &str) -> Message {
         Message {
