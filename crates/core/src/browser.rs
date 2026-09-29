@@ -724,6 +724,9 @@ fn run_steps(
             ));
             break;
         }
+        // Twenty steps can outlast the idle watch, which would close the
+        // browser between two of them and lose the page they work on.
+        mark_agent_use();
         let what = summary(step);
         match run(tool, step) {
             Ok(result) if result.trim().is_empty() => said.push(format!("{number}. {what}: done.")),
@@ -5635,6 +5638,30 @@ mod tests {
             stopped,
             "Stopped by the user before step 2 of 4:\n1. click e1: done."
         );
+    }
+
+    #[test]
+    fn a_long_batch_keeps_its_browser_from_being_closed_as_idle() {
+        let args = json!({"action": "batch", "steps": [
+            {"action": "wait", "text": "Paid"},
+            {"action": "click", "ref": "e1"}
+        ]});
+        let steps = steps(&args).unwrap();
+        mark_agent_use();
+        // As if each step took longer than the idle watch waits.
+        let long_ago = Instant::now().checked_sub(KEEP_FOR_AGENT * 2);
+        let quiet = || {
+            let used = agent_used().lock().unwrap();
+            used.map(|at| at.elapsed())
+        };
+        run_steps(&steps, &Cancel::default(), |_, _| {
+            assert!(
+                quiet().is_some_and(|quiet| !idle(KEEP_AFTER_PANEL, Some(quiet))),
+                "a step began with the browser idle"
+            );
+            *agent_used().lock().unwrap() = long_ago;
+            Ok(String::new())
+        });
     }
 
     #[test]
