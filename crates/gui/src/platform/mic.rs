@@ -110,47 +110,79 @@ fn build_stream(
             *failure.lock().unwrap_or_else(|e| e.into_inner()) = Some(why);
         }
     };
+    // Every format cpal can hand over, not just the common three: with no
+    // float input on offer, cpal's ALSA default picks 32- or 24-bit before
+    // 16-bit, and refusing those would leave the mic dead on that machine.
+    use cpal::SampleFormat as F;
     let built = match config.sample_format() {
-        cpal::SampleFormat::I16 => device.build_input_stream(
-            &stream_config,
-            move |data: &[i16], _| {
-                samples
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .extend_from_slice(data);
-            },
-            on_error,
-            None,
-        ),
-        cpal::SampleFormat::U16 => device.build_input_stream(
-            &stream_config,
-            move |data: &[u16], _| {
-                let mut samples = samples.lock().unwrap_or_else(|e| e.into_inner());
-                samples.extend(data.iter().map(|&s| (i32::from(s) - 32_768) as i16));
-            },
-            on_error,
-            None,
-        ),
-        cpal::SampleFormat::F32 => device.build_input_stream(
-            &stream_config,
-            move |data: &[f32], _| {
-                let mut samples = samples.lock().unwrap_or_else(|e| e.into_inner());
-                samples.extend(
-                    data.iter()
-                        .map(|s| (s.clamp(-1., 1.) * f32::from(i16::MAX)) as i16),
-                );
-            },
-            on_error,
-            None,
-        ),
+        F::I8 => input::<i8>(device, &stream_config, samples, on_error),
+        F::I16 => input::<i16>(device, &stream_config, samples, on_error),
+        F::I24 => input::<cpal::I24>(device, &stream_config, samples, on_error),
+        F::I32 => input::<i32>(device, &stream_config, samples, on_error),
+        F::I64 => input::<i64>(device, &stream_config, samples, on_error),
+        F::U8 => input::<u8>(device, &stream_config, samples, on_error),
+        F::U16 => input::<u16>(device, &stream_config, samples, on_error),
+        F::U24 => input::<cpal::U24>(device, &stream_config, samples, on_error),
+        F::U32 => input::<u32>(device, &stream_config, samples, on_error),
+        F::U64 => input::<u64>(device, &stream_config, samples, on_error),
+        F::F32 => input::<f32>(device, &stream_config, samples, on_error),
+        F::F64 => input::<f64>(device, &stream_config, samples, on_error),
         other => return Err(format!("Letronna cannot record in {other:?}.")),
     };
     built.map_err(|e| format!("Could not start recording: {e}"))
 }
 
+/// An input stream in the device's own sample type, appending what it hears
+/// to `samples`.
+fn input<T>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    samples: Arc<Mutex<Vec<i16>>>,
+    on_error: impl FnMut(cpal::StreamError) + Send + 'static,
+) -> Result<cpal::Stream, cpal::BuildStreamError>
+where
+    T: cpal::SizedSample,
+    i16: cpal::FromSample<T>,
+{
+    device.build_input_stream(
+        config,
+        move |data: &[T], _| heard(data, &mut samples.lock().unwrap_or_else(|e| e.into_inner())),
+        on_error,
+        None,
+    )
+}
+
+/// Append `data`, in whatever sample type the device sends, as 16-bit.
+fn heard<T>(data: &[T], samples: &mut Vec<i16>)
+where
+    T: cpal::Sample,
+    i16: cpal::FromSample<T>,
+{
+    samples.extend(data.iter().map(|&s| s.to_sample::<i16>()));
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{fit, stopped};
+    use super::{fit, heard, stopped};
+
+    #[test]
+    fn every_sample_type_lands_as_16_bit_at_the_same_level() {
+        fn as_16_bit<T>(data: &[T]) -> Vec<i16>
+        where
+            T: cpal::Sample,
+            i16: cpal::FromSample<T>,
+        {
+            let mut samples = Vec::new();
+            heard(data, &mut samples);
+            samples
+        }
+        let full = [-32_768, 0, 32_767];
+        assert_eq!(as_16_bit(&[i32::MIN, 0, i32::MAX]), full);
+        assert_eq!(as_16_bit(&[0u16, 32_768, u16::MAX]), full);
+        assert_eq!(as_16_bit(&[-1.0f32, 0.0, 1.0]), full);
+        let lowest = cpal::I24::new(-(1 << 23)).expect("in range");
+        assert_eq!(as_16_bit(&[lowest]), [-32_768]);
+    }
 
     #[test]
     fn a_recording_past_the_cap_is_cut_to_whole_frames_within_it() {
