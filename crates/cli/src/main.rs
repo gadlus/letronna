@@ -111,6 +111,7 @@ fn main() {
             || (std::io::stdin().is_terminal() && std::io::stdout().is_terminal()),
         trouble: None,
         bar: bar::Bar::new(String::new()),
+        stopped: false,
     };
     letronna_core::browser::share_browser(runner.store.settings.browser_shared);
     std::thread::spawn(letronna_core::browser::close_left_over);
@@ -197,7 +198,23 @@ fn main() {
         replay(&runner, session);
     }
 
-    while let Some(line) = runner.bar.wait() {
+    // Only a conversation that goes on hears about work that ends after its
+    // turn; `-p` has left by now, with its answer.
+    runner.bar.listen();
+    while let Some(waited) = runner.bar.wait() {
+        let bar::Waited::Line(line) = waited else {
+            // Notices came for the open session while it sat idle, and it
+            // takes them as a turn of its own -- unless the user stopped the
+            // last one, when they wait to go in ahead of the next prompt.
+            if !runner.stopped
+                && let Err(error) = runner.resume(session)
+            {
+                render::blank();
+                render::line(&render::red(&error));
+                screen::settle();
+            }
+            continue;
+        };
         let line = line.trim().to_owned();
         if line.is_empty() {
             continue;

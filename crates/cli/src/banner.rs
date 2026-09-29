@@ -24,6 +24,7 @@ pub fn replay(runner: &Runner, session: usize) {
     }
     for message in &messages[from..] {
         match message.role.as_str() {
+            "user" if message.notice => render::notice(&message.content),
             // A chat app's message can quote someone else's, fenced.
             "user" => said_over_lines(
                 &render::blue("›"),

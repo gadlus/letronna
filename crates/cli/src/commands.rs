@@ -826,6 +826,14 @@ pub fn resume(runner: &mut Runner, session: &mut usize, workspace: Option<&std::
     // was taken from, and saying it twice reads as the command having run
     // twice.
     replay(runner, index);
+    // Notices that came for it while another session was open rang for that
+    // one, so they are taken now; and a turn stopped over there is no reason
+    // for this one to stay quiet.
+    runner.stopped = false;
+    if let Err(error) = runner.resume(index) {
+        render::blank();
+        render::line(&render::red(&error));
+    }
 }
 
 /// Whether /undo's argument asks for the files too; `None` for one it does
@@ -936,7 +944,9 @@ fn take_back(
 
 /// Where the last thing you said sits among `messages`, and what it said.
 fn last_prompt(messages: &[letronna_core::chat::Message]) -> Option<(usize, String)> {
-    let at = messages.iter().rposition(|m| m.role == "user")?;
+    let at = messages
+        .iter()
+        .rposition(|m| m.role == "user" && !m.notice)?;
     Some((at, messages[at].content.clone()))
 }
 
@@ -1346,5 +1356,26 @@ mod tests {
         assert_eq!(with_files("--files"), Some(true));
         assert_eq!(with_files("--file"), None);
         assert_eq!(with_files("files"), None);
+    }
+
+    #[test]
+    fn rewind_skips_notices() {
+        // A notice goes to the model as the user's turn, but the user did
+        // not say it, so it is never what gets taken back.
+        let notice = Message {
+            notice: true,
+            ..said("user", "[Letronna notice]\n- job #7 exited with code 0")
+        };
+        let messages = [
+            said("user", "run the tests in the background"),
+            said("assistant", "started job #7"),
+            notice.clone(),
+            said("assistant", "they passed"),
+        ];
+        assert_eq!(
+            last_prompt(&messages),
+            Some((0, "run the tests in the background".to_owned()))
+        );
+        assert_eq!(last_prompt(&[notice]), None);
     }
 }

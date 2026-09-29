@@ -225,6 +225,15 @@ struct Choice {
     picked: usize,
 }
 
+/// What ended a wait at the prompt.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Waited {
+    /// A line was entered.
+    Line(String),
+    /// The doorbell rang for notices that came while the session sat idle.
+    Rang,
+}
+
 /// A setting with a natural order, picked by sliding along a track rather
 /// than from a list: effort goes from less to more, and a list hides that
 /// the options are points on one line.
@@ -276,6 +285,8 @@ pub struct Bar {
     /// The open session's checklist, shown over the box while any of it is
     /// left to do.
     plan: Vec<Todo>,
+    /// The doorbell for notices, once the conversation listens for them.
+    bell: Option<async_channel::Receiver<()>>,
 }
 
 impl Bar {
@@ -303,6 +314,7 @@ impl Bar {
             waiting: None,
             ticked: std::time::Instant::now(),
             plan: Vec::new(),
+            bell: None,
         }
     }
 
@@ -344,8 +356,47 @@ impl Bar {
         self.settle();
     }
 
-    /// Wait for a whole line. `None` when the user is done.
-    pub fn wait(&mut self) -> Option<String> {
+    /// Let the inbox's doorbell end a wait at the prompt, only with the box
+    /// up: a line read from a pipe cannot be cut short, so there the inbox is
+    /// not told that anything will wake an idle session.
+    pub fn listen(&mut self) {
+        if self.live {
+            self.bell = Some(letronna_core::inbox::listen());
+        }
+    }
+
+    /// Wait at the prompt for a whole line, or for the doorbell. `None` when
+    /// the user is done.
+    pub fn wait(&mut self) -> Option<Waited> {
+        loop {
+            if self.done {
+                return None;
+            }
+            if let Some(waited) = self.waited() {
+                return Some(waited);
+            }
+            if !self.live {
+                return crate::input::read(&format!("{} ", render::blue("›"))).map(Waited::Line);
+            }
+            self.pump();
+        }
+    }
+
+    /// A line already entered, or else a ring, taken without waiting for
+    /// either: what the user typed goes first, and the notices it rang for
+    /// go in ahead of it anyway.
+    fn waited(&mut self) -> Option<Waited> {
+        if let Some(line) = self.queued.pop_front() {
+            return Some(Waited::Line(line));
+        }
+        let bell = self.bell.as_ref()?;
+        bell.try_recv().ok().map(|()| Waited::Rang)
+    }
+
+    /// Wait for a whole line that answers a question, leaving any ring for
+    /// the prompt: a turn it started now would cut into the question. `None`
+    /// when the user is done.
+    pub fn reply(&mut self) -> Option<String> {
         if let Some(line) = self.queued.pop_front() {
             return Some(line);
         }
@@ -419,7 +470,7 @@ impl Bar {
         self.asking = Some(hint.to_owned());
         self.note = Some("enter to save  ·  esc to skip".to_owned());
         self.settle();
-        let answer = self.wait();
+        let answer = self.reply();
         self.secret = false;
         self.asking = None;
         self.note = None;
@@ -440,7 +491,7 @@ impl Bar {
         self.asking = Some(hint.to_owned());
         self.note = Some("enter to send  ·  esc to skip".to_owned());
         self.settle();
-        let answer = self.wait();
+        let answer = self.reply();
         self.asking = None;
         self.note = None;
         let later = std::mem::replace(&mut self.queued, earlier);
@@ -1248,7 +1299,7 @@ fn track(stops: &[String], at: usize, room: usize) -> (String, String, usize) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Bar, Choice, MENU_LIMIT, PLAN_ROWS, Slider, checklist, closest, matches, menu_top,
+        Bar, Choice, MENU_LIMIT, PLAN_ROWS, Slider, Waited, checklist, closest, matches, menu_top,
         stops_at, track,
     };
     use crate::render::{MARGIN, plain, visible};
@@ -1553,5 +1604,32 @@ mod tests {
         // The command waits for the loop, and so does what came after it.
         assert_eq!(bar.queued, ["/where", "then this"]);
         assert!(bar.take_typed().is_empty());
+    }
+
+    #[test]
+    fn a_ring_ends_the_wait_without_a_line() {
+        let mut bar = Bar::new(String::new());
+        let (ring, bell) = async_channel::bounded(1);
+        bar.bell = Some(bell);
+        assert_eq!(bar.waited(), None);
+        ring.try_send(()).unwrap();
+        assert_eq!(bar.waited(), Some(Waited::Rang));
+        assert_eq!(bar.waited(), None, "one ring ended two waits");
+        // A line typed before the ring is answered first, and the ring is
+        // kept for the wait after it.
+        ring.try_send(()).unwrap();
+        bar.queued.push_back("and the docs".into());
+        assert_eq!(bar.waited(), Some(Waited::Line("and the docs".into())));
+        assert_eq!(bar.waited(), Some(Waited::Rang));
+    }
+
+    #[test]
+    fn lines_read_from_a_pipe_do_not_listen_for_the_bell() {
+        // A bar never installed is what piped input and no colour get, and
+        // nothing there would wake an idle session.
+        let mut bar = Bar::new(String::new());
+        bar.listen();
+        assert!(bar.bell.is_none());
+        assert!(!letronna_core::inbox::listened());
     }
 }
