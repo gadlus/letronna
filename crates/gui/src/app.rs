@@ -287,6 +287,8 @@ pub(crate) struct Chat {
     pub(crate) skills_refused: Vec<String>,
     /// The side question on show, if one is.
     pub(crate) aside: Option<Aside>,
+    /// A failed turn set to be asked again once its provider's wait is over.
+    pub(crate) waiting_retry: Option<crate::ui::messages::WaitingRetry>,
     /// Sessions a notice woke, marked in the sidebar until they are next on
     /// screen.
     pub(crate) unseen: std::collections::HashSet<u64>,
@@ -654,6 +656,7 @@ impl Chat {
             skills_note: None,
             skills_refused: Vec::new(),
             aside: None,
+            waiting_retry: None,
             unseen: std::collections::HashSet::new(),
             stopping: false,
             helpers: Vec::new(),
@@ -1286,8 +1289,15 @@ impl Chat {
         turn.absorb(&event);
         match event {
             Event::Finished(Err(error)) => {
+                let kept = self.keep_failure(&error);
+                // `finish` reports it to a schedule or a chat app, and holds
+                // back what was queued, by this.
                 self.error = Some(error.to_string());
                 self.finish(cx);
+                // Said where the turn failed, so not again as a toast.
+                if kept {
+                    self.error = None;
+                }
             }
             Event::Finished(Ok(())) => self.on_reply(cx),
             // Kept with the session, so a restart need not ask for it again.
@@ -2541,6 +2551,44 @@ impl Chat {
                 return;
             }
         };
+        self.begin_turn(id, connection, cx);
+    }
+
+    /// Ask again in the session `id` where its last turn failed, carrying on
+    /// from where it stopped rather than from its prompt, so tools that ran
+    /// before the failure are not run again.
+    pub(crate) fn retry_failed(&mut self, id: u64, cx: &mut Context<Self>) {
+        self.waiting_retry = None;
+        let Some(ix) = self.store.index_of(id) else {
+            return;
+        };
+        // Something said or asked since makes the failure old news.
+        let failed = self.store.conversations[ix]
+            .messages
+            .last()
+            .is_some_and(|m| m.role == letronna_core::failure::ROLE);
+        if self.busy || !failed {
+            cx.notify();
+            return;
+        }
+        let connection = match self.connection_for(ix, None) {
+            Ok(connection) => connection,
+            Err(error) => {
+                self.error = Some(error);
+                cx.notify();
+                return;
+            }
+        };
+        if self.store.conversations[self.store.active].id == id {
+            self.follow();
+        } else {
+            self.unseen.insert(id);
+        }
+        self.begin_turn(id, connection, cx);
+    }
+
+    /// Run a turn in the session `id` on what it already holds.
+    fn begin_turn(&mut self, id: u64, connection: Connection, cx: &mut Context<Self>) {
         self.busy = true;
         self.streaming_id = Some(id);
         agents::connected(&connection);

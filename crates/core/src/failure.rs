@@ -13,13 +13,22 @@
 //! with 200 goes through the same steps, with the numeric `error.code`
 //! OpenRouter puts in its envelope standing in for the status it could not
 //! send.
+//!
+//! A failed turn is kept in its session as a message of its own under
+//! `ROLE`, so it is there after a restart and goes wherever the session
+//! goes. The model never reads one: `chat` leaves it out of each request and
+//! each summary. With it is kept what the window needs to say the cause in
+//! a few words and offer at most two ways out, the likely one first.
 
+use crate::chat::Message;
 use reqwest::header::{HeaderMap, RETRY_AFTER};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{fmt, time::Duration};
 
 /// What went wrong with a model call, as far as can be told.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FailureKind {
     /// The key is missing, wrong, or not allowed to do this.
     Auth,
@@ -46,6 +55,9 @@ pub enum FailureKind {
     /// Nobody is waiting for the reply any more.
     Stopped,
     /// Nothing said what went wrong.
+    // A kind a newer version kept reads as this, rather than losing the
+    // message it is on.
+    #[serde(other)]
     Unknown,
 }
 
@@ -88,6 +100,126 @@ impl fmt::Display for Failure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.message)
     }
+}
+
+/// The role a failed turn is kept under in its session.
+pub const ROLE: &str = "failure";
+
+/// What a session keeps of a failed turn beside its words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Kept {
+    pub kind: FailureKind,
+    /// When the provider said to come back, in seconds since 1970.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<u64>,
+    /// The call went to the Letronna account, whose credit and sign-in can
+    /// be mended from here, unlike another provider's.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hosted: bool,
+}
+
+/// A way out of a failed turn, as a button offers it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fix {
+    Retry,
+    /// Retry once the provider's wait is over, at this second since 1970.
+    RetryAt(u64),
+    AddCredit,
+    ChooseModel,
+    SignIn,
+    CopyDetails,
+}
+
+impl Failure {
+    /// The failure as a message for its session, from a call to `model` at
+    /// `now`, in seconds since 1970; `None` for a turn that was stopped,
+    /// which is no failure.
+    pub fn kept(&self, model: &str, hosted: bool, now: u64) -> Option<Message> {
+        if self.kind == FailureKind::Stopped {
+            return None;
+        }
+        // Only a wait that passes is worth coming back after, and one under
+        // a second is over before anyone could press anything.
+        let until = self
+            .retry_after
+            .filter(|wait| crate::retry::passes(self.kind) && wait.as_secs() > 0)
+            .map(|wait| now.saturating_add(wait.as_secs()));
+        Some(Message {
+            role: ROLE.into(),
+            content: self.message.clone(),
+            model: model.to_owned(),
+            failed: Some(Box::new(Kept {
+                kind: self.kind,
+                until,
+                hosted,
+            })),
+            ..Default::default()
+        })
+    }
+}
+
+impl Kept {
+    /// The cause in a few plain words, with `clock` saying when `until` is.
+    pub fn cause(&self, clock: impl Fn(u64) -> String) -> String {
+        match self.kind {
+            FailureKind::Auth if self.hosted => "Signed out".to_owned(),
+            FailureKind::Auth => "The key was not accepted".to_owned(),
+            FailureKind::Quota => "Out of credit".to_owned(),
+            FailureKind::RateLimit => match self.until {
+                Some(until) => format!("Rate limited until {}", clock(until)),
+                None => "Rate limited".to_owned(),
+            },
+            FailureKind::Overloaded => "The provider is overloaded".to_owned(),
+            FailureKind::ContextTooLong => "Context too long".to_owned(),
+            FailureKind::BadRequest => "The provider turned the request down".to_owned(),
+            FailureKind::NotFound => "Model not found".to_owned(),
+            FailureKind::Server => "The provider had an error".to_owned(),
+            FailureKind::Network => "Gateway unreachable".to_owned(),
+            FailureKind::BadReply => "The reply could not be read".to_owned(),
+            FailureKind::Settings => "The connection settings cannot work".to_owned(),
+            FailureKind::Stopped => "Stopped".to_owned(),
+            FailureKind::Unknown => "The reply failed".to_owned(),
+        }
+    }
+
+    /// At most two ways out at `now`, the likely one first. A fix this
+    /// window has no way to make, such as a key for another provider, is
+    /// left to the words, and copying them is all that is offered.
+    pub fn fixes(&self, now: u64) -> Vec<Fix> {
+        let first = match self.kind {
+            FailureKind::Auth if self.hosted => Some(Fix::SignIn),
+            FailureKind::Quota if self.hosted => Some(Fix::AddCredit),
+            // A bigger window is the one way out the window can offer until
+            // a session can be compacted on demand.
+            FailureKind::NotFound | FailureKind::ContextTooLong => Some(Fix::ChooseModel),
+            _ if crate::retry::passes(self.kind) => match self.until {
+                Some(until) if until > now => Some(Fix::RetryAt(until)),
+                _ => Some(Fix::Retry),
+            },
+            FailureKind::BadReply | FailureKind::Unknown => Some(Fix::Retry),
+            _ => None,
+        };
+        first.into_iter().chain([Fix::CopyDetails]).collect()
+    }
+}
+
+/// What Copy details takes of the failure kept in `message`: enough to
+/// report it by.
+pub fn details(message: &Message) -> String {
+    let kind = message
+        .failed
+        .as_ref()
+        .map_or(FailureKind::Unknown, |kept| kept.kind);
+    format!("{kind:?} from {}: {}", message.model, message.content)
+}
+
+/// A second since 1970 as the local clock shows it, such as 14:05.
+pub fn clock(at: u64) -> String {
+    i64::try_from(at)
+        .ok()
+        .and_then(|at| chrono::DateTime::from_timestamp(at, 0))
+        .map(|at| at.with_timezone(&chrono::Local).format("%H:%M").to_string())
+        .unwrap_or_default()
 }
 
 /// Read a provider's error reply, given its HTTP status or `None` when the
@@ -690,6 +822,131 @@ mod tests {
             assert_eq!(failure.kind, expected, "{body}");
             assert_eq!(failure.overflow, Some(numbers), "{body}");
         }
+    }
+
+    #[test]
+    fn a_failed_turn_is_kept_with_when_to_come_back_and_a_stopped_one_is_not() {
+        let mut limited = Failure::new(FailureKind::RateLimit, "Slow down.");
+        limited.retry_after = Some(Duration::from_secs(300));
+        let message = limited.kept("m", true, 1_000).unwrap();
+        assert_eq!(
+            (message.role.as_str(), message.content.as_str()),
+            (ROLE, "Slow down.")
+        );
+        assert_eq!(message.model, "m");
+        assert_eq!(
+            message.failed.as_deref(),
+            Some(&Kept {
+                kind: FailureKind::RateLimit,
+                until: Some(1_300),
+                hosted: true,
+            })
+        );
+        // A wait asked with a bad key is no promise it will pass.
+        let mut refused = Failure::new(FailureKind::Auth, "Bad key.");
+        refused.retry_after = Some(Duration::from_secs(300));
+        let message = refused.kept("m", false, 1_000).unwrap();
+        assert_eq!(message.failed.unwrap().until, None);
+        assert!(
+            Failure::new(FailureKind::Stopped, "Stopped.")
+                .kept("m", false, 1_000)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_likely_fix_comes_first_and_there_are_never_more_than_two() {
+        let fixes = |kind, until, hosted| {
+            Kept {
+                kind,
+                until,
+                hosted,
+            }
+            .fixes(1_000)
+        };
+        use Fix::*;
+        assert_eq!(
+            fixes(FailureKind::Quota, None, true),
+            [AddCredit, CopyDetails]
+        );
+        assert_eq!(fixes(FailureKind::Quota, None, false), [CopyDetails]);
+        assert_eq!(fixes(FailureKind::Auth, None, true), [SignIn, CopyDetails]);
+        assert_eq!(fixes(FailureKind::Auth, None, false), [CopyDetails]);
+        assert_eq!(
+            fixes(FailureKind::RateLimit, Some(1_300), false),
+            [RetryAt(1_300), CopyDetails]
+        );
+        // Once the wait is over there is nothing left to wait for.
+        assert_eq!(
+            fixes(FailureKind::RateLimit, Some(900), false),
+            [Retry, CopyDetails]
+        );
+        assert_eq!(
+            fixes(FailureKind::Network, None, false),
+            [Retry, CopyDetails]
+        );
+        assert_eq!(
+            fixes(FailureKind::NotFound, None, true),
+            [ChooseModel, CopyDetails]
+        );
+        assert_eq!(
+            fixes(FailureKind::ContextTooLong, None, true),
+            [ChooseModel, CopyDetails]
+        );
+        assert_eq!(fixes(FailureKind::Settings, None, false), [CopyDetails]);
+        assert_eq!(
+            fixes(FailureKind::Unknown, None, false),
+            [Retry, CopyDetails]
+        );
+    }
+
+    #[test]
+    fn the_cause_is_said_in_a_few_plain_words() {
+        let cause = |kind, until, hosted| {
+            Kept {
+                kind,
+                until,
+                hosted,
+            }
+            .cause(|at| format!("at {at}"))
+        };
+        assert_eq!(cause(FailureKind::Quota, None, true), "Out of credit");
+        assert_eq!(
+            cause(FailureKind::RateLimit, Some(1_300), false),
+            "Rate limited until at 1300"
+        );
+        assert_eq!(cause(FailureKind::RateLimit, None, false), "Rate limited");
+        assert_eq!(cause(FailureKind::NotFound, None, false), "Model not found");
+        assert_eq!(
+            cause(FailureKind::ContextTooLong, None, false),
+            "Context too long"
+        );
+        assert_eq!(cause(FailureKind::Auth, None, true), "Signed out");
+        assert_eq!(
+            cause(FailureKind::Network, None, false),
+            "Gateway unreachable"
+        );
+    }
+
+    #[test]
+    fn a_kept_failure_reads_back_as_it_was_written() {
+        let message = Failure::new(FailureKind::ContextTooLong, "Too long.")
+            .kept("m", false, 1_000)
+            .unwrap();
+        let line = serde_json::to_string(&message).unwrap();
+        assert!(
+            line.contains(r#""failed":{"kind":"context_too_long"}"#),
+            "{line}"
+        );
+        let back: Message = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.failed, message.failed);
+        // A kind this version does not know keeps its message.
+        let newer: Message = serde_json::from_str(
+            r#"{"role":"failure","content":"Odd.","failed":{"kind":"moon_phase"}}"#,
+        )
+        .unwrap();
+        assert_eq!(newer.failed.unwrap().kind, FailureKind::Unknown);
+        assert_eq!(details(&back), "ContextTooLong from m: Too long.");
     }
 
     #[test]

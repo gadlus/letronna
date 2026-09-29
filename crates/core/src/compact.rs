@@ -240,6 +240,8 @@ fn transcript(messages: &[Message], max: usize) -> String {
         match m.role.as_str() {
             "user" if m.notice => out.push_str(&format!("Notice: {}\n\n", m.content)),
             "user" => out.push_str(&format!("User: {}\n\n", m.content)),
+            // What the provider said to the user, not part of the work.
+            crate::failure::ROLE => {}
             "tool" => out.push_str(&format!(
                 "Tool {} returned: {}\n\n",
                 m.name,
@@ -688,6 +690,15 @@ mod tests {
             panic!("asked again")
         });
         assert_eq!(kept.as_deref(), Some("the summary"));
+    }
+
+    #[test]
+    fn a_kept_failure_is_left_out_of_what_is_summarized() {
+        let failed = crate::failure::Failure::new(crate::failure::FailureKind::Network, "Down.")
+            .kept("m", false, 1_000)
+            .unwrap();
+        let text = transcript(&[said("user", "hi"), failed], INPUT_TOKENS);
+        assert_eq!(text, "User: hi\n\n");
     }
 
     #[test]
