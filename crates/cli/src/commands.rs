@@ -1,9 +1,12 @@
 //! The slash commands: everything you can ask of Letronna itself rather
 //! than of the model.
 
+use letronna_core::agents::Seen;
 use letronna_core::gate::Mode;
 use letronna_core::skills::{Skill, Source};
 use letronna_core::{history, store};
+use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use crate::banner::{banner, folder_name, footer, replay};
 use crate::bar;
@@ -159,6 +162,10 @@ pub fn command(
         }
         "/jobs" => {
             jobs(rest);
+            Flow::Handled
+        }
+        "/agents" => {
+            agents(runner.store.conversations[*session].id, rest);
             Flow::Handled
         }
         "/skills" => {
@@ -569,6 +576,161 @@ fn jobs(rest: &str) {
         ));
     }
     render::line(&render::dim("/jobs stop <id> to stop one"));
+}
+
+/// This session's helpers and how each is getting on, or one of them stopped
+/// or told something.
+///
+/// A helper in the background says nothing until it ends, and the model is
+/// told not to ask after it, so this is where the user looks in on one.
+fn agents(session: u64, rest: &str) {
+    let helpers: Vec<Seen> = (letronna_core::agents::seen().into_iter())
+        .filter(|helper| helper.session == session)
+        .collect();
+    render::blank();
+    if helpers.is_empty() {
+        render::said(
+            &render::blue("●"),
+            &render::bold("No helpers in this session"),
+        );
+        return;
+    }
+
+    // `/agents stop explore-2`, `/agents send explore-2 check the tests too`,
+    // or a bare `/agents` to look.
+    let usage = "/agents stop <name>  ·  /agents send <name> <text>";
+    let (action, rest) = rest.split_once(' ').unwrap_or((rest, ""));
+    match action {
+        "stop" => stop_helper(&helpers, rest.trim()),
+        "send" => send_to_helper(&helpers, rest.trim()),
+        "" => {
+            render::said(&render::blue("●"), &render::bold("Helpers"));
+            let width = render::width().saturating_sub(render::PAD.len());
+            let rows = agent_rows(&helpers, Instant::now(), width);
+            let Some((header, rows)) = rows.split_first() else {
+                return;
+            };
+            render::line(&render::dim(header));
+            for (row, helper) in rows.iter().zip(&helpers) {
+                // One that has ended stands back from those at work.
+                render::line(&match helper.ended {
+                    Some(_) => render::dim(row),
+                    None => row.clone(),
+                });
+            }
+            render::line(&render::dim(usage));
+        }
+        // A typo is not taken for a bare look, which would seem to have worked.
+        _ => render::line(&render::dim(&format!("/agents to list them  ·  {usage}"))),
+    }
+}
+
+/// The helpers as a table, as they stand at `now`, a header first, each row
+/// cut to `width`. The task comes last, so a narrow window loses the end of
+/// that before anything that tells the helpers apart.
+fn agent_rows(helpers: &[Seen], now: Instant, width: usize) -> Vec<String> {
+    let mut rows = vec![["name", "type", "state", "tokens", "task"].map(String::from)];
+    rows.extend(helpers.iter().map(|helper| {
+        let state = match &helper.ended {
+            Some(how) => how.clone(),
+            None => {
+                let seconds = now.saturating_duration_since(helper.started).as_secs();
+                format!("running · {}", crate::spinner::spell(seconds))
+            }
+        };
+        [
+            helper.name.clone(),
+            helper.kind.clone(),
+            state,
+            letronna_core::budget::short(helper.status.input.load(Ordering::Relaxed)),
+            letronna_core::tools::one_line(&helper.description),
+        ]
+    }));
+    // Every column before the task as wide as its widest cell, so they line up.
+    let columns: Vec<usize> = (0..4)
+        .map(|column| {
+            let widest = rows.iter().map(|row| row[column].chars().count()).max();
+            widest.unwrap_or(0)
+        })
+        .collect();
+    rows.iter()
+        .map(|row| {
+            let mut line: String = (row.iter().zip(&columns))
+                .map(|(cell, &wide)| format!("{cell:<wide$}  "))
+                .collect();
+            line.push_str(&row[4]);
+            render::clip(line.trim_end(), width)
+        })
+        .collect()
+}
+
+/// The helper called `name`, or None once the user has been told there is none.
+fn named<'a>(helpers: &'a [Seen], name: &str) -> Option<&'a Seen> {
+    let found = helpers.iter().find(|helper| helper.name == name);
+    if found.is_none() {
+        let names: Vec<&str> = helpers.iter().map(|helper| helper.name.as_str()).collect();
+        render::line(&render::dim(&format!(
+            "No helper called \"{name}\". This session's: {}.",
+            names.join(", ")
+        )));
+    }
+    found
+}
+
+/// Stop helper `name` for good: the user's stop is final, so nothing picks
+/// the helper back up afterwards.
+fn stop_helper(helpers: &[Seen], name: &str) {
+    if name.is_empty() {
+        render::said(
+            &render::blue("●"),
+            &render::bold("Which one? /agents stop <name>"),
+        );
+        return;
+    }
+    let Some(helper) = named(helpers, name) else {
+        return;
+    };
+    // The stop looks again, since the helper may have ended since the list was read.
+    if helper.ended.is_none() && letronna_core::agents::stop(helper.id) {
+        // It ends at its next check, not this instant, so the list may still
+        // show it running for a moment.
+        render::said(
+            &render::blue("●"),
+            &render::bold(&format!("Stopping {name}")),
+        );
+    } else {
+        render::line(&render::dim(&format!(
+            "{name} has already ended; there is nothing to stop."
+        )));
+    }
+}
+
+/// Leave the user's words for helper `name` to read at its next step, as the
+/// window's Steer does.
+fn send_to_helper(helpers: &[Seen], rest: &str) {
+    let (name, message) = rest.split_once(' ').unwrap_or((rest, ""));
+    let message = message.trim();
+    if name.is_empty() || message.is_empty() {
+        render::said(
+            &render::blue("●"),
+            &render::bold("Tell which one what? /agents send <name> <text>"),
+        );
+        return;
+    }
+    let Some(helper) = named(helpers, name) else {
+        return;
+    };
+    // The steer looks again, since the helper may have ended since the list was read.
+    if letronna_core::agents::steer(helper.id, message) {
+        render::said(
+            &render::blue("●"),
+            &render::bold(&format!("Sent to {name}; it reads it at its next step")),
+        );
+    } else {
+        render::line(&render::dim(&format!(
+            "{name} has ended, so it cannot read this. Ask Letronna to pick it back up."
+        )));
+    }
 }
 
 /// The skills: list them, use one, switch one on or off, or add some.
@@ -1318,8 +1480,13 @@ pub fn gateways(runner: &mut Runner) {
 
 #[cfg(test)]
 mod tests {
-    use super::{last_prompt, with_files};
+    use super::{agent_rows, last_prompt, with_files};
+    use letronna_core::agents::Seen;
     use letronna_core::chat::Message;
+    use letronna_core::driver::Status;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
 
     fn said(role: &str, content: &str) -> Message {
         Message {
@@ -1377,5 +1544,61 @@ mod tests {
             Some((0, "run the tests in the background".to_owned()))
         );
         assert_eq!(last_prompt(&[notice]), None);
+    }
+
+    fn helper(name: &str, ended: Option<&str>, description: &str, started: Instant) -> Seen {
+        let status = Status::default();
+        status.input.store(38_000, Ordering::Relaxed);
+        Seen {
+            id: 1 << 40,
+            session: 1,
+            name: name.into(),
+            kind: "explore".into(),
+            description: description.into(),
+            n: 1,
+            ended: ended.map(String::from),
+            started,
+            status: Arc::new(status),
+        }
+    }
+
+    #[test]
+    fn agent_rows_fit_the_width() {
+        let started = Instant::now();
+        let now = started + Duration::from_secs(72);
+        let helpers = [
+            helper("explore-2", None, "Find where windows start", started),
+            helper(
+                "a-helper-with-a-rather-long-name",
+                Some("stopped by the user"),
+                "Run every test in the workspace and report what fails",
+                started,
+            ),
+        ];
+        for width in [0, 1, 12, 40, 60, 100] {
+            for row in agent_rows(&helpers, now, width) {
+                assert!(
+                    row.chars().count() <= width,
+                    "{row:?} is wider than {width}"
+                );
+            }
+        }
+        // A narrow window loses the end of a row, never its start.
+        let narrow = agent_rows(&helpers, now, 40);
+        assert!(narrow[1].starts_with("explore-2  ") && narrow[1].ends_with('…'));
+
+        // With room for it all, nothing is cut and the columns line up.
+        let wide = agent_rows(&helpers, now, 200);
+        let at = |row: &str, text: &str| row[..row.find(text).unwrap()].chars().count();
+        assert_eq!(
+            wide[1],
+            format!(
+                "explore-2{}explore  running · 1m 12s     38k     Find where windows start",
+                " ".repeat(25)
+            )
+        );
+        assert_eq!(at(&wide[0], "task"), at(&wide[1], "Find"));
+        assert_eq!(at(&wide[0], "task"), at(&wide[2], "Run every"));
+        assert_eq!(at(&wide[0], "state"), at(&wide[2], "stopped"));
     }
 }

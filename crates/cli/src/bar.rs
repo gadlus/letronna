@@ -92,6 +92,10 @@ pub const COMMANDS: &[Command] = &[
         blurb: "commands still running in the background",
     },
     Command {
+        name: "/agents",
+        blurb: "helpers working for this session; stop one or tell it something",
+    },
+    Command {
         name: "/skills",
         blurb: "skills: use one, switch them on or off, add from GitHub",
     },
@@ -140,6 +144,15 @@ const MAX_ROWS: usize = 8;
 /// the oldest are counted rather than drawn, so they cannot squeeze the
 /// conversation off the screen.
 const QUEUED_LIMIT: usize = 4;
+
+/// How often the helpers are looked in on: four times a second is live to
+/// the eye, and what their lines say changes by the second at most.
+const LOOK: Duration = Duration::from_millis(250);
+
+/// Helpers given a line of their own while a turn runs. The rest share one
+/// line, so a fan-out of helpers cannot squeeze the conversation out of a
+/// short window.
+const RELAY_LIMIT: usize = 4;
 
 /// How long a pump waits for a keystroke before handing the loop back. Short
 /// enough that typing feels immediate, long enough not to spin.
@@ -305,6 +318,12 @@ pub struct Bar {
     /// The open session's checklist, shown over the box while any of it is
     /// left to do.
     plan: Vec<Todo>,
+    /// The session whose helpers are shown, or 0 before one is open.
+    helpers_of: u64,
+    /// A line for each of its helpers at work, as last looked at.
+    relay: Vec<String>,
+    /// When the helpers were last looked at.
+    looked: std::time::Instant,
     /// The doorbell for notices, once the conversation listens for them.
     bell: Option<async_channel::Receiver<()>>,
     /// Helpers' requests for a yes, once the terminal answers them.
@@ -343,6 +362,9 @@ impl Bar {
             waiting: None,
             ticked: std::time::Instant::now(),
             plan: Vec::new(),
+            helpers_of: 0,
+            relay: Vec::new(),
+            looked: std::time::Instant::now(),
             bell: None,
             asks: None,
             held: None,
@@ -700,6 +722,38 @@ impl Bar {
             self.ticked = std::time::Instant::now();
             self.settle();
         }
+        if self.looked.elapsed() >= LOOK {
+            self.looked = std::time::Instant::now();
+            if self.look_at_helpers() {
+                self.settle();
+            }
+        }
+    }
+
+    /// Follow the helpers of `session`, the one now open: a line for each at
+    /// work while a turn runs, and how many there are in the footer.
+    pub fn show_helpers_of(&mut self, session: u64) {
+        if self.helpers_of == session {
+            return;
+        }
+        self.helpers_of = session;
+        // Looked at now, so the last session's helpers are not shown as this one's.
+        self.look_at_helpers();
+        self.settle();
+    }
+
+    /// Read how the open session's helpers are getting on, and say whether
+    /// that changes the screen: their lines show while a turn runs, and
+    /// their count always.
+    fn look_at_helpers(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let relay: Vec<String> = (letronna_core::agents::seen().iter())
+            .filter(|helper| helper.session == self.helpers_of && helper.ended.is_none())
+            .map(|helper| relay_line(helper, now))
+            .collect();
+        let changed = relay.len() != self.relay.len() || (self.working && relay != self.relay);
+        self.relay = relay;
+        changed
     }
 
     /// Put words in the box as though they had been typed, for a command
@@ -1192,6 +1246,10 @@ impl Bar {
         let room = self.room();
         let edge = "─".repeat(room + 2);
         let mut lines = Vec::new();
+        // Above the waiting line, which stays next to the box it waits to fill.
+        if self.working {
+            self.relay_lines(&mut lines);
+        }
         // The waiting line sits above the box, where the answer it is waiting
         // for will appear.
         if let Some(waiting) = &self.waiting {
@@ -1274,6 +1332,11 @@ impl Bar {
         }
 
         let back = crate::screen::scrolled();
+        let helpers = at_work(self.relay.len());
+        // Cut rather than wrapped, now the count makes it longer: a wrapped
+        // last row would run off the foot of the window and scroll everything
+        // above it.
+        let width = render::width().saturating_sub(render::PAD.len() + 1);
         let note = if let Some(said) = &self.note {
             said.clone()
         } else if self.slider.is_some() {
@@ -1287,9 +1350,9 @@ impl Bar {
         } else if self.working {
             // Said while it applies rather than only after a long silence:
             // a reply going the wrong way is worth stopping early.
-            format!("{}  ·  esc to stop", self.footer)
+            fitted(&self.footer, &format!("{helpers}  ·  esc to stop"), width)
         } else {
-            self.footer.clone()
+            fitted(&self.footer, &helpers, width)
         };
         lines.push(format!("{}{}", render::PAD, render::dim(&note)));
 
@@ -1305,6 +1368,24 @@ impl Bar {
         let under = usize::from(self.waiting.is_some());
         lines.splice(under..under, plan);
         lines
+    }
+
+    /// The helpers' lines, each cut to the window, and no more of them than
+    /// `RELAY_LIMIT` before the rest are counted instead.
+    fn relay_lines(&self, lines: &mut Vec<String>) {
+        let room = render::width().saturating_sub(render::INSIDE.len() + 3);
+        for text in self.relay.iter().take(RELAY_LIMIT) {
+            lines.push(format!(
+                "{}{} {}",
+                render::INSIDE,
+                render::dim("◆"),
+                render::dim(&render::clip(text, room))
+            ));
+        }
+        if self.relay.len() > RELAY_LIMIT {
+            let more = format!("… {} more", self.relay.len() - RELAY_LIMIT);
+            lines.push(format!("{}  {}", render::INSIDE, render::dim(&more)));
+        }
     }
 
     /// One row of the box, padded so its right edge lines up.
@@ -1456,6 +1537,37 @@ fn one_row(text: &str, room: usize) -> String {
     row
 }
 
+/// What a helper's line says at `now`: which one it is, what it was given to
+/// do, and how far it has got.
+fn relay_line(helper: &letronna_core::agents::Seen, now: std::time::Instant) -> String {
+    let mut parts = vec![helper.name.clone()];
+    let task = letronna_core::tools::one_line(&helper.description);
+    if !task.is_empty() {
+        parts.push(task);
+    }
+    let tokens = (helper.status.input).load(std::sync::atomic::Ordering::Relaxed);
+    parts.push(format!("{} tokens", letronna_core::budget::short(tokens)));
+    let seconds = now.saturating_duration_since(helper.started).as_secs();
+    parts.push(crate::spinner::spell(seconds));
+    parts.join(" · ")
+}
+
+/// The footer's note of how many helpers are at work, if any are.
+fn at_work(helpers: usize) -> String {
+    match helpers {
+        0 => String::new(),
+        1 => "  ·  1 helper working".to_owned(),
+        n => format!("  ·  {n} helpers working"),
+    }
+}
+
+/// The footer with `then` after it, in `width` columns. The footer gives way
+/// first, so the model's name loses its end before what the user can do now.
+fn fitted(footer: &str, then: &str, width: usize) -> String {
+    let room = width.saturating_sub(then.chars().count());
+    render::clip(&format!("{}{then}", render::clip(footer, room)), width)
+}
+
 /// Where each stop sits on a track `width` columns wide: spread evenly, the
 /// first at the left end and the last at the right.
 fn stops_at(count: usize, width: usize) -> Vec<usize> {
@@ -1510,8 +1622,9 @@ fn track(stops: &[String], at: usize, room: usize) -> (String, String, usize) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Bar, Choice, MENU_LIMIT, PLAN_ROWS, QUEUED_LIMIT, STILL, Slider, Waited, checklist,
-        closest, matches, menu_top, one_row, stops_at, track,
+        Bar, Choice, MENU_LIMIT, PLAN_ROWS, QUEUED_LIMIT, RELAY_LIMIT, STILL, Slider, Waited,
+        at_work, checklist, closest, fitted, matches, menu_top, one_row, relay_line, stops_at,
+        track,
     };
     use crate::render::{MARGIN, plain, visible};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1845,6 +1958,70 @@ mod tests {
         bar.queued.push_back("and the docs".into());
         assert_eq!(bar.waited(), Some(Waited::Line("and the docs".into())));
         assert_eq!(bar.waited(), Some(Waited::Rang));
+    }
+
+    #[test]
+    fn a_helpers_line_says_which_it_is_and_how_far_it_has_got() {
+        let started = std::time::Instant::now();
+        let mut helper = letronna_core::agents::Seen {
+            id: 1 << 40,
+            session: 1,
+            name: "explore-2".into(),
+            kind: "explore".into(),
+            description: "Find where\nwindows start".into(),
+            n: 1,
+            ended: None,
+            started,
+            status: Default::default(),
+        };
+        let tokens = |helper: &letronna_core::agents::Seen, n| {
+            (helper.status.input).store(n, std::sync::atomic::Ordering::Relaxed);
+        };
+        tokens(&helper, 38_400);
+        let later = |seconds| started + std::time::Duration::from_secs(seconds);
+        assert_eq!(
+            relay_line(&helper, later(72)),
+            "explore-2 · Find where windows start · 38k tokens · 1m 12s"
+        );
+        // Given no words for the user, it says only what it has got to.
+        helper.description.clear();
+        tokens(&helper, 900);
+        assert_eq!(relay_line(&helper, later(5)), "explore-2 · 900 tokens · 5s");
+    }
+
+    #[test]
+    fn helpers_at_work_are_counted_always_and_drawn_while_a_turn_runs() {
+        let mut bar = Bar::new("model".into());
+        bar.relay = (1..=6)
+            .map(|n| format!("helper-{n} · 1k tokens · 5s"))
+            .collect();
+        // Only what is not cut to the window is looked at, so the test
+        // passes in a terminal of any width.
+        let idle = bar.lines(40);
+        assert!(!idle.iter().any(|line| line.contains('◆')));
+
+        bar.working = true;
+        let busy = bar.lines(40);
+        let drawn = busy.iter().filter(|line| line.contains('◆')).count();
+        assert_eq!(drawn, RELAY_LIMIT);
+        assert!(busy.iter().any(|line| line.ends_with("… 2 more")));
+        assert_eq!(at_work(0), "");
+        assert_eq!(at_work(1), "  ·  1 helper working");
+        assert_eq!(at_work(6), "  ·  6 helpers working");
+    }
+
+    #[test]
+    fn a_narrow_footer_loses_the_model_before_what_the_user_can_do() {
+        let footer = "claude-sonnet-4-5  ·  letronna  ·  thinking high  ·  web";
+        let then = format!("{}  ·  esc to stop", at_work(2));
+        assert_eq!(fitted(footer, &then, 200), format!("{footer}{then}"));
+        let cut = fitted(footer, &then, 60);
+        assert_eq!(cut.chars().count(), 60);
+        assert!(cut.starts_with("claude-sonnet") && cut.ends_with(&format!("…{then}")));
+        // Narrower than the hint itself, the hint loses its end too.
+        for width in [0, 1, 10, 30] {
+            assert!(fitted(footer, &then, width).chars().count() <= width);
+        }
     }
 
     #[test]
