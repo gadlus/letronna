@@ -89,6 +89,9 @@ pub(crate) struct Chat {
     pub(crate) settings_open: bool,
     /// Held by the settings panel while it is open, so escape reaches it.
     pub(crate) settings_focus: FocusHandle,
+    /// Held by the pages without a composer, so the window's shortcuts still
+    /// reach the chat there.
+    pub(crate) page_focus: FocusHandle,
     pub(crate) settings_backdrop: Option<std::sync::Arc<RenderImage>>,
     pub(crate) settings_closing: bool,
     pub(crate) rename: Entity<InputState>,
@@ -414,6 +417,7 @@ impl Chat {
             settings_page,
             settings_open: false,
             settings_focus: cx.focus_handle(),
+            page_focus: cx.focus_handle(),
             settings_backdrop: None,
             settings_closing: false,
             rename,
@@ -1827,6 +1831,9 @@ impl Render for Chat {
             .flex_1()
             .min_w_0()
             .h_full()
+            .when(self.page != Page::Chat, |this| {
+                this.track_focus(&self.page_focus)
+            })
             .child(body)
             .when(self.page == Page::Chat, |this| {
                 this.child(

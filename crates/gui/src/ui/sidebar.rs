@@ -34,13 +34,14 @@ impl Chat {
             )
             .child(div().flex_1().child(label))
             .when_some(page, |this, page| {
-                this.on_click(cx.listener(move |this, _, _, cx| {
+                this.on_click(cx.listener(move |this, _, window, cx| {
                     this.page = page;
                     // The terminal or the session's project may have brought
                     // skills since the list was read.
                     if page == Page::Skills {
                         this.reload_skills();
                     }
+                    this.focus_composer(window, cx);
                     cx.notify();
                 }))
             })

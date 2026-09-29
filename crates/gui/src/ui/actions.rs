@@ -158,6 +158,8 @@ impl Chat {
     }
 
     fn ask_again(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        // What had the keys, the edit box or the turn's buttons, is gone.
+        self.focus_composer(window, cx);
         if self.dispatch(text, None, cx).is_err() {
             self.open_settings(window, cx);
         }
