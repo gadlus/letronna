@@ -119,6 +119,11 @@ impl fmt::Display for Switch {
             FailureKind::Overloaded => "is overloaded",
             FailureKind::Quota => "is out of credit or quota",
             FailureKind::NotFound => "was not found",
+            FailureKind::Auth => "turned its key away",
+            FailureKind::Settings => "is not set up",
+            FailureKind::Network => "could not be reached",
+            FailureKind::RateLimit => "is rate limited",
+            FailureKind::ContextTooLong => "cannot read this much at once",
             _ => "had a server error",
         };
         let minutes = COOLDOWN.as_secs() / 60;
@@ -142,6 +147,21 @@ pub fn mends(failure: &Failure) -> bool {
         )
 }
 
+/// Whether a fallback's failure is its own rather than the request's: its
+/// gateway has no key, is not set up or cannot be reached, or the model reads
+/// less than the chosen one. The next fallback may well answer.
+fn own(failure: &Failure) -> bool {
+    !failure.stands
+        && matches!(
+            failure.kind,
+            FailureKind::Auth
+                | FailureKind::Settings
+                | FailureKind::Network
+                | FailureKind::RateLimit
+                | FailureKind::ContextTooLong
+        )
+}
+
 /// The session's connection, then each of `fallbacks` on its own gateway,
 /// leaving out any that repeat one before it.
 pub fn chain(
@@ -161,9 +181,9 @@ pub fn chain(
 }
 
 /// Send with the first of `chain` not cooling down, going on to the next
-/// after a failure `mends` covers, which cools that one down. `switched`
-/// hears of each fallback before it is asked; an error from it ends the call,
-/// as nobody is listening any more.
+/// after a failure `mends` covers, or one of a fallback's `own`, which cools
+/// that one down. `switched` hears of each fallback before it is asked; an
+/// error from it ends the call, as nobody is listening any more.
 pub fn run(
     chain: &[Connection],
     mut send: impl FnMut(&Connection) -> Result<(), Failure>,
@@ -192,6 +212,9 @@ pub fn run(
         let failure = match send(connection) {
             Ok(()) => return Ok(()),
             Err(failure) if mends(&failure) => failure,
+            // Else a fallback with no key, or one not running, ends the task
+            // and, with the chosen model cooling, every request after it.
+            Err(failure) if !same(connection, primary) && own(&failure) => failure,
             Err(failure) => return Err(failure),
         };
         cool(connection, Instant::now() + COOLDOWN);
@@ -330,6 +353,32 @@ mod tests {
             assert_eq!(asked, ["gone", "here"]);
             assert_eq!(switches[0].after, Some(("gone".into(), kind)));
         }
+    }
+
+    #[test]
+    fn a_fallback_that_fails_on_its_own_account_passes_to_the_next() {
+        for (test, kind) in [
+            ("no-key", FailureKind::Auth),
+            ("not-running", FailureKind::Network),
+            ("too-small", FailureKind::ContextTooLong),
+        ] {
+            let chain = [at(test, "big"), at(test, "broken"), at(test, "small")];
+            let (result, asked, switches) = asked(&chain, |model| match model {
+                "big" => fails(FailureKind::Overloaded),
+                "broken" => fails(kind),
+                _ => Ok(()),
+            });
+            assert!(result.is_ok(), "{kind:?}");
+            assert_eq!(asked, ["big", "broken", "small"]);
+            assert_eq!(switches[1].after, Some(("broken".into(), kind)));
+            // It is passed over from then on, as a model that failed is.
+            assert!(cooling(&chain[1]));
+        }
+        // The chosen model's own key or settings are the request's, and go no further.
+        let chain = [at("primary-key", "big"), at("primary-key", "small")];
+        let (result, asked, _) = asked(&chain, |_| fails(FailureKind::Auth));
+        assert_eq!(result.unwrap_err().kind, FailureKind::Auth);
+        assert_eq!(asked, ["big"]);
     }
 
     #[test]
