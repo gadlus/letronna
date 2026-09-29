@@ -269,7 +269,8 @@ impl Chat {
                     .overflow_y_scroll()
                     .px_2()
                     .child(self.section("Sessions", cx))
-                    .child(sessions),
+                    .child(sessions)
+                    .children(self.message_hits(cx)),
             )
             .children(self.grain(&self.grains.sidebar))
     }

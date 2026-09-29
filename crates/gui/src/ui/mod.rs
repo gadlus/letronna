@@ -10,6 +10,7 @@ pub(crate) mod messages;
 pub(crate) mod messaging;
 pub(crate) mod panel;
 pub(crate) mod schedules;
+pub(crate) mod search;
 pub(crate) mod sessions;
 pub(crate) mod settings;
 pub(crate) mod sidebar;

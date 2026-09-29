@@ -93,7 +93,7 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "/resume",
-        blurb: "pick up a session from before",
+        blurb: "pick up a session; a word finds it by title or what was said",
     },
     Command {
         name: "/undo",
