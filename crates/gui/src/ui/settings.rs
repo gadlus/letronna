@@ -359,16 +359,20 @@ impl Chat {
                         .items_center()
                         .rounded(cx.theme().radius)
                         .cursor_pointer()
-                        .text_sm()
-                        .font_weight(FontWeight::MEDIUM)
                         .when(active, |this| this.bg(cx.theme().sidebar_accent))
-                        .hover(|s| s.bg(cx.theme().sidebar_accent.opacity(0.6)))
+                        .active(|s| s.bg(cx.theme().sidebar_accent.opacity(0.6)))
                         .child(
                             Icon::new(*icon)
                                 .size_4()
                                 .text_color(cx.theme().muted_foreground),
                         )
-                        .child(*name)
+                        // The site's DM Mono capitals, a size up from a
+                        // micro label so they read beside the icons.
+                        .child(
+                            crate::ui::micro(name, cx)
+                                .text_xs()
+                                .text_color(cx.theme().sidebar_foreground),
+                        )
                         .on_click(move |_, _, cx| {
                             page.update(cx, |p, cx| {
                                 *p = name;
@@ -418,7 +422,6 @@ impl Chat {
             .border_1()
             .border_color(cx.theme().border)
             .rounded(cx.theme().radius_lg)
-            .shadow_lg()
             .child(
                 h_flex()
                     .h(height)
@@ -451,7 +454,7 @@ impl Chat {
                             .child(
                                 div().absolute().top_3().right_3().child(
                                     Button::new("close-settings")
-                                        .ghost()
+                                        .plain(cx)
                                         .xsmall()
                                         .icon(Icon::new(IconName::Close))
                                         .on_click(cx.listener(|this, _, window, cx| {
@@ -465,7 +468,7 @@ impl Chat {
 }
 
 fn plugins_page(chat: &Entity<Chat>, cx: &App) -> Div {
-    let mut list = v_flex().gap_2();
+    let mut list = v_flex();
     for info in plugins::list(cx) {
         let chat = chat.clone();
         let id = info.id;
@@ -524,9 +527,9 @@ fn plugins_page(chat: &Entity<Chat>, cx: &App) -> Div {
         list = list.child(
             v_flex()
                 .gap_2()
-                .p_3()
-                .rounded(cx.theme().radius)
-                .bg(cx.theme().secondary.opacity(0.3))
+                .py_3()
+                .border_b_1()
+                .border_color(cx.theme().border)
                 .child(row)
                 .children(settings),
         );
@@ -593,7 +596,7 @@ fn elsewhere_row(chat: &Entity<Chat>, address: &Entity<InputState>, cx: &App) ->
                 .child(div().flex_1().child(Input::new(address)))
                 .child(
                     Button::new("browser-elsewhere-clear")
-                        .ghost()
+                        .plain(cx)
                         .small()
                         .label("This computer")
                         .on_click(move |_, window, cx| {
@@ -668,7 +671,7 @@ fn privacy_page(
         )
         .child(
             Button::new("presence-level")
-                .ghost()
+                .plain(cx)
                 .small()
                 .child(
                     h_flex()
@@ -1016,24 +1019,24 @@ fn model_page(model: &Entity<InputState>, chat: &Entity<Chat>, cx: &App) -> Div 
 /// How hard the model thinks, whether that thinking is shown, and whether it
 /// may look things up.
 ///
-/// A model that cannot be told how hard to think ignores the setting, so
-/// there is nothing here that has to be matched against a capability list --
-/// and no list to match against, since the gateway does not publish one.
+/// The effort levels are the ones the model in use offers, from its gateway's
+/// model list, or low, medium and high when the list does not say. The one
+/// marked is what the next request sends, which for a level picked on another
+/// model is the nearest this one offers.
 fn thinking_page(chat: &Entity<Chat>, settings: &Settings, cx: &App) -> Div {
-    const LEVELS: [(&str, &str); 4] = [
-        ("", "Whatever the model likes"),
-        ("low", "Low — quick answers"),
-        ("medium", "Medium"),
-        ("high", "High — slower, and it shows"),
-    ];
+    let endpoint = base_url(&settings.gateway, &settings.custom_endpoint);
+    let offered = letronna_core::models::efforts(&endpoint, &settings.model);
+    let sent = letronna_core::models::clamp(&offered, &settings.effort).map(|level| &*level.id);
+    let auto = ("", "Whatever the model likes");
+    let choices = offered.iter().map(|level| (&*level.id, &*level.label));
 
     let mut levels = v_flex().gap_2();
-    for (value, text) in LEVELS {
-        let active = settings.effort == value;
-        let chat = chat.clone();
+    for (at, (value, text)) in std::iter::once(auto).chain(choices).enumerate() {
+        let active = sent.unwrap_or_default() == value;
+        let (chat, value) = (chat.clone(), value.to_owned());
         levels = levels.child(
             h_flex()
-                .id(if value.is_empty() { "auto" } else { value })
+                .id(("effort", at))
                 .cursor_pointer()
                 .items_center()
                 .gap_2p5()
@@ -1045,10 +1048,10 @@ fn thinking_page(chat: &Entity<Chat>, settings: &Settings, cx: &App) -> Div {
                 } else {
                     cx.theme().border
                 })
-                .child(div().text_sm().child(text))
+                .child(div().text_sm().child(text.to_owned()))
                 .on_click(move |_, _, cx| {
                     chat.update(cx, |this, cx| {
-                        this.store.settings.effort = value.to_string();
+                        this.store.settings.effort = value.clone();
                         this.save();
                         cx.notify();
                     })
@@ -1245,7 +1248,7 @@ fn search_page(
             Button::new(("search-action", i))
                 .small()
                 .when(!row.set_up, |b| b.primary())
-                .when(row.set_up, |b| b.ghost())
+                .when(row.set_up, |b| b.plain(cx))
                 .label(if editing { "Close" } else { action })
                 .on_click(move |_, window, cx| {
                     chat.update(cx, |this, cx| this.select_search(name, window, cx))
@@ -1305,7 +1308,7 @@ fn search_page(
                         .child(div().flex_1().child(Input::new(endpoint)))
                         .child(
                             Button::new("search-reset")
-                                .ghost()
+                                .plain(cx)
                                 .small()
                                 .label("Reset")
                                 .on_click(move |_, window, cx| {
@@ -1337,7 +1340,7 @@ fn search_page(
                             .when(row.set_up, |d| {
                                 d.child(
                                     Button::new("search-remove")
-                                        .ghost()
+                                        .plain(cx)
                                         .small()
                                         .label("Remove")
                                         .on_click(move |_, _, cx| {
@@ -1398,7 +1401,7 @@ fn gateway_page(
             Button::new(("gw-action", i))
                 .small()
                 .when(!row.set_up, |b| b.primary())
-                .when(row.set_up, |b| b.ghost())
+                .when(row.set_up, |b| b.plain(cx))
                 .label(if editing { "Close" } else { action })
                 .on_click(move |_, window, cx| {
                     if action == "Sign in" {
@@ -1488,7 +1491,7 @@ fn gateway_page(
                             .when(row.set_up, |d| {
                                 d.child(
                                     Button::new("gw-remove")
-                                        .ghost()
+                                        .plain(cx)
                                         .small()
                                         .label("Remove")
                                         .on_click(move |_, window, cx| {

@@ -33,6 +33,13 @@ const CONTINUE: &str =
 const CALL_AGAIN: &str = "Your last reply was cut off at the output limit in the middle \
     of a tool call, so the call was not run. Make it again with less in it, splitting the \
     work over several calls if it needs more room.";
+/// The answer a call gets when the turn is stopped while it runs; the front
+/// end that stopped it records it before `Turn::stop`. The call may have
+/// done part of its work, so the model is told to look first.
+pub const STOPPED_WHILE_RUNNING: &str = "Stopped while it ran; check before retrying.";
+
+/// The answer a call gets when the turn is stopped before it starts.
+pub const STOPPED_BEFORE_START: &str = "Not run: stopped before it started.";
 
 /// What the caller should do next.
 #[derive(Debug, PartialEq)]
@@ -236,6 +243,27 @@ impl Turn {
             tools::KEEP_PLANNING
         };
         self.finish_call(Ok(answer.to_owned()));
+    }
+
+    /// What to keep of a stopped turn: the reply streamed so far, marked
+    /// interrupted, then the batch's results with every call still queued
+    /// answered as never started, so the next request answers every call it
+    /// carries.
+    pub fn stop(&mut self, model: &str) -> Vec<Message> {
+        let mut kept = Vec::new();
+        if !self.live.content.trim().is_empty() {
+            let mut reply = self.take_reply(model);
+            // Calls that came with a reply cut short never ran; kept, each
+            // would need an answer of its own.
+            reply.tool_calls.clear();
+            reply.interrupted = true;
+            kept.push(reply);
+        }
+        while !self.queue.is_empty() {
+            self.finish_call(Err(STOPPED_BEFORE_START.into()));
+        }
+        kept.append(&mut self.results);
+        kept
     }
 }
 
@@ -502,5 +530,81 @@ mod tests {
         assert_eq!(notice.content, CALL_AGAIN);
         // Taken once: the next reply starts clean.
         assert!(matches!(turn.continuation(), Ok(None)));
+    }
+
+    #[test]
+    fn a_stop_keeps_the_results_of_the_calls_that_finished() {
+        let mut turn = turn();
+        turn.begin(vec![call("read_file"), call("list_dir")]);
+        turn.finish_call(Ok("contents".into()));
+        let kept = turn.stop("test");
+        assert_eq!(kept[0].tool_call_id, "read_file-1");
+        assert_eq!(kept[0].content, "contents");
+        assert!(!kept[0].is_error);
+    }
+
+    #[test]
+    fn the_call_running_at_a_stop_is_told_to_check_before_retrying() {
+        let mut turn = turn();
+        turn.begin(vec![call("run_command"), call("list_dir")]);
+        // The front end that stopped it answers it as it gives up on it.
+        turn.finish_call(Err(STOPPED_WHILE_RUNNING.into()));
+        let kept = turn.stop("test");
+        assert_eq!(kept[0].tool_call_id, "run_command-1");
+        assert_eq!(
+            kept[0].content,
+            "Stopped while it ran; check before retrying."
+        );
+        assert!(kept[0].is_error);
+        assert_eq!(kept[1].content, STOPPED_BEFORE_START);
+    }
+
+    #[test]
+    fn calls_the_stop_came_before_are_answered_as_not_run() {
+        let mut turn = turn();
+        turn.begin(vec![call("write_file"), call("list_dir")]);
+        // Stopped at the first call's card: neither ran.
+        let kept = turn.stop("test");
+        let answers: Vec<&str> = kept.iter().map(|m| m.content.as_str()).collect();
+        let not_run = "Not run: stopped before it started.";
+        assert_eq!(answers, [not_run, not_run]);
+        assert!(kept.iter().all(|m| m.is_error));
+    }
+
+    #[test]
+    fn a_stop_mid_reply_keeps_what_streamed_marked_interrupted() {
+        let mut turn = turn();
+        turn.absorb(&Event::Delta("Half an ans".into()));
+        turn.absorb(&Event::ToolCalls(vec![call("read_file")]));
+        let kept = turn.stop("some-model");
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].role, "assistant");
+        assert_eq!(kept[0].content, "Half an ans");
+        assert_eq!(kept[0].model, "some-model");
+        assert!(kept[0].interrupted);
+        // The call that came with it never ran, so there is none to answer.
+        assert!(kept[0].tool_calls.is_empty());
+        // Nothing streamed yet: nothing to keep.
+        assert!(
+            Turn::new(turn.connection.clone())
+                .stop("some-model")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn after_a_stop_every_call_the_model_made_has_an_answer() {
+        let mut turn = turn();
+        let calls = vec![call("read_file"), call("run_command"), call("list_dir")];
+        turn.begin(calls.clone());
+        turn.finish_call(Ok("contents".into()));
+        turn.finish_call(Err(STOPPED_WHILE_RUNNING.into()));
+        let kept = turn.stop("test");
+        let answered: Vec<&str> = kept.iter().map(|m| m.tool_call_id.as_str()).collect();
+        let made: Vec<&str> = calls.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(answered, made);
+        assert!(kept.iter().all(|m| m.role == "tool"));
+        // Nothing is left to run or send.
+        assert_eq!(turn.next(|_| false), Next::Done);
     }
 }

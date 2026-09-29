@@ -112,7 +112,7 @@ impl Chat {
                     .when(selected, |this| this.bg(cx.theme().sidebar_accent))
                     .when(*ready, |this| {
                         this.cursor_pointer()
-                            .hover(|s| s.bg(cx.theme().sidebar_accent.opacity(0.6)))
+                            .active(|s| s.bg(cx.theme().sidebar_accent.opacity(0.6)))
                     })
                     .child(badge(channel))
                     .child(
@@ -214,7 +214,7 @@ impl Chat {
                         )
                         .child(
                             Button::new("ignore-chat")
-                                .ghost()
+                                .plain(cx)
                                 .small()
                                 .label("Ignore")
                                 .on_click(cx.listener(|this, _, _, cx| {
@@ -233,7 +233,7 @@ impl Chat {
                 ))
                 .child(
                     Button::new("forget-chat")
-                        .ghost()
+                        .plain(cx)
                         .xsmall()
                         .label("Forget")
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -302,7 +302,7 @@ impl Chat {
                                     .child(
                                         h_flex().child(
                                             Button::new("botfather")
-                                                .outline()
+                                                .framed(cx)
                                                 .xsmall()
                                                 .label("Open @BotFather")
                                                 .on_click(|_, _, cx| {
@@ -441,11 +441,23 @@ impl Chat {
             "Discord" => self.discord_pane(cx).into_any_element(),
             _ => self.telegram_pane(cx).into_any_element(),
         };
-        h_flex()
+        v_flex()
             .flex_1()
             .min_h_0()
-            .child(self.channel_list(cx))
-            .child(pane)
+            .child(div().px_8().py_6().child(crate::ui::page_header(
+                Page::Messaging.title(),
+                Page::Messaging.blurb(),
+                cx,
+            )))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .child(self.channel_list(cx))
+                    .child(pane),
+            )
     }
 }
 
@@ -661,7 +673,7 @@ impl Chat {
                                     .child(
                                         h_flex().child(
                                             Button::new("discord-portal")
-                                                .outline()
+                                                .framed(cx)
                                                 .xsmall()
                                                 .label("Open the Developer Portal")
                                                 .on_click(|_, _, cx| {
@@ -806,7 +818,7 @@ impl Chat {
                             .when(live, |this| {
                                 this.child(
                                     Button::new("test-discord")
-                                        .outline()
+                                        .framed(cx)
                                         .small()
                                         .label("Send a test")
                                         .on_click(cx.listener(|this, _, _, cx| {

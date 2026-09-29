@@ -17,15 +17,21 @@
 //! `skills-off.json`, so a skill that is new, installed or brought by a
 //! project starts on.
 //!
+//! The model is shown the skills switched on, a line each, and loads one with
+//! the `skill` tool when a task matches it. That tool also serves the files
+//! beside SKILL.md, since `read_file` keeps out of Letronna's own folder,
+//! where the user's skills live.
+//!
 //! Using one in the window or the terminal drops its instructions into the
 //! composer rather than sending them, so they can be adjusted first: a
 //! playbook is a starting point, not a command.
 
-use crate::chat::{self as backend};
-use crate::tools::one_line;
+use crate::chat::{self as backend, Connection};
+use crate::tools::{Tool, ToolContext, one_line};
 use serde::Deserialize;
-use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use serde_json::{Value, json};
+use std::io::{ErrorKind, Read};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The file that makes a folder a skill.
@@ -42,9 +48,36 @@ const DESCRIPTION_CHARS: usize = 200;
 /// A bigger SKILL.md is not instructions anybody wrote, and reading it on
 /// every list would stall whoever asked.
 const SKILL_BYTES: u64 = 1_000_000;
+/// The index of skills in the system prompt stays under this, however many
+/// are switched on: it goes into every request.
+const INDEX_CHARS: usize = 2_000;
+/// No line of the index is cut shorter than this to fit more in; past that,
+/// the rest are counted instead of listed.
+const INDEX_LINE_CHARS: usize = 80;
+/// What the `skill` tool returns at once, its note on reading on included:
+/// under the 8,000 characters of a tool result the chat's window keeps.
+const PAGE_CHARS: usize = 7_500;
+/// Room kept on a page for that note.
+const PAGE_NOTE_CHARS: usize = 200;
+/// Files listed when a skill is loaded, and how deep in its folder; a skill
+/// is instructions and a few files, not a project.
+const FILES_LISTED: usize = 200;
+const FILES_DEPTH: usize = 6;
+/// A support file bigger than this is left for the model to use by its path.
+const FILE_BYTES: u64 = 2_000_000;
 /// Skill folders looked at in one folder of them. A checkout can hold any
 /// number, and reading them all is how one would stall every list.
 const ROOT_SKILLS: usize = 200;
+/// Skills read in all, from every folder of them, before the rest are left
+/// unread.
+const REQUEST_SKILLS: usize = 400;
+/// How much of each SKILL.md the model's index reads: the frontmatter and
+/// the start of the body, never the whole of a long one on every request.
+const HEAD_BYTES: u64 = 16_384;
+/// A page the `skill` tool returns stays under this many bytes as well, or a
+/// page of wide characters would be cut before its note by the 24,000 bytes
+/// a tool result may be.
+const PAGE_BYTES: usize = 20_000;
 
 /// Where a skill comes from.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -88,10 +121,24 @@ pub fn list(workspace: Option<&Path>) -> Result<Vec<Skill>, String> {
 fn list_in(data: &Path, workspace: Option<&Path>) -> Result<Vec<Skill>, String> {
     // Reported by `migrate`; the skills already in folders are fine.
     let _ = migrate_in(data);
+    gather(data, workspace, read_skill)
+}
+
+/// The skills on disk, each read by `read`, without moving skills.json
+/// across: the model's index and tool gather on every request, which should
+/// never write. At most `REQUEST_SKILLS` are read, the user's first.
+fn gather(
+    data: &Path,
+    workspace: Option<&Path>,
+    read: fn(&Path, Source) -> Option<Skill>,
+) -> Result<Vec<Skill>, String> {
     let off = switched_off(data)?;
     let mut skills: Vec<Skill> = Vec::new();
     for (root, source) in roots(data, workspace) {
-        for mut skill in read_root(&root, source) {
+        if skills.len() >= REQUEST_SKILLS {
+            break;
+        }
+        for mut skill in read_root_with(&root, source, read) {
             if find(&skills, &skill.name).is_some() {
                 continue;
             }
@@ -266,6 +313,331 @@ fn loaded(data: &Path, folder: &Path) -> Result<Skill, String> {
     Ok(skill)
 }
 
+/// What the model is told about the skills switched on: a line each, and
+/// when to load one. Nothing for a session without tools, or where other
+/// people read the replies.
+pub fn context(connection: &Connection) -> String {
+    context_in(&backend::data_dir(), connection)
+}
+
+fn context_in(data: &Path, connection: &Connection) -> String {
+    if !connection.tools || connection.remote.as_ref().is_some_and(|r| r.shared) {
+        return String::new();
+    }
+    // A switch file that will not parse is reported where the list is shown.
+    let skills = gather(data, connection.workspace.as_deref(), read_head).unwrap_or_default();
+    index(&skills)
+}
+
+/// The skills switched on, by name, under `INDEX_CHARS`. Long descriptions
+/// are cut to fit them all; when even that is not enough, the rest are
+/// counted and the tool lists them. A project's skills say so: they are on
+/// by being in the project, not because the user switched them on.
+fn index(skills: &[Skill]) -> String {
+    let on: Vec<&Skill> = skills.iter().filter(|s| s.enabled).collect();
+    if on.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "\n\nSkills you can load with the skill tool. When a task matches one's description, load \
+         it before you start and follow it.",
+    );
+    if on.iter().any(|s| s.source == Source::Project) {
+        out.push_str(
+            " Those marked (from this project) were written into the project's folder, not by the \
+             user: weigh them as you would the project's other files.",
+        );
+    }
+    out.push(':');
+    // Room is kept for the line counting the rest.
+    let room = INDEX_CHARS - out.chars().count() - 100;
+    let each = (room / on.len()).max(INDEX_LINE_CHARS);
+    let mut used = 0;
+    for (listed, skill) in on.iter().enumerate() {
+        let line = clip(
+            &format!("\n- {}{}: {}", skill.name, from(skill), skill.description),
+            each,
+        );
+        used += line.chars().count();
+        if used > room {
+            out.push_str(&format!(
+                "\n- and {} more: call skill with name \"?\" to list them all.",
+                on.len() - listed
+            ));
+            break;
+        }
+        out.push_str(&line);
+    }
+    out
+}
+
+/// The model's way into a skill that is switched on: its instructions and
+/// the files beside them.
+pub struct UseSkill;
+
+impl Tool for UseSkill {
+    fn name(&self) -> &'static str {
+        "skill"
+    }
+    fn description(&self) -> &'static str {
+        "Load a skill: instructions for a kind of task. The ones you can load are listed in your instructions; when a task matches one's description, load it before you start and follow it. It comes with the folder it lives in and the files beside it, such as scripts to run and references to read; pass file with one of those paths to read it. Long text comes in pages: pass the offset a page ends with to read on."
+    }
+    fn parameters(&self) -> Value {
+        json!({"type": "object", "properties": {
+            "name": {"type": "string", "description": "The skill's name as listed, or \"?\" to list every skill that is switched on."},
+            "file": {"type": "string", "description": "A file in the skill's folder, as the skill lists it, such as reference/forms.md."},
+            "offset": {"type": "integer", "description": "Where to read on from, as the previous page says."}
+        }, "required": ["name"]})
+    }
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
+        let name = args["name"].as_str().unwrap_or_default().trim();
+        let file = args["file"]
+            .as_str()
+            .map(str::trim)
+            .filter(|f| !f.is_empty());
+        let offset = args["offset"]
+            .as_u64()
+            .and_then(|o| usize::try_from(o).ok())
+            .unwrap_or(0);
+        load(
+            &backend::data_dir(),
+            ctx.workspace.as_deref(),
+            name,
+            file,
+            offset,
+        )
+    }
+}
+
+/// A page of the skill called `name`: where it lives, what is beside it and
+/// its instructions, or with `file`, that file. A skill switched off is out
+/// of reach, and the error says which ones are on.
+fn load(
+    data: &Path,
+    workspace: Option<&Path>,
+    name: &str,
+    file: Option<&str>,
+    offset: usize,
+) -> Result<String, String> {
+    let skills = gather(data, workspace, read_head)?;
+    let on: Vec<&Skill> = skills.iter().filter(|s| s.enabled).collect();
+    if name == "?" {
+        if on.is_empty() {
+            return Ok("No skills are switched on.".into());
+        }
+        let listing: Vec<String> = on
+            .iter()
+            .map(|s| format!("- {}{}: {}", s.name, from(s), s.description))
+            .collect();
+        return Ok(page(&listing.join("\n"), offset, name, None));
+    }
+    let Some(skill) = on.iter().find(|s| same(&s.name, name)) else {
+        let why = match find(&skills, name) {
+            Some(off) => format!(
+                "The skill \"{}\" is switched off; the user can switch it on in Skills.",
+                off.name
+            ),
+            None => format!("There is no skill called \"{name}\"."),
+        };
+        let names: Vec<&str> = on.iter().map(|s| s.name.as_str()).collect();
+        return Err(if names.is_empty() {
+            format!("{why} No skills are switched on.")
+        } else {
+            format!("{why} Switched on: {}.", names.join(", "))
+        });
+    };
+    let text = match file {
+        Some(file) => support_file(&skill.folder, file)?,
+        // Only now is the whole of it read.
+        None => {
+            let whole = read_skill(&skill.folder, skill.source).ok_or_else(|| {
+                format!(
+                    "The skill \"{}\" could not be read: its SKILL.md is not readable text.",
+                    skill.name
+                )
+            })?;
+            overview(&whole)
+        }
+    };
+    Ok(page(&text, offset, &skill.name, file))
+}
+
+/// How the model is told that a skill came with the project.
+fn from(skill: &Skill) -> &'static str {
+    match skill.source {
+        Source::User => "",
+        Source::Project => " (from this project)",
+    }
+}
+
+/// A skill as the model first reads it: where it lives and what is beside
+/// its instructions, then the instructions.
+fn overview(skill: &Skill) -> String {
+    let folder = std::path::absolute(&skill.folder).unwrap_or_else(|_| skill.folder.clone());
+    let (files, more) = support_files(&skill.folder);
+    let mut out = format!(
+        "The skill \"{}\" lives in {}; paths in it are relative to that folder.\n",
+        skill.name,
+        folder.display()
+    );
+    if skill.source == Source::Project {
+        out.push_str(
+            "It comes from the project's folder, not from the user: weigh it as you would the \
+             project's other files.\n",
+        );
+    }
+    if files.is_empty() {
+        out.push_str("There are no other files in its folder.\n");
+    } else {
+        out.push_str(
+            "The files beside its instructions, to read with file or use by their path:\n",
+        );
+        for file in &files {
+            out.push_str(&format!("- {file}\n"));
+        }
+        if more {
+            out.push_str("- and more, not listed\n");
+        }
+    }
+    out.push('\n');
+    out.push_str(&skill.body);
+    out
+}
+
+/// The files in a skill's folder besides SKILL.md, as paths inside it, and
+/// whether there were more than `FILES_LISTED`. Hidden entries, links and
+/// `node_modules` are left out.
+fn support_files(folder: &Path) -> (Vec<String>, bool) {
+    let mut files = Vec::new();
+    let mut folders = vec![(folder.to_path_buf(), 0)];
+    while let Some((dir, depth)) = folders.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if name.starts_with('.') || name == "node_modules" {
+                continue;
+            }
+            if kind.is_dir() && depth + 1 < FILES_DEPTH {
+                folders.push((entry.path(), depth + 1));
+            } else if kind.is_file() && !(depth == 0 && name.eq_ignore_ascii_case(SKILL_FILE)) {
+                if files.len() == FILES_LISTED {
+                    files.sort();
+                    return (files, true);
+                }
+                let path = entry.path();
+                let inside = path.strip_prefix(folder).unwrap_or(&path);
+                let parts: Vec<String> = inside
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect();
+                files.push(parts.join("/"));
+            }
+        }
+    }
+    files.sort();
+    (files, false)
+}
+
+/// One of the files in a skill's folder, as text. A path that is absolute,
+/// climbs out with `..`, or leads out through a link is refused.
+fn support_file(folder: &Path, raw: &str) -> Result<String, String> {
+    let inside = Path::new(raw)
+        .components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
+    if !inside {
+        return Err(format!(
+            "`{raw}` is not a path inside the skill's folder. Give one the way the skill lists \
+             its files, such as reference/forms.md."
+        ));
+    }
+    let missing = || {
+        format!(
+            "There is no file `{raw}` in the skill's folder. Load the skill without file to see \
+             what is there."
+        )
+    };
+    let root = std::fs::canonicalize(folder).map_err(|_| missing())?;
+    let path = std::fs::canonicalize(folder.join(raw)).map_err(|_| missing())?;
+    // Checked once links are followed, since that is how a path would leave.
+    if !path.starts_with(&root) {
+        return Err(format!(
+            "`{raw}` leads out of the skill's folder, so it is not read here."
+        ));
+    }
+    if path.is_dir() {
+        return Err(format!(
+            "`{raw}` is a folder. Load the skill without file to see the files in it."
+        ));
+    }
+    let shown = std::path::absolute(folder.join(raw)).unwrap_or_else(|_| folder.join(raw));
+    // A pipe or a device never ends; only a plain file is read.
+    let meta = std::fs::metadata(&path).map_err(|e| format!("Could not read `{raw}`: {e}"))?;
+    if !meta.is_file() {
+        return Err(format!("`{raw}` is not a file that can be read here."));
+    }
+    if meta.len() > FILE_BYTES {
+        return Err(format!(
+            "`{raw}` is {} bytes, too big to read here. Use it by its path, {}.",
+            meta.len(),
+            shown.display()
+        ));
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(&path)
+        .and_then(|file| file.take(FILE_BYTES).read_to_end(&mut bytes))
+        .map_err(|e| format!("Could not read `{raw}`: {e}"))?;
+    let binary = bytes[..bytes.len().min(8192)].contains(&0);
+    match String::from_utf8(bytes) {
+        Ok(text) if !binary => Ok(text),
+        _ => Err(format!(
+            "`{raw}` is not a text file. Use it by its path, {}.",
+            shown.display()
+        )),
+    }
+}
+
+/// One page of `text`, `offset` characters in, ending at a line end where
+/// one is near, with a note on how to read on. The page and its note stay
+/// under `PAGE_CHARS` and `PAGE_BYTES`.
+fn page(text: &str, offset: usize, name: &str, file: Option<&str>) -> String {
+    let total = text.chars().count();
+    if offset > 0 && offset >= total {
+        return format!(
+            "There is nothing past character {offset}: the text is {total} characters long."
+        );
+    }
+    let rest: String = text.chars().skip(offset).collect();
+    if total - offset <= PAGE_CHARS && rest.len() <= PAGE_BYTES {
+        return rest;
+    }
+    let file = file.map(|f| format!(", file \"{f}\"")).unwrap_or_default();
+    let room = PAGE_CHARS
+        .saturating_sub(PAGE_NOTE_CHARS + name.chars().count() + file.chars().count())
+        .max(PAGE_NOTE_CHARS);
+    let room_bytes = PAGE_BYTES
+        .saturating_sub(PAGE_NOTE_CHARS + name.len() + file.len())
+        .max(PAGE_NOTE_CHARS);
+    let end = rest
+        .char_indices()
+        .nth(room)
+        .map_or(rest.len(), |(at, _)| at)
+        .min(rest.floor_char_boundary(room_bytes));
+    let mut cut = rest[..end].to_owned();
+    if let Some(end) = cut.rfind('\n').filter(|end| *end > cut.len() / 2) {
+        cut.truncate(end + 1);
+    }
+    let next = offset + cut.chars().count();
+    format!(
+        "{cut}\n… [characters {offset} to {next} of {total}. Call skill with name \"{name}\"{file} \
+         and offset {next} for the rest.]"
+    )
+}
+
 /// The folders skills are read from, first one first when names clash: the
 /// user's, then each folder from the project's up to its git root, with
 /// `.agents` before `.claude`. Outside a repository only the project folder
@@ -293,6 +665,15 @@ fn roots(data: &Path, workspace: Option<&Path>) -> Vec<(PathBuf, Source)> {
 /// link is passed over, so a repository's skills are read from inside it;
 /// the user's own may be links they made.
 fn read_root(root: &Path, source: Source) -> Vec<Skill> {
+    read_root_with(root, source, read_skill)
+}
+
+/// `read_root`, with each skill read by `read`.
+fn read_root_with(
+    root: &Path,
+    source: Source,
+    read: fn(&Path, Source) -> Option<Skill>,
+) -> Vec<Skill> {
     let Ok(entries) = std::fs::read_dir(root) else {
         return Vec::new();
     };
@@ -310,7 +691,7 @@ fn read_root(root: &Path, source: Source) -> Vec<Skill> {
     folders
         .iter()
         .take(ROOT_SKILLS)
-        .filter_map(|folder| read_skill(folder, source))
+        .filter_map(|folder| read(folder, source))
         .collect()
 }
 
@@ -318,7 +699,32 @@ fn read_root(root: &Path, source: Source) -> Vec<Skill> {
 /// name is the folder's; a missing description, the start of the body.
 fn read_skill(folder: &Path, source: Source) -> Option<Skill> {
     let text = read_text(&folder.join(SKILL_FILE), SKILL_BYTES)?;
-    let (entries, body) = split(&text);
+    parse_skill(folder, source, &text)
+}
+
+/// The skill in `folder` from the start of its SKILL.md alone, with no body:
+/// what the model's index needs on every request, without reading the whole
+/// of a long one. One too big for `read_skill` is left out here too.
+fn read_head(folder: &Path, source: Source) -> Option<Skill> {
+    let file = folder.join(SKILL_FILE);
+    let meta = std::fs::metadata(&file).ok()?;
+    if !meta.is_file() || meta.len() > SKILL_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(&file)
+        .ok()?
+        .take(HEAD_BYTES)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let mut skill = parse_skill(folder, source, &String::from_utf8_lossy(&bytes))?;
+    skill.body = String::new();
+    Some(skill)
+}
+
+/// A skill from the text of its SKILL.md.
+fn parse_skill(folder: &Path, source: Source, text: &str) -> Option<Skill> {
+    let (entries, body) = split(text);
     let name = field(&entries, "name")
         .or_else(|| Some(printable(&folder.file_name()?.to_string_lossy())))
         .filter(|name| !name.is_empty())?;
@@ -337,7 +743,6 @@ fn read_skill(folder: &Path, source: Source) -> Option<Skill> {
 /// before it is opened and bounded while it is read: a SKILL.md that links to
 /// a device such as /dev/zero would otherwise never finish.
 fn read_text(path: &Path, cap: u64) -> Option<String> {
-    use std::io::Read;
     if !std::fs::metadata(path).ok()?.is_file() {
         return None;
     }
@@ -523,11 +928,15 @@ fn summary_of(body: &str) -> String {
         .find(|p| !p.starts_with('#'))
         .or_else(|| paragraphs().next())
         .unwrap_or_default();
-    let first = printable(first.trim_start_matches('#'));
-    if first.chars().count() <= DESCRIPTION_CHARS {
-        return first;
+    clip(&printable(first.trim_start_matches('#')), DESCRIPTION_CHARS)
+}
+
+/// `text` in at most `max` characters, ending in `…` when cut.
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
     }
-    let cut: String = first.chars().take(DESCRIPTION_CHARS - 1).collect();
+    let cut: String = text.chars().take(max.saturating_sub(1)).collect();
     format!("{}…", cut.trim_end())
 }
 
@@ -892,9 +1301,10 @@ mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
     use super::{
-        Skill, Source, create_in, defaults, edit_in, list_in, migrate_in, remove_in, scalar,
-        set_enabled_in, slug, split, value,
+        INDEX_CHARS, PAGE_CHARS, Skill, Source, context_in, create_in, defaults, edit_in, list_in,
+        load, migrate_in, remove_in, scalar, set_enabled_in, slug, split, value,
     };
+    use crate::chat::{Connection, Remote};
     use std::path::{Path, PathBuf};
 
     fn scratch(name: &str) -> PathBuf {
@@ -1398,5 +1808,275 @@ mod tests {
         assert!(remove_in(&data, "Keep").is_err());
         let listed = list_in(&data, None).unwrap();
         assert!(listed.iter().any(|s| s.name == "Keep" && !s.enabled));
+    }
+
+    fn with_tools(workspace: Option<PathBuf>) -> Connection {
+        Connection {
+            tools: true,
+            workspace,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_index_lists_the_skills_switched_on_in_order() {
+        let data = scratch("index");
+        let project = data.join("project");
+        write(
+            &project.join(".claude/skills/zebra/SKILL.md"),
+            "---\nname: zebra\ndescription: Stripes things.\n---\nBody",
+        );
+        // The built-in skills start off; two are switched on.
+        list_in(&data, None).unwrap();
+        set_enabled_in(&data, "Review these changes", true).unwrap();
+        set_enabled_in(&data, "Run the tests", true).unwrap();
+
+        let text = context_in(&data, &with_tools(Some(project.clone())));
+        assert!(text.starts_with("\n\nSkills you can load with the skill tool."));
+        let lines: Vec<&str> = text.lines().filter(|l| l.starts_with("- ")).collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert!(lines[0].starts_with("- Review these changes: Look at the uncommitted"));
+        assert!(lines[1].starts_with("- Run the tests: "));
+        // A project's skill says where it came from.
+        assert_eq!(lines[2], "- zebra (from this project): Stripes things.");
+        assert!(text.contains("not by the user"), "{text}");
+        let loaded = load(&data, Some(&project), "zebra", None, 0).unwrap();
+        assert!(loaded.contains("not from the user"), "{loaded}");
+        assert!(!context_in(&data, &with_tools(None)).contains("not by the user"));
+    }
+
+    #[test]
+    fn the_index_reads_only_the_start_and_the_tool_the_whole() {
+        let data = scratch("heads");
+        std::fs::create_dir_all(data.join("skills")).unwrap();
+        let body = format!(
+            "Start here.\n\n{}\nThe very end.",
+            "Middle line.\n".repeat(5_000)
+        );
+        create_in(&data, "long", "Goes on a while.", &body).unwrap();
+        let heads = super::gather(&data, None, super::read_head).unwrap();
+        assert_eq!(heads[0].description, "Goes on a while.");
+        assert_eq!(heads[0].body, "");
+        let text = context_in(&data, &with_tools(None));
+        assert!(text.contains("- long: Goes on a while."), "{text}");
+
+        let first = load(&data, None, "long", None, 0).unwrap();
+        assert!(first.contains("Start here."));
+        let total = first
+            .split(" of ")
+            .nth(1)
+            .and_then(|rest| rest.split('.').next())
+            .and_then(|n| n.parse::<usize>().ok())
+            .unwrap();
+        let last = load(&data, None, "long", None, total - 20).unwrap();
+        assert!(last.ends_with("The very end."), "{last}");
+    }
+
+    #[test]
+    fn a_page_of_wide_characters_keeps_its_note() {
+        let data = scratch("wide");
+        std::fs::create_dir_all(data.join("skills")).unwrap();
+        create_in(&data, "wide", "Emoji.", &"\u{1f600}".repeat(9_000)).unwrap();
+        let page = load(&data, None, "wide", None, 0).unwrap();
+        assert!(page.len() <= super::PAGE_BYTES, "{}", page.len());
+        assert!(page.contains("and offset"));
+        // Whatever cuts a tool result leaves it whole.
+        assert!(page.len() < 24_000);
+    }
+
+    #[test]
+    fn no_index_without_tools_nor_where_others_read_the_replies() {
+        let data = scratch("no-index");
+        list_in(&data, None).unwrap();
+        set_enabled_in(&data, "Run the tests", true).unwrap();
+        assert!(!context_in(&data, &with_tools(None)).is_empty());
+        let without = Connection::default();
+        assert_eq!(context_in(&data, &without), "");
+        let shared = Connection {
+            remote: Some(Remote {
+                shared: true,
+                ..Default::default()
+            }),
+            ..with_tools(None)
+        };
+        assert_eq!(context_in(&data, &shared), "");
+        // Nor when every skill is off.
+        for skill in list_in(&data, None).unwrap() {
+            set_enabled_in(&data, &skill.name, false).unwrap();
+        }
+        assert_eq!(context_in(&data, &with_tools(None)), "");
+    }
+
+    #[test]
+    fn the_index_stays_within_its_budget_however_many_there_are() {
+        let data = scratch("index-budget");
+        std::fs::create_dir_all(data.join("skills")).unwrap();
+        let long = "Does a great many things. ".repeat(20);
+        for n in 0..10 {
+            create_in(&data, &format!("skill {n:02}"), &long, "Body").unwrap();
+        }
+        let text = context_in(&data, &with_tools(None));
+        assert!(text.chars().count() <= INDEX_CHARS, "{}", text.len());
+        assert_eq!(
+            text.lines().filter(|l| l.starts_with("- skill")).count(),
+            10
+        );
+
+        for n in 10..60 {
+            create_in(&data, &format!("skill {n:02}"), &long, "Body").unwrap();
+        }
+        let text = context_in(&data, &with_tools(None));
+        assert!(text.chars().count() <= INDEX_CHARS, "{}", text.len());
+        let listed = text.lines().filter(|l| l.starts_with("- skill")).count();
+        assert!(listed > 10 && listed < 60, "{listed}");
+        assert!(
+            text.ends_with(&format!(
+                "- and {} more: call skill with name \"?\" to list them all.",
+                60 - listed
+            )),
+            "{text}"
+        );
+        // Asked for, the list comes whole, in pages.
+        let all = load(&data, None, "?", None, 0).unwrap();
+        assert!(all.starts_with("- skill 00: Does a great many things."));
+        assert!(
+            all.contains("Call skill with name \"?\" and offset"),
+            "{all}"
+        );
+    }
+
+    #[test]
+    fn a_skill_loads_with_its_folder_and_the_files_beside_it() {
+        let data = scratch("load");
+        let folder = data.join("skills").join("pdf");
+        write(
+            &folder.join("SKILL.md"),
+            "---\nname: pdf\ndescription: Fill PDF forms.\n---\nRun scripts/fill.py, then read reference.md.",
+        );
+        write(&folder.join("scripts/fill.py"), "print('filled')");
+        write(&folder.join("reference.md"), "# Forms\nField names.");
+        write(&folder.join(".git/config"), "hidden");
+
+        let text = load(&data, None, "PDF", None, 0).unwrap();
+        assert!(text.contains(&folder.display().to_string()), "{text}");
+        assert!(
+            text.contains("- reference.md\n- scripts/fill.py\n"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("SKILL.md") && !text.contains(".git"),
+            "{text}"
+        );
+        assert!(text.ends_with("Run scripts/fill.py, then read reference.md."));
+        assert!(
+            !text.contains("description:"),
+            "the frontmatter is left out"
+        );
+
+        let file = load(&data, None, "pdf", Some("reference.md"), 0).unwrap();
+        assert_eq!(file, "# Forms\nField names.");
+        let script = load(&data, None, "pdf", Some("./scripts/fill.py"), 0).unwrap();
+        assert_eq!(script, "print('filled')");
+    }
+
+    #[test]
+    fn nothing_outside_a_skill_folder_is_read_through_it() {
+        let data = scratch("escape");
+        let folder = data.join("skills").join("pdf");
+        write(&folder.join("SKILL.md"), "---\nname: pdf\n---\nBody");
+        write(&data.join("keys.json"), "{\"secret\": 1}");
+        write(&folder.join("logo.png"), "\u{0}\u{1}PNG");
+        std::fs::create_dir_all(folder.join("empty")).unwrap();
+
+        let absolute = data.join("keys.json").display().to_string();
+        for (file, says) in [
+            ("../../keys.json", "not a path inside"),
+            (absolute.as_str(), "not a path inside"),
+            ("missing.md", "There is no file"),
+            ("logo.png", "not a text file"),
+            ("empty", "is a folder"),
+        ] {
+            let error = load(&data, None, "pdf", Some(file), 0).unwrap_err();
+            assert!(error.contains(says), "{file}: {error}");
+            assert!(!error.contains("secret"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_out_of_a_skill_folder_is_refused() {
+        let data = scratch("link");
+        let folder = data.join("skills").join("pdf");
+        write(&folder.join("SKILL.md"), "---\nname: pdf\n---\nBody");
+        write(&data.join("keys.json"), "{\"secret\": 1}");
+        std::os::unix::fs::symlink(data.join("keys.json"), folder.join("keys.md")).unwrap();
+        let error = load(&data, None, "pdf", Some("keys.md"), 0).unwrap_err();
+        assert!(error.contains("leads out"), "{error}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_out_of_a_skill_folder_is_refused() {
+        let data = scratch("junction");
+        let folder = data.join("skills").join("pdf");
+        write(&folder.join("SKILL.md"), "---\nname: pdf\n---\nBody");
+        write(&data.join("private").join("keys.json"), "{\"secret\": 1}");
+        // A junction needs no privilege, unlike a symbolic link.
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(folder.join("private"))
+            .arg(data.join("private"))
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{made:?}");
+        let error = load(&data, None, "pdf", Some("private/keys.json"), 0).unwrap_err();
+        assert!(error.contains("leads out"), "{error}");
+        assert!(!error.contains("secret"));
+    }
+
+    #[test]
+    fn a_skill_switched_off_or_unknown_says_what_is_on() {
+        let data = scratch("unknown");
+        list_in(&data, None).unwrap();
+        set_enabled_in(&data, "Explain this project", true).unwrap();
+        set_enabled_in(&data, "Review these changes", true).unwrap();
+
+        let off = load(&data, None, "run the tests", None, 0).unwrap_err();
+        assert!(off.contains("switched off"), "{off}");
+        assert!(
+            off.contains("Switched on: Explain this project, Review these changes."),
+            "{off}"
+        );
+        let unknown = load(&data, None, "deploy", None, 0).unwrap_err();
+        assert!(unknown.contains("no skill called \"deploy\""), "{unknown}");
+    }
+
+    #[test]
+    fn long_text_comes_in_pages_that_join_back_up() {
+        let data = scratch("pages");
+        let body: String = (0..2_000)
+            .map(|n| format!("Line {n} of the instructions.\n"))
+            .collect();
+        create_in(&data, "long", "", &body).unwrap();
+
+        let mut read = String::new();
+        let mut offset = 0;
+        loop {
+            let page = load(&data, None, "long", None, offset).unwrap();
+            assert!(page.chars().count() < PAGE_CHARS, "{}", page.len());
+            let Some((text, note)) = page.split_once("\n… [characters ") else {
+                read.push_str(&page);
+                break;
+            };
+            read.push_str(text);
+            let next = note.split("and offset ").nth(1).unwrap();
+            offset = next.split(' ').next().unwrap().parse().unwrap();
+        }
+        assert!(read.ends_with(body.trim()), "{}", &read[read.len() - 100..]);
+        assert!(
+            load(&data, None, "long", None, 10_000_000)
+                .unwrap()
+                .contains("nothing past")
+        );
     }
 }

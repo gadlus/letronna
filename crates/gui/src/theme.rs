@@ -281,13 +281,15 @@ pub(crate) fn apply(cx: &mut App) {
     // gpui-component's near-white danger text reads at 2.5:1 on this lighter
     // red; night reads at 7:1, on the title bar's close button too.
     t.danger_foreground = rgb(NIGHT).into();
-    // A hover colour equal to its base draws no hover: list rows, blue and
-    // red buttons and scrollbars stay still under the pointer. Ghost buttons,
-    // menu items and tabs work out their own hover, and an outline button
-    // goes from the page colour to secondary_hover, so those keep a hover
-    // until their call sites change. On Windows and Linux the title bar's
-    // minimise and maximise hover to secondary_hover, a darker raised square
-    // on deep behind a white glyph, and close hovers to danger.
+    // A hover colour equal to its base draws no hover: list rows and blue
+    // and red buttons stay still under the pointer, and a scrollbar's thumb
+    // keeps its colour, though gpui-component still widens it and fills its
+    // track. Ghost and outline buttons work out their own hover, so Letronna
+    // draws its own as `plain` and `framed` (ui::NoHover); menu items and
+    // gpui-component's own ghost buttons still hover. On Windows and Linux
+    // the title bar's minimise and maximise hover to secondary_hover, a
+    // darker raised square on deep behind a white glyph, and close hovers to
+    // danger.
     t.primary_hover = t.primary;
     t.secondary_hover = t.secondary;
     t.list_hover = t.list;

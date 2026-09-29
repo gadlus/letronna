@@ -55,9 +55,7 @@ impl Page {
             Page::Skills => {
                 "Reusable playbooks Letronna can load into a session. Nothing installed yet."
             }
-            Page::Messaging => {
-                "Connect Telegram, Discord, Slack or email gateways. No channel configured yet."
-            }
+            Page::Messaging => "Message Letronna from a chat app, and get answers back there.",
             Page::Artifacts => "Files, images and links produced in sessions will collect here.",
             // Jobs renders its own page; this blurb is only a fallback.
             Page::Jobs => "Prompts that run on a timer.",
@@ -118,6 +116,9 @@ pub(crate) struct Chat {
     pub(crate) turn: Option<agent::Turn>,
     /// Stops the tool the turn in flight is running, when set.
     pub(crate) turn_stop: letronna_core::cancel::Cancel,
+    /// Whether the call at the front of the turn is running, rather than
+    /// waiting on its card; a stop answers the two differently.
+    pub(crate) call_running: bool,
     /// The session id currently receiving a streamed reply, if any.
     pub(crate) streaming_id: Option<u64>,
     /// The id of the queued call the approval card is up for, decided once
@@ -414,6 +415,7 @@ impl Chat {
             busy: false,
             turn: None,
             turn_stop: Default::default(),
+            call_running: false,
             streaming_id: None,
             asking: None,
             session_allow: std::collections::HashMap::new(),
@@ -918,6 +920,7 @@ impl Chat {
             .map(agent::Turn::tool_context)
             .unwrap_or_default();
         ctx.cancel = self.turn_stop.clone();
+        self.call_running = true;
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
             let _ = tx.send_blocking(letronna_core::tools::run(&call.name, &call.arguments, &ctx));
@@ -927,6 +930,7 @@ impl Chat {
             if let Ok(result) = rx.recv().await {
                 let _ = this.update(cx, |this, cx| {
                     if this.generation == generation {
+                        this.call_running = false;
                         this.record_result(result, cx)
                     }
                 });
@@ -1331,7 +1335,6 @@ impl Chat {
                         // told apart from it.
                         .border_1()
                         .border_color(cx.theme().primary.opacity(0.5))
-                        .shadow_md()
                         .tooltip("Jump to latest")
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.follow();
@@ -1343,8 +1346,8 @@ impl Chat {
 
     /// End the turn in flight, from the Stop button or `/stop` in a chat.
     /// The chat or schedule that started it hears "Stopped." rather than an
-    /// error; any call left without a result is answered as interrupted when
-    /// the session next goes to the model.
+    /// error. What the turn got to is kept: the reply so far, or the batch's
+    /// results with every call left answered as stopped.
     pub(crate) fn stop_turn(&mut self, cx: &mut Context<Self>) {
         if !self.busy {
             return;
@@ -1371,7 +1374,32 @@ impl Chat {
                 self.send_report(title, "Stopped.".into(), cx);
             }
         }
+        self.keep_stopped();
         self.finish(cx);
+    }
+
+    /// Save what a stopped turn got to, so the model hears next time what ran
+    /// and what did not.
+    fn keep_stopped(&mut self) {
+        let model = self.store.settings.model.clone();
+        let running = std::mem::take(&mut self.call_running);
+        let Some(turn) = self.turn.as_mut() else {
+            return;
+        };
+        if running {
+            turn.finish_call(Err(agent::STOPPED_WHILE_RUNNING.into()));
+        }
+        let kept = turn.stop(&model);
+        let Some(ix) = self.streaming_id.and_then(|id| self.store.index_of(id)) else {
+            return;
+        };
+        if kept.is_empty() {
+            return;
+        }
+        let conversation = &mut self.store.conversations[ix];
+        conversation.updated = backend::now();
+        conversation.messages.extend(kept);
+        self.save();
     }
 
     /// Escape that nothing nearer took: close what is open over the chat,
@@ -1557,7 +1585,7 @@ impl Render for Chat {
                         let copied = window.use_keyed_state("copied-error", cx, |_, _| false);
                         let done = *copied.read(cx);
                         Button::new("copy-error")
-                            .ghost()
+                            .plain(cx)
                             .xsmall()
                             .icon(Icon::new(if done {
                                 IconName::Check
@@ -1622,9 +1650,9 @@ impl Render for Chat {
             // One turn per prompt, like Claude Code: the user's message, then
             // everything the model did in reply under a single label. Each
             // turn knows its place, which its buttons and menu work from.
-            use crate::ui::actions::Span;
+            use crate::ui::actions::{Span, shows_bar};
             let messages = &conversation.messages;
-            let mut turns: Vec<(Vec<AnyElement>, Span)> = Vec::new();
+            let mut turns: Vec<(Vec<AnyElement>, Span, FocusHandle)> = Vec::new();
             let mut assistant_turn = false;
             for (i, m) in messages.iter().enumerate() {
                 let is_user = m.role == "user";
@@ -1634,11 +1662,11 @@ impl Render for Chat {
                         last: i,
                         yours: is_user,
                     };
-                    turns.push((Vec::new(), span));
+                    turns.push((Vec::new(), span, self.turn_focus(i, window, cx)));
                 }
                 let labeled = is_user || !assistant_turn;
                 assistant_turn = !is_user;
-                let (rows, span) = turns.last_mut().unwrap();
+                let (rows, span, focus) = turns.last_mut().unwrap();
                 span.last = i;
                 // A reply that only asked for tools has nothing to show of
                 // its own; the tool rows speak for it. Kept only when it
@@ -1658,10 +1686,9 @@ impl Render for Chat {
                 let ends = messages.get(i + 1).is_none_or(|next| next.role == "user")
                     && !(streaming_here && i + 1 == messages.len());
                 let bar = (is_user || ends).then(|| {
-                    // The newest reply keeps its buttons in view; the rest
-                    // show them on hover.
-                    let newest = !is_user && i + 1 == messages.len();
-                    self.turn_bar(*span, newest, cx)
+                    let focused = focus.contains_focused(window, cx);
+                    let shown = shows_bar(*span, messages.len(), streaming_here, focused);
+                    self.turn_bar(*span, shown, cx)
                 });
                 rows.push(self.message_row(i, m, labeled, false, bar, window, cx));
             }
@@ -1676,12 +1703,13 @@ impl Render for Chat {
                             last: messages.len(),
                             yours: false,
                         },
+                        self.turn_focus(messages.len(), window, cx),
                     ));
                 }
                 turns.len() - 1
             });
             if streaming_here {
-                let (rows_here, _) = turns.last_mut().unwrap();
+                let (rows_here, _, _) = turns.last_mut().unwrap();
                 // While tools are queued the card below speaks for the turn;
                 // showing a half-built reply as well would be two spinners.
                 let idle = self
@@ -1725,15 +1753,28 @@ impl Render for Chat {
                 // No min_w_0 or clipping here: both break list layout in the
                 // markdown renderer, which sizes items against this width.
                 // Long lines are held in by the row and code-block widths.
-                .map(|(n, (turn, span))| {
-                    let group = v_flex().w_full().gap_3().group("turn").children(turn);
+                .map(|(n, (turn, span, focus))| {
+                    // A hairline before each of your prompts but the first
+                    // parts the exchanges, where a card used to.
+                    let group = v_flex()
+                        .w_full()
+                        .gap_3()
+                        .when(span.yours && n > 0, |group| {
+                            group.border_t_1().border_color(cx.theme().border).pt_6()
+                        })
+                        .children(turn);
                     if live_turn == Some(n) {
                         return group.into_any_element();
                     }
                     // Its own id, so each turn's menu keeps its own state.
+                    // Tab picks a turn out; a press on it does not, or
+                    // opening a tool's output would take the keys from the
+                    // composer (text inside still takes focus to select).
                     div()
                         .id(self.row_id("turn", span.first))
                         .w_full()
+                        .track_focus(&focus)
+                        .on_any_mouse_down(|_, window, _| window.prevent_default())
                         .child(group.context_menu(self.turn_menu(span, cx)))
                         .into_any_element()
                 })

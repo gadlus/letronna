@@ -30,6 +30,7 @@ pub mod memory;
 pub mod messaging;
 pub mod models;
 mod page;
+pub mod paths;
 pub mod retry;
 pub mod schedule;
 pub mod search;

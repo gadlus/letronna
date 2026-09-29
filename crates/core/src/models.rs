@@ -1,6 +1,6 @@
 //! What Letronna knows about a model: how much it can read in one request,
-//! how much it can write in one reply, what it takes in, and which
-//! parameters it accepts.
+//! how much it can write in one reply, what it takes in, which parameters
+//! it accepts, and how hard it can be told to think.
 //!
 //! Three sources, cheapest first. The gateways' model lists already say most
 //! of it -- OpenRouter gives the window, the output limit, the kinds of input
@@ -19,12 +19,14 @@
 //! answer, so asking never holds up a request. Instead the first request to a
 //! host whose list is not known asks for it on a thread of its own, so the
 //! terminal, helpers and a window whose own listing failed learn the same as
-//! a window that listed its gateways, from the next request on.
+//! a window that listed its gateways, from the next request on. Only a
+//! request that sets an effort waits for that list, a few seconds at most,
+//! because the level it sends is one the list says the model offers.
 
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Mutex, OnceLock},
+    sync::{Mutex, OnceLock, mpsc},
     time::{Duration, Instant},
 };
 
@@ -39,6 +41,17 @@ pub struct Facts {
     pub inputs: Option<Vec<String>>,
     /// The request parameters its route accepts, such as `tools` and `reasoning`.
     pub parameters: Option<Vec<String>>,
+    /// The effort levels it offers, least first; an empty list offers none.
+    pub efforts: Option<Vec<Effort>>,
+}
+
+/// One effort level a model offers.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Effort {
+    /// What `reasoning_effort` is set to, such as `xhigh`.
+    pub id: String,
+    /// What it is called, such as `Extra high`.
+    pub label: String,
 }
 
 /// A limit a provider's error gave away.
@@ -88,11 +101,28 @@ const FAMILIES: &[(&str, u64, u64)] = &[
     ("deepseek-reasoner", 128_000, 65_536),
 ];
 
+/// Effort levels from least to most, by the names gateways give them. A
+/// saved level a model does not offer goes to the nearest one it does by
+/// this order; `ultra` is past `max` because the hosted list has it there.
+const EFFORT_ORDER: &[&str] = &[
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+];
+
+/// The levels offered when a model's list does not say: the three Letronna
+/// always offered, so such a model is sent what it was sent before.
+const USUAL_EFFORTS: [(&str, &str); 3] = [("low", "Low"), ("medium", "Medium"), ("high", "High")];
+
 /// How long a host whose list did not come, or came empty, is left before it
 /// is asked again: ten minutes keeps a gateway without a list from being asked
 /// on every round of a turn, and one that was only down for a moment is not
 /// long without it.
 const ASK_AGAIN_AFTER: Duration = Duration::from_secs(10 * 60);
+
+/// How long a request that sets an effort waits for a list it has just asked
+/// for: the hosted list comes in well under a second, and a gateway slower
+/// than this should not hold up the answer, which then goes with the levels
+/// a list that says nothing would give.
+const WAIT_FOR_LIST: Duration = Duration::from_secs(5);
 
 /// Everything learned so far, by (host, model).
 #[derive(Default)]
@@ -130,7 +160,49 @@ pub fn facts(endpoint: &str, model: &str) -> Facts {
         max_output: lowest(listed.max_output.or(family.max_output), learned.max_output),
         inputs: listed.inputs,
         parameters: listed.parameters,
+        efforts: listed.efforts,
     }
+}
+
+/// The effort levels `model` at `endpoint` offers, least first: those its
+/// gateway's list gives, none when the list says it cannot reason, or low,
+/// medium and high when the list says nothing.
+pub fn efforts(endpoint: &str, model: &str) -> Vec<Effort> {
+    let facts = facts(endpoint, model.trim());
+    if let Some(levels) = facts.efforts {
+        return levels;
+    }
+    // OpenRouter says a route cannot reason by leaving reasoning out of the
+    // parameters it takes.
+    let reasons = |taken: Vec<String>| taken.iter().any(|name| name == "reasoning");
+    if facts.parameters.is_some_and(|taken| !reasons(taken)) {
+        return Vec::new();
+    }
+    USUAL_EFFORTS
+        .iter()
+        .map(|&(id, label)| Effort {
+            id: id.to_owned(),
+            label: label.to_owned(),
+        })
+        .collect()
+}
+
+/// The level of `levels` to send for the saved `effort`: that one when it is
+/// offered, otherwise the nearest by `EFFORT_ORDER`, and `None` for automatic,
+/// a level not in that order, or no levels at all.
+pub fn clamp<'a>(levels: &'a [Effort], effort: &str) -> Option<&'a Effort> {
+    if let Some(level) = levels.iter().find(|level| level.id == effort) {
+        return Some(level);
+    }
+    let rank = |id: &str| EFFORT_ORDER.iter().position(|known| *known == id);
+    let wanted = rank(effort)?;
+    levels
+        .iter()
+        .filter_map(|level| Some((rank(&level.id)?, level)))
+        // Between two as near, the higher: an answer thought through a little
+        // more costs a little more, one thought through too little is worse.
+        .min_by_key(|&(at, _)| (at.abs_diff(wanted), std::cmp::Reverse(at)))
+        .map(|(_, level)| level)
 }
 
 /// Remember a limit a provider's error gave away for `model` at `endpoint`.
@@ -155,21 +227,33 @@ pub fn learn(endpoint: &str, model: &str, limit: Limit) {
 }
 
 /// Ask the gateway a request with a key goes to for its `/models` list on a
-/// thread of its own, the first time for its host, and keep what it says.
-pub(crate) fn ask_for_list(endpoint: &str, key: &str) {
+/// thread of its own, the first time for its host, and keep what it says;
+/// what it gives back hears when that ask is over, and there is none if no ask
+/// was made.
+pub fn ask_for_list(endpoint: &str, key: &str) -> Option<mpsc::Receiver<()>> {
     // A server that takes no key is one of the user's own, such as Ollama or
     // LM Studio, whose list names its models and says nothing about them.
     if key.trim().is_empty() || !due(&host(endpoint)) {
-        return;
+        return None;
     }
     let base = endpoint
         .strip_suffix("/chat/completions")
         .unwrap_or(endpoint)
         .to_owned();
     let key = key.to_owned();
+    let (over, heard) = mpsc::channel();
     // A list that did not come is not asked for again until `ASK_AGAIN_AFTER`
     // has passed since this ask, so what went wrong does not matter here.
-    std::thread::spawn(move || crate::chat::list_models(&base, &key));
+    std::thread::spawn(move || {
+        let _ = crate::chat::list_models(&base, &key);
+        let _ = over.send(());
+    });
+    Some(heard)
+}
+
+/// Wait for an ask `ask_for_list` made to be over, for up to `WAIT_FOR_LIST`.
+pub fn wait_for_list(asked: mpsc::Receiver<()>) {
+    let _ = asked.recv_timeout(WAIT_FOR_LIST);
 }
 
 /// Whether `host` should be asked for its list now, noting the ask if so.
@@ -225,6 +309,25 @@ fn read(entry: &Value) -> Facts {
         inputs: names(&entry["architecture"]["input_modalities"])
             .or_else(|| names(&entry["input_modalities"])),
         parameters: names(&entry["supported_parameters"]),
+        // The hosted gateway leaves the levels out for a model that cannot
+        // reason rather than listing none, and says so in its capabilities.
+        efforts: entry["reasoning_efforts"]
+            .as_array()
+            .map(|list| {
+                list.iter()
+                    .filter_map(|level| {
+                        let id = level["effort"].as_str()?;
+                        Some(Effort {
+                            id: id.to_owned(),
+                            label: level["label"].as_str().unwrap_or(id).to_owned(),
+                        })
+                    })
+                    .collect()
+            })
+            .or_else(|| {
+                let reasons = entry["capabilities"]["reasoning"].as_bool();
+                (reasons == Some(false)).then(Vec::new)
+            }),
     }
 }
 
@@ -505,10 +608,16 @@ mod tests {
     /// Sends one chat request for `model` to `base` with `key`, and what came
     /// of it, failing if it takes more than a few seconds.
     fn send(base: &str, model: &str, key: &str) -> Result<(), String> {
+        send_with_effort(base, model, key, "")
+    }
+
+    /// Like `send`, asking the model to think as hard as `effort`.
+    fn send_with_effort(base: &str, model: &str, key: &str, effort: &str) -> Result<(), String> {
         let connection = Connection {
             endpoint: base.into(),
             model: model.into(),
             key: key.into(),
+            effort: effort.into(),
             ..Default::default()
         };
         let prompt = Message {
@@ -557,7 +666,7 @@ mod tests {
     }
 
     #[test]
-    fn a_request_never_waits_for_the_list() {
+    fn a_request_leaving_effort_to_the_model_never_waits_for_the_list() {
         let stub = Stub::new(json!({"data": [{"id": "some-model", "context_length": 32_000}]}));
         let hold = stub.gate.lock().unwrap();
         send(&stub.base, "some-model", "test-key").unwrap();
@@ -568,6 +677,23 @@ mod tests {
         until("the list", || {
             facts(&stub.base, "some-model").context == Some(32_000)
         });
+    }
+
+    #[test]
+    fn a_request_setting_an_effort_waits_for_the_list() {
+        let stub = Stub::new(json!({"data": [
+            {"id": "some-model", "reasoning_efforts": [{"effort": "high", "label": "High"}]}
+        ]}));
+        let hold = stub.gate.lock().unwrap();
+        let base = stub.base.clone();
+        let request =
+            std::thread::spawn(move || send_with_effort(&base, "some-model", "test-key", "max"));
+        std::thread::sleep(SETTLE);
+        assert!(!request.is_finished());
+        drop(hold);
+        request.join().unwrap().unwrap();
+        // No waiting here: the levels were in before the request was sent.
+        assert!(facts(&stub.base, "some-model").efforts.is_some());
     }
 
     #[test]
@@ -654,5 +780,92 @@ mod tests {
             (small.context, small.max_output),
             (Some(8_192), Some(4_096))
         );
+    }
+
+    /// Remembers four entries of the hosted gateway's list at `endpoint`:
+    /// three with the levels it sends for them, and one that cannot reason.
+    fn hosted_efforts(endpoint: &str) {
+        let list = json!([
+            {"id": "claude-opus-5", "reasoning_efforts": [
+                {"effort": "low", "label": "Low"}, {"effort": "medium", "label": "Medium"},
+                {"effort": "high", "label": "High"}, {"effort": "xhigh", "label": "Extra high"},
+                {"effort": "max", "label": "Max"}
+            ]},
+            {"id": "gpt-5.5", "reasoning_efforts": [
+                {"effort": "low", "label": "Light"}, {"effort": "medium", "label": "Medium"},
+                {"effort": "high", "label": "High"}, {"effort": "xhigh", "label": "Extra high"}
+            ]},
+            {"id": "deepseek-v4-flash", "reasoning_efforts": [
+                {"effort": "none", "label": "None"}, {"effort": "low", "label": "Low"},
+                {"effort": "high", "label": "High"}, {"effort": "max", "label": "Max"}
+            ]},
+            {"id": "hy-mt2-7b", "capabilities": {"tool_calling": false, "reasoning": false}}
+        ]);
+        remember(endpoint, list.as_array().unwrap());
+    }
+
+    /// The ids of `levels`, in order.
+    fn ids(levels: &[Effort]) -> Vec<&str> {
+        levels.iter().map(|level| level.id.as_str()).collect()
+    }
+
+    #[test]
+    fn effort_levels_come_from_the_models_list() {
+        let endpoint = "https://efforts.test/v1";
+        hosted_efforts(endpoint);
+        assert_eq!(
+            ids(&efforts(endpoint, "claude-opus-5")),
+            ["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(
+            ids(&efforts(endpoint, "deepseek-v4-flash")),
+            ["none", "low", "high", "max"]
+        );
+        let gpt = efforts(endpoint, "gpt-5.5");
+        assert_eq!(ids(&gpt), ["low", "medium", "high", "xhigh"]);
+        let labels: Vec<_> = gpt.iter().map(|level| level.label.as_str()).collect();
+        assert_eq!(labels, ["Light", "Medium", "High", "Extra high"]);
+        assert!(efforts(endpoint, "hy-mt2-7b").is_empty());
+        // A level without a label goes by its id.
+        let unlabelled = json!([{"id": "unlabelled", "reasoning_efforts": [{"effort": "high"}]}]);
+        remember(endpoint, unlabelled.as_array().unwrap());
+        assert_eq!(efforts(endpoint, "unlabelled")[0].label, "high");
+    }
+
+    #[test]
+    fn a_level_the_model_lacks_is_clamped_to_the_nearest() {
+        let endpoint = "https://clamped.test/v1";
+        hosted_efforts(endpoint);
+        let sent = |model: &str, effort: &str| {
+            clamp(&efforts(endpoint, model), effort).map(|level| level.id.clone())
+        };
+        assert_eq!(sent("gpt-5.5", "max").as_deref(), Some("xhigh"));
+        assert_eq!(sent("gpt-5.5", "high").as_deref(), Some("high"));
+        assert_eq!(sent("claude-opus-5", "none").as_deref(), Some("low"));
+        assert_eq!(sent("claude-opus-5", "ultra").as_deref(), Some("max"));
+        assert_eq!(sent("deepseek-v4-flash", "none").as_deref(), Some("none"));
+        // As near to low as to high: the higher wins.
+        assert_eq!(sent("deepseek-v4-flash", "medium").as_deref(), Some("high"));
+        // Automatic, and a word that is no level, send nothing.
+        assert_eq!(sent("gpt-5.5", ""), None);
+        assert_eq!(sent("gpt-5.5", "turbo"), None);
+    }
+
+    #[test]
+    fn a_model_without_levels_keeps_the_old_choices() {
+        let endpoint = "https://levelless.test/v1";
+        let list = json!([{"id": "some-model", "context_length": 32_000}]);
+        remember(endpoint, list.as_array().unwrap());
+        for model in ["some-model", "a-model-never-listed"] {
+            let levels = efforts(endpoint, model);
+            assert_eq!(ids(&levels), ["low", "medium", "high"]);
+            assert_eq!(
+                clamp(&levels, "medium").map(|l| l.id.as_str()),
+                Some("medium")
+            );
+            // Saved on a model that goes further than these.
+            assert_eq!(clamp(&levels, "max").map(|l| l.id.as_str()), Some("high"));
+            assert_eq!(clamp(&levels, ""), None);
+        }
     }
 }

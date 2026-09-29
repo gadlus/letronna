@@ -60,7 +60,7 @@ impl Chat {
             let (pick_gw, pick) = (gw.clone(), id.clone());
             list = list.child(
                 Button::new(("model", i))
-                    .ghost()
+                    .plain(cx)
                     .xsmall()
                     .w_full()
                     .justify_start()
@@ -96,7 +96,7 @@ impl Chat {
             .flex_shrink_0()
             .child(
                 Button::new("model-trigger")
-                    .ghost()
+                    .plain(cx)
                     .xsmall()
                     .text_color(cx.theme().muted_foreground)
                     .child(
@@ -135,7 +135,6 @@ impl Chat {
                                                 .border_1()
                                                 .border_color(cx.theme().border)
                                                 .rounded(cx.theme().radius_lg)
-                                                .shadow_md()
                                                 .child(
                                                     div()
                                                         .p_1()
@@ -189,7 +188,7 @@ impl Chat {
         for (i, (kind, label)) in kinds.enumerate() {
             tabs = tabs.child(
                 Button::new(("model-kind", i))
-                    .ghost()
+                    .plain(cx)
                     .xsmall()
                     .label(label)
                     .selected(self.model_kind == kind)
@@ -229,7 +228,7 @@ impl Chat {
             list =
                 list.child(
                     Button::new(("media-model", i))
-                        .ghost()
+                        .plain(cx)
                         .xsmall()
                         .w_full()
                         .justify_start()
@@ -380,7 +379,7 @@ impl Chat {
     pub(crate) fn composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let chat = cx.entity();
         let attach = Button::new("attach")
-            .ghost()
+            .plain(cx)
             .xsmall()
             .icon(Icon::new(IconName::Plus))
             .disabled(self.busy)
@@ -447,7 +446,7 @@ impl Chat {
             )
             .child(
                 Button::new("plan-mode")
-                    .ghost()
+                    .plain(cx)
                     .xsmall()
                     .tooltip(if self.plan_mode {
                         "Plan mode on: reads and asks only. Click to let it act."
@@ -476,7 +475,7 @@ impl Chat {
             // three clicks away in a dialog.
             .child(
                 Button::new("web-search")
-                    .ghost()
+                    .plain(cx)
                     .xsmall()
                     .tooltip(if self.store.settings.search {
                         "Web search on: it may look things up and cite them. Click to stop."
@@ -504,7 +503,7 @@ impl Chat {
             .child(self.model_picker(cx))
             .child(
                 Button::new("mic")
-                    .ghost()
+                    .plain(cx)
                     .xsmall()
                     .icon(Icon::new(AppIcon::Mic))
                     .tooltip("Voice input, coming soon"),

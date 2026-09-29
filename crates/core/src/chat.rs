@@ -53,6 +53,9 @@ pub struct Message {
     /// user's turn.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub notice: bool,
+    /// For `role: "assistant"`: the user stopped this reply part way.
+    #[serde(default)]
+    pub interrupted: bool,
 }
 
 impl Message {
@@ -417,9 +420,11 @@ fn body_with(
             system.push_str(" Other people in this chat can read your replies. Nothing on this computer is reachable from here: no files, folders or commands.");
         }
     }
-    // Memory first: it changes rarely, so the prompt's start stays cacheable;
-    // the summary of dropped turns changes as the conversation grows.
+    // Memory and skills first: they change rarely, so the prompt's start
+    // stays cacheable; the summary of dropped turns changes as the
+    // conversation grows.
     system.push_str(&crate::memory::context(connection));
+    system.push_str(&crate::skills::context(connection));
     // Models reckon "today" from their training and guess who they are. The
     // date alone changes once a day, so the prefix above stays cached; the OS
     // says something about this computer, so a shared chat goes without it.
@@ -506,12 +511,13 @@ fn body_with(
         tools.extend_from_slice(extra);
         body["tools"] = Value::Array(tools);
     }
-    // Most models that cannot be told how hard to think ignore this, so it
-    // goes to all of them; one that refuses it is sent none after. Measured
-    // on one that can: sixty-four reasoning tokens at low against seven
-    // hundred at high.
-    if !connection.effort.is_empty() {
-        body["reasoning_effort"] = connection.effort.clone().into();
+    // Measured on a model that can be told how hard to think: sixty-four
+    // reasoning tokens at low against seven hundred at high. A level saved on
+    // another model goes to the nearest this one offers, since a gateway may
+    // turn down one it does not know, and a model offering none is sent none.
+    let levels = crate::models::efforts(&connection.endpoint, &connection.model);
+    if let Some(level) = crate::models::clamp(&levels, &connection.effort) {
+        body["reasoning_effort"] = level.id.clone().into();
     }
     for (quirk, _) in QUIRKS {
         if has_quirk(connection, quirk) {
@@ -556,9 +562,9 @@ fn screenshot(window: &[Message]) -> Option<(usize, PathBuf)> {
         m.role == "tool"
             && m.name == crate::browser::BROWSE
             && !m.is_error
-            && crate::media::saved(&m.content).is_some()
+            && crate::media::saved_by(&m.name, &m.content).is_some()
     })?;
-    let path = crate::media::saved(&window[at].content)?;
+    let path = crate::media::saved_by(&window[at].name, &window[at].content)?;
     let batch = window[at..].iter().take_while(|m| m.role == "tool").count();
     Some((at + batch - 1, path))
 }
@@ -1184,8 +1190,12 @@ fn stream(
     // The facts about a model come from its gateway's list, which the window
     // reads when it opens and the terminal only for /model and /gateways, so
     // the first request to a host whose list is not known asks for it. This
-    // request does not wait for it.
-    crate::models::ask_for_list(&endpoint, &connection.key);
+    // request does not wait for it, unless it sets an effort, which is sent
+    // as a level the list says the model has.
+    let asked = crate::models::ask_for_list(&endpoint, &connection.key);
+    if let Some(asked) = asked.filter(|_| !connection.effort.is_empty()) {
+        crate::models::wait_for_list(asked);
+    }
     // What the window no longer holds goes in as a summary rather than not at
     // all. It is made here, on the worker, so the wait is part of the reply's.
     let (dropped, window) = messages.split_at(start);
@@ -1754,6 +1764,38 @@ mod tests {
             context.last().unwrap()["content"],
             "Checklist updated: 1 of 1 done."
         );
+    }
+    #[test]
+    fn a_model_listing_no_levels_gets_no_effort_parameter() {
+        let endpoint = "https://effortless.test/v1";
+        let list = json!([
+            {"id": "plain-model", "reasoning_efforts": []},
+            // As the hosted gateway lists a model that cannot reason.
+            {"id": "hy-mt2-7b", "capabilities": {"tool_calling": false, "reasoning": false}},
+            {"id": "thinking-model", "reasoning_efforts": [
+                {"effort": "low", "label": "Light"}, {"effort": "xhigh", "label": "Extra high"}
+            ]}
+        ]);
+        crate::models::remember(endpoint, list.as_array().unwrap());
+        let messages = [Message {
+            role: "user".into(),
+            content: "Hi".into(),
+            ..Default::default()
+        }];
+        let sent = |model: &str| {
+            let c = Connection {
+                endpoint: endpoint.into(),
+                model: model.into(),
+                effort: "max".into(),
+                ..connection()
+            };
+            body(&c, &messages, None, None)
+                .get("reasoning_effort")
+                .cloned()
+        };
+        assert_eq!(sent("plain-model"), None);
+        assert_eq!(sent("hy-mt2-7b"), None);
+        assert_eq!(sent("thinking-model"), Some("xhigh".into()));
     }
     #[test]
     fn the_two_ways_a_route_says_it_cannot_do_tools_read_the_same() {
@@ -2436,6 +2478,18 @@ mod tests {
         // Nor is one sent for a file that has since been deleted.
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(sent("sees-images").iter().all(|m| !m["content"].is_array()));
+    }
+
+    #[test]
+    fn a_page_titled_as_a_saved_share_is_not_taken_for_a_screenshot() {
+        // Browse's listing opens with the page's title, which the page writes.
+        let listing = Message {
+            role: "tool".into(),
+            name: "browse".into(),
+            content: r"Saved to \\nowhere.invalid\s\a.jpg — https://example.com".into(),
+            ..Default::default()
+        };
+        assert_eq!(screenshot(&[listing]).is_none(), cfg!(windows));
     }
 
     /// The body of the next request to `socket`.

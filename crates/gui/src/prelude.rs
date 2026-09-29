@@ -14,7 +14,7 @@ pub(crate) use gpui_component::{
 };
 pub(crate) use std::{borrow::Cow, path::PathBuf};
 
-pub(crate) use crate::{app::*, assets::*, plugins, theme::*};
+pub(crate) use crate::{app::*, assets::*, plugins, theme::*, ui::NoHover};
 pub(crate) use letronna_core::chat::{self as backend, Connection, Event, Message};
 pub(crate) use letronna_core::gateway::*;
 pub(crate) use letronna_core::store::*;

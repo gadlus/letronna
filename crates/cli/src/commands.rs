@@ -422,27 +422,47 @@ pub fn open_in_browser(url: &str) {
     }
 }
 
-/// How hard the model should think.
+/// How hard the model should think, from the levels the model in use offers.
 ///
-/// Sent to every model and ignored by the ones that cannot be told, which is
-/// why there is no capability check here: on a model that can, this is the
-/// difference between sixty-four reasoning tokens and seven hundred.
+/// On a model that can be told, this is the difference between sixty-four
+/// reasoning tokens and seven hundred. The levels come from its gateway's
+/// model list, or are low, medium and high when the list does not say.
 fn effort(runner: &mut Runner, rest: &str) {
-    const LEVELS: [&str; 4] = ["auto", "low", "medium", "high"];
-    let current = match runner.store.settings.effort.as_str() {
-        "" => "auto",
-        level => level,
-    };
+    // This terminal only asks for the gateway's list with its first request
+    // or /model, and the levels are on it.
+    let (endpoint, key) = runner.route();
+    if let Some(asked) = letronna_core::models::ask_for_list(&endpoint, &key) {
+        runner.bar.busy("asking what the model offers", move || {
+            letronna_core::models::wait_for_list(asked)
+        });
+    }
+    let settings = &runner.store.settings;
+    let model = settings.model.clone();
+    let levels = letronna_core::models::efforts(&endpoint, &model);
+    if levels.is_empty() {
+        render::blank();
+        render::line(&render::dim(&format!(
+            "{model} cannot be told how hard to think; it decides for itself."
+        )));
+        return;
+    }
+    let stops: Vec<&str> = std::iter::once("auto")
+        .chain(levels.iter().map(|level| level.id.as_str()))
+        .collect();
+    // What goes with the next request, which for a level saved on another
+    // model is the nearest this one offers.
+    let current = letronna_core::models::clamp(&levels, &settings.effort)
+        .map_or("auto", |level| level.id.as_str());
     let chosen = match rest {
         // Nothing named: slide to it. Effort is a point on one line from
         // less to more, and a slider says so where a list would not.
         "" => {
-            let start = LEVELS.iter().position(|l| *l == current).unwrap_or(0);
-            match runner
-                .bar
-                .slide("How hard should it think?", &LEVELS, start)
-            {
-                Some(index) => LEVELS[index].to_owned(),
+            let start = stops.iter().position(|l| *l == current).unwrap_or(0);
+            match runner.bar.slide("How hard should it think?", &stops, start) {
+                // Where it already was: a level saved on a model that goes
+                // further stays saved for when that model is back.
+                Some(index) if stops[index] == current => settings.effort.clone(),
+                Some(index) => stops[index].to_owned(),
                 None => {
                     render::blank();
                     render::line(&render::dim(&format!("Left at {current}.")));
@@ -452,17 +472,23 @@ fn effort(runner: &mut Runner, rest: &str) {
         }
         asked => asked.to_lowercase(),
     };
-    runner.store.settings.effort = match chosen.as_str() {
-        "low" | "medium" | "high" => chosen,
-        _ => String::new(),
+    // Saved as named, even a level this model lacks: that is sent as the
+    // nearest it has, and as named again on a model that has it. Auto, or a
+    // word that is no level, leaves it to the model.
+    let sent = letronna_core::models::clamp(&levels, &chosen).map(|level| level.id.clone());
+    runner.store.settings.effort = if sent.is_some() {
+        chosen.clone()
+    } else {
+        String::new()
     };
     runner.persist();
     let note = footer(runner);
     runner.bar.set_footer(note);
     render::blank();
-    render::line(&render::dim(&match runner.store.settings.effort.as_str() {
-        "" => "Thinking left to the model.".to_owned(),
-        level => format!("Thinking {level}."),
+    render::line(&render::dim(&match sent {
+        None => "Thinking left to the model.".to_owned(),
+        Some(level) if level == chosen => format!("Thinking {level}."),
+        Some(level) => format!("Thinking {level}, the nearest {model} has to {chosen}."),
     }));
 }
 
