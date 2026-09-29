@@ -241,7 +241,12 @@ fn apply(
     let path = dir.join(target.file());
     // The window and the terminal both save here, so the store is read again
     // under the lock and neither writes over what the other just kept.
-    let _lock = crate::store::Lock::take(&path);
+    let _lock = crate::store::Lock::take(&path).map_err(|e| {
+        format!(
+            "{} is being written by another Letronna, so nothing was changed: {e}",
+            target.file()
+        )
+    })?;
     // Taken as empty, a file that is there but cannot be read would be
     // replaced by the one new entry.
     let raw = read_store(&path).map_err(|e| {

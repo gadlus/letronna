@@ -328,13 +328,21 @@ impl Store {
         Ok(())
     }
 
-    /// Forget a session and remove its file.
+    /// Forget a session and remove its file, and its lock file if it can
+    /// take the lock.
     pub fn remove(&mut self, index: usize) {
         if index >= self.conversations.len() {
             return;
         }
         let gone = self.conversations.remove(index);
-        let _ = std::fs::remove_file(session_path(gone.id));
+        let path = session_path(gone.id);
+        let lock = Lock::take(&path);
+        let _ = std::fs::remove_file(&path);
+        // A lock file someone else holds stays: removed, the next writer
+        // would lock a new file beside them and both would write.
+        if lock.is_ok() {
+            let _ = std::fs::remove_file(path.with_extension("lock"));
+        }
     }
 }
 
@@ -368,7 +376,7 @@ impl Conversation {
             return Ok(());
         }
         let path = session_path(self.id);
-        let _lock = Lock::take(&path);
+        let _lock = Lock::take(&path)?;
         let fresh = !path.exists();
         // Written before and gone now: the other Letronna deleted it. Writing
         // anyway brought it back as a fragment -- a head and whatever changed
@@ -680,45 +688,44 @@ fn legacy_path() -> PathBuf {
 /// The window and the terminal share these files and both append to them, so
 /// two of them can be part way through a line at the same time -- which is
 /// one corrupt record and, because a record is a whole message, one message
-/// lost. The lock is a file beside the session: made with create_new, which
-/// is atomic everywhere, and removed when the guard goes.
-pub struct Lock(PathBuf);
+/// lost. The lock is the operating system's, on a file beside the session
+/// that stays there: the system lets go of it when its holder closes the file
+/// or dies, so no lock is ever stale and no one removes a lock file from
+/// under its holder.
+pub struct Lock(std::fs::File);
 
 impl Lock {
-    /// Wait for the lock, but not forever. A process that died holding one
-    /// would otherwise keep every other process out of that session for good,
-    /// so a lock nobody has touched for a while is taken anyway.
-    pub(crate) fn take(path: &std::path::Path) -> Self {
-        let lock = path.with_extension("lock");
+    /// Wait up to a second for the lock, and fail rather than write without it.
+    pub(crate) fn take(path: &std::path::Path) -> std::io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path.with_extension("lock"))?;
         for _ in 0..40 {
-            if std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&lock)
-                .is_ok()
-            {
-                return Self(lock);
+            match file.try_lock() {
+                Ok(()) => return Ok(Self(file)),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(std::fs::TryLockError::Error(e)) => return Err(e),
             }
-            let stale = std::fs::metadata(&lock)
-                .and_then(|m| m.modified())
-                .map(|t| t.elapsed().unwrap_or_default() > std::time::Duration::from_secs(10))
-                .unwrap_or(true);
-            if stale {
-                let _ = std::fs::remove_file(&lock);
-                continue;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(25));
         }
-        // A second of waiting is long enough that something is wrong. Writing
-        // without the lock risks a torn line; not writing loses the message
-        // for certain, so it writes.
-        Self(lock)
+        // A holder keeps it for one append, so a second of waiting means
+        // something is stuck. Writing anyway could tear a line; failing
+        // leaves the messages unwritten in memory, and the next save sends
+        // them.
+        Err(std::io::Error::other(
+            "another Letronna is still writing this session",
+        ))
     }
 }
 
 impl Drop for Lock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        // Closing the file lets go too, but Windows may take its time over
+        // a lock left to the close.
+        let _ = self.0.unlock();
     }
 }
 
@@ -731,9 +738,10 @@ fn session_ids() -> Vec<u64> {
         // A lock left by a crash shares its session's stem.
         .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
         .filter_map(|e| {
-            e.path()
-                .file_stem()
-                .and_then(|s| s.to_str())
+            // Each session's lock file sits beside it under the same number.
+            e.file_name()
+                .to_str()
+                .and_then(|name| name.strip_suffix(".jsonl"))
                 .and_then(|s| s.parse().ok())
         })
         .collect()
@@ -1021,7 +1029,7 @@ mod tests {
     #[cfg(unix)]
     use super::write_private;
     use super::{
-        Conversation, Store, Todo, apply_todo, fill, load, load_listing, replay, search_in,
+        Conversation, Lock, Store, Todo, apply_todo, fill, load, load_listing, replay, search_in,
         summaries, todos_in,
     };
     use crate::chat::{Message, ToolCall};
@@ -1541,13 +1549,12 @@ mod tests {
         assert_eq!(store.settings.appearance, "");
         assert!(store.settings.grain);
         assert!(store.settings.skip_approvals);
-        // Written back, the file says so rather than switching the grain off.
+        // Saved and read again, the grain is still on and nothing else moved.
         store.save().unwrap();
-        let written: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
-        assert_eq!(written["appearance"], "");
-        assert_eq!(written["grain"], true);
-        assert_eq!(written["skip_approvals"], true);
+        let again = load().settings;
+        assert_eq!(again.appearance, "");
+        assert!(again.grain);
+        assert!(again.skip_approvals);
         // A first run, with no settings file at all, starts the same way.
         std::fs::remove_file(&file).unwrap();
         let first = load().settings;
@@ -1607,7 +1614,7 @@ mod tests {
         assert!(todos_in(&[]).is_empty());
         // A call that could not be read changed nothing, so the one before stands.
         let mut garbled = second.clone();
-        garbled.tool_calls[0].arguments = r#"{"items":"[{\"text\":\"lost\"}]"}"#.into();
+        garbled.tool_calls[0].arguments = r#"{"items": [{"text": "lost"#.into();
         assert_eq!(todos_in(&[second, garbled])[0].text, "build");
     }
 
@@ -1813,6 +1820,125 @@ mod tests {
             let back = load().settings;
             assert_eq!((back.appearance.as_str(), back.grain), (appearance, grain));
         }
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn two_writers_of_one_session_never_interleave_their_lines() {
+        use std::io::Write;
+        let dir = scratch("lock-interleave");
+        let path = dir.join("1.jsonl");
+        let writer = |tag: &'static str| {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                for _ in 0..20 {
+                    let _lock = Lock::take(&path).unwrap();
+                    // One line in two writes with a pause between, as a slow
+                    // append would be.
+                    let mut file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                        .unwrap();
+                    file.write_all(tag.as_bytes()).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    file.write_all(b" end\n").unwrap();
+                }
+            })
+        };
+        let (first, second) = (writer("first"), writer("second"));
+        first.join().unwrap();
+        second.join().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 40);
+        assert!(text.lines().all(|l| l == "first end" || l == "second end"));
+    }
+
+    #[test]
+    fn a_save_that_cannot_take_the_lock_writes_nothing_and_the_next_catches_up() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("lock-timeout");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        store.conversations.push(Conversation {
+            id: 1,
+            messages: vec![said("user", "hello")],
+            ..Default::default()
+        });
+        store.save().unwrap();
+        let path = dir.join("sessions/1.jsonl");
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        store.conversations[0]
+            .messages
+            .push(said("assistant", "hi"));
+        let held = Lock::take(&path).unwrap();
+        assert!(store.save().is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        drop(held);
+        store.save().unwrap();
+        let back = replay(&path).unwrap();
+        assert_eq!(back.messages.len(), 2);
+        assert_eq!(back.messages[1].content, "hi");
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_lock_whose_holder_is_gone_is_free_at_once() {
+        let dir = scratch("lock-gone");
+        let path = dir.join("1.jsonl");
+        // What a process that dies holding the lock leaves behind: the file,
+        // locked until the system closes it.
+        let holder = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path.with_extension("lock"))
+            .unwrap();
+        holder.lock().unwrap();
+        drop(holder);
+        let started = std::time::Instant::now();
+        assert!(Lock::take(&path).is_ok());
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+    }
+
+    #[test]
+    fn a_lock_file_is_never_removed_from_under_its_holder() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("lock-owner");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        for id in [1, 2] {
+            store.conversations.push(Conversation {
+                id,
+                messages: vec![said("user", "hello")],
+                ..Default::default()
+            });
+        }
+        store.save().unwrap();
+        // The lock files beside them are not sessions.
+        assert_eq!(summaries().len(), 2);
+        let (one, two) = (dir.join("sessions/1.jsonl"), dir.join("sessions/2.jsonl"));
+
+        // Waiting in vain and letting go both leave the file where it is.
+        let held = Lock::take(&one).unwrap();
+        assert!(Lock::take(&one).is_err());
+        assert!(one.with_extension("lock").exists());
+        drop(held);
+        assert!(one.with_extension("lock").exists());
+
+        // Removing a session removes its lock file only if nobody holds it.
+        let held = Lock::take(&two).unwrap();
+        store.remove(1);
+        assert!(!two.exists());
+        assert!(two.with_extension("lock").exists());
+        drop(held);
+        store.remove(0);
+        assert!(!one.exists());
+        assert!(!one.with_extension("lock").exists());
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 }

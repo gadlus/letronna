@@ -35,7 +35,7 @@ pub(crate) fn read<T: DeserializeOwned + Default>(path: &Path) -> Result<T, Stri
         // lock, but moving one aside does: without it, the good file the
         // other process has just put there could be the one moved.
         Found::Bad => {
-            let _lock = Lock::take(path);
+            let _lock = Lock::take(path).map_err(|e| e.to_string())?;
             settle::<T>(path)?.map(|(parsed, _)| parsed)
         }
     };
@@ -48,7 +48,7 @@ pub(crate) fn update<T: DeserializeOwned>(
     path: &Path,
     change: impl FnOnce(&mut Value),
 ) -> Result<(), String> {
-    let _lock = Lock::take(path);
+    let _lock = Lock::take(path).map_err(|e| e.to_string())?;
     let before = settle::<T>(path)?
         .map(|(_, value)| value)
         .unwrap_or_default();
@@ -271,7 +271,10 @@ mod tests {
             disk["Mistral"] = json!("m-3");
         })
         .unwrap();
-        assert!(!lock.exists());
+        assert!(
+            crate::store::Lock::take(&path).is_ok(),
+            "the lock was not let go"
+        );
         assert_eq!(read::<Keys>(&path).unwrap().len(), 3);
     }
 
