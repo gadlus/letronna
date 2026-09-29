@@ -262,12 +262,21 @@ pub fn ran_commands(dropped: &[Message]) -> bool {
 /// changed, for git to be asked about. One outside is not the project's.
 pub fn written(messages: &[Message], workspace: &Path) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = Vec::new();
+    // Found once, not per change as `label` would: the window lists these
+    // on every frame, and a long session has written hundreds of times.
+    let real = real(Some(workspace));
+    let roots = [Some(workspace), real.as_deref()];
     let changes = messages
         .iter()
         .filter(|m| m.role == "tool")
         .flat_map(|m| &m.files);
     for change in changes {
-        let file = PathBuf::from(label(&change.path, Some(workspace)));
+        let file = roots
+            .iter()
+            .flatten()
+            .find_map(|root| change.path.strip_prefix(root).ok())
+            .unwrap_or(&change.path)
+            .to_path_buf();
         if file.is_relative() && !files.contains(&file) {
             files.push(file);
         }
@@ -995,5 +1004,24 @@ mod tests {
         };
         let files = written(&[one, two, again, outside], &project);
         assert_eq!(files, vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_session_s_files_are_found_through_a_linked_project_folder() {
+        let (project, _) = scratch("written-link");
+        let link = project.with_file_name("link");
+        std::os::unix::fs::symlink(&project, &link).unwrap();
+        let real = std::fs::canonicalize(&project).unwrap();
+        let wrote = Message {
+            role: "tool".into(),
+            files: vec![FileChange {
+                path: real.join("src").join("a.txt"),
+                ..FileChange::default()
+            }],
+            ..Default::default()
+        };
+        let files = written(&[wrote], &link);
+        assert_eq!(files, vec![Path::new("src").join("a.txt")]);
     }
 }
