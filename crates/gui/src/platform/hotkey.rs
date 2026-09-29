@@ -55,8 +55,8 @@ pub(crate) fn init(spec: &str, cx: &mut App) {
 
 /// Swap the registered shortcut for `spec`. Returns whether it took: a spec
 /// that does not parse, a platform with no manager (Wayland), or a chord
-/// already grabbed by something else all report failure the same way, since
-/// none of them leave anything registered.
+/// already grabbed by something else all report failure the same way, and
+/// each leaves the shortcut that was registered before as it was.
 pub(crate) fn rebind(spec: &str, cx: &mut App) -> bool {
     let Ok(hotkey) = spec.trim().parse::<HotKey>() else {
         return false;
@@ -65,12 +65,35 @@ pub(crate) fn rebind(spec: &str, cx: &mut App) -> bool {
         return false;
     }
     let state = cx.global_mut::<Registered>();
-    if let Some(old) = state.current.take() {
-        let _ = state.manager.unregister(old);
+    if state.current == Some(hotkey) {
+        return true;
     }
+    // The new chord first: a spec another program already holds must leave
+    // the working shortcut alone, which Settings tells the user it did.
     if state.manager.register(hotkey).is_err() {
         return false;
     }
-    state.current = Some(hotkey);
+    if let Some(old) = state.current.replace(hotkey) {
+        let _ = state.manager.unregister(old);
+    }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
+    // would shadow the built-in attribute.
+    use super::DEFAULT;
+    use global_hotkey::hotkey::HotKey;
+
+    #[test]
+    fn the_default_shortcut_parses() {
+        assert!(DEFAULT.parse::<HotKey>().is_ok());
+    }
+
+    #[test]
+    fn a_spelling_slip_does_not_parse() {
+        assert!("ctrl+shift+".parse::<HotKey>().is_err());
+        assert!("hyper+spaec".parse::<HotKey>().is_err());
+    }
 }
