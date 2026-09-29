@@ -44,9 +44,20 @@ fn grammars() -> Vec<Grammar> {
                 "typescript",
                 tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
                 vec![],
-                tree_sitter_typescript::HIGHLIGHTS_QUERY,
+                // The TypeScript grammar's own query only names what
+                // JavaScript lacks (types, `interface`); keywords, strings and
+                // functions come from JavaScript's, which has to come first.
+                &format!(
+                    "{}\n{}",
+                    tree_sitter_javascript::HIGHLIGHT_QUERY,
+                    tree_sitter_typescript::HIGHLIGHTS_QUERY
+                ),
                 "",
-                tree_sitter_typescript::LOCALS_QUERY,
+                &format!(
+                    "{}\n{}",
+                    tree_sitter_javascript::LOCALS_QUERY,
+                    tree_sitter_typescript::LOCALS_QUERY
+                ),
             ),
         },
         Grammar {
@@ -174,6 +185,43 @@ mod tests {
                 canonical,
                 "{alias:?} resolved to {:?}, not {canonical:?}",
                 config.name
+            );
+        }
+    }
+
+    /// Which capture names a fence of `lang` colours, so a query that fails to
+    /// compile (the highlighter then silently falls back to JSON) is caught.
+    fn coloured(lang: &str, code: &str) -> Vec<String> {
+        use gpui_component::Rope;
+        use gpui_component::highlighter::{HighlightTheme, SyntaxHighlighter};
+        register();
+        let mut highlighter = SyntaxHighlighter::new(lang);
+        highlighter.update(None, &Rope::from_str(code));
+        highlighter
+            .styles(&(0..code.len()), &HighlightTheme::default_dark())
+            .iter()
+            .map(|(range, _)| code[range.clone()].to_string())
+            .collect()
+    }
+
+    #[test]
+    fn every_grammar_colours_its_own_keywords_and_strings() {
+        let samples = [
+            ("rust", "fn main() { let x = \"hi\"; }", "fn"),
+            ("typescript", "const x: string = \"hi\";", "const"),
+            ("typescript", "interface A { b: number }", "interface"),
+            ("javascript", "function f() { return \"hi\"; }", "function"),
+            ("python", "def f():\n    return \"hi\"", "def"),
+            ("toml", "[a]\nb = \"hi\"", "\"hi\""),
+            ("yaml", "a: \"hi\"", "\"hi\""),
+            ("bash", "if true; then echo \"hi\"; fi", "if"),
+            ("diff", "--- a\n+++ b\n@@ -1 +1 @@\n-x\n+y\n", "+y"),
+        ];
+        for (lang, code, want) in samples {
+            let parts = coloured(lang, code);
+            assert!(
+                parts.iter().any(|part| part == want),
+                "{lang}: {want:?} was not coloured, got {parts:?}"
             );
         }
     }
