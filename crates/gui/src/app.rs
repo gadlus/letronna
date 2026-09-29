@@ -609,7 +609,8 @@ impl Chat {
         .detach();
     }
 
-    /// A model and the gateway it is on, chosen together.
+    /// A model and the gateway it is on, chosen together, for the session on
+    /// screen and new sessions.
     pub(crate) fn choose_model(
         &mut self,
         gateway: String,
@@ -619,8 +620,7 @@ impl Chat {
     ) {
         self.model
             .update(cx, |input, cx| input.set_value(id.clone(), window, cx));
-        self.store.settings.gateway = gateway;
-        self.store.settings.model = id;
+        self.store.choose_model(self.store.active, &gateway, &id);
         self.model_open = false;
         self.focus_composer(window, cx);
         self.save();
@@ -708,25 +708,23 @@ impl Chat {
         remote: Option<letronna_core::chat::Remote>,
         cx: &mut Context<Self>,
     ) -> std::result::Result<(), ()> {
+        let active = self.store.active;
+        let (gateway, model) = self.store.model(active);
         let saved = self
             .keys
-            .get(key_slot(&self.store.settings.gateway))
+            .get(key_slot(gateway))
             .cloned()
             .unwrap_or_default();
-        let (endpoint, key) = resolve(
-            &self.store.settings.gateway,
-            &self.store.settings.custom_endpoint,
-            &saved,
-        );
+        let (endpoint, key) = resolve(gateway, &self.store.settings.custom_endpoint, &saved);
         let session = self.store.conversations[self.store.active].id;
         let connection = Connection {
             endpoint,
-            model: self.model.read(cx).value().to_string(),
+            model: model.to_owned(),
             key,
             tools: true,
             workspace: None,
             plan: self.mode(session) == letronna_core::gate::Mode::Plan,
-            effort: self.store.settings.effort.clone(),
+            effort: self.store.effort(active).to_owned(),
             search: self.store.settings.search,
             // A schedule's run and a chat app's turn may have nobody watching.
             unattended: remote.is_some()
@@ -742,7 +740,7 @@ impl Chat {
             return Err(());
         }
         self.store.settings.endpoint = connection.endpoint.clone();
-        self.store.settings.model = connection.model.clone();
+        self.store.pin(active);
         let conversation = &mut self.store.conversations[self.store.active];
         // Name an untitled session after its first prompt, but leave a name
         // that was set deliberately, such as a scheduled job's.
@@ -758,6 +756,7 @@ impl Chat {
             ..Default::default()
         });
         let target_id = conversation.id;
+        let model = connection.model.clone();
         self.busy = true;
         self.streaming_id = Some(target_id);
         self.turn = Some(agent::Turn::new(connection));
@@ -768,7 +767,7 @@ impl Chat {
         plugins::emit(
             cx,
             plugins::AppEvent::ChatStarted {
-                model: self.store.settings.model.clone(),
+                model,
                 title: convo_title,
             },
         );
@@ -905,10 +904,10 @@ impl Chat {
 
     /// A reply finished: store it, then either run what it asked for or stop.
     fn on_reply(&mut self, cx: &mut Context<Self>) {
-        let model = self.store.settings.model.clone();
         let Some(turn) = self.turn.as_mut() else {
             return;
         };
+        let model = turn.connection.model.clone();
         let reply = turn.take_reply(&model);
         let calls = reply.tool_calls.clone();
         let continuation = turn.continuation();
@@ -1578,7 +1577,6 @@ impl Chat {
     /// Save what a stopped turn got to, so the model hears next time what ran
     /// and what did not.
     fn keep_stopped(&mut self) {
-        let model = self.store.settings.model.clone();
         let running = std::mem::take(&mut self.call_running);
         let Some(turn) = self.turn.as_mut() else {
             return;
@@ -1586,6 +1584,7 @@ impl Chat {
         if running {
             turn.finish_call(Err(agent::STOPPED_WHILE_RUNNING.into()));
         }
+        let model = turn.connection.model.clone();
         let kept = turn.stop(&model);
         let Some(ix) = self.streaming_id.and_then(|id| self.store.index_of(id)) else {
             return;
@@ -1927,7 +1926,7 @@ impl Render for Chat {
                 if let Some(live) = self.turn.as_ref().filter(|_| idle).map(|turn| Message {
                     role: "assistant".into(),
                     content: turn.live.content.clone(),
-                    model: self.store.settings.model.clone(),
+                    model: turn.connection.model.clone(),
                     reasoning: turn.live.reasoning.clone(),
                     tokens: turn.live.tokens,
                     per_second: turn.live.per_second,

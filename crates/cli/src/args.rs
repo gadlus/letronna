@@ -24,6 +24,9 @@ Options
                            plan, dont-ask or bypass
       --yes                --mode bypass: run tools without asking, bar risky ones
       --plan               --mode plan: read and search only; never write or run
+      --model <id>         this session's model, leaving the default as it is
+      --gateway <name>     the gateway that model is on
+      --effort <level>     how hard it thinks in this session, or auto
       --offline            with doctor: leave the network alone
   -h, --help               this
   -V, --version            which version this is
@@ -48,6 +51,10 @@ pub struct Args {
     /// The mode from `--mode`, `--yes` or `--plan`, or why `--mode` named
     /// none.
     pub mode: Result<Mode, String>,
+    /// The session's own model, gateway and effort, for this run and after.
+    pub model: Option<String>,
+    pub gateway: Option<String>,
+    pub effort: Option<String>,
     pub help: bool,
     pub version: bool,
     pub gui: bool,
@@ -64,6 +71,9 @@ pub fn parse(mut raw: impl Iterator<Item = String>) -> Args {
         prompt: None,
         start: Start::Fresh,
         mode: Ok(Mode::Default),
+        model: None,
+        gateway: None,
+        effort: None,
         help: false,
         version: false,
         gui: false,
@@ -92,6 +102,9 @@ pub fn parse(mut raw: impl Iterator<Item = String>) -> Args {
             "--mode" => mode = Some(Mode::parse(&raw.next().unwrap_or_default())),
             "--yes" => yes = true,
             "--plan" => plan = true,
+            "--model" => args.model = raw.next(),
+            "--gateway" => args.gateway = raw.next(),
+            "--effort" => args.effort = raw.next(),
             "setup" | "--install" => args.install = true,
             "--uninstall" => args.uninstall = true,
             "-h" | "--help" => args.help = true,
@@ -170,6 +183,14 @@ mod tests {
         assert_eq!(edits.prompt.as_deref(), Some("tidy up"));
         assert!(args(&["--mode", "auto"]).mode.is_err());
         assert!(args(&["--mode"]).mode.is_err());
+        // The word after each is its value, not the prompt.
+        let chosen = args(&["--model", "x/y", "--gateway", "openrouter", "hi"]);
+        assert_eq!(chosen.model.as_deref(), Some("x/y"));
+        assert_eq!(chosen.gateway.as_deref(), Some("openrouter"));
+        assert_eq!(chosen.prompt.as_deref(), Some("hi"));
+        let effort = args(&["--effort", "high", "hi"]);
+        assert_eq!(effort.effort.as_deref(), Some("high"));
+        assert_eq!(effort.prompt.as_deref(), Some("hi"));
         assert!(args(&["-h"]).help);
         assert!(args(&["--version"]).version && args(&["-V"]).version);
     }

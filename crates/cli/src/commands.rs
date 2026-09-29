@@ -89,7 +89,7 @@ pub fn command(
             Flow::Handled
         }
         "/model" => {
-            switch_model(runner, rest);
+            switch_model(runner, Some(*session), rest);
             Flow::Handled
         }
         "/gateways" => {
@@ -124,7 +124,7 @@ pub fn command(
             Flow::Handled
         }
         "/effort" => {
-            effort(runner, rest);
+            effort(runner, *session, rest);
             Flow::Handled
         }
         "/thinking" => {
@@ -455,22 +455,23 @@ pub fn open_in_browser(url: &str) {
     }
 }
 
-/// How hard the model should think, from the levels the model in use offers.
+/// How hard the model should think in this session and new ones, from the
+/// levels the session's model offers.
 ///
 /// On a model that can be told, this is the difference between sixty-four
 /// reasoning tokens and seven hundred. The levels come from its gateway's
 /// model list, or are low, medium and high when the list does not say.
-fn effort(runner: &mut Runner, rest: &str) {
+fn effort(runner: &mut Runner, session: usize, rest: &str) {
     // This terminal only asks for the gateway's list with its first request
     // or /model, and the levels are on it.
-    let (endpoint, key) = runner.route();
+    let (endpoint, key) = runner.route(session);
     if let Some(asked) = letronna_core::models::ask_for_list(&endpoint, &key) {
         runner.bar.busy("asking what the model offers", move || {
             letronna_core::models::wait_for_list(asked)
         });
     }
-    let settings = &runner.store.settings;
-    let model = settings.model.clone();
+    let model = runner.store.model(session).1.to_owned();
+    let saved = runner.store.effort(session).to_owned();
     let levels = letronna_core::models::efforts(&endpoint, &model);
     if levels.is_empty() {
         render::blank();
@@ -484,8 +485,8 @@ fn effort(runner: &mut Runner, rest: &str) {
         .collect();
     // What goes with the next request, which for a level saved on another
     // model is the nearest this one offers.
-    let current = letronna_core::models::clamp(&levels, &settings.effort)
-        .map_or("auto", |level| level.id.as_str());
+    let current =
+        letronna_core::models::clamp(&levels, &saved).map_or("auto", |level| level.id.as_str());
     let chosen = match rest {
         // Nothing named: slide to it. Effort is a point on one line from
         // less to more, and a slider says so where a list would not.
@@ -494,7 +495,7 @@ fn effort(runner: &mut Runner, rest: &str) {
             match runner.bar.slide("How hard should it think?", &stops, start) {
                 // Where it already was: a level saved on a model that goes
                 // further stays saved for when that model is back.
-                Some(index) if stops[index] == current => settings.effort.clone(),
+                Some(index) if stops[index] == current => saved.clone(),
                 Some(index) => stops[index].to_owned(),
                 None => {
                     render::blank();
@@ -509,11 +510,8 @@ fn effort(runner: &mut Runner, rest: &str) {
     // nearest it has, and as named again on a model that has it. Auto, or a
     // word that is no level, leaves it to the model.
     let sent = letronna_core::models::clamp(&levels, &chosen).map(|level| level.id.clone());
-    runner.store.settings.effort = if sent.is_some() {
-        chosen.clone()
-    } else {
-        String::new()
-    };
+    let effort = if sent.is_some() { chosen.as_str() } else { "" };
+    runner.store.choose_effort(session, effort);
     runner.persist();
     let note = footer(runner);
     runner.bar.set_footer(note);
@@ -961,6 +959,9 @@ fn branch(runner: &mut Runner, session: &mut usize, name: &str) {
         updated: letronna_core::chat::now(),
         workspace: from.workspace.clone(),
         todos: from.todos.clone(),
+        model: from.model.clone(),
+        gateway: from.gateway.clone(),
+        effort: from.effort.clone(),
         ..Default::default()
     };
     history::share(from.id, copy.id);
@@ -1036,19 +1037,24 @@ fn switch_media(runner: &mut Runner, kind: &'static str, label: &str) {
     }
 }
 
-/// Change the model, picking from what every set-up gateway actually offers.
-/// `filter` narrows the list (by model or gateway name), and an exact model
-/// name skips the asking entirely.
-pub fn switch_model(runner: &mut Runner, filter: &str) {
+/// Change the model of `session` and of new sessions -- only the latter
+/// before there is a session, in setup -- picking from what every set-up
+/// gateway actually offers. `filter` narrows the list (by model or gateway
+/// name), and an exact model name skips the asking entirely.
+pub fn switch_model(runner: &mut Runner, session: Option<usize>, filter: &str) {
     // `/model image`, `/model video`: what makes those, not the chat model.
     if let Some((kind, label)) = media_kind(filter) {
         switch_media(runner, kind, label);
         return;
     }
-    let settings = &runner.store.settings;
     let keys = store::load_keys();
-    let custom = settings.custom_endpoint.clone();
-    let current = format!("{} · {}", settings.model, settings.gateway);
+    let custom = runner.store.settings.custom_endpoint.clone();
+    let settings = &runner.store.settings;
+    let (gateway, model) = match session {
+        Some(index) => runner.store.model(index),
+        None => (settings.gateway.as_str(), settings.model.as_str()),
+    };
+    let current = format!("{model} · {gateway}");
 
     render::blank();
     render::said(&render::blue("●"), &render::bold("Models"));
@@ -1074,7 +1080,7 @@ pub fn switch_model(runner: &mut Runner, filter: &str) {
     // An exact name is an instruction, not a search.
     if let Some(exact) = models.iter().find(|(_, m)| m.eq_ignore_ascii_case(filter)) {
         let (gateway, model) = exact.clone();
-        set_model(runner, gateway, model);
+        set_model(runner, session, gateway, model);
         return;
     }
 
@@ -1111,15 +1117,20 @@ pub fn switch_model(runner: &mut Runner, filter: &str) {
         return;
     };
     match shown.get(picked) {
-        Some((gateway, model)) => set_model(runner, gateway.clone(), model.clone()),
+        Some((gateway, model)) => set_model(runner, session, gateway.clone(), model.clone()),
         None => render::line(&render::dim("Left as it was.")),
     }
 }
 
 /// A model and the gateway it is on, chosen together.
-fn set_model(runner: &mut Runner, gateway: String, model: String) {
-    runner.store.settings.gateway = gateway.clone();
-    runner.store.settings.model = model.clone();
+fn set_model(runner: &mut Runner, session: Option<usize>, gateway: String, model: String) {
+    match session {
+        Some(index) => runner.store.choose_model(index, &gateway, &model),
+        None => {
+            runner.store.settings.gateway = gateway.clone();
+            runner.store.settings.model = model.clone();
+        }
+    }
     runner.persist();
     let note = footer(runner);
     runner.bar.set_footer(note);

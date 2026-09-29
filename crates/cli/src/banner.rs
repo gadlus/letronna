@@ -71,7 +71,7 @@ pub fn folder_name(workspace: Option<&std::path::Path>) -> String {
 pub fn banner(runner: &Runner, folder: &str, session: usize) {
     render::blank();
 
-    let settings = &runner.store.settings;
+    let (gateway, model) = runner.store.model(session);
     let conversation = &runner.store.conversations[session];
     let mut facts = vec![
         format!(
@@ -81,8 +81,8 @@ pub fn banner(runner: &Runner, folder: &str, session: usize) {
         ),
         String::new(),
         fact("project", folder),
-        fact("model", &settings.model),
-        fact("gateway", &settings.gateway),
+        fact("model", model),
+        fact("gateway", gateway),
         fact(
             "session",
             &match conversation.messages.len() {
@@ -137,12 +137,16 @@ pub fn banner(runner: &Runner, folder: &str, session: usize) {
 /// enter.
 pub fn footer(runner: &Runner) -> String {
     let settings = &runner.store.settings;
-    let mut parts = vec![settings.model.clone(), settings.gateway.clone()];
+    // The session on screen is always the store's active one here.
+    let session = runner.store.active;
+    let (gateway, model) = runner.store.model(session);
+    let mut parts = vec![model.to_owned(), gateway.to_owned()];
     if runner.mode != Mode::Default {
         parts.push(format!("{} mode", runner.mode.label().to_lowercase()));
     }
-    if !settings.effort.is_empty() {
-        parts.push(format!("thinking {}", settings.effort));
+    let effort = runner.store.effort(session);
+    if !effort.is_empty() {
+        parts.push(format!("thinking {effort}"));
     }
     if settings.search {
         parts.push("web".into());
