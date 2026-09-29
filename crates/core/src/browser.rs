@@ -1457,15 +1457,15 @@ fn with_session<T>(
     in_session(ctx.conversation, 2, &ctx.cancel, act)
 }
 
-/// `with_session` with no second go, for a print or a picture of the whole
-/// page: one of a huge page may itself be what broke the tab, and would
-/// take as long again only to break it again.
 /// `with_session` for the conversation the window shows, for what the
 /// user does there, which no tool call's stop ends.
 fn for_window<T>(act: impl Fn(&mut Session) -> Result<T, String>) -> Result<T, String> {
     in_session(shown().load(Ordering::Relaxed), 2, &Cancel::default(), act)
 }
 
+/// `with_session` with no second go, for a print or a picture of the whole
+/// page: one of a huge page may itself be what broke the tab, and would
+/// take as long again only to break it again.
 fn with_session_once<T>(
     ctx: &ToolContext,
     act: impl Fn(&mut Session) -> Result<T, String>,
