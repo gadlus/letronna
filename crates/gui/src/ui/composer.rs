@@ -605,6 +605,16 @@ impl Chat {
         // in the meantime; `send` holds it until the reply is done.
         let input = div()
             .min_w_0()
+            .key_context("Composer")
+            // Ctrl+Enter sends now what Enter would queue for the next step.
+            // With nothing running it stays the new line it always was.
+            .on_action(cx.listener(|this, _: &SendNow, window, cx| {
+                if !this.busy {
+                    return cx.propagate();
+                }
+                this.send(window, cx);
+                this.send_now(cx);
+            }))
             .child(Input::new(&self.composer).w_full().appearance(false));
         let controls = h_flex()
             .items_center()

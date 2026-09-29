@@ -275,6 +275,17 @@ impl Chat {
     /// A message sent while the reply runs, waiting for the reply's next
     /// step: your card, faded, with a way to take it back first.
     pub(crate) fn queued_row(&self, n: usize, text: &str, cx: &mut Context<Self>) -> AnyElement {
+        let key = if cfg!(target_os = "macos") {
+            "⌘Enter"
+        } else {
+            "Ctrl+Enter"
+        };
+        // Sending now never stops a running tool, so then it waits for it.
+        let now = if self.turn.as_ref().is_some_and(cuts_in) {
+            format!("Send now, stopping the reply where it is ({key})")
+        } else {
+            format!("Send as soon as the tool is done ({key})")
+        };
         v_flex()
             .w_full()
             .gap_1()
@@ -289,6 +300,14 @@ impl Chat {
                     .child(
                         h_flex()
                             .gap_0p5()
+                            .child(
+                                Button::new(("queued-now", n))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(Icon::new(IconName::ArrowUp))
+                                    .tooltip(now)
+                                    .on_click(cx.listener(|this, _, _, cx| this.send_now(cx))),
+                            )
                             .child(
                                 Button::new(("queued-back", n))
                                     .ghost()

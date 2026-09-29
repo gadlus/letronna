@@ -11,7 +11,10 @@ pub(crate) const GREETINGS: &[&str] = &[
     "Ready when you are.",
 ];
 
-actions!(letronna, [NewSession, Dismiss, ToggleSidebar, OpenSettings]);
+actions!(
+    letronna,
+    [NewSession, Dismiss, ToggleSidebar, OpenSettings, SendNow]
+);
 
 /// How near the bottom still counts as at it: a line or two, so a reply
 /// that grew a little since the last look is still followed.
@@ -1088,29 +1091,66 @@ impl Chat {
                 if let Some(ix) = self.streaming_id.and_then(|id| self.store.index_of(id)) {
                     let conversation = &mut self.store.conversations[ix];
                     conversation.messages.extend(results);
-                    // After the results, which have to follow the calls they
-                    // answer, and before what you typed, so yours is read last.
-                    conversation
-                        .messages
-                        .extend(inbox::fold(&inbox::take(conversation.id, false)));
-                    // What you sent while it worked goes in now: after the
-                    // tool results, before the model is asked again, so it
-                    // reads it before going on.
-                    conversation
-                        .messages
-                        .extend(self.follow_ups.drain(..).map(|text| Message {
-                            role: "user".into(),
-                            content: text,
-                            folded: true,
-                            ..Default::default()
-                        }));
-                    self.save();
-                    self.run_turn(cx);
+                    self.fold_and_ask(ix, cx);
                 } else {
                     self.finish(cx);
                 }
             }
         }
+    }
+
+    /// Ask the model again, with what came in meanwhile after the tool
+    /// results or the reply cut short.
+    fn fold_and_ask(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let conversation = &mut self.store.conversations[ix];
+        // After the results, which have to follow the calls they answer, and
+        // before what you typed, so yours is read last.
+        conversation
+            .messages
+            .extend(inbox::fold(&inbox::take(conversation.id, false)));
+        // What you sent while it worked goes in now, before the model is
+        // asked again, so it reads it before going on.
+        conversation
+            .messages
+            .extend(self.follow_ups.drain(..).map(|text| Message {
+                role: "user".into(),
+                content: text,
+                folded: true,
+                ..Default::default()
+            }));
+        self.save();
+        self.run_turn(cx);
+    }
+
+    /// Send what is queued now, cutting short a reply still coming in; a
+    /// running tool is never stopped, and what is queued goes in when it
+    /// returns.
+    pub(crate) fn send_now(&mut self, cx: &mut Context<Self>) {
+        let here = self.store.conversations[self.store.active].id;
+        if self.streaming_id != Some(here)
+            || self.follow_ups.is_empty()
+            || !self.turn.as_ref().is_some_and(cuts_in)
+        {
+            return;
+        }
+        let Some(ix) = self.store.index_of(here) else {
+            return;
+        };
+        let model = self.store.settings.model.clone();
+        let Some(turn) = self.turn.as_mut() else {
+            return;
+        };
+        // What the stream still sends belongs to the reply cut short, and is
+        // dropped; dropping it also ends the stream.
+        self.generation += 1;
+        let reply = turn.take_reply(&model);
+        // Kept as far as it got, so the model reads what it had said before
+        // you cut in. With no words yet there is nothing to keep, and some
+        // providers refuse an empty reply.
+        if !reply.content.trim().is_empty() || !reply.tool_calls.is_empty() {
+            self.store.conversations[ix].messages.push(reply);
+        }
+        self.fold_and_ask(ix, cx);
     }
 
     /// Run one call off the UI thread and continue the queue when it returns;
@@ -2259,13 +2299,22 @@ fn woken(on_screen: u64, pending: &[u64], wakes: impl Fn(u64) -> bool) -> Option
         .min_by_key(|&id| id != on_screen)
 }
 
+/// Whether sending now cuts in at once, which it does only while a reply is
+/// coming in and never while its tools run or wait on you.
+pub(crate) fn cuts_in(turn: &agent::Turn) -> bool {
+    matches!(
+        turn.next(|_| letronna_core::gate::Outcome::Run),
+        agent::Next::Done
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::woken;
     use letronna_core::gate::Mode;
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
-    use super::front_call;
+    use super::{cuts_in, front_call};
     use letronna_core::agent::{Next, Turn};
     use letronna_core::chat::{Connection, ToolCall};
     use letronna_core::gate::{Gate, Grants, decide};
@@ -2342,5 +2391,22 @@ mod tests {
         assert_eq!(woken(3, &[3, 7, 5], |id| id != 3), Some(7));
         assert_eq!(woken(3, &[3], |id| id != 3), None);
         assert_eq!(woken(3, &[], any), None);
+    }
+
+    #[test]
+    fn sending_now_cuts_into_a_reply_but_never_into_a_tool() {
+        let mut turn = Turn::new(Connection::default());
+        assert!(cuts_in(&turn), "the first reply is coming in");
+        let call = ToolCall {
+            id: "call-1".into(),
+            name: "run_command".into(),
+            arguments: "{}".into(),
+        };
+        assert!(turn.begin(vec![call]));
+        assert!(!cuts_in(&turn), "its tool is running or waiting on you");
+        turn.finish_call(Ok("done".into()));
+        assert!(!cuts_in(&turn), "its result is on the way to the model");
+        turn.take_results();
+        assert!(cuts_in(&turn), "the next reply is coming in");
     }
 }
