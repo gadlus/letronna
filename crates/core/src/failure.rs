@@ -105,6 +105,10 @@ impl fmt::Display for Failure {
 /// The role a failed turn is kept under in its session.
 pub const ROLE: &str = "failure";
 
+/// The longest wait worth offering to come back after. A `Retry-After` of
+/// years has no time of day to show and would tick on the row for as long.
+const LONGEST_KEPT_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// What a session keeps of a failed turn beside its words.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Kept {
@@ -143,6 +147,7 @@ impl Failure {
         let until = self
             .retry_after
             .filter(|wait| crate::retry::passes(self.kind) && wait.as_secs() > 0)
+            .filter(|wait| *wait <= LONGEST_KEPT_WAIT)
             .map(|wait| now.saturating_add(wait.as_secs()));
         Some(Message {
             role: ROLE.into(),
@@ -846,6 +851,10 @@ mod tests {
         let mut refused = Failure::new(FailureKind::Auth, "Bad key.");
         refused.retry_after = Some(Duration::from_secs(300));
         let message = refused.kept("m", false, 1_000).unwrap();
+        assert_eq!(message.failed.unwrap().until, None);
+        // A wait of years is no time anyone could be offered to come back at.
+        limited.retry_after = Some(Duration::from_secs(1_000_000_000_000_000_000));
+        let message = limited.kept("m", false, 1_000).unwrap();
         assert_eq!(message.failed.unwrap().until, None);
         assert!(
             Failure::new(FailureKind::Stopped, "Stopped.")
