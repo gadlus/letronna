@@ -26,6 +26,7 @@
 //! is never written down: after a restart the model is asked again anyway.
 
 use crate::chat::{Connection, Message};
+use crate::usage::Usage;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hasher};
@@ -96,6 +97,7 @@ pub fn summary(
     window: usize,
     compacting: impl FnOnce(),
     made: impl FnOnce(&str),
+    mut spent: impl FnMut(Usage),
 ) -> Option<String> {
     // A fresh summary, the first of a long session after a restart or of a
     // big window's step, reads as much of what was dropped as the window
@@ -110,7 +112,11 @@ pub fn summary(
         Instant::now(),
         |earlier, transcript| {
             compacting();
-            let reply = ask(connection, earlier, transcript);
+            // What asking took is told whatever came of it.
+            let reply = ask(connection, earlier, transcript).map(|(text, usage)| {
+                spent(usage);
+                text
+            });
             // What `summary_in` takes for a summary rather than a failure.
             answered = reply.as_ref().is_ok_and(|text| !text.trim().is_empty());
             reply
@@ -463,14 +469,19 @@ fn line(text: &str) -> String {
     cut(text.trim().lines().next().unwrap_or_default(), LINE_CHARS)
 }
 
-/// One summary from the model the conversation is using, not streamed.
-fn ask(connection: &Connection, earlier: Option<&str>, transcript: &str) -> Result<String, String> {
+/// One summary from the model the conversation is using, not streamed, and
+/// what it took.
+fn ask(
+    connection: &Connection,
+    earlier: Option<&str>,
+    transcript: &str,
+) -> Result<(String, Usage), String> {
     let endpoint = crate::chat::validate(connection)?;
     let input = match earlier {
         Some(earlier) => format!("Earlier summary:\n{earlier}\n\nNew messages:\n{transcript}"),
         None => format!("Messages:\n{transcript}"),
     };
-    let body = json!({
+    let mut body = json!({
         "model": connection.model.trim(),
         "messages": [
             {"role": "system", "content": INSTRUCTIONS},
@@ -479,6 +490,9 @@ fn ask(connection: &Connection, earlier: Option<&str>, transcript: &str) -> Resu
         "stream": false,
         "max_tokens": 1500,
     });
+    if crate::usage::asks_cost(&connection.endpoint) {
+        body["usage"] = json!({"include": true});
+    }
     let mut request = post(endpoint)?.json(&body);
     if !connection.key.trim().is_empty() {
         request = request.bearer_auth(connection.key.trim());
@@ -488,11 +502,14 @@ fn ask(connection: &Connection, earlier: Option<&str>, transcript: &str) -> Resu
         .and_then(|r| r.error_for_status())
         .and_then(|r| r.json())
         .map_err(|e| e.to_string())?;
-    crate::chat::unwrap_response(&value)?
+    let reply = crate::chat::unwrap_response(&value)?;
+    let text = reply
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)
         .map(str::to_owned)
-        .ok_or_else(|| "No summary came back.".to_owned())
+        .ok_or_else(|| "No summary came back.".to_owned())?;
+    let usage = Usage::read(&reply["usage"]).priced(&connection.endpoint, &connection.model);
+    Ok((text, usage))
 }
 
 /// A summary request to `endpoint`, on the chat's connection but with a

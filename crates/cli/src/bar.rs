@@ -124,6 +124,10 @@ pub const COMMANDS: &[Command] = &[
         blurb: "show the project folder and session file",
     },
     Command {
+        name: "/usage",
+        blurb: "tokens and cost: this session, by day and by model",
+    },
+    Command {
         name: "/clear",
         blurb: "clear the screen",
     },

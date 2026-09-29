@@ -234,7 +234,61 @@ pub fn command(
             ));
             Flow::Handled
         }
+        "/usage" => {
+            usage(runner.store.conversations[*session].id);
+            Flow::Handled
+        }
         _ => Flow::Unknown,
+    }
+}
+
+/// What the model calls took: this session's, each recent day's and each
+/// model's, added up from the saved sessions.
+fn usage(session: u64) {
+    use letronna_core::usage::{self, Totals};
+    let report = usage::report(session);
+    let days = report
+        .days
+        .iter()
+        .map(|(date, totals)| (usage::day_name(*date), totals));
+    let models = report
+        .models
+        .iter()
+        .map(|(model, totals)| (model.clone(), totals));
+    let sections: [(String, Vec<(String, &Totals)>); 3] = [
+        (
+            String::new(),
+            vec![("this session".into(), &report.session)],
+        ),
+        (format!("the last {} days", usage::DAYS), days.collect()),
+        (
+            format!("by model, the last {} days", usage::MODEL_DAYS),
+            models.collect(),
+        ),
+    ];
+    let width = sections
+        .iter()
+        .flat_map(|(_, rows)| rows.iter().map(|(label, _)| label.chars().count()))
+        .max()
+        .unwrap_or(0);
+    render::blank();
+    render::said(&render::blue("●"), &render::bold("Usage"));
+    for (heading, rows) in sections.iter().filter(|(_, rows)| !rows.is_empty()) {
+        if !heading.is_empty() {
+            render::blank();
+            render::line(&render::dim(heading));
+        }
+        for (label, totals) in rows {
+            render::line(&format!(
+                "{}  {}",
+                render::bold(&format!("{label:<width$}")),
+                totals.line()
+            ));
+        }
+    }
+    if let Some(legend) = report.legend() {
+        render::blank();
+        render::line(&render::dim(&legend));
     }
 }
 

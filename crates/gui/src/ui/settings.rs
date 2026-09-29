@@ -5,6 +5,7 @@ type ApplyMode = std::rc::Rc<dyn Fn(plugins::PresenceMode, &mut App)>;
 
 const PAGES: &[(&str, AppIcon)] = &[
     ("Account", AppIcon::User),
+    ("Usage", AppIcon::Clock),
     ("Gateways", AppIcon::Plugs),
     ("Search", AppIcon::Search),
     ("Model", AppIcon::Robot),
@@ -240,6 +241,9 @@ impl Chat {
         self.settings_focus.focus(window);
         // The terminal may have signed in or out since this last looked.
         self.refresh_account(cx);
+        if *self.settings_page.read(cx) == "Usage" {
+            self.load_usage(cx);
+        }
         cx.notify();
     }
 
@@ -359,6 +363,7 @@ impl Chat {
                 .border_color(cx.theme().border),
             |nav, (name, icon)| {
                 let page = page.clone();
+                let chat = chat.clone();
                 let active = *name == current_page;
                 nav.child(
                     h_flex()
@@ -384,7 +389,10 @@ impl Chat {
                             page.update(cx, |p, cx| {
                                 *p = name;
                                 cx.notify();
-                            })
+                            });
+                            if *name == "Usage" {
+                                chat.update(cx, |this, cx| this.load_usage(cx));
+                            }
                         }),
                 )
             },
@@ -403,6 +411,7 @@ impl Chat {
             )
             .into_any_element(),
             "Account" => super::account::account_page(&chat, self, cx).into_any_element(),
+            "Usage" => super::usage::usage_page(self.usage_report.as_ref(), cx).into_any_element(),
             "Thinking" => thinking_page(&chat, &self.store, cx).into_any_element(),
             "Plugins" => plugins_page(&chat, cx).into_any_element(),
             "About" => about_page(&chat, self, cx).into_any_element(),

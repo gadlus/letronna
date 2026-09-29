@@ -32,6 +32,26 @@ pub struct Message {
     /// model facts when the reply came; 0 when they did not say.
     #[serde(default)]
     pub window: u64,
+    /// Of the input, how much the provider wrote to its prompt cache.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_write_tokens: u64,
+    /// Of `tokens`, how many the model spent thinking.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reasoning_tokens: u64,
+    /// What the reply cost in US dollars, when that is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<f64>,
+    /// `cost` is estimated from the model's listed price, not billed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cost_estimated: bool,
+    /// For `role: "assistant"`: what summarizing the turns its request no
+    /// longer held took, a model call of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_usage: Option<crate::usage::Usage>,
+    /// For `role: "assistant"`: when the reply finished, in seconds since
+    /// 1970, so its usage counts on the right day.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub at: u64,
     /// Calls the assistant asked for in this turn.
     #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
@@ -67,13 +87,19 @@ pub struct Message {
     pub replay: Option<Box<Replay>>,
 }
 
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
 impl Message {
-    /// All the input a reply was given. OpenAI counts cache hits inside
-    /// `prompt_tokens`, but some gateways count them beside it, which shows
-    /// as more cached than sent -- and as a cache rate over a hundred percent.
+    /// All the input a reply was given. OpenAI counts cache hits and writes
+    /// inside `prompt_tokens`, but some gateways count them beside it, which
+    /// shows as more cached than sent -- and as a cache rate over a hundred
+    /// percent.
     pub fn input_tokens(&self) -> u64 {
-        if self.cached_tokens > self.prompt_tokens {
-            self.prompt_tokens + self.cached_tokens
+        let cache = self.cached_tokens.saturating_add(self.cache_write_tokens);
+        if cache > self.prompt_tokens {
+            self.prompt_tokens.saturating_add(cache)
         } else {
             self.prompt_tokens
         }
@@ -219,7 +245,15 @@ pub enum Event {
         /// is the number to watch when tuning the context window.
         prompt: u64,
         cached: u64,
+        cache_write: u64,
+        /// Of `completion`, the tokens spent thinking.
+        reasoning: u64,
+        /// What OpenRouter billed, in dollars; see `usage::Usage::priced`.
+        cost: Option<f64>,
     },
+    /// What summarizing the turns the request no longer holds took, sent
+    /// before the reply when a summary had to be asked for.
+    SummaryUsage(crate::usage::Usage),
     /// Sent once, before `Finished`, when the model asked for tools.
     ToolCalls(Vec<ToolCall>),
     /// Sent once, before `Finished`, when a finished reply came with
@@ -785,6 +819,9 @@ fn body_with(
     if host(&connection.endpoint).as_deref() == Some("api.openai.com") {
         body["prompt_cache_key"] = format!("letronna-{}", connection.conversation).into();
     }
+    if crate::usage::asks_cost(&connection.endpoint) {
+        body["usage"] = json!({"include": true});
+    }
     body
 }
 
@@ -1040,7 +1077,7 @@ fn learn(connection: &Connection, sent: &Value, error: &str) -> bool {
 }
 
 /// The host a URL names, if it is one.
-fn host(url: &str) -> Option<String> {
+pub(crate) fn host(url: &str) -> Option<String> {
     reqwest::Url::parse(url.trim())
         .ok()?
         .host_str()
@@ -1378,6 +1415,9 @@ struct Chunk {
     /// stream assembles them.
     tool_calls: Vec<(Option<usize>, String, String, String, Value)>,
     reasoning_details: Vec<Value>,
+    cache_write_tokens: Option<u64>,
+    reasoning_tokens: Option<u64>,
+    cost: Option<f64>,
     finish: Option<FinishReason>,
 }
 
@@ -1515,14 +1555,11 @@ fn parse_chunk(value: &Value) -> Result<Chunk, Failure> {
     let prompt_tokens = inner
         .pointer("/usage/prompt_tokens")
         .and_then(Value::as_u64);
-    // OpenAI reports cache hits under prompt_tokens_details; DeepSeek and
-    // Anthropic use fields of their own. Gateways pass through whichever the
-    // upstream provider sent.
-    let cached_tokens = inner
-        .pointer("/usage/prompt_tokens_details/cached_tokens")
-        .or_else(|| inner.pointer("/usage/prompt_cache_hit_tokens"))
-        .or_else(|| inner.pointer("/usage/cache_read_input_tokens"))
-        .and_then(Value::as_u64);
+    let usage = inner.get("usage").filter(|usage| usage.is_object());
+    let cached_tokens = usage.and_then(crate::usage::cached);
+    let cache_write_tokens = usage.and_then(crate::usage::cache_write);
+    let reasoning_tokens = usage.and_then(crate::usage::reasoning);
+    let cost = usage.and_then(crate::usage::billed);
     let tool_calls = delta
         .and_then(|d| d["tool_calls"].as_array())
         .map(|calls| {
@@ -1563,6 +1600,9 @@ fn parse_chunk(value: &Value) -> Result<Chunk, Failure> {
         completion_tokens,
         prompt_tokens,
         cached_tokens,
+        cache_write_tokens,
+        reasoning_tokens,
+        cost,
         tool_calls,
         reasoning_details,
         finish,
@@ -1819,6 +1859,9 @@ fn stream(
                 text: text.to_owned(),
             });
         },
+        |usage| {
+            let _ = sender.send_blocking(Event::SummaryUsage(usage));
+        },
     );
     let sent = body_with(
         connection,
@@ -2038,6 +2081,9 @@ struct Reply {
     completion_tokens: u64,
     prompt_tokens: u64,
     cached_tokens: u64,
+    cache_write_tokens: u64,
+    reasoning_tokens: u64,
+    cost: Option<f64>,
     assembler: Assembler,
     reasoning_details: Vec<Value>,
     finish: Option<FinishReason>,
@@ -2059,6 +2105,15 @@ impl Reply {
         }
         if let Some(n) = chunk.cached_tokens {
             self.cached_tokens = n;
+        }
+        if let Some(n) = chunk.cache_write_tokens {
+            self.cache_write_tokens = n;
+        }
+        if let Some(n) = chunk.reasoning_tokens {
+            self.reasoning_tokens = n;
+        }
+        if chunk.cost.is_some() {
+            self.cost = chunk.cost;
         }
         if chunk.finish.is_some() {
             self.finish = chunk.finish;
@@ -2103,6 +2158,9 @@ impl Reply {
                 per_second: self.completion_tokens as f32 / secs,
                 prompt: self.prompt_tokens,
                 cached: self.cached_tokens,
+                cache_write: self.cache_write_tokens,
+                reasoning: self.reasoning_tokens,
+                cost: self.cost,
             });
         }
         if !done && self.finish.is_none() {
@@ -3446,7 +3504,7 @@ mod tests {
             let replies = [
                 (
                     "application/json",
-                    r#"{"choices":[{"message":{"content":"A big file was written."}}]}"#,
+                    r#"{"choices":[{"message":{"content":"A big file was written."}}],"usage":{"prompt_tokens":800,"completion_tokens":40}}"#,
                 ),
                 (
                     "text/event-stream",
@@ -3466,9 +3524,14 @@ mod tests {
             ..connection()
         };
         let rx = start(c, a_big_write());
-        // The wait for the summary is said to be one, and the summary is
-        // handed over for the session to keep, with what it covers.
+        // The wait for the summary is said to be one, what asking took is
+        // told, and the summary is handed over for the session to keep, with
+        // what it covers.
         assert!(matches!(rx.recv_blocking().unwrap(), Event::Compacting));
+        assert!(matches!(
+            rx.recv_blocking().unwrap(),
+            Event::SummaryUsage(usage) if (usage.input, usage.output) == (800, 40)
+        ));
         assert!(matches!(
             rx.recv_blocking().unwrap(),
             Event::Summarized { upto: 4, text } if text == "A big file was written."
@@ -3522,8 +3585,13 @@ mod tests {
         messages[0].content = "write the other big file".into();
         let rx = start(c, messages);
         assert!(matches!(rx.recv_blocking().unwrap(), Event::Compacting));
-        // The digest standing in is not for the session to keep.
-        assert!(matches!(rx.recv_blocking().unwrap(), Event::Delta(s) if s == "Welcome"));
+        // What asking took is told, as it was paid for, but the digest
+        // standing in is not for the session to keep.
+        let mut next = rx.recv_blocking().unwrap();
+        if matches!(next, Event::SummaryUsage(_)) {
+            next = rx.recv_blocking().unwrap();
+        }
+        assert!(matches!(next, Event::Delta(s) if s == "Welcome"));
         assert!(matches!(
             rx.recv_blocking().unwrap(),
             Event::Finished(Ok(()))
@@ -5295,6 +5363,45 @@ mod tests {
         let anthropic = r#"{"prompt_tokens":20,"cache_read_input_tokens":4100,"cache_creation_input_tokens":300}"#;
         assert_eq!(cached(anthropic), Some(4100));
         assert_eq!(cached(r#"{"prompt_tokens":20}"#), None);
+    }
+
+    #[test]
+    fn a_reply_brings_its_cache_writes_thinking_and_bill() {
+        let events = reply_of(
+            "text/event-stream",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":\"stop\"}]}\n\n\
+             data: {\"choices\":[],\"usage\":{\"prompt_tokens\":900,\"completion_tokens\":40,\
+             \"prompt_tokens_details\":{\"cached_tokens\":500,\"cache_write_tokens\":300},\
+             \"completion_tokens_details\":{\"reasoning_tokens\":25},\"cost\":0.0042}}\n\n\
+             data: [DONE]\n\n",
+        );
+        let usage = events.iter().find_map(|event| match event {
+            Event::Usage {
+                cache_write,
+                reasoning,
+                cost,
+                ..
+            } => Some((*cache_write, *reasoning, *cost)),
+            _ => None,
+        });
+        assert_eq!(usage, Some((300, 25, Some(0.0042))));
+    }
+
+    #[test]
+    fn only_openrouter_is_asked_what_a_reply_cost() {
+        let turn = tool_turn();
+        for (endpoint, asked) in [
+            ("https://openrouter.ai/api/v1", true),
+            ("https://api.openai.com/v1", false),
+            ("http://localhost:11434/v1", false),
+        ] {
+            let c = Connection {
+                endpoint: endpoint.into(),
+                ..connection()
+            };
+            let payload = body(&c, &turn, None, None);
+            assert_eq!(payload["usage"]["include"] == true, asked, "{endpoint}");
+        }
     }
 
     #[test]
