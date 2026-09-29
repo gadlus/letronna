@@ -235,12 +235,7 @@ pub fn changed_files(folder: &Path) -> Result<Vec<ChangedFile>, String> {
     for path in untracked.split('\0').filter(|p| !p.is_empty()) {
         // Counted from the file itself, as git would for a new one; one too
         // big to be worth reading is listed without its count.
-        let full = folder.join(path);
-        let small = std::fs::metadata(&full).is_ok_and(|meta| meta.len() <= PATCH_CAP as u64);
-        let text = small
-            .then(|| std::fs::read(&full).ok())
-            .flatten()
-            .map(String::from_utf8);
+        let text = read_small(&folder.join(path)).map(String::from_utf8);
         files.push(ChangedFile {
             path: PathBuf::from(path),
             added: match &text {
@@ -253,6 +248,22 @@ pub fn changed_files(folder: &Path) -> Result<Vec<ChangedFile>, String> {
         });
     }
     Ok(files)
+}
+
+/// A plain file's bytes, or `None` for a link, a device, a pipe or a file
+/// over [`PATCH_CAP`]: a link to `/dev/zero` reports no size and never ends,
+/// and a pipe blocks the read for good.
+fn read_small(path: &Path) -> Option<Vec<u8>> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > PATCH_CAP as u64 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    let file = std::fs::File::open(path).ok()?;
+    file.take(PATCH_CAP as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() <= PATCH_CAP).then_some(bytes)
 }
 
 /// Ok when `folder` is in a git repository, or an error saying there is
@@ -548,6 +559,16 @@ mod tests {
                 ("new.txt".into(), 2, 0, true)
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_untracked_link_to_a_device_is_listed_without_being_read() {
+        let folder = repo("device-link");
+        std::os::unix::fs::symlink("/dev/zero", folder.join("zero")).unwrap();
+        let files = changed_files(&folder).unwrap();
+        let zero = files.iter().find(|f| f.path == Path::new("zero")).unwrap();
+        assert!(zero.created && !zero.binary && zero.added == 0, "{zero:?}");
     }
 
     #[test]
