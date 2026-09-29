@@ -1,3 +1,4 @@
+use crate::failure::{Failure, FailureKind, classify};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -105,6 +106,9 @@ pub struct Connection {
     pub remote: Option<Remote>,
     /// The session's id: each keeps a browser of its own.
     pub conversation: u64,
+    /// Nobody may be watching, as in a schedule or a chat app, so a failed
+    /// call is tried more times and may wait longer.
+    pub unattended: bool,
 }
 
 /// Where a remote conversation is happening, and what that allows.
@@ -143,7 +147,9 @@ pub enum Event {
     },
     /// Sent once, before `Finished`, when the model asked for tools.
     ToolCalls(Vec<ToolCall>),
-    Finished(Result<(), String>),
+    /// A try failed in a way that passes, and another follows after a wait.
+    Retrying(crate::retry::Retry),
+    Finished(Result<(), Failure>),
 }
 
 pub fn validate(connection: &Connection) -> Result<String, String> {
@@ -764,10 +770,10 @@ fn written(arguments: &str, wrote: bool) -> Option<String> {
     Some(args.to_string())
 }
 
-/// Statuses worth one retry: gateway and edge failures that say nothing about
-/// the request itself. 520-527 are Cloudflare's own (525 is a failed TLS
-/// handshake between the edge and the origin).
-fn transient(status: reqwest::StatusCode) -> bool {
+/// Gateway and edge failures that say nothing about the request itself.
+/// 520-527 are Cloudflare's own (525 is a failed TLS handshake between the
+/// edge and the origin).
+pub(crate) fn transient(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 502 | 503 | 504 | 520..=527)
 }
 
@@ -860,10 +866,15 @@ fn name_as_offered(calls: &mut [ToolCall]) {
     }
 }
 
-fn parse_event(data: &str) -> Result<Chunk, String> {
-    let value: Value = serde_json::from_str(data)
-        .map_err(|_| "Provider returned an invalid stream event.".to_owned())?;
-    let inner = unwrap_response(&value)?;
+fn parse_event(data: &str) -> Result<Chunk, Failure> {
+    let value: Value = serde_json::from_str(data).map_err(|_| {
+        Failure::new(
+            FailureKind::BadReply,
+            "Provider returned an invalid stream event.",
+        )
+    })?;
+    let inner = unwrap_response(&value)
+        .map_err(|_| classify(None, &reqwest::header::HeaderMap::new(), &value))?;
     let delta = inner.pointer("/choices/0/delta");
     let content = delta
         .and_then(|d| d.get("content"))
@@ -1002,61 +1013,108 @@ fn stream(
     start: usize,
     budget: &Budget,
     sender: &async_channel::Sender<Event>,
-) -> Result<(), String> {
-    let endpoint = validate(connection)?;
+) -> Result<(), Failure> {
+    let endpoint = validate(connection).map_err(|e| Failure::new(FailureKind::Settings, e))?;
     // What the window no longer holds goes in as a summary rather than not at
     // all. It is made here, on the worker, so the wait is part of the reply's.
     let (dropped, window) = messages.split_at(start);
     let summary = crate::compact::summary(connection, dropped, budget.step);
-    let mut request = client()?
+    let mut request = client()
+        .map_err(|e| Failure::new(FailureKind::Unknown, e))?
         .post(endpoint)
         .timeout(Duration::from_secs(120))
         .json(&body(connection, window, summary.as_deref(), budget));
     if !connection.key.trim().is_empty() {
         request = request.bearer_auth(connection.key.trim());
     }
-    // A transient edge failure part way through an agent loop would otherwise
-    // lose the whole task, so give it one more go before giving up.
-    let mut attempt = 0;
-    let response = loop {
-        attempt += 1;
+    // A rate limit or a dropped connection part way through an agent loop
+    // would otherwise lose the whole task, though it passes on its own.
+    let mut tried = 0;
+    let mut timeouts = 0;
+    loop {
+        tried += 1;
         let send = request
             .try_clone()
-            .ok_or("Could not prepare the request.")?
+            .ok_or_else(|| Failure::new(FailureKind::Unknown, "Could not prepare the request."))?
             .send();
-        match send {
-            Ok(response) if transient(response.status()) && attempt == 1 => {
-                std::thread::sleep(Duration::from_millis(600));
-            }
-            Ok(response) => break response,
-            Err(_) if attempt == 1 => std::thread::sleep(Duration::from_millis(600)),
-            Err(_) => return Err("Cannot reach the model. Check that your server is running and the endpoint is correct (120-second request timeout).".to_owned()),
-        }
-    };
-    let status = response.status();
-    if !status.is_success() {
-        // A model that cannot take pictures turns the whole request down,
-        // each provider in words of its own. Send it again without the
-        // screenshot, which that model is spared from then on.
-        if status.is_client_error() && shows_picture(connection, window) {
-            forget_images(&connection.model);
-            return stream(connection, messages, start, budget, sender);
-        }
-        let detail = response
-            .json::<Value>()
-            .ok()
-            .and_then(|v| unwrap_response(&v).err());
-        return Err(detail.unwrap_or_else(|| {
-            let code = status.as_u16();
-            if transient(status) {
-                format!(
-                    "The gateway is having trouble right now (HTTP {code}). This is at                      the provider's end, not your settings. Try again in a moment, or                      switch gateway in Settings."
+        let mut stands = false;
+        let mut slow = false;
+        let failure = match send {
+            Err(e) => {
+                slow = ran_out(&e);
+                Failure::new(
+                    FailureKind::Network,
+                    "Cannot reach the model. Check that your server is running and the endpoint is correct (120-second request timeout).",
                 )
-            } else {
-                format!("Provider returned HTTP {code}. Check connection settings and quota.")
             }
-        }));
+            Ok(response) if response.status().is_success() => {
+                match read(response, sender, &mut stands, &mut slow) {
+                    Ok(()) => return Ok(()),
+                    Err(failure) => failure,
+                }
+            }
+            Ok(response) => {
+                let status = response.status();
+                // A model that cannot take pictures turns the whole request down,
+                // each provider in words of its own. Send it again without the
+                // screenshot, which that model is spared from then on. A timeout
+                // or a rate limit is not about the picture, and passes by itself.
+                if status.is_client_error()
+                    && !matches!(status.as_u16(), 408 | 429)
+                    && shows_picture(connection, window)
+                {
+                    forget_images(&connection.model);
+                    return stream(connection, messages, start, budget, sender);
+                }
+                let headers = response.headers().clone();
+                let body = response.json::<Value>().unwrap_or_default();
+                classify(Some(status.as_u16()), &headers, &body)
+            }
+        };
+        if slow {
+            timeouts += 1;
+        }
+        // Once part of the reply is on screen, another go would be shown
+        // after it rather than in its place; read says when else a failure
+        // stands. A reply that ran out of time may well run out again, each
+        // try perhaps billed, so it gets one more go and no more.
+        if stands || timeouts > 1 {
+            return Err(failure);
+        }
+        let Some(retry) = crate::retry::after(&failure, tried, connection.unattended) else {
+            return Err(failure);
+        };
+        sender
+            .send_blocking(Event::Retrying(retry))
+            .map_err(|_| Failure::new(FailureKind::Stopped, "Chat closed."))?;
+        if !crate::retry::pause(retry.wait, || sender.is_closed()) {
+            return Err(Failure::new(FailureKind::Stopped, "Chat closed."));
+        }
     }
+}
+
+/// Whether a call ran out of time after it was sent; one that could not
+/// connect in time was never sent, so it is not counted.
+fn ran_out(e: &reqwest::Error) -> bool {
+    e.is_timeout() && !e.is_connect()
+}
+
+/// Whether reading a reply broke off because the call ran out of time.
+fn ran_out_reading(e: &std::io::Error) -> bool {
+    e.get_ref()
+        .and_then(|e| e.downcast_ref::<reqwest::Error>())
+        .is_some_and(ran_out)
+}
+
+/// Pass a successful reply on as it arrives, setting `stands` once the model
+/// has begun it or when it is no event stream, and `slow` if it runs out of
+/// time.
+fn read(
+    response: reqwest::blocking::Response,
+    sender: &async_channel::Sender<Event>,
+    stands: &mut bool,
+    slow: &mut bool,
+) -> Result<(), Failure> {
     if response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -1065,18 +1123,27 @@ fn stream(
     {
         let value: Value = response
             .json()
-            .map_err(|_| "Invalid model response.".to_owned())?;
-        let content = unwrap_response(&value)?
+            .map_err(|_| Failure::new(FailureKind::BadReply, "Invalid model response."))?;
+        let content = unwrap_response(&value)
+            .map_err(|_| classify(None, &reqwest::header::HeaderMap::new(), &value))?
             .pointer("/choices/0/message/content")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
-            .ok_or("Model returned no text.")?
+            .ok_or_else(|| Failure::new(FailureKind::BadReply, "Model returned no text."))?
             .to_owned();
         sender
             .send_blocking(Event::Delta(content))
-            .map_err(|_| "Chat closed.".to_owned())?;
+            .map_err(|_| Failure::new(FailureKind::Stopped, "Chat closed."))?;
         return Ok(());
     }
+    // An event stream can end early for a reason that passes, as when a
+    // gateway keeps it open with comments and then gives up on the model.
+    // Any other reply, a web page say, would come back the same every time.
+    *stands = !response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|h| h.to_str().ok())
+        .is_some_and(|h| h.contains("text/event-stream"));
     let mut received = false;
     let mut complete = false;
     let mut completion_tokens = 0u64;
@@ -1085,8 +1152,13 @@ fn stream(
     let mut calls: Vec<ToolCall> = Vec::new();
     let began = std::time::Instant::now();
     for line in BufReader::new(response).lines() {
-        let line =
-            line.map_err(|_| "Connection interrupted before the response completed.".to_owned())?;
+        let line = line.map_err(|e| {
+            *slow = ran_out_reading(&e);
+            Failure::new(
+                FailureKind::Network,
+                "Connection interrupted before the response completed.",
+            )
+        })?;
         let Some(data) = line.strip_prefix("data:").map(str::trim) else {
             continue;
         };
@@ -1104,17 +1176,23 @@ fn stream(
         if let Some(n) = chunk.cached_tokens {
             cached_tokens = n;
         }
+        // A tool call is not shown until the stream ends, but one begun is an
+        // answer under way like any text: another go is billed again, and a
+        // server that never sends [DONE] would cut it off again.
+        *stands |= !chunk.tool_calls.is_empty();
         merge_tool_calls(&mut calls, &chunk);
         if let Some(text) = chunk.reasoning {
+            *stands = true;
             sender
                 .send_blocking(Event::Reasoning(text))
-                .map_err(|_| "Chat closed.".to_owned())?;
+                .map_err(|_| Failure::new(FailureKind::Stopped, "Chat closed."))?;
         }
         if let Some(text) = chunk.content {
             received = true;
+            *stands = true;
             sender
                 .send_blocking(Event::Delta(text))
-                .map_err(|_| "Chat closed.".to_owned())?;
+                .map_err(|_| Failure::new(FailureKind::Stopped, "Chat closed."))?;
         }
     }
     if completion_tokens > 0 {
@@ -1127,9 +1205,10 @@ fn stream(
         });
     }
     if !complete {
-        return Err(
-            "The provider closed the stream early or does not support SSE chat completions.".into(),
-        );
+        return Err(Failure::new(
+            FailureKind::Network,
+            "The provider closed the stream early or does not support SSE chat completions.",
+        ));
     }
     calls.retain(|c| !c.name.is_empty());
     name_unnamed(&mut calls);
@@ -1138,10 +1217,13 @@ fn stream(
         received = true;
         sender
             .send_blocking(Event::ToolCalls(calls))
-            .map_err(|_| "Chat closed.".to_owned())?;
+            .map_err(|_| Failure::new(FailureKind::Stopped, "Chat closed."))?;
     }
     if !received {
-        return Err("The model returned no text. Check model compatibility.".into());
+        return Err(Failure::new(
+            FailureKind::BadReply,
+            "The model returned no text. Check model compatibility.",
+        ));
     }
     Ok(())
 }
@@ -1161,6 +1243,7 @@ mod tests {
             effort: String::new(),
             search: false,
             conversation: 0,
+            unattended: false,
         }
     }
     #[test]
@@ -1223,6 +1306,7 @@ mod tests {
             effort: String::new(),
             search: false,
             conversation: 0,
+            unattended: false,
         };
         let ctx = crate::tools::ToolContext::of(&connection);
         let mut messages = vec![Message {
@@ -2591,5 +2675,298 @@ mod tests {
         );
         // The newest write goes out whole.
         assert_eq!(arguments("w1")["content"].as_str().unwrap().len(), 5_000);
+    }
+
+    #[test]
+    fn an_error_partway_through_a_stream_is_classified_like_one_before_it() {
+        // OpenRouter's event for a provider that failed after the stream began.
+        let data = r#"{"id":"gen-1759000000-abc","object":"chat.completion.chunk","model":"anthropic/claude-sonnet-4","provider":"Anthropic","error":{"code":"server_error","message":"Provider disconnected unexpectedly"},"choices":[{"index":0,"delta":{"content":""},"finish_reason":"error"}]}"#;
+        let Err(failure) = parse_event(data) else {
+            panic!("an error event was read as a chunk");
+        };
+        assert_eq!(failure.kind, FailureKind::Server);
+        assert_eq!(failure.to_string(), "Provider disconnected unexpectedly");
+    }
+
+    #[test]
+    fn a_refused_request_ends_with_its_kind_and_the_wait_asked_for() {
+        use std::io::Write;
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1", server.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = server.accept().unwrap();
+            request_body(&mut socket);
+            let reply = r#"{"error":{"message":"Rate limit reached for gpt-4o in organization org-abc on requests per min (RPM): Limit 500, Used 500, Requested 1.","type":"requests","param":null,"code":"rate_limit_exceeded"}}"#;
+            // Longer than anyone watching is kept waiting, so it is not
+            // tried again.
+            write!(socket, "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 120\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+        });
+        let c = Connection {
+            endpoint,
+            ..connection()
+        };
+        let rx = start(
+            c,
+            vec![Message {
+                role: "user".into(),
+                content: "Hi".into(),
+                ..Default::default()
+            }],
+        );
+        let Event::Finished(Err(failure)) = rx.recv_blocking().unwrap() else {
+            panic!("a refused request did not end in a failure");
+        };
+        assert_eq!(failure.kind, FailureKind::RateLimit);
+        assert_eq!(failure.retry_after, Some(Duration::from_secs(120)));
+        assert!(
+            failure
+                .to_string()
+                .starts_with("Rate limit reached for gpt-4o")
+        );
+        worker.join().unwrap();
+    }
+
+    /// A server that answers each request it gets with the next of `replies`,
+    /// given as status, content type and body, and hands back what it was sent.
+    fn serve(
+        replies: Vec<(&'static str, &'static str, &'static str)>,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::Write;
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1", server.local_addr().unwrap());
+        // Polled, so a request that never comes fails the test instead of
+        // hanging it.
+        server.set_nonblocking(true).unwrap();
+        let worker = std::thread::spawn(move || {
+            let mut bodies = Vec::new();
+            for (status, kind, reply) in replies {
+                let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                let mut socket = loop {
+                    match server.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(_) if std::time::Instant::now() < deadline => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(e) => panic!("request {} never came: {e}", bodies.len() + 1),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                bodies.push(request_body(&mut socket));
+                write!(socket, "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+            }
+            bodies
+        });
+        (endpoint, worker)
+    }
+
+    /// Ask `endpoint` for a reply to "Hi".
+    fn ask(endpoint: String) -> async_channel::Receiver<Event> {
+        let c = Connection {
+            endpoint,
+            ..connection()
+        };
+        start(
+            c,
+            vec![Message {
+                role: "user".into(),
+                content: "Hi".into(),
+                ..Default::default()
+            }],
+        )
+    }
+
+    #[test]
+    fn a_rate_limit_is_waited_out_and_the_call_made_again() {
+        let (endpoint, worker) = serve(vec![
+            (
+                "429 Too Many Requests",
+                "application/json",
+                r#"{"error":{"message":"Rate limit reached.","code":"rate_limit_exceeded"}}"#,
+            ),
+            (
+                "200 OK",
+                "text/event-stream",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: [DONE]\n\n",
+            ),
+        ]);
+        let rx = ask(endpoint);
+        let Event::Retrying(retry) = rx.recv_blocking().unwrap() else {
+            panic!("a rate limit was not tried again");
+        };
+        assert_eq!(retry.kind, FailureKind::RateLimit);
+        assert_eq!((retry.attempt, retry.of), (2, 6));
+        assert!(matches!(rx.recv_blocking().unwrap(), Event::Delta(s) if s == "Hello"));
+        assert!(matches!(
+            rx.recv_blocking().unwrap(),
+            Event::Finished(Ok(()))
+        ));
+        let bodies = worker.join().unwrap();
+        assert_eq!(bodies[0], bodies[1], "the second try asked something else");
+    }
+
+    #[test]
+    fn a_stream_that_ends_before_saying_anything_is_tried_again() {
+        let (endpoint, worker) = serve(vec![
+            ("200 OK", "text/event-stream", ": still here\n\n"),
+            (
+                "200 OK",
+                "text/event-stream",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: [DONE]\n\n",
+            ),
+        ]);
+        let rx = ask(endpoint);
+        let Event::Retrying(retry) = rx.recv_blocking().unwrap() else {
+            panic!("a stream that said nothing was not tried again");
+        };
+        assert_eq!(retry.kind, FailureKind::Network);
+        assert!(matches!(rx.recv_blocking().unwrap(), Event::Delta(s) if s == "Hello"));
+        assert!(matches!(
+            rx.recv_blocking().unwrap(),
+            Event::Finished(Ok(()))
+        ));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn a_stream_cut_off_after_it_began_is_not_tried_again() {
+        let (endpoint, worker) = serve(vec![(
+            "200 OK",
+            "text/event-stream",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+        )]);
+        let rx = ask(endpoint);
+        assert!(matches!(rx.recv_blocking().unwrap(), Event::Delta(s) if s == "Hel"));
+        let Event::Finished(Err(failure)) = rx.recv_blocking().unwrap() else {
+            panic!("a reply already on screen was tried again");
+        };
+        assert_eq!(failure.kind, FailureKind::Network);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn a_stream_cut_off_in_a_tool_call_is_not_tried_again() {
+        let (endpoint, worker) = serve(vec![(
+            "200 OK",
+            "text/event-stream",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"\"}}]}}]}\n\n",
+        )]);
+        let rx = ask(endpoint);
+        let Event::Finished(Err(failure)) = rx.recv_blocking().unwrap() else {
+            panic!("a tool call already begun was tried again");
+        };
+        assert_eq!(failure.kind, FailureKind::Network);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn a_reply_that_is_no_event_stream_is_not_tried_again() {
+        let (endpoint, worker) = serve(vec![(
+            "200 OK",
+            "text/html; charset=utf-8",
+            "<!doctype html><title>Welcome</title><p>Sign in to continue.</p>",
+        )]);
+        let rx = ask(endpoint);
+        let Event::Finished(Err(failure)) = rx.recv_blocking().unwrap() else {
+            panic!("a web page was taken for a stream that dropped");
+        };
+        assert!(
+            failure.to_string().contains("does not support SSE"),
+            "{failure}"
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn a_rate_limit_on_a_request_with_a_screenshot_is_waited_out_with_it() {
+        let dir = std::env::temp_dir().join(format!("letronna-limited-{}", std::process::id()));
+        let messages = screenshots(&dir);
+        let (endpoint, worker) = serve(vec![
+            (
+                "429 Too Many Requests",
+                "application/json",
+                r#"{"error":{"message":"Rate limit reached.","code":"rate_limit_exceeded"}}"#,
+            ),
+            (
+                "200 OK",
+                "text/event-stream",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"A form\"}}]}\n\ndata: [DONE]\n\n",
+            ),
+        ]);
+        let c = Connection {
+            endpoint,
+            model: "sees-through-a-rate-limit".into(),
+            ..connection()
+        };
+        let rx = start(c, messages);
+        let Event::Retrying(retry) = rx.recv_blocking().unwrap() else {
+            panic!("a rate limit was taken for a picture turned down");
+        };
+        assert_eq!(retry.kind, FailureKind::RateLimit);
+        assert!(matches!(rx.recv_blocking().unwrap(), Event::Delta(s) if s == "A form"));
+        assert!(matches!(
+            rx.recv_blocking().unwrap(),
+            Event::Finished(Ok(()))
+        ));
+        let bodies = worker.join().unwrap();
+        assert!(bodies[0].contains("image_url"));
+        assert!(bodies[1].contains("image_url"));
+        assert!(sees_images("sees-through-a-rate-limit"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_call_that_ran_out_of_time_is_told_from_one_cut_off() {
+        use std::io::{Read, Write};
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1", server.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            // No answer at all; the start of a stream and then nothing; and
+            // part of a body before the server hangs up.
+            let answers = [
+                ("", true),
+                (
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: {}\n\n",
+                    true,
+                ),
+                ("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\ndata:", false),
+            ];
+            for (answer, hold) in answers {
+                let (mut socket, _) = server.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                request_body(&mut socket);
+                socket.write_all(answer.as_bytes()).unwrap();
+                // Held until the client gives up and hangs up, or the read
+                // timeout ends it should the client not.
+                while hold && socket.read(&mut [0; 64]).is_ok_and(|n| n > 0) {}
+            }
+        });
+        let send = || {
+            client()
+                .unwrap()
+                .post(&url)
+                .body("{}")
+                // Long enough that only a server holding back runs it out,
+                // however busy the machine running the tests.
+                .timeout(Duration::from_secs(2))
+                .send()
+        };
+        let broken = |response: reqwest::blocking::Response| {
+            BufReader::new(response)
+                .lines()
+                .find_map(Result::err)
+                .unwrap()
+        };
+        let Err(silence) = send() else {
+            panic!("a server that never answered was heard");
+        };
+        assert!(ran_out(&silence));
+        assert!(ran_out_reading(&broken(send().unwrap())));
+        assert!(!ran_out_reading(&broken(send().unwrap())));
+        worker.join().unwrap();
     }
 }
