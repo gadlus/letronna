@@ -144,7 +144,38 @@ pub enum Event {
     },
     /// Sent once, before `Finished`, when the model asked for tools.
     ToolCalls(Vec<ToolCall>),
+    /// Sent before `Finished` when the reply stopped at the output limit;
+    /// `in_call` when it stopped inside a tool call, which is then dropped
+    /// rather than run half written.
+    CutOff {
+        in_call: bool,
+    },
     Finished(Result<(), String>),
+}
+
+/// Why the model stopped, as the provider said.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FinishReason {
+    Stop,
+    Length,
+    ToolCalls,
+    ContentFilter,
+    /// A reason not known here, which still means the reply is over.
+    Other,
+}
+
+impl FinishReason {
+    /// Read a `finish_reason`, including the names Anthropic and Gemini give
+    /// the same stops, which some gateways pass through unchanged.
+    fn parse(reason: &str) -> Self {
+        match reason.to_ascii_lowercase().as_str() {
+            "stop" | "end_turn" | "stop_sequence" => Self::Stop,
+            "length" | "max_tokens" => Self::Length,
+            "tool_calls" | "function_call" | "tool_use" => Self::ToolCalls,
+            "content_filter" | "safety" | "refusal" => Self::ContentFilter,
+            _ => Self::Other,
+        }
+    }
 }
 
 pub fn validate(connection: &Connection) -> Result<String, String> {
@@ -472,6 +503,7 @@ struct Chunk {
     cached_tokens: Option<u64>,
     /// Fragments of `(index, id, name, arguments)`; the stream assembles them.
     tool_calls: Vec<(usize, String, String, String)>,
+    finish: Option<FinishReason>,
 }
 
 /// Merge streamed fragments into whole calls, ordered by index.
@@ -521,8 +553,16 @@ fn name_as_offered(calls: &mut [ToolCall]) {
 fn parse_event(data: &str) -> Result<Chunk, String> {
     let value: Value = serde_json::from_str(data)
         .map_err(|_| "Provider returned an invalid stream event.".to_owned())?;
-    let inner = unwrap_response(&value)?;
-    let delta = inner.pointer("/choices/0/delta");
+    parse_chunk(&value)
+}
+
+/// Read one stream event, or the whole reply of a server that does not
+/// stream, which has under `message` what an event has under `delta`.
+fn parse_chunk(value: &Value) -> Result<Chunk, String> {
+    let inner = unwrap_response(value)?;
+    let delta = inner
+        .pointer("/choices/0/delta")
+        .or_else(|| inner.pointer("/choices/0/message"));
     let content = delta
         .and_then(|d| d.get("content"))
         .and_then(Value::as_str)
@@ -563,6 +603,13 @@ fn parse_event(data: &str) -> Result<Chunk, String> {
                 .collect()
         })
         .unwrap_or_default();
+    // vLLM also sends a `stop_reason`, but there it is the stop string that
+    // matched rather than why, so only `finish_reason` is read.
+    let finish = inner
+        .pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(FinishReason::parse);
     Ok(Chunk {
         content,
         reasoning,
@@ -570,6 +617,7 @@ fn parse_event(data: &str) -> Result<Chunk, String> {
         prompt_tokens,
         cached_tokens,
         tool_calls,
+        finish,
     })
 }
 
@@ -709,6 +757,8 @@ fn stream(
             }
         }));
     }
+    let began = std::time::Instant::now();
+    let mut reply = Reply::default();
     if response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -718,84 +768,137 @@ fn stream(
         let value: Value = response
             .json()
             .map_err(|_| "Invalid model response.".to_owned())?;
-        let content = unwrap_response(&value)?
-            .pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .ok_or("Model returned no text.")?
-            .to_owned();
-        sender
-            .send_blocking(Event::Delta(content))
-            .map_err(|_| "Chat closed.".to_owned())?;
-        return Ok(());
+        reply.absorb(parse_chunk(&value)?, sender)?;
+        // A whole body is a whole reply, whether or not it says why it ended.
+        return reply.end(true, began, sender);
     }
-    let mut received = false;
-    let mut complete = false;
-    let mut completion_tokens = 0u64;
-    let mut prompt_tokens = 0u64;
-    let mut cached_tokens = 0u64;
-    let mut calls: Vec<ToolCall> = Vec::new();
-    let began = std::time::Instant::now();
+    let mut done = false;
     for line in BufReader::new(response).lines() {
-        let line =
-            line.map_err(|_| "Connection interrupted before the response completed.".to_owned())?;
+        let line = match line {
+            Ok(line) => line,
+            // The reply was over by then; only the goodbye was lost.
+            Err(_) if reply.finish.is_some() => break,
+            Err(_) => {
+                return Err("Connection interrupted before the response completed.".to_owned());
+            }
+        };
         let Some(data) = line.strip_prefix("data:").map(str::trim) else {
             continue;
         };
         if data == "[DONE]" {
-            complete = true;
+            done = true;
             break;
         }
-        let chunk = parse_event(data)?;
+        reply.absorb(parse_event(data)?, sender)?;
+    }
+    reply.end(done, began, sender)
+}
+
+/// A reply as it arrives, streamed or in one piece.
+#[derive(Default)]
+struct Reply {
+    received: bool,
+    completion_tokens: u64,
+    prompt_tokens: u64,
+    cached_tokens: u64,
+    calls: Vec<ToolCall>,
+    finish: Option<FinishReason>,
+}
+
+impl Reply {
+    /// Take in one chunk, passing its text on as it comes.
+    fn absorb(
+        &mut self,
+        chunk: Chunk,
+        sender: &async_channel::Sender<Event>,
+    ) -> Result<(), String> {
         if let Some(n) = chunk.completion_tokens {
-            completion_tokens = n;
+            self.completion_tokens = n;
         }
         if let Some(n) = chunk.prompt_tokens {
-            prompt_tokens = n;
+            self.prompt_tokens = n;
         }
         if let Some(n) = chunk.cached_tokens {
-            cached_tokens = n;
+            self.cached_tokens = n;
         }
-        merge_tool_calls(&mut calls, &chunk);
+        if chunk.finish.is_some() {
+            self.finish = chunk.finish;
+        }
+        merge_tool_calls(&mut self.calls, &chunk);
         if let Some(text) = chunk.reasoning {
             sender
                 .send_blocking(Event::Reasoning(text))
                 .map_err(|_| "Chat closed.".to_owned())?;
         }
         if let Some(text) = chunk.content {
-            received = true;
+            self.received = true;
             sender
                 .send_blocking(Event::Delta(text))
                 .map_err(|_| "Chat closed.".to_owned())?;
         }
+        Ok(())
     }
-    if completion_tokens > 0 {
-        let secs = began.elapsed().as_secs_f32().max(0.001);
-        let _ = sender.send_blocking(Event::Usage {
-            completion: completion_tokens,
-            per_second: completion_tokens as f32 / secs,
-            prompt: prompt_tokens,
-            cached: cached_tokens,
-        });
+
+    /// Hand over the usage and the calls once the provider stops sending.
+    ///
+    /// A stream without `[DONE]` still counts when it said why it finished:
+    /// some servers close straight after, and the reply is whole by then.
+    fn end(
+        mut self,
+        done: bool,
+        began: std::time::Instant,
+        sender: &async_channel::Sender<Event>,
+    ) -> Result<(), String> {
+        if self.completion_tokens > 0 {
+            let secs = began.elapsed().as_secs_f32().max(0.001);
+            let _ = sender.send_blocking(Event::Usage {
+                completion: self.completion_tokens,
+                per_second: self.completion_tokens as f32 / secs,
+                prompt: self.prompt_tokens,
+                cached: self.cached_tokens,
+            });
+        }
+        if !done && self.finish.is_none() {
+            return Err(
+                "The provider closed the stream early or does not support SSE chat completions."
+                    .into(),
+            );
+        }
+        self.calls.retain(|c| !c.name.is_empty());
+        let cut_off = self.finish == Some(FinishReason::Length);
+        // The limit falls inside the last call, so its arguments are half
+        // written -- half a file, if it was a write. None of the calls is
+        // handed over; the turn asks for them again, smaller.
+        let in_call = cut_off && !self.calls.is_empty();
+        if in_call {
+            self.calls.clear();
+        }
+        name_unnamed(&mut self.calls);
+        name_as_offered(&mut self.calls);
+        if !self.calls.is_empty() {
+            self.received = true;
+            sender
+                .send_blocking(Event::ToolCalls(self.calls))
+                .map_err(|_| "Chat closed.".to_owned())?;
+        }
+        if !self.received && !in_call {
+            return Err(match self.finish {
+                Some(FinishReason::Length) => "The model reached its output limit before writing \
+                     anything. A lower effort leaves it more room."
+                    .into(),
+                Some(FinishReason::ContentFilter) => {
+                    "The provider's content filter stopped the reply.".into()
+                }
+                _ => "The model returned no text. Check model compatibility.".into(),
+            });
+        }
+        if cut_off {
+            sender
+                .send_blocking(Event::CutOff { in_call })
+                .map_err(|_| "Chat closed.".to_owned())?;
+        }
+        Ok(())
     }
-    if !complete {
-        return Err(
-            "The provider closed the stream early or does not support SSE chat completions.".into(),
-        );
-    }
-    calls.retain(|c| !c.name.is_empty());
-    name_unnamed(&mut calls);
-    name_as_offered(&mut calls);
-    if !calls.is_empty() {
-        received = true;
-        sender
-            .send_blocking(Event::ToolCalls(calls))
-            .map_err(|_| "Chat closed.".to_owned())?;
-    }
-    if !received {
-        return Err("The model returned no text. Check model compatibility.".into());
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1534,5 +1637,133 @@ mod tests {
         assert!(start > 0, "the window never left the user's message");
         assert!(messages[start].notice, "start {start} is not a notice");
         assert!(budget(&messages[start..]) <= CONTEXT_CHARS);
+    }
+
+    #[test]
+    fn every_finish_reason_is_read() {
+        let finish = |reason: &str| {
+            parse_event(&format!(
+                r#"{{"choices":[{{"delta":{{}},"finish_reason":{reason}}}]}}"#
+            ))
+            .unwrap()
+            .finish
+        };
+        assert_eq!(finish(r#""stop""#), Some(FinishReason::Stop));
+        assert_eq!(finish(r#""length""#), Some(FinishReason::Length));
+        assert_eq!(finish(r#""tool_calls""#), Some(FinishReason::ToolCalls));
+        assert_eq!(
+            finish(r#""content_filter""#),
+            Some(FinishReason::ContentFilter)
+        );
+        // The same stops under the names other providers give them.
+        assert_eq!(finish(r#""end_turn""#), Some(FinishReason::Stop));
+        assert_eq!(finish(r#""max_tokens""#), Some(FinishReason::Length));
+        assert_eq!(finish(r#""MAX_TOKENS""#), Some(FinishReason::Length));
+        assert_eq!(finish(r#""tool_use""#), Some(FinishReason::ToolCalls));
+        assert_eq!(finish(r#""something_new""#), Some(FinishReason::Other));
+        // Every chunk but the last carries a null.
+        assert_eq!(finish("null"), None);
+    }
+
+    /// Answer one request with `body` as `kind`, and collect the events the
+    /// reply came to.
+    fn reply_of(kind: &'static str, body: &'static str) -> Vec<Event> {
+        use std::io::Write;
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1", server.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = server.accept().unwrap();
+            request_body(&mut socket);
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        let asked = vec![Message {
+            role: "user".into(),
+            content: "Hi".into(),
+            ..Default::default()
+        }];
+        let rx = start(
+            Connection {
+                endpoint,
+                ..connection()
+            },
+            asked,
+        );
+        let mut events = Vec::new();
+        while let Ok(event) = rx.recv_blocking() {
+            let last = matches!(event, Event::Finished(_));
+            events.push(event);
+            if last {
+                break;
+            }
+        }
+        worker.join().unwrap();
+        events
+    }
+
+    #[test]
+    fn a_stream_that_ends_after_a_finish_is_complete_without_done() {
+        let events = reply_of(
+            "text/event-stream",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+        assert!(matches!(&events[0], Event::Delta(s) if s == "Hello"));
+        assert!(matches!(events.last(), Some(Event::Finished(Ok(())))));
+        // Neither a finish nor `[DONE]`: the reply may have been cut short.
+        let events = reply_of(
+            "text/event-stream",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+        );
+        assert!(matches!(events.last(), Some(Event::Finished(Err(_)))));
+    }
+
+    #[test]
+    fn a_reply_cut_off_at_the_limit_keeps_its_text_and_says_so() {
+        let events = reply_of(
+            "text/event-stream",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"The first half\"}}]}\n\n\
+             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n\
+             data: [DONE]\n\n",
+        );
+        assert!(matches!(&events[0], Event::Delta(s) if s == "The first half"));
+        assert!(matches!(events[1], Event::CutOff { in_call: false }));
+        assert!(matches!(events[2], Event::Finished(Ok(()))));
+    }
+
+    #[test]
+    fn a_call_cut_off_at_the_limit_is_not_handed_over() {
+        let events = reply_of(
+            "text/event-stream",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"a.rs\\\",\\\"content\\\":\\\"fn\"}}]}}]}\n\n\
+             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n\
+             data: [DONE]\n\n",
+        );
+        assert!(!events.iter().any(|e| matches!(e, Event::ToolCalls(_))));
+        assert!(matches!(events[0], Event::CutOff { in_call: true }));
+        // Not an error: the turn goes on and asks for the call again.
+        assert!(matches!(events[1], Event::Finished(Ok(()))));
+    }
+
+    #[test]
+    fn a_reply_that_does_not_stream_brings_its_calls_and_usage() {
+        let events = reply_of(
+            "application/json",
+            r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":120,"completion_tokens":9,"prompt_tokens_details":{"cached_tokens":64}}}"#,
+        );
+        assert!(matches!(
+            events[0],
+            Event::Usage {
+                completion: 9,
+                prompt: 120,
+                cached: 64,
+                ..
+            }
+        ));
+        let Event::ToolCalls(calls) = &events[1] else {
+            panic!("no calls");
+        };
+        assert_eq!(calls[0].id, "c1");
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments, r#"{"path":"a.rs"}"#);
+        assert!(matches!(events[2], Event::Finished(Ok(()))));
     }
 }

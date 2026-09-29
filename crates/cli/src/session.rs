@@ -86,6 +86,9 @@ impl Runner {
     }
 
     fn work(&mut self, turn: &mut Turn, session: usize) -> Result<String, String> {
+        // A reply cut off at the output limit goes on in the next one, and
+        // the answer is both.
+        let mut answer = String::new();
         loop {
             let Some(reply) = self.stream_once(turn, session)? else {
                 // Ctrl-C stops the turn and leaves; escape only stops the
@@ -96,10 +99,32 @@ impl Runner {
                 }
                 return Ok(String::new());
             };
-            let answer = reply.content.clone();
+            answer.push_str(&reply.content);
             let calls = reply.tool_calls.clone();
+            let continuation = turn.continuation();
             self.store.conversations[session].updated = chat::now();
-            self.store.conversations[session].messages.push(reply);
+            // A reply cut off inside a tool call, with no text before it,
+            // leaves nothing to keep.
+            if !reply.content.is_empty() || !calls.is_empty() {
+                self.store.conversations[session].messages.push(reply);
+            }
+            match continuation {
+                Ok(Some(notice)) => {
+                    render::blank();
+                    render::said(
+                        &render::dim("●"),
+                        &render::dim("Cut off at the output limit; continuing."),
+                    );
+                    self.store.conversations[session].messages.push(notice);
+                    self.persist();
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.persist();
+                    return Err(error);
+                }
+            }
             self.persist();
 
             if !turn.begin(calls) {
@@ -108,6 +133,7 @@ impl Runner {
             if !self.work_through(turn, session)? {
                 return Ok(answer);
             }
+            answer.clear();
         }
     }
 
