@@ -93,6 +93,7 @@ pub(crate) struct Chat {
     /// reach the chat there.
     pub(crate) page_focus: FocusHandle,
     pub(crate) settings_backdrop: Option<std::sync::Arc<RenderImage>>,
+    pub(crate) grains: crate::ui::grain::Grains,
     pub(crate) settings_closing: bool,
     pub(crate) rename: Entity<InputState>,
     pub(crate) page: Page,
@@ -249,6 +250,7 @@ impl Chat {
         // Sessions are separate files now, so a damaged one costs that
         // session rather than the history.
         let (mut store, error) = (letronna_core::store::load(), None);
+        crate::theme::apply(&store.settings.appearance, window, cx);
         letronna_core::browser::share_browser(store.settings.browser_shared);
         std::thread::spawn(letronna_core::browser::close_left_over);
         if store.conversations.is_empty() {
@@ -409,6 +411,16 @@ impl Chat {
                     this.add_skills(window, cx);
                 }
             }),
+            // Only a window left to follow the system hears it change; the
+            // other settings pin the window's own look.
+            cx.observe_window_appearance(window, |this, window, cx| {
+                if crate::theme::follows_system(&this.store.settings.appearance) {
+                    // As when the theme is picked: the blurred snapshot behind
+                    // settings wears the old colours.
+                    this.settings_backdrop = None;
+                    crate::theme::apply(&this.store.settings.appearance, window, cx);
+                }
+            }),
         ];
         // The message when the old skills.json will not move across, or the
         // skills cannot be read at all; the Skills page shows it too.
@@ -453,6 +465,7 @@ impl Chat {
             settings_focus: cx.focus_handle(),
             page_focus: cx.focus_handle(),
             settings_backdrop: None,
+            grains: crate::ui::grain::Grains::new(cx),
             settings_closing: false,
             rename,
             busy: false,
@@ -1933,7 +1946,13 @@ impl Render for Chat {
                     }
                 }),
             )
-            .child(self.title_bar(window, cx))
+            .child(
+                div()
+                    .relative()
+                    .flex_shrink_0()
+                    .child(self.title_bar(window, cx))
+                    .children(self.grain(&self.grains.title_bar)),
+            )
             .child(
                 h_flex()
                     .flex_1()

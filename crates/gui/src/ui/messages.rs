@@ -9,6 +9,13 @@ impl Chat {
         (SharedString::from(format!("{name}-{session}")), index).into()
     }
 
+    /// A row id for a text view that also names the theme it is drawn in:
+    /// the view keeps the syntax colours of its first draw, so a new theme
+    /// takes a new view.
+    fn text_id(&self, name: &str, index: usize) -> ElementId {
+        self.row_id(&format!("{name}-{}", crate::theme::generation()), index)
+    }
+
     /// Whether a thought or a tool's output is shown open, by session and
     /// place, so opening one does not open its twin in another session.
     fn open_key(&self, index: usize) -> (u64, usize) {
@@ -59,7 +66,7 @@ impl Chat {
         };
         let leading = px(24.);
         let cx_muted = cx.theme().muted_foreground;
-        let md = self.row_id("md", index);
+        let md = self.text_id("md", index);
         // Not while a dialog is up: the text view starts a selection on any
         // press inside it, even one on a dialog drawn over it, and that press
         // never ends -- confirming a rewind left the reply half selected.
@@ -494,9 +501,14 @@ impl Chat {
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
                         .child(
-                            TextView::markdown(self.row_id("reason", index), reasoning, window, cx)
-                                .selectable(!window.has_active_dialog(cx))
-                                .line_height(px(21.)),
+                            TextView::markdown(
+                                self.text_id("reason", index),
+                                reasoning,
+                                window,
+                                cx,
+                            )
+                            .selectable(!window.has_active_dialog(cx))
+                            .line_height(px(21.)),
                         ),
                 )
             })
@@ -509,6 +521,7 @@ impl Chat {
             .workspace
             .is_none();
         v_flex()
+            .relative()
             .flex_1()
             .items_center()
             .justify_center()
@@ -547,6 +560,7 @@ impl Chat {
                     .text_color(cx.theme().muted_foreground.opacity(0.7))
                     .child("Enter to send  ·  Shift+Enter for a new line  ·  Esc to stop"),
             )
+            .children(self.grain(&self.grains.empty_chat))
     }
 
     pub(crate) fn page_view(&self, page: Page, cx: &mut Context<Self>) -> impl IntoElement {

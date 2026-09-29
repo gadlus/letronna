@@ -26,15 +26,16 @@ pub(crate) fn hide(window: &mut Window) {
     }
 }
 
-/// Match the native window chrome to the app's dark theme. On macOS the traffic
-/// lights follow the window's appearance, not the content under them: a light
-/// window draws them inactive as dark discs, which vanish on the dark title bar
-/// whenever another app has focus. Other platforms draw their own controls.
-pub(crate) fn use_dark_chrome(window: &Window) {
+/// Match the native window chrome to the app's theme: pinned dark or light,
+/// or with None left to follow the system. On macOS the traffic lights follow
+/// the window's appearance, not the content under them: a light window draws
+/// them inactive as dark discs, which vanish on a dark title bar whenever
+/// another app has focus. Other platforms draw their own controls.
+pub(crate) fn pin_chrome(window: &Window, dark: Option<bool>) {
     #[cfg(target_os = "macos")]
-    mac::use_dark_appearance(window);
+    mac::pin_appearance(window, dark);
     #[cfg(not(target_os = "macos"))]
-    let _ = window;
+    let _ = (window, dark);
 }
 
 #[cfg(windows)]
@@ -47,7 +48,7 @@ mod mac {
     use crate::prelude::*;
     use objc::{class, msg_send, runtime::Object, sel, sel_impl};
 
-    pub(crate) fn use_dark_appearance(window: &Window) {
+    pub(crate) fn pin_appearance(window: &Window, dark: Option<bool>) {
         use raw_window_handle::{HasWindowHandle, RawWindowHandle};
         let Ok(handle) = HasWindowHandle::window_handle(window) else {
             return;
@@ -61,14 +62,22 @@ mod mac {
             if ns_window.is_null() {
                 return;
             }
-            let name: *mut Object = msg_send![
-                class!(NSString),
-                stringWithUTF8String: c"NSAppearanceNameDarkAqua".as_ptr()
-            ];
-            let appearance: *mut Object = msg_send![class!(NSAppearance), appearanceNamed: name];
-            if !appearance.is_null() {
-                let _: () = msg_send![ns_window, setAppearance: appearance];
+            // A nil appearance is the system's own.
+            let mut appearance: *mut Object = std::ptr::null_mut();
+            if let Some(dark) = dark {
+                let name = if dark {
+                    c"NSAppearanceNameDarkAqua"
+                } else {
+                    c"NSAppearanceNameAqua"
+                };
+                let name: *mut Object =
+                    msg_send![class!(NSString), stringWithUTF8String: name.as_ptr()];
+                appearance = msg_send![class!(NSAppearance), appearanceNamed: name];
+                if appearance.is_null() {
+                    return;
+                }
             }
+            let _: () = msg_send![ns_window, setAppearance: appearance];
         }
     }
 }

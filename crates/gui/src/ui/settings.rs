@@ -323,6 +323,7 @@ impl Chat {
                 .justify_center()
                 .children(blur)
                 .child(scrim)
+                .children(self.grain(&self.grains.settings))
                 .child(panel)
                 .into_any_element(),
         )
@@ -384,12 +385,9 @@ impl Chat {
         );
         let body: AnyElement = match current_page {
             "Model" => model_page(&model, &chat, cx).into_any_element(),
-            "Appearance" => text_page(
-                "Appearance",
-                "Dark theme with the Letronna palette. Theme and font options land here later.",
-                cx,
-            )
-            .into_any_element(),
+            "Appearance" => {
+                appearance_page(&chat, &self.store.settings, window, cx).into_any_element()
+            }
             "Privacy" => privacy_page(
                 &chat,
                 &presence,
@@ -991,8 +989,99 @@ fn updates(chat: &Entity<Chat>, this: &Chat, cx: &App) -> Div {
         )))
 }
 
-fn text_page(title: &'static str, blurb: &'static str, cx: &App) -> Div {
-    v_flex().gap_4().child(heading(title, blurb, cx))
+/// Night, Paper or the computer's own, and the film grain on or off.
+fn appearance_page(
+    chat: &Entity<Chat>,
+    settings: &Settings,
+    window: &mut Window,
+    cx: &mut App,
+) -> Div {
+    const LOOKS: [(&str, &str, &str); 3] = [
+        ("", "night", "Night — deep blue around a near-black page"),
+        (
+            "paper",
+            "paper",
+            "Paper — ink on a light page, for daylight",
+        ),
+        (
+            "system",
+            "system",
+            "Follow system — Night or Paper as the computer is set",
+        ),
+    ];
+
+    let mut looks = v_flex().gap_2();
+    for (value, id, text) in LOOKS {
+        let active = settings.appearance == value;
+        // A tab stop of its own, so Tab reaches each choice and Enter or
+        // Space takes it.
+        let focus = window
+            .use_keyed_state(SharedString::from(format!("look-{id}")), cx, |_, cx| {
+                cx.focus_handle()
+            })
+            .read(cx)
+            .clone();
+        let chat = chat.clone();
+        looks = looks.child(
+            h_flex()
+                .id(id)
+                .track_focus(&focus.tab_stop(true))
+                .cursor_pointer()
+                .items_center()
+                .gap_2p5()
+                .p_2p5()
+                .rounded(cx.theme().radius)
+                .border_1()
+                .border_color(if active {
+                    cx.theme().primary
+                } else {
+                    cx.theme().border
+                })
+                .focus(|s| s.border_color(cx.theme().ring))
+                .child(div().flex_1().min_w_0().text_sm().child(text))
+                // Paper's focus ring is its primary blue, so the chosen row
+                // is told apart by its tick.
+                .when(active, |row| {
+                    row.child(
+                        Icon::new(IconName::Check)
+                            .small()
+                            .text_color(cx.theme().primary),
+                    )
+                })
+                .on_click(move |_, window, cx| {
+                    chat.update(cx, |this, cx| {
+                        this.store.settings.appearance = value.to_string();
+                        this.save();
+                        // The blurred snapshot behind settings still wears
+                        // the old colours; the live window shows through.
+                        this.settings_backdrop = None;
+                        crate::theme::apply(value, window, cx);
+                        cx.notify();
+                    })
+                }),
+        );
+    }
+
+    let grain = settings.grain;
+    let grain = toggle_row(
+        "grain",
+        "Film grain",
+        "A faint grain on the frame and the empty pages, as letronna.ai has. Never over the conversation, code or diffs.",
+        grain,
+        chat,
+        cx,
+        std::rc::Rc::new(move |this: &mut Chat| this.store.settings.grain = !grain),
+    );
+
+    v_flex()
+        .gap_4()
+        .child(heading(
+            "Appearance",
+            "How the window looks. Paper suits daylight; following the system switches with the computer.",
+            cx,
+        ))
+        .child(v_flex().gap_1().child(label("Theme", cx)).child(looks))
+        .child(grain)
 }
 
 fn model_page(model: &Entity<InputState>, chat: &Entity<Chat>, cx: &App) -> Div {
@@ -1116,7 +1205,11 @@ fn toggle_row(
         .items_center()
         .gap_4()
         .child(
+            // Shrinks and wraps, so a long line never pushes the switch
+            // off the page.
             v_flex()
+                .flex_1()
+                .min_w_0()
                 .gap_0p5()
                 .child(div().text_sm().child(title))
                 .child(
