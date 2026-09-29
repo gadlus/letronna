@@ -261,10 +261,33 @@ impl Conversation {
 impl Store {
     /// An id no existing session uses. Ids also name files, so a collision
     /// would merge two histories; the folder is checked as well as memory.
-    pub fn next_id(&self) -> u64 {
+    fn next_id(&self) -> u64 {
         let highest = self.conversations.iter().map(|c| c.id).max().unwrap_or(0);
         let on_disk = session_ids().into_iter().max().unwrap_or(0);
         highest.max(on_disk) + 1
+    }
+
+    /// Claim an id for a new session by creating its empty file, so two
+    /// Letronnas starting sessions at the same moment never get the same one.
+    pub fn reserve_id(&self) -> u64 {
+        // The highest id plus one is only where the search starts: another
+        // process can read the same folder in the same instant. Creating the
+        // file with create_new is atomic, so exactly one of them gets it.
+        let _ = std::fs::create_dir_all(sessions_dir());
+        let mut id = self.next_id();
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(session_path(id))
+            {
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => id += 1,
+                // Claimed, or the folder cannot be written at all. Then the
+                // session carries on in memory and its save reports the
+                // failure, as it did before ids were claimed.
+                _ => return id,
+            }
+        }
     }
 
     /// Give every session an id. Older saves have none.
@@ -377,7 +400,8 @@ impl Conversation {
         }
         let path = session_path(self.id);
         let _lock = Lock::take(&path)?;
-        let fresh = !path.exists();
+        // A reserved session's file is there but empty, and still needs its head.
+        let fresh = !std::fs::metadata(&path).is_ok_and(|m| m.len() > 0);
         // Written before and gone now: the other Letronna deleted it. Writing
         // anyway brought it back as a fragment -- a head and whatever changed
         // since the last save, with none of the history before it. Remembered
@@ -511,6 +535,10 @@ pub fn summaries() -> Vec<Summary> {
         .into_iter()
         .filter_map(|id| {
             let bytes = std::fs::read(session_path(id)).ok()?;
+            // Reserved and not yet saved: it belongs to whoever reserved it.
+            if bytes.is_empty() {
+                return None;
+            }
             let text = String::from_utf8_lossy(&bytes);
             let mut summary = Summary {
                 id,
@@ -1939,6 +1967,54 @@ mod tests {
         store.remove(0);
         assert!(!one.exists());
         assert!(!one.with_extension("lock").exists());
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn ids_reserved_at_the_same_time_differ() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("reserve");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        // Each thread is a Letronna starting up: its own empty store, the
+        // same folder, all let go at once.
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let racers: Vec<_> = (0..16)
+            .map(|_| {
+                let gate = gate.clone();
+                std::thread::spawn(move || {
+                    gate.wait();
+                    Store::default().reserve_id()
+                })
+            })
+            .collect();
+        let mut ids: Vec<u64> = racers.into_iter().map(|r| r.join().unwrap()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 16);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_reserved_session_is_listed_once_saved_and_not_before() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("reserve-save");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        let id = store.reserve_id();
+        assert!(summaries().is_empty());
+
+        // The file is already there, and the first save still writes its head.
+        store.conversations.push(Conversation {
+            id,
+            messages: vec![said("user", "hello")],
+            ..Default::default()
+        });
+        store.save().unwrap();
+        assert_eq!(summaries()[0].messages, 1);
+        let back = replay(&dir.join(format!("sessions/{id}.jsonl"))).unwrap();
+        assert_eq!(back.id, id);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 }

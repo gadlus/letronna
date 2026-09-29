@@ -682,7 +682,7 @@ fn branch(runner: &mut Runner, session: &mut usize, name: &str) {
         name => name.to_owned(),
     };
     let copy = store::Conversation {
-        id: runner.store.next_id(),
+        id: runner.store.reserve_id(),
         title: title.clone(),
         messages: from.messages.clone(),
         updated: letronna_core::chat::now(),

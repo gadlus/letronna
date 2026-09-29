@@ -230,7 +230,7 @@ impl Chat {
     /// as it is. From your message, the copy stops before it and its text is
     /// in the box, ready to be asked differently.
     pub(crate) fn fork_turn(&mut self, span: Span, window: &mut Window, cx: &mut Context<Self>) {
-        let id = self.store.next_id();
+        let id = self.store.reserve_id();
         let back = span.yours.then(|| self.prompt_text(span.first)).flatten();
         let source = &self.store.conversations[self.store.active];
         let messages = source.messages[..span.keep().min(source.messages.len())].to_vec();
