@@ -756,7 +756,7 @@ impl Chat {
         turn.absorb(&event);
         match event {
             Event::Finished(Err(error)) => {
-                self.error = Some(error);
+                self.error = Some(error.to_string());
                 self.finish(cx);
             }
             Event::Finished(Ok(())) => self.on_reply(cx),

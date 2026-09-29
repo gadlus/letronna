@@ -13,6 +13,7 @@ mod cdp;
 pub mod chat;
 pub mod compact;
 mod edit;
+pub mod failure;
 pub mod gateway;
 pub mod jobs;
 pub mod mcp;

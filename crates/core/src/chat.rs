@@ -1,3 +1,4 @@
+use crate::failure::{Failure, FailureKind, classify};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -139,7 +140,7 @@ pub enum Event {
     },
     /// Sent once, before `Finished`, when the model asked for tools.
     ToolCalls(Vec<ToolCall>),
-    Finished(Result<(), String>),
+    Finished(Result<(), Failure>),
 }
 
 pub fn validate(connection: &Connection) -> Result<String, String> {
@@ -420,7 +421,7 @@ fn wire_message(m: &Message) -> Value {
 /// Statuses worth one retry: gateway and edge failures that say nothing about
 /// the request itself. 520-527 are Cloudflare's own (525 is a failed TLS
 /// handshake between the edge and the origin).
-fn transient(status: reqwest::StatusCode) -> bool {
+pub(crate) fn transient(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 502 | 503 | 504 | 520..=527)
 }
 
@@ -513,10 +514,15 @@ fn name_as_offered(calls: &mut [ToolCall]) {
     }
 }
 
-fn parse_event(data: &str) -> Result<Chunk, String> {
-    let value: Value = serde_json::from_str(data)
-        .map_err(|_| "Provider returned an invalid stream event.".to_owned())?;
-    let inner = unwrap_response(&value)?;
+fn parse_event(data: &str) -> Result<Chunk, Failure> {
+    let value: Value = serde_json::from_str(data).map_err(|_| {
+        Failure::new(
+            FailureKind::BadReply,
+            "Provider returned an invalid stream event.",
+        )
+    })?;
+    let inner = unwrap_response(&value)
+        .map_err(|_| classify(None, &reqwest::header::HeaderMap::new(), &value))?;
     let delta = inner.pointer("/choices/0/delta");
     let content = delta
         .and_then(|d| d.get("content"))
@@ -651,13 +657,14 @@ fn stream(
     connection: &Connection,
     messages: &[Message],
     sender: &async_channel::Sender<Event>,
-) -> Result<(), String> {
-    let endpoint = validate(connection)?;
+) -> Result<(), Failure> {
+    let endpoint = validate(connection).map_err(|e| Failure::new(FailureKind::Settings, e))?;
     // What the window no longer holds goes in as a summary rather than not at
     // all. It is made here, on the worker, so the wait is part of the reply's.
     let dropped = &messages[..window_start(messages)];
     let summary = crate::compact::summary(connection, dropped);
-    let mut request = client()?
+    let mut request = client()
+        .map_err(|e| Failure::new(FailureKind::Unknown, e))?
         .post(endpoint)
         .timeout(Duration::from_secs(120))
         .json(&body(connection, messages, summary.as_deref()));
@@ -671,7 +678,7 @@ fn stream(
         attempt += 1;
         let send = request
             .try_clone()
-            .ok_or("Could not prepare the request.")?
+            .ok_or_else(|| Failure::new(FailureKind::Unknown, "Could not prepare the request."))?
             .send();
         match send {
             Ok(response) if transient(response.status()) && attempt == 1 => {
@@ -679,7 +686,12 @@ fn stream(
             }
             Ok(response) => break response,
             Err(_) if attempt == 1 => std::thread::sleep(Duration::from_millis(600)),
-            Err(_) => return Err("Cannot reach the model. Check that your server is running and the endpoint is correct (120-second request timeout).".to_owned()),
+            Err(_) => {
+                return Err(Failure::new(
+                    FailureKind::Network,
+                    "Cannot reach the model. Check that your server is running and the endpoint is correct (120-second request timeout).",
+                ));
+            }
         }
     };
     let status = response.status();
@@ -691,20 +703,9 @@ fn stream(
             forget_images(&connection.model);
             return stream(connection, messages, sender);
         }
-        let detail = response
-            .json::<Value>()
-            .ok()
-            .and_then(|v| unwrap_response(&v).err());
-        return Err(detail.unwrap_or_else(|| {
-            let code = status.as_u16();
-            if transient(status) {
-                format!(
-                    "The gateway is having trouble right now (HTTP {code}). This is at                      the provider's end, not your settings. Try again in a moment, or                      switch gateway in Settings."
-                )
-            } else {
-                format!("Provider returned HTTP {code}. Check connection settings and quota.")
-            }
-        }));
+        let headers = response.headers().clone();
+        let body = response.json::<Value>().unwrap_or_default();
+        return Err(classify(Some(status.as_u16()), &headers, &body));
     }
     if response
         .headers()
@@ -714,16 +715,17 @@ fn stream(
     {
         let value: Value = response
             .json()
-            .map_err(|_| "Invalid model response.".to_owned())?;
-        let content = unwrap_response(&value)?
+            .map_err(|_| Failure::new(FailureKind::BadReply, "Invalid model response."))?;
+        let content = unwrap_response(&value)
+            .map_err(|_| classify(None, &reqwest::header::HeaderMap::new(), &value))?
             .pointer("/choices/0/message/content")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
-            .ok_or("Model returned no text.")?
+            .ok_or_else(|| Failure::new(FailureKind::BadReply, "Model returned no text."))?
             .to_owned();
         sender
             .send_blocking(Event::Delta(content))
-            .map_err(|_| "Chat closed.".to_owned())?;
+            .map_err(|_| Failure::new(FailureKind::Stopped, "Chat closed."))?;
         return Ok(());
     }
     let mut received = false;
@@ -734,8 +736,12 @@ fn stream(
     let mut calls: Vec<ToolCall> = Vec::new();
     let began = std::time::Instant::now();
     for line in BufReader::new(response).lines() {
-        let line =
-            line.map_err(|_| "Connection interrupted before the response completed.".to_owned())?;
+        let line = line.map_err(|_| {
+            Failure::new(
+                FailureKind::Network,
+                "Connection interrupted before the response completed.",
+            )
+        })?;
         let Some(data) = line.strip_prefix("data:").map(str::trim) else {
             continue;
         };
@@ -757,13 +763,13 @@ fn stream(
         if let Some(text) = chunk.reasoning {
             sender
                 .send_blocking(Event::Reasoning(text))
-                .map_err(|_| "Chat closed.".to_owned())?;
+                .map_err(|_| Failure::new(FailureKind::Stopped, "Chat closed."))?;
         }
         if let Some(text) = chunk.content {
             received = true;
             sender
                 .send_blocking(Event::Delta(text))
-                .map_err(|_| "Chat closed.".to_owned())?;
+                .map_err(|_| Failure::new(FailureKind::Stopped, "Chat closed."))?;
         }
     }
     if completion_tokens > 0 {
@@ -776,9 +782,10 @@ fn stream(
         });
     }
     if !complete {
-        return Err(
-            "The provider closed the stream early or does not support SSE chat completions.".into(),
-        );
+        return Err(Failure::new(
+            FailureKind::Network,
+            "The provider closed the stream early or does not support SSE chat completions.",
+        ));
     }
     calls.retain(|c| !c.name.is_empty());
     name_unnamed(&mut calls);
@@ -787,10 +794,13 @@ fn stream(
         received = true;
         sender
             .send_blocking(Event::ToolCalls(calls))
-            .map_err(|_| "Chat closed.".to_owned())?;
+            .map_err(|_| Failure::new(FailureKind::Stopped, "Chat closed."))?;
     }
     if !received {
-        return Err("The model returned no text. Check model compatibility.".into());
+        return Err(Failure::new(
+            FailureKind::BadReply,
+            "The model returned no text. Check model compatibility.",
+        ));
     }
     Ok(())
 }
@@ -1466,5 +1476,52 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(beside.input_tokens(), 1933);
+    }
+
+    #[test]
+    fn an_error_partway_through_a_stream_is_classified_like_one_before_it() {
+        // OpenRouter's event for a provider that failed after the stream began.
+        let data = r#"{"id":"gen-1759000000-abc","object":"chat.completion.chunk","model":"anthropic/claude-sonnet-4","provider":"Anthropic","error":{"code":"server_error","message":"Provider disconnected unexpectedly"},"choices":[{"index":0,"delta":{"content":""},"finish_reason":"error"}]}"#;
+        let Err(failure) = parse_event(data) else {
+            panic!("an error event was read as a chunk");
+        };
+        assert_eq!(failure.kind, FailureKind::Server);
+        assert_eq!(failure.to_string(), "Provider disconnected unexpectedly");
+    }
+
+    #[test]
+    fn a_refused_request_ends_with_its_kind_and_the_wait_asked_for() {
+        use std::io::Write;
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1", server.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = server.accept().unwrap();
+            request_body(&mut socket);
+            let reply = r#"{"error":{"message":"Rate limit reached for gpt-4o in organization org-abc on requests per min (RPM): Limit 500, Used 500, Requested 1.","type":"requests","param":null,"code":"rate_limit_exceeded"}}"#;
+            write!(socket, "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 3\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+        });
+        let c = Connection {
+            endpoint,
+            ..connection()
+        };
+        let rx = start(
+            c,
+            vec![Message {
+                role: "user".into(),
+                content: "Hi".into(),
+                ..Default::default()
+            }],
+        );
+        let Event::Finished(Err(failure)) = rx.recv_blocking().unwrap() else {
+            panic!("a refused request did not end in a failure");
+        };
+        assert_eq!(failure.kind, FailureKind::RateLimit);
+        assert_eq!(failure.retry_after, Some(Duration::from_secs(3)));
+        assert!(
+            failure
+                .to_string()
+                .starts_with("Rate limit reached for gpt-4o")
+        );
+        worker.join().unwrap();
     }
 }
