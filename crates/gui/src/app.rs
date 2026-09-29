@@ -142,6 +142,8 @@ pub(crate) struct Chat {
     pub(crate) job_tick: bool,
     /// Plan mode: the model may read and ask, but not change anything.
     pub(crate) plan_mode: bool,
+    /// Whether the message box holds nothing to send.
+    pub(crate) composer_empty: bool,
     pub(crate) schedules: Vec<letronna_core::schedule::Schedule>,
     /// Id of the schedule being edited on the Scheduled jobs page.
     pub(crate) editing: Option<u64>,
@@ -360,9 +362,19 @@ impl Chat {
                 }
                 cx.notify()
             }),
-            cx.subscribe_in(&composer, window, |this, _, event, window, cx| {
-                if matches!(event, InputEvent::PressEnter { secondary: false }) {
-                    this.send(window, cx);
+            cx.subscribe_in(&composer, window, |this, input, event, window, cx| {
+                match event {
+                    InputEvent::PressEnter { secondary: false } => this.send(window, cx),
+                    // Send lights up once there is something to send. Redraw
+                    // only when that flips, not on every key.
+                    InputEvent::Change => {
+                        let empty = input.read(cx).value().trim().is_empty();
+                        if empty != this.composer_empty {
+                            this.composer_empty = empty;
+                            cx.notify();
+                        }
+                    }
+                    _ => {}
                 }
             }),
             cx.subscribe_in(&search, window, |_, _, _: &InputEvent, _, cx| cx.notify()),
@@ -432,6 +444,7 @@ impl Chat {
             answer,
             job_tick: false,
             plan_mode: false,
+            composer_empty: true,
             schedules: letronna_core::schedule::load(),
             editing: None,
             job_name,

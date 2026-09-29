@@ -539,6 +539,7 @@ impl Chat {
                     } else {
                         "Plan mode off. Click to stop it writing or running anything."
                     })
+                    .selected(self.plan_mode)
                     .text_color(if self.plan_mode {
                         cx.theme().link
                     } else {
@@ -568,6 +569,7 @@ impl Chat {
                     } else {
                         "Web search off. Click to let it look things up."
                     })
+                    .selected(self.store.settings.search)
                     .text_color(if self.store.settings.search {
                         cx.theme().link
                     } else {
@@ -592,6 +594,7 @@ impl Chat {
                     .plain(cx)
                     .xsmall()
                     .icon(Icon::new(AppIcon::Mic))
+                    .disabled(true)
                     .tooltip("Voice input, coming soon"),
             )
             // Stop only where the reply is: in another session it would end
@@ -622,7 +625,7 @@ impl Chat {
                     } else {
                         "Send (Enter)"
                     })
-                    .disabled(self.busy_elsewhere().is_some())
+                    .disabled(self.composer_empty || self.busy_elsewhere().is_some())
                     .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
             )
     }
