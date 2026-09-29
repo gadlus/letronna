@@ -61,7 +61,7 @@ fn grammars() -> Vec<Grammar> {
             ),
         },
         Grammar {
-            names: &["javascript", "js"],
+            names: &["javascript", "js", "jsx"],
             config: LanguageConfig::new(
                 "javascript",
                 tree_sitter_javascript::LANGUAGE.into(),
@@ -105,7 +105,7 @@ fn grammars() -> Vec<Grammar> {
             ),
         },
         Grammar {
-            names: &["bash", "sh"],
+            names: &["bash", "sh", "shell", "zsh"],
             config: LanguageConfig::new(
                 "bash",
                 tree_sitter_bash::LANGUAGE.into(),
@@ -116,7 +116,7 @@ fn grammars() -> Vec<Grammar> {
             ),
         },
         Grammar {
-            names: &["diff"],
+            names: &["diff", "patch"],
             config: LanguageConfig::new(
                 "diff",
                 tree_sitter_diff::LANGUAGE.into(),
@@ -151,16 +151,20 @@ mod tests {
                 "javascript",
                 "js",
                 "json",
+                "jsx",
+                "patch",
                 "py",
                 "python",
                 "rs",
                 "rust",
                 "sh",
+                "shell",
                 "toml",
                 "ts",
                 "typescript",
                 "yaml",
                 "yml",
+                "zsh",
             ]
         );
     }
@@ -175,6 +179,10 @@ mod tests {
             ("py", "python"),
             ("sh", "bash"),
             ("yml", "yaml"),
+            ("jsx", "javascript"),
+            ("shell", "bash"),
+            ("zsh", "bash"),
+            ("patch", "diff"),
         ];
         for (alias, canonical) in aliases {
             let config = registry
