@@ -217,6 +217,11 @@ fn add_to_draft(draft: &mut String, text: &str) {
 /// that worked -- it is only ever a copy of what the user just said out
 /// loud, kept no longer than turning it into text takes.
 fn transcribe(audio: &Captured) -> Result<String, String> {
+    // A press straight after the first, or a device that sent nothing: not
+    // worth a paid request that can only come back empty or refused.
+    if audio.samples.is_empty() {
+        return Err("No speech was heard.".to_owned());
+    }
     let wav = encode_wav(audio);
     with_temp_wav(&wav, letronna_core::media::transcribe_path)
 }
@@ -281,7 +286,17 @@ fn encode_wav(audio: &Captured) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Captured, add_to_draft, elapsed, encode_wav, with_temp_wav};
+    use super::{Captured, add_to_draft, elapsed, encode_wav, transcribe, with_temp_wav};
+
+    #[test]
+    fn an_empty_recording_is_not_sent() {
+        let audio = Captured {
+            samples: Vec::new(),
+            sample_rate: 48_000,
+            channels: 1,
+        };
+        assert_eq!(transcribe(&audio), Err("No speech was heard.".to_owned()));
+    }
 
     #[test]
     fn words_for_a_session_off_screen_join_the_end_of_its_draft() {
