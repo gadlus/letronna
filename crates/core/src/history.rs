@@ -307,6 +307,22 @@ fn origins(messages: &[Message], workspace: &Path) -> Vec<Origin> {
     files
 }
 
+/// What is at `path` now: `None` when nothing is, an error for a link, a
+/// device, a pipe or a file over [`FILE_CAP`]. A link could name a secret
+/// outside the project, and a device or a pipe never ends.
+fn read_now(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return Ok(None);
+    };
+    if !meta.is_file() {
+        return Err("it is not a plain file".into());
+    }
+    if meta.len() > FILE_CAP {
+        return Err("it is too big".into());
+    }
+    Ok(std::fs::read(path).ok())
+}
+
 /// A file as it is now against how the session found it: `None` when it
 /// is back as it was, the patch when both are text, and an empty patch
 /// marked binary when either is not.
@@ -320,7 +336,8 @@ fn compare(dir: &Path, file: &Origin) -> Result<Option<(crate::unified::Patch, b
         })?,
         None => Vec::new(),
     };
-    let now = std::fs::read(&file.path).ok();
+    let now = read_now(&file.path)
+        .map_err(|why| format!("{}: {why}, so it is not compared.", file.name.display()))?;
     if now.as_deref() == Some(old.as_slice()) || (now.is_none() && file.from.is_none()) {
         return Ok(None);
     }
@@ -1205,6 +1222,27 @@ mod tests {
         assert!(patch.contains(" one\n+two\n"), "{patch}");
         let made = session_patch_in(&kept, &turns, &project, Path::new("b.txt")).unwrap();
         assert!(made.starts_with("--- /dev/null\n"), "{made}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_session_file_turned_into_a_link_is_not_read() {
+        let (project, kept) = scratch("session-link");
+        let secret = project.parent().unwrap().join("session-link-secret.txt");
+        std::fs::write(&secret, "hunter2\n").unwrap();
+        std::fs::write(project.join("a.txt"), "one\n").unwrap();
+        let ctx = context(&project, &kept);
+        let turns = [call(
+            &ctx,
+            "write_file",
+            serde_json::json!({"path": "a.txt", "content": "two\n"}),
+        )];
+        std::fs::remove_file(project.join("a.txt")).unwrap();
+        std::os::unix::fs::symlink(&secret, project.join("a.txt")).unwrap();
+        let files = session_files_in(&kept, &turns, &project);
+        assert_eq!((files[0].added, files[0].removed), (0, 0), "{files:?}");
+        let shown = session_patch_in(&kept, &turns, &project, Path::new("a.txt"));
+        assert!(shown.is_err_and(|why| !why.contains("hunter2")));
     }
 
     #[test]
