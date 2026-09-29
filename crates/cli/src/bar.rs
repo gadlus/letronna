@@ -764,6 +764,12 @@ impl Bar {
         self.settle();
     }
 
+    /// Change what the waiting line names without starting its clock again.
+    pub fn rename_wait(&mut self, what: &str) {
+        self.waiting = self.waiting.take().map(|waiting| waiting.renamed(what));
+        self.settle();
+    }
+
     /// Say whether a turn is running, so escape knows what it means.
     pub fn working(&mut self, on: bool) {
         self.working = on;

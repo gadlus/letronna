@@ -324,10 +324,11 @@ impl Turn {
 
     /// The calls at the front of the queue that may run at once, at most
     /// `max`, left queued until `finish_id` records each.
-    pub fn next_batch(&self, gate: impl Fn(&str) -> bool, max: usize) -> Vec<ToolCall> {
+    /// `gate` says whether a call must wait for the user, from the whole call.
+    pub fn next_batch(&self, gate: impl Fn(&ToolCall) -> bool, max: usize) -> Vec<ToolCall> {
         self.queue
             .iter()
-            .take_while(|call| tools::concurrent(&call.name) && !gate(&call.name))
+            .take_while(|call| tools::concurrent(&call.name) && !gate(call))
             .take(max)
             .cloned()
             .collect()
@@ -838,7 +839,7 @@ mod tests {
     #[test]
     fn reads_in_one_batch_run_together_and_come_back_in_order() {
         let mut turn = turn();
-        let never = |_: &str| false;
+        let never = |_: &ToolCall| false;
         let names = [
             "read_file",
             "list_dir",
@@ -872,17 +873,32 @@ mod tests {
     }
 
     #[test]
+    fn a_call_asked_about_for_its_arguments_ends_the_batch() {
+        // A read joins a batch by its tool, but a read of a file of keys is
+        // asked about, and the gate sees the whole call to know that.
+        let mut turn = turn();
+        let keys = ToolCall {
+            id: "keys".into(),
+            name: "read_file".into(),
+            arguments: r#"{"path": ".env"}"#.into(),
+        };
+        turn.begin(vec![call("read_file"), keys, call("list_dir")]);
+        let asks = |queued: &ToolCall| queued.arguments.contains(".env");
+        assert_eq!(turn.next_batch(asks, MAX_BATCH), [call("read_file")]);
+    }
+
+    #[test]
     fn a_call_that_needs_asking_ends_the_batch() {
         let mut turn = turn();
         turn.begin(vec![call("read_file"), call("web_fetch"), call("list_dir")]);
-        let asks = |name: &str| name == "web_fetch";
+        let asks = |queued: &ToolCall| queued.name == "web_fetch";
         assert_eq!(turn.next_batch(asks, MAX_BATCH), [call("read_file")]);
         turn.finish_id("read_file-1", Ok("contents".into()));
 
         // Nothing runs past it while it waits for an answer.
         assert!(turn.next_batch(asks, MAX_BATCH).is_empty());
         assert_eq!(
-            turn.next(|queued: &ToolCall| if asks(&queued.name) {
+            turn.next(|queued: &ToolCall| if asks(queued) {
                 Outcome::Ask
             } else {
                 Outcome::Run
@@ -890,7 +906,7 @@ mod tests {
             Next::AskUser(call("web_fetch"))
         );
         // Once allowed, the same fetch joins the read after it.
-        let allowed = |_: &str| false;
+        let allowed = |_: &ToolCall| false;
         assert_eq!(
             turn.next_batch(allowed, MAX_BATCH),
             [call("web_fetch"), call("list_dir")]
@@ -899,7 +915,7 @@ mod tests {
 
     #[test]
     fn browse_and_memory_are_never_batched() {
-        let never = |_: &str| false;
+        let never = |_: &ToolCall| false;
         for alone in [
             "browse",
             "use_page",

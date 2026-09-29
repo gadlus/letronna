@@ -126,6 +126,14 @@ impl Waiting {
         }
     }
 
+    /// The same wait under another name, its clock still running.
+    pub fn renamed(self, what: &str) -> Self {
+        Self {
+            about: Some(what.to_owned()),
+            ..self
+        }
+    }
+
     /// The line as it should look now, in a window `width` columns wide.
     pub fn line(&self, width: usize) -> String {
         let elapsed = self.began.elapsed();
@@ -193,5 +201,14 @@ mod tests {
             assert!(visible(&line) <= width - MARGIN.len(), "{line}");
             assert!(line.contains(" · Wri"), "{line}");
         }
+    }
+
+    #[test]
+    fn a_renamed_wait_keeps_its_clock() {
+        let wait = Waiting::about("read_file(a) and 1 more");
+        let began = wait.began;
+        let wait = wait.renamed("read_file(b)");
+        assert_eq!(wait.began, began);
+        assert_eq!(wait.about.as_deref(), Some("read_file(b)"));
     }
 }

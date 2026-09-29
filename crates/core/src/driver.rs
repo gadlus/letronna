@@ -245,7 +245,8 @@ fn work_through(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result
         }
         // A tool allowed for the whole run would get its yes at once from
         // `approvals::ask`, so it counts as allowed here and can join a batch.
-        let batchable = |name: &str| {
+        let batchable = |call: &ToolCall| {
+            let name = call.name.as_str();
             refusal(&spec.allow, name).is_none()
                 && tools::needs_approval(name)
                 && !approvals::granted(spec.run, name)
