@@ -1,7 +1,7 @@
 //! The Messaging page: a channel list beside the setup for the selected one.
 
 use crate::prelude::*;
-use letronna_core::messaging;
+use letronna_core::messaging::{self, pairing};
 
 struct Channel {
     name: &'static str,
@@ -190,44 +190,55 @@ impl Chat {
             pills = pills.child(pill("Listening", cx.theme().green, cx));
         }
 
-        let chat_block = match (self.pairing.clone(), config.telegram.chat) {
-            (Some((chat, from)), _) => v_flex()
-                .gap_2()
-                .child(help(
-                    &format!("{from} messaged your bot from chat {chat}."),
-                    cx,
-                ))
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .child(
-                            Button::new("allow-chat")
-                                .primary()
-                                .small()
-                                .label("Allow this chat")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.messaging.telegram.chat = Some(chat);
-                                    this.pairing = None;
-                                    this.save_messaging(cx);
-                                })),
-                        )
-                        .child(
-                            Button::new("ignore-chat")
+        let now = std::time::Instant::now();
+        let chat_block = match (self.pairing.as_ref(), config.telegram.chat) {
+            (Some(code), _) if code.live(now) => {
+                let mut said = format!(
+                    "Send this code to your bot from the chat it should answer; in a \
+                     group, mention the bot first. It works for {} minutes.",
+                    pairing::LIFE.as_secs() / 60
+                );
+                if code.wrong() > 0 {
+                    said.push_str(&format!(" Wrong codes so far: {}.", code.wrong()));
+                }
+                v_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xl()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(code.code.clone()),
+                    )
+                    .child(help(&said, cx))
+                    .child(
+                        h_flex().child(
+                            Button::new("cancel-code")
                                 .plain(cx)
-                                .small()
-                                .label("Ignore")
+                                .xsmall()
+                                .label("Cancel")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.pairing = None;
                                     cx.notify();
                                 })),
                         ),
-                )
-                .into_any_element(),
+                    )
+                    .into_any_element()
+            }
             (None, Some(chat)) => h_flex()
                 .gap_2()
                 .items_center()
                 .child(help(
-                    &format!("Answering chat {chat}, and nothing else."),
+                    &match pairing::owner(&config.telegram) {
+                        Some(_) => format!(
+                            "Answering chat {chat}, and nothing else. Only the person who \
+                             paired it answers what Letronna asks there."
+                        ),
+                        None => format!(
+                            "Answering chat {chat}, and nothing else. It was paired before \
+                             owners were kept, so what Letronna asks there is answered here; \
+                             forget it and pair again to answer from the chat."
+                        ),
+                    },
                     cx,
                 ))
                 .child(
@@ -237,19 +248,39 @@ impl Chat {
                         .label("Forget")
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.messaging.telegram.chat = None;
+                            this.messaging.telegram.owner = None;
                             this.save_messaging(cx);
                         })),
                 )
                 .into_any_element(),
-            (None, None) => help(
-                if has_token {
-                    "Send your bot a message and it will appear here to allow."
-                } else {
-                    "Add a bot token first."
-                },
-                cx,
-            )
-            .into_any_element(),
+            _ if !has_token => help("Add a bot token first.", cx).into_any_element(),
+            (spent, _) => h_flex()
+                .gap_2()
+                .items_center()
+                .child(help(
+                    match spent {
+                        Some(_) => "That code ran out or was guessed at too often.",
+                        None => "Pair the chat Letronna should answer with a code sent from it.",
+                    },
+                    cx,
+                ))
+                .child(
+                    Button::new("pair-chat")
+                        .primary()
+                        .small()
+                        .label(match spent {
+                            Some(_) => "New code",
+                            None => "Pair a chat",
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            match pairing::Code::new() {
+                                Ok(code) => this.pairing = Some(code),
+                                Err(error) => this.error = Some(error),
+                            }
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
         };
 
         v_flex()
