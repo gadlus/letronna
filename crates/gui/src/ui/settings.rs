@@ -747,8 +747,9 @@ fn keep_row(chat: &Entity<Chat>, days: &Entity<InputState>, kept: u32, cx: &App)
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
                         .child(format!(
-                            "Looked for when Letronna starts, at most once a day. Pinned \
-                             sessions and one in use are kept. Empty keeps them all. {now}"
+                            "Looked for when Letronna starts with no other copy open, at \
+                             most once a day. Pinned sessions and one in use are kept. Empty \
+                             keeps them all. {now}"
                         )),
                 ),
         )

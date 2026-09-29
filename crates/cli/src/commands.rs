@@ -377,8 +377,9 @@ fn retention(runner: &mut Runner, rest: &str) {
     render::line(&render::dim(&match days {
         0 => "Every session is kept. /retention 30 deletes those untouched for 30 days.".into(),
         days => format!(
-            "Sessions untouched for {days} day{} are deleted when Letronna starts, at most \
-             once a day; pinned ones are kept. /retention off keeps them all.",
+            "Sessions untouched for {days} day{} are deleted when Letronna starts with no \
+             other copy open, at most once a day; pinned ones are kept. /retention off keeps \
+             them all.",
             if days == 1 { "" } else { "s" }
         ),
     }));

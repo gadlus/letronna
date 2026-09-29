@@ -332,7 +332,8 @@ pub struct Settings {
     #[serde(default)]
     pub crew: String,
     /// Sessions untouched for longer than this many days are deleted when
-    /// Letronna starts, at most once a day; 0 keeps them forever.
+    /// Letronna starts with no other one open, at most once a day; 0 keeps
+    /// them forever.
     #[serde(default)]
     pub keep_days: u32,
 }
@@ -758,26 +759,54 @@ fn pruned_path() -> PathBuf {
     backend::data_dir().join("pruned")
 }
 
+/// The file every running Letronna holds shared from its start. A prune
+/// takes it alone, so it only runs while no other Letronna is open: one
+/// that is has the sessions listed, and would write on into one deleted
+/// under it -- dropped as deleted elsewhere, or appended to the new session
+/// that took its freed id.
+fn running_path() -> PathBuf {
+    backend::data_dir().join("running.lock")
+}
+
+/// This process's hold on the running file, kept for as long as it runs.
+static RUNNING: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+
 /// Delete the sessions untouched for longer than the settings' `keep_days`,
-/// if that is set and this has not run in the last day. Called at startup,
-/// before the sessions are read, so none of them is open yet but the one
-/// the settings say was open last, which is kept.
+/// if that is set, this has not run in the last day and no other Letronna
+/// is open, then hold the running file for as long as this one runs.
+/// Called at startup, before the sessions are read, so none of them is open
+/// yet but the one the settings say was open last, which is kept.
 pub fn prune_old() {
-    let settings = current_settings();
-    if settings.keep_days == 0 {
+    let mut held = RUNNING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Only a start calls this, before anything is read, so this process's
+    // own earlier hold is not one to wait for.
+    *held = None;
+    let _ = std::fs::create_dir_all(backend::data_dir());
+    let Ok(running) = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(running_path())
+    else {
         return;
-    }
+    };
+    let settings = current_settings();
     let marker = pruned_path();
     let recent = std::fs::metadata(&marker)
         .and_then(|meta| meta.modified())
         .is_ok_and(|at| at.elapsed().is_ok_and(|age| age.as_secs() < DAY));
-    if recent {
-        return;
+    // With another Letronna open this waits for a later start, unmarked.
+    if settings.keep_days != 0 && !recent && running.try_lock().is_ok() {
+        let _ = std::fs::write(&marker, b"");
+        prune(settings.keep_days, backend::now(), &[settings.active_id]);
+        let _ = running.unlock();
     }
-    // Marked first, so the window and the terminal starting together do not
-    // both look; if they do, the second finds less to delete.
-    let _ = std::fs::write(&marker, b"");
-    prune(settings.keep_days, backend::now(), &[settings.active_id]);
+    // Waits out another start's prune, so nothing is read half deleted.
+    if running.lock_shared().is_ok() {
+        *held = Some(running);
+    }
 }
 
 /// Seconds in a day.
@@ -6680,6 +6709,46 @@ pub(crate) mod tests {
         window.save().unwrap();
         assert!(window.conversations[0].diverged);
         assert_eq!(contents(&replay(&path).unwrap()), ["0", "1", "more"]);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn old_sessions_wait_while_another_letronna_is_open() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("prune-running");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let now = crate::chat::now();
+        let mut store = Store::default();
+        saved_days_ago(&mut store, 1, 40, now);
+        saved_days_ago(&mut store, 2, 5, now);
+        std::fs::write(
+            super::settings_path(),
+            "{\"endpoint\":\"\",\"model\":\"\",\"keep_days\":30}",
+        )
+        .unwrap();
+
+        // Another Letronna, running, holds the file as its start left it.
+        let running = || {
+            std::fs::File::options()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(super::running_path())
+                .unwrap()
+        };
+        let other = running();
+        other.lock_shared().unwrap();
+        super::prune_old();
+        assert!(super::session_path(1).exists());
+        // Not marked, so the next start looks again.
+        assert!(!super::pruned_path().exists());
+
+        drop(other);
+        super::prune_old();
+        assert!(!super::session_path(1).exists());
+        assert!(super::session_path(2).exists());
+        // And this one now holds it, so no other start prunes meanwhile.
+        assert!(running().try_lock().is_err());
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 }
