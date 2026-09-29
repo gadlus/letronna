@@ -1189,13 +1189,10 @@ impl Chat {
     /// The user answered the approval card, here or from a chat.
     pub(crate) fn resolve_call(&mut self, verdict: Verdict, cx: &mut Context<Self>) {
         self.remote_waiting = None;
-        let Some(call) = self
+        let Some((call, true)) = self
             .turn
             .as_ref()
-            .and_then(|turn| match turn.next(|_| true) {
-                agent::Next::AskUser(call) => Some(call),
-                _ => None,
-            })
+            .and_then(|turn| front_call(turn, self.asking.as_deref()))
         else {
             return;
         };
@@ -1214,6 +1211,25 @@ impl Chat {
                 }
                 self.execute_call(call, cx);
             }
+        }
+    }
+
+    /// Decide the call the card is up for again after an approval setting
+    /// changed, so it runs at once if it no longer needs the user.
+    pub(crate) fn approvals_changed(&mut self, cx: &mut Context<Self>) {
+        let waiting = self
+            .turn
+            .as_ref()
+            .and_then(|turn| front_call(turn, self.asking.as_deref()))
+            .is_some_and(|(_, waiting)| waiting);
+        // Advancing past a call that is already running would start it twice.
+        if !waiting {
+            return;
+        }
+        self.advance_tools(cx);
+        // The chat that was sent the card must not answer a call that ran.
+        if self.asking.is_none() {
+            self.remote_waiting = None;
         }
     }
 
@@ -1800,9 +1816,20 @@ mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
     use super::{allowed_in, front_call};
-    use letronna_core::agent::Turn;
+    use letronna_core::agent::{Next, Turn, needs_user};
     use letronna_core::chat::{Connection, ToolCall};
     use std::collections::{HashMap, HashSet};
+
+    /// A turn whose queue holds one `write_file` call.
+    fn writing() -> Turn {
+        let mut turn = Turn::new(Connection::default());
+        turn.begin(vec![ToolCall {
+            id: "call-1".into(),
+            name: "write_file".into(),
+            arguments: "{}".into(),
+        }]);
+        turn
+    }
 
     #[test]
     fn a_tool_allowed_in_one_session_is_still_asked_about_in_another() {
@@ -1833,5 +1860,30 @@ mod tests {
         // Stopped on an earlier call, which has left the queue since.
         assert!(front_call(&turn, Some("call-0")).is_some_and(|(_, waiting)| !waiting));
         assert!(front_call(&Turn::new(Connection::default()), Some("call-1")).is_none());
+    }
+
+    #[test]
+    fn a_call_that_was_answered_or_never_asked_about_has_no_card() {
+        let turn = writing();
+        assert!(front_call(&turn, None).is_some_and(|(_, waiting)| !waiting));
+        assert!(front_call(&turn, Some("an-earlier-call")).is_some_and(|(_, waiting)| !waiting));
+        assert!(front_call(&Turn::new(Connection::default()), Some("call-1")).is_none());
+    }
+
+    #[test]
+    fn a_card_stays_up_when_approvals_are_switched_off_until_the_call_is_decided_again() {
+        let turn = writing();
+        let none = HashSet::new();
+        let Next::AskUser(asked) = turn.next(|name| needs_user(name, false, &none, false)) else {
+            panic!("write_file should wait for the user while approvals are on");
+        };
+        // The card keeps its buttons rather than showing a call as running
+        // that nothing started.
+        assert!(front_call(&turn, Some(&asked.id)).is_some_and(|(_, waiting)| waiting));
+        // Deciding again with approvals off runs it.
+        assert!(matches!(
+            turn.next(|name| needs_user(name, true, &none, false)),
+            Next::Run(_)
+        ));
     }
 }

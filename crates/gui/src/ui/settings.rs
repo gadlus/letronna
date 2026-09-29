@@ -745,6 +745,7 @@ fn privacy_page(
                             chat.update(cx, |this, cx| {
                                 this.store.settings.skip_approvals = !skip;
                                 this.save();
+                                this.approvals_changed(cx);
                                 cx.notify();
                             })
                         }
