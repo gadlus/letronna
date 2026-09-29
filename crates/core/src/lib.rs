@@ -54,6 +54,7 @@ pub mod store;
 pub mod structured;
 pub mod tasklist;
 pub mod tasks;
+mod think;
 pub mod timers;
 pub mod tools;
 pub mod untrusted;
