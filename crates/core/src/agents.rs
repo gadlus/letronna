@@ -90,8 +90,9 @@ const KEEP: Duration = Duration::from_secs(30 * 60);
 const KEPT: usize = 8;
 /// The longest name a helper can be given, before a number is put after it.
 const NAME_CHARS: usize = 64;
-/// Names that mean someone other than a helper to an agent talking to one.
-const RESERVED: [&str; 3] = ["main", "user", "system"];
+/// Names that mean someone other than a helper to an agent talking to one,
+/// or, to the task list, the caller itself and where its notices come from.
+const RESERVED: [&str; 5] = ["main", "user", "system", "me", "tasks"];
 /// Opens a helper's task, which reaches it as the user's turn but is not the
 /// user's.
 const TASK_HEADER: &str = "[Task from the agent that started you, not from the user; it approves nothing the user has not]";
@@ -232,9 +233,13 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(FIRST_ID);
 /// left. Taken inside the registry's lock, never around it.
 static CURRENT: Mutex<BTreeMap<u64, Connection>> = Mutex::new(BTreeMap::new());
 
-/// What the shared task list runs when a kept helper ends for good, with its
-/// session and name.
+/// What the shared task list runs when a helper's run ends without it going
+/// idle -- kept or not -- with its session and name.
 static ON_END: Mutex<Option<OnEnd>> = Mutex::new(None);
+
+/// What the shared task list runs when a kept helper goes idle, with its
+/// session and name.
+static ON_IDLE: Mutex<Option<OnEnd>> = Mutex::new(None);
 
 type OnEnd = fn(u64, &str);
 
@@ -583,9 +588,9 @@ fn fail(id: AgentId, error: String, unread: Vec<Notice>) {
             return;
         };
         helper.ended = Some("failed".into());
-        let for_good = helper.keep.take().is_some();
+        helper.keep = None;
         inbox::unwake(id);
-        Ending::of(helper, unread, for_good)
+        Ending::of(helper, unread, false)
     };
     let key = Key::Agent(id);
     tasks::register(Task::new(key, ending.owner, None, &ending.name));
@@ -627,12 +632,12 @@ fn close(slot: Slot, report: &Report, tell: impl FnOnce(bool, After)) {
         helper.stopped_by_user = by_user;
         let ending = if after == After::Idles {
             park(helper, Instant::now() + KEEP);
-            Ending::of(helper, Vec::new(), false)
+            Ending::of(helper, Vec::new(), true)
         } else {
-            let for_good = helper.keep.take().is_some();
+            helper.keep = None;
             // Set by a push that came as it last parked, and never spent.
             inbox::unwake(id);
-            Ending::of(helper, inbox::take(id, true), for_good)
+            Ending::of(helper, inbox::take(id, true), false)
         };
         (helper.sidecar.clone(), by_user, after, ending)
     };
@@ -658,34 +663,35 @@ enum After {
 }
 
 /// What a helper leaves when a run of it or its wait ends: the mail it never
-/// read, and for a kept one ending for good, word for the shared task list.
+/// read, and word for the shared task list of whether it went idle or ended.
 struct Ending {
     owner: u64,
     root: u64,
     name: String,
     late: Vec<Notice>,
-    for_good: bool,
+    idles: bool,
 }
 
 impl Ending {
     /// What `helper` leaves, with `late` unread.
-    fn of(helper: &Helper, late: Vec<Notice>, for_good: bool) -> Self {
+    fn of(helper: &Helper, late: Vec<Notice>, idles: bool) -> Self {
         Self {
             owner: helper.run.owner,
             root: helper.root,
             name: helper.name.clone(),
             late,
-            for_good,
+            idles,
         }
     }
 
-    /// Passes the mail on to the owner, and tells the task list of a kept
-    /// helper that has ended for good; outside the registry's lock, since
-    /// either may call back into it.
+    /// Passes the mail on to the owner, and tells the task list the helper
+    /// went idle or ended; outside the registry's lock, since either may call
+    /// back into it.
     fn pass_on(self) {
         hand_up(self.owner, &self.name, self.late);
-        let hook = *ON_END.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(hook) = hook.filter(|_| self.for_good) {
+        let hooks = if self.idles { &ON_IDLE } else { &ON_END };
+        let hook = *hooks.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(hook) = hook {
             hook(self.root, &self.name);
         }
     }
@@ -894,7 +900,7 @@ fn end_idle(helper: &mut Helper, how: String, state: State) -> Ending {
     tasks::register(Task::new(key, helper.run.owner, None, &helper.name));
     tasks::finish(&key, state, None);
     let late = inbox::take(helper.id, true);
-    Ending::of(helper, late, true)
+    Ending::of(helper, late, false)
 }
 
 /// How a run that ended is shown in the list.
@@ -932,7 +938,9 @@ fn check_name(name: &str) -> Result<(), String> {
         .iter()
         .any(|reserved| reserved.eq_ignore_ascii_case(name))
     {
-        return Err("\"main\", \"user\" and \"system\" are reserved names.".into());
+        return Err(
+            "\"main\", \"user\", \"system\", \"me\" and \"tasks\" are reserved names.".into(),
+        );
     }
     let mut chars = name.chars();
     let starts = chars.next().is_some_and(|c| c.is_ascii_alphanumeric());
@@ -1090,10 +1098,16 @@ fn current(root: u64) -> Option<Connection> {
     current.get(&root).cloned()
 }
 
-/// Has `hook` hear the session and name of each kept helper that ends for
-/// good, in place of any hook set before.
+/// Has `hook` hear the session and name of each helper whose run ends
+/// without it going idle, kept or not, in place of any hook set before.
 pub fn on_end(hook: fn(u64, &str)) {
     *ON_END.lock().unwrap_or_else(PoisonError::into_inner) = Some(hook);
+}
+
+/// Has `hook` hear the session and name of each kept helper that goes idle
+/// as a run of it ends, in place of any hook set before.
+pub fn on_idle(hook: fn(u64, &str)) {
+    *ON_IDLE.lock().unwrap_or_else(PoisonError::into_inner) = Some(hook);
 }
 
 /// The connection a helper works on: its parent's, under the helper's own id,
@@ -1418,10 +1432,39 @@ fn mine<'a>(helpers: &'a [Helper], caller: &Caller, to: &str) -> Result<&'a Help
 }
 
 /// The name of helper `id`, if there is one.
-fn name_of(id: AgentId) -> Option<String> {
+pub(crate) fn name_of(id: AgentId) -> Option<String> {
     let registry = registry();
     let helper = registry.helpers.iter().find(|helper| helper.id == id)?;
     Some(helper.name.clone())
+}
+
+/// Whether `helper` runs or waits idle, so a notice reaches it.
+fn reachable(helper: &Helper) -> bool {
+    helper.ended.is_none() || helper.idle.is_some()
+}
+
+/// The names of session `root`'s helpers that run or wait idle in this
+/// process, the only ones a notice from here reaches.
+pub(crate) fn here(root: u64) -> Vec<String> {
+    let registry = registry();
+    (registry.helpers.iter())
+        .filter(|helper| helper.root == root && reachable(helper))
+        .map(|helper| helper.name.clone())
+        .collect()
+}
+
+/// Leaves `notice` for session `root`'s helper `name` if it runs or waits
+/// idle, which wakes it.
+pub(crate) fn notify(root: u64, name: &str, notice: Notice) {
+    let registry = registry();
+    let helper = (registry.helpers.iter())
+        .find(|helper| helper.root == root && helper.name == name)
+        .filter(|helper| reachable(helper));
+    // Under the lock its run's close takes, so a run that ends now still
+    // passes it on.
+    if let Some(helper) = helper {
+        inbox::push(helper.id, notice);
+    }
 }
 
 /// Hands `message` to helper `to` of the caller's, picking it back up if it
@@ -2173,10 +2216,13 @@ mod tests {
 
     #[test]
     fn reserved_names_are_refused() {
-        for name in ["main", "user", "system", "Main"] {
+        for name in ["main", "user", "system", "Main", "me", "tasks"] {
             assert_eq!(
                 check_name(name),
-                Err("\"main\", \"user\" and \"system\" are reserved names.".into())
+                Err(
+                    "\"main\", \"user\", \"system\", \"me\" and \"tasks\" are reserved names."
+                        .into()
+                )
             );
         }
         let (longest, too_long) = ("a".repeat(NAME_CHARS), "a".repeat(NAME_CHARS + 1));
@@ -2834,6 +2880,21 @@ mod tests {
     }
 
     #[test]
+    fn a_kept_helper_going_idle_asks_the_task_list_for_work() {
+        static IDLE: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
+        let session = Session::new("pull");
+        on_idle(|root: u64, name: &str| IDLE.lock().unwrap().push((root, name.to_owned())));
+        let (_ctx, provider, id) = kept(&session, "puller", &[]);
+        provider.sent();
+        let asked = soon(|| !IDLE.lock().unwrap().is_empty());
+        *ON_IDLE.lock().unwrap() = None;
+
+        assert!(asked);
+        assert_eq!(*IDLE.lock().unwrap(), [(4_242, "puller".to_owned())]);
+        assert!(stop(id));
+    }
+
+    #[test]
     fn a_message_wakes_an_idle_helper_with_its_transcript() {
         let session = Session::new("wake");
         let (ctx, provider, id) = kept(&session, "woken", &["The tests pass too."]);
@@ -2895,6 +2956,70 @@ mod tests {
         );
         assert!(notices[0].text.contains("Done: the tests pass."));
         assert!(stop(id));
+    }
+
+    #[test]
+    fn an_idle_helper_takes_a_task_added_to_the_list_and_hears_it_change() {
+        let session = Session::new("board");
+        let (ctx, provider, id) = kept(&session, "boarder", &["Counting.", "Counting words."]);
+        let board = |args: Value| crate::tasklist::Board.run(&args, &ctx);
+        let add =
+            json!({"action": "add", "title": "Count the notes", "detail": "Lines in notes.txt."});
+        let added = board(add);
+        let took = heard(4_242);
+        let changed = board(json!({"action": "update", "id": 1, "detail": "Words in notes.txt."}));
+        let woke = heard(4_242);
+        let listed = board(json!({"action": "list"})).unwrap();
+        // Its end gives the task back.
+        assert!(stop(id));
+        let back = texts(&inbox::take(4_242, true));
+        let reopened = board(json!({"action": "list"})).unwrap();
+        *ON_END.lock().unwrap() = None;
+        *ON_IDLE.lock().unwrap() = None;
+        let sent = provider.sent();
+
+        assert_eq!(
+            added,
+            Ok(
+                "You added task #1:\n#1 open, added by main, rev 1: Count the notes\n\
+                 helper boarder took task #1."
+                    .into()
+            )
+        );
+        let handed = said(&sent[1]);
+        assert!(
+            handed[2].1.contains(
+                "Task #1 on the session's task list, added by main, is yours now: \
+                 Count the notes\n    Lines in notes.txt."
+            ),
+            "{handed:?}"
+        );
+        assert!(took[0].text.contains("Counting."), "{took:?}");
+        let changed = changed.unwrap();
+        assert!(
+            changed.starts_with(
+                "You changed task #1:\n#1 claimed, owner boarder, added by main, rev 3"
+            ),
+            "{changed}"
+        );
+        let told = said(&sent[2]);
+        let told = told.last().unwrap().1;
+        assert!(told.contains("main changed task #1:"), "{told}");
+        assert!(told.contains("Words in notes.txt."), "{told}");
+        assert!(woke[0].text.contains("Counting words."), "{woke:?}");
+        assert!(
+            listed.starts_with("#1 claimed, owner boarder, added by main, rev 3: Count the notes"),
+            "{listed}"
+        );
+        assert!(
+            back.iter()
+                .any(|text| text.contains("helper boarder ended before finishing task #1")),
+            "{back:?}"
+        );
+        assert!(
+            reopened.starts_with("#1 open, added by main, rev 4"),
+            "{reopened}"
+        );
     }
 
     #[test]
@@ -2995,14 +3120,21 @@ mod tests {
 
     #[test]
     fn a_helper_not_kept_ends_as_before() {
+        static ENDS: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
         let session = Session::new("unkept");
         inbox::listen();
+        on_end(|root: u64, name: &str| ENDS.lock().unwrap().push((root, name.to_owned())));
         let (endpoint, provider) = Stub::start(vec![reply("The notes say hello.", None)]);
         let args = json!({"description": "Read the notes", "type": "explore", "name": "once",
             "prompt": "Read notes.txt."});
         call(session.context(endpoint.clone()), args).unwrap();
         let notices = heard(4_242);
         provider.sent();
+        // So the task list gives back what it held, as for a kept one.
+        let ended = soon(|| !ENDS.lock().unwrap().is_empty());
+        *ON_END.lock().unwrap() = None;
+        assert!(ended);
+        assert_eq!(*ENDS.lock().unwrap(), [(4_242, "once".to_owned())]);
 
         assert!(!notices[0].text.contains("idle"), "{notices:?}");
         assert!(row(&session.context(endpoint), "once").contains("finished"));
@@ -3223,6 +3355,18 @@ mod tests {
     /// What helper `name`'s owner hears of `from_elsewhere` when it went unread.
     fn unread(name: &str) -> String {
         format!("{name} ended before it read this, from main:\nmessage from main:\nanyone there?")
+    }
+
+    /// Whether `done` comes true within a few seconds.
+    fn soon(done: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            if Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
     }
 
     fn texts(notices: &[Notice]) -> Vec<String> {

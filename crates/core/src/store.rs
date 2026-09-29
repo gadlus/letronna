@@ -228,7 +228,8 @@ impl Store {
         std::fs::rename(temp, path)
     }
 
-    /// Forget a session and remove its file and its helpers' conversations.
+    /// Forget a session and remove its file, its helpers' conversations and
+    /// its task list, which a new session given its id would otherwise inherit.
     pub fn remove(&mut self, index: usize) {
         if index >= self.conversations.len() {
             return;
@@ -236,6 +237,7 @@ impl Store {
         let gone = self.conversations.remove(index);
         let _ = std::fs::remove_file(session_path(gone.id));
         let _ = std::fs::remove_dir_all(helpers_dir(gone.id));
+        crate::tasklist::forget(gone.id);
     }
 }
 
@@ -1448,7 +1450,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn removing_a_session_removes_its_helpers() {
+    fn removing_a_session_removes_its_helpers_and_its_task_list() {
         let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
         let dir = scratch("transcript-remove");
         unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
@@ -1463,10 +1465,17 @@ pub(crate) mod tests {
         for session in [1, 1, 2] {
             Transcript::create(session, "helper", None).unwrap();
         }
+        let lists = dir.join("tasklists");
+        std::fs::create_dir_all(&lists).unwrap();
+        for list in ["1.jsonl", "1.lock", "2.jsonl"] {
+            std::fs::write(lists.join(list), "").unwrap();
+        }
 
         store.remove(0);
         assert!(!dir.join("sessions").join("1.jsonl").exists());
         assert!(!dir.join("agents").join("1").exists());
+        assert!(!lists.join("1.jsonl").exists() && !lists.join("1.lock").exists());
+        assert!(lists.join("2.jsonl").exists());
         assert!(Transcript::open(1, 1).is_none());
         // Another session's helpers are its own.
         assert!(Transcript::open(2, 1).is_some());
