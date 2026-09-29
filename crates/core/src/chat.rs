@@ -42,6 +42,11 @@ pub struct Message {
     /// follow-up typed while its tools ran, rather than starting a turn.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub folded: bool,
+    /// Set on a message that reports something that happened meanwhile
+    /// rather than something the user said, and is sent to the model as the
+    /// user's turn.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub notice: bool,
 }
 
 impl Message {
@@ -2605,5 +2610,71 @@ mod tests {
         assert!(learn(&c, &sent, refusal));
         // Sent without it, the same refusal is no reason to go again.
         assert!(!learn(&c, &body(&c, &hello(), None, None), refusal));
+    }
+
+    #[test]
+    fn a_notice_goes_to_the_model_as_the_users_turn() {
+        let messages = [
+            Message {
+                role: "user".into(),
+                content: "run the tests in the background".into(),
+                ..Default::default()
+            },
+            Message {
+                role: "assistant".into(),
+                content: "Started.".into(),
+                ..Default::default()
+            },
+            Message {
+                role: "user".into(),
+                content: "job #7 exited with code 1".into(),
+                notice: true,
+                ..Default::default()
+            },
+        ];
+        let payload = body(&connection(), &messages, None, None);
+        let sent = payload["messages"].as_array().unwrap().last().unwrap();
+        assert_eq!(sent["role"], "user");
+        assert_eq!(sent["content"], "job #7 exited with code 1");
+        // The flag is Letronna's own; a provider only ever sees a user turn.
+        assert!(sent.get("notice").is_none(), "{sent}");
+    }
+
+    #[test]
+    fn a_session_written_before_notices_still_loads() {
+        let old: Message = serde_json::from_str(r#"{"role":"user","content":"hi"}"#).unwrap();
+        assert!(!old.notice);
+        // Only a notice carries the field, so everything else is written as before.
+        let written = serde_json::to_string(&old).unwrap();
+        assert!(!written.contains("notice"), "{written}");
+        let notice = Message {
+            notice: true,
+            ..old
+        };
+        let line = serde_json::to_string(&notice).unwrap();
+        assert!(serde_json::from_str::<Message>(&line).unwrap().notice);
+    }
+
+    #[test]
+    fn a_run_of_notices_still_moves_the_window() {
+        // A session driven by finished jobs or loop ticks hears from the user
+        // once. Were only the user's own words a turn, the window could never
+        // pass them and every request would carry the whole session.
+        let said = |role: &str, notice: bool, i: usize| Message {
+            role: role.into(),
+            content: format!("{role} {i} {}", "x".repeat(600)),
+            notice,
+            ..Default::default()
+        };
+        let mut messages = vec![said("user", false, 0), said("assistant", false, 0)];
+        for i in 1..60 {
+            messages.push(said("user", true, i));
+            messages.push(said("assistant", false, i));
+        }
+        let start = window_start(&messages);
+        assert!(start > 0, "the window never left the user's message");
+        assert!(messages[start].notice, "start {start} is not a notice");
+        let sums = token_sums(&messages);
+        assert!(sums[messages.len()] - sums[start] <= CONTEXT_TOKENS);
     }
 }

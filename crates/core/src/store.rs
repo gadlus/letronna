@@ -639,7 +639,15 @@ fn search_in(dir: &std::path::Path, query: &str, limit: usize) -> Vec<Hit> {
                 Ok(Record::Meta(meta)) => (title, updated) = (meta.title, meta.updated),
                 Ok(Record::Message(message)) => {
                     if let Some(snippet) = around(&message.content, &query) {
-                        hits.push((said, message.role, snippet));
+                        // A notice has the user's role, but the snippet rarely
+                        // reaches its header, and a job's output read back as
+                        // the user's words becomes a request they never made.
+                        let role = if message.notice {
+                            "notice".into()
+                        } else {
+                            message.role
+                        };
+                        hits.push((said, role, snippet));
                     }
                     said += 1;
                 }
@@ -1358,6 +1366,22 @@ mod tests {
         assert_eq!(hits[1].snippet, "Should we use Postgres or SQLite?");
         assert_eq!(search_in(&dir, "POSTGRES", 1).len(), 1);
         assert!(search_in(&dir, "mysql", 10).is_empty());
+    }
+
+    #[test]
+    fn a_search_hit_on_a_notice_is_not_the_users() {
+        let dir = scratch("search-notice");
+        std::fs::write(
+            dir.join("1.jsonl"),
+            "{\"type\":\"message\",\"role\":\"user\",\"content\":\"run the tests\"}\n\
+             {\"type\":\"message\",\"role\":\"user\",\"content\":\"the tests failed\",\"notice\":true}\n",
+        )
+        .unwrap();
+        let roles: Vec<String> = search_in(&dir, "tests", 10)
+            .into_iter()
+            .map(|hit| hit.role)
+            .collect();
+        assert_eq!(roles, ["user", "notice"]);
     }
 
     #[test]

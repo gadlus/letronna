@@ -109,6 +109,7 @@ fn transcript(messages: &[Message]) -> String {
     let mut out = String::new();
     for m in messages {
         match m.role.as_str() {
+            "user" if m.notice => out.push_str(&format!("Notice: {}\n\n", m.content)),
             "user" => out.push_str(&format!("User: {}\n\n", m.content)),
             "tool" => out.push_str(&format!(
                 "Tool {} returned: {}\n\n",
@@ -268,5 +269,19 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(request.timeout(), Some(&Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn a_summary_labels_notices_as_notices() {
+        // A job's report remembered as the user's words would become a request
+        // the user never made.
+        let notice = Message {
+            notice: true,
+            ..said("user", "job #7 exited with code 1")
+        };
+        let text = transcript(&[said("user", "run the tests"), notice]);
+        assert!(text.contains("User: run the tests"), "{text}");
+        assert!(text.contains("Notice: job #7 exited with code 1"), "{text}");
+        assert!(!text.contains("User: job #7"), "{text}");
     }
 }
