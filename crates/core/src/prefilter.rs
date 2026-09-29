@@ -164,7 +164,8 @@ pub(crate) fn write(session: &Path, stamp: Stamp, filter: &Filter) {
 ///
 /// An empty file starts a set. One whose set was made from it as it was
 /// before gets the new runs, and is made again from the whole file once
-/// they crowd it. Any other is left for a search to make.
+/// they crowd it, unless it is as wide as a set gets and so as good as the
+/// whole file would make it. Any other is left for a search to make.
 pub(crate) fn appended(session: &Path, before: Stamp, after: Stamp, appended: &str) {
     let lower = appended.to_lowercase();
     let mut filter = if before.0 == 0 {
@@ -176,7 +177,9 @@ pub(crate) fn appended(session: &Path, before: Stamp, after: Stamp, appended: &s
         filter.add(&lower);
         filter
     };
-    if filter.crowded() {
+    // At the widest, the set made again would be this one, and every save
+    // of the session would read the whole file on the window's thread.
+    if filter.crowded() && filter.bits() < WIDEST {
         let Ok(bytes) = std::fs::read(session) else {
             return;
         };
@@ -200,7 +203,7 @@ fn checksum(stamp: Stamp, words: &[u64]) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{BITS_PER_RUN, Filter, NARROWEST, appended, path_for, read, write};
+    use super::{BITS_PER_RUN, Filter, NARROWEST, WIDEST, appended, path_for, read, write};
 
     fn scratch(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("letronna-prefilter-{name}"));
@@ -303,5 +306,45 @@ mod tests {
         // A save the set was not made before is left for a search.
         appended(&session, (5, 5), (200, 200), "{\"content\":\"late\"}\n");
         assert_eq!(read(&session, (200, 200)), None);
+    }
+
+    #[test]
+    fn a_set_crowded_at_the_widest_is_not_made_again_on_each_save() {
+        let dir = scratch("widest");
+        let session = dir.join("1.jsonl");
+        // Characters of one, two and three bytes in no order hold more runs
+        // than even the widest set keeps apart.
+        let mut seed = 0x5EED_u64;
+        let text: String = (0..500_000)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let pick = (seed >> 8) as u32;
+                let code = match (seed >> 60) % 3 {
+                    0 => 0x21 + pick % 0x5E,
+                    1 => 0x80 + pick % 0x780,
+                    // Clear of the surrogates, which are no characters.
+                    _ => match 0x800 + pick % 0xF000 {
+                        c @ 0xD800..0xE000 => c - 0x800,
+                        c => c,
+                    },
+                };
+                char::from_u32(code).unwrap()
+            })
+            .chain(['\n'])
+            .collect::<String>()
+            .to_lowercase();
+        let widest = Filter::of(&text);
+        assert!(widest.bits() == WIDEST && widest.crowded());
+        std::fs::write(&session, &text).unwrap();
+        appended(&session, (0, 0), (1, 1), &text);
+        assert_eq!(read(&session, (1, 1)), Some(widest));
+        // Remaking it could not thin it, so a save only adds its runs and
+        // never reads the file, which is gone here.
+        std::fs::remove_file(&session).unwrap();
+        appended(&session, (1, 1), (2, 2), "{\"content\":\"late\"}\n");
+        let added = read(&session, (2, 2)).unwrap();
+        assert!(added.may_hold("\"late\""));
     }
 }
