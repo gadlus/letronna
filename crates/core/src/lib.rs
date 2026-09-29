@@ -20,6 +20,7 @@ pub mod diag;
 mod edit;
 pub mod failure;
 pub mod gateway;
+pub mod inbox;
 pub mod jobs;
 pub mod mcp;
 pub mod media;
