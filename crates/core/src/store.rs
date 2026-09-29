@@ -52,6 +52,11 @@ pub struct Conversation {
     /// same reason as `flushed`.
     #[serde(skip)]
     pub rewound: Option<usize>,
+    /// Deleted by the other Letronna while this one had it open, so it is
+    /// never written again, even once a new session takes its id. Only
+    /// `flush` should touch it; it is visible for the same reason as `flushed`.
+    #[serde(skip)]
+    pub gone: bool,
 }
 
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -311,6 +316,9 @@ impl Conversation {
     /// Append the head (first time), any rewind and new messages, and the
     /// descriptive fields if they have moved since the last write.
     fn flush(&mut self) -> std::io::Result<()> {
+        if self.gone {
+            return Ok(());
+        }
         let meta = self.meta();
         let meta_changed = self.written.as_ref() != Some(&meta);
         // Every session is flushed on every save, and most have nothing new.
@@ -326,6 +334,15 @@ impl Conversation {
         let path = session_path(self.id);
         let _lock = Lock::take(&path);
         let fresh = !path.exists();
+        // Written before and gone now: the other Letronna deleted it. Writing
+        // anyway brought it back as a fragment -- a head and whatever changed
+        // since the last save, with none of the history before it. Remembered
+        // rather than checked each time, because the freed id is handed out
+        // again and this would then write into someone else's session.
+        if fresh && self.written.is_some() {
+            self.gone = true;
+            return Ok(());
+        }
         if !fresh && self.flushed == self.messages.len() && self.rewound.is_none() && !meta_changed
         {
             return Ok(());
@@ -1651,6 +1668,50 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert!(super::save_key("OpenAI", None).unwrap().is_empty());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_session_deleted_elsewhere_is_not_written_back() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("deleted-elsewhere");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut terminal = Store::default();
+        terminal.conversations.push(numbered(2));
+        terminal.save().unwrap();
+        let path = dir.join("sessions/1.jsonl");
+
+        // The window lists the same session and deletes it.
+        let mut window = load_listing();
+        window.remove(0);
+        assert!(!path.exists());
+
+        // The terminal still has it open, and more is said and renamed there.
+        terminal.conversations[0]
+            .messages
+            .push(said("user", "still here?"));
+        terminal.conversations[0].title = "renamed".into();
+        terminal.save().unwrap();
+        assert!(!path.exists());
+
+        // The window starts a new session, which is handed the freed id.
+        let id = window.next_id();
+        assert_eq!(id, 1);
+        window.conversations.push(Conversation {
+            id,
+            title: "new".into(),
+            messages: vec![said("user", "fresh")],
+            ..Default::default()
+        });
+        window.save().unwrap();
+        let new = std::fs::read_to_string(&path).unwrap();
+
+        // The terminal says more again; none of it lands in the new session.
+        terminal.conversations[0]
+            .messages
+            .push(said("user", "anyone?"));
+        terminal.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), new);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 }
