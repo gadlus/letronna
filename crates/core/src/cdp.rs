@@ -2034,6 +2034,45 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn frames_coming_and_going_in_a_loop_leave_nothing_held() {
+        let (outgoing, _sent) = mpsc::channel();
+        let link = Arc::new(Link {
+            outgoing: Mutex::new(outgoing),
+            waiting: Mutex::default(),
+            sessions: Mutex::default(),
+            frames: Mutex::default(),
+            next: AtomicU64::new(0),
+            open: AtomicBool::new(true),
+            contexts: Mutex::default(),
+        });
+        let mut tab = Tab::over(&link, Some("S".into()), "T1");
+        tab.attaching = true;
+        let told = |method: &str, params: Value| {
+            link.hand_on(json!({"method": method, "sessionId": "S", "params": params}).to_string());
+        };
+        for round in 0..3 {
+            for n in 0..40 {
+                let frame = format!("F{round}-{n}");
+                told(
+                    "Target.attachedToTarget",
+                    attached(&frame, &frame, "iframe"),
+                );
+            }
+            tab.wait(Duration::from_millis(50), |_| false).unwrap();
+            assert_eq!(tab.frames.len(), MAX_FRAMES);
+            assert_eq!(link.frames.lock().unwrap().len(), MAX_FRAMES);
+            for n in 0..40 {
+                let gone = json!({"sessionId": format!("F{round}-{n}")});
+                told("Target.detachedFromTarget", gone);
+            }
+            tab.wait(Duration::from_millis(50), |_| false).unwrap();
+            assert!(tab.frames.is_empty());
+            assert!(link.frames.lock().unwrap().is_empty());
+        }
+        assert!(!tab.broken);
+    }
+
+    #[test]
     fn a_frame_is_asked_through_its_session_and_what_it_says_is_not_the_pages() {
         let (address, server) = fake_frames(|session, method, _| match (session, method) {
             (None, "Target.setAutoAttach") => (
