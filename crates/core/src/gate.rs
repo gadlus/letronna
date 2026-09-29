@@ -610,17 +610,43 @@ fn editable(name: &str, args: &Value, ctx: &ToolContext) -> bool {
 
 /// Whether `path` is a file that other names share, which may lie outside
 /// the project: the write changes the file in place, so it changes theirs.
-#[cfg(unix)]
 fn linked(path: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.nlink() > 1)
+    std::fs::metadata(path).is_ok_and(|meta| meta.is_file() && shared(links(path)))
 }
 
-/// Whether `path` is a file that other names share; std's link count is
-/// unstable on Windows, so none is known there.
-#[cfg(not(unix))]
-fn linked(_path: &Path) -> bool {
-    false
+/// Whether a file with `links` names is shared; a count that could not be
+/// read counts as shared, so the write asks rather than guessing.
+fn shared(links: Option<u64>) -> bool {
+    links.is_none_or(|links| links > 1)
+}
+
+/// How many names the file at `path` has, or `None` when that cannot be read.
+#[cfg(unix)]
+fn links(path: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|meta| meta.nlink())
+}
+
+/// How many names the file at `path` has, or `None` when that cannot be
+/// read. std's link count is unstable on Windows, so this asks Windows.
+#[cfg(windows)]
+fn links(path: &Path) -> Option<u64> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    unsafe extern "system" {
+        fn GetFileInformationByHandle(file: *mut std::ffi::c_void, info: *mut u32) -> i32;
+    }
+    // BY_HANDLE_FILE_INFORMATION is thirteen DWORDs: the attributes, three
+    // FILETIMEs, the volume, the size's two halves, then the link count.
+    const LINKS: usize = 10;
+    // No access asked for, as std's own metadata does, so a file the user
+    // may not read is still counted.
+    let file = std::fs::OpenOptions::new().access_mode(0).open(path).ok()?;
+    let mut info = [0u32; 13];
+    // SAFETY: `info` is as large and as aligned as the structure the call
+    // fills, and `file` keeps the handle open through the call.
+    let read = unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) };
+    (read != 0).then(|| u64::from(info[LINKS]))
 }
 
 /// Whether an edit to `path` in the project at `root` could change what the
@@ -1511,6 +1537,23 @@ mod tests {
             letter(&edit("notes.txt"), Mode::AcceptEdits, &ctx, &[]),
             'R'
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_with_a_second_name_or_an_unknown_count_is_shared() {
+        assert!(!shared(Some(1)));
+        assert!(shared(Some(2)));
+        assert!(shared(None));
+        // A real hard link, counted the way this OS counts them.
+        let dir = project("counted");
+        let file = dir.join("outside.txt");
+        assert_eq!(links(&file), Some(1));
+        assert!(!linked(&file));
+        std::fs::hard_link(&file, dir.join("project/second.txt")).unwrap();
+        assert_eq!(links(&file), Some(2));
+        assert!(linked(&file));
+        assert!(linked(&dir.join("project/second.txt")));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
