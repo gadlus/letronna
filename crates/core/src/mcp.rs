@@ -140,7 +140,7 @@ const NOTE_TIME: Duration = Duration::from_secs(5);
 /// milliseconds, and one slower than this gets the call anyway.
 const ROOTS_TIME: Duration = Duration::from_secs(2);
 /// The protocol revision asked for; a server answers with one it speaks.
-const PROTOCOL: &str = "2025-06-18";
+pub(crate) const PROTOCOL: &str = "2025-06-18";
 /// The words in an `env` or `headers` name that say its value is a secret.
 /// Other values -- paths, addresses, flags -- would hide ordinary text
 /// wherever they turned up.
@@ -1672,6 +1672,15 @@ fn connect(
     server.list()
 }
 
+/// Writes `message` as the stdio transport frames it: one line of JSON,
+/// flushed at once so the other end is not left waiting.
+pub(crate) fn write_message(to: &mut dyn Write, message: &Value) -> std::io::Result<()> {
+    let mut line = message.to_string();
+    line.push('\n');
+    to.write_all(line.as_bytes())?;
+    to.flush()
+}
+
 /// Whether a tool's `annotations` say it only looks, as `read_file` does:
 /// read-only, not destructive, and explicitly reaching no other machine.
 fn only_looks(annotations: &Value) -> bool {
@@ -1835,13 +1844,9 @@ impl Server {
     }
 
     fn send(&self, message: &Value) -> Result<(), String> {
-        let mut line = message.to_string();
-        line.push('\n');
         let gone = || format!("{} has stopped.", self.name);
         let mut to = self.to.lock().map_err(|_| gone())?;
-        to.write_all(line.as_bytes())
-            .and_then(|_| to.flush())
-            .map_err(|_| gone())
+        write_message(&mut *to, message).map_err(|_| gone())
     }
 
     /// Send a request and wait for its answer.

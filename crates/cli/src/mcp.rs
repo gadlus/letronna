@@ -1,12 +1,21 @@
-//! `letronna mcp`: add, list, get and remove the MCP servers in `mcp.json`.
+//! `letronna mcp`: add, list, get and remove the MCP servers in `mcp.json`,
+//! and `serve`, which offers Letronna's own tools to other MCP clients.
 //!
 //! The flags are Claude Code's own, so a server's README that says `claude
 //! mcp add ...` works with `letronna` in its place. Letronna keeps one list
 //! for every folder, so `user` is the only scope it takes, and it signs in to
 //! no server yet, so the OAuth flags are refused rather than dropped.
 
+use crate::bar::Bar;
 use crate::render;
+use crate::session::Runner;
+use letronna_core::chat::{self, Message};
+use letronna_core::driver::{self, Allow, Outcome, Spec};
+use letronna_core::gate::Mode;
 use letronna_core::mcp::{self, ServerStatus, State};
+use letronna_core::mcp_serve;
+use letronna_core::store::Transcript;
+use letronna_core::tools::ToolContext;
 use serde_json::{Map, Value, json};
 use std::time::Duration;
 
@@ -21,6 +30,12 @@ Manage the MCP servers in mcp.json
   letronna mcp list              every server, started to see it answer
   letronna mcp get <name>        one server in full
   letronna mcp remove <name>     take one out
+  letronna mcp serve [options]   offer the browser, media and search tools
+                                 to another agent over stdio
+
+Options for serve
+      --yes                run tools that need a yes without one
+      --allow-turn         also offer letronna_turn, a whole agent turn
 
 Options for add
   -t, --transport <kind>   stdio (a command run here) or http; a URL means http
@@ -47,6 +62,16 @@ pub fn run(words: &[String]) -> i32 {
     if wants_help || matches!(verb, "" | "help" | "-h" | "--help") {
         print!("{HELP}");
         return 0;
+    }
+    // Its stdout is the protocol's, so its one failure goes to stderr.
+    if verb == "serve" {
+        return match serve(rest) {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("{error}");
+                1
+            }
+        };
     }
     let done = match verb {
         "add" => add(rest),
@@ -175,6 +200,102 @@ fn get(name: &str) -> Result<(), String> {
         "To remove it: letronna mcp remove {name}"
     )));
     Ok(())
+}
+
+/// Serve Letronna's tools over stdin and stdout until the client hangs up.
+fn serve(words: &[String]) -> Result<(), String> {
+    let (mut yes, mut allow_turn) = (false, false);
+    for word in words {
+        match word.as_str() {
+            "--yes" => yes = true,
+            "--allow-turn" => allow_turn = true,
+            other => {
+                return Err(format!(
+                    "`letronna mcp serve` takes --yes and --allow-turn, not {other}."
+                ));
+            }
+        }
+    }
+    letronna_core::diag::init("cli");
+    let settings = letronna_core::store::load_listing().settings;
+    letronna_core::browser::share_browser(settings.browser_shared);
+    std::thread::spawn(letronna_core::browser::close_left_over);
+    let turn = allow_turn.then(|| {
+        // Served once, before any turn: a request with nobody serving is
+        // declined at once, and there is no keyboard behind this stdin.
+        crate::answer_approvals(
+            yes,
+            false,
+            ToolContext::default(),
+            letronna_core::cancel::Cancel::default(),
+        );
+        let turn: mcp_serve::Turn = Box::new(move |prompt| turn(prompt, yes));
+        turn
+    });
+    let mut server = mcp_serve::Server::new(mcp_serve::exposed(), yes, turn);
+    let served = mcp_serve::serve(&mut server, std::io::stdin().lock(), std::io::stdout());
+    // A hidden browser, a job or an MCP server of our own would outlive the
+    // client unseen.
+    letronna_core::browser::close_hidden();
+    letronna_core::jobs::stop_all();
+    mcp::stop_all();
+    letronna_core::diag::stop();
+    served
+}
+
+/// Runs `prompt` as `letronna -p` would, in a session of its own that is
+/// listed with the rest, and gives the last thing the agent said.
+fn turn(prompt: &str, yes: bool) -> Result<String, String> {
+    let mut runner = Runner {
+        store: letronna_core::store::load_listing(),
+        allowed: Default::default(),
+        mode: if yes { Mode::Bypass } else { Mode::Default },
+        human: false,
+        trouble: None,
+        bar: Bar::new(String::new()),
+        stopped: false,
+        images: Vec::new(),
+    };
+    let session = runner.start(std::env::current_dir().ok());
+    let connection = runner.connection(session);
+    chat::validate(&connection)?;
+    let mut conversation = runner.store.conversations.remove(session);
+    conversation.title = prompt.chars().take(40).collect();
+    conversation.messages.push(Message {
+        role: "user".into(),
+        content: prompt.to_owned(),
+        ..Default::default()
+    });
+    let id = conversation.id;
+    // The run is the only writer of the session's file, which lists it.
+    let report = driver::run(Spec {
+        connection,
+        transcript: Transcript {
+            path: letronna_core::store::sessions_dir().join(format!("{id}.jsonl")),
+            conversation,
+        },
+        id,
+        owner: id,
+        root: id,
+        run: id,
+        label: "Letronna".into(),
+        allow: Allow::All,
+        rounds: letronna_core::agent::MAX_ROUNDS,
+        cancel: Default::default(),
+        budget: None,
+        status: Default::default(),
+        depth: 0,
+        fork: false,
+        from: 0,
+        schema: None,
+    });
+    for problem in letronna_core::hooks::problems() {
+        eprintln!("{problem}");
+    }
+    match report.status {
+        Outcome::Failed(why) => Err(why),
+        _ => Ok(report.text),
+    }
 }
 
 /// Every server, once each has answered or had `HEALTH_WAIT` to.
