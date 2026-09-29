@@ -1284,7 +1284,11 @@ fn usage_only(reply: Message) -> Message {
 /// session's lock, which keeps writers off it meanwhile.
 fn replace(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     let temp = path.with_extension(format!("{}.tmp", std::process::id()));
-    let written = std::fs::write(&temp, bytes).and_then(|()| std::fs::rename(&temp, path));
+    // Synced before the rename, or a power cut could leave the session's
+    // name on blocks never written: the whole history lost, not one line.
+    let written = std::fs::File::create(&temp)
+        .and_then(|mut file| file.write_all(bytes).and_then(|()| file.sync_all()))
+        .and_then(|()| std::fs::rename(&temp, path));
     if written.is_err() {
         let _ = std::fs::remove_file(&temp);
     }
@@ -6778,6 +6782,28 @@ pub(crate) mod tests {
         // 1 is the one `--resume 1` opens, 3 the one `-c` goes on with.
         assert_eq!(super::prune(30, now, &[1]), [2]);
         assert!(super::session_path(1).exists() && super::session_path(3).exists());
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_rewrite_leaves_only_the_session_its_lock_and_terms_in_the_folder() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("rewrite-temp");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let mut store = Store::default();
+        store.conversations.push(numbered(4));
+        store.save().unwrap();
+        store.conversations[0].rewind(1);
+        store.save().unwrap();
+
+        assert_eq!(replay(&super::session_path(1)).unwrap().messages.len(), 1);
+        let mut names: Vec<String> = std::fs::read_dir(dir.join("sessions"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "index.json")
+            .collect();
+        names.sort();
+        assert_eq!(names, ["1.jsonl", "1.lock", "1.terms"]);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 }
