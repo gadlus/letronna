@@ -2903,12 +2903,34 @@ impl Session {
         })?;
         let within = within.cloned();
         framed_as(number, within.as_deref(), frame)?;
-        let Some(within) = within else {
-            return Ok(node);
-        };
-        self.still_there(number, &within)?;
-        self.inside = Some(self.inside_of(within)?);
+        if let Some(within) = within {
+            self.still_there(number, &within)?;
+            self.inside = Some(self.inside_of(within)?);
+        }
+        self.not_a_frame(number, node)?;
         Ok(node)
+    }
+
+    /// Refuses `e{number}` when its node is the element a frame is shown in,
+    /// as a ref from before frames were listed can be: a click or keys sent
+    /// to it land inside that frame, past the check that `frame` names it.
+    fn not_a_frame(&mut self, number: u32, node: i64) -> Result<(), String> {
+        let described: Value = self
+            .on_node("DOM.describeNode", json!({"backendNodeId": node}))
+            .map_err(|_| format!("e{number} is no longer on the page. Look again."))?;
+        let element = &described["node"];
+        let tag = element["nodeName"].as_str().unwrap_or_default();
+        // An `<object>` or `<embed>` holds a frame only when it has an id
+        // for one; one showing a picture is acted on as any element is.
+        let owner = matches!(tag, "IFRAME" | "FRAME" | "FENCEDFRAME");
+        if !owner && element["frameId"].is_null() {
+            return Ok(());
+        }
+        Err(format!(
+            "e{number} is the element a frame is shown in, which is not acted on itself: act on \
+             the refs listed under that frame's header. A frame the listing leaves out cannot be \
+             acted in; ask the user to do it in the browser."
+        ))
     }
 
     /// Refuses a ref from a frame that has loaded another page since, or
@@ -4578,6 +4600,48 @@ mod tests {
             };
             (Vec::new(), answer)
         }
+    }
+
+    #[test]
+    fn the_element_a_frame_is_shown_in_is_not_acted_on() {
+        let (mut session, server) = fake_session(|method, params| {
+            let ax = |id: u32, role: &str, name: &str, kids: &[u32]| {
+                json!({"nodeId": id.to_string(), "role": {"value": role},
+                       "name": {"value": name}, "backendDOMNodeId": id,
+                       "childIds": kids.iter().map(u32::to_string).collect::<Vec<_>>()})
+            };
+            let answer = match method {
+                "Accessibility.getFullAXTree" => json!({"nodes": [
+                    ax(1, "RootWebArea", "Shop", &[4, 5, 6, 7]), ax(4, "button", "Buy", &[]),
+                    ax(5, "button", "Continue", &[]), ax(6, "button", "Pay", &[]),
+                    ax(7, "Iframe", "Card payment", &[])]}),
+                // An iframe the page gave a button's role, and an `<embed>`
+                // showing a frame.
+                "DOM.describeNode" => match params["backendNodeId"].as_i64() {
+                    Some(5) => json!({"node": {"nodeName": "IFRAME"}}),
+                    Some(6) => json!({"node": {"nodeName": "EMBED", "frameId": "F1"}}),
+                    _ => json!({"node": {"nodeName": "BUTTON"}}),
+                },
+                _ => json!({}),
+            };
+            (Vec::new(), answer)
+        });
+        let listed = session.read(false).unwrap().text();
+        assert_eq!(
+            listed,
+            "- button \"Buy\" [e1]\n- button \"Continue\" [e2]\n- button \"Pay\" [e3]\n\
+             - Iframe \"Card payment\" (its frame is not listed)"
+        );
+        assert_eq!(session.reach("e1", None), Ok(4));
+        for owner in ["e2", "e3"] {
+            let refused = session.reach(owner, None).unwrap_err();
+            assert!(
+                refused.contains("the element a frame is shown in"),
+                "{refused}"
+            );
+        }
+        drop(session);
+        server.join().unwrap();
     }
 
     #[test]

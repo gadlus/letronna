@@ -35,6 +35,15 @@ const MAX_DEPTH: usize = 400;
 /// Roles skipped with everything inside them: pieces of text layout, and
 /// list bullets.
 const SKIPPED: &[&str] = &["InlineTextBox", "LineBreak", "ListMarker"];
+/// Roles of an element a frame is shown in. None gets a ref: what is done
+/// to one lands inside its frame, whose own refs under its header say
+/// which frame an action is for.
+const FRAME_OWNERS: &[&str] = &[
+    "Iframe",
+    "IframePresentational",
+    "EmbeddedObject",
+    "PluginObject",
+];
 /// Parts of a page worth a line for the shape they give it.
 const LANDMARKS: &[&str] = &[
     "banner",
@@ -572,6 +581,19 @@ impl Walk<'_> {
                 text: format!("{pad}{}", line.text),
                 ..line
             }));
+            return;
+        }
+        if FRAME_OWNERS.contains(&role) {
+            // One with a name is said to be there, so a frame left out of
+            // the listing is not taken for none.
+            if !node.ignored && !node.raw_name().trim().is_empty() {
+                let (label, _) = describe(node);
+                self.lines.push(Line {
+                    text: format!("{}- {label} (its frame is not listed)", pad(indent)),
+                    plain: None,
+                    nodes: node.backend.into_iter().collect(),
+                });
+            }
             return;
         }
         let Some(backend) = node.backend.filter(|_| !node.ignored && shown(node)) else {
@@ -1148,5 +1170,23 @@ mod tests {
             HashMap::new(),
         );
         assert_eq!(bare.main, None);
+    }
+
+    #[test]
+    fn a_frames_element_gets_no_ref_and_one_left_out_is_said_to_be_there() {
+        let shop = json!({"nodes": [
+            node(1, "RootWebArea", "Shop", &[3, 9, 10]),
+            node(3, "heading", "Shop", &[]),
+            with(node(9, "Iframe", "Card payment", &[]), &[focusable()]),
+            node(10, "Iframe", "", &[]),
+        ]});
+        let shop: Tree = serde_json::from_value(shop).unwrap();
+        let listed = page(&shop, false, &mut Refs::default(), None, HashMap::new());
+        assert_eq!(
+            listed.text(),
+            "- heading \"Shop\" [e1]\n- Iframe \"Card payment\" (its frame is not listed)"
+        );
+        // A point on it still finds its line.
+        assert_eq!(listed.line_of(9), Some(1));
     }
 }
