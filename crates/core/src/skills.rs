@@ -473,13 +473,15 @@ fn from(skill: &Skill) -> &'static str {
     }
 }
 
-/// A project's skill text as the model reads it: cleaned and marked as the
-/// project's instruction file is, since a cloned repository's skill is
-/// anyone's. `what` names it in the note. The user's own are as written.
+/// A project's or a learned skill's text as the model reads it: cleaned and
+/// marked as the project's instruction file is, since a cloned repository's
+/// skill is anyone's, and a learned one was written by a model that may have
+/// been reading one. `what` names it in the note. The user's own are as
+/// written.
 fn told(skill: &Skill, what: &str, text: &str) -> String {
     match skill.source {
-        Source::User => text.to_owned(),
-        Source::Project => crate::untrusted::vetted(what, text),
+        Source::User if !skill.learned => text.to_owned(),
+        Source::User | Source::Project => crate::untrusted::vetted(what, text),
     }
 }
 
