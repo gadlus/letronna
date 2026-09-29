@@ -1118,6 +1118,50 @@ pub fn spent(since: u64, session: u64) -> Vec<crate::usage::Spent> {
         .collect()
 }
 
+/// Keeps with session `session`'s helpers, where `spent` counts them, the
+/// model calls saved in the throwaway conversation at `aside`, such as a
+/// goal check's: what each took and cost, and nothing it said.
+pub(crate) fn keep_calls(aside: &std::path::Path, session: u64) -> std::io::Result<()> {
+    let Some(aside) = replay(aside) else {
+        return Ok(());
+    };
+    let mut out = String::new();
+    for reply in aside.messages.iter().filter(|m| m.role == "assistant") {
+        let call = Message {
+            role: reply.role.clone(),
+            model: reply.model.clone(),
+            tokens: reply.tokens,
+            prompt_tokens: reply.prompt_tokens,
+            cached_tokens: reply.cached_tokens,
+            cache_write_tokens: reply.cache_write_tokens,
+            reasoning_tokens: reply.reasoning_tokens,
+            cost: reply.cost,
+            cost_estimated: reply.cost_estimated,
+            summary_usage: reply.summary_usage,
+            at: reply.at,
+            ..Default::default()
+        };
+        push(&mut out, &Record::Message(call));
+    }
+    if out.is_empty() {
+        return Ok(());
+    }
+    let dir = helpers_dir(session);
+    std::fs::create_dir_all(&dir)?;
+    // Not a number, so no helper's conversation is ever given this name.
+    let path = dir.join("calls.jsonl");
+    let _lock = Lock::take(&path)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .read(true)
+        .open(&path)?;
+    if torn(&mut file)? {
+        out.insert(0, '\n');
+    }
+    file.write_all(out.as_bytes())
+}
+
 /// Whether the file at `path` was written to at `since` or later, or might
 /// have been. Files are only appended to, so an older one holds nothing newer.
 fn written_since(path: &std::path::Path, since: u64) -> bool {
@@ -4085,5 +4129,46 @@ pub(crate) mod tests {
         conversation.goal = None;
         conversation.flush_to(&path).unwrap();
         assert_eq!(replay(&path).unwrap().goal, None);
+    }
+
+    #[test]
+    fn a_goal_checks_calls_count_in_usage_without_what_it_said() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("goal-calls");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        for (at, answer) in [(500, "first verdict"), (560, "second verdict")] {
+            let mut aside = Transcript::aside(7, None).unwrap();
+            aside.conversation.messages = vec![
+                said("user", "the question"),
+                Message {
+                    model: "judge".into(),
+                    tokens: 40,
+                    prompt_tokens: 800,
+                    cost: Some(0.002),
+                    at,
+                    ..said("assistant", answer)
+                },
+            ];
+            aside.save().unwrap();
+            super::keep_calls(&aside.path, 7).unwrap();
+        }
+        let spent = super::spent(0, 7);
+        assert_eq!(spent.len(), 2, "{spent:?}");
+        assert!(spent.iter().all(|call| {
+            (
+                call.session,
+                call.model.as_str(),
+                call.usage.output,
+                call.usage.input,
+            ) == (7, "judge", 40, 800)
+                && call.usage.cost == Some(0.002)
+                && !call.copy
+        }));
+        let kept = std::fs::read_to_string(dir.join("agents/7/calls.jsonl")).unwrap();
+        assert!(
+            !kept.contains("verdict") && !kept.contains("question"),
+            "{kept}"
+        );
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 }

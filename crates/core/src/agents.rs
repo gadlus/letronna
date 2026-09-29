@@ -1484,7 +1484,7 @@ pub fn btw(
 /// is set, on a run that offers no tool and makes one request, until
 /// `cancel` stops it, and gives back what it said. For a quick look that
 /// needs none of the conversation, so it costs the same however long that
-/// is. Nothing of it is kept.
+/// is. Only what it cost is kept, where /usage counts it for the session.
 pub fn quick(connection: &Connection, question: &str, cancel: Cancel) -> Result<String, String> {
     let session = connection.conversation;
     let id = fresh_id();
@@ -1517,6 +1517,8 @@ pub fn quick(connection: &Connection, question: &str, cancel: Cancel) -> Result<
         from: 0,
         schema: None,
     });
+    // A cost that cannot be written down is no reason to lose the answer.
+    let _ = crate::store::keep_calls(&path, session);
     let _ = std::fs::remove_file(path.with_extension("lock"));
     let _ = std::fs::remove_file(path);
     match report.status {
