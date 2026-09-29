@@ -24,14 +24,14 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 
 /// What was said to a request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Decision {
     /// Run this call.
     Once,
     /// Run this call, and later calls of the same tool in the same run without asking.
     ForRun,
-    /// Do not run it.
-    Deny,
+    /// Do not run it, for the reason the user typed, empty when they gave none.
+    Deny(String),
 }
 
 /// A call waiting for a yes, as the frontend that serves receives it.
@@ -60,7 +60,7 @@ impl Drop for Request {
         // The agent reads only the first word, so after an answer this is
         // never heard; without one, a frontend that goes away with cards
         // still up does not leave their agents waiting for ever.
-        let _ = self.reply.send(Decision::Deny);
+        let _ = self.reply.send(Decision::Deny(String::new()));
     }
 }
 
@@ -107,15 +107,22 @@ pub fn serve() -> Receiver<Request> {
     served
 }
 
-/// Whether `call` may run, waiting for the frontend's answer unless the agent is stopped first.
+/// Whether `call` may run, waiting for the frontend's answer unless the
+/// agent is stopped first; a no carries the user's reason, empty without one.
 // The driver, its first caller, comes in a later change.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn ask(root: u64, run: u64, label: &str, call: &ToolCall, ctx: &ToolContext) -> bool {
+pub(crate) fn ask(
+    root: u64,
+    run: u64,
+    label: &str,
+    call: &ToolCall,
+    ctx: &ToolContext,
+) -> Result<(), String> {
     let (reply, answer) = mpsc::channel();
     let stop = reply.clone();
     // Set up before taking the lock, since a stopped token runs it at once.
     let _waker = ctx.cancel.on_set(move || {
-        let _ = stop.send(Decision::Deny);
+        let _ = stop.send(Decision::Deny(String::new()));
         // Taken so that a caller between its check and its wait cannot miss this.
         drop(lock(&ASKS));
         SETTLED.notify_all();
@@ -124,10 +131,10 @@ pub(crate) fn ask(root: u64, run: u64, label: &str, call: &ToolCall, ctx: &ToolC
     let mut asks = lock(&ASKS);
     loop {
         if ctx.cancel.is_set() {
-            return false;
+            return Err(String::new());
         }
         if asks.granted.contains(&key) {
-            return true;
+            return Ok(());
         }
         if asks.asking.insert(key.clone()) {
             break;
@@ -139,7 +146,7 @@ pub(crate) fn ask(root: u64, run: u64, label: &str, call: &ToolCall, ctx: &ToolC
     drop(asks);
     let _turn = Turn(key.clone());
     let Some(server) = lock(&SERVER).clone() else {
-        return false;
+        return Err(String::new());
     };
     let request = Request {
         root,
@@ -150,15 +157,16 @@ pub(crate) fn ask(root: u64, run: u64, label: &str, call: &ToolCall, ctx: &ToolC
         reply,
     };
     if server.send(request).is_err() {
-        return false;
+        return Err(String::new());
     }
     match answer.recv() {
-        Ok(Decision::Once) => true,
+        Ok(Decision::Once) => Ok(()),
         Ok(Decision::ForRun) => {
             lock(&ASKS).granted.insert(key);
-            true
+            Ok(())
         }
-        Ok(Decision::Deny) | Err(_) => false,
+        Ok(Decision::Deny(reason)) => Err(reason),
+        Err(_) => Err(String::new()),
     }
 }
 
@@ -189,7 +197,7 @@ mod tests {
     fn asking(run: u64, call: ToolCall, ctx: ToolContext) -> Receiver<bool> {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(ask(7, run, "helper", &call, &ctx));
+            let _ = tx.send(ask(7, run, "helper", &call, &ctx).is_ok());
         });
         rx
     }
@@ -236,8 +244,25 @@ mod tests {
         // Answered in the other order, and differently.
         b.answer(Decision::Once);
         assert_eq!(second.recv_timeout(WAIT), Ok(true));
-        a.answer(Decision::Deny);
+        a.answer(Decision::Deny(String::new()));
         assert_eq!(first.recv_timeout(WAIT), Ok(false));
+    }
+
+    #[test]
+    fn a_no_carries_the_reason_the_user_gave() {
+        let _turn = lock(&SERVING);
+        let requests = serve();
+        let (tx, said) = mpsc::channel();
+        std::thread::spawn(move || {
+            let call = call("a", "run_command");
+            let _ = tx.send(ask(7, 1908, "helper", &call, &ToolContext::default()));
+        });
+        let request = requests.recv_timeout(WAIT).unwrap();
+        request.answer(Decision::Deny("not on the main branch".into()));
+        assert_eq!(
+            said.recv_timeout(WAIT),
+            Ok(Err("not on the main branch".to_owned()))
+        );
     }
 
     #[test]
@@ -256,13 +281,13 @@ mod tests {
         let other_run = asking(1904, call("c", "run_command"), ToolContext::default());
         let request = requests.recv_timeout(WAIT).unwrap();
         assert_eq!(request.run, 1904);
-        request.answer(Decision::Deny);
+        request.answer(Decision::Deny(String::new()));
         assert_eq!(other_run.recv_timeout(WAIT), Ok(false));
 
         let other_tool = asking(1903, call("d", "write_file"), ToolContext::default());
         let request = requests.recv_timeout(WAIT).unwrap();
         assert_eq!(request.call.name, "write_file");
-        request.answer(Decision::Deny);
+        request.answer(Decision::Deny(String::new()));
         assert_eq!(other_tool.recv_timeout(WAIT), Ok(false));
     }
 
@@ -293,7 +318,7 @@ mod tests {
         assert_eq!(first.recv_timeout(WAIT), Ok(true));
         let request = requests.recv_timeout(WAIT).unwrap();
         assert_eq!(request.call.id, "e");
-        request.answer(Decision::Deny);
+        request.answer(Decision::Deny(String::new()));
         assert_eq!(next.recv_timeout(WAIT), Ok(false));
     }
 

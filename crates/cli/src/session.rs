@@ -496,7 +496,12 @@ impl Runner {
             Some(3) | None => Ok(false),
             _ => {
                 render::tool(&call.name, &summary, "declined", true);
-                turn.finish_call(Err(tools::DECLINED.into()));
+                // None when the user left instead, which ends the turn as
+                // stopping here does.
+                let Some(reason) = self.bar.reason("Why not?") else {
+                    return Ok(false);
+                };
+                turn.finish_call(Err(tools::declined(&reason)));
                 Ok(true)
             }
         }

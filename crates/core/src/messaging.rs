@@ -138,7 +138,8 @@ pub fn card_text(name: &str, arguments: &str, preview: &str) -> String {
         return text;
     }
     format!(
-        "Letronna wants to use {name}:\n{}\n\nReply yes to allow it. Anything else declines.",
+        "Letronna wants to use {name}:\n{}\n\nReply yes to allow it, or no and why not. \
+         Anything else declines.",
         quote(&trim_to(preview, 800))
     )
 }
@@ -146,12 +147,14 @@ pub fn card_text(name: &str, arguments: &str, preview: &str) -> String {
 pub enum CardAnswer {
     Answer(String),
     Allow,
-    Deny,
+    /// Declined, with the user's reason, empty when they gave none.
+    Deny(String),
 }
 
 /// Read a chat reply as the answer to the card it was asked about. A number
 /// picks that option; an approval needs a plain yes, so anything unclear
-/// declines rather than runs.
+/// declines rather than runs, and what else was said goes with the no as the
+/// reason.
 pub fn card_answer(name: &str, arguments: &str, reply: &str) -> CardAnswer {
     let reply = reply.trim();
     if name == crate::tools::ASK_USER {
@@ -166,7 +169,21 @@ pub fn card_answer(name: &str, arguments: &str, reply: &str) -> CardAnswer {
     }
     match reply.to_lowercase().as_str() {
         "yes" | "y" | "ok" | "allow" | "ya" | "iya" => CardAnswer::Allow,
-        _ => CardAnswer::Deny,
+        _ => CardAnswer::Deny(reason_after_no(reply).to_owned()),
+    }
+}
+
+/// A declining reply without the no it opens with, as in "no, not that one".
+fn reason_after_no(reply: &str) -> &str {
+    let end = reply
+        .find(|c: char| !c.is_alphabetic())
+        .unwrap_or(reply.len());
+    let (word, rest) = reply.split_at(end);
+    match word.to_lowercase().as_str() {
+        "no" | "n" | "nope" | "deny" | "tidak" => {
+            rest.trim_start_matches(|c: char| c.is_whitespace() || ",.:;!-–—".contains(c))
+        }
+        _ => reply,
     }
 }
 
@@ -1137,14 +1154,30 @@ mod card_tests {
             card_answer("run_command", "{}", "ya"),
             CardAnswer::Allow
         ));
-        assert!(matches!(
-            card_answer("run_command", "{}", "yes but no"),
-            CardAnswer::Deny
-        ));
-        assert!(matches!(
-            card_answer("run_command", "{}", "what is it?"),
-            CardAnswer::Deny
-        ));
+        let reason = |reply| match card_answer("run_command", "{}", reply) {
+            CardAnswer::Deny(reason) => reason,
+            _ => panic!("{reply} should decline"),
+        };
+        assert_eq!(reason("yes but no"), "yes but no");
+        assert_eq!(reason("what is it?"), "what is it?");
+    }
+
+    #[test]
+    fn a_no_passes_on_what_follows_it_as_the_reason() {
+        let reason = |reply| match card_answer("run_command", "{}", reply) {
+            CardAnswer::Deny(reason) => reason,
+            _ => panic!("{reply} should decline"),
+        };
+        assert_eq!(
+            reason("No, use the staging database"),
+            "use the staging database"
+        );
+        assert_eq!(reason("nope -- not on main"), "not on main");
+        assert_eq!(reason(" no. "), "");
+        assert_eq!(reason("n"), "");
+        // A word that only starts like a no is part of the reason.
+        assert_eq!(reason("not yet"), "not yet");
+        assert_eq!(reason("nothing to add"), "nothing to add");
     }
 }
 

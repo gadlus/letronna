@@ -423,6 +423,28 @@ impl Bar {
         answer
     }
 
+    /// Ask for a line to go with an answer just given, with `hint` at the top
+    /// of the box: enter sends it, escape sends nothing. Lines typed before it
+    /// was asked were meant for the model, so they stay queued for it rather
+    /// than answer this.
+    pub fn reason(&mut self, hint: &str) -> Option<String> {
+        if !self.live {
+            render::line(&render::bold(hint));
+            return crate::input::read(&format!("{}{} ", render::PAD, render::blue("›")));
+        }
+        let earlier = std::mem::take(&mut self.queued);
+        self.asking = Some(hint.to_owned());
+        self.note = Some("enter to send  ·  esc to skip".to_owned());
+        self.settle();
+        let answer = self.wait();
+        self.asking = None;
+        self.note = None;
+        let later = std::mem::replace(&mut self.queued, earlier);
+        self.queued.extend(later);
+        self.settle();
+        answer
+    }
+
     /// Pick one of `stops` by sliding along a track, starting at `start`.
     /// `None` when it was left where it was.
     pub fn slide(&mut self, question: &str, stops: &[&str], start: usize) -> Option<usize> {
@@ -737,11 +759,12 @@ impl Bar {
             // Escape stops an answer when one is running, and is otherwise
             // the quickest way to drop what you were typing.
             KeyCode::Esc if crate::screen::selecting() => crate::screen::unselect(),
-            KeyCode::Esc if self.working && self.line.is_empty() => self.interrupt = true,
-            // Escape on an empty answer skips the question.
+            // Escape on an empty answer skips the question, even one asked
+            // in the middle of a turn, as the reason for a no is.
             KeyCode::Esc if self.asking.is_some() && self.line.is_empty() => {
                 self.queued.push_back(String::new())
             }
+            KeyCode::Esc if self.working && self.line.is_empty() => self.interrupt = true,
             KeyCode::Esc => {
                 self.line.clear();
                 self.picked = 0;
@@ -1260,6 +1283,16 @@ mod tests {
         bar.working(true);
         bar.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(bar.interrupted() && !bar.finished());
+    }
+
+    #[test]
+    fn escape_in_a_question_asked_during_a_turn_skips_it_without_stopping_the_turn() {
+        let mut bar = Bar::new(String::new());
+        bar.working(true);
+        bar.asking = Some("Why not?".into());
+        bar.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!bar.interrupted(), "the turn was stopped");
+        assert_eq!(bar.queued.pop_front().as_deref(), Some(""));
     }
 
     #[test]

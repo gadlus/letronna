@@ -331,7 +331,7 @@ impl Chat {
         let key = self.open_key(index);
         // A failure is the output you need to read, so it starts open, in
         // full. One you declined yourself is no news, so it stays shut.
-        let failed = message.is_error && message.content != letronna_core::tools::DECLINED;
+        let failed = message.is_error && !letronna_core::tools::is_declined(&message.content);
         let open = self.thinking_open.contains(&key) != failed;
         let summary = letronna_core::tools::summary(&message.name, &message.args);
         let lines = message.content.lines().count();

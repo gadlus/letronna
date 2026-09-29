@@ -15,6 +15,21 @@ impl Chat {
         self.resolve_call(Verdict::Answer(text), cx);
     }
 
+    /// Denies the call on the card, with what was typed in its reason field.
+    pub(crate) fn deny_call(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let reason = self.take_reason(window, cx);
+        self.resolve_call(Verdict::Deny(reason), cx);
+    }
+
+    /// Empties the card's reason field and hands back what was in it, so a
+    /// reason typed on one card cannot go with the next.
+    fn take_reason(&mut self, window: &mut Window, cx: &mut Context<Self>) -> String {
+        let reason = self.deny_reason.read(cx).value().to_string();
+        self.deny_reason
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        reason
+    }
+
     /// The row under the messages while tools run: a progress line, or the
     /// card waiting on the user. `None` when nothing is queued.
     pub(crate) fn approval_card(
@@ -142,7 +157,7 @@ impl Chat {
                                 .small()
                                 .label("Keep planning")
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.resolve_call(Verdict::Deny, cx)
+                                    this.resolve_call(Verdict::Deny(String::new()), cx)
                                 })),
                         ),
                 )
@@ -188,9 +203,9 @@ impl Chat {
                         .plain(cx)
                         .small()
                         .label("Deny")
-                        .on_click(
-                            cx.listener(|this, _, _, cx| this.resolve_call(Verdict::Deny, cx)),
-                        ),
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.resolve_call(Verdict::Deny(String::new()), cx)
+                        })),
                 )
                 .child(
                     div()
@@ -203,12 +218,14 @@ impl Chat {
         } else {
             h_flex()
                 .gap_2()
+                .items_center()
                 .child(
                     Button::new("allow")
                         .primary()
                         .small()
                         .label("Allow")
-                        .on_click(cx.listener(|this, _, _, cx| {
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.take_reason(window, cx);
                             this.resolve_call(Verdict::Allow { remember: false }, cx)
                         })),
                 )
@@ -217,18 +234,25 @@ impl Chat {
                         .framed(cx)
                         .small()
                         .label("Allow for this session")
-                        .on_click(cx.listener(|this, _, _, cx| {
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.take_reason(window, cx);
                             this.resolve_call(Verdict::Allow { remember: true }, cx)
                         })),
+                )
+                // Beside Deny, which sends what is typed here; enter in the
+                // field denies too.
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(Input::new(&self.deny_reason).small().w_full()),
                 )
                 .child(
                     Button::new("deny")
                         .plain(cx)
                         .small()
                         .label("Deny")
-                        .on_click(
-                            cx.listener(|this, _, _, cx| this.resolve_call(Verdict::Deny, cx)),
-                        ),
+                        .on_click(cx.listener(|this, _, window, cx| this.deny_call(window, cx))),
                 )
         };
         Some(
