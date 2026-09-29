@@ -43,6 +43,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
   <key>CFBundleVersion</key><string>$version</string>
   <key>LSMinimumSystemVersion</key><string>10.15.7</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSMicrophoneUsageDescription</key><string>Letronna listens only while you record a message for it to type out.</string>
 </dict>
 </plist>
 PLIST
@@ -51,8 +52,20 @@ PLIST
 # (MACOS_SIGN_IDENTITY), with the hardened runtime notarization asks for.
 # Otherwise ad-hoc: an unsigned bundle has no stable identity, so macOS can
 # keep serving a stale icon from its cache, and ad-hoc is enough for that.
+# Under the hardened runtime the microphone stays silent without its
+# entitlement, so voice input would upload nothing but silence.
 if [ -n "${MACOS_SIGN_IDENTITY-}" ]; then
-  codesign --force --options runtime --timestamp --sign "$MACOS_SIGN_IDENTITY" "$app"
+  cat > "$tmp/entitlements.plist" <<ENT
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.device.audio-input</key><true/>
+</dict>
+</plist>
+ENT
+  codesign --force --options runtime --timestamp --entitlements "$tmp/entitlements.plist" \
+    --sign "$MACOS_SIGN_IDENTITY" "$app"
 else
   codesign --force --sign - "$app" >/dev/null 2>&1 || true
 fi
