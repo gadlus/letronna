@@ -1,6 +1,7 @@
 //! The Messaging page: a channel list beside the setup for the selected one.
 
 use crate::prelude::*;
+use crate::ui::section;
 use letronna_core::messaging;
 
 struct Channel {
@@ -280,7 +281,6 @@ impl Chat {
                                             .child(
                                                 div()
                                                     .text_base()
-                                                    .font_family(HEADING_FONT)
                                                     .font_weight(FontWeight::SEMIBOLD)
                                                     .child("Telegram"),
                                             )
@@ -482,15 +482,6 @@ fn pill(text: &'static str, colour: Hsla, cx: &App) -> impl IntoElement {
         .child(text)
 }
 
-fn section(text: &'static str, cx: &App) -> impl IntoElement {
-    div()
-        .text_xs()
-        .font_family(HEADING_FONT)
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(cx.theme().muted_foreground)
-        .child(text.to_uppercase())
-}
-
 fn help(text: &str, cx: &App) -> Div {
     div()
         .min_w_0()
@@ -636,7 +627,6 @@ impl Chat {
                                             .child(
                                                 div()
                                                     .text_base()
-                                                    .font_family(HEADING_FONT)
                                                     .font_weight(FontWeight::SEMIBOLD)
                                                     .child(channel.name),
                                             )

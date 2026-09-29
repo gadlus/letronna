@@ -54,11 +54,11 @@ impl Chat {
             .update(cx, |input, cx| input.set_value(title, window, cx));
         let input = self.rename.clone();
         let chat = cx.entity();
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_dialog(cx, move |dialog, _, cx| {
             let input = input.clone();
             let chat = chat.clone();
             dialog
-                .title(div().font_family(HEADING_FONT).child("Rename session"))
+                .title(crate::ui::section("Rename session", cx))
                 .w(px(420.))
                 .confirm()
                 .child(Input::new(&input))

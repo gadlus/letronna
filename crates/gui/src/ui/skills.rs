@@ -233,26 +233,14 @@ impl Chat {
                     .justify_between()
                     .gap_4()
                     .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_xl()
-                                    .font_family(HEADING_FONT)
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child("Skills"),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(
-                                        "Prompts you reach for often. Using one puts it in the \
-                                         composer so you can adjust it before sending.",
-                                    ),
-                            ),
+                        crate::ui::page_header(
+                            "Skills",
+                            "Prompts you reach for often. Using one puts it in the composer so \
+                             you can adjust it before sending.",
+                            cx,
+                        )
+                        .flex_1()
+                        .min_w_0(),
                     )
                     .child(
                         Button::new("add-skill")
