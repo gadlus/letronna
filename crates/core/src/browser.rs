@@ -2979,6 +2979,10 @@ impl Session {
 
     /// The page as it is now.
     fn read(&mut self, full: bool) -> Result<Page, String> {
+        // Asked before the page is read: one that loads another meanwhile
+        // is then taken for the old document and listed whole after, where
+        // asked after it the old listing would be kept as the new one's.
+        let document = (!full).then(|| self.document_now());
         let tree: Tree = self.tab.call("Accessibility.getFullAXTree", json!({}))?;
         let frames = self.frames(full);
         let mut page = page(&tree, full, &mut self.refs, None, frames);
@@ -2994,9 +2998,9 @@ impl Session {
                 url: page.url.clone(),
             });
         }
-        if !full {
+        if let Some(document) = document {
             self.last = page.text();
-            self.document = self.document_now();
+            self.document = document;
         }
         self.seen = self.sight().ok();
         Ok(page)
@@ -5508,6 +5512,34 @@ mod tests {
             .filter(|m| *m == "Accessibility.getFullAXTree")
             .count();
         assert_eq!(reads, 7, "{heard:?}");
+    }
+
+    #[test]
+    fn a_page_that_loads_another_while_it_is_read_is_listed_whole_after() {
+        let names: Vec<String> = (1..=30).map(|n| format!("Item {n}")).collect();
+        let state = Arc::new(Mutex::new(("L1", names)));
+        let listed = listed_page(state.clone());
+        let loaded = std::sync::atomic::AtomicBool::new(false);
+        let (mut session, _server) = fake_session(move |method, params| {
+            let answer = listed(method, params);
+            // The first read gets the old page's elements, and by the time
+            // it is done another page has loaded in their place.
+            if method == "Accessibility.getFullAXTree" && !loaded.swap(true, Ordering::Relaxed) {
+                let mut state = state.lock().unwrap();
+                state.0 = "L2";
+                state.1[9] = "Welcome".into();
+            }
+            answer
+        });
+        let page = session.read(false).unwrap();
+        session.show(&page, &View::default(), Vec::new()).unwrap();
+        let after = session
+            .act(false, None, After::Changes, |_| Ok(()))
+            .unwrap();
+        assert!(
+            !after.contains("unchanged") && after.ends_with("- button \"Item 30\" [e30]"),
+            "{after}"
+        );
     }
 
     #[test]
