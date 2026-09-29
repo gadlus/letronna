@@ -193,7 +193,7 @@ pub(crate) struct ServerConfig {
     #[serde(default)]
     args: Vec<String>,
     #[serde(default)]
-    env: HashMap<String, String>,
+    pub(crate) env: HashMap<String, String>,
     #[serde(default)]
     pub(crate) disabled: bool,
     /// Tools that run without asking.

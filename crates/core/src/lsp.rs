@@ -389,9 +389,7 @@ struct Pipes {
 
 /// Start the server `config` gives, in the project at `root`.
 fn launch(config: &ServerConfig, root: &Path) -> Result<Pipes, String> {
-    let mut config = config.expanded(&|var| std::env::var(var).ok())?;
-    // A language server finds the project from the folder it starts in.
-    config.cwd.get_or_insert_with(|| ".".into());
+    let config = prepared(config)?;
     let mut child = crate::mcp::spawn(&config, root)?;
     // At once, so the server has had as little time as possible to start
     // anything outside the tree.
@@ -416,6 +414,21 @@ fn launch(config: &ServerConfig, root: &Path) -> Result<Pipes, String> {
         from: Box::new(stdout),
         to: Box::new(stdin),
     })
+}
+
+/// `config` as a server is started from it: `${VAR}`s filled in, and in
+/// the project folder unless it names another.
+fn prepared(config: &ServerConfig) -> Result<ServerConfig, String> {
+    let mut config = config.expanded(&|var| std::env::var(var).ok())?;
+    // A language server finds the project from the folder it starts in.
+    config.cwd.get_or_insert_with(|| ".".into());
+    // On Windows a server npm installs is a `.cmd` file only cmd finds, and
+    // cmd looks in its current folder, the project, before the PATH: a
+    // repository could ship a `.cmd` of the same name. Nothing else reads it.
+    config
+        .env
+        .insert("NoDefaultCurrentDirectoryInExePath".into(), "1".into());
+    Ok(config)
 }
 
 /// A write for the server to hear of.
@@ -1298,6 +1311,15 @@ mod tests {
             heard.ends_with(&["shutdown".into(), "exit".into()]),
             "{heard:?}"
         );
+    }
+
+    #[test]
+    fn a_server_starts_in_the_project_with_cmd_kept_from_looking_there() {
+        let config: ServerConfig =
+            serde_json::from_value(json!({"command": "typescript-language-server"})).unwrap();
+        let config = prepared(&config).unwrap();
+        assert_eq!(config.cwd.as_deref(), Some("."));
+        assert_eq!(config.env["NoDefaultCurrentDirectoryInExePath"], "1");
     }
 
     #[test]
