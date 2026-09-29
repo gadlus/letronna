@@ -39,7 +39,7 @@ pub fn list() -> Vec<Profile> {
             dir: entry.path(),
         })
         .collect();
-    rest.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    rest.sort_by_key(|a| a.name.to_lowercase());
     let mut all = vec![Profile {
         name: DEFAULT.to_owned(),
         dir: crate::chat::base_dir(),
