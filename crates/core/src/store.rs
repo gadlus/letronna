@@ -341,6 +341,7 @@ impl Conversation {
         self.messages.truncate(len);
         // Replies from here on take the places of those taken back.
         crate::filestate::forget(self.id);
+        crate::compact::forget(self.id, len);
         // Rewound to nothing, the messages are empty and the listing's count
         // is read again: left as it was, `length` would report the old
         // history and `fill` would read it back in.
@@ -545,6 +546,7 @@ impl Store {
         let _ = std::fs::remove_dir_all(crate::tools::results_dir(gone.id));
         // A new session can be given the same id.
         crate::filestate::forget(gone.id);
+        crate::compact::forget(gone.id, 0);
         crate::history::forget(gone.id);
         crate::tasklist::forget(gone.id);
     }

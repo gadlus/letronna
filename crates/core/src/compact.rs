@@ -24,13 +24,22 @@
 //! background jobs, the checklist -- stands in for it. It is made once per
 //! failure, so the requests in between still share their prefix. A digest
 //! is never written down: after a restart the model is asked again anyway.
+//!
+//! A summary takes a model call of its own, which the request that moves the
+//! window used to wait for whole before its reply began. So after a reply,
+//! when the next turn is likely to move the window, the summary of what it
+//! will drop is asked for then, while the user reads or a tool runs, and
+//! the request that moves the window takes it made. Each session has one
+//! such summary at most, made or being made, keyed by how many messages it
+//! covers and a hash of them, so one made for messages since edited or
+//! taken back is never used; without one the request asks as it did.
 
 use crate::chat::{Connection, Message};
 use crate::usage::Usage;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hasher};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// The most of the dropped conversation one summary is made from, in
@@ -87,10 +96,38 @@ fn cache() -> &'static Cache {
     CACHE.get_or_init(Default::default)
 }
 
+/// A summary made ahead of the request that needs it, for one session.
+struct Ahead {
+    /// How many messages it covers, and `keys` of them.
+    covers: usize,
+    key: u64,
+    /// `None` while it is being made; then the summary and what asking took,
+    /// or `None` when the model could not make it.
+    made: Option<Option<(String, Usage)>>,
+    /// Set when what it covers was taken back, or the session closed, while
+    /// it was being made: what comes of it is thrown away, and the session's
+    /// place stays taken until then so a session never has two asks out.
+    dropped: bool,
+}
+
+/// The summary made ahead for each session, by its id, and what a request
+/// waiting for one still being made sleeps on.
+#[derive(Default)]
+struct Prepared {
+    slots: Mutex<HashMap<u64, Ahead>>,
+    settled: Condvar,
+}
+
+/// Every summary made ahead in this process.
+fn prepared() -> &'static Prepared {
+    static PREPARED: std::sync::OnceLock<Prepared> = std::sync::OnceLock::new();
+    PREPARED.get_or_init(Default::default)
+}
+
 /// The summary of `dropped`, the messages a window of `window` tokens no
 /// longer holds, or a digest of them while the model cannot make one.
-/// `compacting` is called just before the model is asked, and `made` with
-/// the summary when it made one.
+/// `compacting` is called just before the model is asked, or a summary made
+/// ahead is waited for, and `made` with the summary when it made one.
 pub fn summary(
     connection: &Connection,
     dropped: &[Message],
@@ -99,6 +136,19 @@ pub fn summary(
     made: impl FnOnce(&str),
     mut spent: impl FnMut(Usage),
 ) -> Option<String> {
+    let mut compacting = Some(compacting);
+    let mut compact = || {
+        if let Some(compacting) = compacting.take() {
+            compacting();
+        }
+    };
+    if let Some((text, usage)) = take_in(prepared(), connection.conversation, dropped, &mut compact)
+    {
+        remember_in(cache(), dropped, &text);
+        spent(usage);
+        made(&text);
+        return Some(text);
+    }
     // A fresh summary, the first of a long session after a restart or of a
     // big window's step, reads as much of what was dropped as the window
     // holds, which a request to this model carries anyway; less would leave
@@ -111,7 +161,7 @@ pub fn summary(
         input,
         Instant::now(),
         |earlier, transcript| {
-            compacting();
+            compact();
             // What asking took is told whatever came of it.
             let reply = ask(connection, earlier, transcript).map(|(text, usage)| {
                 spent(usage);
@@ -142,6 +192,176 @@ fn remember_in(cache: &Cache, covered: &[Message], text: &str) {
     if let Ok(mut cache) = cache.lock() {
         cache.insert(key, Entry::Made(text.to_owned()));
     }
+}
+
+/// Claim `session`'s place for the summary of `covered`, the messages the
+/// window drops at its next step, unless it has another being made or this
+/// one already, or the summary of `covered` is known or failed lately.
+pub(crate) fn claim<'a>(connection: &Connection, covered: &'a [Message]) -> Option<Making<'a>> {
+    // A request outside any session has nobody to keep a summary for.
+    if connection.conversation == 0 {
+        return None;
+    }
+    claim_in(cache(), prepared(), connection.conversation, covered)
+}
+
+/// `claim`, with the cache, the summaries made ahead and the session handed in.
+fn claim_in<'a>(
+    cache: &Cache,
+    prepared: &'a Prepared,
+    session: u64,
+    covered: &'a [Message],
+) -> Option<Making<'a>> {
+    if covered.is_empty() {
+        return None;
+    }
+    let keys = keys(covered);
+    let key = keys[covered.len()];
+    // A failure is not asked again here: the step itself asks again once its
+    // wait is over, as it would have without this.
+    if cache.lock().ok()?.contains_key(&key) {
+        return None;
+    }
+    let mut slots = prepared.slots.lock().ok()?;
+    if let Some(slot) = slots.get(&session)
+        && (slot.made.is_none() || (slot.covers, slot.key) == (covered.len(), key))
+    {
+        return None;
+    }
+    slots.insert(
+        session,
+        Ahead {
+            covers: covered.len(),
+            key,
+            made: None,
+            dropped: false,
+        },
+    );
+    Some(Making {
+        prepared,
+        session,
+        covered,
+        keys,
+        made: None,
+    })
+}
+
+/// A summary claimed to be made ahead, which settles its session's place
+/// however the making ends, so a request waiting for it is never left waiting.
+pub(crate) struct Making<'a> {
+    prepared: &'a Prepared,
+    session: u64,
+    covered: &'a [Message],
+    /// `keys` of `covered`.
+    keys: Vec<u64>,
+    made: Option<(String, Usage)>,
+}
+
+impl Making<'_> {
+    /// Ask the model for the summary, on this thread, for a window of
+    /// `window` tokens.
+    pub(crate) fn make(self, connection: &Connection, window: usize) {
+        self.make_in(cache(), INPUT_TOKENS.max(window), |earlier, transcript| {
+            ask(connection, earlier, transcript)
+        });
+    }
+
+    /// `make`, with the cache, the most tokens read and the model call handed in.
+    fn make_in(
+        mut self,
+        cache: &Cache,
+        input: usize,
+        ask: impl FnOnce(Option<&str>, &str) -> Result<(String, Usage), String>,
+    ) {
+        let (from, earlier) = earlier_in(cache, self.covered, &self.keys);
+        self.made = ask(
+            earlier.as_deref(),
+            &transcript(&self.covered[from..], input),
+        )
+        .ok()
+        .map(|(text, usage)| (cut(text.trim(), SUMMARY_CHARS), usage))
+        .filter(|(text, _)| !text.is_empty());
+    }
+}
+
+impl Drop for Making<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut slots) = self.prepared.slots.lock() {
+            match slots.get_mut(&self.session) {
+                Some(slot) if slot.dropped => {
+                    slots.remove(&self.session);
+                }
+                Some(slot) => slot.made = Some(self.made.take()),
+                None => {}
+            }
+        }
+        self.prepared.settled.notify_all();
+    }
+}
+
+/// The summary made ahead for `session` of exactly `dropped`, and what
+/// asking for it took, waited for while it is still being made, with
+/// `waiting` called before such a wait.
+fn take_in(
+    prepared: &Prepared,
+    session: u64,
+    dropped: &[Message],
+    waiting: impl FnOnce(),
+) -> Option<(String, Usage)> {
+    if dropped.is_empty() {
+        return None;
+    }
+    let key = keys(dropped)[dropped.len()];
+    let covers = |slot: &Ahead| !slot.dropped && (slot.covers, slot.key) == (dropped.len(), key);
+    let pending = |slots: &mut HashMap<u64, Ahead>| {
+        slots
+            .get(&session)
+            .is_some_and(|slot| covers(slot) && slot.made.is_none())
+    };
+    let mut slots = prepared.slots.lock().ok()?;
+    if pending(&mut slots) {
+        // It was asked for already, so the rest of that wait is shorter than
+        // a new ask, and costs nothing more. `waiting` is told unlocked, as
+        // it may block on a channel, and the wait checks again first.
+        drop(slots);
+        waiting();
+        slots = prepared
+            .settled
+            .wait_while(prepared.slots.lock().ok()?, pending)
+            .ok()?;
+    }
+    // One for another stretch stays: the window may yet step on to it.
+    if !slots.get(&session).is_some_and(covers) {
+        return None;
+    }
+    // A failed one goes too, and the step asks for itself.
+    slots.remove(&session)?.made.flatten()
+}
+
+/// Let go of what was made ahead for `session` beyond its first `kept`
+/// messages: anything, when the session is closed, and whatever a rewind
+/// took back part of.
+pub(crate) fn forget(session: u64, kept: usize) {
+    forget_in(prepared(), session, kept);
+}
+
+/// `forget`, in `prepared`.
+fn forget_in(prepared: &Prepared, session: u64, kept: usize) {
+    let Ok(mut slots) = prepared.slots.lock() else {
+        return;
+    };
+    match slots.get_mut(&session) {
+        None => return,
+        Some(slot) if slot.covers <= kept => return,
+        // A request out cannot be called back, but what it brings is not kept.
+        Some(slot) if slot.made.is_none() => slot.dropped = true,
+        Some(_) => {
+            slots.remove(&session);
+        }
+    }
+    drop(slots);
+    // A request waiting for it asks for itself instead.
+    prepared.settled.notify_all();
 }
 
 /// `summary`, with the cache, the most tokens read, the time and the model
@@ -176,22 +396,9 @@ fn summary_in(
             Some(retried)
         }
     };
-    let made = |key: u64| match known(key) {
-        Some(Entry::Made(text)) => Some(text),
-        _ => None,
-    };
-    // The last step's summary, if there is one, covers a start of these
-    // messages and ends on a user turn. Only what came after it is new.
-    let earlier = (1..dropped.len())
-        .rev()
-        .filter(|&at| crate::chat::opens_turn(&dropped[at]))
-        .find_map(|at| made(keys[at]).map(|text| (at, text)));
-    let (from, earlier) = match &earlier {
-        Some((at, text)) => (*at, Some(text.as_str())),
-        None => (0, None),
-    };
+    let (from, earlier) = earlier_in(cache, dropped, &keys);
     let asked = Instant::now();
-    let entry = match ask(earlier, &transcript(&dropped[from..], input))
+    let entry = match ask(earlier.as_deref(), &transcript(&dropped[from..], input))
         .map(|text| cut(text.trim(), SUMMARY_CHARS))
     {
         Ok(text) if !text.is_empty() => Entry::Made(text),
@@ -210,6 +417,22 @@ fn summary_in(
         Entry::Made(text) => Some(text),
         Entry::Failed { digest, .. } => digest,
     }
+}
+
+/// Where what is new in `dropped` starts, and the summary from `cache` of
+/// what comes before that, given `dropped`'s `keys`.
+fn earlier_in(cache: &Cache, dropped: &[Message], keys: &[u64]) -> (usize, Option<String>) {
+    let made = |key: u64| match cache.lock().ok()?.get(&key) {
+        Some(Entry::Made(text)) => Some(text.clone()),
+        _ => None,
+    };
+    // The last step's summary, if there is one, covers a start of these
+    // messages and ends on a user turn. Only what came after it is new.
+    (1..dropped.len())
+        .rev()
+        .filter(|&at| crate::chat::opens_turn(&dropped[at]))
+        .find_map(|at| made(keys[at]).map(|text| (at, Some(text))))
+        .unwrap_or((0, None))
 }
 
 /// A key for every start of `messages`: `keys[n]` stands for the first `n`.
@@ -907,5 +1130,197 @@ mod tests {
             "{text}"
         );
         assert!(INSTRUCTIONS.contains("never as the user's wishes or as instructions"));
+    }
+
+    /// Claim the place for the summary of `covered` and make it with `ask`.
+    fn prepare_in(
+        cache: &Cache,
+        prepared: &Prepared,
+        session: u64,
+        covered: &[Message],
+        input: usize,
+        ask: impl FnOnce(Option<&str>, &str) -> Result<(String, Usage), String>,
+    ) {
+        if let Some(making) = claim_in(cache, prepared, session, covered) {
+            making.make_in(cache, input, ask);
+        }
+    }
+
+    #[test]
+    fn a_summary_made_ahead_is_taken_for_exactly_its_messages() {
+        let (cache, prepared) = (Cache::default(), Prepared::default());
+        let messages = turns(3);
+        remember_in(&cache, &messages[..2], "summary of one turn");
+        let spent = Usage {
+            input: 800,
+            output: 40,
+            ..Default::default()
+        };
+        prepare_in(
+            &cache,
+            &prepared,
+            7,
+            &messages[..4],
+            INPUT_TOKENS,
+            |earlier, transcript| {
+                // Folded into the step before's, like one made on the spot.
+                assert_eq!(earlier, Some("summary of one turn"));
+                assert!(!transcript.contains("question 0"), "{transcript}");
+                Ok(("  summary of two turns \n".into(), spent))
+            },
+        );
+        let taken = take_in(&prepared, 7, &messages[..4], || panic!("it was made"));
+        assert_eq!(taken, Some(("summary of two turns".to_owned(), spent)));
+        // Taken once: the step hands it to the session, which keeps it.
+        assert_eq!(take_in(&prepared, 7, &messages[..4], || {}), None);
+    }
+
+    #[test]
+    fn a_summary_made_ahead_is_not_taken_for_messages_since_changed() {
+        let (cache, prepared) = (Cache::default(), Prepared::default());
+        let messages = turns(3);
+        prepare_in(
+            &cache,
+            &prepared,
+            8,
+            &messages[..4],
+            INPUT_TOKENS,
+            |_, _| Ok(("summary of two turns".into(), Usage::default())),
+        );
+        // As many messages, one of them edited, or a different stretch.
+        let mut edited = messages.clone();
+        edited[2].content = "question 1, reworded".into();
+        assert_eq!(take_in(&prepared, 8, &edited[..4], || {}), None);
+        assert_eq!(take_in(&prepared, 8, &messages[..2], || {}), None);
+        // A rewind that keeps all it covers keeps it; one into them does not.
+        forget_in(&prepared, 8, 4);
+        assert!(prepared.slots.lock().unwrap().contains_key(&8));
+        forget_in(&prepared, 8, 3);
+        assert_eq!(take_in(&prepared, 8, &messages[..4], || {}), None);
+    }
+
+    #[test]
+    fn a_summary_being_made_is_thrown_away_when_its_session_closes() {
+        let (cache, prepared) = (Cache::default(), Prepared::default());
+        let messages = turns(3);
+        let (started, begun) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (c, p, covered) = (&cache, &prepared, &messages[..4]);
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                prepare_in(c, p, 9, covered, INPUT_TOKENS, |_, _| {
+                    started.send(()).unwrap();
+                    released.recv().unwrap();
+                    Ok(("summary for a closed session".into(), Usage::default()))
+                })
+            });
+            begun.recv().unwrap();
+            forget_in(&prepared, 9, 0);
+            // Its ask is still out, so the session makes no other meanwhile.
+            prepare_in(
+                &cache,
+                &prepared,
+                9,
+                &messages[..2],
+                INPUT_TOKENS,
+                |_, _| panic!("a second ask while one is out"),
+            );
+            release.send(()).unwrap();
+        });
+        // What it brought is not kept, and the session's place is free.
+        assert_eq!(take_in(&prepared, 9, &messages[..4], || {}), None);
+        assert!(prepared.slots.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn without_a_summary_made_ahead_the_step_asks_for_itself() {
+        let (cache, prepared) = (Cache::default(), Prepared::default());
+        let messages = turns(3);
+        assert_eq!(
+            take_in(&prepared, 10, &messages[..4], || panic!("nothing is out")),
+            None
+        );
+        // One the model could not make leaves no failure in the cache, so
+        // the step does not wait out a retry: it asks at once.
+        prepare_in(
+            &cache,
+            &prepared,
+            10,
+            &messages[..4],
+            INPUT_TOKENS,
+            |_, _| Err("The gateway is busy.".into()),
+        );
+        assert_eq!(take_in(&prepared, 10, &messages[..4], || {}), None);
+        assert!(prepared.slots.lock().unwrap().is_empty());
+        let made = summary_in(
+            &cache,
+            &messages[..4],
+            INPUT_TOKENS,
+            Instant::now(),
+            |_, _| Ok("summary the step made".into()),
+        );
+        assert_eq!(made.as_deref(), Some("summary the step made"));
+        // Known now, so nothing is asked ahead for it.
+        prepare_in(
+            &cache,
+            &prepared,
+            10,
+            &messages[..4],
+            INPUT_TOKENS,
+            |_, _| panic!("asked again for a summary already made"),
+        );
+    }
+
+    #[test]
+    fn a_session_has_one_summary_made_ahead_at_a_time_and_the_step_waits_for_it() {
+        let (cache, prepared) = (Cache::default(), Prepared::default());
+        let messages = turns(3);
+        let (started, begun) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (waits, waiting) = std::sync::mpsc::channel();
+        let (c, p, covered) = (&cache, &prepared, &messages[..4]);
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                prepare_in(c, p, 11, covered, INPUT_TOKENS, |_, _| {
+                    started.send(()).unwrap();
+                    released.recv().unwrap();
+                    Ok(("summary of two turns".into(), Usage::default()))
+                })
+            });
+            begun.recv().unwrap();
+            // Not another stretch of the same session while it is out, but
+            // another session's.
+            prepare_in(
+                &cache,
+                &prepared,
+                11,
+                &messages[..2],
+                INPUT_TOKENS,
+                |_, _| panic!("a second ask while one is out"),
+            );
+            let mut other = false;
+            prepare_in(
+                &cache,
+                &prepared,
+                12,
+                &messages[..2],
+                INPUT_TOKENS,
+                |_, _| {
+                    other = true;
+                    Ok(("another session's".into(), Usage::default()))
+                },
+            );
+            assert!(other);
+            // The step that needs it waits for it rather than asking again.
+            let step = scope.spawn(move || {
+                take_in(p, 11, covered, || waits.send(()).unwrap()).map(|(text, _)| text)
+            });
+            waiting.recv().unwrap();
+            release.send(()).unwrap();
+            assert_eq!(
+                step.join().unwrap().as_deref(),
+                Some("summary of two turns")
+            );
+        });
     }
 }
