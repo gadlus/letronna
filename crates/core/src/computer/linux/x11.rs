@@ -124,14 +124,26 @@ impl X {
             .extension_information(res::X11_EXTENSION_NAME)
             .map_err(lost)?
             .is_some();
-        Ok(X {
+        // A client's process is asked for with QueryClientIds, new in 1.2.
+        let res = res
+            && conn
+                .res_query_version(1, 2)
+                .map_err(lost)?
+                .reply()
+                .is_ok_and(|version| (version.server_major, version.server_minor) >= (1, 2));
+        let own = conn.setup().resource_id_base;
+        let x = X {
             conn,
             root,
             width,
             height,
             atoms,
             res,
-        })
+        };
+        if x.res {
+            here(x.client_pid(own)?, std::process::id())?;
+        }
+        Ok(x)
     }
 
     /// The root window, which is the whole screen.
@@ -270,22 +282,7 @@ impl X {
     /// else as the window claims in `_NET_WM_PID`.
     pub(super) fn pid_of(&self, window: u32) -> Result<Option<u32>, String> {
         if self.res {
-            let spec = ClientIdSpec {
-                client: window,
-                mask: ClientIdMask::LOCAL_CLIENT_PID,
-            };
-            let reply = self
-                .conn
-                .res_query_client_ids(&[spec])
-                .map_err(lost)?
-                .reply();
-            let pid = reply.ok().and_then(|reply| {
-                reply
-                    .ids
-                    .iter()
-                    .find(|id| id.spec.mask.contains(ClientIdMask::LOCAL_CLIENT_PID))
-                    .and_then(|id| id.value.first().copied())
-            });
+            let pid = self.client_pid(window)?;
             // A client across the network has no local process.
             if pid.is_some() {
                 return Ok(pid);
@@ -293,6 +290,27 @@ impl X {
         }
         let claimed = self.property32(window, self.atoms._NET_WM_PID, AtomEnum::CARDINAL)?;
         Ok(claimed.and_then(|pids| pids.first().copied()))
+    }
+
+    /// The process of the client that made resource `id`, as the X server's
+    /// X-Resource extension names it.
+    fn client_pid(&self, id: u32) -> Result<Option<u32>, String> {
+        let spec = ClientIdSpec {
+            client: id,
+            mask: ClientIdMask::LOCAL_CLIENT_PID,
+        };
+        let reply = self
+            .conn
+            .res_query_client_ids(&[spec])
+            .map_err(lost)?
+            .reply();
+        Ok(reply.ok().and_then(|reply| {
+            reply
+                .ids
+                .iter()
+                .find(|id| id.spec.mask.contains(ClientIdMask::LOCAL_CLIENT_PID))
+                .and_then(|id| id.value.first().copied())
+        }))
     }
 
     /// `window`'s ancestor just under the root, or itself when it is one.
@@ -544,6 +562,25 @@ impl X {
     }
 }
 
+/// Refuses unless `said`, the process the X server gives for Letronna's
+/// own connection, is Letronna's process `own`: a server on another
+/// machine, as over ssh -X, or outside this one's process namespace, as
+/// from a container, names processes that are not the ones `/proc` here
+/// holds, so no window's app could be told apart from another's.
+fn here(said: Option<u32>, own: u32) -> Result<(), String> {
+    if said == Some(own) {
+        return Ok(());
+    }
+    Err(
+        "Computer use needs the X display to run on this computer and to be \
+         reached through its local socket, and this one is on another machine \
+         or outside Letronna's own processes, as over ssh -X or from a \
+         container, so which app a window belongs to cannot be told. Carry on \
+         without it."
+            .into(),
+    )
+}
+
 /// A coordinate as X takes it, which is 16 bits.
 fn clamp16(n: f64) -> i16 {
     n.round().clamp(i16::MIN.into(), i16::MAX.into()) as i16
@@ -686,6 +723,14 @@ mod tests {
         let rgb = [0xff_0000, 0x00_ff00, 0x00_00ff];
         assert_eq!(to_rgb(&[0; 7], 2, 1, &format(32, false, rgb)), None);
         assert_eq!(to_rgb(&[0; 8], 2, 1, &format(4, false, rgb)), None);
+    }
+
+    #[test]
+    fn an_x_server_that_sees_letronna_as_another_process_is_refused() {
+        assert_eq!(here(Some(42), 42), Ok(()));
+        let over_ssh = here(Some(7), 42).unwrap_err();
+        assert!(over_ssh.contains("ssh -X"), "{over_ssh}");
+        assert!(here(None, 42).is_err());
     }
 
     #[test]
