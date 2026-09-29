@@ -572,6 +572,14 @@ fn support_file(folder: &Path, raw: &str) -> Result<String, String> {
             "`{raw}` leads out of the skill's folder, so it is not read here."
         ));
     }
+    // As read_file keeps them out of reach: a project's skill folder is in
+    // the project, and can hold its .env as well as anywhere else.
+    if crate::tools::secret(&path) {
+        return Err(format!(
+            "`{raw}` holds keys, passwords or tokens, so it stays out of reach. Ask the user to \
+             paste what you need from it."
+        ));
+    }
     if path.is_dir() {
         return Err(format!(
             "`{raw}` is a folder. Load the skill without file to see the files in it."
@@ -1990,6 +1998,8 @@ mod tests {
         write(&data.join("keys.json"), "{\"secret\": 1}");
         write(&folder.join("logo.png"), "\u{0}\u{1}PNG");
         std::fs::create_dir_all(folder.join("empty")).unwrap();
+        write(&folder.join(".env"), "TOKEN=secret");
+        write(&folder.join(".env.example"), "TOKEN=");
 
         let absolute = data.join("keys.json").display().to_string();
         for (file, says) in [
@@ -1998,11 +2008,17 @@ mod tests {
             ("missing.md", "There is no file"),
             ("logo.png", "not a text file"),
             ("empty", "is a folder"),
+            (".env", "stays out of reach"),
         ] {
             let error = load(&data, None, "pdf", Some(file), 0).unwrap_err();
             assert!(error.contains(says), "{file}: {error}");
             assert!(!error.contains("secret"));
         }
+        // What a project commits to show its settings is fine to read.
+        assert_eq!(
+            load(&data, None, "pdf", Some(".env.example"), 0).unwrap(),
+            "TOKEN="
+        );
     }
 
     #[cfg(unix)]
