@@ -31,6 +31,7 @@ pub mod skills;
 mod state;
 pub mod store;
 pub mod structured;
+pub mod timers;
 pub mod tools;
 pub mod update;
 pub mod watch;
