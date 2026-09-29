@@ -202,15 +202,20 @@ impl Chat {
                 _ => {}
             }
         }
-        let inserted = if into && choice.kind == Kind::Folder {
+        // A folder Tab opens is only passed through: its name stays inside
+        // whatever is picked in it, so it would stay listed as taken.
+        let opened = into && choice.kind == Kind::Folder;
+        let inserted = if opened {
             choice.text.trim_end().to_owned()
         } else {
             choice.text.clone()
         };
-        if matches!(
-            choice.kind,
-            Kind::File | Kind::Folder | Kind::Session | Kind::Diff
-        ) {
+        if !opened
+            && matches!(
+                choice.kind,
+                Kind::File | Kind::Folder | Kind::Session | Kind::Diff
+            )
+        {
             let named = choice.text.trim_end().to_owned();
             if !self.completer.accepted.contains(&named) {
                 self.completer.accepted.push(named);
