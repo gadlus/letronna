@@ -104,7 +104,15 @@ const UTF16_BYTES: u64 = 16 * 1024 * 1024;
 /// replies, so the first message can carry a port or an early crash.
 const SETTLE: std::time::Duration = std::time::Duration::from_millis(1200);
 
-const MAX_OUTPUT: usize = 24_000;
+/// A tool's reply is cut to this many bytes, so no more characters: the cap
+/// the chat puts on a tool result in a request, which then carries the cut
+/// whole instead of trimming its middle again, marker line and all. A quarter
+/// goes to the start and the rest to the end, because a build, a test run or
+/// an install ends with its errors, its summary and the exit code.
+const MAX_OUTPUT: usize = crate::chat::MAX_TOOL_CHARS;
+/// Bytes kept free for the line that says what was left out, which with the
+/// largest counts a `usize` can hold is still shorter than this.
+const MARKER_ROOM: usize = 100;
 const SKIP_DIRS: &[&str] = &[".git", "node_modules", "target", ".next", "dist", "build"];
 
 /// Tools contributed by enabled plugins. Kept here rather than read from the
@@ -232,13 +240,53 @@ pub fn run(name: &str, args: &str, ctx: &ToolContext) -> Result<String, String> 
         ));
     }
     let args = parse_args(args)?;
-    let mut out = tool.run(&args, ctx)?;
-    if out.len() > MAX_OUTPUT {
-        let cut = out.floor_char_boundary(MAX_OUTPUT);
-        out.truncate(cut);
-        out.push_str("\n… [truncated]");
+    let out = tool.run(&args, ctx)?;
+    Ok(keep_ends(out, MAX_OUTPUT))
+}
+
+/// `text` as it is when it fits in `max` bytes; otherwise its first and last
+/// whole lines, with a line between them saying how much was left out.
+fn keep_ends(text: String, max: usize) -> String {
+    if text.len() <= max {
+        return text;
     }
-    Ok(out)
+    let room = max.saturating_sub(MARKER_ROOM);
+    let head = line_end(&text, room / 4);
+    let tail = line_start(&text, text.len() - (room - room / 4));
+    let left = &text[head..tail];
+    let lines = left.lines().count();
+    let unit = if lines == 1 { "line" } else { "lines" };
+    let gap = if head == 0 || text[..head].ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    format!(
+        "{}{gap}… [{lines} {unit} ({} bytes) left out]\n{}",
+        &text[..head],
+        left.len(),
+        &text[tail..]
+    )
+}
+
+/// Where the last line that ends by `at` ends, or `at` itself on a line
+/// longer than that, so one huge line is cut rather than dropped.
+fn line_end(text: &str, at: usize) -> usize {
+    let at = text.floor_char_boundary(at);
+    text[..at].rfind('\n').map_or(at, |i| i + 1)
+}
+
+/// Where the first line that starts at or after `at` starts, or `at` itself
+/// when no other line follows, so one huge line is cut rather than dropped.
+fn line_start(text: &str, at: usize) -> usize {
+    let at = text.ceil_char_boundary(at);
+    if at == 0 || text.as_bytes()[at - 1] == b'\n' {
+        return at;
+    }
+    match text[at..].find('\n') {
+        Some(i) if at + i + 1 < text.len() => at + i + 1,
+        _ => at,
+    }
 }
 
 /// The first `max` lines, with a note about the rest. Keeps cards and rows
@@ -1696,5 +1744,84 @@ mod tests {
         };
         let refused = run("read_file", r#"{"path": "x"}"#, &shared).unwrap_err();
         assert!(refused.contains("not available here"), "{refused}");
+    }
+
+    #[test]
+    fn long_output_keeps_more_of_its_end_and_says_what_was_left_out() {
+        let lines: Vec<String> = (1..=5000).map(|n| format!("line {n}")).collect();
+        let text = lines.join("\n") + "\n[exit code 3]";
+        let out = keep_ends(text.clone(), MAX_OUTPUT);
+        assert!(out.len() <= MAX_OUTPUT, "{}", out.len());
+        assert!(out.starts_with("line 1\nline 2\n"), "{out}");
+        assert!(out.ends_with("line 5000\n[exit code 3]"), "{out}");
+        let (head, rest) = out.split_once("… [").unwrap();
+        let (marker, tail) = rest.split_once("]\n").unwrap();
+        assert!(tail.len() > 2 * head.len(), "{} {}", head.len(), tail.len());
+        // The counts add up to exactly what is missing.
+        let left = text.len() - head.len() - tail.len();
+        let missing = text.lines().count() - head.lines().count() - tail.lines().count();
+        assert_eq!(marker, format!("{missing} lines ({left} bytes) left out"));
+    }
+
+    #[test]
+    fn a_long_output_is_cut_between_whole_lines() {
+        let lines: Vec<String> = (1..=3000)
+            .map(|n| format!("row {n} {}", "=".repeat(n % 40)))
+            .collect();
+        let text = lines.join("\n");
+        let out = keep_ends(text, 2_000);
+        let kept: Vec<&str> = out.lines().filter(|l| !l.starts_with("… [")).collect();
+        assert!(kept.len() > 10, "{out}");
+        for line in kept {
+            assert!(lines.iter().any(|l| l == line), "cut line {line:?}");
+        }
+    }
+
+    #[test]
+    fn short_output_comes_back_as_it_was() {
+        assert_eq!(keep_ends("a\nb\n".into(), 100), "a\nb\n");
+        let full = "x".repeat(100);
+        assert_eq!(keep_ends(full.clone(), 100), full);
+    }
+
+    #[test]
+    fn one_huge_line_is_cut_inside_rather_than_dropped() {
+        let out = keep_ends("x".repeat(1_000_000), MAX_OUTPUT);
+        assert!(out.len() <= MAX_OUTPUT, "{}", out.len());
+        let (head, rest) = out.split_once("\n… [1 line (").unwrap();
+        let (_, tail) = rest.split_once("]\n").unwrap();
+        assert!(head.len() > 1_000 && tail.len() > 3 * 1_000, "{out}");
+    }
+
+    #[test]
+    fn a_cut_never_splits_a_character() {
+        // Lossily decoded bytes and wide characters, cut at every offset.
+        let bad = String::from_utf8_lossy(&[b'a', 0xff, 0xfe, b'\n']).into_owned();
+        let text = format!("{}{}", bad.repeat(50), "é日🙂".repeat(200));
+        for max in 150..400 {
+            let out = keep_ends(text.clone(), max);
+            assert!(out.len() <= max && out.contains(" left out]\n"), "{max}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_command_with_a_long_output_keeps_its_exit_code() {
+        let ctx = ToolContext {
+            workspace: Some(std::env::temp_dir()),
+            ..Default::default()
+        };
+        let out = run(
+            "run_command",
+            r#"{"command":"seq 1 20000; echo failed >&2; exit 3"}"#,
+            &ctx,
+        )
+        .unwrap();
+        assert!(out.len() <= MAX_OUTPUT, "{}", out.len());
+        assert!(out.starts_with("1\n2\n"), "{out}");
+        assert!(
+            out.ends_with("20000\n\n[stderr]\nfailed\n\n[exit code 3]"),
+            "{out}"
+        );
     }
 }
