@@ -54,6 +54,8 @@ const PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_millis(250
 const PREVIEW_LINES: usize = 12;
 
 fn main() {
+    // The first mark, from which the others are timed.
+    letronna_core::diag::mark("start");
     rescue_terminal();
     let args = match parse(std::env::args().skip(1)) {
         Ok(args) => args,
@@ -112,6 +114,7 @@ fn main() {
     // MCP servers can take seconds to start; started now, their tools are
     // there by the first question.
     letronna_core::mcp::start();
+    letronna_core::diag::mark("mcp");
 
     let mut runner = Runner {
         store: store::load_listing(),
@@ -126,6 +129,7 @@ fn main() {
         stopped: false,
         images: Vec::new(),
     };
+    letronna_core::diag::mark("listed");
     letronna_core::browser::share_browser(runner.store.settings.browser_shared);
     std::thread::spawn(letronna_core::browser::close_left_over);
     // With nothing set up there is nothing to talk to, so the first run is
@@ -167,6 +171,7 @@ fn main() {
         _ => runner.open(false, workspace.clone()),
     };
     choose_by_flags(&mut runner, session, gateway, &args);
+    letronna_core::diag::mark("session");
 
     // One question, one answer, no banner: this form gets piped.
     if let Some(prompt) = &args.prompt {
@@ -193,6 +198,7 @@ fn main() {
     let note = footer(&runner);
     runner.bar.set_footer(note);
     runner.bar.install();
+    letronna_core::diag::mark("screen");
     // Before anything can start a turn. Without the box, a terminal on both
     // ends is still someone to ask.
     runner.serve_helpers(std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
@@ -215,6 +221,8 @@ fn main() {
     } else if runner.store.conversations[session].length() > 0 {
         replay(&runner, session);
     }
+
+    letronna_core::diag::mark("ready");
 
     // Only a conversation that goes on hears about work that ends after its
     // turn; `-p` has left by now, with its answer.

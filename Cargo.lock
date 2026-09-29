@@ -3671,6 +3671,7 @@ dependencies = [
  "async-channel 2.5.0",
  "crossterm",
  "letronna-core",
+ "libc",
  "serde_json",
 ]
 

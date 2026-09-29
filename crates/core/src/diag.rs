@@ -12,7 +12,9 @@
 //! `crashes/<frontend>-<time>.txt` with its message and a backtrace. That
 //! message is kept as it is, masked, since it is the clue, even though it
 //! can quote the text the panic choked on; so every file here is readable
-//! by its owner only.
+//! by its owner only. Startup marks are the exception to the log: asked for
+//! with `LETRONNA_PROFILE_STARTUP`, they go to stderr, where whoever asked
+//! is looking, and cost one look at the environment otherwise.
 
 use serde_json::Value;
 use std::io::Write;
@@ -45,6 +47,10 @@ const FLUSH_WAIT: Duration = Duration::from_secs(1);
 const REACH_WAIT: Duration = Duration::from_secs(5);
 /// What a masked secret is replaced with.
 const HIDDEN: &str = "***";
+/// Set to have `mark` time the phases of a start, for finding what makes
+/// one slow. A terminal's stderr is the screen it draws on, so send the
+/// marks elsewhere: `LETRONNA_PROFILE_STARTUP=1 letronna 2>startup.txt`.
+pub const PROFILE_STARTUP: &str = "LETRONNA_PROFILE_STARTUP";
 
 /// The log of this process, once `init` has run.
 struct Log {
@@ -194,6 +200,21 @@ pub fn logs(dir: &Path) -> PathBuf {
 /// The newest crash file in `dir`, the data folder.
 pub fn last_crash(dir: &Path) -> Option<PathBuf> {
     crashes(&dir.join("crashes")).into_iter().next()
+}
+
+/// Prints to stderr how long after the first mark `phase` was reached, when
+/// `LETRONNA_PROFILE_STARTUP` is set to anything but 0.
+pub fn mark(phase: &str) {
+    // Read once: the first mark, first thing in main, decides for the rest,
+    // and a start that is not being profiled pays for one look.
+    static FIRST: OnceLock<Option<Instant>> = OnceLock::new();
+    let asked = || std::env::var_os(PROFILE_STARTUP).is_some_and(|on| !on.is_empty() && on != "0");
+    let Some(first) = FIRST.get_or_init(|| asked().then(Instant::now)) else {
+        return;
+    };
+    let ms = first.elapsed().as_secs_f64() * 1000.0;
+    // Not eprintln, which panics when stderr is gone.
+    let _ = writeln!(std::io::stderr(), "startup {phase} {ms:.1} ms");
 }
 
 /// Queue `entry` unless the queue is full, counting it in `dropped` then.

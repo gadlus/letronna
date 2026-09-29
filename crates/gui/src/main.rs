@@ -10,6 +10,8 @@ mod ui;
 use prelude::*;
 
 fn main() {
+    // The first mark, from which the others are timed.
+    letronna_core::diag::mark("start");
     // Asked by the updater and the release build before a new binary is
     // trusted. First, because a release build that went on would install
     // itself over the Letronna already there.
@@ -33,6 +35,7 @@ fn main() {
     }
     letronna_core::diag::init("gui");
     Application::new().with_assets(Assets).run(|cx| {
+        letronna_core::diag::mark("app");
         gpui_component::init(cx);
         plugins::init(
             cx,
@@ -116,6 +119,9 @@ fn main() {
                 },
             )
             .expect("Could not open native application window");
+        // Opened with the chat built; its first frame comes on the next
+        // refresh of the display.
+        letronna_core::diag::mark("window");
         // With a tray to bring it back, closing the window tucks the app
         // away; without one that would strand it, so let it close.
         if platform::tray::available() {
