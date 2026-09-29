@@ -25,7 +25,7 @@ pub fn unsafe_raw(raw: &str, workspace: Option<&Path>) -> Option<&'static str> {
 }
 
 /// What `unsafe_raw` refuses on Windows, where `/` separates as `\` does.
-fn on_windows(raw: &str, workspace: Option<&str>) -> Option<&'static str> {
+pub(crate) fn on_windows(raw: &str, workspace: Option<&str>) -> Option<&'static str> {
     let path = raw.replace('/', "\\");
     if [r"\\.\", r"\\?\", r"\??\"]
         .iter()

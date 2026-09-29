@@ -20,6 +20,7 @@ pub mod command;
 pub mod compact;
 pub mod diag;
 pub mod driver;
+mod downloads;
 mod edit;
 pub mod failure;
 mod filestate;

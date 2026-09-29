@@ -112,6 +112,18 @@ pub(crate) fn granted(run: u64, name: &str) -> bool {
     lock(&ASKS).granted.contains(&(run, name.to_owned()))
 }
 
+/// What a yes for the whole run on `call`'s card covers: every call of its
+/// tool, but for an upload only other uploads, as a yes to using pages is
+/// not one to send this computer's files to them.
+fn grant_name(call: &ToolCall) -> String {
+    let upload = tools::parse_args(&call.arguments)
+        .is_ok_and(|args| crate::gate::uploads(&call.name, &args));
+    match upload {
+        true => format!("{} upload", call.name),
+        false => call.name.clone(),
+    }
+}
+
 /// Whether `call` may run, waiting for the frontend's answer unless the
 /// agent is stopped first; a no carries the user's reason, empty without one.
 pub(crate) fn ask(
@@ -130,7 +142,7 @@ pub(crate) fn ask(
         drop(lock(&ASKS));
         SETTLED.notify_all();
     });
-    let key = (run, call.name.clone());
+    let key = (run, grant_name(call));
     let mut asks = lock(&ASKS);
     loop {
         if ctx.cancel.is_set() {
@@ -337,6 +349,18 @@ pub(crate) mod tests {
         assert_eq!(in_line.recv_timeout(WAIT), Ok(false));
         request.answer(Decision::Once);
         assert_eq!(first.recv_timeout(WAIT), Ok(true));
+    }
+
+    #[test]
+    fn a_yes_for_the_run_to_using_pages_does_not_cover_uploads() {
+        let page = |action: &str| ToolCall {
+            id: "p".into(),
+            name: "use_page".into(),
+            arguments: format!(r#"{{"action": "{action}", "ref": "e1"}}"#),
+        };
+        assert_eq!(grant_name(&page("click")), "use_page");
+        assert_eq!(grant_name(&page("upload")), "use_page upload");
+        assert_eq!(grant_name(&call("a", "write_file")), "write_file");
     }
 
     #[test]

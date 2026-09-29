@@ -654,7 +654,7 @@ fn audio_extension(content_type: &str) -> &'static str {
     }
 }
 
-fn size(bytes: usize) -> String {
+pub(crate) fn size(bytes: usize) -> String {
     if bytes >= 1024 * 1024 {
         format!("{:.1} MB", bytes as f64 / (1024. * 1024.))
     } else {

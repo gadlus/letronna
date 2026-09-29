@@ -380,12 +380,14 @@ fn ladder(call: &ToolCall, gate: &Gate, judge: Option<&dyn Fn(&str) -> Verdict>)
     if gate.mode == Mode::Bypass {
         return Outcome::Run;
     }
-    // Layer 4: what the user allowed in this session or by rule.
+    // Layer 4: what the user allowed in this session or by rule. A yes to
+    // using pages is not one to send this computer's files to them, so each
+    // upload is asked about, or judged, on its own.
     let granted = gate
         .grants
         .get(&gate.ctx.conversation)
         .is_some_and(|tools| tools.contains(tool.name()));
-    if !opaque && (granted || ruling.allow) {
+    if !opaque && !uploads(tool.name(), &args) && (granted || ruling.allow) {
         return Outcome::Run;
     }
     // Layer 5: a command that only reads, inside the workspace, needs no
@@ -417,6 +419,19 @@ fn ladder(call: &ToolCall, gate: &Gate, judge: Option<&dyn Fn(&str) -> Verdict>)
          Carry on without it and say what was left undone.",
         tool.name()
     ))
+}
+
+/// Whether a call to the tool named `name` with `args` sends files from this
+/// computer to a web page.
+pub(crate) fn uploads(name: &str, args: &Value) -> bool {
+    name == "use_page" && args["action"] == "upload"
+}
+
+/// Whether a yes on the card for a call to `name` with `args` may be kept
+/// for the rest of the session: an upload is asked about each time, so its
+/// card offers no such choice.
+pub fn grants_for_session(name: &str, args: &Value) -> bool {
+    !uploads(name, args)
 }
 
 /// Whether the tool named `name` spends the user's credit, which is theirs
@@ -2024,6 +2039,40 @@ mod tests {
         std::fs::write(dir.join("project/notes.txt"), "a").unwrap();
         std::fs::write(dir.join("outside.txt"), "a").unwrap();
         dir
+    }
+
+    #[test]
+    fn a_yes_to_using_pages_does_not_cover_sending_files_to_them() {
+        let ctx = ToolContext::default();
+        let granted = Grants::from([(0, HashSet::from(["use_page".to_owned()]))]);
+        let gate = |mode: Mode| Gate {
+            ctx: &ctx,
+            mode,
+            grants: &granted,
+            rules: &[],
+            broken: None,
+            human: true,
+        };
+        let click = call(
+            "use_page",
+            serde_json::json!({ "action": "click", "ref": "e1" }),
+        );
+        let upload = call(
+            "use_page",
+            serde_json::json!({ "action": "upload", "ref": "e1", "files": ["cv.pdf"] }),
+        );
+        assert_eq!(decide(&click, &gate(Mode::Default)), Outcome::Run);
+        assert_eq!(decide(&upload, &gate(Mode::Default)), Outcome::Ask);
+        // Bypass runs it, as it runs everything the floor lets through; plan
+        // mode and Don't ask refuse it.
+        assert_eq!(decide(&upload, &gate(Mode::Bypass)), Outcome::Run);
+        for mode in [Mode::Plan, Mode::DontAsk] {
+            assert!(matches!(decide(&upload, &gate(mode)), Outcome::Refuse(_)));
+        }
+        // So an upload's card offers no yes for the session.
+        let args = |call: &ToolCall| serde_json::from_str::<Value>(&call.arguments).unwrap();
+        assert!(grants_for_session("use_page", &args(&click)));
+        assert!(!grants_for_session("use_page", &args(&upload)));
     }
 
     #[test]
