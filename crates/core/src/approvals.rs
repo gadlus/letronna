@@ -108,8 +108,6 @@ pub fn serve() -> Receiver<Request> {
 }
 
 /// Whether `call` may run, waiting for the frontend's answer unless the agent is stopped first.
-// The driver, its first caller, comes in a later change.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn ask(root: u64, run: u64, label: &str, call: &ToolCall, ctx: &ToolContext) -> bool {
     let (reply, answer) = mpsc::channel();
     let stop = reply.clone();
