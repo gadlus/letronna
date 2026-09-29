@@ -21,7 +21,10 @@
 //! helpers' model when one is set: a small model answers this as well as a
 //! large one, and the price of each look stays flat as the session grows.
 //! A user who stops or types meanwhile ends it where it is, and nothing it
-//! found is acted on.
+//! found is acted on. While the session's jobs, helpers, workflows or
+//! wake-ups run there is no look at all: the agent can only poll them, and
+//! each poll would spend a continuation. Their end wakes the session, and
+//! the turn that follows is looked at instead.
 
 use crate::approvals;
 use crate::cancel::Cancel;
@@ -106,6 +109,9 @@ pub enum Step {
     Done(String),
     /// Show `notice` and pause the goal for `why` until the user resumes it.
     Pause { notice: String, why: String },
+    /// Background work is still running: show the notice and wait for its
+    /// end, whose notice wakes the session, with nothing counted.
+    Deferred(String),
     /// The user stopped or typed meanwhile, so nothing follows and nothing is said.
     Cleared,
 }
@@ -256,7 +262,7 @@ pub fn settle(goal: &mut Option<Goal>, step: &Step) {
                 goal.paused = Some(why.clone());
             }
         }
-        Step::Cleared => {}
+        Step::Deferred(_) | Step::Cleared => {}
     }
 }
 
@@ -264,6 +270,11 @@ pub fn settle(goal: &mut Option<Goal>, step: &Step) {
 /// on a command and the network, so it never runs on a UI thread; `cancel`
 /// is set when the user stops or types.
 pub fn review(goal: &Goal, connection: &Connection, reply: &str, cancel: &Cancel) -> Step {
+    if working(connection.conversation) {
+        return Step::Deferred(
+            "Goal: waiting for background work; it is checked once that work reports back.".into(),
+        );
+    }
     review_with(
         goal,
         reply,
@@ -271,6 +282,13 @@ pub fn review(goal: &Goal, connection: &Connection, reply: &str, cancel: &Cancel
         |command| check(connection, command, cancel),
         |prompt| crate::agents::quick(connection, prompt, cancel.clone()),
     )
+}
+
+/// Whether any of session `session`'s jobs, helpers, workflows or wake-ups
+/// is still running; a helper kept idle is not.
+fn working(session: u64) -> bool {
+    let tasks = crate::tasks::list(session);
+    (tasks.iter()).any(|task| task.state == crate::tasks::State::Running)
 }
 
 /// `review`, with the check and the model call handed in.
@@ -767,5 +785,33 @@ mod tests {
         kept.as_mut().unwrap().paused = Some("blocked".into());
         apply_command(&mut kept, parse("ship it")).unwrap();
         assert!(active(&kept).is_some());
+    }
+
+    #[test]
+    fn no_look_runs_while_the_sessions_background_work_does() {
+        use crate::tasks::{self, Key, State, Task};
+        let session = 9_310_001;
+        let job = Key::Job(9_310_002);
+        tasks::register(Task::new(job, session, None, "cargo test"));
+        let connection = Connection {
+            conversation: session,
+            ..Default::default()
+        };
+        // Neither the check nor the judge could run on this connection.
+        let step = review(
+            &goal(Some("cargo test")),
+            &connection,
+            "started",
+            &Cancel::default(),
+        );
+        tasks::finish(&job, State::Stopped, None);
+        assert!(
+            matches!(&step, Step::Deferred(n) if n.contains("background work")),
+            "{step:?}"
+        );
+        let mut kept = Some(goal(None));
+        settle(&mut kept, &step);
+        assert_eq!(kept, Some(goal(None)));
+        assert!(!working(session));
     }
 }

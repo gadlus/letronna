@@ -2604,7 +2604,9 @@ impl Chat {
                 self.note = Some(notice);
                 self.start_in(id, goal::continuation(message), cx);
             }
-            goal::Step::Done(notice) | goal::Step::Pause { notice, .. } => {
+            goal::Step::Done(notice)
+            | goal::Step::Pause { notice, .. }
+            | goal::Step::Deferred(notice) => {
                 self.note = Some(notice);
                 self.wake_idle(cx);
             }
