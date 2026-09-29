@@ -1062,4 +1062,500 @@ mod tests {
         assert_eq!(report.text, "Done after the rest.");
         assert_eq!(limits::gate(&endpoint).throttled(), 1);
     }
+
+    /// Agents the bench runs at once, as the performance budget has them.
+    const BENCH_AGENTS: usize = 64;
+    /// Tool rounds each bench agent works through before it answers.
+    const BENCH_ROUNDS: usize = 5;
+    /// How long the bench's provider takes over each token it streams, as the
+    /// budget has it.
+    const TOKEN: Duration = Duration::from_millis(50);
+    /// Streams the background gets on a local server: it takes two, and one
+    /// is kept for the foreground.
+    const LOCAL_STREAMS: usize = 1;
+    /// How long the bench watches waiting agents for wake-ups, as the budget
+    /// says to.
+    const QUIET: Duration = Duration::from_secs(5);
+    /// Threads the budget allows beyond agents, streams and tools, for
+    /// reqwest's runtime, the timer thread and the like.
+    const SPARE_THREADS: usize = 4;
+
+    /// What the bench's provider saw.
+    #[derive(Default)]
+    struct Seen {
+        /// Requests so far.
+        taken: AtomicUsize,
+        /// Streams open now.
+        open: AtomicUsize,
+        /// The most streams ever open at once.
+        most: AtomicUsize,
+        /// Nanoseconds spent answering, from each request read to its last line.
+        served: AtomicU64,
+    }
+
+    /// A provider that takes each request on a thread of its own, as a real
+    /// one takes streams side by side, so only the gate keeps them apart.
+    /// `plan` gets the request's number and body and gives the reply; or it
+    /// keeps the caller waiting, as a model still thinking does, and gives
+    /// None to hang up.
+    fn paced(
+        plan: impl Fn(usize, &Value) -> Option<String> + Send + Sync + 'static,
+    ) -> (String, Arc<Seen>) {
+        let (server, endpoint) = listen();
+        let seen = Arc::new(Seen::default());
+        let (plan, counts) = (Arc::new(plan), seen.clone());
+        std::thread::spawn(move || {
+            for socket in server.incoming() {
+                let Ok(mut socket) = socket else {
+                    continue;
+                };
+                let n = counts.taken.fetch_add(1, Ordering::SeqCst);
+                // Open from here, where its caller already holds a permit.
+                let open = counts.open.fetch_add(1, Ordering::SeqCst) + 1;
+                counts.most.fetch_max(open, Ordering::SeqCst);
+                let (plan, counts) = (plan.clone(), counts.clone());
+                std::thread::spawn(move || {
+                    // Each event goes when written, not when the last is acknowledged.
+                    let _ = socket.set_nodelay(true);
+                    let body = request(&mut socket);
+                    let began = Instant::now();
+                    trickle(&mut socket, plan(n, &body).as_deref(), &counts.open);
+                    let served = began.elapsed().as_nanos() as u64;
+                    counts.served.fetch_add(served, Ordering::SeqCst);
+                });
+            }
+        });
+        (endpoint, seen)
+    }
+
+    /// Sends `reply` with `TOKEN` before each event that carries a token, and
+    /// counts the stream as closed before its usage and [DONE] lines, after
+    /// which its caller can give its permit back.
+    fn trickle(socket: &mut TcpStream, reply: Option<&str>, open: &AtomicUsize) {
+        let Some(reply) = reply else {
+            open.fetch_sub(1, Ordering::SeqCst);
+            return;
+        };
+        let _ = write!(
+            socket,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            reply.len()
+        );
+        let events: Vec<&str> = reply.split_inclusive("\n\n").collect();
+        // Every reply ends with its usage and [DONE], which carry no token.
+        let (tokens, end) = events.split_at(events.len().saturating_sub(2));
+        for event in tokens {
+            std::thread::sleep(TOKEN);
+            let _ = socket.write_all(event.as_bytes());
+        }
+        open.fetch_sub(1, Ordering::SeqCst);
+        let _ = socket.write_all(end.concat().as_bytes());
+    }
+
+    /// The bench's agents against `endpoint`, each with a transcript of its own in `dir`.
+    fn many(endpoint: &str, dir: &Path, first: AgentId) -> Vec<Spec> {
+        (0..BENCH_AGENTS as u64)
+            .map(|n| {
+                let mut spec = spec(endpoint.to_owned(), dir, first + n);
+                spec.transcript.path = dir.join(format!("{n}.jsonl"));
+                // Written once already, as `Transcript::create` leaves a helper's.
+                save(&mut spec.transcript).unwrap();
+                spec
+            })
+            .collect()
+    }
+
+    /// Runs each agent on a thread of its own, as `spawn` does, and says when
+    /// each ended, with its place in `specs` and its report.
+    fn start_all(specs: Vec<Spec>) -> mpsc::Receiver<(usize, Report, Instant)> {
+        let (done, ended) = mpsc::channel();
+        for (n, spec) in specs.into_iter().enumerate() {
+            let done = done.clone();
+            std::thread::spawn(move || {
+                let report = run(spec);
+                let _ = done.send((n, report, Instant::now()));
+            });
+        }
+        ended
+    }
+
+    /// What one look at the process found: its threads, their context
+    /// switches and its seconds of processor time.
+    type Look = (usize, u64, f64);
+
+    /// What the whole process uses at one moment.
+    #[derive(Clone, Copy)]
+    struct Usage {
+        threads: usize,
+        /// Context switches its threads have made: one at least for every wake-up.
+        switches: u64,
+        /// Processor time, in seconds.
+        cpu: f64,
+    }
+
+    impl Usage {
+        /// What `look` found, or None where the bench cannot look without a
+        /// new dependency; where it can, a look that failed fails the bench.
+        fn looked(look: Option<Look>) -> Option<Self> {
+            assert!(
+                look.is_some() || cfg!(not(any(target_os = "linux", target_os = "macos"))),
+                "could not read the process's threads, switches and processor time"
+            );
+            let (threads, switches, cpu) = look?;
+            Some(Self {
+                threads,
+                switches,
+                cpu,
+            })
+        }
+    }
+
+    /// What the process uses now.
+    fn usage() -> Option<Usage> {
+        Usage::looked(measured())
+    }
+
+    /// What the process uses at the start and at the end of `spell`, which
+    /// this thread sleeps through.
+    fn across(spell: Duration) -> Option<(Usage, Usage)> {
+        let (first, last) = measured_across(spell);
+        Some((Usage::looked(first)?, Usage::looked(last)?))
+    }
+
+    /// Reads /proc, where each thread keeps its own switches, leaving out the
+    /// looking thread's, which are the bench's and not the agents'.
+    #[cfg(target_os = "linux")]
+    fn measured() -> Option<Look> {
+        let looking = std::fs::read_link("/proc/thread-self").ok()?;
+        let tasks: Vec<PathBuf> = std::fs::read_dir("/proc/self/task")
+            .ok()?
+            .filter_map(|task| Some(task.ok()?.path()))
+            .collect();
+        // Only live threads count theirs, which is enough for a quiet spell,
+        // since none ends during one.
+        let switches = tasks
+            .iter()
+            .filter(|task| task.file_name() != looking.file_name())
+            .filter_map(|task| std::fs::read_to_string(task.join("status")).ok())
+            .map(|status| {
+                status
+                    .lines()
+                    .filter(|line| line.contains("ctxt_switches"))
+                    .filter_map(|line| line.split_whitespace().next_back()?.parse::<u64>().ok())
+                    .sum::<u64>()
+            })
+            .sum();
+        // utime and stime, in the hundredths of a second Linux counts in.
+        let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+        let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+        let ticks = fields.get(11)?.parse::<u64>().ok()? + fields.get(12)?.parse::<u64>().ok()?;
+        Some((tasks.len(), switches, ticks as f64 / 100.0))
+    }
+
+    /// Looks before and after sleeping through `spell`.
+    #[cfg(not(target_os = "macos"))]
+    fn measured_across(spell: Duration) -> (Option<Look>, Option<Look>) {
+        let first = measured();
+        std::thread::sleep(spell);
+        (first, measured())
+    }
+
+    /// Asks top, which reports a Mac process's threads, switches and time
+    /// together without a library.
+    #[cfg(target_os = "macos")]
+    fn measured() -> Option<Look> {
+        top(1, Duration::ZERO)?.pop()
+    }
+
+    /// Has top take both looks, so this thread sleeps through `spell` rather
+    /// than waking to look: a look of its own makes more switches than the
+    /// agents may in the whole spell.
+    #[cfg(target_os = "macos")]
+    fn measured_across(spell: Duration) -> (Option<Look>, Option<Look>) {
+        let looks = top(2, spell).unwrap_or_default();
+        (looks.first().copied(), looks.get(1).copied())
+    }
+
+    /// Runs top for `looks` looks, `apart` apart, and reads each one's row.
+    #[cfg(target_os = "macos")]
+    fn top(looks: usize, apart: Duration) -> Option<Vec<Look>> {
+        let (looks, apart) = (looks.to_string(), apart.as_secs().to_string());
+        let pid = std::process::id().to_string();
+        let out = std::process::Command::new("top")
+            .args(["-l", &looks, "-s", &apart, "-pid", &pid])
+            .args(["-stats", "th,csw,time"])
+            .output()
+            .ok()?;
+        let text = String::from_utf8(out.stdout).ok()?;
+        let lines: Vec<&str> = text.lines().collect();
+        // Each look's row comes under its own heading.
+        lines
+            .windows(2)
+            .filter(|pair| pair[0].starts_with("#TH"))
+            .map(|pair| {
+                // A later look marks with + or - what changed since the last.
+                let mut row = pair[1]
+                    .split_whitespace()
+                    .map(|field| field.trim_end_matches(['+', '-']));
+                // "97", or "97/2" while two of them run.
+                let threads = row.next()?.split('/').next()?.parse().ok()?;
+                let switches = row.next()?.parse().ok()?;
+                // "mm:ss.hh", or "hh:mm:ss" past an hour.
+                let cpu = row.next()?.split(':').try_fold(0.0, |total, part| {
+                    Some(total * 60.0 + part.parse::<f64>().ok()?)
+                })?;
+                Some((threads, switches, cpu))
+            })
+            .collect()
+    }
+
+    /// Nothing to read here without a new dependency, so the bench skips what
+    /// needs it.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn measured() -> Option<Look> {
+        None
+    }
+
+    /// What the process uses once `threads` or fewer are left, giving threads
+    /// on their way out a second to go.
+    fn settled(threads: usize) -> Option<Usage> {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let now = usage()?;
+            if now.threads <= threads || Instant::now() > deadline {
+                return Some(now);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The middle and the longest of `times`.
+    fn spread(mut times: Vec<Duration>) -> (Duration, Duration) {
+        times.sort();
+        let middle = times.get(times.len() / 2).copied().unwrap_or_default();
+        (middle, times.last().copied().unwrap_or_default())
+    }
+
+    /// Every agent reads a file five times and answers, one token a reply,
+    /// all in line for one local provider.
+    fn busy_agents_share_one_provider() {
+        let dir = scratch("bench");
+        let (endpoint, seen) = paced(|_, body| {
+            let replied = messages(body)
+                .iter()
+                .filter(|message| message["role"] == "assistant")
+                .count();
+            Some(if replied < BENCH_ROUNDS {
+                reply("", &[read_notes()])
+            } else {
+                reply("The notes say hello.", &[])
+            })
+        });
+        let calls = BENCH_AGENTS * (BENCH_ROUNDS + 1);
+        // What the tokens alone take: one a call, each stream one call at a time.
+        let tokens = TOKEN * (calls / LOCAL_STREAMS) as u32;
+        let before = usage();
+        let started = Instant::now();
+        let ended = start_all(many(&endpoint, &dir, AGENTS + 1_000));
+        let (mut finished, mut last, mut peak) = (0, started, 0);
+        while finished < BENCH_AGENTS {
+            match ended.recv_timeout(Duration::from_millis(100)) {
+                Ok((_, report, at)) => {
+                    assert_eq!(
+                        (report.status, report.rounds, report.text.as_str()),
+                        (Outcome::Done, BENCH_ROUNDS, "The notes say hello.")
+                    );
+                    (finished, last) = (finished + 1, at);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // Only a hang takes ten times its tokens, even on a busy machine.
+                    let taken = started.elapsed();
+                    assert!(
+                        taken < tokens * 10,
+                        "the agents were still at it after {taken:?}"
+                    );
+                    peak = usage().map_or(peak, |now| peak.max(now.threads));
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => panic!("an agent's thread died"),
+            }
+        }
+        let wall = last - started;
+        let most = seen.most.load(Ordering::SeqCst);
+        // What the provider took, oversleeping on a busy machine included, is
+        // not the driver's; the rest of the wall time is.
+        let served = Duration::from_nanos(seen.served.load(Ordering::SeqCst));
+        let overhead = wall.saturating_sub(served / LOCAL_STREAMS as u32) / calls as u32;
+        println!(
+            "{BENCH_AGENTS} agents x {BENCH_ROUNDS} tool rounds, a token every {TOKEN:?}, {LOCAL_STREAMS} background stream:"
+        );
+        println!(
+            "  {calls} calls in {wall:.1?}, the provider's {served:.1?} of it ({tokens:.1?} asked for): {overhead:.2?} added a call; at most {most} stream open"
+        );
+        assert_eq!(
+            seen.taken.load(Ordering::SeqCst),
+            calls,
+            "a round was asked twice"
+        );
+        assert!(most <= LOCAL_STREAMS, "{most} streams open at once");
+        // Under a tenth of a token a call, so the wall time is rounds times
+        // latency times agents over streams, as the budget has it.
+        assert!(
+            overhead < TOKEN / 10,
+            "the driver added {overhead:?} to each call"
+        );
+        let Some(before) = before else {
+            println!("  threads and processor time: not measured on this system");
+            return;
+        };
+        // reqwest's runtime, which the first call starts, stays; a thread of
+        // an agent that has ended does not.
+        let after = settled(before.threads + 1).expect("the process was looked at before");
+        let added = peak.saturating_sub(before.threads);
+        let left = after.threads.saturating_sub(before.threads);
+        // At most a tool thread for each agent: read_file's end too soon to count.
+        let ceiling = BENCH_AGENTS + LOCAL_STREAMS + BENCH_AGENTS + SPARE_THREADS;
+        let cpu = after.cpu - before.cpu;
+        println!(
+            "  threads: {added} the agents' at the most seen (ceiling {ceiling}), {left} left once all were done; cpu {cpu:.2} s, {:.2} ms a call, the provider's and looking's included",
+            cpu * 1000.0 / calls as f64
+        );
+        assert!(
+            added <= ceiling,
+            "the agents had {added} threads, over {ceiling}"
+        );
+        assert!(left <= 1, "{left} threads outlived the agents");
+    }
+
+    /// Half the agents sleep in a tool, one waits on a model that is still
+    /// thinking and the rest wait in line behind it: nothing streams, nothing
+    /// should wake, a stop should reach each at once, and once stopped none
+    /// should keep a thread.
+    fn waiting_agents_cost_nothing_and_stop_at_once() {
+        let dir = scratch("bench-waiting");
+        let in_tools = BENCH_AGENTS / 2;
+        let (release, released) = async_channel::bounded::<()>(1);
+        let (holding, held) = mpsc::channel();
+        let (endpoint, seen) = paced(move |n, _| {
+            if n < in_tools {
+                return Some(reply("", &[("wait", json!({"seconds": 120}))]));
+            }
+            let _ = holding.send(n);
+            let _ = released.recv_blocking();
+            None
+        });
+        let specs = many(&endpoint, &dir, AGENTS + 2_000);
+        let stops: Vec<Cancel> = specs.iter().map(|spec| spec.cancel.clone()).collect();
+        let before = usage();
+        let ended = start_all(specs);
+        held.recv_timeout(WAIT).expect("the model was never asked");
+        // Time for the last agent answered to start its tool.
+        std::thread::sleep(Duration::from_millis(200));
+        if let (Some(before), Some((quiet, after))) = (before, across(QUIET)) {
+            let added = quiet.threads.saturating_sub(before.threads);
+            // A driver for each agent, a thread for each tool and the stream;
+            // the stub's thread holding it is one of the spares.
+            let least = BENCH_AGENTS + in_tools + LOCAL_STREAMS;
+            let ceiling = least + SPARE_THREADS;
+            let woken = after.switches.saturating_sub(quiet.switches);
+            let cpu = after.cpu - quiet.cpu;
+            println!(
+                "  waiting {QUIET:?}: {added} threads the agents' ({least} to {ceiling}), {woken} context switches, cpu {cpu:.2} s"
+            );
+            // Fewer, and some agents were not where the bench put them.
+            assert!(
+                (least..=ceiling).contains(&added),
+                "the agents had {added} threads, not {least} to {ceiling}"
+            );
+            // Under one a second: one thread polling once a second makes five,
+            // and an agent polling at all many more.
+            assert!(
+                woken < QUIET.as_secs(),
+                "{woken} wake-ups while nothing happened"
+            );
+            assert!(
+                cpu < 0.1,
+                "{cpu:.2} s of processor time while nothing happened"
+            );
+        } else {
+            println!("  threads, wake-ups and processor time: not measured on this system");
+        }
+
+        let (mut in_a_tool, mut waiting) = (Vec::new(), Vec::new());
+        for (n, stop) in stops.iter().enumerate() {
+            let asked = Instant::now();
+            stop.set();
+            let (which, report, at) = ended.recv_timeout(WAIT).expect("a stop never landed");
+            assert_eq!((which, report.status), (n, Outcome::Stopped));
+            let took = at.saturating_duration_since(asked);
+            if report.rounds == 0 {
+                waiting.push(took);
+                continue;
+            }
+            // Stopped in its wait, not in line after a wait that ended early.
+            let last = written(&dir.join(format!("{n}.jsonl"))).pop().unwrap();
+            assert_eq!(
+                (last["name"].as_str(), last["is_error"].as_bool()),
+                (Some("wait"), Some(true)),
+                "agent {n} was not in its wait"
+            );
+            in_a_tool.push(took);
+        }
+        drop(release);
+        // The held stream gives its permit back once it has hung up, and after
+        // anything it sent again, so by then every request has come.
+        let gate = limits::gate(&endpoint);
+        let (freed, free) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = freed.send(gate.acquire(&Cancel::default()).is_some());
+        });
+        assert_eq!(
+            free.recv_timeout(WAIT),
+            Ok(true),
+            "the held stream kept its permit"
+        );
+        assert_eq!(
+            in_a_tool.len(),
+            in_tools,
+            "the agents were not where the bench put them"
+        );
+        assert_eq!(
+            seen.taken.load(Ordering::SeqCst),
+            in_tools + 1,
+            "an agent asked the model while it waited or after it stopped"
+        );
+        let ((model, slowest_model), (tool, slowest_tool)) = (spread(waiting), spread(in_a_tool));
+        println!(
+            "  stops, one at a time: waiting for the model {model:.2?} at the median (slowest {slowest_model:.2?}); in a tool, which saves the stopped call first, {tool:.2?} (slowest {slowest_tool:.2?})"
+        );
+        // A stop is the unblocking, and in a tool one short write besides.
+        assert!(
+            model.max(tool) < Duration::from_millis(1),
+            "stops took {model:?} and {tool:?} at the median"
+        );
+        // A stop that waited for a poll would take its interval.
+        let slowest = slowest_model.max(slowest_tool);
+        assert!(
+            slowest < Duration::from_millis(10),
+            "a stop took {slowest:?}"
+        );
+        let Some(before) = before else {
+            return;
+        };
+        let after = settled(before.threads).expect("the process was looked at before");
+        let left = after.threads.saturating_sub(before.threads);
+        println!("  {left} threads left once all were stopped");
+        assert_eq!(left, 0, "{left} threads outlived the stopped agents");
+    }
+
+    #[test]
+    #[ignore = "bench: AGENT_DATA_DIR=<an empty folder> cargo test -p letronna-core --release -- --ignored many_agents_keep_to_the_performance_budget --nocapture"]
+    fn many_agents_keep_to_the_performance_budget() {
+        // The timer thread every app has, waiting on a deadline an hour off,
+        // so its wake-ups count too.
+        crate::timers::at(Instant::now() + Duration::from_secs(3600), Box::new(|| {}));
+        // One after the other, since each measures the whole process. Forks,
+        // whose cached share the budget also promises, do not exist yet.
+        busy_agents_share_one_provider();
+        waiting_agents_cost_nothing_and_stop_at_once();
+    }
 }
