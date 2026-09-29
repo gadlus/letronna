@@ -386,6 +386,9 @@ impl Chat {
             updated: backend::now(),
             workspace: source.workspace.clone(),
             todos: todos_in(&messages),
+            model: source.model.clone(),
+            gateway: source.gateway.clone(),
+            effort: source.effort.clone(),
             messages,
             ..Default::default()
         };

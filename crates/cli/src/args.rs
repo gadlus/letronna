@@ -24,6 +24,9 @@ Options
                            plan, dont-ask or bypass
       --yes                --mode bypass: run tools without asking, bar risky ones
       --plan               --mode plan: read and search only; never write or run
+      --model <id>         this session's model, leaving the default as it is
+      --gateway <name>     the gateway that model is on
+      --effort <level>     how hard it thinks in this session, or auto
       --offline            with doctor: leave the network alone
   -h, --help               this
   -V, --version            which version this is
@@ -66,6 +69,10 @@ pub struct Args {
     /// The mode from `--mode`, `--yes` or `--plan`, or why `--mode` named
     /// none.
     pub mode: Result<Mode, String>,
+    /// The session's own model, gateway and effort, for this run and after.
+    pub model: Option<String>,
+    pub gateway: Option<String>,
+    pub effort: Option<String>,
     pub help: bool,
     pub version: bool,
     pub gui: bool,
@@ -76,7 +83,6 @@ pub struct Args {
     pub offline: bool,
     pub output: Output,
     pub max_rounds: Option<usize>,
-    pub model: Option<String>,
     pub tools: Option<Vec<String>>,
     pub budget: Option<u64>,
 }
@@ -89,6 +95,9 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
         prompt: None,
         start: Start::Fresh,
         mode: Ok(Mode::Default),
+        model: None,
+        gateway: None,
+        effort: None,
         help: false,
         version: false,
         gui: false,
@@ -99,7 +108,6 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
         offline: false,
         output: Output::Text,
         max_rounds: None,
-        model: None,
         tools: None,
         budget: None,
     };
@@ -156,6 +164,8 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
                     "--budget takes a number of tokens above 0, like --budget 200000.",
                 )?)
             }
+            "--gateway" => args.gateway = raw.next(),
+            "--effort" => args.effort = raw.next(),
             "setup" | "--install" => args.install = true,
             "--uninstall" => args.uninstall = true,
             "-h" | "--help" => args.help = true,
@@ -173,13 +183,10 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
     }
     let shaped = args.output != Output::Text
         || args.max_rounds.is_some()
-        || args.model.is_some()
         || args.tools.is_some()
         || args.budget.is_some();
     if shaped && args.prompt.is_none() {
-        return Err(
-            "--output, --max-rounds, --model, --tools and --budget only work with -p.".into(),
-        );
+        return Err("--output, --max-rounds, --tools and --budget only work with -p.".into());
     }
     Ok(args)
 }
@@ -355,7 +362,7 @@ mod tests {
         assert!(refused(&["-p", "--output", "json"]).starts_with("-p takes the question"));
         assert_eq!(
             refused(&["--budget", "1000"]),
-            "--output, --max-rounds, --model, --tools and --budget only work with -p."
+            "--output, --max-rounds, --tools and --budget only work with -p."
         );
     }
 }

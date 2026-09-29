@@ -8,14 +8,14 @@ impl Chat {
     /// The (gateway, model) pairs the picker shows for what is typed in its
     /// search box.
     pub(crate) fn model_matches(&self, cx: &App) -> Vec<(String, String)> {
-        let current = self.model.read(cx).value().to_string();
+        let (on, current) = self.store.model(self.store.active);
+        let (on, current) = (on.to_owned(), current.to_owned());
         let query = self.model_search.read(cx).value().to_lowercase();
-        let on = &self.store.settings.gateway;
         let mut ids = self.models.clone();
         // The model in use stays on the list even when its gateway did not
         // offer it, or the picker could not show what is picked.
-        if !current.is_empty() && !ids.iter().any(|(g, m)| g == on && *m == current) {
-            ids.insert(0, (on.clone(), current));
+        if !current.is_empty() && !ids.iter().any(|(g, m)| *g == on && *m == current) {
+            ids.insert(0, (on, current));
         }
         ids.retain(|(gw, id)| {
             query.is_empty()
@@ -26,7 +26,8 @@ impl Chat {
     }
 
     pub(crate) fn model_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let current = self.model.read(cx).value().to_string();
+        let (on, current) = self.store.model(self.store.active);
+        let (on, current) = (on.to_owned(), current.to_owned());
         let short = current.rsplit('/').next().unwrap_or(&current).to_string();
         let mut list = v_flex()
             .id("model-list")
@@ -34,7 +35,6 @@ impl Chat {
             .overflow_y_scroll()
             .p_1()
             .gap_0p5();
-        let on = self.store.settings.gateway.clone();
         // The chat models, unless a media tab is showing instead.
         let chat = self.model_kind == "chat";
         let matches = if chat {

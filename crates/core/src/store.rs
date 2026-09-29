@@ -38,6 +38,17 @@ pub struct Conversation {
     /// The model's own checklist for the work in progress.
     #[serde(default)]
     pub todos: Vec<Todo>,
+    /// The model this session talks to, with `gateway`; `None` until it is
+    /// chosen or the session first sends, and in every session from before
+    /// sessions had their own, which follow the settings' instead.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// The gateway `model` is on; the two are only ever set together.
+    #[serde(default)]
+    pub gateway: Option<String>,
+    /// How hard the model thinks in this session; `None` follows the settings.
+    #[serde(default)]
+    pub effort: Option<String>,
     /// Messages already on disk. Everything past this is appended on save.
     /// Only `flush` and `rewind` should touch it; it is visible because
     /// callers build a Conversation with `..Default::default()`.
@@ -66,6 +77,14 @@ pub struct Meta {
     pub pinned: bool,
     pub workspace: Option<PathBuf>,
     pub todos: Vec<Todo>,
+    // Left out while unset, so a session that never chose writes the same
+    // meta line as before it could.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -336,6 +355,60 @@ impl Store {
         self.conversations.iter().position(|c| c.id == id)
     }
 
+    /// The gateway and model the session at `index` talks to: its own, or
+    /// the settings' when it has none or its gateway is no longer offered.
+    pub fn model(&self, index: usize) -> (&str, &str) {
+        let own = self.conversations.get(index).and_then(|c| {
+            let (gateway, model) = (c.gateway.as_deref()?, c.model.as_deref()?);
+            let offered = crate::gateway::GATEWAYS.iter().any(|g| g.name == gateway);
+            (offered && !model.is_empty()).then_some((gateway, model))
+        });
+        own.unwrap_or((&self.settings.gateway, &self.settings.model))
+    }
+
+    /// How hard the model thinks in the session at `index`: its own level,
+    /// or the settings' when it has none.
+    pub fn effort(&self, index: usize) -> &str {
+        self.conversations
+            .get(index)
+            .and_then(|c| c.effort.as_deref())
+            .unwrap_or(&self.settings.effort)
+    }
+
+    /// Put the session at `index` on `model` at `gateway`, and start new
+    /// sessions there too. Sessions with a model of their own keep it.
+    pub fn choose_model(&mut self, index: usize, gateway: &str, model: &str) {
+        self.settings.gateway = gateway.to_owned();
+        self.settings.model = model.to_owned();
+        if let Some(conversation) = self.conversations.get_mut(index) {
+            conversation.gateway = Some(gateway.to_owned());
+            conversation.model = Some(model.to_owned());
+        }
+    }
+
+    /// Have the session at `index` think `effort` hard, and new sessions too.
+    pub fn choose_effort(&mut self, index: usize, effort: &str) {
+        self.settings.effort = effort.to_owned();
+        if let Some(conversation) = self.conversations.get_mut(index) {
+            conversation.effort = Some(effort.to_owned());
+        }
+    }
+
+    /// Hold the session at `index` to the model and effort it runs on now,
+    /// before it sends: a session that followed the settings would otherwise
+    /// change model whenever another session chose one.
+    pub fn pin(&mut self, index: usize) {
+        let (gateway, model) = self.model(index);
+        let (gateway, model) = (gateway.to_owned(), model.to_owned());
+        let effort = self.effort(index).to_owned();
+        let Some(conversation) = self.conversations.get_mut(index) else {
+            return;
+        };
+        conversation.gateway = Some(gateway);
+        conversation.model = Some(model);
+        conversation.effort = Some(effort);
+    }
+
     /// Append whatever is new in each session, then the settings. Returns the
     /// first failure, so the caller can say the history is not safe.
     pub fn save(&mut self) -> std::io::Result<()> {
@@ -414,6 +487,9 @@ impl Conversation {
             pinned: self.pinned,
             workspace: self.workspace.clone(),
             todos: self.todos.clone(),
+            model: self.model.clone(),
+            gateway: self.gateway.clone(),
+            effort: self.effort.clone(),
         }
     }
 
@@ -535,6 +611,9 @@ fn replay(path: &std::path::Path) -> Option<Conversation> {
                 conversation.pinned = meta.pinned;
                 conversation.workspace = meta.workspace;
                 conversation.todos = meta.todos;
+                conversation.model = meta.model;
+                conversation.gateway = meta.gateway;
+                conversation.effort = meta.effort;
             }
             Ok(Record::Message(message)) => conversation.messages.push(message),
             Ok(Record::Rewind { to }) => conversation.messages.truncate(to),
@@ -635,6 +714,9 @@ pub struct Summary {
     pub workspace: Option<PathBuf>,
     pub pinned: bool,
     pub todos: Vec<Todo>,
+    pub model: Option<String>,
+    pub gateway: Option<String>,
+    pub effort: Option<String>,
 }
 
 /// The sessions on disk, newest first, without loading what is in them.
@@ -660,6 +742,9 @@ pub fn summaries() -> Vec<Summary> {
                 workspace: None,
                 pinned: false,
                 todos: Vec::new(),
+                model: None,
+                gateway: None,
+                effort: None,
             };
             for line in text.lines().filter(|l| !l.trim().is_empty()) {
                 // Messages are most of the file and none of them are wanted
@@ -678,6 +763,9 @@ pub fn summaries() -> Vec<Summary> {
                         summary.workspace = meta.workspace;
                         summary.pinned = meta.pinned;
                         summary.todos = meta.todos;
+                        summary.model = meta.model;
+                        summary.gateway = meta.gateway;
+                        summary.effort = meta.effort;
                     }
                     Ok(Record::Message(_)) => summary.messages += 1,
                     Ok(Record::Rewind { to }) => summary.messages = summary.messages.min(to),
@@ -930,6 +1018,9 @@ pub fn load_listing() -> Store {
                 workspace: s.workspace,
                 pinned: s.pinned,
                 todos: s.todos,
+                model: s.model,
+                gateway: s.gateway,
+                effort: s.effort,
                 counted: s.messages,
                 ..Default::default()
             };
@@ -2501,6 +2592,78 @@ pub(crate) mod tests {
         std::fs::remove_file(&file).unwrap();
         let first = load().settings;
         assert_eq!((first.appearance.as_str(), first.grain), ("", true));
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_model_chosen_in_one_session_leaves_the_others_on_theirs() {
+        let mut store = Store {
+            settings: super::Settings {
+                gateway: "Letronna".into(),
+                model: "a/first".into(),
+                effort: "low".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        store.conversations.push(numbered(1));
+        store.conversations.push(numbered(1));
+        // The first has sent, so it is held to what it sent on.
+        store.pin(0);
+        store.choose_model(1, "OpenRouter", "b/second");
+        store.choose_effort(1, "high");
+        assert_eq!(store.model(0), ("Letronna", "a/first"));
+        assert_eq!(store.effort(0), "low");
+        assert_eq!(store.model(1), ("OpenRouter", "b/second"));
+        assert_eq!(store.effort(1), "high");
+        // A new session, like one that never chose, starts from the latest.
+        store.conversations.push(Conversation::default());
+        assert_eq!(store.model(2), ("OpenRouter", "b/second"));
+        assert_eq!(store.effort(2), "high");
+        // A gateway no longer offered falls back to the settings.
+        store.conversations[0].gateway = Some("Retired".into());
+        assert_eq!(store.model(0), ("OpenRouter", "b/second"));
+        // As does a session that is not there.
+        assert_eq!(store.model(9), ("OpenRouter", "b/second"));
+    }
+
+    #[test]
+    fn a_session_s_model_is_read_back_and_older_sessions_follow_the_settings() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("session-model");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let sessions = dir.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        // Written before sessions had a model of their own.
+        std::fs::write(
+            sessions.join("2.jsonl"),
+            "{\"type\":\"head\",\"id\":2,\"created\":5}\n\
+             {\"type\":\"meta\",\"title\":\"old\",\"updated\":5,\"pinned\":false,\"workspace\":null,\"todos\":[]}\n\
+             {\"type\":\"message\",\"role\":\"user\",\"content\":\"hello\"}\n",
+        )
+        .unwrap();
+
+        let mut store = Store::default();
+        store.settings.model = "a/first".into();
+        store.conversations.push(numbered(1));
+        store.choose_model(0, "OpenAI", "b/second");
+        store.choose_effort(0, "max");
+        store.save().unwrap();
+
+        for mut back in [load(), load_listing()] {
+            back.settings.model = "c/third".into();
+            back.settings.gateway = "Ollama".into();
+            let new = back.index_of(1).unwrap();
+            let old = back.index_of(2).unwrap();
+            assert_eq!(back.model(new), ("OpenAI", "b/second"));
+            assert_eq!(back.effort(new), "max");
+            assert_eq!(back.model(old), ("Ollama", "c/third"));
+            // Listing read the model too, so saving writes no meta line over it.
+            let before = std::fs::read_to_string(sessions.join("1.jsonl")).unwrap();
+            back.save().unwrap();
+            let after = std::fs::read_to_string(sessions.join("1.jsonl")).unwrap();
+            assert_eq!(before, after);
+        }
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 }

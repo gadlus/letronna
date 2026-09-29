@@ -43,29 +43,30 @@ pub struct Runner {
 }
 
 impl Runner {
-    /// Where requests go and the key or sign-in token they carry.
-    pub fn route(&self) -> (String, String) {
-        let settings = &self.store.settings;
+    /// Where a session's requests go and the key or sign-in token they carry.
+    pub fn route(&self, session: usize) -> (String, String) {
+        let (gateway, _) = self.store.model(session);
         let saved = letronna_core::store::load_keys()
-            .get(letronna_core::gateway::key_slot(&settings.gateway))
+            .get(letronna_core::gateway::key_slot(gateway))
             .cloned()
             .unwrap_or_default();
-        letronna_core::gateway::resolve(&settings.gateway, &settings.custom_endpoint, &saved)
+        let custom = &self.store.settings.custom_endpoint;
+        letronna_core::gateway::resolve(gateway, custom, &saved)
     }
 
     pub fn connection(&self, session: usize) -> Connection {
         let workspace = self.store.conversations[session].workspace.clone();
         let settings = &self.store.settings;
-        let (endpoint, key) = self.route();
+        let (endpoint, key) = self.route(session);
         Connection {
             endpoint,
-            model: settings.model.clone(),
+            model: self.store.model(session).1.to_owned(),
             key,
             tools: true,
             workspace,
             plan: self.mode == Mode::Plan,
             remote: None,
-            effort: settings.effort.clone(),
+            effort: self.store.effort(session).to_owned(),
             search: settings.search,
             conversation: self.store.conversations[session].id,
             unattended: false,
@@ -78,6 +79,7 @@ impl Runner {
     pub fn ask(&mut self, session: usize, prompt: &str) -> Result<String, String> {
         let connection = self.connection(session);
         chat::validate(&connection)?;
+        self.store.pin(session);
 
         {
             let conversation = &mut self.store.conversations[session];
@@ -318,7 +320,7 @@ impl Runner {
                 break;
             }
         }
-        let model = self.store.settings.model.clone();
+        let model = turn.connection.model.clone();
         let reply = turn.take_reply(&model);
         // A reply that only asked for a tool has nothing to caption; the tool
         // line below speaks for it.
@@ -387,7 +389,8 @@ impl Runner {
     /// Save what a stopped turn got to, so the model hears next time what ran
     /// and what did not.
     fn keep_stopped(&mut self, turn: &mut Turn, session: usize) {
-        let kept = turn.stop(&self.store.settings.model);
+        let model = turn.connection.model.clone();
+        let kept = turn.stop(&model);
         if kept.is_empty() {
             return;
         }
@@ -803,6 +806,9 @@ impl Runner {
             letronna_core::store::fill(conversation);
             self.bar.set_plan(&conversation.todos);
         }
+        // Each session has its own model, and the footer names it.
+        let note = crate::banner::footer(self);
+        self.bar.set_footer(note);
     }
 
     /// A session of its own.
@@ -817,6 +823,8 @@ impl Runner {
         let index = self.store.conversations.len() - 1;
         self.store.active = index;
         self.bar.set_plan(&[]);
+        let note = crate::banner::footer(self);
+        self.bar.set_footer(note);
         index
     }
 }

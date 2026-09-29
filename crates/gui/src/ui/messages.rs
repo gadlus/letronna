@@ -63,7 +63,7 @@ impl Chat {
         // A reply that only asked for tools: its tool rows say what happened.
         let tool_only = !is_user && message.content.is_empty() && !message.tool_calls.is_empty();
         let label: String = if message.model.is_empty() {
-            self.store.settings.model.clone()
+            self.store.model(self.store.active).1.to_owned()
         } else {
             message.model.clone()
         };

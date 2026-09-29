@@ -212,9 +212,14 @@ impl Chat {
         cx.notify();
     }
 
-    /// The Model page's Save: the default model.
+    /// The Model page's Save: the default model, and the session on screen's
+    /// when it was changed here, as a pick from the composer changes both.
     pub(crate) fn apply_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.store.settings.model = self.model.read(cx).value().to_string();
+        let typed = self.model.read(cx).value().to_string();
+        if typed != self.store.settings.model {
+            let gateway = self.store.settings.gateway.clone();
+            self.store.choose_model(self.store.active, &gateway, &typed);
+        }
         // Cleared before saving, not after: clearing last threw away the very
         // error that says the save failed.
         self.error = None;
@@ -398,7 +403,7 @@ impl Chat {
             )
             .into_any_element(),
             "Account" => super::account::account_page(&chat, self, cx).into_any_element(),
-            "Thinking" => thinking_page(&chat, &self.store.settings, cx).into_any_element(),
+            "Thinking" => thinking_page(&chat, &self.store, cx).into_any_element(),
             "Plugins" => plugins_page(&chat, cx).into_any_element(),
             "About" => about_page(&chat, self, cx).into_any_element(),
             "Search" => search_page(self.search_rows(), &pick, &endpoint, &key, &chat, cx)
@@ -1131,17 +1136,20 @@ fn model_page(model: &Entity<InputState>, chat: &Entity<Chat>, cx: &App) -> Div 
         )
 }
 
-/// How hard the model thinks, whether that thinking is shown, and whether it
-/// may look things up.
+/// How hard the model thinks in the session on screen and new ones, whether
+/// that thinking is shown, and whether it may look things up.
 ///
-/// The effort levels are the ones the model in use offers, from its gateway's
-/// model list, or low, medium and high when the list does not say. The one
-/// marked is what the next request sends, which for a level picked on another
-/// model is the nearest this one offers.
-fn thinking_page(chat: &Entity<Chat>, settings: &Settings, cx: &App) -> Div {
-    let endpoint = base_url(&settings.gateway, &settings.custom_endpoint);
-    let offered = letronna_core::models::efforts(&endpoint, &settings.model);
-    let sent = letronna_core::models::clamp(&offered, &settings.effort).map(|level| &*level.id);
+/// The effort levels are the ones the session's model offers, from its
+/// gateway's model list, or low, medium and high when the list does not say.
+/// The one marked is what the next request sends, which for a level picked on
+/// another model is the nearest this one offers.
+fn thinking_page(chat: &Entity<Chat>, store: &Store, cx: &App) -> Div {
+    let settings = &store.settings;
+    let (gateway, model) = store.model(store.active);
+    let endpoint = base_url(gateway, &settings.custom_endpoint);
+    let offered = letronna_core::models::efforts(&endpoint, model);
+    let effort = store.effort(store.active);
+    let sent = letronna_core::models::clamp(&offered, effort).map(|level| &*level.id);
     let auto = ("", "Whatever the model likes");
     let choices = offered.iter().map(|level| (&*level.id, &*level.label));
 
@@ -1166,7 +1174,7 @@ fn thinking_page(chat: &Entity<Chat>, settings: &Settings, cx: &App) -> Div {
                 .child(div().text_sm().child(text.to_owned()))
                 .on_click(move |_, _, cx| {
                     chat.update(cx, |this, cx| {
-                        this.store.settings.effort = value.clone();
+                        this.store.choose_effort(this.store.active, &value);
                         this.save();
                         cx.notify();
                     })
