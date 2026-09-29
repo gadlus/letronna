@@ -941,9 +941,13 @@ impl Chat {
         };
         self.store.settings.endpoint = connection.endpoint.clone();
         self.store.pin(self.store.active);
-        // What is still being said of the last answer is not wanted now.
+        // What is still being said of the last answer is not wanted now, but
+        // only the user asking again says so: a chat's or a schedule's turn
+        // is not read aloud, and would cut off the answer they are hearing.
         self.match_voice();
-        if let Some(voice) = &mut self.voice {
+        let session = self.store.conversations[self.store.active].id;
+        let own = !self.remote.contains_key(&session) && !self.scheduled.contains(&session);
+        if let (Some(voice), true) = (&mut self.voice, own) {
             voice.hush();
         }
         let conversation = &mut self.store.conversations[self.store.active];
