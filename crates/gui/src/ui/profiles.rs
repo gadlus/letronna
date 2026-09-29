@@ -69,8 +69,9 @@ impl Chat {
                 let chosen = current == index;
                 Button::new(("profile-source", key))
                     .small()
+                    // Picking the chosen one again changes nothing, and a
+                    // disabled primary would read as the one not on offer.
                     .when(chosen, |b| b.primary())
-                    .disabled(chosen)
                     .label(label)
                     .on_click(move |_, window, _| {
                         picked.set(index);
