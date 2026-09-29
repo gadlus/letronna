@@ -32,15 +32,19 @@ use crate::chat::{Connection, Message, ToolCall};
 use crate::tools::{self, ToolContext};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::time::Duration;
+use std::path::Path;
+use std::process::Stdio;
+use std::time::{Duration, Instant};
 
 /// Continuations in a row before the loop stops by itself: enough for a
 /// long task, few enough that a judge that never says "met" costs little.
 pub const MAX_CONTINUATIONS: u32 = 20;
 
-/// How long the check command may run: less than a command's usual limit,
-/// since the loop waits on it after every turn.
-const CHECK_TIME: Duration = Duration::from_secs(60);
+/// How long the check command may run: a workspace's tests take minutes,
+/// and a stop or a typed line ends it sooner.
+const CHECK_TIME: Duration = Duration::from_secs(10 * 60);
+/// How often a running check is looked at for its end, a stop or its limit.
+const CHECK_POLL: Duration = Duration::from_millis(50);
 /// How much of the check's output the judge reads, in bytes with its
 /// fence, both ends kept.
 const CHECK_CHARS: usize = 4_000;
@@ -436,20 +440,31 @@ fn prompt(goal: &Goal, reply: &str, checked: Option<(&str, String)>) -> Result<S
     Ok(prompt)
 }
 
-/// Runs the goal's check command as a helper's command runs: asked about
-/// where the session's rules do not already allow it, and ended at
-/// `CHECK_TIME`. Whatever happens is output for the judge to read.
+/// Runs the goal's check command as a helper's command runs: refused where
+/// the session could not run it, asked about where its rules do not already
+/// allow it, and put to the user's hooks. It runs here rather than through
+/// `tools::run`, whose limit is shorter than a test run and whose stop
+/// loses what was printed. Whatever happens is output for the judge.
 fn check(connection: &Connection, command: &str, cancel: &Cancel) -> String {
+    let args = json!({ "command": command });
     let call = ToolCall {
         id: "goal-check".into(),
         name: "run_command".into(),
-        arguments: json!({ "command": command }).to_string(),
+        arguments: args.to_string(),
     };
-    let bounded = cancel.child();
     let ctx = ToolContext {
-        cancel: bounded.clone(),
+        cancel: cancel.clone(),
         ..ToolContext::of(connection)
     };
+    let Some(tool) = tools::find(&call.name) else {
+        return "The check command was not run: commands cannot be run here.".into();
+    };
+    let Some(cwd) = ctx.workspace.clone() else {
+        return "The check command was not run: no project folder is attached.".into();
+    };
+    if let Some(why) = crate::gate::refusal(tool.as_ref(), &args, &ctx) {
+        return format!("The check command was not run: {why}");
+    }
     let run = crate::agents::fresh_id();
     if tools::needs_approval(&call.name)
         && let Err(why) = approvals::ask(connection.conversation, run, "goal check", &call, &ctx)
@@ -459,24 +474,83 @@ fn check(connection: &Connection, command: &str, cancel: &Cancel) -> String {
             why => format!("The check command was not run: {why}"),
         };
     }
-    let timer = bounded.clone();
-    std::thread::spawn(move || {
-        if timer.sleep(CHECK_TIME) {
-            timer.set();
-        }
-    });
-    let outcome = tools::run(&call.name, &call.arguments, &ctx);
-    let timed_out = bounded.is_set() && !cancel.is_set();
-    // Wakes the timer, whose thread would otherwise sleep on.
-    bounded.set();
-    let mut out = match outcome {
-        Ok(out) => out,
-        Err(error) => format!("The check command failed:\n{error}"),
+    let hooks = crate::hooks::current();
+    let heard = match crate::hooks::before(&hooks, &call.name, &args, &ctx) {
+        Ok(heard) => heard,
+        Err(why) => return format!("The check command was not run: {why}"),
     };
-    if timed_out {
-        out.push_str(&format!("\n[stopped after {} s]", CHECK_TIME.as_secs()));
+    let ran = run_check(command, &cwd, CHECK_TIME, cancel);
+    let out = crate::redact::scrub(&ran, tool.hides_key_shapes());
+    let said = crate::hooks::after(&hooks, &call.name, &args, &out, &ctx);
+    out + &heard + &said
+}
+
+/// Runs `command` in `cwd` as a process tree of its own until it ends,
+/// `limit` passes or `cancel` is set, and gives back what it printed and
+/// how it ended. The whole tree is ended after, so nothing a test run
+/// started is left running to hold the build lock the next check needs.
+fn run_check(command: &str, cwd: &Path, limit: Duration, cancel: &Cancel) -> String {
+    let mut shell = tools::shell(command, Some(cwd));
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut shell, 0);
+    let spawned = (shell.stdin(Stdio::null()))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(e) => return format!("The check command could not start: {e}"),
+    };
+    // At once, so the shell has had as little time as possible to start
+    // anything that would escape the tree.
+    let tree = crate::jobs::Tree::of(&child);
+    let (Ok(tree), Some(stdout), Some(stderr)) = (tree, child.stdout.take(), child.stderr.take())
+    else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return "The check command could not start: its output could not be read.".into();
+    };
+    let (sender, open) = std::sync::mpsc::channel();
+    let kept = [
+        tools::forward(stdout, sender.clone()),
+        tools::forward(stderr, sender),
+    ];
+    let started = Instant::now();
+    let ending = loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break None,
+            Ok(Some(status)) => {
+                break Some(format!("[exit code {}]", status.code().unwrap_or(-1)));
+            }
+            Ok(None) => {}
+            Err(e) => break Some(format!("[could not be waited on: {e}]")),
+        }
+        if started.elapsed() >= limit {
+            break Some(format!(
+                "[stopped after {} s, the check's time limit; above is what it printed until then]",
+                limit.as_secs()
+            ));
+        }
+        if !cancel.sleep(CHECK_POLL) {
+            break Some("[stopped]".to_owned());
+        }
+    };
+    tree.kill();
+    let _ = child.kill();
+    let _ = child.wait();
+    // With the tree gone the pipes close, unless something left the tree.
+    tools::pipes_closed(&open);
+    let (mut text, _) = tools::take(&kept[0]).into_text();
+    let (err, _) = tools::take(&kept[1]).into_text();
+    if !err.trim().is_empty() {
+        text.push_str("\n[stderr]\n");
+        text.push_str(&err);
     }
-    out
+    if let Some(ending) = ending {
+        text.push('\n');
+        text.push_str(&ending);
+    }
+    text
 }
 
 #[cfg(test)]
@@ -813,5 +887,63 @@ mod tests {
         settle(&mut kept, &step);
         assert_eq!(kept, Some(goal(None)));
         assert!(!working(session));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_check_that_prints_and_fails_says_so() {
+        let out = run_check(
+            "echo one; echo two >&2; exit 3",
+            &std::env::temp_dir(),
+            Duration::from_secs(20),
+            &Cancel::default(),
+        );
+        assert!(out.starts_with("one\n"), "{out}");
+        assert!(out.contains("[stderr]\ntwo"), "{out}");
+        assert!(out.ends_with("[exit code 3]"), "{out}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_check_past_its_limit_keeps_its_output_and_leaves_nothing_running() {
+        let dir = std::env::temp_dir().join(format!("letronna-goal-check-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A child that outlives the shell's own command, as a test run's do.
+        let command = "echo before; sleep 30 & echo $! > child.pid; sleep 30";
+        let started = Instant::now();
+        let out = run_check(command, &dir, Duration::from_secs(1), &Cancel::default());
+        assert!(started.elapsed() < Duration::from_secs(10), "{out}");
+        assert!(out.starts_with("before"), "{out}");
+        assert!(
+            out.contains("[stopped after 1 s, the check's time limit"),
+            "{out}"
+        );
+        let pid: libc::pid_t = std::fs::read_to_string(dir.join("child.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        // Killed, though whoever inherits it may take a moment to reap it,
+        // or never will where nothing reaps orphans.
+        let gone = (0..100).any(|_| {
+            std::thread::sleep(Duration::from_millis(20));
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+            // SAFETY: signal 0 only asks whether the process is there.
+            let there = unsafe { libc::kill(pid, 0) == 0 };
+            !there || stat.contains(") Z ")
+        });
+        assert!(gone, "the check's child {pid} is still running");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stopped_check_ends_at_once_and_says_so() {
+        let cancel = Cancel::default();
+        cancel.set();
+        let started = Instant::now();
+        let out = run_check("sleep 30", &std::env::temp_dir(), CHECK_TIME, &cancel);
+        assert!(started.elapsed() < Duration::from_secs(10), "{out}");
+        assert!(out.ends_with("[stopped]"), "{out}");
     }
 }
