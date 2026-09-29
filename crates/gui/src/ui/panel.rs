@@ -1,6 +1,6 @@
 //! The panel on the right of the chat: what goes on beside the
-//! conversation, a tab each -- the browser now; the helpers' activity, the
-//! files, the changes and the jobs join it later.
+//! conversation, a tab each -- the browser and the project's files now; the
+//! helpers' activity, the changes and the jobs join them later.
 //!
 //! It is one fixed panel, not a layout of docks: there are no zones to
 //! drag tabs into and nothing to arrange or break. A tab shows only while
@@ -43,15 +43,17 @@ const FLOAT_CLEAR: Pixels = px(240.);
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PanelTab {
     Browser,
+    Files,
 }
 
 impl PanelTab {
     /// Every tab, in the order the bar shows them.
-    const ALL: [PanelTab; 1] = [PanelTab::Browser];
+    const ALL: [PanelTab; 2] = [PanelTab::Browser, PanelTab::Files];
 
     fn label(self) -> &'static str {
         match self {
             PanelTab::Browser => "Browser",
+            PanelTab::Files => "Files",
         }
     }
 }
@@ -148,12 +150,14 @@ impl Chat {
                 let browser = self.browser.read(cx);
                 browser.has_content(docked).then(|| browser.waiting())
             }
+            PanelTab::Files => self.has_files().then_some(0),
         }
     }
 
-    fn tab_body(&self, tab: PanelTab) -> AnyElement {
+    fn tab_body(&self, tab: PanelTab, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         match tab {
             PanelTab::Browser => self.browser.clone().into_any_element(),
+            PanelTab::Files => self.files_tab(window, cx),
         }
     }
 
@@ -178,6 +182,12 @@ impl Chat {
         }
         let (shown, open) = self.tabs_now(docked, cx);
         Some((shown, open?))
+    }
+
+    /// The tab drawn now, if the panel is.
+    pub(crate) fn tab_on_screen(&self, window: &Window, cx: &App) -> Option<PanelTab> {
+        let docked = docks(window.viewport_size().width);
+        self.panel_view(docked, cx).map(|(_, open)| open)
     }
 
     /// How much of the window the docked panel takes from the chat: none
@@ -223,6 +233,9 @@ impl Chat {
         if tab == PanelTab::Browser && !self.browser.read(cx).is_open() {
             self.browser.update(cx, |view, cx| view.ask(window, cx));
         }
+        if tab == PanelTab::Files {
+            self.focus_files(window);
+        }
         cx.notify();
     }
 
@@ -255,7 +268,7 @@ impl Chat {
     /// bar over the open tab, which alone is drawn.
     pub(crate) fn right_panel(
         &self,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let width = dock_width(
@@ -289,7 +302,7 @@ impl Chat {
             .bg(cx.theme().background)
             .border_color(cx.theme().border)
             .child(bar)
-            .child(self.tab_body(open));
+            .child(self.tab_body(open, window, cx));
         Some(match width {
             Some(width) => panel
                 .relative()
@@ -368,7 +381,14 @@ mod tests {
     #[test]
     fn a_tab_shows_only_with_something_to_show_and_counts_what_waits() {
         assert!(shown_tabs(|_| None).is_empty());
-        assert_eq!(shown_tabs(|_| Some(1)), vec![(PanelTab::Browser, 1)]);
+        assert_eq!(
+            shown_tabs(|_| Some(1)),
+            vec![(PanelTab::Browser, 1), (PanelTab::Files, 1)]
+        );
+        assert_eq!(
+            shown_tabs(|tab| (tab == PanelTab::Files).then_some(0)),
+            vec![(PanelTab::Files, 0)]
+        );
         assert_eq!(title(PanelTab::Browser, 0), "Browser");
         assert_eq!(title(PanelTab::Browser, 1), "Browser 1");
     }

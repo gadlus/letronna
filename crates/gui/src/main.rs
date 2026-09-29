@@ -57,6 +57,7 @@ fn main() {
             KeyBinding::new("escape", Dismiss, Some("Chat")),
             KeyBinding::new("secondary-j", ui::panel::TogglePanel, Some("Chat")),
             KeyBinding::new("secondary-shift-l", ui::panel::BrowserTab, Some("Chat")),
+            KeyBinding::new("secondary-shift-e", ui::files::FilesTab, Some("Chat")),
             KeyBinding::new("secondary-shift-u", ui::usage::OpenUsage, Some("Chat")),
             KeyBinding::new("secondary-shift-a", OpenActivity, Some("Chat")),
             KeyBinding::new(
@@ -74,6 +75,25 @@ fn main() {
             KeyBinding::new("shift-tab", ui::browser::PageTabBack, Some("Browser")),
             KeyBinding::new("tab", ui::composer::LeaveComposer, Some("Composer > Input")),
             KeyBinding::new("enter", ui::search::OpenHit, Some("SearchHit")),
+            // The Files tab: the arrows and Enter walk the tree while it
+            // has the keys, and the rest act on its picked row from
+            // anywhere in the tab.
+            KeyBinding::new("up", ui::files::FileUp, Some("FileTree")),
+            KeyBinding::new("down", ui::files::FileDown, Some("FileTree")),
+            KeyBinding::new("left", ui::files::FileLeft, Some("FileTree")),
+            KeyBinding::new("right", ui::files::FileRight, Some("FileTree")),
+            KeyBinding::new("enter", ui::files::OpenFile, Some("FileTree")),
+            KeyBinding::new("secondary-enter", ui::files::AddToMessage, Some("Files")),
+            KeyBinding::new("secondary-o", ui::files::OpenInEditor, Some("Files")),
+            KeyBinding::new(
+                "secondary-shift-o",
+                ui::files::OpenWithSystem,
+                Some("Files"),
+            ),
+            KeyBinding::new("secondary-shift-r", ui::files::ShowInFolder, Some("Files")),
+            KeyBinding::new("secondary-shift-c", ui::files::CopyPath, Some("Files")),
+            KeyBinding::new("secondary-i", ui::files::ToggleIgnored, Some("Files")),
+            KeyBinding::new("escape", ui::files::ClosePreview, Some("Files")),
         ]);
         platform::tray::init(cx);
         cx.on_window_closed(|cx| {
