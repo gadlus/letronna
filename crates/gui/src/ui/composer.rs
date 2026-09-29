@@ -297,7 +297,14 @@ impl Chat {
             if let Ok(Ok(Some(paths))) = receiver.await {
                 let _ = this.update(cx, |this, cx| {
                     if let Some(ix) = this.store.index_of(id) {
-                        this.store.conversations[ix].workspace = paths.into_iter().next();
+                        let folder = paths.into_iter().next();
+                        // A call already waiting in this session runs there too.
+                        if this.streaming_id == Some(id)
+                            && let Some(turn) = this.turn.as_mut()
+                        {
+                            turn.connection.workspace = folder.clone();
+                        }
+                        this.store.conversations[ix].workspace = folder;
                         this.save();
                         cx.notify();
                     }
