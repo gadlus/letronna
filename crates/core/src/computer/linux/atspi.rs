@@ -229,10 +229,13 @@ impl Bus {
         true
     }
 
-    /// Puts `text` at `element`'s cursor, as typing there would.
+    /// Puts `text` at `element`'s cursor, as typing there would, or does
+    /// nothing and says so where it could not put in all of it.
     pub(super) fn insert(&self, element: &Accessible, text: &str) -> bool {
+        let Some(length) = insert_length(text) else {
+            return false;
+        };
         let at = self.caret(element).unwrap_or(0).max(0);
-        let length = i32::try_from(text.chars().count()).unwrap_or(i32::MAX);
         self.call(element, EDITABLE_TEXT, "InsertText", &(at, text, length)) == Some(true)
     }
 
@@ -259,5 +262,25 @@ impl Bus {
             )
             .ok()?;
         reply.body().deserialize::<R>().ok()
+    }
+}
+
+/// The length `InsertText` is told `text` has, or None where the toolkits
+/// would not put in all of it: GTK reads the length in bytes, as AT-SPI
+/// says, and Qt in UTF-16 units, which agree only on ASCII, so other
+/// text would be cut short or padded out while the call said it was done.
+fn insert_length(text: &str) -> Option<i32> {
+    text.is_ascii().then(|| i32::try_from(text.len()).ok())?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_text_every_toolkit_counts_alike_is_inserted() {
+        assert_eq!(insert_length("hello, world"), Some(12));
+        assert_eq!(insert_length("café"), None);
+        assert_eq!(insert_length("€5"), None);
     }
 }
