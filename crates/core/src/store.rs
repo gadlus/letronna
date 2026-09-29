@@ -256,6 +256,14 @@ pub struct Settings {
     /// its full `mcp__server__tool` name; a name no tool has is passed over.
     #[serde(default, deserialize_with = "tool_names")]
     pub disabled_tools: Vec<String>,
+    /// The sidebar's list narrowed to one state: "needs_you", "working",
+    /// "unseen" or "pinned"; empty for no filter.
+    #[serde(default)]
+    pub session_filter: String,
+    /// Group the sidebar's sessions by their project folder instead of by
+    /// how long ago each was updated.
+    #[serde(default)]
+    pub group_by_project: bool,
 }
 
 // Written out rather than derived so the film grain starts on for a first
@@ -284,6 +292,8 @@ impl Default for Settings {
             browse_unseen: false,
             appearance: String::new(),
             grain: true,
+            session_filter: String::new(),
+            group_by_project: false,
         }
     }
 }

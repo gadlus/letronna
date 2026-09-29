@@ -74,6 +74,33 @@ fn main() {
             KeyBinding::new("shift-tab", ui::browser::PageTabBack, Some("Browser")),
             KeyBinding::new("tab", ui::composer::LeaveComposer, Some("Composer > Input")),
             KeyBinding::new("enter", ui::search::OpenHit, Some("SearchHit")),
+            // The sidebar's own filters, so a shortcut typed elsewhere is
+            // never swallowed by one narrowing a list it cannot see.
+            KeyBinding::new(
+                "secondary-shift-1",
+                ui::sessions::FilterNeedsYou,
+                Some("Sessions"),
+            ),
+            KeyBinding::new(
+                "secondary-shift-2",
+                ui::sessions::FilterWorking,
+                Some("Sessions"),
+            ),
+            KeyBinding::new(
+                "secondary-shift-3",
+                ui::sessions::FilterUnseen,
+                Some("Sessions"),
+            ),
+            KeyBinding::new(
+                "secondary-shift-4",
+                ui::sessions::FilterPinned,
+                Some("Sessions"),
+            ),
+            KeyBinding::new(
+                "secondary-shift-g",
+                ui::sessions::ToggleGrouping,
+                Some("Sessions"),
+            ),
         ]);
         platform::tray::init(cx);
         cx.on_window_closed(|cx| {

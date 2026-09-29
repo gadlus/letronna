@@ -2457,6 +2457,8 @@ impl Chat {
         } else if self.page == Page::Activity && self.viewing.is_some() {
             // And out of a helper's transcript, back to the list.
             self.open_activity(window, cx);
+        } else if self.clear_session_filter(cx) {
+            // The sidebar's filter, narrowed by a click or its own key.
         } else if self.busy_elsewhere().is_none() {
             // Not a reply in another session, which nothing here shows.
             self.stop_turn(cx);
