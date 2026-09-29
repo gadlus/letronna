@@ -24,7 +24,12 @@ pub fn replay(runner: &Runner, session: usize) {
     }
     for message in &messages[from..] {
         match message.role.as_str() {
-            "user" => said_over_lines(&render::blue("›"), &message.content, true),
+            // A chat app's message can quote someone else's, fenced.
+            "user" => said_over_lines(
+                &render::blue("›"),
+                &letronna_core::untrusted::shown("", &message.content).0,
+                true,
+            ),
             "assistant" if !message.content.trim().is_empty() => {
                 said_over_lines(&render::blue("●"), &message.content, false);
                 if message.interrupted {

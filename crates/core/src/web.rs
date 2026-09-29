@@ -92,6 +92,10 @@ impl Tool for WebFetch {
     fn concurrent(&self) -> bool {
         true
     }
+
+    fn untrusted(&self) -> bool {
+        true
+    }
     fn preview(&self, args: &Value, _: &ToolContext) -> String {
         format!("GET {}", args["url"].as_str().unwrap_or_default())
     }

@@ -114,7 +114,9 @@ impl Chat {
                 )
                 .into_any_element()
         } else if is_user {
-            TextView::markdown(md, message.content.clone(), window, cx)
+            // A chat app's message can quote someone else's, fenced.
+            let (said, _) = letronna_core::untrusted::shown("", &message.content);
+            TextView::markdown(md, said, window, cx)
                 .selectable(selectable)
                 .text_size(px(15.))
                 .font_weight(FontWeight::MEDIUM)
@@ -334,8 +336,10 @@ impl Chat {
         let failed = message.is_error && !letronna_core::tools::is_declined(&message.content);
         let open = self.thinking_open.contains(&key) != failed;
         let summary = letronna_core::tools::summary(&message.name, &message.args);
-        let lines = message.content.lines().count();
-        let content = message.content.clone();
+        // The fences' tags are for the model; here a few words say where the
+        // text came from.
+        let (content, from) = letronna_core::untrusted::shown(&message.name, &message.content);
+        let lines = content.lines().count();
         let one_line = letronna_core::tools::one_line;
         // A file a media tool made, while it is still where it was saved.
         let made = (!message.is_error)
@@ -408,6 +412,14 @@ impl Chat {
                             .child(summary),
                     )
                     .child(div().min_w_0().text_color(color).truncate().child(status))
+                    .when_some(from, |row, from| {
+                        row.child(
+                            div()
+                                .flex_none()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(from),
+                        )
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if !this.thinking_open.remove(&key) {
                             this.thinking_open.insert(key);

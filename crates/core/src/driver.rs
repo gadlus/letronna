@@ -1050,12 +1050,20 @@ mod tests {
         assert_eq!(report.status, Outcome::Done);
         let sent = provider.sent();
 
-        assert_eq!(
-            results(&sent[1]),
-            [
-                format!("{site}/first\n\nfirst"),
-                format!("{site}/second\n\nsecond")
-            ]
+        // Each page comes back fenced, as anything from the web does.
+        let got = results(&sent[1]);
+        assert_eq!(got.len(), 2);
+        assert!(
+            got[0].contains(&format!("{site}/first\n\nfirst")),
+            "{got:?}"
+        );
+        assert!(
+            got[1].contains(&format!("{site}/second\n\nsecond")),
+            "{got:?}"
+        );
+        assert!(
+            got.iter()
+                .all(|page| page.starts_with("<untrusted-content-"))
         );
     }
 

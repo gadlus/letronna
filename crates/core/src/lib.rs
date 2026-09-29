@@ -49,6 +49,7 @@ pub mod structured;
 pub mod tasks;
 pub mod timers;
 pub mod tools;
+pub mod untrusted;
 pub mod update;
 pub mod wake;
 pub mod watch;

@@ -331,20 +331,31 @@ impl Runner {
         // speaking; a tool result that butts up against the question it came
         // from reads as part of it.
         render::blank();
+        // The fences' tags are for the model; here a few words say where the
+        // text came from.
+        let (text, from) = match &outcome {
+            Ok(text) | Err(text) => letronna_core::untrusted::shown(&call.name, text),
+        };
+        let from = from.map(|from| format!(", {from}")).unwrap_or_default();
         match &outcome {
-            Ok(text) => {
+            Ok(_) => {
                 let lines = text.lines().count();
                 let count = if lines == 1 {
                     "1 line".to_owned()
                 } else {
                     format!("{lines} lines")
                 };
-                render::tool(&call.name, &summary, &count, false);
+                render::tool(&call.name, &summary, &format!("{count}{from}"), false);
                 if !text.trim().is_empty() {
-                    render::detail(text, DETAIL_LINES);
+                    render::detail(&text, DETAIL_LINES);
                 }
             }
-            Err(error) => render::tool(&call.name, &summary, &tools::one_line(error), true),
+            Err(_) => render::tool(
+                &call.name,
+                &summary,
+                &format!("{}{from}", tools::one_line(&text)),
+                true,
+            ),
         }
         turn.finish_call(outcome);
         !stopped

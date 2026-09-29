@@ -702,6 +702,7 @@ fn gateway_message(
                 token: config.bot_token.trim().to_owned(),
                 channel,
                 bot_id: bot_id.to_owned(),
+                owner: config.owner.trim().to_owned(),
             }),
         },
     })
@@ -749,22 +750,41 @@ fn message_text(message: &serde_json::Value, bot_id: &str) -> Option<String> {
         parts.push(own);
     }
     if let Some(forwarded) = forwarded_text(message) {
-        parts.push(format!("Forwarded message:\n{}", quote(&forwarded)));
+        parts.push(quoted_in("Forwarded message:", &forwarded, true));
     }
     if parts.is_empty() {
         return None;
     }
     let reference = &message["referenced_message"];
-    if let Some(text) = own_text(reference).or_else(|| forwarded_text(reference)) {
-        let who = match reference["author"]["id"].as_str() == Some(bot_id) {
+    let by = reference["author"]["id"].as_str();
+    // A forward is always someone else's words; a message is, unless the
+    // sender or Letronna wrote it.
+    let (text, theirs) = match own_text(reference) {
+        Some(text) => (
+            Some(text),
+            by != Some(bot_id) && by != message["author"]["id"].as_str(),
+        ),
+        None => (forwarded_text(reference), true),
+    };
+    if let Some(text) = text {
+        let who = match by == Some(bot_id) {
             true => "your earlier message",
             false => reference["author"]["username"]
                 .as_str()
                 .unwrap_or("a message"),
         };
-        parts.push(format!("In reply to {who}:\n{}", quote(&text)));
+        parts.push(quoted_in(&format!("In reply to {who}:"), &text, theirs));
     }
     Some(parts.join("\n\n"))
+}
+
+/// `text` quoted in under `lead`, fenced when someone other than the sender
+/// and Letronna wrote it: it is part of the prompt, but not the user's.
+fn quoted_in(lead: &str, text: &str, theirs: bool) -> String {
+    match theirs {
+        true => crate::untrusted::quoted(lead, &quote(text)),
+        false => format!("{lead}\n{}", quote(text)),
+    }
 }
 
 fn own_text(message: &serde_json::Value) -> Option<String> {
@@ -942,9 +962,11 @@ fn gateway_session(
 }
 
 pub const READ_CHAT: &str = "read_chat";
-/// Roughly what read_chat returns at most. It stays under the tool output
-/// cap on purpose: that cap cuts the end, which here is the newest part.
-const HISTORY_BUDGET: usize = 20_000;
+/// Roughly what read_chat returns at most, in bytes. It stays under the tool
+/// output cap, with room for the line heading it, on purpose: that cap cuts
+/// the middle, and saves the whole aside, where a page of it read back would
+/// come without its fences.
+const HISTORY_BUDGET: usize = crate::chat::MAX_TOOL_CHARS - 100;
 
 /// Reads the chat a remote session is happening in, including messages not
 /// addressed to the bot. Discord only, and only the channel the session came
@@ -1008,42 +1030,56 @@ impl crate::tools::Tool for ReadChat {
                 break;
             }
         }
-        Ok(render_history(
+        render_history(
             &messages,
-            &history.bot_id,
+            (&history.bot_id, &history.owner),
             HISTORY_BUDGET,
             &chrono::Local,
-        ))
+        )
     }
 }
 
 /// Channel history as the model reads it: oldest first, one message per
-/// line, the date only where the day changes. Over `budget` the oldest lines
-/// go, since the recent end is what a question is usually about.
+/// line, the date only where the day changes, and each run of other
+/// people's messages fenced. `own` is the bot's ID and the user's. Over
+/// `budget` bytes the oldest lines go, since the recent end is what a
+/// question is usually about.
 fn render_history<Tz: chrono::TimeZone>(
     messages: &[serde_json::Value],
-    bot_id: &str,
+    own: (&str, &str),
     budget: usize,
     zone: &Tz,
-) -> String
+) -> Result<String, String>
 where
     Tz::Offset: std::fmt::Display,
 {
     let mut ordered: Vec<&serde_json::Value> = messages.iter().collect();
     ordered.sort_by_key(|m| m["id"].as_str().and_then(|id| id.parse::<u64>().ok()));
-    let lines: Vec<(String, String)> = ordered
+    let lines: Vec<(String, String, bool)> = ordered
         .into_iter()
-        .filter_map(|m| history_line(m, bot_id, zone))
+        .filter_map(|m| history_line(m, own, zone))
         .collect();
     if lines.is_empty() {
-        return "No messages in this chat yet.".into();
+        return Ok("No messages in this chat yet.".into());
     }
     let mut used = 0;
+    let mut day = None;
+    let mut joins_a_fence = false;
     let kept = lines
         .iter()
         .rev()
-        .take_while(|(_, line)| {
+        .take_while(|(date, line, theirs)| {
             used += line.len() + 1;
+            // The day's heading, and one fence for each run of other
+            // people's lines, counted going back from the newest.
+            if day != Some(date) {
+                used += date.len() + 7;
+                day = Some(date);
+            }
+            if *theirs && !joins_a_fence {
+                used += crate::untrusted::FENCE_BYTES + 1;
+            }
+            joins_a_fence = *theirs;
             used <= budget
         })
         .count();
@@ -1058,24 +1094,47 @@ where
         ),
     };
     let mut day = String::new();
-    for (date, line) in &lines[left_out..] {
+    // Other people's lines not yet fenced.
+    let mut run = String::new();
+    for (date, line, theirs) in &lines[left_out..] {
+        let mut text = String::new();
         if *date != day {
-            out.push_str(&format!("\n-- {date} --"));
+            text.push_str(&format!("-- {date} --\n"));
             day = date.clone();
         }
+        text.push_str(line);
+        if *theirs {
+            run.push_str(&text);
+            run.push('\n');
+            continue;
+        }
+        fence_run(&mut out, &mut run)?;
         out.push('\n');
-        out.push_str(line);
+        out.push_str(&text);
     }
-    out
+    fence_run(&mut out, &mut run)?;
+    Ok(out)
 }
 
-/// One message as a line of history, with the day it was sent, or `None`
-/// for one with nothing to read, such as a member joining.
+/// `run`, other people's lines, fenced onto the end of `out`, and emptied.
+fn fence_run(out: &mut String, run: &mut String) -> Result<(), String> {
+    if run.is_empty() {
+        return Ok(());
+    }
+    out.push('\n');
+    out.push_str(&crate::untrusted::fence(run.trim_end(), usize::MAX)?);
+    run.clear();
+    Ok(())
+}
+
+/// One message as a line of history, with the day it was sent and whether
+/// it is someone else's words, or `None` for one with nothing to read, such
+/// as a member joining.
 fn history_line<Tz: chrono::TimeZone>(
     message: &serde_json::Value,
-    bot_id: &str,
+    (bot_id, owner): (&str, &str),
     zone: &Tz,
-) -> Option<(String, String)>
+) -> Option<(String, String, bool)>
 where
     Tz::Offset: std::fmt::Display,
 {
@@ -1102,9 +1161,13 @@ where
     // Later lines are indented, so every message still starts a line.
     let text = text.lines().collect::<Vec<_>>().join("\n    ");
     let author = display_name(&message["author"], bot_id);
+    // Someone else wrote it, or it carries what someone else wrote.
+    let by = message["author"]["id"].as_str();
+    let theirs = (by != Some(bot_id) && by != Some(owner)) || forwarded_text(message).is_some();
     Some((
         when.format("%Y-%m-%d").to_string(),
         format!("{} {author}: {reply}{text}", when.format("%H:%M")),
+        theirs,
     ))
 }
 
@@ -1184,6 +1247,7 @@ mod card_tests {
 #[cfg(test)]
 mod discord_tests {
     use super::{Discord, Source, gateway_message, render_history};
+    use crate::untrusted::without_ids;
     use serde_json::{Value, json};
 
     const BOT: &str = "99";
@@ -1272,16 +1336,22 @@ mod discord_tests {
             "message_snapshots": [{"message": {"type": 19, "content": "ship it before the trip"}}]
         });
         assert_eq!(
-            heard(forward.clone()).as_deref(),
-            Some("Forwarded message:\n> ship it before the trip")
+            heard(forward.clone()).map(|t| without_ids(&t)).as_deref(),
+            Some(
+                "Forwarded message:\n<untrusted-content-ID>\n> ship it before the trip\n\
+                 </untrusted-content-ID>"
+            )
         );
         let reply_to_forward = json!({
             "channel_id": "dm1", "content": "is that right?", "author": {"id": "7"},
             "referenced_message": forward
         });
         assert_eq!(
-            heard(reply_to_forward).as_deref(),
-            Some("is that right?\n\nIn reply to me:\n> ship it before the trip")
+            heard(reply_to_forward).map(|t| without_ids(&t)).as_deref(),
+            Some(
+                "is that right?\n\nIn reply to me:\n<untrusted-content-ID>\n\
+                 > ship it before the trip\n</untrusted-content-ID>"
+            )
         );
         let about_someone = json!({
             "channel_id": "c1", "guild_id": "500", "content": "<@99> is this true?",
@@ -1289,8 +1359,20 @@ mod discord_tests {
             "referenced_message": {"content": "it ships friday", "author": {"id": "8", "username": "other"}}
         });
         assert_eq!(
-            heard(about_someone).as_deref(),
-            Some("is this true?\n\nIn reply to other:\n> it ships friday")
+            heard(about_someone).map(|t| without_ids(&t)).as_deref(),
+            Some(
+                "is this true?\n\nIn reply to other:\n<untrusted-content-ID>\n\
+                 > it ships friday\n</untrusted-content-ID>"
+            )
+        );
+        // The sender's own words are theirs, and are not fenced.
+        let own = json!({
+            "channel_id": "dm1", "content": "and this?", "author": {"id": "7"},
+            "referenced_message": {"content": "my plan", "author": {"id": "7", "username": "me"}}
+        });
+        assert_eq!(
+            heard(own).as_deref(),
+            Some("and this?\n\nIn reply to me:\n> my plan")
         );
     }
 
@@ -1333,28 +1415,50 @@ mod discord_tests {
                    "author": {"id": "7", "username": "me", "global_name": "Me"},
                    "mentions": [{"id": "99", "username": "bot"}]}),
         ];
-        let all = render_history(&page, BOT, 10_000, &chrono::Utc);
+        let all = render_history(&page, (BOT, "7"), 10_000, &chrono::Utc).unwrap();
+        // Only the other person's line is fenced: the user's and the bot's
+        // are their own.
         assert_eq!(
-            all,
+            without_ids(&all),
             "3 messages, oldest first.\n\
              -- 2026-09-23 --\n\
              23:50 Me: @Letronna hello\n    second line\n\
              -- 2026-09-24 --\n\
              00:05 Letronna (you): (replying to Me) hi there\n\
-             00:06 other: [forwarded] shipped [attachment: log.txt]"
+             <untrusted-content-ID>\n\
+             00:06 other: [forwarded] shipped [attachment: log.txt]\n\
+             </untrusted-content-ID>"
         );
         // Over budget, the newest survive and the rest are counted.
-        let cut = render_history(&page, BOT, 60, &chrono::Utc);
+        let cut = render_history(&page, (BOT, "7"), 150, &chrono::Utc).unwrap();
         assert_eq!(
-            cut,
+            without_ids(&cut),
             "The last 1 message, oldest first; 2 older ones left out to fit.\n\
+             <untrusted-content-ID>\n\
              -- 2026-09-24 --\n\
-             00:06 other: [forwarded] shipped [attachment: log.txt]"
+             00:06 other: [forwarded] shipped [attachment: log.txt]\n\
+             </untrusted-content-ID>"
         );
         assert_eq!(
-            render_history(&[], BOT, 100, &chrono::Utc),
+            render_history(&[], (BOT, "7"), 100, &chrono::Utc).unwrap(),
             "No messages in this chat yet."
         );
+    }
+
+    #[test]
+    fn a_full_history_fits_one_result_with_its_fences() {
+        // The user and someone else take turns, each on a day of their own,
+        // so every other line opens a fence and a day.
+        let page: Vec<Value> = (0..500)
+            .map(|n| {
+                json!({"id": n.to_string(), "content": "word ".repeat(40),
+                       "timestamp": format!("2026-{:02}-{:02}T10:00:00+00:00", 1 + n / 28 % 12, 1 + n % 28),
+                       "author": {"id": if n % 2 == 0 { "7" } else { "8" }, "username": "someone"}})
+            })
+            .collect();
+        let out = render_history(&page, (BOT, "7"), super::HISTORY_BUDGET, &chrono::Utc).unwrap();
+        assert!(out.len() <= crate::chat::MAX_TOOL_CHARS, "{}", out.len());
+        assert!(out.matches("<untrusted-content-").count() > 10, "{out}");
     }
 
     /// Reads a real channel. `LETRONNA_TEST_DISCORD_BOT=<token>
@@ -1371,6 +1475,7 @@ mod discord_tests {
                     token: env("LETRONNA_TEST_DISCORD_BOT"),
                     channel: env("LETRONNA_TEST_DISCORD_CHANNEL"),
                     bot_id: String::new(),
+                    owner: String::new(),
                 }),
                 ..Default::default()
             }),
