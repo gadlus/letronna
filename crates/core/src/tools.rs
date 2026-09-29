@@ -565,6 +565,13 @@ pub fn summary(name: &str, args: &str) -> String {
     let mut v: Value = serde_json::from_str(args).unwrap_or(Value::Null);
     rename_aliases(name, &mut v);
     let text = match name {
+        "search_sessions" if v["session"].is_u64() => {
+            format!(
+                "session {} #{}",
+                v["session"],
+                v["around"].as_u64().unwrap_or(0)
+            )
+        }
         "search" | "search_sessions" => v["pattern"]
             .as_str()
             .or(v["query"].as_str())
@@ -1291,43 +1298,126 @@ impl Tool for SearchSessions {
         "search_sessions"
     }
     fn description(&self) -> &'static str {
-        "Search what was said in the user's earlier Letronna sessions for a word or phrase, ignoring case. Returns the matching lines with each session's id, title and age, newest sessions first. Use it when the user refers to something from an earlier conversation, or when an earlier session may already hold the answer."
+        "Search what was said in the user's earlier Letronna sessions, ignoring case. A match holds every word of the query (\"quoted words\" stay together), or when nothing does, some of them; matches on rarer words come first. Titles and tool call arguments are searched too; the current session is left out. Each match gives the session's id, title and age and the message's #. To read the messages around a match, call again with session and around. Use it when the user refers to something from an earlier conversation, or when an earlier session may already hold the answer."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
-            "query": {"type": "string"},
-            "limit": {"type": "integer", "description": "How many matches at most. Default 20."}
-        }, "required": ["query"]})
+            "query": {"type": "string", "description": "The words to find. With session, the words to center long messages on."},
+            "limit": {"type": "integer", "description": "How many matches at most. Default 20."},
+            "after": {"type": "string", "description": "Only sessions last used on or after this date, such as 2026-09-01, or this many days ago, such as 7d."},
+            "before": {"type": "string", "description": "Only sessions last used before this date, or this many days ago."},
+            "session": {"type": "integer", "description": "Read the messages of this session around one message instead of searching."},
+            "around": {"type": "integer", "description": "With session: the # of the message to read, with the three either side of it. Default 0."}
+        }})
     }
-    fn run(&self, args: &Value, _: &ToolContext) -> Result<String, String> {
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         let query = args["query"].as_str().unwrap_or_default().trim();
+        if let Some(id) = args["session"].as_u64() {
+            let around = args["around"].as_u64().unwrap_or(0) as usize;
+            return read_around(id, around, query);
+        }
         if query.is_empty() {
             return Err("Query is empty.".into());
         }
         let limit = args["limit"].as_u64().unwrap_or(20).clamp(1, 50) as usize;
-        let hits = crate::store::search(query, limit);
+        let now = crate::chat::now();
+        let date = |key: &str| {
+            args[key]
+                .as_str()
+                .map(|text| day_or_days(text, now))
+                .transpose()
+        };
+        let within = crate::store::Within {
+            exclude: ctx.conversation,
+            after: date("after")?,
+            before: date("before")?,
+        };
+        let hits = crate::store::search(query, &within, limit);
         if hits.is_empty() {
             return Ok(format!("No earlier session mentions \"{query}\"."));
         }
         let lines: Vec<String> = hits
             .iter()
             .map(|hit| {
-                let title = match hit.title.trim() {
-                    "" => "untitled",
-                    title => title,
-                };
+                let title = shown_title(&hit.title);
                 let when = crate::chat::ago(hit.updated);
+                let place = hit.ordinal.map(|n| format!("#{n} ")).unwrap_or_default();
                 format!(
-                    "{}  {title}  ({when}) {}: {}",
+                    "{}  {title}  ({when}) {place}{}: {}",
                     hit.id, hit.role, hit.snippet
                 )
             })
             .collect();
         Ok(format!(
-            "id  title  (when) who: what was said\n{}\n\nThe user opens one with /resume, or `letronna --resume <id>`.",
+            "id  title  (when) #message who: what was said\n{}\n\nRead around a match with session and around. The user opens one with /resume, or `letronna --resume <id>`.",
             lines.join("\n")
         ))
     }
+}
+
+/// Messages read either side of the one asked for.
+const READ_SIDE: usize = 3;
+/// Characters shown of each message read: seven of them with their labels
+/// stay under the chat's cap on a tool result, which would cut their middle.
+const READ_CHARS: usize = 1_000;
+
+/// The messages of session `id` either side of message `around`, each cut
+/// around the words of `query` when it is long.
+fn read_around(id: u64, around: usize, query: &str) -> Result<String, String> {
+    let Some(session) = crate::store::saved(id) else {
+        return Err(format!("There is no saved session {id}."));
+    };
+    let count = session.messages.len();
+    if around >= count {
+        return Err(format!(
+            "Session {id} has {count} messages, #0 to #{}.",
+            count.saturating_sub(1)
+        ));
+    }
+    let from = around.saturating_sub(READ_SIDE);
+    let to = (around + READ_SIDE).min(count - 1);
+    let title = shown_title(&session.title);
+    let mut out = format!(
+        "Session {id}  {title}  ({}), messages #{from} to #{to} of {count}:",
+        crate::chat::ago(session.updated)
+    );
+    for (n, message) in session.messages.iter().enumerate().take(to + 1).skip(from) {
+        let who = if message.notice {
+            "notice"
+        } else {
+            &message.role
+        };
+        let text = crate::store::searched(message);
+        let said = crate::store::excerpt(&text, query, READ_CHARS);
+        out.push_str(&format!("\n#{n} {who}: {said}"));
+    }
+    Ok(out)
+}
+
+/// A session's title on one line and cut short, as a renamed session's
+/// title can be any length and is shown on every line that names it.
+fn shown_title(title: &str) -> String {
+    match one_line(title) {
+        title if title.is_empty() => "untitled".into(),
+        title if title.chars().count() > 100 => title.chars().take(100).chain(['…']).collect(),
+        title => title,
+    }
+}
+
+/// Seconds since 1970 for an `after` or `before` argument: a date such as
+/// 2026-09-01, from the start of that day here, or days ago such as 7d.
+fn day_or_days(text: &str, now: u64) -> Result<u64, String> {
+    let text = text.trim();
+    if let Some(days) = text.strip_suffix('d').and_then(|d| d.parse::<u64>().ok()) {
+        return Ok(now.saturating_sub(days.saturating_mul(86_400)));
+    }
+    let wrong = || format!("\"{text}\" is not a date such as 2026-09-01, nor days ago such as 7d.");
+    let day = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").map_err(|_| wrong())?;
+    let start = day
+        .and_hms_opt(0, 0, 0)
+        .and_then(|t| t.and_local_timezone(chrono::Local).earliest())
+        .ok_or_else(wrong)?;
+    Ok(start.timestamp().max(0) as u64)
 }
 
 struct ReadJob;
@@ -1974,6 +2064,21 @@ impl Tool for Search {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_session_search_date_is_a_day_here_or_days_ago() {
+        let now = 1_800_000_000;
+        assert_eq!(day_or_days("7d", now), Ok(now - 7 * 86_400));
+        assert_eq!(day_or_days(" 0d ", now), Ok(now));
+        let day = day_or_days("2026-09-01", now).unwrap();
+        let local = chrono::TimeZone::timestamp_opt(&chrono::Local, day as i64, 0).unwrap();
+        assert_eq!(local.format("%F %T").to_string(), "2026-09-01 00:00:00");
+        for wrong in ["yesterday", "7", "2026-13-01", "-3d"] {
+            let refused = day_or_days(wrong, now);
+            assert!(refused.is_err_and(|e| e.contains("7d")), "{wrong}");
+        }
+    }
+
     #[test]
     fn reads_lists_searches_within_workspace() {
         let dir = std::env::temp_dir().join("letronna-tools");
