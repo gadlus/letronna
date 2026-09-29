@@ -249,6 +249,12 @@ pub fn words(reply: &str) -> String {
     let mut said = String::new();
     for sentence in all {
         if said.chars().count() + sentence.chars().count() + 1 > NOTE_CHARACTERS {
+            // A first sentence longer than one request takes, such as a long
+            // line with no stop in it, is said as far as it fits rather
+            // than leaving nothing to say.
+            if said.is_empty() {
+                said = sentence.chars().take(NOTE_CHARACTERS).collect();
+            }
             break;
         }
         if !said.is_empty() {
@@ -610,6 +616,14 @@ mod tests {
         let pieces: Vec<&str> = pieces.iter().map(String::as_str).collect();
         assert_eq!(all(&[reply]), ["Done."]);
         assert_eq!(all(&pieces), ["Done."]);
+    }
+
+    #[test]
+    fn a_voice_note_of_one_long_line_says_its_start() {
+        let long = "word ".repeat(2000);
+        let said = words(&long);
+        assert!(!said.is_empty());
+        assert!(said.chars().count() <= NOTE_CHARACTERS);
     }
 
     #[cfg(unix)]
