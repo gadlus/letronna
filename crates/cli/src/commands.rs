@@ -4,7 +4,7 @@
 use letronna_core::agents::Seen;
 use letronna_core::gate::Mode;
 use letronna_core::skills::{Skill, Source};
-use letronna_core::{history, store};
+use letronna_core::{goal, history, store};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
@@ -224,6 +224,19 @@ pub fn command(
         }
         "/btw" => {
             aside(runner, *session, rest);
+            Flow::Handled
+        }
+        "/goal" => {
+            let goal = &mut runner.store.conversations[*session].goal;
+            let said = goal::apply_command(goal, goal::parse(rest));
+            runner.persist();
+            render::blank();
+            match said {
+                Ok(said) => said
+                    .lines()
+                    .for_each(|line| render::line(&render::dim(line))),
+                Err(error) => render::line(&render::red(&error)),
+            }
             Flow::Handled
         }
         "/image" => {

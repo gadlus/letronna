@@ -1480,6 +1480,58 @@ pub fn btw(
     }
 }
 
+/// Puts `question` alone to the helpers' model, or the session's when none
+/// is set, on a run that offers no tool and makes one request, until
+/// `cancel` stops it, and gives back what it said. For a quick look that
+/// needs none of the conversation, so it costs the same however long that
+/// is. Nothing of it is kept.
+pub fn quick(connection: &Connection, question: &str, cancel: Cancel) -> Result<String, String> {
+    let session = connection.conversation;
+    let id = fresh_id();
+    let mut transcript = Transcript::aside(session, connection.workspace.clone())?;
+    let path = transcript.path.clone();
+    transcript.conversation.messages = vec![Message {
+        role: "user".into(),
+        content: question.to_owned(),
+        ..Default::default()
+    }];
+    let mut asking = child(connection, &AgentDef::default(), None, &Limits::read(), id);
+    // No tool schemas either, which would cost more than the question.
+    asking.tools = false;
+    asking.wrap_up = true;
+    let report = driver::run(Spec {
+        connection: asking,
+        transcript,
+        id,
+        owner: session,
+        root: session,
+        run: id,
+        label: "check".into(),
+        allow: Allow::Only(Vec::new()),
+        rounds: 0,
+        cancel,
+        budget: None,
+        status: Arc::default(),
+        depth: 1,
+        fork: false,
+        from: 0,
+        schema: None,
+    });
+    let _ = std::fs::remove_file(path.with_extension("lock"));
+    let _ = std::fs::remove_file(path);
+    match report.status {
+        Outcome::Stopped => Err("Stopped.".into()),
+        Outcome::Failed(error) => Err(error),
+        _ if report.text.trim().is_empty() => Err("No answer came.".into()),
+        _ => Ok(report.text),
+    }
+}
+
+/// An id no helper, run or other agent has, for one that needs its own.
+pub(crate) fn fresh_id() -> AgentId {
+    NEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 /// What the agent that started a helper hears back: how it went, what it
 /// changed, and its report cut to `share` characters, keeping both ends.
 fn answer(name: &str, report: &Report, rounds: usize, share: usize) -> Result<String, String> {

@@ -466,6 +466,37 @@ impl Chat {
         )
     }
 
+    /// The session's standing goal, above the composer while it has one:
+    /// what it is, how many turns it has carried on for, and whether it is
+    /// being looked at now.
+    pub(crate) fn goal_line(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let goal = self.store.conversations[self.store.active].goal.as_ref()?;
+        let mut text = goal.line();
+        if self.checking_goal() {
+            text.push_str(" · checking");
+        }
+        Some(
+            h_flex()
+                .gap_1p5()
+                .items_center()
+                .pb_2()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(
+                    Icon::new(IconName::CircleCheck)
+                        .size_3()
+                        .text_color(cx.theme().primary),
+                )
+                .child(div().flex_1().min_w_0().truncate().child(text)),
+        )
+    }
+
+    /// Whether the goal of the session on screen is being looked at.
+    fn checking_goal(&self) -> bool {
+        let on_screen = self.store.conversations[self.store.active].id;
+        (self.goal_check.as_ref()).is_some_and(|(id, _)| *id == on_screen)
+    }
+
     /// The session's mode, which opens the list of modes to pick from on a
     /// click, or on Enter or Space while it has the focus.
     fn mode_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -665,19 +696,23 @@ impl Chat {
             )
             // Stop only where the reply is: in another session it would end
             // a reply that is not on screen.
-            .when(self.busy && self.busy_elsewhere().is_none(), |row| {
-                // A turn can wait on a slow tool or a card nobody answers;
-                // this is the way out that does not need a restart.
-                row.child(
-                    Button::new("stop")
-                        .ghost()
-                        .xsmall()
-                        .rounded_full()
-                        .icon(Icon::new(IconName::CircleX))
-                        .tooltip_with_action("Stop", &Dismiss, None)
-                        .on_click(cx.listener(|this, _, _, cx| this.stop_turn(cx))),
-                )
-            })
+            // And between turns, while its goal is looked at.
+            .when(
+                (self.busy && self.busy_elsewhere().is_none()) || self.checking_goal(),
+                |row| {
+                    // A turn can wait on a slow tool or a card nobody answers;
+                    // this is the way out that does not need a restart.
+                    row.child(
+                        Button::new("stop")
+                            .ghost()
+                            .xsmall()
+                            .rounded_full()
+                            .icon(Icon::new(IconName::CircleX))
+                            .tooltip_with_action("Stop", &Dismiss, None)
+                            .on_click(cx.listener(|this, _, _, cx| this.stop_turn(cx))),
+                    )
+                },
+            )
             // While a reply runs, sending queues the message for its next
             // step, as in Claude Code, rather than doing nothing.
             .child(

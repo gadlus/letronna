@@ -1,5 +1,5 @@
 use crate::prelude::*;
-use letronna_core::{agent, agents, approvals, inbox};
+use letronna_core::{agent, agents, approvals, goal, inbox};
 
 pub(crate) const BRAND: &str = "Letronna";
 
@@ -335,6 +335,9 @@ pub(crate) struct Chat {
     pub(crate) note: Option<String>,
     /// Hook failures to show once, the next time the window is drawn.
     pub(crate) hook_note: Option<String>,
+    /// The session whose goal is being looked at after its turn, and what
+    /// ends the look when the user stops or sends.
+    pub(crate) goal_check: Option<(u64, letronna_core::cancel::Cancel)>,
     /// How many times this turn a Stop hook has sent the model back to work.
     pub(crate) stop_blocks: u32,
     pub(crate) scroll: ScrollHandle,
@@ -677,6 +680,7 @@ impl Chat {
             updating: Default::default(),
             note: None,
             hook_note: None,
+            goal_check: None,
             stop_blocks: 0,
             scroll: ScrollHandle::new(),
             following: true,
@@ -819,6 +823,19 @@ impl Chat {
                 .update(cx, |input, cx| input.set_value("", window, cx));
             return self.ask_aside(question, cx);
         }
+        if let Some(args) = goal_command(&prompt) {
+            let command = goal::parse(args);
+            let ix = self.store.active;
+            match goal::apply_command(&mut self.store.conversations[ix].goal, command) {
+                Ok(said) => self.note = Some(said),
+                Err(error) => self.error = Some(error),
+            }
+            self.composer
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            self.save();
+            cx.notify();
+            return;
+        }
         if self.busy && !prompt.is_empty() {
             return self.queue_follow_up(prompt, window, cx);
         }
@@ -934,7 +951,13 @@ impl Chat {
         };
         self.store.settings.endpoint = connection.endpoint.clone();
         self.store.pin(self.store.active);
+        // A new message is the user's next step, whatever a look at the goal
+        // was about to say.
+        if let Some((_, check)) = self.goal_check.take() {
+            check.set();
+        }
         let conversation = &mut self.store.conversations[self.store.active];
+        goal::interrupted(&mut conversation.goal);
         // Name an untitled session after its first prompt, but leave a name
         // that was set deliberately, such as a scheduled job's.
         if conversation.messages.is_empty()
@@ -2381,6 +2404,15 @@ impl Chat {
     /// error. What the turn got to is kept: the reply so far, or the batch's
     /// results with every call left answered as stopped.
     pub(crate) fn stop_turn(&mut self, cx: &mut Context<Self>) {
+        // A look at the goal between turns stops as a turn does.
+        if let Some((id, check)) = self.goal_check.take() {
+            check.set();
+            if let Some(ix) = self.store.index_of(id) {
+                goal::interrupted(&mut self.store.conversations[ix].goal);
+                self.save();
+            }
+            cx.notify();
+        }
         if !self.busy {
             return;
         }
@@ -2492,10 +2524,91 @@ impl Chat {
         self.stop_blocks = 0;
         plugins::emit(cx, plugins::AppEvent::ChatIdle);
         self.send_follow_ups(session, cx);
+        if stopped && let Some(ix) = session.and_then(|id| self.store.index_of(id)) {
+            goal::interrupted(&mut self.store.conversations[ix].goal);
+            self.save();
+        }
         // Stop means stop, and after a failure the next turn would most
         // likely fail too: what is waiting goes in at the next ring or prompt.
-        if !stopped && self.error.is_none() {
+        // A goal is looked at first, and the notices wait for its answer.
+        if !stopped && self.error.is_none() && !session.is_some_and(|id| self.review_goal(id, cx)) {
             self.wake_idle(cx);
+        }
+        cx.notify();
+    }
+
+    /// Looks at the goal of session `id`, whose turn ended by itself, off
+    /// the UI thread, then carries on toward it or says why not. False when
+    /// there is nothing to look at, or a message the user sent went first.
+    fn review_goal(&mut self, id: u64, cx: &mut Context<Self>) -> bool {
+        if self.busy {
+            return false;
+        }
+        let Some(ix) = self.store.index_of(id) else {
+            return false;
+        };
+        let Some(standing) = self.store.conversations[ix].goal.clone() else {
+            return false;
+        };
+        let mut connection = match self.connection_for(ix, None) {
+            Ok(connection) => connection,
+            Err(error) => {
+                self.error = Some(error);
+                return false;
+            }
+        };
+        // Where the check command runs.
+        connection.workspace = self.store.conversations[ix].workspace.clone();
+        let reply = (self.store.conversations[ix].messages.iter())
+            .rfind(|message| message.role == "assistant")
+            .map(|message| message.content.clone())
+            .unwrap_or_default();
+        let cancel = letronna_core::cancel::Cancel::default();
+        if let Some((_, earlier)) = self.goal_check.replace((id, cancel.clone())) {
+            earlier.set();
+        }
+        let (sender, receiver) = async_channel::bounded(1);
+        let stop = cancel.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send_blocking(goal::review(&standing, &connection, &reply, &stop));
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(step) = receiver.recv().await {
+                let _ = this.update(cx, |this, cx| this.after_goal_review(id, &cancel, step, cx));
+            }
+        })
+        .detach();
+        true
+    }
+
+    /// Acts on what the look at session `id`'s goal came to, unless the
+    /// user stopped or sent something meanwhile.
+    fn after_goal_review(
+        &mut self,
+        id: u64,
+        cancel: &letronna_core::cancel::Cancel,
+        step: goal::Step,
+        cx: &mut Context<Self>,
+    ) {
+        if cancel.is_set() {
+            return;
+        }
+        self.goal_check = None;
+        let Some(ix) = self.store.index_of(id).filter(|_| !self.busy) else {
+            return cx.notify();
+        };
+        goal::settle(&mut self.store.conversations[ix].goal, &step);
+        self.save();
+        match step {
+            goal::Step::Continue { notice, message } => {
+                self.note = Some(notice);
+                self.start_in(id, goal::continuation(message), cx);
+            }
+            goal::Step::Met(notice) | goal::Step::Stop(notice) => {
+                self.note = Some(notice);
+                self.wake_idle(cx);
+            }
+            goal::Step::Cleared => self.wake_idle(cx),
         }
         cx.notify();
     }
@@ -2994,6 +3107,7 @@ impl Render for Chat {
                         .pb_2()
                         .children(self.busy_note(cx))
                         .children(self.todo_panel(cx))
+                        .children(self.goal_line(cx))
                         .child(self.composer(pane < px(600.), cx)),
                 )
             })
@@ -3143,6 +3257,12 @@ pub(crate) fn running_calls(turn: &agent::Turn, outstanding: usize) -> Vec<backe
 /// once `replying`, the session a reply runs in, is not that one.
 fn escape_closes_aside(asked: u64, here: u64, replying: Option<u64>) -> bool {
     asked == here && replying != Some(here)
+}
+
+/// What follows `/goal` in `prompt`, when that is what it is.
+fn goal_command(prompt: &str) -> Option<&str> {
+    let rest = prompt.strip_prefix("/goal")?;
+    (rest.is_empty() || rest.starts_with(char::is_whitespace)).then_some(rest)
 }
 
 /// The question a /btw line asks, empty when it names none, or None for any

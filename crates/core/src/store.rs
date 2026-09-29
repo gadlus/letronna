@@ -58,6 +58,9 @@ pub struct Conversation {
     /// How hard the model thinks in this session; `None` follows the settings.
     #[serde(default)]
     pub effort: Option<String>,
+    /// What the session keeps working toward after each turn, if anything.
+    #[serde(default)]
+    pub goal: Option<crate::goal::Goal>,
     /// Messages already on disk. Everything past this is appended on save.
     /// Only `flush` and `rewind` should touch it; it is visible because
     /// callers build a Conversation with `..Default::default()`.
@@ -103,6 +106,8 @@ pub struct Meta {
     pub gateway: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<crate::goal::Goal>,
 }
 
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -561,6 +566,7 @@ impl Conversation {
             model: self.model.clone(),
             gateway: self.gateway.clone(),
             effort: self.effort.clone(),
+            goal: self.goal.clone(),
         }
     }
 
@@ -706,6 +712,7 @@ fn replay(path: &std::path::Path) -> Option<Conversation> {
                 conversation.model = meta.model;
                 conversation.gateway = meta.gateway;
                 conversation.effort = meta.effort;
+                conversation.goal = meta.goal;
             }
             Ok(Record::Message(message)) => conversation.messages.push(message),
             Ok(Record::Rewind { to }) => {
@@ -842,6 +849,8 @@ pub struct Summary {
     pub model: Option<String>,
     pub gateway: Option<String>,
     pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<crate::goal::Goal>,
 }
 
 /// The sessions on disk, newest first, without loading what is in them.
@@ -1033,6 +1042,7 @@ fn tally(summary: &mut Summary, bytes: &[u8]) {
                 summary.model = meta.model;
                 summary.gateway = meta.gateway;
                 summary.effort = meta.effort;
+                summary.goal = meta.goal;
             }
             Ok(Record::Message(_)) => summary.messages += 1,
             Ok(Record::Rewind { to }) => summary.messages = summary.messages.min(to),
@@ -1617,6 +1627,7 @@ pub fn load_listing() -> Store {
                 model: s.model,
                 gateway: s.gateway,
                 effort: s.effort,
+                goal: s.goal,
                 counted: s.messages,
                 ..Default::default()
             };
@@ -4054,5 +4065,25 @@ pub(crate) mod tests {
         assert!(running.exists() && other.exists());
         assert!(!dir.join("agents").exists());
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_goal_is_kept_with_its_session_and_cleared_on_disk_too() {
+        let dir = scratch("goal");
+        let path = dir.join("1.jsonl");
+        let mut conversation = tagged(1, "goal");
+        conversation.flush_to(&path).unwrap();
+        // A session without one writes no more than before goals existed.
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("goal\""));
+        let goal = crate::goal::Goal {
+            continuations: 3,
+            ..crate::goal::Goal::new("ship it", Some("cargo test".into()))
+        };
+        conversation.goal = Some(goal.clone());
+        conversation.flush_to(&path).unwrap();
+        assert_eq!(replay(&path).unwrap().goal, Some(goal));
+        conversation.goal = None;
+        conversation.flush_to(&path).unwrap();
+        assert_eq!(replay(&path).unwrap().goal, None);
     }
 }

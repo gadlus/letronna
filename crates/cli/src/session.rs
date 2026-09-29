@@ -12,7 +12,7 @@ use letronna_core::chat::{self, Connection, Event, Message, ToolCall};
 use letronna_core::gate::{self, Gate, Grants, Mode};
 use letronna_core::inbox;
 use letronna_core::store::{Conversation, Store};
-use letronna_core::{hooks, permissions, tools};
+use letronna_core::{goal, hooks, permissions, tools};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -91,6 +91,7 @@ impl Runner {
                 conversation.title = shown.chars().take(40).collect();
             }
             conversation.updated = chat::now();
+            goal::interrupted(&mut conversation.goal);
         }
         // What came meanwhile goes in ahead of the prompt, so the user's
         // words are the last thing the model reads.
@@ -103,7 +104,8 @@ impl Runner {
         });
         self.persist();
 
-        self.run(connection, session)
+        let answer = self.run(connection, session);
+        self.pursue(session, answer)
     }
 
     /// Run a turn on the notices waiting for an idle session, with nothing
@@ -120,7 +122,84 @@ impl Runner {
         let connection = self.connection(session);
         chat::validate(&connection)?;
         self.take_notices(session, true);
-        self.run(connection, session)
+        let answer = self.run(connection, session);
+        self.pursue(session, answer)
+    }
+
+    /// After a turn that ended by itself, looks at the session's goal and
+    /// carries on toward it, turn after turn, until the look says to stop.
+    /// A stop, or anything typed, ends it where it is.
+    fn pursue(
+        &mut self,
+        session: usize,
+        mut answer: Result<String, String>,
+    ) -> Result<String, String> {
+        loop {
+            if self.stopped || self.bar.finished() {
+                goal::interrupted(&mut self.store.conversations[session].goal);
+                self.persist();
+                return answer;
+            }
+            // What was typed is the user's next turn, which the goal waits for.
+            if answer.is_err() || self.bar.has_queued() {
+                return answer;
+            }
+            let Some(standing) = self.store.conversations[session].goal.clone() else {
+                return answer;
+            };
+            let connection = self.connection(session);
+            let reply = (self.store.conversations[session].messages.iter())
+                .rfind(|message| message.role == "assistant")
+                .map(|message| message.content.clone())
+                .unwrap_or_default();
+            let cancel = Cancel::default();
+            let (sender, receiver) = mpsc::sync_channel(1);
+            let (asking, stop) = (connection.clone(), cancel.clone());
+            std::thread::spawn(move || {
+                let _ = sender.send(goal::review(&standing, &asking, &reply, &stop));
+            });
+            self.bar.working(true);
+            self.bar.wait_line_about("goal check");
+            let waited = self.wait_on(&receiver);
+            self.bar.wait_line(false);
+            self.bar.working(false);
+            let step = match waited {
+                Ok(_) if self.bar.has_queued() => goal::Step::Cleared,
+                Ok(step) => step,
+                Err(Unheard::Stopped) => {
+                    // Stopped as a turn is, so a ring waits for the user too.
+                    self.stopped = true;
+                    render::blank();
+                    render::said(&render::dim("●"), &render::dim("Stopped."));
+                    goal::Step::Cleared
+                }
+                Err(Unheard::Gone) => {
+                    goal::Step::Stop("The goal check ended without a verdict.".into())
+                }
+            };
+            cancel.set();
+            let conversation = &mut self.store.conversations[session];
+            goal::settle(&mut conversation.goal, &step);
+            let (notice, message) = match step {
+                goal::Step::Continue { notice, message } => (notice, Some(message)),
+                goal::Step::Met(notice) | goal::Step::Stop(notice) => (notice, None),
+                goal::Step::Cleared => {
+                    goal::interrupted(&mut conversation.goal);
+                    self.persist();
+                    return answer;
+                }
+            };
+            render::blank();
+            render::said(&render::dim("●"), &render::dim(&notice));
+            let Some(message) = message else {
+                self.persist();
+                return answer;
+            };
+            conversation.messages.push(goal::continuation(message));
+            conversation.updated = chat::now();
+            self.persist();
+            answer = self.run(connection, session);
+        }
     }
 
     /// Ask a side question about the session on a fork of it, with no tools

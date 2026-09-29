@@ -128,6 +128,10 @@ pub const COMMANDS: &[Command] = &[
         blurb: "ask something aside; the answer is not kept",
     },
     Command {
+        name: "/goal",
+        blurb: "keep working until a goal is met: /goal <text>, check <command>, clear",
+    },
+    Command {
         name: "/image",
         blurb: "attach a picture to your next message: /image <path>",
     },
@@ -806,6 +810,11 @@ impl Bar {
             self.settle();
         }
         typed
+    }
+
+    /// Whether anything typed is waiting to be sent or run.
+    pub fn has_queued(&self) -> bool {
+        !self.queued.is_empty()
     }
 
     /// How many queued lines the model's next step would take: those before
