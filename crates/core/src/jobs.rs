@@ -5,7 +5,7 @@
 //! instead. The process keeps running, its output collects in a buffer the
 //! agent can read back, and the chat shows a chip until it is stopped.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Stdio};
@@ -19,7 +19,7 @@ const MAX_LOG: usize = 64_000;
 pub struct Job {
     pub id: u64,
     pub command: String,
-    log: Arc<Mutex<String>>,
+    log: Arc<Mutex<VecDeque<u8>>>,
     child: Arc<Mutex<Child>>,
     /// Set once the process has exited and the reader threads are done.
     finished: Arc<AtomicBool>,
@@ -45,7 +45,7 @@ fn next_id() -> u64 {
 }
 
 /// Drain a pipe into the shared log until the process closes it.
-fn pump(mut source: impl Read + Send + 'static, log: Arc<Mutex<String>>) {
+fn pump(mut source: impl Read + Send + 'static, log: Arc<Mutex<VecDeque<u8>>>) {
     std::thread::spawn(move || {
         let mut block = [0u8; 4096];
         loop {
@@ -53,19 +53,41 @@ fn pump(mut source: impl Read + Send + 'static, log: Arc<Mutex<String>>) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let Ok(mut log) = log.lock() else { break };
-                    log.push_str(&String::from_utf8_lossy(&block[..n]));
-                    if log.len() > MAX_LOG {
-                        // Keep the tail: the newest output is what matters.
-                        let cut = log.len() - MAX_LOG;
-                        let cut = (cut..log.len())
-                            .find(|i| log.is_char_boundary(*i))
-                            .unwrap_or(log.len());
-                        *log = log[cut..].to_owned();
-                    }
+                    append(&mut log, &block[..n]);
                 }
             }
         }
     });
+}
+
+/// Add output to the log, dropping its oldest bytes beyond `MAX_LOG`.
+fn append(log: &mut VecDeque<u8>, bytes: &[u8]) {
+    log.extend(bytes);
+    // Keep the tail: the newest output is what matters.
+    let over = log.len().saturating_sub(MAX_LOG);
+    log.drain(..over);
+}
+
+/// The log as text, starting at its first whole character.
+fn text(log: &mut VecDeque<u8>) -> String {
+    let bytes = log.make_contiguous();
+    // Dropping bytes can leave the tail of a cut character at the front, and a
+    // character is at most four bytes, so at most three of them.
+    let start = bytes
+        .iter()
+        .take(3)
+        .take_while(|b| **b & 0xC0 == 0x80)
+        .count();
+    let mut text = String::from_utf8_lossy(&bytes[start..]).into_owned();
+    // A byte that was never text decodes to a three-byte replacement
+    // character, so keep the limit the text always had as well.
+    if text.len() > MAX_LOG {
+        let cut = (text.len() - MAX_LOG..text.len())
+            .find(|i| text.is_char_boundary(*i))
+            .unwrap_or(text.len());
+        text.drain(..cut);
+    }
+    text
 }
 
 pub fn start(command: &str, cwd: &Path) -> Result<u64, String> {
@@ -76,7 +98,7 @@ pub fn start(command: &str, cwd: &Path) -> Result<u64, String> {
         .spawn()
         .map_err(|e| format!("Cannot start the shell: {e}"))?;
 
-    let log = Arc::new(Mutex::new(String::new()));
+    let log = Arc::new(Mutex::new(VecDeque::new()));
     pump(child.stdout.take().unwrap(), log.clone());
     pump(child.stderr.take().unwrap(), log.clone());
 
@@ -136,7 +158,7 @@ pub fn log(id: u64) -> Result<String, String> {
     with_job(id, |job| {
         job.log
             .lock()
-            .map(|l| crate::tools::strip_escapes(&l))
+            .map(|mut l| crate::tools::strip_escapes(&text(&mut l)))
             .unwrap_or_default()
     })
 }
@@ -244,5 +266,28 @@ mod tests {
             log(id).unwrap()
         );
         assert_eq!(log(id).unwrap().trim_end(), "done");
+    }
+
+    #[test]
+    fn a_full_log_keeps_the_newest_whole_characters() {
+        // Three-byte characters in pump-sized reads: reads split characters,
+        // and the byte limit lands inside one.
+        let output = "€".repeat(30_000) + "newest";
+        let mut log = VecDeque::new();
+        for read in output.as_bytes().chunks(4096) {
+            append(&mut log, read);
+        }
+        assert_eq!(log.len(), MAX_LOG);
+        let kept = (MAX_LOG - "newest".len()) / "€".len();
+        assert_eq!(text(&mut log), "€".repeat(kept) + "newest");
+    }
+
+    #[test]
+    fn output_that_was_never_text_reads_back_within_the_limit() {
+        let mut log = VecDeque::new();
+        append(&mut log, &[0xFF; MAX_LOG]);
+        let read = text(&mut log);
+        assert!(read.len() <= MAX_LOG, "{} bytes", read.len());
+        assert!(read.chars().all(|c| c == char::REPLACEMENT_CHARACTER));
     }
 }
