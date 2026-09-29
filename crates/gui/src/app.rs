@@ -1552,12 +1552,14 @@ impl Chat {
             .messages
             .extend(inbox::fold(&inbox::take(conversation.id, false)));
         // What you sent while it worked goes in now, before the model is
-        // asked again, so it reads it before going on.
+        // asked again, so it reads it before going on, with its `@` paths
+        // attached as a message sent on its own has them.
+        let workspace = conversation.workspace.clone();
         conversation
             .messages
             .extend(self.follow_ups.drain(..).map(|text| Message {
                 role: "user".into(),
-                content: text,
+                content: letronna_core::references::expand(&text, workspace.as_deref()),
                 folded: true,
                 ..Default::default()
             }));
