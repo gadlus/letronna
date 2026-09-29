@@ -20,7 +20,7 @@ impl Global for MainChat {}
 
 /// The quick entry window, while one is open. Its absence is how [`toggle`]
 /// knows whether to open a new one or dismiss the one already showing.
-struct Open(WindowHandle<QuickEntry>);
+struct Open(WindowHandle<Root>);
 impl Global for Open {}
 
 pub(crate) fn init(cx: &mut App) {
@@ -53,7 +53,12 @@ pub(crate) fn toggle(cx: &mut App) {
             show: true,
             ..Default::default()
         },
-        move |window, cx| cx.new(|cx| QuickEntry::new(chat.clone(), window, cx)),
+        move |window, cx| {
+            let bar = cx.new(|cx| QuickEntry::new(chat.clone(), window, cx));
+            // The input reads and writes its focus through the window's
+            // `Root` as it paints, and panics on a window that has none.
+            cx.new(|cx| Root::new(bar, window, cx))
+        },
     ) else {
         return;
     };
