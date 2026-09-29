@@ -64,7 +64,12 @@ impl Chat {
                                 cx.listener(|this, _, window, cx| this.toggle_panel(window, cx)),
                             ),
                     )
-                    .children(crate::ui::profiles::title_label(cx))
+                    .children(self.profile_label.clone().map(|name| {
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(name)
+                    }))
                     .child(self.account_chip(cx)),
             )
     }

@@ -207,6 +207,8 @@ pub(crate) struct Chat {
     pub(crate) job_prompt: Entity<InputState>,
     /// The name field on the New profile dialog.
     pub(crate) profile_name: Entity<InputState>,
+    /// The active profile's name for the title bar, once there are several.
+    pub(crate) profile_label: Option<String>,
     pub(crate) messaging: letronna_core::messaging::Config,
     /// The code the Messaging page shows for pairing a Telegram chat.
     pub(crate) pairing: Option<letronna_core::messaging::pairing::Code>,
@@ -624,6 +626,7 @@ impl Chat {
             job_name,
             job_prompt,
             profile_name,
+            profile_label: crate::ui::profiles::title_label(),
             messaging: letronna_core::messaging::load(),
             pairing: None,
             scheduled: std::collections::HashSet::new(),

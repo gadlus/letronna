@@ -110,6 +110,8 @@ impl Chat {
     }
 
     /// Make the profile the New profile dialog asked for, then switch to it.
+    /// The copy runs off the window's thread: a profile with a browser
+    /// folder or a long history is a lot of files.
     fn create_profile(
         &mut self,
         name: String,
@@ -122,20 +124,37 @@ impl Chat {
             cx.notify();
             return;
         }
-        let profile = match letronna_core::profiles::create(&name, clone_from.as_deref()) {
-            Ok(profile) => profile,
-            Err(err) => {
-                self.error = Some(err);
-                cx.notify();
-                return;
-            }
-        };
-        if let Err(err) = letronna_core::profiles::switch(&profile.name) {
-            self.error = Some(err);
-            cx.notify();
-            return;
-        }
-        self.reload_profile(window, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let made = cx
+                .background_executor()
+                .spawn(async move { letronna_core::profiles::create(&name, clone_from.as_deref()) })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                // A reply may have started while the copy ran, and would
+                // now be cut off from the folder it began in.
+                let profile = match made {
+                    Ok(profile) => profile,
+                    Err(err) => {
+                        this.error = Some(err);
+                        cx.notify();
+                        return;
+                    }
+                };
+                if let Some(why) = this.profile_switch_blocked() {
+                    this.error = Some(format!("Profile \"{}\" was made. {why}", profile.name));
+                    this.profile_label = title_label();
+                    cx.notify();
+                    return;
+                }
+                if let Err(err) = letronna_core::profiles::switch(&profile.name) {
+                    this.error = Some(err);
+                    cx.notify();
+                    return;
+                }
+                this.reload_profile(window, cx);
+            });
+        })
+        .detach();
     }
 
     /// Re-read everything the active profile owns -- its sessions, keys,
@@ -272,6 +291,7 @@ impl Chat {
         self.page = Page::Chat;
         self.error = None;
         self.teams = Vec::new();
+        self.profile_label = title_label();
         self.restart_messaging(cx);
         self.refresh_account(cx);
         self.load_models(window, cx);
@@ -282,18 +302,10 @@ impl Chat {
 
 /// The active profile's name, small, next to the account chip -- shown only
 /// once there is more than one, so a single-profile window still just says
-/// nothing about it.
-pub(crate) fn title_label(cx: &App) -> Option<impl IntoElement> {
-    let profiles = letronna_core::profiles::list();
-    if profiles.len() <= 1 {
-        return None;
-    }
-    Some(
-        div()
-            .text_xs()
-            .text_color(cx.theme().muted_foreground)
-            .child(letronna_core::profiles::active()),
-    )
+/// nothing about it. Read from disk here, not while drawing, which happens
+/// on every frame of a streaming reply.
+pub(crate) fn title_label() -> Option<String> {
+    (letronna_core::profiles::list().len() > 1).then(letronna_core::profiles::active)
 }
 
 /// The "Profile: …" item in the account chip's menu: a submenu listing
