@@ -292,18 +292,24 @@ pub(crate) fn note(conversation: u64) -> Option<String> {
     let mut note =
         String::from("(From Letronna, not part of the above: what the language server says.)");
     if !errors.is_empty() {
-        note.push_str("\nNew errors since your last edit:");
-        for line in errors.iter().take(MAX_LINES) {
-            note.push('\n');
-            note.push_str(line);
-        }
+        // Scrubbed as a command's output is, and fenced: an error quotes the
+        // project -- its strings, a macro's own words -- which a note in
+        // Letronna's voice must not vouch for.
+        let listed: Vec<&str> = errors.iter().take(MAX_LINES).map(String::as_str).collect();
+        let listed = crate::redact::scrub(&listed.join("\n"), true);
+        note.push('\n');
+        note.push_str(&crate::untrusted::quoted(
+            "New errors since your last edit:",
+            &listed,
+        ));
         if errors.len() > MAX_LINES {
             note.push_str(&format!("\n... and {} more.", errors.len() - MAX_LINES));
         }
     }
     for why in gone {
         note.push('\n');
-        note.push_str(&why);
+        // It can carry what the server said as it failed.
+        note.push_str(&crate::redact::scrub(&why, true));
     }
     Some(note)
 }
@@ -1153,7 +1159,8 @@ mod tests {
 
         let said = note(owner).unwrap();
         assert!(
-            said.contains("New errors since your last edit:\nmain.rs:3: expected i32, found &str"),
+            said.contains("New errors since your last edit:\n<untrusted-content-")
+                && said.contains("\nmain.rs:3: expected i32, found &str\n</untrusted-content-"),
             "{said}"
         );
         assert!(
@@ -1192,6 +1199,22 @@ mod tests {
                 .contains("lib.rs:1: cannot find value `x`")
         );
         stop(owner);
+    }
+
+    #[test]
+    fn errors_reach_the_model_fenced_with_keys_hidden() {
+        let owner = session();
+        let (dir, file, _) = project("fenced", owner, Fake::Checks);
+        let path = dir.join("main.rs");
+        let key = "ghp_0123456789abcdefghijABCDEFGHIJ012345";
+        let broken = format!("ERROR: expected u32, found \"{key}\"\n");
+        edit(&file, owner, &dir, &path, None, &broken);
+        let said = note(owner).unwrap();
+        stop(owner);
+        assert!(!said.contains(key), "{said}");
+        let (head, fenced) = said.split_once("<untrusted-content-").unwrap();
+        assert!(head.starts_with("(From Letronna"), "{said}");
+        assert!(fenced.contains("main.rs:1: expected u32, found"), "{said}");
     }
 
     #[test]
