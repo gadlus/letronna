@@ -1,6 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 mod app;
 mod assets;
+mod highlight;
 mod platform;
 mod plugins;
 mod prelude;
@@ -34,6 +35,7 @@ fn main() {
     letronna_core::diag::init("gui");
     Application::new().with_assets(Assets).run(|cx| {
         gpui_component::init(cx);
+        highlight::register();
         plugins::init(
             cx,
             vec![

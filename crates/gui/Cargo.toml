@@ -23,6 +23,20 @@ image = "0.25"
 # Plays speech a tool made, in the chat: playback and the formats voices come
 # back in, and no recording.
 rodio = { version = "0.22", default-features = false, features = ["playback", "mp3", "wav", "flac", "vorbis"] }
+# Grammars registered by hand with gpui-component's `LanguageRegistry`
+# (see src/highlight.rs), instead of its `tree-sitter-languages` feature,
+# which links all 27 of its bundled grammars whether a chat shows them or
+# not. `tree-sitter` itself and `tree-sitter-json` come in already, via
+# gpui-component.
+tree-sitter = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-toml-ng = "0.7"
+tree-sitter-yaml = "0.7"
+tree-sitter-bash = "0.23"
+tree-sitter-diff = "0.1"
 
 [target.'cfg(windows)'.dependencies]
 tray-icon = "0.25"
