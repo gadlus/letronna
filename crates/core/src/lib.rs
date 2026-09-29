@@ -11,6 +11,7 @@ pub mod auth;
 pub mod browser;
 mod cdp;
 pub mod chat;
+pub mod command;
 pub mod compact;
 mod edit;
 pub mod failure;

@@ -218,6 +218,20 @@ pub fn run(name: &str, args: &str, ctx: &ToolContext) -> Result<String, String> 
         ));
     }
     let args = parse_args(args)?;
+    // Refused however the call was approved: with approvals skipped, --yes
+    // or an unattended schedule there was no card to stop it.
+    if name == "run_command" {
+        let line = args["command"].as_str().unwrap_or_default();
+        let dialect = crate::command::Dialect::here();
+        let judged = crate::command::assess(line, dialect, ctx.workspace.as_deref());
+        if let crate::command::Risk::Hardline(why) = judged.risk {
+            return Err(format!(
+                "Refused: this command {why}. Letronna never runs that, whatever the \
+                 approval setting; if it is really meant, the user can run it \
+                 themselves, outside Letronna."
+            ));
+        }
+    }
     let mut out = tool.run(&args, ctx)?;
     if out.len() > MAX_OUTPUT {
         let cut = out.floor_char_boundary(MAX_OUTPUT);
@@ -887,7 +901,7 @@ impl Tool for Todo {
     }
 }
 
-fn home() -> Option<PathBuf> {
+pub(crate) fn home() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
@@ -1446,5 +1460,14 @@ World"
         };
         let out = run_shell(print, None).unwrap();
         assert_eq!(out.trim_end(), "red plain");
+    }
+
+    #[test]
+    fn a_catastrophic_command_is_refused_however_it_was_approved() {
+        // No project folder either, so were the refusal missing it still
+        // could not start.
+        let args = r#"{"command": "Remove-Item -Recurse -Force ~"}"#;
+        let refused = run("run_command", args, &ToolContext::default()).unwrap_err();
+        assert!(refused.contains("deletes the home folder"), "{refused}");
     }
 }
