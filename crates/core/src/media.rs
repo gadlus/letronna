@@ -238,7 +238,14 @@ impl Tool for EditImage {
             files.push(("mask", name.as_path(), bytes.as_slice()));
         }
         let (boundary, body) = forms(&fields, &files);
-        let mut request = client(MAKE_TIME)?
+        // Not followed, as the chat's own requests are not: a 307 would send
+        // the pictures on to wherever the gateway pointed, plain HTTP and
+        // this network included.
+        let mut request = reqwest::blocking::Client::builder()
+            .timeout(MAKE_TIME)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| e.to_string())?
             .post(format!("{base}/images/edits"))
             .header(
                 reqwest::header::CONTENT_TYPE,
@@ -1663,6 +1670,30 @@ mod tests {
         asked.join().unwrap();
         assert!(why.contains("no image edits route"), "{why}");
         assert!(!project.join("media").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_gateway_that_redirects_the_edit_is_not_followed() {
+        let (_turn, dir) = scratch("redirect");
+        let project = dir.join("project");
+        std::fs::write(
+            project.join("cat.png"),
+            picture(4, 4, image::ImageFormat::Png),
+        )
+        .unwrap();
+        let made = picture(2, 2, image::ImageFormat::Png);
+        let reply = json!({"data": [{"b64_json": to_base64(&made)}]}).to_string();
+        let (elsewhere, reached) = gateway("200 OK", &reply);
+        let moved = format!("307 Temporary Redirect\r\nLocation: {elsewhere}/v1/images/edits");
+        let (base, asked) = gateway(&moved, "");
+        let args = json!({"images": ["cat.png"], "prompt": "a hat"});
+        let why = EditImage
+            .run(&args, &on_gateway(&base, &project))
+            .unwrap_err();
+        asked.join().unwrap();
+        assert!(why.contains("answered 307"), "{why}");
+        assert!(!reached.is_finished() && !project.join("media").exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
