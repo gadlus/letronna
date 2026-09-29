@@ -128,12 +128,19 @@ pub fn candidate_at(path: &Path) -> Option<Candidate> {
 
 /// `imported` as a session of its own, at `id`.
 pub fn into_conversation(imported: Imported, id: u64) -> Conversation {
+    // The folder is whatever the file says, and a file can come from another
+    // machine or be written by hand: one that is not a folder here, or is the
+    // root of the disk, would widen what the permission modes treat as inside
+    // the project. Without one the session takes the folder it is opened in.
+    let workspace = imported
+        .workspace
+        .filter(|p| p.is_dir() && p.parent().is_some());
     Conversation {
         id,
         title: imported.title,
         messages: imported.messages,
         updated: imported.updated,
-        workspace: imported.workspace,
+        workspace,
         imported_from: Some(imported.source),
         ..Default::default()
     }
@@ -977,5 +984,34 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].session_id, "codex-abc");
         assert_eq!(found[0].title, "Add a health check endpoint");
+    }
+
+    #[test]
+    fn a_folder_that_is_not_here_is_not_kept() {
+        let imported = |workspace| Imported {
+            source: Source {
+                tool: Tool::Codex,
+                session_id: "s".into(),
+                path: PathBuf::from("s.jsonl"),
+            },
+            title: String::new(),
+            workspace,
+            updated: 0,
+            messages: Vec::new(),
+            skipped: 0,
+        };
+        assert_eq!(
+            into_conversation(imported(Some(PathBuf::from("/nowhere/at/all"))), 1).workspace,
+            None
+        );
+        assert_eq!(
+            into_conversation(imported(Some(PathBuf::from("/"))), 1).workspace,
+            None
+        );
+        let here = std::env::temp_dir();
+        assert_eq!(
+            into_conversation(imported(Some(here.clone())), 1).workspace,
+            Some(here)
+        );
     }
 }
