@@ -110,6 +110,20 @@ impl Runner {
             if !self.work_through(turn, session)? {
                 return Ok(answer);
             }
+            // What was typed while it worked goes in after the results, so
+            // the model reads it before carrying on rather than once the turn
+            // is over. It is on the screen already, echoed when entered.
+            let typed = self.bar.take_typed();
+            if !typed.is_empty() {
+                self.store.conversations[session]
+                    .messages
+                    .extend(typed.into_iter().map(|content| Message {
+                        role: "user".into(),
+                        content,
+                        ..Default::default()
+                    }));
+                self.persist();
+            }
         }
     }
 

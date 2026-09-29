@@ -9,8 +9,9 @@
 //! box goes with everything else, which is the price and a fair one.
 //!
 //! Keys are read on the same loop that pumps the model's reply, so the next
-//! question can be typed while the current one is still being answered; a
-//! line entered mid-answer waits its turn rather than cutting in.
+//! question can be typed while the current one is still being answered. A
+//! line entered while tools are at work goes to the model with their
+//! results; one entered during the last answer waits its turn instead.
 
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
@@ -549,6 +550,18 @@ impl Bar {
         self.echo(text);
         self.queued.push_front(text.to_owned());
         self.settle();
+    }
+
+    /// Take the lines waiting for the model, up to the first command: that
+    /// command, and everything typed after it, stays for the loop to run in
+    /// the order it was typed.
+    pub fn take_typed(&mut self) -> Vec<String> {
+        let plain = self
+            .queued
+            .iter()
+            .take_while(|line| !line.starts_with('/'))
+            .count();
+        self.queued.drain(..plain).collect()
     }
 
     /// Do `work` without the screen going quiet: the waiting line in the
@@ -1477,5 +1490,17 @@ mod tests {
         assert!(!asking.iter().any(|l| l.contains("Plan ·")), "{asking:#?}");
         assert!(asking.iter().any(|l| l.contains("4 Tell it what to do")));
         assert!(asking.last().unwrap().contains("enter to take it"));
+    }
+
+    #[test]
+    fn what_was_typed_goes_in_up_to_the_first_command() {
+        let mut bar = Bar::new(String::new());
+        bar.queued = ["check the tests too", "and the docs", "/where", "then this"]
+            .map(String::from)
+            .into();
+        assert_eq!(bar.take_typed(), ["check the tests too", "and the docs"]);
+        // The command waits for the loop, and so does what came after it.
+        assert_eq!(bar.queued, ["/where", "then this"]);
+        assert!(bar.take_typed().is_empty());
     }
 }
