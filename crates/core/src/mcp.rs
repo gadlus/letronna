@@ -1214,8 +1214,14 @@ fn spawn(config: &ServerConfig, base: &Path) -> Result<std::process::Child, Stri
         if let Some(folder) = &folder {
             command.current_dir(folder);
         }
+        // The server's own variables win over the login shell's, which give
+        // it, and the search for `npx` or `uvx`, the user's PATH. A scrubbed
+        // server takes only the kept names from the login shell too.
+        let login = (crate::login_env::vars().iter())
+            .filter(|(name, _)| !config.env_scrub || KEPT_ENV.iter().any(|kept| *name == **kept));
         command
             .args(args)
+            .envs(login.map(|(name, value)| (name, value)))
             .envs(&config.env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

@@ -946,6 +946,16 @@ fn own_program(path: &Path, me: &Path) -> bool {
 
 /// The platform shell, configured the way every caller needs it.
 pub fn shell(command: &str, cwd: Option<&Path>) -> std::process::Command {
+    shell_over(crate::login_env::vars(), command, cwd)
+}
+
+/// `shell` starting from the login shell's variables `login`, which every
+/// variable set here wins over.
+fn shell_over(
+    login: &[(std::ffi::OsString, std::ffi::OsString)],
+    command: &str,
+    cwd: Option<&Path>,
+) -> std::process::Command {
     use std::process::Command;
     let mut cmd = if cfg!(windows) {
         let mut c = Command::new("powershell");
@@ -957,6 +967,7 @@ pub fn shell(command: &str, cwd: Option<&Path>) -> std::process::Command {
         c.args(["-c", command]);
         c
     };
+    cmd.envs(login.iter().map(|(name, value)| (name, value)));
     // Output is read back as UTF-8, and Python writes to a pipe in the
     // locale's encoding, which on Windows is not. An encoding on its own
     // would make Python strict, and a file name holding bytes that are not
@@ -3006,6 +3017,29 @@ mod tests {
         assert_eq!(
             String::from_utf8_lossy(&out.stdout).trim(),
             "cat cat true 1 dumb"
+        );
+    }
+
+    #[test]
+    fn the_login_shell_gives_commands_its_variables_but_not_a_pager_or_colour() {
+        let login: Vec<(std::ffi::OsString, std::ffi::OsString)> = [
+            ("PAGER", "less"),
+            ("GIT_PAGER", "delta"),
+            ("TERM", "xterm-256color"),
+            ("FROM_PROFILE", "yes"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.into(), value.into()))
+        .collect();
+        let print = if cfg!(windows) {
+            r#"Write-Output "$env:PAGER $env:GIT_PAGER $env:TERM $env:FROM_PROFILE""#
+        } else {
+            r#"echo "$PAGER $GIT_PAGER $TERM $FROM_PROFILE""#
+        };
+        let out = shell_over(&login, print, None).output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "cat cat dumb yes"
         );
     }
 
