@@ -136,12 +136,20 @@ impl Chat {
             )
             .dropdown_menu_with_anchor(gpui::Corner::TopRight, move |menu, _, _| {
                 let (settings, account, auth) = (chat.clone(), chat.clone(), chat.clone());
+                let usage = chat.clone();
                 menu.min_w(px(180.))
                     .item(
                         PopupMenuItem::new("Account")
                             .icon(Icon::new(IconName::CircleUser))
                             .on_click(move |_, window, cx| {
                                 account.update(cx, |this, cx| this.open_account(window, cx))
+                            }),
+                    )
+                    .item(
+                        PopupMenuItem::new("Usage")
+                            .icon(Icon::new(AppIcon::Clock))
+                            .on_click(move |_, window, cx| {
+                                usage.update(cx, |this, cx| this.open_usage(window, cx))
                             }),
                     )
                     .item(

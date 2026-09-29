@@ -20,8 +20,10 @@ use crossterm::event::{
     MouseEventKind,
 };
 use crossterm::terminal;
+use letronna_core::approvals::{self, Request};
 use letronna_core::store::Todo;
 use std::collections::VecDeque;
+use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 use crate::edit::Line;
@@ -90,6 +92,10 @@ pub const COMMANDS: &[Command] = &[
         blurb: "commands still running in the background",
     },
     Command {
+        name: "/agents",
+        blurb: "helpers working for this session; stop one or tell it something",
+    },
+    Command {
         name: "/skills",
         blurb: "skills: use one, switch them on or off, add from GitHub",
     },
@@ -99,7 +105,7 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "/resume",
-        blurb: "pick up a session from before",
+        blurb: "pick up a session; a word finds it by title or what was said",
     },
     Command {
         name: "/undo",
@@ -114,8 +120,16 @@ pub const COMMANDS: &[Command] = &[
         blurb: "carry on in a copy of this session",
     },
     Command {
+        name: "/init",
+        blurb: "have the model write or fill in the project's AGENTS.md",
+    },
+    Command {
         name: "/where",
         blurb: "show the project folder and session file",
+    },
+    Command {
+        name: "/usage",
+        blurb: "tokens and cost: this session, by day and by model",
     },
     Command {
         name: "/clear",
@@ -143,6 +157,15 @@ const MAX_ROWS: usize = 8;
 /// conversation off the screen.
 const QUEUED_LIMIT: usize = 4;
 
+/// How often the helpers are looked in on: four times a second is live to
+/// the eye, and what their lines say changes by the second at most.
+const LOOK: Duration = Duration::from_millis(250);
+
+/// Helpers given a line of their own while a turn runs. The rest share one
+/// line, so a fan-out of helpers cannot squeeze the conversation out of a
+/// short window.
+const RELAY_LIMIT: usize = 4;
+
 /// How long a pump waits for a keystroke before handing the loop back. Short
 /// enough that typing feels immediate, long enough not to spin.
 const TICK: Duration = Duration::from_millis(20);
@@ -155,6 +178,12 @@ const PLAN_ROWS: usize = 5;
 /// Rows of conversation the plan never takes: half of a 24-row terminal, the
 /// shortest in common use, which there still leaves the whole plan its room.
 const PLAN_LEAVES: usize = 12;
+
+/// How long a question that came up on its own has to have been up, and the
+/// typing under it to have stopped, before an enter or a digit answers it:
+/// longer than the gap between keys in a word, shorter than reading the
+/// question takes.
+const STILL: Duration = Duration::from_millis(500);
 
 fn matches(text: &str) -> Vec<&'static Command> {
     if !text.starts_with('/') || text.contains(char::is_whitespace) {
@@ -243,6 +272,8 @@ pub enum Waited {
     Line(String),
     /// The doorbell rang for notices that came while the session sat idle.
     Rang,
+    /// A helper asked for a yes, which `asked` hands over.
+    Asked,
 }
 
 /// A setting with a natural order, picked by sliding along a track rather
@@ -299,8 +330,22 @@ pub struct Bar {
     /// The open session's checklist, shown over the box while any of it is
     /// left to do.
     plan: Vec<Todo>,
+    /// The session whose helpers are shown, or 0 before one is open.
+    helpers_of: u64,
+    /// A line for each of its helpers at work, as last looked at.
+    relay: Vec<String>,
+    /// When the helpers were last looked at.
+    looked: std::time::Instant,
     /// The doorbell for notices, once the conversation listens for them.
     bell: Option<async_channel::Receiver<()>>,
+    /// Helpers' requests for a yes, once the terminal answers them.
+    asks: Option<Receiver<Request>>,
+    /// A request taken but not yet answered: one that ended a wait at the
+    /// prompt, or one put back to be asked later. `asked` hands it over first.
+    held: Option<Request>,
+    /// While a question that came up on its own is open, when it came up or
+    /// when a letter was last typed under it, whichever is later.
+    guard: Option<std::time::Instant>,
 }
 
 impl Bar {
@@ -329,7 +374,13 @@ impl Bar {
             waiting: None,
             ticked: std::time::Instant::now(),
             plan: Vec::new(),
+            helpers_of: 0,
+            relay: Vec::new(),
+            looked: std::time::Instant::now(),
             bell: None,
+            asks: None,
+            held: None,
+            guard: None,
         }
     }
 
@@ -380,8 +431,31 @@ impl Bar {
         }
     }
 
-    /// Wait at the prompt for a whole line, or for the doorbell. `None` when
-    /// the user is done.
+    /// Take helpers' requests for a yes from now on, to put to the user in the
+    /// box. False, taking nothing, when the box is not up.
+    pub fn serve(&mut self) -> bool {
+        if !self.live {
+            return false;
+        }
+        self.asks = Some(approvals::serve());
+        true
+    }
+
+    /// The next helper's request waiting for an answer, taken without waiting.
+    pub fn asked(&mut self) -> Option<Request> {
+        self.held
+            .take()
+            .or_else(|| self.asks.as_ref()?.try_recv().ok())
+    }
+
+    /// Put back a request that is better asked later, for `asked` to hand
+    /// over first.
+    pub fn hold(&mut self, request: Request) {
+        self.held = Some(request);
+    }
+
+    /// Wait at the prompt for a whole line, for the doorbell, or for a
+    /// helper's request. `None` when the user is done.
     pub fn wait(&mut self) -> Option<Waited> {
         loop {
             if self.done {
@@ -397,12 +471,20 @@ impl Bar {
         }
     }
 
-    /// A line already entered, or else a ring, taken without waiting for
-    /// either: what the user typed goes first, and the notices it rang for
-    /// go in ahead of it anyway.
+    /// A line already entered, a helper's request, or else a ring, taken
+    /// without waiting for any: what the user typed goes first, and the
+    /// notices it rang for go in ahead of it anyway.
     fn waited(&mut self) -> Option<Waited> {
         if let Some(line) = self.next_line() {
             return Some(Waited::Line(line));
+        }
+        // A receiver cannot be looked into without taking what it holds, so
+        // the request is kept here until `asked` hands it over.
+        if self.held.is_none() {
+            self.held = self.asks.as_ref().and_then(|asks| asks.try_recv().ok());
+        }
+        if self.held.is_some() {
+            return Some(Waited::Asked);
         }
         let bell = self.bell.as_ref()?;
         bell.try_recv().ok().map(|()| Waited::Rang)
@@ -477,6 +559,21 @@ impl Bar {
             }
             self.pump();
         }
+    }
+
+    /// `choose`, for a question nobody at the keyboard asked for. It can come
+    /// up under someone typing, so an enter or a digit counts only after
+    /// `STILL`: the end of a line, or a digit in it, is not taken for a yes.
+    pub fn interject(
+        &mut self,
+        question: &str,
+        detail: Vec<String>,
+        options: &[&str],
+    ) -> Option<usize> {
+        self.guard = Some(std::time::Instant::now());
+        let picked = self.choose(question, detail, options);
+        self.guard = None;
+        picked
     }
 
     /// Ask for a line of text, with `hint` as the question at the top of the box.
@@ -637,6 +734,38 @@ impl Bar {
             self.ticked = std::time::Instant::now();
             self.settle();
         }
+        if self.looked.elapsed() >= LOOK {
+            self.looked = std::time::Instant::now();
+            if self.look_at_helpers() {
+                self.settle();
+            }
+        }
+    }
+
+    /// Follow the helpers of `session`, the one now open: a line for each at
+    /// work while a turn runs, and how many there are in the footer.
+    pub fn show_helpers_of(&mut self, session: u64) {
+        if self.helpers_of == session {
+            return;
+        }
+        self.helpers_of = session;
+        // Looked at now, so the last session's helpers are not shown as this one's.
+        self.look_at_helpers();
+        self.settle();
+    }
+
+    /// Read how the open session's helpers are getting on, and say whether
+    /// that changes the screen: their lines show while a turn runs, and
+    /// their count always.
+    fn look_at_helpers(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let relay: Vec<String> = (letronna_core::agents::seen().iter())
+            .filter(|helper| helper.session == self.helpers_of && helper.ended.is_none())
+            .map(|helper| relay_line(helper, now))
+            .collect();
+        let changed = relay.len() != self.relay.len() || (self.working && relay != self.relay);
+        self.relay = relay;
+        changed
     }
 
     /// Put words in the box as though they had been typed, for a command
@@ -765,6 +894,12 @@ impl Bar {
     /// Show a waiting line that says what is being waited for.
     pub fn wait_line_about(&mut self, what: &str) {
         self.waiting = Some(crate::spinner::Waiting::about(what));
+        self.settle();
+    }
+
+    /// Change what the waiting line names without starting its clock again.
+    pub fn rename_wait(&mut self, what: &str) {
+        self.waiting = self.waiting.take().map(|waiting| waiting.renamed(what));
         self.settle();
     }
 
@@ -1020,6 +1155,16 @@ impl Bar {
     /// one outright, and escape is the same as picking the last answer, which
     /// is always the one that does nothing.
     fn pick(&mut self, key: KeyEvent) {
+        // Letters are typing, not answering, and each one puts an answer off
+        // again; an answer that comes too soon is dropped rather than put off,
+        // so pressing it again a moment later takes.
+        if let Some(since) = self.guard.as_mut() {
+            match key.code {
+                KeyCode::Enter | KeyCode::Char('0'..='9') if since.elapsed() < STILL => return,
+                KeyCode::Char(_) | KeyCode::Backspace => *since = std::time::Instant::now(),
+                _ => {}
+            }
+        }
         let Some(choice) = self.choice.as_mut() else {
             return;
         };
@@ -1029,7 +1174,13 @@ impl Bar {
             KeyCode::Down => choice.picked = (choice.picked + 1) % choice.options.len(),
             KeyCode::Enter => self.answer = Some(choice.picked),
             KeyCode::Esc => self.answer = Some(last),
-            KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => self.done = true,
+            KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
+                // A helper's question can come up while a call runs, and
+                // leaving there stops the turn, as Ctrl-C does anywhere else
+                // in one.
+                self.interrupt = self.working;
+                self.done = true;
+            }
             KeyCode::Char(digit) if digit.is_ascii_digit() => {
                 if let Some(index) = digit.to_digit(10).and_then(|d| (d as usize).checked_sub(1))
                     && index < choice.options.len()
@@ -1107,6 +1258,10 @@ impl Bar {
         let room = self.room();
         let edge = "─".repeat(room + 2);
         let mut lines = Vec::new();
+        // Above the waiting line, which stays next to the box it waits to fill.
+        if self.working {
+            self.relay_lines(&mut lines);
+        }
         // The waiting line sits above the box, where the answer it is waiting
         // for will appear.
         if let Some(waiting) = &self.waiting {
@@ -1189,6 +1344,11 @@ impl Bar {
         }
 
         let back = crate::screen::scrolled();
+        let helpers = at_work(self.relay.len());
+        // Cut rather than wrapped, now the count makes it longer: a wrapped
+        // last row would run off the foot of the window and scroll everything
+        // above it.
+        let width = render::width().saturating_sub(render::PAD.len() + 1);
         let note = if let Some(said) = &self.note {
             said.clone()
         } else if self.slider.is_some() {
@@ -1202,9 +1362,9 @@ impl Bar {
         } else if self.working {
             // Said while it applies rather than only after a long silence:
             // a reply going the wrong way is worth stopping early.
-            format!("{}  ·  esc to stop", self.footer)
+            fitted(&self.footer, &format!("{helpers}  ·  esc to stop"), width)
         } else {
-            self.footer.clone()
+            fitted(&self.footer, &helpers, width)
         };
         lines.push(format!("{}{}", render::PAD, render::dim(&note)));
 
@@ -1220,6 +1380,24 @@ impl Bar {
         let under = usize::from(self.waiting.is_some());
         lines.splice(under..under, plan);
         lines
+    }
+
+    /// The helpers' lines, each cut to the window, and no more of them than
+    /// `RELAY_LIMIT` before the rest are counted instead.
+    fn relay_lines(&self, lines: &mut Vec<String>) {
+        let room = render::width().saturating_sub(render::INSIDE.len() + 3);
+        for text in self.relay.iter().take(RELAY_LIMIT) {
+            lines.push(format!(
+                "{}{} {}",
+                render::INSIDE,
+                render::dim("◆"),
+                render::dim(&render::clip(text, room))
+            ));
+        }
+        if self.relay.len() > RELAY_LIMIT {
+            let more = format!("… {} more", self.relay.len() - RELAY_LIMIT);
+            lines.push(format!("{}  {}", render::INSIDE, render::dim(&more)));
+        }
     }
 
     /// One row of the box, padded so its right edge lines up.
@@ -1371,6 +1549,37 @@ fn one_row(text: &str, room: usize) -> String {
     row
 }
 
+/// What a helper's line says at `now`: which one it is, what it was given to
+/// do, and how far it has got.
+fn relay_line(helper: &letronna_core::agents::Seen, now: std::time::Instant) -> String {
+    let mut parts = vec![helper.name.clone()];
+    let task = letronna_core::tools::one_line(&helper.description);
+    if !task.is_empty() {
+        parts.push(task);
+    }
+    let tokens = (helper.status.input).load(std::sync::atomic::Ordering::Relaxed);
+    parts.push(format!("{} tokens", letronna_core::budget::short(tokens)));
+    let seconds = now.saturating_duration_since(helper.started).as_secs();
+    parts.push(crate::spinner::spell(seconds));
+    parts.join(" · ")
+}
+
+/// The footer's note of how many helpers are at work, if any are.
+fn at_work(helpers: usize) -> String {
+    match helpers {
+        0 => String::new(),
+        1 => "  ·  1 helper working".to_owned(),
+        n => format!("  ·  {n} helpers working"),
+    }
+}
+
+/// The footer with `then` after it, in `width` columns. The footer gives way
+/// first, so the model's name loses its end before what the user can do now.
+fn fitted(footer: &str, then: &str, width: usize) -> String {
+    let room = width.saturating_sub(then.chars().count());
+    render::clip(&format!("{}{then}", render::clip(footer, room)), width)
+}
+
 /// Where each stop sits on a track `width` columns wide: spread evenly, the
 /// first at the left end and the last at the right.
 fn stops_at(count: usize, width: usize) -> Vec<usize> {
@@ -1425,12 +1634,14 @@ fn track(stops: &[String], at: usize, room: usize) -> (String, String, usize) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Bar, Choice, MENU_LIMIT, PLAN_ROWS, QUEUED_LIMIT, Slider, Waited, checklist, closest,
-        matches, menu_top, one_row, stops_at, track,
+        Bar, Choice, MENU_LIMIT, PLAN_ROWS, QUEUED_LIMIT, RELAY_LIMIT, STILL, Slider, Waited,
+        at_work, checklist, closest, fitted, matches, menu_top, one_row, relay_line, stops_at,
+        track,
     };
     use crate::render::{MARGIN, plain, visible};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use letronna_core::store::Todo;
+    use std::time::Instant;
 
     fn step(text: &str, status: &str) -> Todo {
         Todo {
@@ -1762,6 +1973,70 @@ mod tests {
     }
 
     #[test]
+    fn a_helpers_line_says_which_it_is_and_how_far_it_has_got() {
+        let started = std::time::Instant::now();
+        let mut helper = letronna_core::agents::Seen {
+            id: 1 << 40,
+            session: 1,
+            name: "explore-2".into(),
+            kind: "explore".into(),
+            description: "Find where\nwindows start".into(),
+            n: 1,
+            ended: None,
+            started,
+            status: Default::default(),
+        };
+        let tokens = |helper: &letronna_core::agents::Seen, n| {
+            (helper.status.input).store(n, std::sync::atomic::Ordering::Relaxed);
+        };
+        tokens(&helper, 38_400);
+        let later = |seconds| started + std::time::Duration::from_secs(seconds);
+        assert_eq!(
+            relay_line(&helper, later(72)),
+            "explore-2 · Find where windows start · 38k tokens · 1m 12s"
+        );
+        // Given no words for the user, it says only what it has got to.
+        helper.description.clear();
+        tokens(&helper, 900);
+        assert_eq!(relay_line(&helper, later(5)), "explore-2 · 900 tokens · 5s");
+    }
+
+    #[test]
+    fn helpers_at_work_are_counted_always_and_drawn_while_a_turn_runs() {
+        let mut bar = Bar::new("model".into());
+        bar.relay = (1..=6)
+            .map(|n| format!("helper-{n} · 1k tokens · 5s"))
+            .collect();
+        // Only what is not cut to the window is looked at, so the test
+        // passes in a terminal of any width.
+        let idle = bar.lines(40);
+        assert!(!idle.iter().any(|line| line.contains('◆')));
+
+        bar.working = true;
+        let busy = bar.lines(40);
+        let drawn = busy.iter().filter(|line| line.contains('◆')).count();
+        assert_eq!(drawn, RELAY_LIMIT);
+        assert!(busy.iter().any(|line| line.ends_with("… 2 more")));
+        assert_eq!(at_work(0), "");
+        assert_eq!(at_work(1), "  ·  1 helper working");
+        assert_eq!(at_work(6), "  ·  6 helpers working");
+    }
+
+    #[test]
+    fn a_narrow_footer_loses_the_model_before_what_the_user_can_do() {
+        let footer = "claude-sonnet-4-5  ·  letronna  ·  thinking high  ·  web";
+        let then = format!("{}  ·  esc to stop", at_work(2));
+        assert_eq!(fitted(footer, &then, 200), format!("{footer}{then}"));
+        let cut = fitted(footer, &then, 60);
+        assert_eq!(cut.chars().count(), 60);
+        assert!(cut.starts_with("claude-sonnet") && cut.ends_with(&format!("…{then}")));
+        // Narrower than the hint itself, the hint loses its end too.
+        for width in [0, 1, 10, 30] {
+            assert!(fitted(footer, &then, width).chars().count() <= width);
+        }
+    }
+
+    #[test]
     fn lines_read_from_a_pipe_do_not_listen_for_the_bell() {
         // A bar never installed is what piped input and no colour get, and
         // nothing there would wake an idle session.
@@ -1910,5 +2185,31 @@ mod tests {
         assert!(!bar.lines(40).last().unwrap().contains("ctrl-s"));
         bar.queued.push_back("check the docs".into());
         assert!(bar.lines(40).last().unwrap().contains("ctrl-s to send now"));
+    }
+
+    #[test]
+    fn an_enter_typed_as_a_helper_asks_is_not_taken_for_yes() {
+        let mut bar = Bar::new(String::new());
+        bar.choice = Some(Choice {
+            question: "Helper general wants to run a command".into(),
+            detail: Vec::new(),
+            options: vec!["Yes".into(), "No".into()],
+            picked: 0,
+        });
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        // Just after the question came up, neither answers.
+        bar.guard = Some(Instant::now());
+        bar.pick(key(KeyCode::Enter));
+        bar.pick(key(KeyCode::Char('1')));
+        assert_eq!(bar.answer, None);
+        // Nor just after a letter, however long it has been up.
+        bar.guard = Instant::now().checked_sub(STILL);
+        bar.pick(key(KeyCode::Char('k')));
+        bar.pick(key(KeyCode::Enter));
+        assert_eq!(bar.answer, None);
+        // Once it has been up a moment with nothing typed, enter takes it.
+        bar.guard = Instant::now().checked_sub(STILL);
+        bar.pick(key(KeyCode::Enter));
+        assert_eq!(bar.answer, Some(0));
     }
 }

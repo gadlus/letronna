@@ -93,6 +93,14 @@ fn main() {
     if args.doctor {
         std::process::exit(doctor::run(args.offline));
     }
+    // Before anything is opened, so a mistyped name leaves nothing behind.
+    let gateway = match args.gateway.as_deref().map(gateway_named).transpose() {
+        Ok(gateway) => gateway,
+        Err(error) => {
+            render::line(&render::red(&error));
+            std::process::exit(1);
+        }
+    };
     letronna_core::diag::init("cli");
     let mode = match &args.mode {
         Ok(mode) => *mode,
@@ -157,6 +165,7 @@ fn main() {
         },
         _ => runner.open(false, workspace.clone()),
     };
+    choose_by_flags(&mut runner, session, gateway, &args);
 
     // One question, one answer, no banner: this form gets piped.
     if let Some(prompt) = &args.prompt {
@@ -183,6 +192,9 @@ fn main() {
     let note = footer(&runner);
     runner.bar.set_footer(note);
     runner.bar.install();
+    // Before anything can start a turn. Without the box, a terminal on both
+    // ends is still someone to ask.
+    runner.serve_helpers(std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
     render::clear();
     banner(&runner, &folder, session);
     if let Some(version) = update::seen() {
@@ -198,7 +210,7 @@ fn main() {
         });
     }
     if args.start == Start::Choose {
-        resume(&mut runner, &mut session, workspace.as_deref());
+        resume(&mut runner, &mut session, workspace.as_deref(), "");
     } else if runner.store.conversations[session].length() > 0 {
         replay(&runner, session);
     }
@@ -207,6 +219,10 @@ fn main() {
     // turn; `-p` has left by now, with its answer.
     runner.bar.listen();
     while let Some(waited) = runner.bar.wait() {
+        if waited == bar::Waited::Asked {
+            runner.answer_helpers(true);
+            continue;
+        }
         let bar::Waited::Line(line) = waited else {
             // Notices came for the open session while it sat idle, and it
             // takes them as a turn of its own -- unless the user stopped the
@@ -224,8 +240,13 @@ fn main() {
         if line.is_empty() {
             continue;
         }
+        let mut prompt = line.as_str();
         if line.starts_with('/') {
             let flow = command(&mut runner, &line, &mut session, workspace.as_deref());
+            // Every turn follows its own session's helpers; this is for the
+            // footer's count once a command has opened another.
+            let open = runner.store.conversations[session].id;
+            runner.bar.show_helpers_of(open);
             if let Flow::Unknown = flow {
                 let name = line.split_whitespace().next().unwrap_or(&line);
                 render::line(&render::dim(&match bar::closest(name) {
@@ -239,10 +260,12 @@ fn main() {
             screen::settle();
             match flow {
                 Flow::Stop => break,
+                // The command stays on screen as typed; the model gets its prompt.
+                Flow::Ask(asked) => prompt = asked,
                 _ => continue,
             }
         }
-        if let Err(error) = runner.ask(session, &line) {
+        if let Err(error) = runner.ask(session, prompt) {
             render::blank();
             render::line(&render::red(&error));
             // Nothing is painted after this until the next key, so without
@@ -543,6 +566,46 @@ fn as_json(report: &Report) -> Value {
         out["error"] = error.as_str().into();
     }
     out
+}
+
+/// The gateway `name` means, in any case.
+fn gateway_named(name: &str) -> Result<&'static str, String> {
+    let gateways = letronna_core::gateway::GATEWAYS;
+    if let Some(gateway) = gateways
+        .iter()
+        .find(|g| g.name.eq_ignore_ascii_case(name.trim()))
+    {
+        return Ok(gateway.name);
+    }
+    let names: Vec<&str> = gateways.iter().map(|g| g.name).collect();
+    Err(format!(
+        "There is no gateway called {name}. The gateways are {}.",
+        names.join(", ")
+    ))
+}
+
+/// Put the session on the model, gateway and effort the flags name. Only the
+/// session takes them: the settings, and with them new sessions, stay as
+/// they were.
+fn choose_by_flags(runner: &mut Runner, session: usize, gateway: Option<&str>, args: &args::Args) {
+    if gateway.is_some() || args.model.is_some() {
+        let (on, model) = runner.store.model(session);
+        let gateway = gateway.unwrap_or(on).to_owned();
+        let model = args.model.clone().unwrap_or_else(|| model.to_owned());
+        let conversation = &mut runner.store.conversations[session];
+        conversation.gateway = Some(gateway);
+        conversation.model = Some(model);
+    }
+    if let Some(effort) = &args.effort {
+        let effort = effort.trim().to_lowercase();
+        // Auto leaves it to the model, as it does for `/effort`.
+        let effort = if effort == "auto" {
+            String::new()
+        } else {
+            effort
+        };
+        runner.store.conversations[session].effort = Some(effort);
+    }
 }
 
 /// Hand the terminal back if we panic. Without this a crash leaves the

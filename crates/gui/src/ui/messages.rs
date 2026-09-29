@@ -63,7 +63,7 @@ impl Chat {
         // A reply that only asked for tools: its tool rows say what happened.
         let tool_only = !is_user && message.content.is_empty() && !message.tool_calls.is_empty();
         let label: String = if message.model.is_empty() {
-            self.store.settings.model.clone()
+            self.store.model(self.store.active).1.to_owned()
         } else {
             message.model.clone()
         };
@@ -117,8 +117,12 @@ impl Chat {
                 )
                 .into_any_element()
         } else if is_user {
-            // A chat app's message can quote someone else's, fenced.
-            let (said, _) = letronna_core::untrusted::shown("", &message.content);
+            // `/init` shows as typed, not as the prompt it sent; a chat app's
+            // message can quote someone else's, fenced.
+            let said = match letronna_core::init::typed(&message.content) {
+                Some(typed) => typed.to_owned(),
+                None => letronna_core::untrusted::shown("", &message.content).0,
+            };
             TextView::markdown(md, said, window, cx)
                 .selectable(selectable)
                 .text_size(px(15.))
@@ -135,13 +139,17 @@ impl Chat {
                         .xsmall()
                         .color(cx.theme().primary),
                 )
-                .child(
-                    self.turn
-                        .as_ref()
-                        .and_then(|turn| turn.live.retrying)
-                        .filter(|_| streaming)
-                        .map_or_else(|| "Thinking…".to_owned(), |retry| retry.to_string()),
-                )
+                .child({
+                    let live = self.turn.as_ref().filter(|_| streaming).map(|t| &t.live);
+                    match (
+                        live.and_then(|l| l.retrying),
+                        live.is_some_and(|l| l.compacting),
+                    ) {
+                        (Some(retry), _) => retry.to_string(),
+                        (None, true) => "Compacting…".to_owned(),
+                        (None, false) => "Thinking…".to_owned(),
+                    }
+                })
                 .into_any_element()
         } else {
             TextView::markdown(md, message.content.clone(), window, cx)
@@ -758,6 +766,7 @@ fn usage_line(message: &Message) -> String {
     let input = message.input_tokens();
     if input > 0 {
         parts.push(format!("{input} in"));
+        parts.extend(message.fullness());
         if message.cached_tokens > 0 {
             let share = 100 * message.cached_tokens / input;
             parts.push(format!("{share}% cached"));
@@ -975,5 +984,20 @@ mod tests {
             ..message.clone()
         };
         assert_eq!(usage_line(&uncached), "16 out · 18.4 tok/s · 3291 in");
+    }
+
+    #[test]
+    fn usage_line_says_how_full_the_window_was_after_the_prompt() {
+        let message = Message {
+            tokens: 16,
+            prompt_tokens: 76_000,
+            cached_tokens: 72_200,
+            window: 200_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            usage_line(&message),
+            "16 out · 76000 in · 38% of 200K · 95% cached"
+        );
     }
 }
