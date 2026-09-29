@@ -129,7 +129,7 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "/goal",
-        blurb: "keep working until a goal is met: /goal <text>, check <command>, resume, clear",
+        blurb: "keep working until a goal is met: /goal <text>, --check <command>, resume, clear",
     },
     Command {
         name: "/image",

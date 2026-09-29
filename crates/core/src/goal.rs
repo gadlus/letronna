@@ -164,7 +164,9 @@ pub fn active(goal: &Option<Goal>) -> Option<Goal> {
     goal.clone().filter(|goal| goal.paused.is_none())
 }
 
-/// Reads what follows `/goal`.
+/// Reads what follows `/goal`. The check command comes after a flag, since
+/// a goal may well start with "check"; `clear` and `resume` count only on
+/// their own.
 pub fn parse(args: &str) -> Command {
     let args = args.trim();
     if args.is_empty() {
@@ -176,7 +178,7 @@ pub fn parse(args: &str) -> Command {
     if args == "resume" {
         return Command::Resume;
     }
-    match args.strip_prefix("check") {
+    match args.strip_prefix("--check") {
         Some(rest) if rest.is_empty() || rest.starts_with(char::is_whitespace) => {
             Command::Check(rest.trim().to_owned())
         }
@@ -204,7 +206,11 @@ pub fn apply_command(goal: &mut Option<Goal>, command: Command) -> Result<String
         }
         Command::Check(check) => {
             let Some(goal) = goal.as_mut() else {
-                return Err("Set a goal first: /goal <what to reach>.".into());
+                return Err(
+                    "Set a goal first: /goal <what to reach>, then /goal --check \
+                            <command>."
+                        .into(),
+                );
             };
             if check.is_empty() {
                 goal.check = None;
@@ -814,17 +820,23 @@ mod tests {
         assert_eq!(parse(""), Command::Show);
         assert_eq!(parse(" clear "), Command::Clear);
         assert_eq!(
-            parse("check cargo test"),
+            parse("--check cargo test"),
             Command::Check("cargo test".into())
         );
-        assert_eq!(
-            parse("checkout the branch"),
-            Command::Set("checkout the branch".into())
-        );
+        assert_eq!(parse("--check"), Command::Check(String::new()));
+        // A goal may start with what would otherwise be a command's name.
+        for text in [
+            "check that every page loads",
+            "checkout the branch",
+            "clear the cache",
+            "resume the upload",
+        ] {
+            assert_eq!(parse(text), Command::Set(text.into()));
+        }
         let mut kept = None;
-        assert!(apply_command(&mut kept, parse("check cargo test")).is_err());
+        assert!(apply_command(&mut kept, parse("--check cargo test")).is_err());
         apply_command(&mut kept, parse("ship the release")).unwrap();
-        apply_command(&mut kept, parse("check cargo test")).unwrap();
+        apply_command(&mut kept, parse("--check cargo test")).unwrap();
         // A new goal keeps the check and starts its count again.
         if let Some(goal) = kept.as_mut() {
             goal.continuations = 3;
