@@ -20,6 +20,7 @@ pub mod compact;
 pub mod diag;
 mod edit;
 pub mod failure;
+mod filestate;
 pub mod gateway;
 mod grep;
 pub mod inbox;

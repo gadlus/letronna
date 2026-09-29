@@ -1142,6 +1142,9 @@ pub fn start_with(
     messages: Vec<Message>,
     extra: Extra,
 ) -> async_channel::Receiver<Event> {
+    // Before the reply exists, so every call it makes is stamped with it.
+    let window = window_start(&messages);
+    crate::filestate::asked(connection.conversation, messages.len(), window);
     let (sender, receiver) = async_channel::bounded(64);
     std::thread::spawn(move || {
         let started = std::time::Instant::now();

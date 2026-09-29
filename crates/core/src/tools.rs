@@ -924,7 +924,7 @@ impl Tool for WriteFile {
         "write_file"
     }
     fn description(&self) -> &'static str {
-        "Create or overwrite a text file in the project folder. Parent folders are created. A file that exists keeps its line endings and byte order mark."
+        "Create or overwrite a text file in the project folder. Parent folders are created. A file that exists keeps its line endings and byte order mark. Overwriting needs the whole file read first, in an earlier step; to change part of a file, use edit_file."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -941,17 +941,14 @@ impl Tool for WriteFile {
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         let path = resolve_write(path_arg(args), ctx)?;
         let content = args["content"].as_str().ok_or("`content` is required.")?;
-        // Only a regular file is read: opening a pipe would wait for a writer.
-        let before = std::fs::metadata(&path)
-            .ok()
-            .filter(std::fs::Metadata::is_file)
-            .and_then(|_| std::fs::read(&path).ok());
-        let text = crate::write::keep_format(before.as_deref().unwrap_or_default(), content);
-        crate::write::check_syntax(&path, before.as_deref(), &text)?;
+        let change = crate::filestate::overwrite(ctx.conversation, &path, path_arg(args))?;
+        let before = change.before().map(str::as_bytes);
+        let text = crate::write::keep_format(before.unwrap_or_default(), content);
+        crate::write::check_syntax(&path, before, &text)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        crate::write::atomic(&path, text.as_bytes())?;
+        change.write(text.as_bytes())?;
         Ok(format!("Wrote {} bytes.", text.len()))
     }
 }
@@ -965,7 +962,7 @@ impl Tool for EditFile {
         "edit_file"
     }
     fn description(&self) -> &'static str {
-        "Replace `old` with `new` in a file. `old` must match exactly once, unless replace_all is set to change every match. Line endings, trailing spaces, indentation and curly quotes need not match; the file keeps its own. For several changes to one file, pass `edits` instead: they are made in order, and if one fails none is made."
+        "Replace `old` with `new` in a file you have read. `old` must match exactly once, unless replace_all is set to change every match. Line endings, trailing spaces, indentation and curly quotes need not match; the file keeps its own. For several changes to one file, pass `edits` instead: they are made in order, and if one fails none is made."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -1004,13 +1001,14 @@ impl Tool for EditFile {
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         let path = resolve_write(path_arg(args), ctx)?;
         let edits = edits(args)?;
-        let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        let done = crate::edit::apply(&text, &edits)?;
+        let change = crate::filestate::edit(ctx.conversation, &path, path_arg(args))?;
+        let text = change.before().unwrap_or_default();
+        let done = crate::edit::apply(text, &edits)?;
         if done.replaced == 0 {
             return Ok("Already applied; nothing changed.".into());
         }
         crate::write::check_syntax(&path, Some(text.as_bytes()), &done.text)?;
-        crate::write::atomic(&path, done.text.as_bytes())?;
+        change.write(done.text.as_bytes())?;
         Ok(match (done.replaced, done.already) {
             (1, 0) => "Edited.".into(),
             (n, 0) => format!("Edited {n} places."),
@@ -1075,7 +1073,14 @@ impl Tool for RunCommand {
             .as_deref()
             .ok_or("No project folder is attached. Ask the user to attach one first.")?;
         if !args["background"].as_bool().unwrap_or(false) {
-            return run_shell(command, Some(cwd), &ctx.cancel);
+            let before = crate::filestate::before(ctx.conversation);
+            let out = run_shell(command, Some(cwd), &ctx.cancel);
+            let note = crate::filestate::note(ctx.conversation, before, cwd);
+            // The note goes first, so cutting long output short cannot drop it.
+            return match out {
+                Ok(text) => Ok(note + &text),
+                Err(e) => Err(note + &e),
+            };
         }
         let id = crate::jobs::start(command, cwd)?;
         // Give it a moment to fail or announce a port, so the first reply says
@@ -1554,8 +1559,13 @@ impl Tool for ReadFile {
         let path = resolve(raw, ctx).map_err(|e| e + &similar(raw, ctx))?;
         let offset = args["offset"].as_u64().unwrap_or(1).max(1) as usize;
         let limit = args["limit"].as_u64().unwrap_or(u64::MAX).max(1) as usize;
+        let before = crate::filestate::stat(&path);
         let (mut text, cut) = open_text(&path)?;
-        page(&mut text, offset, limit, cut)
+        let (shown, whole) = page(&mut text, offset, limit, cut)?;
+        // A longer result loses its middle on the way to the model.
+        let whole = whole && shown.chars().count() <= crate::chat::MAX_TOOL_CHARS;
+        crate::filestate::read(ctx.conversation, &path, before, whole);
+        Ok(shown)
     }
 }
 
@@ -1594,16 +1604,16 @@ fn open_text(path: &Path) -> Result<(Box<dyn BufRead>, bool), String> {
 
 /// Lines from `offset` on, numbered, until `limit` of them or `PAGE_BYTES`,
 /// with a footer saying where the rest starts and a note on every page of a
-/// `cut` file.
+/// `cut` file; and whether that showed all of the file, as it is.
 fn page(
     reader: &mut impl BufRead,
     offset: usize,
     limit: usize,
     cut: bool,
-) -> Result<String, String> {
+) -> Result<(String, bool), String> {
     let mut out = String::new();
     let mut line = Vec::new();
-    let (mut n, mut lossy, mut more) = (0, false, false);
+    let (mut n, mut lossy, mut more, mut long) = (0, false, false, false);
     while next_line(reader, &mut line)? {
         n += 1;
         if n < offset {
@@ -1615,7 +1625,10 @@ fn page(
         }
         let text = String::from_utf8_lossy(&line);
         let shown = match text.char_indices().nth(LINE_CHARS) {
-            Some((at, _)) => format!("{n}|{} … [line cut]\n", &text[..at]),
+            Some((at, _)) => {
+                long = true;
+                format!("{n}|{} … [line cut]\n", &text[..at])
+            }
             None => format!("{n}|{text}\n"),
         };
         if !out.is_empty() && out.len() + shown.len() > PAGE_BYTES {
@@ -1630,7 +1643,7 @@ fn page(
         out.push_str(&shown);
     }
     if n == 0 {
-        return Ok("The file is empty.".into());
+        return Ok(("The file is empty.".into(), true));
     }
     let mb = UTF16_BYTES / (1024 * 1024);
     if out.is_empty() {
@@ -1665,7 +1678,8 @@ fn page(
             n - 1
         ));
     }
-    Ok(out)
+    let whole = offset == 1 && !more && !long && !lossy && !cut;
+    Ok((out, whole))
 }
 
 /// Reads the next line into `line`, without its line break and only as much
