@@ -1182,6 +1182,13 @@ pub(crate) fn resolve(raw: &str, ctx: &ToolContext) -> Result<PathBuf, String> {
             "`{raw}` is in Letronna's own folder, with the keys and sign-in; it stays out of reach."
         ));
     }
+    // Refused rather than asked about: the approval gate sees a tool's name,
+    // not the path it was given, so it cannot tell this read from any other.
+    if secret(&path) {
+        return Err(format!(
+            "`{raw}` holds keys, passwords or tokens, so it stays out of reach. Ask the user to paste what you need from it."
+        ));
+    }
     Ok(path)
 }
 
@@ -1191,6 +1198,43 @@ pub(crate) fn resolve(raw: &str, ctx: &ToolContext) -> Result<PathBuf, String> {
 /// model into it would have had them read out.
 fn private(path: &Path, data: &Path) -> bool {
     std::fs::canonicalize(data).is_ok_and(|data| path.starts_with(data))
+}
+
+/// Folders and files that hold keys, passwords or other agents' sign-in
+/// tokens, matched as a run of names anywhere in a path so that a folder
+/// covers everything in it; `_netrc` is what curl and Git read on Windows.
+const SECRETS: &[&str] = &[
+    ".ssh",
+    ".aws",
+    ".netrc",
+    "_netrc",
+    ".git-credentials",
+    ".claude/.credentials.json",
+    ".codex/auth.json",
+];
+
+/// Whether `path` is or lies in one of `SECRETS`, or is a `.env` file other
+/// than the example and sample ones that projects commit.
+fn secret(path: &Path) -> bool {
+    // Without case, because Windows and macOS open `.SSH` as `.ssh`.
+    let names: Vec<&std::ffi::OsStr> = path.iter().collect();
+    let listed = SECRETS.iter().any(|entry| {
+        let len = entry.split('/').count();
+        names.windows(len).any(|run| {
+            run.iter()
+                .zip(entry.split('/'))
+                .all(|(name, part)| name.eq_ignore_ascii_case(part))
+        })
+    });
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    listed
+        || name == ".env"
+        || name
+            .strip_prefix(".env.")
+            .is_some_and(|rest| !matches!(rest, "example" | "sample"))
 }
 
 fn path_arg(args: &Value) -> &str {
@@ -1291,7 +1335,8 @@ fn search(root: &Path, query: &str, time: Duration, files: usize) -> String {
     let mut scanned = 0;
     let mut stopped = false;
     let mut hits = Vec::new();
-    walk(root, &mut |path, is_dir| {
+    let mut skipped = 0;
+    walk(root, &mut skipped, &mut |path, is_dir| {
         // Checked on folders too, or a deep tree of them runs unbounded.
         if scanned >= files || started.elapsed() >= time {
             stopped = true;
@@ -1331,6 +1376,12 @@ fn search(root: &Path, query: &str, time: Duration, files: usize) -> String {
              complete results."
         ));
     }
+    if skipped > 0 {
+        out.push_str(&format!(
+            "\n… Secret files and folders left out: {skipped}. Ask the user to paste \
+             what you need from them."
+        ));
+    }
     out
 }
 
@@ -1347,11 +1398,11 @@ fn searchable(path: &Path) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-/// Depth-first walk skipping build, VCS and hidden folders. A symlink is
-/// never followed, so a link back up the tree cannot loop it. The callback
-/// sees each folder before it is entered and each file, and returns false to
-/// stop.
-fn walk(dir: &Path, f: &mut dyn FnMut(&Path, bool) -> bool) -> bool {
+/// Depth-first walk skipping build, VCS and hidden folders, and secrets,
+/// which it counts in `skipped`. A symlink is never followed, so a link back
+/// up the tree cannot loop it. The callback sees each folder before it is
+/// entered and each file, and returns false to stop.
+fn walk(dir: &Path, skipped: &mut usize, f: &mut dyn FnMut(&Path, bool) -> bool) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return true;
     };
@@ -1363,6 +1414,10 @@ fn walk(dir: &Path, f: &mut dyn FnMut(&Path, bool) -> bool) -> bool {
             continue;
         }
         let path = entry.path();
+        if secret(&path) {
+            *skipped += 1;
+            continue;
+        }
         if kind.is_dir() {
             let name = entry.file_name();
             let hidden = name.to_string_lossy().starts_with('.');
@@ -1372,7 +1427,7 @@ fn walk(dir: &Path, f: &mut dyn FnMut(&Path, bool) -> bool) -> bool {
             {
                 continue;
             }
-            if !f(&path, true) || !walk(&path, f) {
+            if !f(&path, true) || !walk(&path, skipped, f) {
                 return false;
             }
         } else if !f(&path, false) {
@@ -2033,6 +2088,63 @@ World"
             run("read_file", r#"{"path":"a.txt"}"#, &ctx).unwrap(),
             "hello"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn search_leaves_out_secret_files_and_says_how_many() {
+        let dir = std::env::temp_dir().join(format!("letronna-unsearched-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("app/.ssh")).unwrap();
+        std::fs::write(dir.join("app/.ssh/id_rsa"), "TOKEN=1").unwrap();
+        std::fs::write(dir.join("app/.env.local"), "TOKEN=2").unwrap();
+        std::fs::write(dir.join(".env"), "TOKEN=3").unwrap();
+        std::fs::write(dir.join(".git-credentials"), "https://me:TOKEN@host").unwrap();
+        std::fs::write(dir.join(".env.example"), "TOKEN=").unwrap();
+        // The folder counts once; nothing inside it is looked at.
+        assert_eq!(
+            search(&dir, "token", SEARCH_TIME, SEARCH_FILES),
+            ".env.example:1: TOKEN=\n… Secret files and folders left out: 4. Ask the user \
+             to paste what you need from them."
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn secret_files_are_refused_but_env_examples_are_not() {
+        let dir = std::env::temp_dir().join(format!("letronna-secrets-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for folder in [".ssh", ".aws", ".claude", ".codex"] {
+            std::fs::create_dir_all(dir.join(folder)).unwrap();
+        }
+        let secrets = [
+            ".ssh",
+            ".ssh/id_ed25519",
+            ".aws/credentials",
+            ".netrc",
+            ".git-credentials",
+            ".claude/.credentials.json",
+            ".codex/auth.json",
+            ".env",
+            ".env.local",
+            ".ENV.production",
+        ];
+        let open = [".env.example", ".env.sample", ".claude/settings.json"];
+        for name in secrets.iter().skip(1).chain(&open) {
+            std::fs::write(dir.join(name), "KEY=value").unwrap();
+        }
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        for name in secrets {
+            let refused = resolve(name, &ctx).unwrap_err();
+            assert!(refused.contains("out of reach"), "{name}: {refused}");
+        }
+        for name in open {
+            let text = ReadFile.run(&json!({"path": name}), &ctx).unwrap();
+            assert_eq!(text, "KEY=value", "{name}");
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
