@@ -32,8 +32,10 @@ use commands::{Flow, command, resume};
 use letronna_core::approvals::{self, Decision, Request};
 use letronna_core::budget::Budget;
 use letronna_core::cancel::Cancel;
-use letronna_core::chat::{self, Message};
+use letronna_core::chat::{self, Message, ToolCall};
 use letronna_core::driver::{self, Allow, Outcome, Report, Spec, Status};
+use letronna_core::gate::{self, Gate, Grants, Mode};
+use letronna_core::permissions::{self, Rule};
 use letronna_core::store::Transcript;
 use letronna_core::{agent, hooks, store, tools, update};
 use serde_json::{Value, json};
@@ -357,12 +359,7 @@ fn ask_once(runner: &mut Runner, session: usize, prompt: &str, args: &Args) -> b
     // Served before the run starts, since a request with nobody serving is
     // declined at once.
     let keyboard = args.output == Output::Text && render::interactive();
-    answer_approvals(
-        runner.mode == letronna_core::gate::Mode::Bypass,
-        keyboard,
-        context,
-        spec.cancel.clone(),
-    );
+    answer_approvals(runner.mode, keyboard, context, spec.cancel.clone());
     let (running, ended) = mpsc::channel::<()>();
     let progress =
         (args.output == Output::StreamJson).then(|| show_progress(spec.status.clone(), ended));
@@ -447,26 +444,51 @@ fn emit(line: &Value) -> bool {
     writeln!(std::io::stdout().lock(), "{line}").is_ok()
 }
 
-/// Answers the run's calls that need a yes: every one with `--yes`, by asking
-/// when there is a keyboard to ask at, and otherwise no, saying why.
-fn answer_approvals(yes: bool, keyboard: bool, context: tools::ToolContext, cancel: Cancel) {
+/// Answers the run's calls that need a yes from the gate in the run's `mode`,
+/// asking about the rest when there is a keyboard to ask at, and otherwise
+/// saying no and why.
+fn answer_approvals(mode: Mode, keyboard: bool, context: tools::ToolContext, cancel: Cancel) {
     let requests = approvals::serve();
     std::thread::spawn(move || {
         for request in requests {
-            let decision = if yes {
-                Decision::Once
-            } else if keyboard {
-                consult(&request, &context, &cancel)
-            } else {
-                eprintln!(
-                    "`{}` needs a yes and nobody is here to give it; run with --yes to allow it.",
-                    request.call.name
-                );
-                Decision::Deny(String::new())
+            let rules = permissions::load(&permissions::user_file());
+            let decision = match answered(&request.call, &context, &rules, mode, keyboard) {
+                Some(Decision::Deny(why)) => {
+                    eprintln!(
+                        "`{}` did not run: {}",
+                        request.call.name,
+                        tools::one_line(&why)
+                    );
+                    Decision::Deny(why)
+                }
+                Some(decision) => decision,
+                None => consult(&request, &context, &cancel),
             };
             request.answer(decision);
         }
     });
+}
+
+/// What the gate answers for `call` in `mode`, as the terminal answers a
+/// helper's; None when it is the person at the keyboard's to answer. Under
+/// `--yes` that is Bypass, which still stays under the floor and the rules.
+fn answered(
+    call: &ToolCall,
+    context: &tools::ToolContext,
+    rules: &Result<Vec<Rule>, String>,
+    mode: Mode,
+    keyboard: bool,
+) -> Option<Decision> {
+    let none = Grants::new();
+    let gate = Gate::for_terminal(context, &none, rules, mode, keyboard);
+    match gate::decide(call, &gate) {
+        gate::Outcome::Run => Some(Decision::Once),
+        gate::Outcome::Refuse(why) => Some(Decision::Deny(why)),
+        gate::Outcome::Ask if keyboard => None,
+        // With nobody to answer the gate refuses rather than asks, so this
+        // only keeps a card from waiting on a keyboard that is not there.
+        gate::Outcome::Ask => Some(Decision::Deny("Nobody is here to answer.".into())),
+    }
 }
 
 /// Asks the person at the keyboard about one call, the way the conversation
@@ -787,5 +809,70 @@ mod tests {
         ];
         assert_eq!(said_last(&session[2..]), "");
         assert_eq!(said_last(&session), "The notes say hello.");
+    }
+
+    fn call(name: &str, args: Value) -> ToolCall {
+        ToolCall {
+            id: format!("{name}-1"),
+            name: name.into(),
+            arguments: args.to_string(),
+        }
+    }
+
+    fn command(line: &str) -> ToolCall {
+        call("run_command", json!({ "command": line }))
+    }
+
+    fn write() -> ToolCall {
+        call("write_file", json!({ "path": "notes.txt", "content": "x" }))
+    }
+
+    #[test]
+    fn yes_answers_under_the_floor_and_the_deny_rules() {
+        let ctx = tools::ToolContext::default();
+        let none = Ok(Vec::new());
+        let yes = |call: &ToolCall, rules| answered(call, &ctx, rules, Mode::Bypass, false);
+        assert_eq!(yes(&write(), &none), Some(Decision::Once));
+        // Deletes the home folder, in sh and in PowerShell alike.
+        let Some(Decision::Deny(why)) = yes(&command("Remove-Item -Recurse -Force ~"), &none)
+        else {
+            panic!("a hardline command got a yes");
+        };
+        assert!(why.contains("deletes the home folder"), "{why}");
+        // Hard to take back, so it needs a person, and nobody is here.
+        let Some(Decision::Deny(why)) = yes(&command("git reset --hard HEAD~1"), &none) else {
+            panic!("a dangerous command got a yes with nobody to give it");
+        };
+        assert!(why.contains("nobody is here to approve it"), "{why}");
+        let denied = Ok(vec![Rule {
+            tool: "write_file".into(),
+            pattern: String::new(),
+            effect: permissions::Effect::Deny,
+            project: None,
+        }]);
+        let Some(Decision::Deny(why)) = yes(&write(), &denied) else {
+            panic!("a denied write got a yes");
+        };
+        assert!(
+            why.contains("a permission rule denies `write_file`"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn without_yes_a_call_is_asked_at_the_keyboard_or_refused() {
+        let ctx = tools::ToolContext::default();
+        let none = Ok(Vec::new());
+        let asked = |call: &ToolCall, mode, keyboard| answered(call, &ctx, &none, mode, keyboard);
+        assert_eq!(asked(&write(), Mode::Default, true), None);
+        let Some(Decision::Deny(why)) = asked(&write(), Mode::Default, false) else {
+            panic!("a write got a yes with nobody to give it");
+        };
+        assert!(why.contains("nobody is here to give it"), "{why}");
+        // Someone at the keyboard is asked about what the floor holds back.
+        assert_eq!(
+            asked(&command("git reset --hard HEAD~1"), Mode::Bypass, true),
+            None
+        );
     }
 }
