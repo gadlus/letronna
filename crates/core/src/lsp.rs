@@ -10,10 +10,14 @@
 //! Nothing runs unless the user asks for it in `lsp.json` in the data
 //! folder, a map of names to servers in the shape `mcp.json` gives one
 //! (`command`, `args`, `env`, `cwd`, `${VAR}`), plus the file `extensions`
-//! each serves and, optionally, the `projects` it is for. It lives beside
-//! `hooks.json` rather than in the project, because a server is a command
-//! and whoever wrote a repo may not be whoever runs it. With no file the
-//! cost of a write is one failed open, and a request's is a look at an
+//! each serves and the `projects` it is for. It lives beside `hooks.json`
+//! rather than in the project, because a server is a command and whoever
+//! wrote a repo may not be whoever runs it. And a server serves only the
+//! projects it names, none by default: most run the project's own code as
+//! they check it -- rust-analyzer its build scripts and proc macros, a
+//! TypeScript server the project's own compiler -- so a folder cloned a
+//! minute ago must not start one on the agent's first edit. With no file
+//! the cost of a write is one failed open, and a request's is a look at an
 //! empty map.
 //!
 //! A server starts the first time a file it serves is written, in the
@@ -80,7 +84,8 @@ struct Entry {
     /// The file extensions it serves, with or without the dot.
     #[serde(default)]
     extensions: Vec<String>,
-    /// The project folders it is for; none means every project.
+    /// The project folders it is for; none means none, as a server runs
+    /// what the project holds.
     #[serde(default)]
     projects: Vec<PathBuf>,
     /// The LSP language id its files are opened as, when the extension
@@ -101,7 +106,7 @@ impl Entry {
             .extensions
             .iter()
             .any(|e| e.trim_start_matches('.').eq_ignore_ascii_case(extension));
-        let here = self.projects.is_empty() || self.projects.iter().any(|p| same_folder(p, root));
+        let here = self.projects.iter().any(|p| same_folder(p, root));
         listed && here && !self.server.disabled && !self.server.command.trim().is_empty()
     }
 }
@@ -1013,10 +1018,12 @@ mod tests {
         NEXT.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// `lsp.json` in `dir`, with a server for `.rs` files running `command`.
+    /// `lsp.json` in `dir`, with a server for `.rs` files in the project
+    /// at `dir` running `command`.
     fn config(dir: &Path, command: &str) -> PathBuf {
         let file = dir.join(FILE);
-        let text = json!({"servers": {"fake": {"command": command, "extensions": [".rs"]}}});
+        let text = json!({"servers": {"fake": {"command": command, "extensions": [".rs"],
+            "projects": [dir]}}});
         std::fs::write(&file, text.to_string()).unwrap();
         file
     }
@@ -1222,6 +1229,21 @@ mod tests {
 
         assert!(lock(servers()).keys().all(|(o, _)| *o != owner));
         assert_eq!(note(owner), None);
+    }
+
+    #[test]
+    fn a_server_serves_only_the_projects_it_lists() {
+        let dir = scratch("listed");
+        let clone = scratch("listed-clone");
+        let listed = config(&dir, "fake-language-server");
+        assert!(plan(&listed, 1, 1, &dir, &dir.join("main.rs"), None).is_some());
+        // A folder the user never named, such as one cloned a minute ago.
+        assert!(plan(&listed, 1, 1, &clone, &clone.join("build.rs"), None).is_none());
+        let unlisted = clone.join(FILE);
+        let text = json!({"servers": {"fake": {"command": "fake-language-server",
+            "extensions": ["rs"]}}});
+        std::fs::write(&unlisted, text.to_string()).unwrap();
+        assert!(plan(&unlisted, 1, 1, &clone, &clone.join("main.rs"), None).is_none());
     }
 
     #[test]

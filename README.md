@@ -229,7 +229,7 @@ There is no Windows build, and inside WSL or Docker its virtual machine costs mo
 
 ## Language servers
 
-After Letronna writes or edits a file, a language server can check it, and the errors the edit brought in reach the model with its next request, without a build. Nothing runs unless you list servers in `lsp.json` in the data folder; each takes the `command`, `args`, `env` and `cwd` an MCP server does, the file `extensions` it serves, and optionally the `projects` it is for:
+After Letronna writes or edits a file, a language server can check it, and the errors the edit brought in reach the model with its next request, without a build. Nothing runs unless you list servers in `lsp.json` in the data folder; each takes the `command`, `args`, `env` and `cwd` an MCP server does, the file `extensions` it serves, and the `projects` it is for:
 
 ```json
 {
@@ -242,6 +242,8 @@ After Letronna writes or edits a file, a language server can check it, and the e
   }
 }
 ```
+
+A server serves only the project folders listed for it. Most run the project's own code as they check it -- rust-analyzer its build scripts and proc macros, a TypeScript server the project's own compiler -- so list only projects you would build yourself: there, an edit Letronna makes, in Accept edits mode too, can run that code on the next check.
 
 A server starts in the project folder the first time a file it serves is written, and is shut down when Letronna quits. Only errors are told, not warnings, and only those that were not there before the edit. A server that cannot start or stops is mentioned once and not started again until the next session. Projects cannot add servers of their own, since a server is a command and whoever wrote a repository may not be whoever runs it.
 
