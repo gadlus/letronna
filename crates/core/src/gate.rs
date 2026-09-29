@@ -468,6 +468,14 @@ fn unavailable(
     plan: bool,
 ) -> Option<String> {
     let name = tool.name();
+    // A tool the user switched off is not offered either, but the model may
+    // remember it from earlier in the conversation.
+    if tools::switched_off(name, &crate::store::disabled_tools()) {
+        return Some(format!(
+            "`{name}` is switched off: the user listed it in `disabled_tools` in \
+             Letronna's settings.json. Carry on without it."
+        ));
+    }
     // Only fitting tools are offered, but the model can name any of them;
     // refuse here too rather than trust the offer.
     if ctx.shared() && tool.machine() {

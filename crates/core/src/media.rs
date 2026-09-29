@@ -3,12 +3,14 @@
 //! These always go to the account API, whichever gateway the chat itself
 //! uses: only Letronna sells them, and they are paid from the signed-in
 //! account's credit. So every one of them asks first -- it spends money --
-//! and its card says so.
+//! and its card says so. None is offered while signed out, when it could
+//! only fail.
 //!
 //! What is made is saved as a file: in `media/` in the project folder, or in
 //! Letronna's own data folder when no project is attached. The result starts
 //! with `Saved to <path>`, which is how the window finds the file to show.
 
+use crate::chat::Connection;
 use crate::tools::{Tool, ToolContext};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -45,6 +47,9 @@ impl Tool for MakeImage {
     }
     fn needs_approval(&self) -> bool {
         true
+    }
+    fn offered(&self, _: &Connection) -> bool {
+        crate::auth::signed_in()
     }
     fn mutates(&self) -> bool {
         true
@@ -108,6 +113,9 @@ impl Tool for Speak {
     fn needs_approval(&self) -> bool {
         true
     }
+    fn offered(&self, _: &Connection) -> bool {
+        crate::auth::signed_in()
+    }
     fn mutates(&self) -> bool {
         true
     }
@@ -164,6 +172,9 @@ impl Tool for Transcribe {
     }
     fn needs_approval(&self) -> bool {
         true
+    }
+    fn offered(&self, _: &Connection) -> bool {
+        crate::auth::signed_in()
     }
     // It changes nothing on disk, but it spends credit, which plan mode is
     // not for.
@@ -228,6 +239,9 @@ impl Tool for MakeVideo {
     }
     fn needs_approval(&self) -> bool {
         true
+    }
+    fn offered(&self, _: &Connection) -> bool {
+        crate::auth::signed_in()
     }
     fn mutates(&self) -> bool {
         true
