@@ -1227,10 +1227,15 @@ fn replies_in(
             Ok(Record::Meta(meta)) => updated = updated.max(meta.updated),
             Ok(Record::Message(mut reply)) => {
                 if reply.at == 0 {
-                    // Only the counts and the calls are wanted from it later.
-                    reply.content.clear();
-                    reply.reasoning.clear();
+                    // Only the counts and the tool names are wanted from it
+                    // later, and clearing would keep what the text took.
+                    reply.content = String::new();
+                    reply.reasoning = String::new();
                     reply.replay = None;
+                    for call in &mut reply.tool_calls {
+                        call.id = String::new();
+                        call.arguments = String::new();
+                    }
                     undated.push(reply);
                     continue;
                 }
@@ -4112,6 +4117,32 @@ pub(crate) mod tests {
         assert_eq!(super::spent(u64::MAX, 1).len(), 4);
         assert!(super::spent(u64::MAX, 3).is_empty());
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn undated_replies_wait_for_the_end_without_their_text() {
+        let path = scratch("undated").join("1.jsonl");
+        let big = "x".repeat(100_000);
+        let lines = [
+            r#"{"type":"head","id":1,"created":100}"#.to_owned(),
+            format!(
+                r#"{{"type":"message","role":"assistant","content":"{big}","reasoning":"{big}","model":"m","tool_calls":[{{"id":"1","name":"write_file","arguments":"{big}"}}]}}"#
+            ),
+            r#"{"type":"meta","title":"t","updated":200,"pinned":false,"workspace":null,"todos":[]}"#.to_owned(),
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        let mut held = Vec::new();
+        super::replies_in(&path, &mut seen, &mut |at, reply: &Message| {
+            let call = &reply.tool_calls[0];
+            held.push((
+                at,
+                call.name.clone(),
+                reply.content.capacity() + reply.reasoning.capacity(),
+                call.arguments.capacity(),
+            ));
+        });
+        assert_eq!(held, [(200, "write_file".to_owned(), 0, 0)]);
     }
 
     #[test]
