@@ -34,6 +34,25 @@ const CONTINUE: &str =
 const CALL_AGAIN: &str = "Your last reply was cut off at the output limit in the middle \
     of a tool call, so the call was not run. Make it again with less in it, splitting the \
     work over several calls if it needs more room.";
+
+/// The notice after a reply with nothing in it, or only thinking, in the
+/// words other agents send, which models already answer well.
+const SPEAK_UP: &str = "Your previous response had no visible output. Please continue and \
+    produce a user-visible response.";
+
+/// The notice after a short answer that stops at what it is about to do.
+const CONTINUE_NOW: &str = "Continue now.";
+
+/// The longest answer read as only announcing its next step: room for a
+/// sentence or two before "Now let me...", too little for a finished answer
+/// that happens to end on a plan.
+const ANNOUNCEMENT_CHARS: usize = 400;
+
+/// The notice at the round cap, sent with the tools still offered but none
+/// allowed.
+const WRAP_UP: &str = "You have reached the tool-round limit. Summarize what is done and \
+    what remains, then stop.";
+
 /// The answer a call gets when the turn is stopped while it runs; the front
 /// end that stopped it records it before `Turn::stop`. The call may have
 /// done part of its work, so the model is told to look first.
@@ -56,6 +75,13 @@ pub enum Next {
     Refuse(ToolCall, String),
     /// The turn is over.
     Done,
+}
+
+/// A notice sending the model back to work, and the line that tells the
+/// user why.
+pub struct Nudge {
+    pub notice: Message,
+    pub why: &'static str,
 }
 
 /// The reply being streamed in. Kept separate from `Message` so a half-built
@@ -86,6 +112,10 @@ pub struct Turn {
     /// when it stopped inside a tool call.
     cut_off: Option<bool>,
     continued: usize,
+    /// An empty reply was sent back since the last tool round.
+    asked_again: bool,
+    /// An answer that stopped at its next step was sent back this turn.
+    pushed_on: bool,
 }
 
 impl Turn {
@@ -99,6 +129,8 @@ impl Turn {
             results: Vec::new(),
             cut_off: None,
             continued: 0,
+            asked_again: false,
+            pushed_on: false,
         }
     }
 
@@ -153,38 +185,101 @@ impl Turn {
         }
     }
 
-    /// The notice asking the model to go on, when the reply just finished
-    /// was cut off at the output limit. An error once it has been asked
-    /// `MAX_CONTINUATIONS` times already, so the turn ends saying why.
-    pub fn continuation(&mut self) -> Result<Option<Message>, String> {
-        let Some(in_call) = self.cut_off.take() else {
-            return Ok(None);
-        };
-        if self.continued >= MAX_CONTINUATIONS {
-            return Err(format!(
-                "The reply was still cut off at the output limit after {MAX_CONTINUATIONS} \
-                 continuations, so it stops here."
-            ));
+    /// The notice sending the model back to work after the reply just
+    /// finished, if it needs one: a reply cut off at the output limit, one
+    /// with nothing in it, or a short answer that stops at "Now let me...".
+    /// A second empty reply takes its thinking as the answer, and calls made
+    /// in the wrap-up at the round cap are dropped unrun. An error when a
+    /// reply is still cut off after `MAX_CONTINUATIONS` notices, or still
+    /// empty with no thinking to take, so the turn ends saying why.
+    pub fn continuation(&mut self, reply: &mut Message) -> Result<Option<Nudge>, String> {
+        if let Some(in_call) = self.cut_off.take() {
+            if self.continued >= MAX_CONTINUATIONS {
+                return Err(format!(
+                    "The reply was still cut off at the output limit after {MAX_CONTINUATIONS} \
+                     continuations, so it stops here."
+                ));
+            }
+            self.continued += 1;
+            let notice = if in_call { CALL_AGAIN } else { CONTINUE };
+            return Ok(Some(nudge(
+                notice,
+                "Cut off at the output limit; continuing.",
+            )));
         }
-        self.continued += 1;
-        Ok(Some(Message {
-            role: "user".into(),
-            content: if in_call { CALL_AGAIN } else { CONTINUE }.into(),
-            notice: true,
-            ..Default::default()
-        }))
+        let wrap_up = self.connection.wrap_up;
+        // None were allowed; a server that ignores that may send some anyway.
+        if wrap_up {
+            reply.tool_calls.clear();
+        }
+        if !reply.tool_calls.is_empty() {
+            return Ok(None);
+        }
+        if reply.content.trim().is_empty() {
+            // Some routes turn down an assistant message with no content, so
+            // an empty reply is dropped rather than kept.
+            reply.content.clear();
+            if !self.asked_again && !wrap_up {
+                self.asked_again = true;
+                return Ok(Some(nudge(SPEAK_UP, "No answer came; asking again.")));
+            }
+            if !reply.reasoning.trim().is_empty() {
+                reply.content = std::mem::take(&mut reply.reasoning);
+            } else if !wrap_up {
+                return Err("The model returned no text. Check model compatibility.".into());
+            }
+            return Ok(None);
+        }
+        if self.rounds > 0 && !self.pushed_on && !wrap_up && announces(&reply.content) {
+            self.pushed_on = true;
+            return Ok(Some(nudge(
+                CONTINUE_NOW,
+                "It stopped at its next step; asking it to go on.",
+            )));
+        }
+        Ok(None)
     }
 
     /// Queue the calls the model asked for. False when the turn should stop
-    /// instead: nothing to run, or it has gone round too many times.
+    /// instead: nothing to run, or the wrap-up asked for at the round cap has
+    /// come. At the cap the calls are answered as not run instead, and a
+    /// notice after them asks for that wrap-up with no tools.
     pub fn begin(&mut self, calls: Vec<ToolCall>) -> bool {
-        if calls.is_empty() || self.rounds >= self.limit {
+        if calls.is_empty() || self.connection.wrap_up {
             return false;
         }
-        self.rounds += 1;
         self.queue = calls.into();
         self.results.clear();
+        if self.rounds >= self.limit {
+            let why = format!(
+                "Not run: the tool-round limit ({}) was reached.",
+                self.limit
+            );
+            while !self.queue.is_empty() {
+                self.finish_call(Err(why.clone()));
+            }
+            self.results.push(Message {
+                role: "user".into(),
+                content: WRAP_UP.into(),
+                notice: true,
+                ..Default::default()
+            });
+            self.connection.wrap_up = true;
+            return true;
+        }
+        self.rounds += 1;
+        self.asked_again = false;
         true
+    }
+
+    /// What to tell the user when the turn stopped at its round cap.
+    pub fn capped(&self) -> Option<String> {
+        self.connection.wrap_up.then(|| {
+            format!(
+                "Stopped after {} rounds; send \"continue\" to keep going.",
+                self.limit
+            )
+        })
     }
 
     /// What to do next, given what the gate makes of the call in front.
@@ -223,8 +318,8 @@ impl Turn {
         });
     }
 
-    /// The tool results collected for this batch, ready to append before the
-    /// next model call.
+    /// The tool results collected for this batch, and at the round cap the
+    /// notice after them, ready to append before the next model call.
     pub fn take_results(&mut self) -> Vec<Message> {
         std::mem::take(&mut self.results)
     }
@@ -264,6 +359,56 @@ impl Turn {
     }
 }
 
+/// A notice for the model, with the line that tells the user why.
+fn nudge(notice: &str, why: &'static str) -> Nudge {
+    Nudge {
+        notice: Message {
+            role: "user".into(),
+            content: notice.into(),
+            notice: true,
+            ..Default::default()
+        },
+        why,
+    }
+}
+
+/// Whether `answer` is short and ends by announcing a step it did not take,
+/// as in "Now let me run the tests:". Handing back to the user, as in "I'll
+/// wait for your go-ahead" or "Let me know", never counts, however it is
+/// worded: pushing on past it would act without them.
+fn announces(answer: &str) -> bool {
+    let answer = answer.trim();
+    if answer.chars().count() > ANNOUNCEMENT_CHARS || answer.ends_with(['?', '!']) {
+        return false;
+    }
+    let body = answer.trim_end_matches(['.', ':', '…']);
+    // Split at a stop and a space, so a file name like main.rs stays whole.
+    let start = [". ", "! ", "? ", "\n"]
+        .iter()
+        .filter_map(|stop| body.rfind(stop).map(|at| at + stop.len()))
+        .max()
+        .unwrap_or(0);
+    let last = &body[start..];
+    let last = last.trim().to_lowercase().replace('’', "'");
+    let after_then = ["now", "next", "first", "then"]
+        .iter()
+        .find_map(|word| {
+            last.strip_prefix(word)
+                .filter(|rest| rest.starts_with([',', ' ']))
+        })
+        .map(|rest| rest.trim_start_matches([',', ' ']));
+    let rest = after_then.unwrap_or(&last);
+    if ["know", "wait", "stop", "pause"]
+        .iter()
+        .any(|word| rest.contains(word))
+    {
+        return false;
+    }
+    let opens = |with: &[&str]| with.iter().any(|opening| rest.starts_with(opening));
+    opens(&["let me ", "i'll now ", "i will now "])
+        || (after_then.is_some() && opens(&["i'll ", "i will ", "i'm going to ", "i am going to "]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,6 +434,7 @@ mod tests {
             search: false,
             conversation: 0,
             unattended: false,
+            wrap_up: false,
         })
     }
 
@@ -296,13 +442,20 @@ mod tests {
     /// 1,000 so a turn that never stops fails the test instead of hanging it.
     fn rounds_before_stopping(mut turn: Turn) -> usize {
         for round in 0..1_000 {
-            if !turn.begin(vec![call("read_file")]) {
+            turn.begin(vec![call("read_file")]);
+            if turn.next(|_| Outcome::Run) != Next::Run(call("read_file")) {
                 return round;
             }
             turn.finish_call(Ok("again".into()));
             turn.take_results();
         }
         1_000
+    }
+
+    /// The reply the model just finished, streamed as `text`.
+    fn answer(turn: &mut Turn, text: &str) -> Message {
+        turn.absorb(&Event::Delta(text.into()));
+        turn.take_reply("some-model")
     }
 
     #[test]
@@ -393,10 +546,38 @@ mod tests {
             turn.finish_call(Ok("again".into()));
             turn.take_results();
         }
-        assert!(!turn.begin(vec![call("read_file")]), "ran past the cap");
+        assert_eq!(turn.capped(), None);
+        // At the cap nothing more runs: every call is answered as not run,
+        // and a notice after them asks for a wrap-up with no tools.
+        assert!(turn.begin(vec![call("read_file"), call("list_dir")]));
+        assert_eq!(turn.next(|_| Outcome::Run), Next::Ask);
+        let sent = turn.take_results();
+        let not_run = "Not run: the tool-round limit (25) was reached.";
+        let answered: Vec<(&str, &str)> = sent[..2]
+            .iter()
+            .map(|m| (m.tool_call_id.as_str(), m.content.as_str()))
+            .collect();
+        assert_eq!(
+            answered,
+            [("read_file-1", not_run), ("list_dir-1", not_run)]
+        );
+        assert!(sent[..2].iter().all(|m| m.role == "tool" && m.is_error));
+        assert_eq!((sent[2].role.as_str(), sent[2].notice), ("user", true));
+        assert_eq!(sent[2].content, WRAP_UP);
+        assert!(turn.connection.wrap_up);
+        // The wrap-up asks for calls anyway: they are dropped unrun, and the
+        // turn ends saying where it stopped.
+        let mut summary = answer(&mut turn, "Read most of it; the tests remain.");
+        summary.tool_calls = vec![call("read_file")];
+        assert!(matches!(turn.continuation(&mut summary), Ok(None)));
+        assert!(summary.tool_calls.is_empty());
+        assert!(!turn.begin(summary.tool_calls));
+        assert_eq!(
+            turn.capped().as_deref(),
+            Some("Stopped after 25 rounds; send \"continue\" to keep going.")
+        );
         // An empty batch ends the turn rather than looping on nothing.
-        let mut empty = Turn::new(turn.connection.clone());
-        assert!(!empty.begin(Vec::new()));
+        assert!(!self::turn().begin(Vec::new()));
     }
 
     #[test]
@@ -475,34 +656,45 @@ mod tests {
     fn a_reply_cut_off_at_the_limit_goes_on_three_times_then_stops() {
         let mut turn = turn();
         // A reply that ended on its own asks for nothing more.
-        turn.absorb(&Event::Delta("Done.".into()));
-        turn.take_reply("some-model");
-        assert!(matches!(turn.continuation(), Ok(None)));
+        let mut done = answer(&mut turn, "Done.");
+        assert!(matches!(turn.continuation(&mut done), Ok(None)));
         for time in 0..MAX_CONTINUATIONS {
             turn.absorb(&Event::Delta("part".into()));
             turn.absorb(&Event::CutOff { in_call: false });
+            let mut reply = turn.take_reply("some-model");
+            let nudge = turn
+                .continuation(&mut reply)
+                .unwrap()
+                .expect("a continuation");
             // The fragment is kept, not thrown away.
-            assert_eq!(turn.take_reply("some-model").content, "part");
-            let notice = turn.continuation().unwrap().expect("a continuation");
-            assert!(notice.notice, "time {time}");
-            assert_eq!(notice.role, "user");
-            assert_eq!(notice.content, CONTINUE);
+            assert_eq!(reply.content, "part");
+            assert!(nudge.notice.notice, "time {time}");
+            assert_eq!(nudge.notice.role, "user");
+            assert_eq!(nudge.notice.content, CONTINUE);
         }
         turn.absorb(&Event::CutOff { in_call: false });
-        assert!(turn.continuation().is_err(), "went on past the cap");
+        let mut reply = turn.take_reply("some-model");
+        assert!(
+            turn.continuation(&mut reply).is_err(),
+            "went on past the cap"
+        );
     }
 
     #[test]
     fn a_call_cut_off_at_the_limit_is_asked_for_again() {
         let mut turn = turn();
         turn.absorb(&Event::CutOff { in_call: true });
-        let reply = turn.take_reply("some-model");
+        let mut reply = turn.take_reply("some-model");
         assert!(reply.tool_calls.is_empty());
-        let notice = turn.continuation().unwrap().expect("a continuation");
-        assert!(notice.notice);
-        assert_eq!(notice.content, CALL_AGAIN);
+        let nudge = turn
+            .continuation(&mut reply)
+            .unwrap()
+            .expect("a continuation");
+        assert!(nudge.notice.notice);
+        assert_eq!(nudge.notice.content, CALL_AGAIN);
         // Taken once: the next reply starts clean.
-        assert!(matches!(turn.continuation(), Ok(None)));
+        let mut done = answer(&mut turn, "Done.");
+        assert!(matches!(turn.continuation(&mut done), Ok(None)));
     }
 
     #[test]
@@ -579,5 +771,91 @@ mod tests {
         assert!(kept.iter().all(|m| m.role == "tool"));
         // Nothing is left to run or send.
         assert_eq!(turn.next(|_| Outcome::Run), Next::Done);
+    }
+
+    #[test]
+    fn an_empty_reply_is_asked_for_again_once_then_its_thinking_is_the_answer() {
+        let mut turn = turn();
+        turn.absorb(&Event::Reasoning("The answer is 4.".into()));
+        let mut reply = turn.take_reply("some-model");
+        let nudge = turn.continuation(&mut reply).unwrap().expect("a nudge");
+        assert_eq!(nudge.notice.content, SPEAK_UP);
+        assert!(nudge.notice.notice);
+        // Nothing is left in it to keep.
+        assert!(reply.content.is_empty() && reply.tool_calls.is_empty());
+        turn.absorb(&Event::Reasoning("Still just 4.".into()));
+        let mut again = turn.take_reply("some-model");
+        assert!(matches!(turn.continuation(&mut again), Ok(None)));
+        assert_eq!(again.content, "Still just 4.");
+        assert!(again.reasoning.is_empty());
+    }
+
+    #[test]
+    fn two_empty_replies_with_no_thinking_end_the_turn_saying_so() {
+        let mut turn = turn();
+        let mut blank = answer(&mut turn, "  \n");
+        assert!(turn.continuation(&mut blank).unwrap().is_some());
+        // Some routes refuse an assistant message of only whitespace.
+        assert!(blank.content.is_empty());
+        let mut blank = turn.take_reply("some-model");
+        assert_eq!(
+            turn.continuation(&mut blank).err().as_deref(),
+            Some("The model returned no text. Check model compatibility.")
+        );
+    }
+
+    #[test]
+    fn a_tool_round_earns_an_empty_reply_another_nudge() {
+        let mut turn = turn();
+        let mut blank = turn.take_reply("some-model");
+        assert!(turn.continuation(&mut blank).unwrap().is_some());
+        turn.begin(vec![call("read_file")]);
+        turn.finish_call(Ok("contents".into()));
+        turn.take_results();
+        let mut blank = turn.take_reply("some-model");
+        assert!(turn.continuation(&mut blank).unwrap().is_some());
+    }
+
+    #[test]
+    fn an_answer_that_stops_at_its_next_step_is_pushed_on_once() {
+        let mut turn = turn();
+        // Before any tool has run there is nothing to go on with.
+        let mut plan = answer(&mut turn, "Let me read the file.");
+        assert!(matches!(turn.continuation(&mut plan), Ok(None)));
+        turn.begin(vec![call("read_file")]);
+        turn.finish_call(Ok("contents".into()));
+        turn.take_results();
+        let mut plan = answer(&mut turn, "Found it. Now let me run the tests:");
+        let nudge = turn.continuation(&mut plan).unwrap().expect("a nudge");
+        assert_eq!(nudge.notice.content, "Continue now.");
+        // The announcement itself is kept.
+        assert_eq!(plan.content, "Found it. Now let me run the tests:");
+        let mut plan = answer(&mut turn, "Now let me run the tests:");
+        assert!(matches!(turn.continuation(&mut plan), Ok(None)), "twice");
+    }
+
+    #[test]
+    fn announcements_are_told_from_answers_and_hand_backs() {
+        for said in [
+            "Let me check the config file.",
+            "The build passed. Now let me run the tests:",
+            "Next, I'll update the README\u{2026}",
+            "I\u{2019}ll now edit main.rs.",
+            "Now I'm going to rerun the build",
+        ] {
+            assert!(announces(said), "{said}");
+        }
+        for said in [
+            "The tests pass.",
+            "Let me know if you want the other file changed too.",
+            "I'll wait for your go-ahead before deleting it.",
+            "Let me stop here until you confirm.",
+            "I'm going to leave the config as it is.",
+            "Shall I go on and run the tests?",
+            "Now I see: the bug was the off-by-one in the loop.",
+            &format!("{} Let me run the tests.", "Done. ".repeat(80)),
+        ] {
+            assert!(!announces(said), "{said}");
+        }
     }
 }

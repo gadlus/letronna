@@ -234,8 +234,9 @@ pub(crate) struct Chat {
     pub(crate) error: Option<String>,
     /// Where updating stands, for the About page and the status bar.
     pub(crate) updating: crate::ui::update::Updating,
-    /// A new version to announce, the next time the window draws.
-    pub(crate) update_note: Option<String>,
+    /// A passing note for the next time the window draws: a new version, or
+    /// a turn stopped at its round cap.
+    pub(crate) note: Option<String>,
     pub(crate) scroll: ScrollHandle,
     /// Whether the chat keeps to its newest message as more arrives.
     pub(crate) following: bool,
@@ -525,7 +526,7 @@ impl Chat {
             draft_for,
             error: error.or(skills_error),
             updating: Default::default(),
-            update_note: None,
+            note: None,
             scroll: ScrollHandle::new(),
             following: true,
             followed_offset: px(0.),
@@ -713,6 +714,7 @@ impl Chat {
                     .contains(&self.store.conversations[self.store.active].id),
             remote,
             conversation: self.store.conversations[self.store.active].id,
+            wrap_up: false,
         };
         if let Err(error) = backend::validate(&connection) {
             self.error = Some(error);
@@ -884,9 +886,9 @@ impl Chat {
         let Some(turn) = self.turn.as_mut() else {
             return;
         };
-        let reply = turn.take_reply(&model);
+        let mut reply = turn.take_reply(&model);
+        let continuation = turn.continuation(&mut reply);
         let calls = reply.tool_calls.clone();
-        let continuation = turn.continuation();
         // The session may have been switched or deleted while it streamed.
         let Some(ix) = self.streaming_id.and_then(|id| self.store.index_of(id)) else {
             self.finish(cx);
@@ -894,14 +896,14 @@ impl Chat {
         };
         let conversation = &mut self.store.conversations[ix];
         conversation.updated = backend::now();
-        // A reply cut off inside a tool call, with no text before it, leaves
-        // nothing to keep.
+        // A reply with nothing in it -- empty, or cut off inside a tool call
+        // with no text before it -- leaves nothing to keep.
         if !reply.content.is_empty() || !calls.is_empty() {
             conversation.messages.push(reply);
         }
         match continuation {
-            Ok(Some(notice)) => {
-                conversation.messages.push(notice);
+            Ok(Some(nudge)) => {
+                conversation.messages.push(nudge.notice);
                 self.save();
                 self.run_turn(cx);
                 return;
@@ -914,6 +916,9 @@ impl Chat {
         if more {
             self.advance_tools(cx);
         } else {
+            if let Some(note) = self.turn.as_ref().and_then(agent::Turn::capped) {
+                self.note = Some(note);
+            }
             self.finish(cx);
         }
     }
@@ -1651,7 +1656,7 @@ impl Render for Chat {
             })
             .detach();
         }
-        if let Some(note) = self.update_note.take() {
+        if let Some(note) = self.note.take() {
             window.push_notification(gpui_component::notification::Notification::info(note), cx);
         }
         if let Some(error) = self.error.take() {
