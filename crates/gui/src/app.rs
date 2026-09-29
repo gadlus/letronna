@@ -105,6 +105,8 @@ pub(crate) struct Chat {
     pub(crate) finding: Option<Task<()>>,
     pub(crate) endpoint: Entity<InputState>,
     pub(crate) model: Entity<InputState>,
+    /// The models to carry on with, written as a comma-separated list.
+    pub(crate) fallbacks: Entity<InputState>,
     pub(crate) key: Entity<InputState>,
     /// Where the browser is when it is not on this computer.
     pub(crate) browser_address: Entity<InputState>,
@@ -403,6 +405,11 @@ impl Chat {
                 .placeholder("Model ID")
                 .default_value(store.settings.model.clone())
         });
+        let fallbacks = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("None. Such as gpt-5-mini, OpenRouter:deepseek/deepseek-chat")
+                .default_value(store.settings.fallbacks.join(", "))
+        });
         let key = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("API key")
@@ -578,6 +585,7 @@ impl Chat {
             finding: None,
             endpoint,
             model,
+            fallbacks,
             key,
             browser_address,
             models: Vec::new(),
@@ -1290,6 +1298,11 @@ impl Chat {
                 self.finish(cx);
             }
             Event::Finished(Ok(())) => self.on_reply(cx),
+            // Only the switch a failure caused: the requests after it go to
+            // the same fallback until the cooldown ends, and say nothing new.
+            Event::Switched(switch) if switch.after.is_some() => {
+                self.note = Some(switch.to_string());
+            }
             // Kept with the session, so a restart need not ask for it again.
             Event::Summarized { upto, text } => {
                 if let Some(ix) = self.streaming_id.and_then(|id| self.store.index_of(id)) {

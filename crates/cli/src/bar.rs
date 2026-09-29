@@ -56,6 +56,10 @@ pub const COMMANDS: &[Command] = &[
         blurb: "show or change the model; add image, speech or video for those",
     },
     Command {
+        name: "/fallback",
+        blurb: "models to carry on with when yours is overloaded or out of credit",
+    },
+    Command {
         name: "/gateways",
         blurb: "see, add or remove gateways",
     },

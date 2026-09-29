@@ -57,6 +57,9 @@ pub struct Failure {
     pub retry_after: Option<Duration>,
     /// The limits an overflow named, when the failure is one.
     pub overflow: Option<Overflow>,
+    /// Part of the reply was already passed on, so it cannot be asked for
+    /// again without showing a second one after it.
+    pub stands: bool,
     message: String,
 }
 
@@ -79,6 +82,7 @@ impl Failure {
             kind,
             retry_after: None,
             overflow: None,
+            stands: false,
             message: message.into(),
         }
     }
@@ -128,6 +132,7 @@ pub fn classify(status: Option<u16>, headers: &HeaderMap, body: &Value) -> Failu
         kind,
         retry_after: retry_after(headers),
         overflow,
+        stands: false,
         message: words(status, body),
     }
 }
@@ -199,6 +204,8 @@ const PHRASES: &[(&str, FailureKind)] = &[
     ("api key", FailureKind::Auth),
     ("not exist", FailureKind::NotFound),
     ("not found", FailureKind::NotFound),
+    ("unknown model", FailureKind::NotFound),
+    ("not a valid model", FailureKind::NotFound),
 ];
 
 /// The kind the first of `PHRASES` found in the lowercase `text` names.
@@ -492,6 +499,12 @@ mod tests {
             (
                 Some(400),
                 r#"{"error":{"message":"Model Not Exist","type":"invalid_request_error","param":null,"code":"invalid_request_error"}}"#,
+                FailureKind::NotFound,
+            ),
+            // OpenRouter says a model id it does not know with 400.
+            (
+                Some(400),
+                r#"{"error":{"message":"acme/nope is not a valid model ID","code":400}}"#,
                 FailureKind::NotFound,
             ),
             // Envelopes with nothing but words, as a gateway may pass them on

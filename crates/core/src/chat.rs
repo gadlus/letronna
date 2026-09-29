@@ -273,6 +273,8 @@ pub enum Event {
     },
     /// A try failed in a way that passes, and another follows after a wait.
     Retrying(crate::retry::Retry),
+    /// The request went to a fallback model rather than the session's.
+    Switched(crate::fallback::Switch),
     /// Sent before `Finished` when the reply stopped at the output limit;
     /// `in_call` when it stopped inside a tool call, which is then dropped
     /// rather than run half written.
@@ -1849,7 +1851,19 @@ pub fn start_with(
     let (sender, receiver) = async_channel::bounded(64);
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
-        let result = send_window(&connection, &messages, &budget, &extra, &sender);
+        let chain = fallbacks(&connection);
+        let result = crate::fallback::run(
+            &chain,
+            |connection| {
+                let budget = budget_for(connection, &chain[0], budget);
+                send_window(connection, &messages, &budget, &extra, &sender)
+            },
+            |switch| {
+                sender
+                    .send_blocking(Event::Switched(switch))
+                    .map_err(|_| Failure::new(FailureKind::Stopped, "Chat closed."))
+            },
+        );
         // The call is over by now. Letting go before saying so means whoever
         // hears `Finished` never finds the guard still held.
         drop(extra.guard);
@@ -1871,6 +1885,32 @@ pub fn start_with(
         let _ = sender.send_blocking(Event::Finished(result));
     });
     receiver
+}
+
+/// The session's connection, then the fallbacks Settings names. The file is
+/// read on each call, as the context cap is, so a change made in the window
+/// counts in the terminal from its next request.
+fn fallbacks(connection: &Connection) -> Vec<Connection> {
+    let settings = crate::store::current_settings();
+    // Entries that do not read are passed over here; the frontends say why
+    // when they are written.
+    let fallbacks: Vec<_> = (settings.fallbacks.iter())
+        .filter_map(|text| crate::fallback::Fallback::parse(text).ok())
+        .collect();
+    if fallbacks.is_empty() {
+        return vec![connection.clone()];
+    }
+    let keys = crate::store::load_keys();
+    crate::fallback::chain(connection, &fallbacks, &keys, &settings.custom_endpoint)
+}
+
+/// The budget for a request to `connection`: the session's own for its model,
+/// and one of its own for a fallback, whose window may differ.
+fn budget_for(connection: &Connection, primary: &Connection, own: Budget) -> Budget {
+    if connection.endpoint == primary.endpoint && connection.model == primary.model {
+        return own;
+    }
+    budget(connection, crate::store::context_cap())
 }
 
 /// Send `messages` in the window `budget` gives, unless what no window
@@ -2072,6 +2112,8 @@ fn stream(
         // stands. A reply that ran out of time may well run out again, each
         // try perhaps billed, so it gets one more go and no more.
         if stands || timeouts > 1 {
+            let mut failure = failure;
+            failure.stands = stands;
             return Err(failure);
         }
         let Some(retry) = crate::retry::after(&failure, tried, connection.unattended) else {

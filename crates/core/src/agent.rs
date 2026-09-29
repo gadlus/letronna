@@ -111,6 +111,8 @@ pub struct Live {
     pub replay: Option<Replay>,
     /// The try about to be made again after a failure, while it waits.
     pub retrying: Option<crate::retry::Retry>,
+    /// The fallback the reply comes from, when not the session's model.
+    pub switched: Option<crate::fallback::Switch>,
     /// Set while the turns the window dropped are summarized, until the
     /// reply starts.
     pub compacting: bool,
@@ -196,8 +198,8 @@ impl Turn {
                 self.live.per_second = *per_second;
                 self.live.prompt_tokens = *prompt;
                 self.live.cached_tokens = *cached;
-                let model = self.connection.model.trim();
-                let facts = crate::models::facts(&self.connection.endpoint, model);
+                let (endpoint, model) = self.served();
+                let facts = crate::models::facts(endpoint, model.trim());
                 self.live.window = facts.context.unwrap_or(0);
                 self.live.cache_write_tokens = *cache_write;
                 self.live.reasoning_tokens = *reasoning;
@@ -207,6 +209,7 @@ impl Turn {
             Event::ToolCalls(calls) => self.live.calls = calls.clone(),
             Event::Replay(replay) => self.live.replay = Some(replay.clone()),
             Event::Retrying(retry) => self.live.retrying = Some(*retry),
+            Event::Switched(switch) => self.live.switched = Some(switch.clone()),
             Event::Compacting => self.live.compacting = true,
             // The front end keeps it with the session.
             Event::Summarized { .. } => {}
@@ -215,10 +218,24 @@ impl Turn {
         }
     }
 
+    /// Where the reply being streamed comes from, as (endpoint, model): the
+    /// session's model, or the fallback that stood in for it.
+    fn served(&self) -> (&str, &str) {
+        match &self.live.switched {
+            Some(switch) => (&switch.endpoint, &switch.model),
+            None => (&self.connection.endpoint, &self.connection.model),
+        }
+    }
+
     /// The assistant message for the reply just finished, its cost settled,
-    /// and a clean slate for the next one.
+    /// and a clean slate for the next one. A reply a fallback wrote is
+    /// labelled and priced as that model's rather than `model`'s.
     pub fn take_reply(&mut self, model: &str) -> Message {
         let live = std::mem::take(&mut self.live);
+        let (endpoint, model) = match &live.switched {
+            Some(switch) => (switch.endpoint.as_str(), switch.model.as_str()),
+            None => (self.connection.endpoint.as_str(), model),
+        };
         let mut reply = Message {
             role: "assistant".into(),
             content: live.content,
@@ -238,7 +255,7 @@ impl Turn {
             replay: live.replay.map(Box::new),
             ..Default::default()
         };
-        let usage = crate::usage::Usage::of(&reply).priced(&self.connection.endpoint, model);
+        let usage = crate::usage::Usage::of(&reply).priced(endpoint, model);
         reply.cost = usage.cost;
         reply.cost_estimated = usage.estimated;
         reply
@@ -625,6 +642,21 @@ mod tests {
         assert_eq!(turn.live.retrying, Some(retry));
         turn.absorb(&Event::Reasoning("thinking".into()));
         assert_eq!(turn.live.retrying, None);
+    }
+
+    #[test]
+    fn a_reply_a_fallback_wrote_is_labelled_as_that_model() {
+        let mut turn = turn();
+        turn.absorb(&Event::Switched(crate::fallback::Switch {
+            model: "small".into(),
+            endpoint: "https://fallback.test/v1".into(),
+            after: None,
+        }));
+        turn.absorb(&Event::Delta("Done.".into()));
+        assert_eq!(turn.take_reply("test").model, "small");
+        // The next request says again where it went, or it went to the session's.
+        turn.absorb(&Event::Delta("Done.".into()));
+        assert_eq!(turn.take_reply("test").model, "test");
     }
 
     #[test]
