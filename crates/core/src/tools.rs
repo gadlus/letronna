@@ -1276,12 +1276,30 @@ fn copy_clean(raw: &Path, to: &mut std::fs::File) -> std::io::Result<()> {
                 .find(|&i| held[i] & 0xC0 != 0x80)
                 .unwrap_or(held.len()),
         };
+        // A private key cut in two would show the half after the cut, whose
+        // lines nothing marks as a key; it goes out whole, in the next piece.
+        let end = match open_key(&held[..end]) {
+            Some(0) if n > 0 && held.len() < 4 * BLOCK => continue,
+            Some(start) if start > 0 && n > 0 => start,
+            _ => end,
+        };
         to.write_all(clean(&held[..end]).as_bytes())?;
         held.drain(..end);
         if n == 0 {
             return Ok(());
         }
     }
+}
+
+/// Where the line starts that opens a key block `bytes` ends inside of,
+/// before its `-----END` line.
+fn open_key(bytes: &[u8]) -> Option<usize> {
+    let begin = bytes.windows(11).rposition(|w| w == b"-----BEGIN ")?;
+    if bytes[begin..].windows(9).any(|w| w == b"-----END ") {
+        return None;
+    }
+    let line = bytes[..begin].iter().rposition(|&b| b == b'\n');
+    Some(line.map_or(0, |i| i + 1))
 }
 
 /// A new file only its owner can read, open for appending, its folder made.
@@ -4248,6 +4266,27 @@ mod tests {
             &all[..cap]
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_saved_private_key_is_hidden_where_a_piece_ends_inside_it() {
+        let dir = std::env::temp_dir().join(format!("letronna-pipe-key-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The first piece read ends inside the key's body.
+        let mut raw = "x\n".repeat(1024 * 512 - 100);
+        raw.push_str("-----BEGIN RSA PRIVATE KEY-----\n");
+        for n in 0..8 {
+            raw.push_str(&format!("MIIEpAIBAAKCAQEA{n:04}\n").repeat(4));
+        }
+        raw.push_str("-----END RSA PRIVATE KEY-----\nafter\n");
+        std::fs::write(dir.join("raw"), &raw).unwrap();
+        let mut to = std::fs::File::create(dir.join("clean")).unwrap();
+        copy_clean(&dir.join("raw"), &mut to).unwrap();
+        let clean = std::fs::read_to_string(dir.join("clean")).unwrap();
+        assert!(!clean.contains("MIIEpAIBAAKCAQEA"), "a key was left in");
+        assert!(clean.ends_with("-----END RSA PRIVATE KEY-----\nafter\n"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
