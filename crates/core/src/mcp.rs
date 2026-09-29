@@ -46,6 +46,14 @@
 //! to the user's screen, never to the model. `mcp.json` is changed as plain
 //! JSON rather than through the structs below, so keys another app or a
 //! newer Letronna wrote are kept.
+//!
+//! A server that could not start or stopped is started again by a timer
+//! entry, not a thread kept waiting: one reached by URL up to five times,
+//! 1 s later and doubling each time, as a hosted server that went away is
+//! often soon back; one run here once, as a process that dies twice will
+//! most likely die again, and each start may download it anew. Then it
+//! waits for the user's Reconnect. A server that says its tools changed is
+//! asked for them again.
 
 use crate::tools::{Tool, ToolContext};
 use serde::Deserialize;
@@ -54,8 +62,28 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, Once, OnceLock, mpsc};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex, Once, OnceLock, Weak, mpsc};
+use std::time::{Duration, Instant};
+
+/// How many times a server reached by URL is started again after it could
+/// not start or stopped, before it waits for the user: Claude Code's number,
+/// about half a minute of trying with the waits below.
+const REMOTE_RETRIES: u32 = 5;
+/// How many times a server run here is started again: once, as a crash can
+/// be a fluke but a second one seldom is.
+const LOCAL_RETRIES: u32 = 1;
+/// The wait before the first start again, doubled for each one after.
+const FIRST_RETRY: Duration = Duration::from_secs(1);
+/// The longest wait between starts.
+const LONGEST_RETRY: Duration = Duration::from_secs(30);
+/// How long a server must stay connected for its next loss to have all its
+/// retries again, so one that drops each time within a minute of answering
+/// runs out of them rather than being started forever.
+const STEADY: Duration = Duration::from_secs(60);
+/// The least time between two listings of one server's tools. Each new name
+/// or description a server gives is kept for the rest of the run, so one
+/// that keeps saying its tools changed is listed once a second at most.
+const RELIST_GAP: Duration = Duration::from_secs(1);
 
 /// How long a server gets to start and list its tools, unless its
 /// `startup_timeout_ms` says otherwise. The first run of an npx server
@@ -291,6 +319,13 @@ fn matches_glob(glob: &str, name: &str) -> bool {
 }
 
 /// What a configured server is doing.
+///
+/// A start (`open`, and `retry` for one retrying) makes it Starting, or
+/// Disabled or Failed when its entry says so. Starting becomes Connected when
+/// it lists its tools (`settle`); Starting or Connected becomes Retrying when
+/// it could not start or stopped with retries left, else Failed (`lose`).
+/// Retrying becomes Starting when its timer fires. Reconnect and enable
+/// start it afresh, with all its retries, from any state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum State {
     /// Started, and not yet answered with its tools.
@@ -298,8 +333,11 @@ pub enum State {
     Starting,
     /// Answered, and its tools are offered.
     Connected,
-    /// Could not start, stopped, or its entry will not parse; the error says
-    /// which.
+    /// Could not start or stopped, and is started again once its wait is
+    /// over; the error says why.
+    Retrying,
+    /// Could not start, stopped with no retries left, or its entry will not
+    /// parse; the error says which. It waits for Reconnect.
     Failed,
     /// Switched off in `mcp.json`.
     Disabled,
@@ -325,6 +363,19 @@ pub struct ServerStatus {
     /// with keys hidden. For the user's eyes only: nothing hands it to the
     /// model.
     pub log: String,
+    /// When a retrying server is started again.
+    pub retry: Option<Retry>,
+}
+
+/// The next start of a server that is retrying.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Retry {
+    /// How long after the status was read.
+    pub wait: Duration,
+    /// Which start again this is, from 1.
+    pub attempt: u32,
+    /// How many it gets before it waits for Reconnect.
+    pub attempts: u32,
 }
 
 /// One configured server and what became of it: the one record that
@@ -342,17 +393,48 @@ struct Slot {
     /// Counts the starts, so one that ends after a later start began is
     /// dropped rather than taken for the current one.
     run: u64,
+    /// The server as spoken to, held so one that lists no tools stays up.
+    server: Option<Arc<Server>>,
+    /// Starts again since the user last started it or it last held.
+    retries: u32,
+    /// When it last answered, for telling one that held from one that drops.
+    connected_at: Option<Instant>,
+    /// Its next start again, and the timer entry that makes it.
+    retry: Option<(Instant, crate::timers::TimerId)>,
 }
 
 impl Slot {
-    /// Stop its process, if it runs here, and drop its tools.
+    /// Stop its process, if it runs here, drop its tools and take back its
+    /// next start.
     fn stop(&mut self) {
         self.tools.clear();
+        self.server = None;
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
+        if let Some((_, timer)) = self.retry.take() {
+            crate::timers::cancel(timer);
+        }
     }
+
+    /// How many starts again it gets.
+    fn attempts(&self) -> u32 {
+        match self.config.url.trim().is_empty() {
+            true => LOCAL_RETRIES,
+            false => REMOTE_RETRIES,
+        }
+    }
+}
+
+/// How long to wait before start again number `attempt` (from 0), if the
+/// server has that many: 1 s, doubling to at most 30 s.
+fn retry_wait(attempt: u32, attempts: u32) -> Option<Duration> {
+    (attempt < attempts).then(|| {
+        FIRST_RETRY
+            .saturating_mul(2u32.saturating_pow(attempt))
+            .min(LONGEST_RETRY)
+    })
 }
 
 /// The tools of every server that has answered so far.
@@ -475,6 +557,11 @@ pub fn status() -> Vec<ServerStatus> {
                     .lock()
                     .map(|mut log| crate::tools::strip_escapes(&crate::jobs::text(&mut log)))
                     .unwrap_or_default(),
+                retry: slot.retry.map(|(when, _)| Retry {
+                    wait: when.saturating_duration_since(Instant::now()),
+                    attempt: slot.retries,
+                    attempts: slot.attempts(),
+                }),
             }
         })
         .collect();
@@ -673,6 +760,7 @@ fn open(name: &str, server: Result<ServerConfig, String>) {
     let slot = slots.entry(name.to_owned()).or_default();
     slot.stop();
     slot.run += 1;
+    slot.retries = 0;
     slot.error = None;
     let config = match server {
         Ok(config) => config,
@@ -694,6 +782,11 @@ fn open(name: &str, server: Result<ServerConfig, String>) {
         slot.error = Some("Its entry has neither a command nor a url.".into());
         return;
     }
+    start_slot(name, slot);
+}
+
+/// Start the server in `slot` on a thread of its own, as its current run.
+fn start_slot(name: &str, slot: &mut Slot) {
     slot.state = State::Starting;
     // What the last run printed stays, marked off from what this one does.
     if let Ok(mut log) = slot.log.lock()
@@ -701,8 +794,7 @@ fn open(name: &str, server: Result<ServerConfig, String>) {
     {
         crate::jobs::append(&mut log, b"\n--- started again ---\n");
     }
-    let run = slot.run;
-    drop(slots);
+    let (config, run) = (slot.config.clone(), slot.run);
     begin_start();
     let name = name.to_owned();
     std::thread::spawn(move || {
@@ -728,26 +820,70 @@ fn settle(name: &str, run: u64, outcome: Result<Vec<Arc<dyn Tool>>, String>) {
         Ok(tools) => {
             slot.state = State::Connected;
             slot.tools = tools;
+            slot.error = None;
+            slot.connected_at = Some(Instant::now());
         }
-        Err(error) => {
-            // One that never answered may still be running.
-            slot.stop();
-            slot.state = State::Failed;
-            slot.error = Some(error);
+        Err(error) => lose(name, slot, error),
+    });
+}
+
+/// Mark a connected server as lost: one run here once its stderr closes,
+/// which it does as the process ends, one reached by URL once it cannot be
+/// reached. One still starting hears of it from `connect`.
+fn gone(name: &str, run: u64, error: String) {
+    with_run(name, run, |slot| {
+        if slot.state == State::Connected {
+            lose(name, slot, error);
         }
     });
 }
 
-/// Mark a server run here as stopped once its stderr closes, which it does
-/// as the process ends. One still starting hears of it from `connect`.
-fn gone(name: &str, run: u64) {
-    with_run(name, run, |slot| {
-        if slot.state == State::Connected {
-            slot.stop();
-            slot.state = State::Failed;
-            slot.error = Some(format!("{name} stopped."));
-        }
-    });
+/// Take a server that could not start or stopped to Retrying, with a timer
+/// entry for its next start, while it has retries left, and to Failed once
+/// it has none.
+fn lose(name: &str, slot: &mut Slot, error: String) {
+    if slot
+        .connected_at
+        .take()
+        .is_some_and(|at| at.elapsed() >= STEADY)
+    {
+        slot.retries = 0;
+    }
+    // One that never answered may still be running.
+    slot.stop();
+    slot.error = Some(error);
+    let Some(wait) = retry_wait(slot.retries, slot.attempts()) else {
+        slot.state = State::Failed;
+        return;
+    };
+    slot.state = State::Retrying;
+    slot.retries += 1;
+    let when = Instant::now() + wait;
+    let (name, run) = (name.to_owned(), slot.run);
+    // The timer thread only hands the start on: it kills and spawns, which
+    // would hold up every timer behind it.
+    let fire = move || drop(std::thread::spawn(move || retry(&name, run)));
+    slot.retry = Some((when, crate::timers::at(when, Box::new(fire))));
+}
+
+/// Start a retrying server again, unless it has been started, stopped or
+/// switched off since its timer was set.
+fn retry(name: &str, run: u64) {
+    let Ok(mut slots) = slots().lock() else {
+        return;
+    };
+    let Some(slot) = slots
+        .get_mut(name)
+        .filter(|slot| slot.run == run && slot.state == State::Retrying)
+    else {
+        return;
+    };
+    // Taken back as well, should it be started before its timer fires.
+    if let Some((_, timer)) = slot.retry.take() {
+        crate::timers::cancel(timer);
+    }
+    slot.run += 1;
+    start_slot(name, slot);
 }
 
 /// Keep what a server prints on stderr until it closes.
@@ -801,7 +937,7 @@ fn launch(name: &str, config: &ServerConfig, run: u64) -> Result<Vec<Arc<dyn Too
         .expanded(&|var| std::env::var(var).ok())
         .map_err(|e| format!("{name}: {e}"))?;
     if !config.url.trim().is_empty() {
-        return reach(name, config);
+        return reach(name, config, run);
     }
     let mut child = spawn(config, &crate::chat::data_dir())?;
     let (Some(stdin), Some(stdout), Some(stderr)) =
@@ -827,9 +963,9 @@ fn launch(name: &str, config: &ServerConfig, run: u64) -> Result<Vec<Arc<dyn Too
     let who = name.to_owned();
     std::thread::spawn(move || {
         keep_log(stderr, &log);
-        gone(&who, run);
+        gone(&who, run, format!("{who} stopped."));
     });
-    connect(name, config, stdout, stdin)
+    connect(name, run, config, stdout, stdin)
 }
 
 /// The server's process, with its pipes, started in its `cwd` from `base`,
@@ -890,7 +1026,7 @@ fn spawn(config: &ServerConfig, base: &Path) -> Result<std::process::Child, Stri
 }
 
 /// Greet a server reached by URL and wrap each tool it lists.
-fn reach(name: &str, config: &ServerConfig) -> Result<Vec<Arc<dyn Tool>>, String> {
+fn reach(name: &str, config: &ServerConfig, run: u64) -> Result<Vec<Arc<dyn Tool>>, String> {
     let (from, replies) = std::io::pipe().map_err(|e| format!("{name}: {e}"))?;
     // Each request carries its own deadline, from the server's call time,
     // rather than the client cutting every call off at one length.
@@ -902,6 +1038,7 @@ fn reach(name: &str, config: &ServerConfig) -> Result<Vec<Arc<dyn Tool>>, String
         .map_err(|e| e.to_string())?;
     let link = Arc::new(Link {
         name: name.to_owned(),
+        run,
         url: config.url.trim().to_owned(),
         headers: config.headers.clone(),
         client,
@@ -911,6 +1048,10 @@ fn reach(name: &str, config: &ServerConfig) -> Result<Vec<Arc<dyn Tool>>, String
         greeting_again: Mutex::default(),
     });
     if let Ok(mut links) = links().lock() {
+        // One per server, the newest: each start again would otherwise keep
+        // another client, and its thread, until the app quits. An older
+        // session is left to expire on the server.
+        links.retain(|old| old.name != name);
         links.push(link.clone());
     }
     let http = Http {
@@ -918,7 +1059,7 @@ fn reach(name: &str, config: &ServerConfig) -> Result<Vec<Arc<dyn Tool>>, String
         replies: Arc::new(Mutex::new(replies)),
         line: Vec::new(),
     };
-    connect(name, config, from, http)
+    connect(name, run, config, from, http)
 }
 
 /// Every server reached by URL, for ending their sessions when the app quits.
@@ -961,6 +1102,8 @@ struct Http {
 /// session it gave.
 struct Link {
     name: String,
+    /// The start of its slot it belongs to.
+    run: u64,
     url: String,
     headers: HashMap<String, String>,
     client: reqwest::blocking::Client,
@@ -1138,9 +1281,16 @@ impl Link {
             .header("Accept", "application/json, text/event-stream")
             .body(message.to_vec());
         let (request, sent_with) = self.headed(request);
-        let reply = request
-            .send()
-            .map_err(|e| Failed::Said(format!("could not reach {url}: {e}")))?;
+        let reply = request.send().map_err(|e| {
+            let why = format!("could not reach {url}: {e}");
+            // Nothing answers there now, as when the server went down:
+            // it is lost, and started again. A call that timed out or was
+            // cut short is its own failure, not the server's.
+            if e.is_connect() {
+                gone(&self.name, self.run, format!("{}: {why}", self.name));
+            }
+            Failed::Said(why)
+        })?;
         let status = reply.status();
         // What a server that restarted says of a session from before.
         if status == reqwest::StatusCode::NOT_FOUND
@@ -1224,18 +1374,25 @@ fn events(from: impl BufRead, hand_on: &mut dyn FnMut(Value)) -> std::io::Result
 /// Greet a server over its pipes and wrap each tool it lists.
 fn connect(
     name: &str,
+    run: u64,
     config: &ServerConfig,
     from: impl Read + Send + 'static,
     to: impl Write + Send + 'static,
 ) -> Result<Vec<Arc<dyn Tool>>, String> {
     let server = Arc::new(Server {
         name: name.to_owned(),
+        run,
+        config: config.clone(),
         to: Mutex::new(Box::new(to)),
         waiting: Mutex::default(),
         next: AtomicU64::new(1),
+        relisting: Mutex::default(),
     });
-    let reader = server.clone();
-    std::thread::spawn(move || reader.listen(from));
+    // Held weakly, so a server let go of is dropped, closing what it
+    // speaks over, rather than kept by the thread reading its replies.
+    let reader = Arc::downgrade(&server);
+    std::thread::spawn(move || Server::listen(&reader, from));
+    with_run(name, run, |slot| slot.server = Some(server.clone()));
     server.request(
         "initialize",
         json!({
@@ -1246,39 +1403,7 @@ fn connect(
         config.start_time(),
     )?;
     server.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))?;
-    let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
-    let mut cursor: Option<String> = None;
-    loop {
-        let params = match &cursor {
-            Some(cursor) => json!({ "cursor": cursor }),
-            None => json!({}),
-        };
-        let page = server.request("tools/list", params, config.start_time())?;
-        for tool in page["tools"].as_array().into_iter().flatten() {
-            let Some(own) = tool["name"].as_str().filter(|own| config.offers(own)) else {
-                continue;
-            };
-            let (description, schema) = vetted(name, own, tool);
-            tools.push(Arc::new(McpTool {
-                server: server.clone(),
-                own: own.to_owned(),
-                name: keep(tool_name(name, own)),
-                description: keep(description),
-                schema,
-                // A server elsewhere is only its word, and a tool that
-                // reaches other machines can send what it is given there.
-                ask: !config.auto_approve.approves(own, &tool["annotations"])
-                    && !(config.url.trim().is_empty() && only_looks(&tool["annotations"])),
-                read_only: tool["annotations"]["readOnlyHint"].as_bool() == Some(true),
-                wait: config.call_time(),
-            }));
-        }
-        match page["nextCursor"].as_str() {
-            Some(next) => cursor = Some(next.to_owned()),
-            None => break,
-        }
-    }
-    Ok(tools)
+    server.list()
 }
 
 /// Whether a tool's `annotations` say it only looks, as `read_file` does:
@@ -1292,13 +1417,103 @@ fn only_looks(annotations: &Value) -> bool {
 /// One running server, as seen from this side of its pipes.
 struct Server {
     name: String,
+    /// The start of its slot it belongs to.
+    run: u64,
+    /// Its config with the variables filled in, for listing its tools again.
+    config: ServerConfig,
     to: Mutex<Box<dyn Write + Send>>,
     /// Requests sent and not yet answered, by id.
     waiting: Mutex<HashMap<u64, mpsc::Sender<Result<Value, String>>>>,
     next: AtomicU64,
+    relisting: Mutex<Relisting>,
+}
+
+/// Where asking a server for its tools again stands, so a burst of notices
+/// brings one listing more, not one each.
+#[derive(Default)]
+enum Relisting {
+    #[default]
+    Idle,
+    Listing,
+    /// Told again while listing: list once more, `RELIST_GAP` after.
+    Again,
 }
 
 impl Server {
+    /// Its tools, wrapped under Letronna's names for them; those its config
+    /// does not offer are left out.
+    fn list(self: &Arc<Self>) -> Result<Vec<Arc<dyn Tool>>, String> {
+        let (name, config) = (&self.name, &self.config);
+        let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let params = match &cursor {
+                Some(cursor) => json!({ "cursor": cursor }),
+                None => json!({}),
+            };
+            let page = self.request("tools/list", params, config.start_time())?;
+            for tool in page["tools"].as_array().into_iter().flatten() {
+                let Some(own) = tool["name"].as_str().filter(|own| config.offers(own)) else {
+                    continue;
+                };
+                let (description, schema) = vetted(name, own, tool);
+                tools.push(Arc::new(McpTool {
+                    server: self.clone(),
+                    own: own.to_owned(),
+                    name: keep(tool_name(name, own)),
+                    description: keep(description),
+                    schema,
+                    // A server elsewhere is only its word, and a tool that
+                    // reaches other machines can send what it is given there.
+                    ask: !config.auto_approve.approves(own, &tool["annotations"])
+                        && !(config.url.trim().is_empty() && only_looks(&tool["annotations"])),
+                    read_only: tool["annotations"]["readOnlyHint"].as_bool() == Some(true),
+                    wait: config.call_time(),
+                }));
+            }
+            match page["nextCursor"].as_str() {
+                Some(next) => cursor = Some(next.to_owned()),
+                None => break,
+            }
+        }
+        Ok(tools)
+    }
+
+    /// List its tools again on a thread of its own, after it said they
+    /// changed, and offer the new list while it is connected.
+    fn relist(self: Arc<Self>) {
+        if let Ok(mut relisting) = self.relisting.lock() {
+            if !matches!(*relisting, Relisting::Idle) {
+                *relisting = Relisting::Again;
+                return;
+            }
+            *relisting = Relisting::Listing;
+        }
+        std::thread::spawn(move || {
+            loop {
+                // A list that fails leaves the one it had; a server that
+                // went is lost by the way it went.
+                if let Ok(tools) = self.list() {
+                    with_run(&self.name, self.run, |slot| {
+                        if slot.state == State::Connected {
+                            slot.tools = tools;
+                        }
+                    });
+                }
+                let Ok(mut relisting) = self.relisting.lock() else {
+                    return;
+                };
+                if !matches!(*relisting, Relisting::Again) {
+                    *relisting = Relisting::Idle;
+                    return;
+                }
+                *relisting = Relisting::Listing;
+                drop(relisting);
+                std::thread::sleep(RELIST_GAP);
+            }
+        });
+    }
+
     fn send(&self, message: &Value) -> Result<(), String> {
         let mut line = message.to_string();
         line.push('\n');
@@ -1339,12 +1554,15 @@ impl Server {
         })
     }
 
-    /// Read what the server says until it goes, handing each answer to
-    /// whoever asked for it.
-    fn listen(&self, from: impl Read) {
+    /// Read what the server says until it goes or is let go of, handing
+    /// each answer to whoever asked for it.
+    fn listen(weak: &Weak<Self>, from: impl Read) {
         for line in BufReader::new(from).lines() {
             let Ok(line) = line else {
                 break;
+            };
+            let Some(server) = weak.upgrade() else {
+                return;
             };
             // Some servers print other things on stdout; they are not ours.
             let Ok(message) = serde_json::from_str::<Value>(&line) else {
@@ -1360,25 +1578,31 @@ impl Server {
                         json!({"jsonrpc": "2.0", "id": id,
                             "error": {"code": -32601, "message": "Letronna does not offer this."}})
                     };
-                    let _ = self.send(&reply);
+                    let _ = server.send(&reply);
                 }
                 (Some(id), None) => {
                     let Some(id) = id.as_u64() else {
                         continue;
                     };
-                    let asker = self.waiting.lock().ok().and_then(|mut w| w.remove(&id));
+                    let asker = server.waiting.lock().ok().and_then(|mut w| w.remove(&id));
                     if let Some(asker) = asker {
                         let _ = asker.send(Ok(message));
                     }
                 }
-                // Notifications: progress, logging, changed lists.
+                (None, Some(method)) if method == "notifications/tools/list_changed" => {
+                    server.clone().relist();
+                }
+                // Other notifications: progress, logging, other lists.
                 _ => {}
             }
         }
+        let Some(server) = weak.upgrade() else {
+            return;
+        };
         // Gone: anyone still waiting hears it now rather than at a timeout.
-        if let Ok(mut waiting) = self.waiting.lock() {
+        if let Ok(mut waiting) = server.waiting.lock() {
             for (_, asker) in waiting.drain() {
-                let _ = asker.send(Err(format!("{} stopped.", self.name)));
+                let _ = asker.send(Err(format!("{} stopped.", server.name)));
             }
         }
     }
@@ -2137,7 +2361,7 @@ mod tests {
             auto_approve: AutoApprove::Names(vec!["look up".into()]),
             ..Default::default()
         };
-        let tools = connect("demo", &config, from_server, to_server).unwrap();
+        let tools = connect("demo", 0, &config, from_server, to_server).unwrap();
 
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert_eq!(
@@ -2176,7 +2400,7 @@ mod tests {
         let (from_client, to_server) = std::io::pipe().unwrap();
         let (from_server, to_client) = std::io::pipe().unwrap();
         scripted_server(from_client, to_client);
-        let tools = connect("demo", &ServerConfig::default(), from_server, to_server).unwrap();
+        let tools = connect("demo", 0, &ServerConfig::default(), from_server, to_server).unwrap();
         let (echo, planted) = (&tools[0], &tools[2]);
         let ctx = ToolContext::default();
         let run = |args: &str| crate::tools::run_found(echo.as_ref(), args, &ctx);
@@ -2223,7 +2447,7 @@ mod tests {
                 auto_approve: AutoApprove::Names(auto_approve),
                 ..Default::default()
             };
-            let tools = connect("demo", &config, from_server, to_server).unwrap();
+            let tools = connect("demo", 0, &config, from_server, to_server).unwrap();
             let (echo, look_up) = (&tools[0], &tools[1]);
             assert_eq!(echo.needs_approval(), echo_asks);
             assert!(!look_up.needs_approval() && !look_up.mutates());
@@ -2257,7 +2481,7 @@ mod tests {
                 auto_approve: AutoApprove::Names(auto_approve),
                 ..Default::default()
             };
-            let tools = connect("demo", &config, from_server, to_server).unwrap();
+            let tools = connect("demo", 0, &config, from_server, to_server).unwrap();
             let look_up = &tools[1];
             assert_eq!(look_up.needs_approval(), asks);
             assert!(!look_up.mutates());
@@ -2275,7 +2499,7 @@ mod tests {
             drop(to_client);
         });
         let started = std::time::Instant::now();
-        let Err(err) = connect("quiet", &ServerConfig::default(), from_server, to_server) else {
+        let Err(err) = connect("quiet", 0, &ServerConfig::default(), from_server, to_server) else {
             panic!("a server that hung up counted as connected");
         };
         assert_eq!(err, "quiet stopped.");
@@ -2486,7 +2710,7 @@ mod tests {
             "excludeTools": ["plant*"]
         }))
         .unwrap();
-        let tools = connect("demo", &config, from_server, to_server).unwrap();
+        let tools = connect("demo", 0, &config, from_server, to_server).unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert_eq!(names, ["mcp__demo__echo", "mcp__demo__look_up"]);
         assert!(ServerConfig::default().offers("anything"));
@@ -2506,7 +2730,7 @@ mod tests {
         let (from_client, to_server) = std::io::pipe().unwrap();
         let (from_server, to_client) = std::io::pipe().unwrap();
         scripted_server(from_client, to_client);
-        let tools = connect("demo", &config, from_server, to_server).unwrap();
+        let tools = connect("demo", 0, &config, from_server, to_server).unwrap();
         let (echo, look_up, planted) = (&tools[0], &tools[1], &tools[2]);
         assert!(!look_up.needs_approval());
         assert!(echo.needs_approval() && planted.needs_approval());
@@ -2524,7 +2748,7 @@ mod tests {
             ..Default::default()
         };
         let asked = std::time::Instant::now();
-        let Err(error) = connect("mute", &config, from_server, to_server) else {
+        let Err(error) = connect("mute", 0, &config, from_server, to_server) else {
             panic!("a mute server started");
         };
         assert!(error.contains("did not answer initialize"), "{error}");
@@ -2771,5 +2995,227 @@ mod tests {
         let file = read_config(&theirs).unwrap();
         assert_eq!(file["theirs"], true);
         assert_eq!(file["mcpServers"]["a"]["command"], "x");
+    }
+
+    #[test]
+    fn retries_wait_from_one_second_doubling_to_thirty() {
+        let waits: Vec<u64> = (0..=REMOTE_RETRIES)
+            .filter_map(|attempt| retry_wait(attempt, REMOTE_RETRIES))
+            .map(|wait| wait.as_secs())
+            .collect();
+        assert_eq!(waits, [1, 2, 4, 8, 16]);
+        assert_eq!(retry_wait(5, 10), Some(LONGEST_RETRY));
+        assert_eq!(retry_wait(40, 50), Some(LONGEST_RETRY));
+        assert_eq!(retry_wait(0, LOCAL_RETRIES), Some(FIRST_RETRY));
+        assert_eq!(retry_wait(1, LOCAL_RETRIES), None);
+    }
+
+    /// Put `config` in slot `name` as a start that answered `since` ago with
+    /// `retries` used, and give its run.
+    fn connected(name: &str, config: ServerConfig, retries: u32, since: Duration) -> u64 {
+        let mut slots = slots().lock().unwrap();
+        let slot = slots.entry(name.to_owned()).or_default();
+        slot.stop();
+        slot.run += 1;
+        slot.config = config;
+        slot.state = State::Connected;
+        slot.retries = retries;
+        slot.connected_at = Instant::now().checked_sub(since);
+        slot.run
+    }
+
+    /// Switch a test's server off, taking back any start still to come.
+    fn switch_off(name: &str) {
+        let off = ServerConfig {
+            disabled: true,
+            ..Default::default()
+        };
+        open(name, Ok(off));
+        assert_eq!(settled(name, |_| true).retry, None);
+    }
+
+    /// An address where nothing listens, so connecting is refused at once.
+    fn nowhere() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}/mcp", listener.local_addr().unwrap())
+    }
+
+    #[test]
+    fn a_server_that_stops_while_connected_is_retrying_with_its_next_start_shown() {
+        let run = connected("t-lost", shell("true"), 0, Duration::ZERO);
+        // A loss of an earlier start is not this one's.
+        gone("t-lost", run - 1, "old news.".into());
+        assert_eq!(settled("t-lost", |_| true).state, State::Connected);
+        gone("t-lost", run, "t-lost stopped.".into());
+        let lost = settled("t-lost", |_| true);
+        assert_eq!(lost.state, State::Retrying);
+        assert_eq!(lost.error.as_deref(), Some("t-lost stopped."));
+        let retry = lost.retry.unwrap();
+        assert_eq!((retry.attempt, retry.attempts), (1, LOCAL_RETRIES));
+        assert!(retry.wait <= FIRST_RETRY, "{retry:?}");
+        // Switched off, it is not started again.
+        switch_off("t-lost");
+        assert_eq!(settled("t-lost", |_| true).state, State::Disabled);
+    }
+
+    #[test]
+    fn a_loss_after_a_steady_minute_has_all_its_retries_and_one_sooner_has_none() {
+        let run = connected("t-steady", shell("true"), LOCAL_RETRIES, STEADY);
+        gone("t-steady", run, "t-steady stopped.".into());
+        let held = settled("t-steady", |_| true);
+        assert_eq!(held.state, State::Retrying);
+        assert_eq!(held.retry.map(|r| r.attempt), Some(1));
+        let run = connected("t-steady", shell("true"), LOCAL_RETRIES, Duration::ZERO);
+        gone("t-steady", run, "t-steady stopped.".into());
+        let dropped = settled("t-steady", |_| true);
+        assert_eq!((dropped.state, dropped.retry), (State::Failed, None));
+        switch_off("t-steady");
+    }
+
+    #[test]
+    fn a_server_run_here_is_started_once_more_then_waits_for_reconnect() {
+        let script = if cfg!(windows) {
+            "echo ran 1>&2 & exit 3"
+        } else {
+            "echo ran >&2; exit 3"
+        };
+        open("t-once", Ok(shell(script)));
+        let retrying = settled("t-once", |s| s.state == State::Retrying);
+        assert_eq!(retrying.state, State::Retrying);
+        let failed = settled("t-once", |s| s.state == State::Failed);
+        assert_eq!((failed.state, failed.retry), (State::Failed, None));
+        assert!(
+            failed.log.contains("--- started again ---"),
+            "{}",
+            failed.log
+        );
+        // Waiting, it is not started a third time.
+        std::thread::sleep(FIRST_RETRY * 2);
+        let waiting = settled("t-once", |_| true);
+        assert_eq!(waiting.log.matches("ran").count(), 2, "{}", waiting.log);
+        assert_eq!(waiting.state, State::Failed);
+        // Reconnect starts it afresh, with its retry again.
+        open("t-once", Ok(shell(script)));
+        let again = settled("t-once", |s| s.state == State::Retrying);
+        assert_eq!(again.retry.map(|r| r.attempt), Some(1));
+        switch_off("t-once");
+    }
+
+    /// The run of a test's server now.
+    fn run_of(name: &str) -> u64 {
+        slots().lock().unwrap()[name].run
+    }
+
+    #[test]
+    fn a_server_reached_by_url_is_retried_five_times_waiting_longer_each_time() {
+        let far = ServerConfig {
+            url: nowhere(),
+            ..Default::default()
+        };
+        open("t-far", Ok(far));
+        let first = settled("t-far", |s| s.state == State::Retrying);
+        let error = first.error.unwrap_or_default();
+        assert!(error.contains("could not reach"), "{error}");
+        let next = first.retry.unwrap();
+        assert_eq!((next.attempt, next.attempts), (1, REMOTE_RETRIES));
+        // The timer starts it again.
+        let second = settled("t-far", |s| s.retry.is_some_and(|r| r.attempt == 2));
+        let wait = second.retry.unwrap().wait;
+        assert!(wait > FIRST_RETRY && wait <= FIRST_RETRY * 2, "{wait:?}");
+        // The rest are started here rather than waited for.
+        for (attempt, most) in [(3, 4), (4, 8), (5, 16)] {
+            retry("t-far", run_of("t-far"));
+            let next = settled("t-far", |s| s.retry.is_some_and(|r| r.attempt == attempt));
+            let wait = next.retry.unwrap().wait;
+            assert!(
+                wait > FIRST_RETRY * (most / 2) && wait <= FIRST_RETRY * most,
+                "{wait:?}"
+            );
+        }
+        retry("t-far", run_of("t-far"));
+        let failed = settled("t-far", |s| s.state == State::Failed);
+        assert_eq!((failed.state, failed.retry), (State::Failed, None));
+        switch_off("t-far");
+    }
+
+    #[test]
+    fn a_server_reached_by_url_that_cannot_be_reached_once_connected_is_lost() {
+        let config = ServerConfig {
+            url: nowhere(),
+            ..Default::default()
+        };
+        let run = connected("t-drop", config.clone(), 0, Duration::ZERO);
+        let link = Link {
+            name: "t-drop".into(),
+            run,
+            url: config.url,
+            headers: HashMap::new(),
+            client: reqwest::blocking::Client::new(),
+            wait: Duration::from_secs(5),
+            session: Mutex::default(),
+            greeting: Mutex::default(),
+            greeting_again: Mutex::default(),
+        };
+        let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call"});
+        let error = link
+            .send(call.to_string().as_bytes(), &mut |_| {})
+            .unwrap_err();
+        assert!(error.contains("could not reach"), "{error}");
+        let lost = settled("t-drop", |_| true);
+        assert_eq!(lost.state, State::Retrying);
+        assert_eq!(lost.retry.map(|r| r.attempts), Some(REMOTE_RETRIES));
+        assert!(lost.error.unwrap().starts_with("t-drop: could not reach"));
+        switch_off("t-drop");
+    }
+
+    #[test]
+    fn a_server_that_says_its_tools_changed_is_asked_for_them_again() {
+        let grown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let url = {
+            let grown = grown.clone();
+            serve(move |_, message, stream| {
+                let id = &message["id"];
+                let reply = match message["method"].as_str() {
+                    Some("tools/list") => {
+                        let mut tools = vec![json!({"name": "grow"})];
+                        if grown.load(Ordering::SeqCst) {
+                            tools.push(json!({"name": "grown"}));
+                        }
+                        json_reply(
+                            &json!({"jsonrpc": "2.0", "id": id, "result": {"tools": tools}}),
+                            "",
+                        )
+                    }
+                    // The call adds a tool, and says so before its answer.
+                    Some("tools/call") => {
+                        grown.store(true, Ordering::SeqCst);
+                        let changed =
+                            json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"});
+                        let done = json!({"jsonrpc": "2.0", "id": id, "result": {"content": []}});
+                        let body = format!("data: {changed}\n\ndata: {done}\n\n");
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        )
+                    }
+                    _ => usual(&message, "s-1").unwrap(),
+                };
+                let _ = stream.write_all(reply.as_bytes());
+            })
+        };
+        let config = ServerConfig {
+            url,
+            ..Default::default()
+        };
+        open("t-grow", Ok(config));
+        assert_eq!(settled("t-grow", |s| s.state == State::Connected).tools, 1);
+        let grow = tools()
+            .into_iter()
+            .find(|t| t.name() == "mcp__t-grow__grow")
+            .unwrap();
+        grow.run(&json!({}), &ToolContext::default()).unwrap();
+        assert_eq!(settled("t-grow", |s| s.tools == 2).tools, 2);
+        assert!(tools().iter().any(|t| t.name() == "mcp__t-grow__grown"));
+        switch_off("t-grow");
     }
 }
