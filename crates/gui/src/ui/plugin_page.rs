@@ -195,8 +195,13 @@ impl Chat {
         });
     }
 
-    /// Add the marketplace the box names, then read them all.
+    /// Add the marketplace the box names, then read them all. Not while a
+    /// task runs: a read in flight would put back the list it began with,
+    /// and one that cannot start would leave this one unread.
     pub(crate) fn add_market(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.plugins.busy {
+            return;
+        }
         let url = self
             .plugins
             .market_source
@@ -500,6 +505,7 @@ impl Chat {
                             .xsmall()
                             .icon(Icon::new(AppIcon::Trash))
                             .tooltip("Stop listing this marketplace")
+                            .disabled(busy)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.remove_market(url.clone(), cx)
                             })),
