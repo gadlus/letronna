@@ -101,7 +101,7 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "/mcp",
-        blurb: "MCP servers: how each is doing; reconnect, enable, disable, log, reload",
+        blurb: "MCP servers: how each is doing; reconnect, enable, disable, login, logout, log, reload",
     },
     Command {
         name: "/resume",

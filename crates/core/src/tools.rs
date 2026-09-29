@@ -101,6 +101,11 @@ pub trait Tool: Send + Sync {
     fn needs_approval(&self) -> bool {
         false
     }
+    /// Whether each call is asked about on its own, with no "stop asking"
+    /// and no rule offered for it.
+    fn asked_each_time(&self) -> bool {
+        false
+    }
     /// Whether the tool changes anything outside Letronna. Plan mode hides
     /// these so the model can look and propose but not act.
     fn mutates(&self) -> bool {
@@ -445,6 +450,12 @@ fn reinterpreted(changed: &[String]) -> String {
 
 pub fn needs_approval(name: &str) -> bool {
     find(name).is_some_and(|t| t.needs_approval())
+}
+
+/// Whether a call to `name` is asked about each time, with nothing to
+/// remember the answer by.
+pub fn asked_each_time(name: &str) -> bool {
+    find(name).is_some_and(|t| t.asked_each_time())
 }
 
 /// Whether a call to `name` may run beside the other such calls from its reply.

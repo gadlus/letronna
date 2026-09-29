@@ -39,7 +39,10 @@
 //! as it arrives, so a server can ask something mid-reply and hear the
 //! answer. A server that restarts has forgotten the session it gave, and is
 //! greeted again; the session is ended when the app quits. The older way, a
-//! stream opened first at an address ending in /sse, is not spoken.
+//! stream opened first at an address ending in /sse, is not spoken. One
+//! with no key in its headers that answers 401 with a Bearer challenge
+//! wants a sign-in, which `mcp_auth` does; until then its one tool asks the
+//! user for it.
 //!
 //! A server's config may name `${VAR}` or `${VAR:-default}` in its command,
 //! args, cwd, url, env and headers, filled in from Letronna's environment
@@ -217,6 +220,10 @@ struct ServerConfig {
     /// Start the server with only `KEPT_ENV` of Letronna's environment.
     #[serde(default)]
     env_scrub: bool,
+    /// How a server reached by URL is signed in to, where it gives out its
+    /// own app ids.
+    #[serde(default)]
+    oauth: crate::mcp_auth::OAuthConfig,
 }
 
 /// `autoApprove`: which of a server's tools run without asking.
@@ -270,8 +277,8 @@ impl ServerConfig {
         (!cwd.is_empty()).then(|| base.join(cwd))
     }
 
-    /// This config with every `${VAR}` in its command, args, cwd, url, env
-    /// and headers filled in from `var`.
+    /// This config with every `${VAR}` in its command, args, cwd, url, env,
+    /// headers and app id and secret filled in from `var`.
     fn expanded(&self, var: &dyn Fn(&str) -> Option<String>) -> Result<Self, String> {
         let one = |text: &String| expand(text, var);
         let values = |map: &HashMap<String, String>| {
@@ -286,6 +293,11 @@ impl ServerConfig {
             args: self.args.iter().map(one).collect::<Result<_, _>>()?,
             env: values(&self.env)?,
             cwd: self.cwd.as_ref().map(one).transpose()?,
+            oauth: crate::mcp_auth::OAuthConfig {
+                client_id: self.oauth.client_id.as_ref().map(one).transpose()?,
+                client_secret: self.oauth.client_secret.as_ref().map(one).transpose()?,
+                ..self.oauth.clone()
+            },
             ..self.clone()
         })
     }
@@ -375,6 +387,9 @@ pub enum State {
     Failed,
     /// Switched off in `mcp.json`.
     Disabled,
+    /// Reached by URL, and refused until the user signs in; its one tool
+    /// asks them to. The error says why.
+    NeedsAuth,
 }
 
 /// One server as the user sees it, in `/mcp` and in the window's settings.
@@ -399,6 +414,8 @@ pub struct ServerStatus {
     pub log: String,
     /// When a retrying server is started again.
     pub retry: Option<Retry>,
+    /// Whether a sign-in to it is saved, for a server reached by URL.
+    pub signed_in: bool,
 }
 
 /// The next start of a server that is retrying.
@@ -525,7 +542,8 @@ fn retry_wait(attempt: u32, attempts: u32) -> Option<Duration> {
     })
 }
 
-/// The tools of every server that has answered so far.
+/// The tools of every server that has answered so far, and the one tool of
+/// each that needs a sign-in.
 pub fn tools() -> Vec<Arc<dyn Tool>> {
     start();
     slots()
@@ -533,7 +551,7 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
         .map(|slots| {
             slots
                 .values()
-                .filter(|slot| slot.state == State::Connected)
+                .filter(|slot| matches!(slot.state, State::Connected | State::NeedsAuth))
                 .flat_map(|slot| slot.tools.iter().cloned())
                 .collect()
         })
@@ -580,9 +598,19 @@ pub fn start() {
 /// The values in `mcp.json` whose names say they are secret, for hiding
 /// wherever they turn up.
 pub(crate) fn secrets() -> Vec<String> {
-    secret_values(&configured().unwrap_or_default(), &|name| {
-        std::env::var(name).ok()
-    })
+    let servers = configured().unwrap_or_default();
+    let var = |name: &str| std::env::var(name).ok();
+    let mut all = secret_values(&servers, &var);
+    // The sign-ins too: an app's secret from mcp.json, and every token saved.
+    all.extend(
+        servers
+            .values()
+            .flatten()
+            .filter_map(|server| server.oauth.client_secret.as_deref())
+            .filter_map(|secret| expand(secret, &var).ok()),
+    );
+    all.extend(crate::mcp_auth::secrets());
+    all
 }
 
 /// Each server's `env` and `headers` values named for a key, a token or a
@@ -669,12 +697,15 @@ pub fn status() -> Vec<ServerStatus> {
                     attempt: slot.retries,
                     attempts: slot.attempts(),
                 }),
+                signed_in: false,
             }
         })
         .collect();
     // Scrubbed with the lock let go, since finding the saved keys reads files.
     drop(slots);
     for server in &mut all {
+        let url = expand(&server.target, &|var| std::env::var(var).ok()).unwrap_or_default();
+        server.signed_in = server.transport == "http" && crate::mcp_auth::saved(&url);
         if !server.log.is_empty() {
             server.log = crate::redact::scrub_cut(&server.log, true);
         }
@@ -1027,8 +1058,78 @@ fn settle(name: &str, run: u64, outcome: Result<Vec<Arc<dyn Tool>>, String>) {
             slot.error = None;
             slot.connected_at = Some(Instant::now());
         }
+        // Refused for want of a sign-in, which starting again will not mend.
+        Err(_) if slot.state == State::NeedsAuth => {}
         Err(error) => lose(name, slot, error),
     });
+}
+
+/// Mark a server reached by URL as refused until the user signs in: its
+/// tools give way to the one that asks them to.
+fn needs_sign_in(name: &str, run: u64, why: &str) {
+    with_run(name, run, |slot| {
+        if !matches!(slot.state, State::Starting | State::Connected) {
+            return;
+        }
+        slot.stop();
+        slot.state = State::NeedsAuth;
+        slot.error = Some(why.to_owned());
+        slot.connected_at = None;
+        slot.tools = vec![Arc::new(crate::mcp_auth::Authenticate {
+            server: name.to_owned(),
+            name: keep(tool_name(name, "authenticate")),
+            description: keep(crate::mcp_auth::described(name)),
+        })];
+    });
+}
+
+/// Show why a sign-in to the server `name` failed, on it while it still
+/// needs one.
+pub(crate) fn sign_in_failed(name: &str, why: &str) {
+    if let Ok(mut slots) = slots().lock()
+        && let Some(slot) = slots.get_mut(name)
+        && slot.state == State::NeedsAuth
+    {
+        slot.error = Some(format!("The last sign-in failed: {why}"));
+    }
+}
+
+/// Start a server again after its sign-in was saved or forgotten, if it is
+/// running here at all; `letronna mcp login` in a shell runs none.
+pub(crate) fn signed_in(name: &str) {
+    let running = slots().lock().is_ok_and(|slots| slots.contains_key(name));
+    if running && let Ok(server) = entry(name) {
+        open(name, server);
+    }
+}
+
+/// The URL of the server `name` and how it signs in, with its variables
+/// filled in, for a sign-in to it.
+pub(crate) fn remote(name: &str) -> Result<(String, crate::mcp_auth::OAuthConfig), String> {
+    let config = entry(name)??
+        .expanded(&|var| std::env::var(var).ok())
+        .map_err(|e| format!("{name}: {e}"))?;
+    if config.url.trim().is_empty() {
+        return Err(format!(
+            "{name} runs on this computer; only a server reached by URL signs in."
+        ));
+    }
+    if keyed(&config.headers) {
+        return Err(format!(
+            "{name} is given its key in a header in mcp.json, so it has no sign-in of its own."
+        ));
+    }
+    Ok((config.url.trim().to_owned(), config.oauth))
+}
+
+/// Whether `headers` give a server its key: Authorization, or one named for
+/// a key or token as X-API-Key is. Its 401 then means the key is wrong, not
+/// that it wants a sign-in.
+fn keyed(headers: &HashMap<String, String>) -> bool {
+    headers.keys().any(|name| {
+        let name = name.to_lowercase();
+        name.contains("auth") || SECRET_NAMES.iter().any(|word| name.contains(word))
+    })
 }
 
 /// Mark a connected server as lost: one run here once its stderr closes,
@@ -1273,6 +1374,11 @@ fn reach(name: &str, config: &ServerConfig, run: u64) -> Result<Vec<Arc<dyn Tool
         run,
         url: config.url.trim().to_owned(),
         headers: config.headers.clone(),
+        // A key given in mcp.json is the server's way in; else it may want
+        // a sign-in.
+        auth: (!keyed(&config.headers))
+            .then(|| crate::mcp_auth::Auth::new(&config.url))
+            .flatten(),
         client,
         wait: config.call_time().max(config.start_time()),
         session: Mutex::default(),
@@ -1346,6 +1452,8 @@ struct Link {
     run: u64,
     url: String,
     headers: HashMap<String, String>,
+    /// Its sign-in, unless mcp.json gives it a key.
+    auth: Option<crate::mcp_auth::Auth>,
     client: reqwest::blocking::Client,
     /// How long a request may take: a call, or the start if that is longer.
     wait: Duration,
@@ -1372,6 +1480,8 @@ enum Failed {
     Said(String),
     /// The server no longer knows the session it was sent, whose id this is.
     Forgot(String),
+    /// The server wants a sign-in (HTTP 401); the token sent, if one was.
+    Unsigned(Option<String>),
 }
 
 impl Write for Http {
@@ -1447,6 +1557,22 @@ impl Link {
                 self.exchange(message, time, hand_on)
                     .map_err(|failed| self.said(failed))
             }
+            // A token refused is refreshed, once however many requests found
+            // it so, and the message sent again with the new one. One that
+            // cannot be refreshed for now is kept for the next request.
+            Err(Failed::Unsigned(Some(stale))) => {
+                match self.auth.as_ref().map(|auth| auth.renewed(&stale)) {
+                    Some(Ok(_)) => self
+                        .exchange(message, time, hand_on)
+                        .map_err(|failed| self.said(failed)),
+                    Some(Err(crate::mcp_auth::Lapse::Unreachable(why))) => {
+                        let lead =
+                            format!("{}'s sign-in could not be refreshed for now:", self.name);
+                        Err(crate::untrusted::quoted(&lead, &why))
+                    }
+                    _ => Err(self.said(Failed::Unsigned(Some(stale)))),
+                }
+            }
             other => other.map_err(|failed| self.said(failed)),
         }
     }
@@ -1477,14 +1603,78 @@ impl Link {
             .map_err(|failed| self.said(failed))
     }
 
-    /// A failure in words for whoever asked.
+    /// A failure in words for whoever asked. One for want of a sign-in
+    /// also swaps the server's tools for the one that asks for it.
     fn said(&self, failed: Failed) -> String {
         match failed {
             Failed::Said(why) => why,
+            Failed::Unsigned(_) => {
+                let name = &self.name;
+                let why = format!(
+                    "{name} wants a sign-in (HTTP 401): `/mcp login {name}` in the terminal, \
+                     or Sign in under Settings › MCP."
+                );
+                needs_sign_in(name, self.run, &why);
+                why
+            }
             Failed::Forgot(_) => format!(
                 "{} forgot its session (HTTP 404) and did not keep a new one.",
                 self.url
             ),
+        }
+    }
+
+    /// The failure a 401 asking for a sign-in, or a 403 for want of a
+    /// scope, is for a server that signs in; None for any other answer, or
+    /// for a server given its key. `peer` is where the answer came from.
+    fn refused(
+        &self,
+        status: u16,
+        challenge: Option<crate::mcp_auth::Challenge>,
+        bearer: Option<String>,
+        peer: Option<std::net::IpAddr>,
+    ) -> Option<Failed> {
+        self.auth.as_ref()?;
+        let challenge = crate::mcp_auth::Challenge {
+            peer,
+            ..challenge.unwrap_or_default()
+        };
+        // A plain 401 with no Bearer challenge is some other lock, left to
+        // the usual "check the headers".
+        if status == 401 && challenge.wants_sign_in() {
+            crate::mcp_auth::hear(&self.url, challenge);
+            return Some(Failed::Unsigned(bearer));
+        }
+        if status != 403 || challenge.error.as_deref() != Some("insufficient_scope") {
+            return None;
+        }
+        // The server's words, so only what scope names are written in, and
+        // a few of them.
+        let scope = challenge.scope.as_deref().unwrap_or_default();
+        let scope: Vec<&str> = (scope.split_whitespace())
+            .filter(|word| word.len() <= 64)
+            .filter(|word| (word.chars()).all(|c| c.is_ascii_alphanumeric() || ":._/-".contains(c)))
+            .take(10)
+            .collect();
+        let scope = scope.join(" ");
+        crate::mcp_auth::hear(&self.url, challenge);
+        let name = &self.name;
+        Some(Failed::Said(format!(
+            "{name} wants more access for this ({scope}): the user can grant it with \
+             `/mcp login {name}` in the terminal, or Sign in under Settings › MCP."
+        )))
+    }
+
+    /// `request` with the token of the server's sign-in, if it has one, and
+    /// that token.
+    fn signed(
+        &self,
+        request: reqwest::blocking::RequestBuilder,
+    ) -> (reqwest::blocking::RequestBuilder, Option<String>) {
+        let bearer = self.auth.as_ref().and_then(crate::mcp_auth::Auth::bearer);
+        match bearer {
+            Some(token) => (request.bearer_auth(&token), Some(token)),
+            None => (request, None),
         }
     }
 
@@ -1512,8 +1702,12 @@ impl Link {
     /// Tell the server the session is over; one that keeps none, or has
     /// gone, is left be.
     fn end(&self) {
-        let (request, Some(_)) = self.headed(self.client.delete(&self.url).timeout(END_TIME))
-        else {
+        let mut request = self.client.delete(&self.url).timeout(END_TIME);
+        // As it stands: a refresh could hold up quitting.
+        if let Some(token) = self.auth.as_ref().and_then(crate::mcp_auth::Auth::token) {
+            request = request.bearer_auth(token);
+        }
+        let (request, Some(_)) = self.headed(request) else {
             return;
         };
         let _ = request.send();
@@ -1535,6 +1729,7 @@ impl Link {
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream")
             .body(message.to_vec());
+        let (request, bearer) = self.signed(request);
         let (request, sent_with) = self.headed(request);
         let reply = request.send().map_err(|e| {
             let why = format!("could not reach {url}: {e}");
@@ -1560,6 +1755,15 @@ impl Link {
             && let Ok(mut session) = self.session.lock()
         {
             session.id = Some(id.to_owned());
+        }
+        let challenge = reply
+            .headers()
+            .get(reqwest::header::WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok())
+            .map(crate::mcp_auth::challenge);
+        let peer = reply.remote_addr().map(|addr| addr.ip());
+        if let Some(auth_failed) = self.refused(status.as_u16(), challenge, bearer, peer) {
+            return Err(auth_failed);
         }
         if !status.is_success() {
             return Err(Failed::Said(match status.as_u16() {
@@ -2531,26 +2735,89 @@ mod tests {
     #[test]
     fn a_server_reached_by_url_that_refuses_says_why() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let base = format!("http://{}", listener.local_addr().unwrap());
         std::thread::spawn(move || {
             use std::io::{Read, Write};
             for stream in listener.incoming() {
                 let mut stream = stream.unwrap();
-                let _ = stream.read(&mut [0; 4096]);
-                let _ = stream.write_all(
-                    b"HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                let mut request = [0; 4096];
+                let read = stream.read(&mut request).unwrap_or(0);
+                // At /mcp it asks for a sign-in; at /plain it only refuses.
+                let bearer = String::from_utf8_lossy(&request[..read]).contains("POST /mcp ");
+                let challenge = if bearer {
+                    "WWW-Authenticate: Bearer realm=\"mcp\"\r\n"
+                } else {
+                    ""
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 401 Unauthorized\r\n{challenge}Connection: close\r\n\
+                     Content-Length: 0\r\n\r\n"
                 );
             }
         });
+        // Given a key, in Authorization or a header of its own, it is the key
+        // that is wrong; given none, it wants a sign-in.
+        for header in ["Authorization", "X-API-Key"] {
+            let config = ServerConfig {
+                url: format!("{base}/mcp"),
+                headers: HashMap::from([(header.into(), "wrong".into())]),
+                ..ServerConfig::default()
+            };
+            let refused = launch("locked", &config, 0).err().unwrap();
+            assert!(
+                refused.contains("HTTP 401") && refused.contains("headers"),
+                "{header}: {refused}"
+            );
+        }
         let config = ServerConfig {
-            url,
+            url: format!("{base}/mcp"),
             ..ServerConfig::default()
         };
         let refused = launch("locked", &config, 0).err().unwrap();
-        assert!(
-            refused.contains("HTTP 401") && refused.contains("headers"),
-            "{refused}"
+        assert!(refused.contains("/mcp login locked"), "{refused}");
+        // A 401 that names no Bearer sign-in is not taken for one.
+        let config = ServerConfig {
+            url: format!("{base}/plain"),
+            ..ServerConfig::default()
+        };
+        let refused = launch("locked", &config, 0).err().unwrap();
+        assert!(refused.contains("headers"), "{refused}");
+    }
+
+    #[test]
+    fn a_server_that_wants_a_sign_in_takes_the_saved_token_and_refreshes_it_once() {
+        use crate::mcp_auth::tests::{provider, scratch, signed_in_to};
+        let (fake, base) = provider(None);
+        let dir = scratch("link");
+        crate::mcp_auth::keep_tokens_in(&dir);
+        let config = ServerConfig {
+            url: format!("{base}/mcp"),
+            ..ServerConfig::default()
+        };
+        let refused = launch("oauth-link", &config, 0).err().unwrap();
+        assert!(refused.contains("wants a sign-in"), "{refused}");
+
+        signed_in_to(&base, &dir, None);
+        fake.valid.lock().unwrap().push("a-1".into());
+        let tools = launch("oauth-link", &config, 0).unwrap();
+        let ctx = ToolContext::default();
+        assert_eq!(tools[0].run(&json!({"text": "hi"}), &ctx).unwrap(), "hi");
+        // Refused from now on, the token is refreshed once and the call sent
+        // again with the new one.
+        fake.valid.lock().unwrap().retain(|token| token != "a-1");
+        assert_eq!(
+            tools[0].run(&json!({"text": "again"}), &ctx).unwrap(),
+            "again"
         );
+        assert_eq!(fake.refreshes.load(Ordering::SeqCst), 1);
+        // A call that needs more than was granted says how to grant it.
+        let wanting = tools[0].run(&json!({"text": "more"}), &ctx).unwrap_err();
+        assert!(
+            wanting.contains("more access") && wanting.contains("(write)"),
+            "{wanting}"
+        );
+        assert!(!wanting.contains("a-2"), "{wanting}");
     }
 
     #[test]
@@ -4021,6 +4288,7 @@ mod tests {
             run,
             url: config.url,
             headers: HashMap::new(),
+            auth: None,
             client: reqwest::blocking::Client::new(),
             wait: Duration::from_secs(5),
             session: Mutex::default(),

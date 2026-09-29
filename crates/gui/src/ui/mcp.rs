@@ -130,6 +130,7 @@ fn server_row(
         State::Retrying => ("Retrying", cx.theme().warning),
         State::Failed => ("Failed", cx.theme().danger),
         State::Disabled => ("Off", cx.theme().muted_foreground),
+        State::NeedsAuth => ("Needs sign-in", cx.theme().warning),
     };
     let what = match server.state {
         State::Connected => format!("{} · {} tools", server.transport, server.tools),

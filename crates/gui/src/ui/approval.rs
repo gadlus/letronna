@@ -239,7 +239,8 @@ impl Chat {
                             this.resolve_call(Verdict::Allow { remember: false }, cx)
                         })),
                 )
-                .child(
+                // A sign-in is asked about each time.
+                .children((!tools::asked_each_time(&call.name)).then(|| {
                     Button::new("allow-session")
                         .framed(cx)
                         .small()
@@ -247,8 +248,8 @@ impl Chat {
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.take_reason(window, cx);
                             this.resolve_call(Verdict::Allow { remember: true }, cx)
-                        })),
-                )
+                        }))
+                }))
                 .children(self.offer.as_ref().map(|rule| {
                     Button::new("allow-here")
                         .framed(cx)

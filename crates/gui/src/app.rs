@@ -1463,8 +1463,10 @@ impl Chat {
         };
         if asking != self.asking {
             self.offer = match &next {
+                // Nothing to remember a sign-in by: each is asked.
                 agent::Next::AskUser(call) => {
                     letronna_core::permissions::suggest(call, &self.call_context())
+                        .filter(|_| !letronna_core::tools::asked_each_time(&call.name))
                 }
                 _ => None,
             };
