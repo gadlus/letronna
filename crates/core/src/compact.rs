@@ -142,12 +142,17 @@ pub fn summary(
             compacting();
         }
     };
-    if let Some((text, usage)) = take_in(prepared(), connection.conversation, dropped, &mut compact)
-    {
-        remember_in(cache(), dropped, &text);
-        spent(usage);
-        made(&text);
-        return Some(text);
+    match take_in(prepared(), connection.conversation, dropped, &mut compact) {
+        Some(Some((text, usage))) => {
+            remember_in(cache(), dropped, &text);
+            spent(usage);
+            made(&text);
+            return Some(text);
+        }
+        // Asking again at once would make the reply wait out a second ask
+        // after the one it just waited for.
+        Some(None) => return failed_in(cache(), dropped, Instant::now()),
+        None => {}
     }
     // A fresh summary, the first of a long session after a restart or of a
     // big window's step, reads as much of what was dropped as the window
@@ -301,13 +306,14 @@ impl Drop for Making<'_> {
 
 /// The summary made ahead for `session` of exactly `dropped`, and what
 /// asking for it took, waited for while it is still being made, with
-/// `waiting` called before such a wait.
+/// `waiting` called before such a wait; `Some(None)` when it was waited for
+/// and the model could not make it.
 fn take_in(
     prepared: &Prepared,
     session: u64,
     dropped: &[Message],
     waiting: impl FnOnce(),
-) -> Option<(String, Usage)> {
+) -> Option<Option<(String, Usage)>> {
     if dropped.is_empty() {
         return None;
     }
@@ -319,7 +325,8 @@ fn take_in(
             .is_some_and(|slot| covers(slot) && slot.made.is_none())
     };
     let mut slots = prepared.slots.lock().ok()?;
-    if pending(&mut slots) {
+    let waited = pending(&mut slots);
+    if waited {
         // It was asked for already, so the rest of that wait is shorter than
         // a new ask, and costs nothing more. `waiting` is told unlocked, as
         // it may block on a channel, and the wait checks again first.
@@ -334,8 +341,13 @@ fn take_in(
     if !slots.get(&session).is_some_and(covers) {
         return None;
     }
-    // A failed one goes too, and the step asks for itself.
-    slots.remove(&session)?.made.flatten()
+    // A failed one goes too. One that failed a while ago says nothing about
+    // now, so the step asks for itself; one it waited for failed just now.
+    match slots.remove(&session)?.made.flatten() {
+        Some(made) => Some(Some(made)),
+        None if waited => Some(None),
+        None => None,
+    }
 }
 
 /// Let go of what was made ahead for `session` beyond its first `kept`
@@ -416,6 +428,26 @@ fn summary_in(
     match entry {
         Entry::Made(text) => Some(text),
         Entry::Failed { digest, .. } => digest,
+    }
+}
+
+/// What stands in for the summary of `dropped` that the model failed to make
+/// `at`, kept in `cache` as a failure as `summary_in` keeps its own, so the
+/// requests after it wait before asking again.
+fn failed_in(cache: &Cache, dropped: &[Message], at: Instant) -> Option<String> {
+    let key = keys(dropped)[dropped.len()];
+    let digest = digest(dropped);
+    let Ok(mut cache) = cache.lock() else {
+        return digest;
+    };
+    // Another request may have settled it meanwhile, and what it found stands.
+    match cache.entry(key).or_insert(Entry::Failed {
+        at,
+        retried: 0,
+        digest,
+    }) {
+        Entry::Made(text) => Some(text.clone()),
+        Entry::Failed { digest, .. } => digest.clone(),
     }
 }
 
@@ -1170,7 +1202,10 @@ mod tests {
             },
         );
         let taken = take_in(&prepared, 7, &messages[..4], || panic!("it was made"));
-        assert_eq!(taken, Some(("summary of two turns".to_owned(), spent)));
+        assert_eq!(
+            taken,
+            Some(Some(("summary of two turns".to_owned(), spent)))
+        );
         // Taken once: the step hands it to the session, which keeps it.
         assert_eq!(take_in(&prepared, 7, &messages[..4], || {}), None);
     }
@@ -1313,7 +1348,9 @@ mod tests {
             assert!(other);
             // The step that needs it waits for it rather than asking again.
             let step = scope.spawn(move || {
-                take_in(p, 11, covered, || waits.send(()).unwrap()).map(|(text, _)| text)
+                take_in(p, 11, covered, || waits.send(()).unwrap())
+                    .flatten()
+                    .map(|(text, _)| text)
             });
             waiting.recv().unwrap();
             release.send(()).unwrap();
@@ -1322,5 +1359,44 @@ mod tests {
                 Some("summary of two turns")
             );
         });
+    }
+
+    #[test]
+    fn a_step_that_waited_for_a_failed_summary_does_not_ask_again_at_once() {
+        let (cache, prepared) = (Cache::default(), Prepared::default());
+        let messages = turns(3);
+        let (started, begun) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (waits, waiting) = std::sync::mpsc::channel();
+        let (c, p, covered) = (&cache, &prepared, &messages[..4]);
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                prepare_in(c, p, 13, covered, INPUT_TOKENS, |_, _| {
+                    started.send(()).unwrap();
+                    released.recv().unwrap();
+                    Err("The gateway timed out.".into())
+                })
+            });
+            begun.recv().unwrap();
+            let step = scope.spawn(move || take_in(p, 13, covered, || waits.send(()).unwrap()));
+            waiting.recv().unwrap();
+            release.send(()).unwrap();
+            assert_eq!(step.join().unwrap(), Some(None));
+        });
+        // Kept as a failure, so the step stands in the digest rather than
+        // making the reply wait out a second ask.
+        let digest = failed_in(&cache, &messages[..4], Instant::now());
+        assert!(
+            digest.as_deref().is_some_and(|d| d.contains("question 1")),
+            "{digest:?}"
+        );
+        let again = summary_in(
+            &cache,
+            &messages[..4],
+            INPUT_TOKENS,
+            Instant::now(),
+            |_, _| panic!("asked again right after the ask it waited for failed"),
+        );
+        assert_eq!(again, digest);
     }
 }
