@@ -1,5 +1,5 @@
 use crate::prelude::*;
-use letronna_core::{agent, approvals, inbox};
+use letronna_core::{agent, agents, approvals, inbox};
 
 pub(crate) const BRAND: &str = "Letronna";
 
@@ -13,7 +13,14 @@ pub(crate) const GREETINGS: &[&str] = &[
 
 actions!(
     letronna,
-    [NewSession, Dismiss, ToggleSidebar, OpenSettings, SendNow]
+    [
+        NewSession,
+        Dismiss,
+        ToggleSidebar,
+        OpenSettings,
+        SendNow,
+        OpenActivity
+    ]
 );
 
 /// How near the bottom still counts as at it: a line or two, so a reply
@@ -23,7 +30,7 @@ const FOLLOW_SLACK: Pixels = px(48.);
 /// The chat column's widest, gutters included: about 90 characters of
 /// text, which reads as one measure. A wider window gets wider margins
 /// rather than longer lines.
-const COLUMN: Pixels = px(816.);
+pub(crate) const COLUMN: Pixels = px(816.);
 
 pub(crate) enum Verdict {
     Allow {
@@ -37,6 +44,19 @@ pub(crate) enum Verdict {
     Answer(String),
 }
 
+/// A side question asked with /btw, answered on a fork of its session and
+/// shown under the conversation rather than in it.
+pub(crate) struct Aside {
+    /// The session it was asked about, the only one it shows under.
+    pub(crate) session: u64,
+    pub(crate) question: String,
+    /// None while the fork works on it; the reply carries what it cost.
+    pub(crate) answer: Option<Result<Message, String>>,
+    pub(crate) cancel: letronna_core::cancel::Cancel,
+    /// When it was asked, which tells its answer from an earlier one's.
+    asked: std::time::Instant,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Page {
     Chat,
@@ -44,6 +64,7 @@ pub(crate) enum Page {
     Messaging,
     Artifacts,
     Jobs,
+    Activity,
 }
 impl Page {
     pub(crate) fn title(self) -> &'static str {
@@ -53,6 +74,7 @@ impl Page {
             Page::Messaging => "Messaging",
             Page::Artifacts => "Artifacts",
             Page::Jobs => "Scheduled jobs",
+            Page::Activity => "Activity",
         }
     }
     pub(crate) fn blurb(self) -> &'static str {
@@ -65,6 +87,10 @@ impl Page {
             Page::Artifacts => "Files, images and links produced in sessions will collect here.",
             // Jobs renders its own page; this blurb is only a fallback.
             Page::Jobs => "Prompts that run on a timer.",
+            Page::Activity => {
+                "Helpers your agents handed part of their work to: what each is doing, and a way \
+                 to read, steer or stop it."
+            }
         }
     }
 }
@@ -73,6 +99,10 @@ pub(crate) struct Chat {
     pub(crate) store: Store,
     pub(crate) composer: Entity<InputState>,
     pub(crate) search: Entity<InputState>,
+    /// What the sidebar's search found in what was said.
+    pub(crate) found: Vec<crate::ui::search::Found>,
+    /// The search waiting for typing to pause, or running.
+    pub(crate) finding: Option<Task<()>>,
     pub(crate) endpoint: Entity<InputState>,
     pub(crate) model: Entity<InputState>,
     pub(crate) key: Entity<InputState>,
@@ -92,6 +122,8 @@ pub(crate) struct Chat {
     pub(crate) gateway_pick: Entity<String>,
     pub(crate) presence_pick: Entity<String>,
     pub(crate) settings_page: Entity<&'static str>,
+    /// The Usage page's totals, added up when it was last opened.
+    pub(crate) usage_report: Option<letronna_core::usage::Report>,
     pub(crate) settings_open: bool,
     /// Held by the settings panel while it is open, so escape reaches it.
     pub(crate) settings_focus: FocusHandle,
@@ -238,12 +270,26 @@ pub(crate) struct Chat {
     pub(crate) skills_note: Option<Result<String, String>>,
     /// The skills the last add left out, each with why.
     pub(crate) skills_refused: Vec<String>,
+    /// The side question on show, if one is.
+    pub(crate) aside: Option<Aside>,
     /// Sessions a notice woke, marked in the sidebar until they are next on
     /// screen.
     pub(crate) unseen: std::collections::HashSet<u64>,
     /// Set by Stop for the `finish` it causes, so stopping does not start a
     /// turn for notices in the same moment.
     pub(crate) stopping: bool,
+    /// The helpers as last read, for the Activity page, the status bar's pill
+    /// and the sidebar's dots.
+    pub(crate) helpers: Vec<crate::ui::activity::Helper>,
+    /// Whether the helpers are being read again on a timer.
+    pub(crate) helper_tick: bool,
+    /// The helper whose transcript the Activity page shows.
+    pub(crate) viewing: Option<crate::ui::activity::Viewing>,
+    /// The helper the steer box is open for, and the box.
+    pub(crate) steering: Option<letronna_core::driver::AgentId>,
+    pub(crate) steer: Entity<InputState>,
+    /// The Activity page's, for the keyboard to land on.
+    pub(crate) activity_focus: FocusHandle,
     /// Your message being changed in place, by session id and place.
     pub(crate) editing_message: Option<(u64, usize)>,
     /// The box a message is changed in.
@@ -275,6 +321,11 @@ pub(crate) struct Chat {
     /// Where the chat was scrolled to at the last draw, to tell which way
     /// it has moved since.
     pub(crate) followed_offset: Pixels,
+    /// The session and message a search hit opened, which the chat is held
+    /// at until it is scrolled by hand or another session is shown.
+    pub(crate) reveal: Option<(u64, usize)>,
+    /// Where holding it last put the chat, to tell a scroll by hand from it.
+    pub(crate) revealed: Option<Pixels>,
     /// The list of modes, while the mode chip has it open.
     pub(crate) mode_menu: Option<Entity<gpui_component::menu::PopupMenu>>,
     pub(crate) _subscriptions: Vec<Subscription>,
@@ -404,6 +455,8 @@ impl Chat {
                 .multi_line(true)
                 .auto_grow(1, 12)
         });
+        let steer =
+            cx.new(|cx| InputState::new(window, cx).placeholder("What it should know or do now"));
         let subscriptions = vec![
             cx.subscribe_in(&model_search, window, |this, _, event, window, cx| {
                 // Enter takes the first match, so a model can be picked by
@@ -432,7 +485,12 @@ impl Chat {
                     _ => {}
                 }
             }),
-            cx.subscribe_in(&search, window, |_, _, _: &InputEvent, _, cx| cx.notify()),
+            cx.subscribe_in(&search, window, |this, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.find_in_messages(cx);
+                }
+                cx.notify();
+            }),
             cx.subscribe_in(&edit_message, window, |this, _, event, window, cx| {
                 if matches!(event, InputEvent::PressEnter { secondary: false }) {
                     this.send_edit(window, cx);
@@ -463,6 +521,11 @@ impl Chat {
                     crate::theme::apply(&this.store.settings.appearance, window, cx);
                 }
             }),
+            cx.subscribe_in(&steer, window, |this, _, event, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.send_steer(window, cx);
+                }
+            }),
         ];
         // The message when the old skills.json will not move across, or the
         // skills cannot be read at all; the Skills page shows it too.
@@ -489,6 +552,8 @@ impl Chat {
             store,
             composer,
             search,
+            found: Vec::new(),
+            finding: None,
             endpoint,
             model,
             key,
@@ -503,6 +568,7 @@ impl Chat {
             gateway_pick,
             presence_pick,
             settings_page,
+            usage_report: None,
             settings_open: false,
             settings_focus: cx.focus_handle(),
             page_focus: cx.focus_handle(),
@@ -562,8 +628,15 @@ impl Chat {
             adding_skills: false,
             skills_note: None,
             skills_refused: Vec::new(),
+            aside: None,
             unseen: std::collections::HashSet::new(),
             stopping: false,
+            helpers: Vec::new(),
+            helper_tick: false,
+            viewing: None,
+            steering: None,
+            steer,
+            activity_focus: cx.focus_handle(),
             editing_message: None,
             edit_message,
             thinking_open: std::collections::HashSet::new(),
@@ -580,6 +653,8 @@ impl Chat {
             scroll: ScrollHandle::new(),
             following: true,
             followed_offset: px(0.),
+            reveal: None,
+            revealed: None,
             mode_menu: None,
             _subscriptions: subscriptions,
         };
@@ -642,7 +717,8 @@ impl Chat {
         .detach();
     }
 
-    /// A model and the gateway it is on, chosen together.
+    /// A model and the gateway it is on, chosen together, for the session on
+    /// screen and new sessions.
     pub(crate) fn choose_model(
         &mut self,
         gateway: String,
@@ -652,8 +728,7 @@ impl Chat {
     ) {
         self.model
             .update(cx, |input, cx| input.set_value(id.clone(), window, cx));
-        self.store.settings.gateway = gateway;
-        self.store.settings.model = id;
+        self.store.choose_model(self.store.active, &gateway, &id);
         self.model_open = false;
         self.focus_composer(window, cx);
         self.save();
@@ -709,6 +784,13 @@ impl Chat {
 
     pub(crate) fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let prompt = self.composer.read(cx).value().trim().to_owned();
+        // Asked beside the session, so it waits for no reply to end.
+        if let Some(question) = side_question(&prompt) {
+            let question = question.to_owned();
+            self.composer
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            return self.ask_aside(question, cx);
+        }
         if self.busy && !prompt.is_empty() {
             return self.queue_follow_up(prompt, window, cx);
         }
@@ -725,11 +807,79 @@ impl Chat {
             cx.notify();
             return;
         }
+        let Some(prompt) = self.prompt_for(prompt, cx) else {
+            return;
+        };
         self.composer
             .update(cx, |input, cx| input.set_value("", window, cx));
         if self.dispatch(prompt, None, cx).is_err() {
             self.open_settings(window, cx);
         }
+    }
+
+    /// What sending `text` in the active session asks the model: `/init`
+    /// becomes its prompt, or `None` with the reason shown when there is no
+    /// project folder for it.
+    pub(crate) fn prompt_for(&mut self, text: String, cx: &mut Context<Self>) -> Option<String> {
+        let workspace = self.store.conversations[self.store.active]
+            .workspace
+            .as_deref();
+        match letronna_core::init::command(&text, workspace) {
+            Some(Ok(prompt)) => Some(prompt.to_owned()),
+            Some(Err(why)) => {
+                self.error = Some(why);
+                cx.notify();
+                None
+            }
+            None => Some(text),
+        }
+    }
+
+    /// Asks `question` about the active session on a fork of it, whose answer
+    /// shows under the conversation and never goes into it.
+    fn ask_aside(&mut self, question: String, cx: &mut Context<Self>) {
+        let ix = self.store.active;
+        let mut connection = match self.connection_for(ix, None) {
+            Ok(connection) => connection,
+            Err(error) => {
+                self.error = Some(error);
+                cx.notify();
+                return;
+            }
+        };
+        connection.workspace = self.store.conversations[ix].workspace.clone();
+        let messages = self.store.conversations[ix].messages.clone();
+        if let Some(earlier) = self.aside.take() {
+            earlier.cancel.set();
+        }
+        let cancel = letronna_core::cancel::Cancel::default();
+        let asked = std::time::Instant::now();
+        self.aside = Some(Aside {
+            session: connection.conversation,
+            question: question.clone(),
+            answer: None,
+            cancel: cancel.clone(),
+            asked,
+        });
+        let (sender, receiver) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let answer = letronna_core::agents::btw(&connection, messages, &question, cancel);
+            let _ = sender.send_blocking(answer);
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(answer) = receiver.recv().await {
+                let _ = this.update(cx, |this, cx| {
+                    // One closed or asked again since has no place for it.
+                    if let Some(aside) = this.aside.as_mut().filter(|a| a.asked == asked) {
+                        aside.answer = Some(answer);
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
+        self.follow();
+        cx.notify();
     }
 
     /// Send a prompt in the active session. Split out of `send` so a schedule
@@ -741,7 +891,7 @@ impl Chat {
         remote: Option<letronna_core::chat::Remote>,
         cx: &mut Context<Self>,
     ) -> std::result::Result<(), ()> {
-        let connection = match self.connection_for(self.store.active, remote, cx) {
+        let connection = match self.connection_for(self.store.active, remote) {
             Ok(connection) => connection,
             Err(error) => {
                 self.error = Some(error);
@@ -750,14 +900,15 @@ impl Chat {
             }
         };
         self.store.settings.endpoint = connection.endpoint.clone();
-        self.store.settings.model = connection.model.clone();
+        self.store.pin(self.store.active);
         let conversation = &mut self.store.conversations[self.store.active];
         // Name an untitled session after its first prompt, but leave a name
         // that was set deliberately, such as a scheduled job's.
         if conversation.messages.is_empty()
             && (conversation.title.is_empty() || conversation.title == "New session")
         {
-            conversation.title = prompt.chars().take(40).collect();
+            let shown = letronna_core::init::typed(&prompt).unwrap_or(&prompt);
+            conversation.title = shown.chars().take(40).collect();
         }
         conversation.updated = backend::now();
         // What came in meanwhile goes first, so the prompt is read last.
@@ -770,8 +921,11 @@ impl Chat {
             ..Default::default()
         });
         let target_id = conversation.id;
+        let model = connection.model.clone();
         self.busy = true;
         self.streaming_id = Some(target_id);
+        // What the session's kept helpers wake on from now on.
+        agents::connected(&connection);
         self.turn = Some(agent::Turn::new(connection));
         // A browser closed during the last turn shows again in this one.
         self.browser.update(cx, |view, _| view.dismissed = false);
@@ -780,7 +934,7 @@ impl Chat {
         plugins::emit(
             cx,
             plugins::AppEvent::ChatStarted {
-                model: self.store.settings.model.clone(),
+                model,
                 title: convo_title,
             },
         );
@@ -797,27 +951,24 @@ impl Chat {
         &self,
         ix: usize,
         remote: Option<letronna_core::chat::Remote>,
-        cx: &App,
     ) -> std::result::Result<Connection, String> {
+        // Each session keeps the model it was on, and the gateway with it.
+        let (gateway, model) = self.store.model(ix);
         let saved = self
             .keys
-            .get(key_slot(&self.store.settings.gateway))
+            .get(key_slot(gateway))
             .cloned()
             .unwrap_or_default();
-        let (endpoint, key) = resolve(
-            &self.store.settings.gateway,
-            &self.store.settings.custom_endpoint,
-            &saved,
-        );
+        let (endpoint, key) = resolve(gateway, &self.store.settings.custom_endpoint, &saved);
         let session = self.store.conversations[ix].id;
         let connection = Connection {
             endpoint,
-            model: self.model.read(cx).value().to_string(),
+            model: model.to_owned(),
             key,
             tools: true,
             workspace: None,
             plan: self.mode(session) == letronna_core::gate::Mode::Plan,
-            effort: self.store.settings.effort.clone(),
+            effort: self.store.effort(ix).to_owned(),
             search: self.store.settings.search,
             // A schedule's run and a chat app's turn may have nobody watching.
             unattended: remote.is_some() || self.scheduled.contains(&session),
@@ -1094,6 +1245,12 @@ impl Chat {
                 self.finish(cx);
             }
             Event::Finished(Ok(())) => self.on_reply(cx),
+            // Kept with the session, so a restart need not ask for it again.
+            Event::Summarized { upto, text } => {
+                if let Some(ix) = self.streaming_id.and_then(|id| self.store.index_of(id)) {
+                    self.store.conversations[ix].summarized(upto, text);
+                }
+            }
             _ => {}
         }
         cx.notify();
@@ -1101,10 +1258,10 @@ impl Chat {
 
     /// A reply finished: store it, then either run what it asked for or stop.
     fn on_reply(&mut self, cx: &mut Context<Self>) {
-        let model = self.store.settings.model.clone();
         let Some(turn) = self.turn.as_mut() else {
             return;
         };
+        let model = turn.connection.model.clone();
         let mut reply = turn.take_reply(&model);
         let continuation = turn.continuation(&mut reply);
         let calls = reply.tool_calls.clone();
@@ -1747,6 +1904,7 @@ impl Chat {
             return;
         };
         self.modes.insert(session.id, mode);
+        agents::set_plan(mode == letronna_core::gate::Mode::Plan);
         self.approvals_changed(cx);
         cx.notify();
     }
@@ -1779,6 +1937,8 @@ impl Chat {
     /// Go to the newest message and stay with it as more arrives.
     pub(crate) fn follow(&mut self) {
         self.following = true;
+        self.reveal = None;
+        self.revealed = None;
         self.scroll.scroll_to_bottom();
     }
 
@@ -1790,6 +1950,12 @@ impl Chat {
     /// moves it up, but pinned to the bottom, and that must not count.
     fn keep_following(&mut self) {
         let offset = self.scroll.offset().y;
+        // Held at a search hit, the chat stays put. Where it is still counts,
+        // so a scroll by hand after it lets go is told the right way round.
+        if self.holding_hit() {
+            self.followed_offset = offset;
+            return;
+        }
         let near_bottom = self.distance_from_bottom() <= FOLLOW_SLACK;
         // The offset grows towards zero going up.
         if offset > self.followed_offset && !near_bottom {
@@ -1873,7 +2039,6 @@ impl Chat {
     /// Save what a stopped turn got to, so the model hears next time what ran
     /// and what did not.
     fn keep_stopped(&mut self) {
-        let model = self.store.settings.model.clone();
         let running = std::mem::take(&mut self.call_running);
         let Some(turn) = self.turn.as_mut() else {
             return;
@@ -1881,6 +2046,7 @@ impl Chat {
         if running {
             turn.finish_call(Err(agent::STOPPED_WHILE_RUNNING.into()));
         }
+        let model = turn.connection.model.clone();
         let kept = turn.stop(&model);
         let Some(ix) = self.streaming_id.and_then(|id| self.store.index_of(id)) else {
             return;
@@ -1907,10 +2073,27 @@ impl Chat {
             self.model_open = false;
             self.focus_composer(window, cx);
             cx.notify();
+        } else if let Some(aside) = self.aside_to_close() {
+            aside.cancel.set();
+            cx.notify();
+        } else if self.page == Page::Activity && self.steering.is_some() {
+            // Escape in the steer box backs out of it; the reply carries on.
+            self.close_steer(window, cx);
+        } else if self.page == Page::Activity && self.viewing.is_some() {
+            // And out of a helper's transcript, back to the list.
+            self.open_activity(window, cx);
         } else if self.busy_elsewhere().is_none() {
             // Not a reply in another session, which nothing here shows.
             self.stop_turn(cx);
         }
+    }
+
+    /// Takes the aside escape closes rather than stopping a reply, if any.
+    fn aside_to_close(&mut self) -> Option<Aside> {
+        let here = self.store.conversations[self.store.active].id;
+        let replying = self.streaming_id.filter(|_| self.busy);
+        self.aside
+            .take_if(|aside| escape_closes_aside(aside.session, here, replying))
     }
 
     fn finish(&mut self, cx: &mut Context<Self>) {
@@ -1972,7 +2155,7 @@ impl Chat {
         conversation.messages.push(notice);
         self.unseen.insert(id);
         self.save();
-        let connection = match self.connection_for(ix, None, cx) {
+        let connection = match self.connection_for(ix, None) {
             Ok(connection) => connection,
             Err(error) => {
                 self.error = Some(error);
@@ -1982,6 +2165,7 @@ impl Chat {
         };
         self.busy = true;
         self.streaming_id = Some(id);
+        agents::connected(&connection);
         self.turn = Some(agent::Turn::new(connection));
         self.error = None;
         self.run_turn(cx);
@@ -1996,6 +2180,9 @@ impl Chat {
             Some("Another session is working. Send this when it is done, or stop it first.")
         } else if prompt.chars().count() > 12_000 {
             Some("Please keep each message under 12,000 characters.")
+        } else if prompt == letronna_core::init::COMMAND {
+            // Folded into a turn as it runs, it would reach the model as typed.
+            Some("/init starts a turn of its own. Send it when this one is done.")
         } else {
             None
         };
@@ -2128,6 +2315,9 @@ impl Render for Chat {
             })
             .detach();
         }
+        // Helpers work off the UI thread too, and a timer reads them while a
+        // turn runs or one works.
+        self.watch_helpers(cx);
         if let Some(note) = self.note.take() {
             window.push_notification(gpui_component::notification::Notification::info(note), cx);
         }
@@ -2198,6 +2388,8 @@ impl Render for Chat {
             self.skills_page(cx).into_any_element()
         } else if self.page == Page::Messaging {
             self.messaging_page(cx).into_any_element()
+        } else if self.page == Page::Activity {
+            self.activity_page(window, cx)
         } else if self.page != Page::Chat {
             self.page_view(self.page, cx).into_any_element()
         } else if conversation.messages.is_empty()
@@ -2205,7 +2397,7 @@ impl Render for Chat {
             // A helper's card needs the chat body even with nothing said.
             && !self.agent_asks.iter().any(|ask| ask.root == conversation.id)
         {
-            self.empty_state(cx).into_any_element()
+            self.empty_state(window, cx).into_any_element()
         } else {
             // One turn per prompt, like Claude Code: the user's message, then
             // everything the model did in reply under a single label. Each
@@ -2221,7 +2413,11 @@ impl Render for Chat {
                 .any(|context| context.contains("PopupMenu"));
             let mut turns: Vec<(Vec<AnyElement>, Span, FocusHandle)> = Vec::new();
             let mut assistant_turn = false;
+            // The message a search hit opened, marked on the first row drawn
+            // from it on: a reply that only called tools has none of its own.
+            let mut marking = false;
             for (i, m) in messages.iter().enumerate() {
+                marking |= self.reveal == Some((conversation.id, i));
                 let is_user = m.role == "user";
                 if is_user || !assistant_turn {
                     // A notice stands apart as your message does, but it is
@@ -2259,7 +2455,12 @@ impl Render for Chat {
                     let shown = shows_bar(*span, messages.len(), streaming_here, focused);
                     self.turn_bar(*span, shown, cx)
                 });
-                rows.push(self.message_row(i, m, labeled, false, bar, window, cx));
+                let row = self.message_row(i, m, labeled, false, bar, window, cx);
+                rows.push(if std::mem::take(&mut marking) {
+                    self.mark_hit(row, cx)
+                } else {
+                    row
+                });
             }
             // The turn a reply is still coming in to has no buttons or menu:
             // it is not finished, and it owns the session until it is.
@@ -2288,12 +2489,13 @@ impl Render for Chat {
                 if let Some(live) = self.turn.as_ref().filter(|_| idle).map(|turn| Message {
                     role: "assistant".into(),
                     content: turn.live.content.clone(),
-                    model: self.store.settings.model.clone(),
+                    model: turn.connection.model.clone(),
                     reasoning: turn.live.reasoning.clone(),
                     tokens: turn.live.tokens,
                     per_second: turn.live.per_second,
                     prompt_tokens: turn.live.prompt_tokens,
                     cached_tokens: turn.live.cached_tokens,
+                    window: turn.live.window,
                     ..Default::default()
                 }) {
                     // Keyed by the place the reply will have once it is
@@ -2351,6 +2553,7 @@ impl Render for Chat {
                 .collect();
             // Last, where the eye is: a helper does not wait on a turn.
             rows.extend(self.helper_card(conversation.id, window, cx));
+            rows.extend(self.aside_row(conversation.id, window, cx));
             // The scrollbar must sit outside the scrolling element, or it
             // scrolls away with the content. The scrolling box spans the
             // pane, so the bar is at its edge and the wheel works over the
@@ -2428,6 +2631,11 @@ impl Render for Chat {
                 }
             }))
             .on_action(
+                cx.listener(|this, _: &crate::ui::usage::OpenUsage, window, cx| {
+                    this.open_usage(window, cx)
+                }),
+            )
+            .on_action(
                 cx.listener(|this, _: &crate::ui::panel::TogglePanel, window, cx| {
                     if !window.has_active_dialog(cx) && !this.settings_open {
                         this.toggle_panel(window, cx)
@@ -2440,6 +2648,9 @@ impl Render for Chat {
                         this.show_tab(crate::ui::panel::PanelTab::Browser, window, cx)
                     }
                 }),
+            )
+            .on_action(
+                cx.listener(|this, _: &OpenActivity, window, cx| this.open_activity(window, cx)),
             )
             .child(
                 div()
@@ -2538,13 +2749,30 @@ pub(crate) fn running_calls(turn: &agent::Turn, outstanding: usize) -> Vec<backe
         .collect()
 }
 
+/// Whether escape closes an aside asked in session `asked` rather than
+/// stopping a reply: only with that session on screen as `here`, and only
+/// once `replying`, the session a reply runs in, is not that one.
+fn escape_closes_aside(asked: u64, here: u64, replying: Option<u64>) -> bool {
+    asked == here && replying != Some(here)
+}
+
+/// The question a /btw line asks, empty when it names none, or None for any
+/// other line.
+fn side_question(prompt: &str) -> Option<&str> {
+    let rest = prompt.strip_prefix("/btw")?;
+    (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim())
+}
+
 #[cfg(test)]
 mod tests {
     use super::woken;
     use letronna_core::gate::Mode;
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
-    use super::{cuts_in, front_call, run_ended, running_calls, until_repeated_id};
+    use super::{
+        cuts_in, escape_closes_aside, front_call, run_ended, running_calls, side_question,
+        until_repeated_id,
+    };
     use letronna_core::agent::{MAX_BATCH, Next, Turn};
     use letronna_core::chat::{Connection, ToolCall};
     use letronna_core::gate::{Gate, Grants, decide};
@@ -2735,5 +2963,26 @@ mod tests {
         assert!(run_ended(root, run));
         // A run with nothing listed, as one a turn waits on, never looks ended.
         assert!(!run_ended(root, run + 1));
+    }
+
+    #[test]
+    fn escape_stops_the_reply_on_screen_before_it_closes_that_sessions_aside() {
+        assert!(escape_closes_aside(1, 1, None));
+        assert!(!escape_closes_aside(1, 1, Some(1)));
+        // A reply running elsewhere is not the one on screen.
+        assert!(escape_closes_aside(1, 1, Some(2)));
+        // An aside of another session is hidden, so escape is not for it.
+        assert!(!escape_closes_aside(1, 2, None));
+    }
+
+    #[test]
+    fn only_a_btw_line_asks_a_side_question() {
+        assert_eq!(
+            side_question("/btw what did we decide?"),
+            Some("what did we decide?")
+        );
+        assert_eq!(side_question("/btw"), Some(""));
+        assert_eq!(side_question("/btwx"), None);
+        assert_eq!(side_question("tell me /btw"), None);
     }
 }

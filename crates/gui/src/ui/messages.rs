@@ -63,7 +63,7 @@ impl Chat {
         // A reply that only asked for tools: its tool rows say what happened.
         let tool_only = !is_user && message.content.is_empty() && !message.tool_calls.is_empty();
         let label: String = if message.model.is_empty() {
-            self.store.settings.model.clone()
+            self.store.model(self.store.active).1.to_owned()
         } else {
             message.model.clone()
         };
@@ -117,8 +117,12 @@ impl Chat {
                 )
                 .into_any_element()
         } else if is_user {
-            // A chat app's message can quote someone else's, fenced.
-            let (said, _) = letronna_core::untrusted::shown("", &message.content);
+            // `/init` shows as typed, not as the prompt it sent; a chat app's
+            // message can quote someone else's, fenced.
+            let said = match letronna_core::init::typed(&message.content) {
+                Some(typed) => typed.to_owned(),
+                None => letronna_core::untrusted::shown("", &message.content).0,
+            };
             TextView::markdown(md, said, window, cx)
                 .selectable(selectable)
                 .text_size(px(15.))
@@ -135,13 +139,17 @@ impl Chat {
                         .xsmall()
                         .color(cx.theme().primary),
                 )
-                .child(
-                    self.turn
-                        .as_ref()
-                        .and_then(|turn| turn.live.retrying)
-                        .filter(|_| streaming)
-                        .map_or_else(|| "Thinking…".to_owned(), |retry| retry.to_string()),
-                )
+                .child({
+                    let live = self.turn.as_ref().filter(|_| streaming).map(|t| &t.live);
+                    match (
+                        live.and_then(|l| l.retrying),
+                        live.is_some_and(|l| l.compacting),
+                    ) {
+                        (Some(retry), _) => retry.to_string(),
+                        (None, true) => "Compacting…".to_owned(),
+                        (None, false) => "Thinking…".to_owned(),
+                    }
+                })
                 .into_any_element()
         } else {
             TextView::markdown(md, message.content.clone(), window, cx)
@@ -342,6 +350,80 @@ impl Chat {
                     .child(text.to_owned()),
             )
             .into_any_element()
+    }
+
+    /// The side question on show for `session`, under the conversation and
+    /// in no turn of it, since the session does not keep it.
+    pub(crate) fn aside_row(
+        &self,
+        session: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let aside = self
+            .aside
+            .as_ref()
+            .filter(|aside| aside.session == session)?;
+        let muted = cx.theme().muted_foreground;
+        // Rendered and selectable as a reply is, since it is the only copy.
+        let answer = match &aside.answer {
+            None => div()
+                .text_color(muted)
+                .child("Thinking…")
+                .into_any_element(),
+            Some(Ok(reply)) => v_flex()
+                .gap_1()
+                .text_color(muted)
+                .child(
+                    TextView::markdown(self.row_id("aside", 0), reply.content.clone(), window, cx)
+                        .selectable(!window.has_active_dialog(cx))
+                        .line_height(px(26.)),
+                )
+                .child(div().text_xs().child(usage_line(reply)))
+                .into_any_element(),
+            Some(Err(error)) => div()
+                .text_color(cx.theme().danger)
+                .child(error.clone())
+                .into_any_element(),
+        };
+        let row = v_flex()
+            .w_full()
+            .gap_1()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .text_xs()
+                    .font_family(HEADING_FONT)
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Aside · not kept in the session")
+                    .child(
+                        Button::new("aside-close")
+                            .ghost()
+                            .xsmall()
+                            .icon(Icon::new(IconName::Close))
+                            .tooltip_with_action("Close", &Dismiss, None)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(aside) = this.aside.take() {
+                                    aside.cancel.set();
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .w_full()
+                    .gap_2()
+                    .px_4()
+                    .py_3()
+                    .rounded(cx.theme().radius_lg)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .child(aside.question.clone())
+                    .child(answer),
+            );
+        Some(row.into_any_element())
     }
 
     /// Something that happened meanwhile, such as a job exiting: one quiet
@@ -624,7 +706,11 @@ impl Chat {
             })
     }
 
-    pub(crate) fn empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn empty_state(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         // Without a project folder the tools have nowhere to read or write,
         // and the only other place that says so is a chip in the status bar.
         let no_project = self.store.conversations[self.store.active]
@@ -671,6 +757,11 @@ impl Chat {
                     .child("Enter to send  ·  Shift+Enter for a new line  ·  Esc to stop"),
             )
             .children(self.grain(&self.grains.empty_chat))
+            // A side question asked before anything else still needs somewhere to show.
+            .children(
+                self.aside_row(self.store.conversations[self.store.active].id, window, cx)
+                    .map(|row| div().w_full().max_w(COLUMN).px_6().mt_6().child(row)),
+            )
     }
 
     pub(crate) fn page_view(&self, page: Page, cx: &mut Context<Self>) -> impl IntoElement {
@@ -758,6 +849,7 @@ fn usage_line(message: &Message) -> String {
     let input = message.input_tokens();
     if input > 0 {
         parts.push(format!("{input} in"));
+        parts.extend(message.fullness());
         if message.cached_tokens > 0 {
             let share = 100 * message.cached_tokens / input;
             parts.push(format!("{share}% cached"));
@@ -975,5 +1067,20 @@ mod tests {
             ..message.clone()
         };
         assert_eq!(usage_line(&uncached), "16 out · 18.4 tok/s · 3291 in");
+    }
+
+    #[test]
+    fn usage_line_says_how_full_the_window_was_after_the_prompt() {
+        let message = Message {
+            tokens: 16,
+            prompt_tokens: 76_000,
+            cached_tokens: 72_200,
+            window: 200_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            usage_line(&message),
+            "16 out · 76000 in · 38% of 200K · 95% cached"
+        );
     }
 }
