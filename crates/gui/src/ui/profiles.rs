@@ -143,9 +143,8 @@ impl Chat {
     /// what belonged to the old profile's sessions rather than carry ids
     /// that mean nothing here.
     ///
-    /// Messaging and scheduled jobs keep whatever they loaded at startup:
-    /// their listeners run off the old profile's settings until the app is
-    /// restarted, a gap left for a follow-up.
+    /// The chat app listeners are restarted on the new profile's settings, so
+    /// the old profile's bots stop feeding messages into this one.
     fn reload_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut store = letronna_core::store::load();
         if store.conversations.is_empty() {
@@ -204,6 +203,36 @@ impl Chat {
             Err(why) => (Vec::new(), Some(why)),
         };
 
+        // Whatever is kept here is saved back, so left alone these would put
+        // the old profile's jobs and tokens into the new one.
+        self.schedules = letronna_core::schedule::load();
+        self.messaging = letronna_core::messaging::load();
+        let messaging = &self.messaging;
+        for (input, value) in [
+            (&self.token_input, messaging.telegram.token.clone()),
+            (&self.webhook_input, messaging.discord.webhook.clone()),
+            (
+                &self.discord_token_input,
+                messaging.discord.bot_token.clone(),
+            ),
+            (&self.discord_owner_input, messaging.discord.owner.clone()),
+            (
+                &self.discord_servers_input,
+                messaging.discord.servers.join(", "),
+            ),
+            (
+                &self.browser_address,
+                keys.get(letronna_core::browser::ELSEWHERE)
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+        ] {
+            input.update(cx, |input, cx| input.set_value(value, window, cx));
+        }
+        self.pairing = None;
+        self.hook_name = None;
+        self.bot_name = None;
+        self.discord_bot_name = None;
         self.draft_for = store.conversations[store.active].id;
         self.store = store;
         self.keys = keys;
@@ -223,6 +252,15 @@ impl Chat {
         self.unseen.clear();
         self.found.clear();
         self.editing_message = None;
+        // Sessions the old profile opened for a schedule or a chat app, by
+        // ids that another profile's sessions may share.
+        self.scheduled.clear();
+        self.remote.clear();
+        self.remote_session.clear();
+        self.follow_ups.clear();
+        self.returned_follow_ups = None;
+        // The rules file is re-read by its date, which may match.
+        self.rules_read = None;
         self.reveal = None;
         self.revealed = None;
         self.aside = None;
@@ -234,6 +272,7 @@ impl Chat {
         self.page = Page::Chat;
         self.error = None;
         self.teams = Vec::new();
+        self.restart_messaging(cx);
         self.refresh_account(cx);
         self.load_models(window, cx);
         self.focus_composer(window, cx);
