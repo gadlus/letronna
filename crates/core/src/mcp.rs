@@ -54,6 +54,11 @@
 //! most likely die again, and each start may download it anew. Then it
 //! waits for the user's Reconnect. A server that says its tools changed is
 //! asked for them again.
+//!
+//! `reload` reads `mcp.json` afresh after the user edits it: servers added
+//! start, those removed stop, and those whose entry now says anything else
+//! once its variables are filled in start again; the rest run on untouched,
+//! so a long npx start or a hosted session is not thrown away for nothing.
 
 use crate::tools::{Tool, ToolContext};
 use serde::Deserialize;
@@ -145,7 +150,7 @@ const KEPT_ENV: &[&str] = &[
 ];
 
 /// One entry under `mcpServers` in `mcp.json`, as Claude Desktop writes it.
-#[derive(Deserialize, Clone, Default)]
+#[derive(Deserialize, Clone, Default, PartialEq)]
 struct ServerConfig {
     /// Empty for a server reached by URL.
     #[serde(default)]
@@ -378,8 +383,43 @@ pub struct Retry {
     pub attempts: u32,
 }
 
+/// What `reload` changed, by server name.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Reloaded {
+    /// New to `mcp.json`, and started.
+    pub added: Vec<String>,
+    /// Gone from it, and stopped.
+    pub removed: Vec<String>,
+    /// Their entry says something else now, so they were started again.
+    pub changed: Vec<String>,
+    /// How many were left running as they were.
+    pub unchanged: usize,
+}
+
+impl std::fmt::Display for Reloaded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let lists = [
+            ("added", &self.added),
+            ("removed", &self.removed),
+            ("changed", &self.changed),
+        ];
+        let mut said: Vec<String> = lists
+            .iter()
+            .filter(|(_, names)| !names.is_empty())
+            .map(|(what, names)| format!("{what} {}", names.join(", ")))
+            .collect();
+        if said.is_empty() {
+            return f.write_str("no server changed");
+        }
+        if self.unchanged > 0 {
+            said.push(format!("{} unchanged", self.unchanged));
+        }
+        f.write_str(&said.join("; "))
+    }
+}
+
 /// One configured server and what became of it: the one record that
-/// `status`, `reconnect` and `set_enabled` read and change.
+/// `status`, `reconnect`, `set_enabled` and `reload` read and change.
 #[derive(Default)]
 struct Slot {
     config: ServerConfig,
@@ -390,8 +430,10 @@ struct Slot {
     log: Arc<Mutex<VecDeque<u8>>>,
     /// The process of a server run here, held so a restart can stop it.
     child: Option<std::process::Child>,
-    /// Counts the starts, so one that ends after a later start began is
-    /// dropped rather than taken for the current one.
+    /// Numbers the starts, so one that ends after a later start began is
+    /// dropped rather than taken for the current one. Every server shares
+    /// the count, so a start of a slot that `reload` removed is never taken
+    /// for one of the slot made again under its name.
     run: u64,
     /// The server as spoken to, held so one that lists no tools stays up.
     server: Option<Arc<Server>>,
@@ -615,12 +657,21 @@ pub fn reconnect(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Switch a server on or off in `mcp.json`, and start or stop it to match.
+/// Switch a server on or off in `mcp.json`, and start or stop it to match,
+/// along with any other change made to the file by hand meanwhile.
 pub fn set_enabled(name: &str, on: bool) -> Result<(), String> {
     start();
     edit(&config_path(), |servers| switch(servers, name, on))?;
-    open(name, entry(name)?);
-    Ok(())
+    reload().map(drop)
+}
+
+/// Read `mcp.json` afresh and bring the servers in line with it: start
+/// those added, stop those removed and start again those whose entry
+/// changed, leaving the rest running as they are. A file that will not
+/// read changes nothing and says why.
+pub fn reload() -> Result<Reloaded, String> {
+    start();
+    reload_from(&config_path())
 }
 
 /// Add a server to `mcp.json` under a name not yet taken, as the JSON its
@@ -676,6 +727,82 @@ fn remove(servers: &mut Map<String, Value>, name: &str) -> Result<(), String> {
 
 fn missing(name: &str) -> String {
     format!("There is no {name} in mcp.json.")
+}
+
+fn reload_from(path: &Path) -> Result<Reloaded, String> {
+    let servers = entries(&read_config(path)?);
+    let done = {
+        let slots = slots()
+            .lock()
+            .map_err(|_| "The MCP servers cannot be reached.".to_owned())?;
+        diff(slots.iter(), &servers, &|var| std::env::var(var).ok())
+    };
+    apply(&done, servers);
+    Ok(done)
+}
+
+/// Which of the servers `running` are gone from `servers`, as `mcp.json`
+/// has them now, which are new and which changed, with variables filled in
+/// from `var`.
+fn diff<'a>(
+    running: impl Iterator<Item = (&'a String, &'a Slot)>,
+    servers: &BTreeMap<String, Result<ServerConfig, String>>,
+    var: &dyn Fn(&str) -> Option<String>,
+) -> Reloaded {
+    let mut done = Reloaded::default();
+    let mut seen = HashSet::new();
+    for (name, slot) in running {
+        seen.insert(name);
+        match servers.get(name) {
+            None => done.removed.push(name.clone()),
+            Some(server) if same(slot, server, var) => done.unchanged += 1,
+            Some(_) => done.changed.push(name.clone()),
+        }
+    }
+    done.added = servers
+        .keys()
+        .filter(|name| !seen.contains(name))
+        .cloned()
+        .collect();
+    done
+}
+
+/// Whether `slot` was started from `server`, its entry as `mcp.json` has it
+/// now: the same once their variables are filled in from `var`.
+fn same(
+    slot: &Slot,
+    server: &Result<ServerConfig, String>,
+    var: &dyn Fn(&str) -> Option<String>,
+) -> bool {
+    let failed = slot.state == State::Failed;
+    let config = match server {
+        // Nothing ran for an entry that would not read; only why can differ.
+        Err(error) => return failed && slot.error.as_ref() == Some(error),
+        // Nor for one that would not read before, which kept no config.
+        Ok(_) if failed && slot.config == ServerConfig::default() => return false,
+        Ok(config) => config,
+    };
+    match (slot.config.expanded(var), config.expanded(var)) {
+        (Ok(old), Ok(new)) => old == new,
+        // One with a variable unset changes only as its entry does.
+        _ => slot.config == *config,
+    }
+}
+
+/// Stop the servers `done` removed, and start those it added or changed as
+/// `servers` has them.
+fn apply(done: &Reloaded, mut servers: BTreeMap<String, Result<ServerConfig, String>>) {
+    for name in &done.removed {
+        let slot = slots().lock().ok().and_then(|mut slots| slots.remove(name));
+        if let Some(mut slot) = slot {
+            slot.stop();
+        }
+    }
+    for name in done.added.iter().chain(&done.changed) {
+        if let Some(server) = servers.remove(name) {
+            open(name, server);
+        }
+    }
 }
 
 fn slots() -> &'static Mutex<BTreeMap<String, Slot>> {
@@ -778,7 +905,7 @@ fn open(name: &str, server: Result<ServerConfig, String>) {
     };
     let slot = slots.entry(name.to_owned()).or_default();
     slot.stop();
-    slot.run += 1;
+    slot.run = next_run();
     slot.retries = 0;
     slot.error = None;
     let config = match server {
@@ -901,8 +1028,14 @@ fn retry(name: &str, run: u64) {
     if let Some((_, timer)) = slot.retry.take() {
         crate::timers::cancel(timer);
     }
-    slot.run += 1;
+    slot.run = next_run();
     start_slot(name, slot);
+}
+
+/// A number for a start that no start of any server has had.
+fn next_run() -> u64 {
+    static RUNS: AtomicU64 = AtomicU64::new(0);
+    RUNS.fetch_add(1, Ordering::Relaxed) + 1
 }
 
 /// Keep what a server prints on stderr until it closes.
@@ -3037,7 +3170,7 @@ mod tests {
         let mut slots = slots().lock().unwrap();
         let slot = slots.entry(name.to_owned()).or_default();
         slot.stop();
-        slot.run += 1;
+        slot.run = next_run();
         slot.config = config;
         slot.state = State::Connected;
         slot.retries = retries;
@@ -3238,5 +3371,202 @@ mod tests {
         assert_eq!(settled("t-grow", |s| s.tools == 2).tools, 2);
         assert!(tools().iter().any(|t| t.name() == "mcp__t-grow__grown"));
         switch_off("t-grow");
+    }
+
+    /// Slots as `open` leaves them for each entry, without starting any.
+    fn slots_of(entries: &[(&str, Result<ServerConfig, String>)]) -> BTreeMap<String, Slot> {
+        let slot = |server: &Result<ServerConfig, String>| match server {
+            Ok(config) => Slot {
+                config: config.clone(),
+                state: State::Connected,
+                ..Default::default()
+            },
+            Err(error) => Slot {
+                state: State::Failed,
+                error: Some(error.clone()),
+                ..Default::default()
+            },
+        };
+        entries
+            .iter()
+            .map(|(name, server)| (name.to_string(), slot(server)))
+            .collect()
+    }
+
+    fn names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn a_reload_starts_the_added_stops_the_removed_and_restarts_only_the_changed() {
+        let with = |change: fn(&mut ServerConfig)| {
+            let mut config = shell("serve");
+            change(&mut config);
+            Ok(config)
+        };
+        let running = slots_of(&[
+            ("kept", with(|_| {})),
+            ("moved", with(|_| {})),
+            ("gone", with(|_| {})),
+            (
+                "keyed",
+                with(|c| c.env = HashMap::from([("K".into(), var("TOKEN").unwrap())])),
+            ),
+            ("off", with(|_| {})),
+        ]);
+        let servers = BTreeMap::from([
+            ("kept".to_string(), with(|_| {})),
+            (
+                "moved".to_string(),
+                with(|c| c.args.push("--port=2".into())),
+            ),
+            // The same once its variable is filled in.
+            (
+                "keyed".to_string(),
+                with(|c| c.env = HashMap::from([("K".into(), "${TOKEN}".into())])),
+            ),
+            ("off".to_string(), with(|c| c.disabled = true)),
+            ("new".to_string(), with(|_| {})),
+        ]);
+        let done = diff(running.iter(), &servers, &var);
+        let expected = Reloaded {
+            added: names(&["new"]),
+            removed: names(&["gone"]),
+            changed: names(&["moved", "off"]),
+            unchanged: 2,
+        };
+        assert_eq!(done, expected);
+    }
+
+    #[test]
+    fn a_change_to_any_part_of_a_servers_entry_starts_it_again() {
+        let changes: [fn(&mut ServerConfig); 13] = [
+            |c| c.command = "other".into(),
+            |c| c.url = "https://example.com/mcp".into(),
+            |c| c.headers = HashMap::from([("Authorization".into(), "Bearer 2".into())]),
+            |c| c.args.push("--more".into()),
+            |c| c.env = HashMap::from([("K".into(), "2".into())]),
+            |c| c.disabled = true,
+            |c| c.auto_approve = AutoApprove::Word("readOnly".into()),
+            |c| c.timeout_ms = Some(5_000),
+            |c| c.startup_timeout_ms = Some(5_000),
+            |c| c.cwd = Some("tools".into()),
+            |c| c.include_tools = vec!["read_*".into()],
+            |c| c.exclude_tools = vec!["write_*".into()],
+            |c| c.env_scrub = true,
+        ];
+        let running = slots_of(&[("s", Ok(shell("serve")))]);
+        for (at, change) in changes.into_iter().enumerate() {
+            let mut config = shell("serve");
+            change(&mut config);
+            let servers = BTreeMap::from([("s".to_string(), Ok(config))]);
+            let done = diff(running.iter(), &servers, &var);
+            assert_eq!(done.changed, names(&["s"]), "change {at}");
+        }
+    }
+
+    #[test]
+    fn an_entry_that_will_not_read_or_fill_in_changes_only_as_its_text_does() {
+        let unread = || Err("Its entry in mcp.json will not read: no".to_string());
+        let unset = || Ok(shell("${UNSET}"));
+        let running = slots_of(&[
+            ("unread", unread()),
+            ("unset", unset()),
+            ("fixed", unread()),
+        ]);
+        let servers = BTreeMap::from([
+            ("unread".to_string(), unread()),
+            ("unset".to_string(), unset()),
+            ("fixed".to_string(), Ok(shell("serve"))),
+        ]);
+        let done = diff(running.iter(), &servers, &var);
+        assert_eq!((done.changed, done.unchanged), (names(&["fixed"]), 2));
+        let servers = BTreeMap::from([
+            (
+                "unread".to_string(),
+                Err("Its entry in mcp.json will not read: other".into()),
+            ),
+            ("unset".to_string(), Ok(shell("${UNSET} --more"))),
+        ]);
+        let done = diff(running.iter(), &servers, &var);
+        assert_eq!(done.changed, names(&["unread", "unset"]));
+    }
+
+    #[test]
+    fn what_a_reload_did_is_said_in_a_line() {
+        let done = Reloaded {
+            added: names(&["a", "b"]),
+            removed: Vec::new(),
+            changed: names(&["c"]),
+            unchanged: 2,
+        };
+        assert_eq!(done.to_string(), "added a, b; changed c; 2 unchanged");
+        let none = Reloaded {
+            unchanged: 3,
+            ..Default::default()
+        };
+        assert_eq!(none.to_string(), "no server changed");
+    }
+
+    #[test]
+    fn a_file_that_will_not_parse_reloads_nothing_and_says_why() {
+        let path = scratch("reload").join("mcp.json");
+        std::fs::write(&path, "{\"mcpServers\": {").unwrap();
+        let run = connected("t-unparsed", shell("serve"), 0, Duration::ZERO);
+        let error = reload_from(&path).unwrap_err();
+        assert!(error.contains("will not parse"), "{error}");
+        assert_eq!(run_of("t-unparsed"), run);
+        assert_eq!(settled("t-unparsed", |_| true).state, State::Connected);
+        switch_off("t-unparsed");
+    }
+
+    /// The process id of a test's server run here, once it has printed.
+    fn pid_of(name: &str) -> u32 {
+        settled(name, |s| s.log.contains("waiting"));
+        let slots = slots().lock().unwrap();
+        slots[name].child.as_ref().unwrap().id()
+    }
+
+    #[cfg(unix)]
+    fn alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reloading_leaves_an_unchanged_server_running_and_stops_a_removed_one() {
+        let hangs = |id: &str| shell(&format!("echo waiting {id} >&2; exec sleep 30"));
+        for name in ["t-r-kept", "t-r-moved", "t-r-gone"] {
+            open(name, Ok(hangs("1")));
+        }
+        let (kept, moved, gone) = (pid_of("t-r-kept"), pid_of("t-r-moved"), pid_of("t-r-gone"));
+        let run = run_of("t-r-kept");
+        let servers = BTreeMap::from([
+            ("t-r-kept".to_string(), Ok(hangs("1"))),
+            ("t-r-moved".to_string(), Ok(hangs("2"))),
+            ("t-r-new".to_string(), Ok(hangs("1"))),
+        ]);
+        let done = {
+            let slots = slots().lock().unwrap();
+            let ours = slots.iter().filter(|(name, _)| name.starts_with("t-r-"));
+            diff(ours, &servers, &|name| std::env::var(name).ok())
+        };
+        apply(&done, servers);
+        assert_eq!(done.added, names(&["t-r-new"]));
+        assert_eq!((run_of("t-r-kept"), pid_of("t-r-kept")), (run, kept));
+        assert!(alive(kept));
+        settled("t-r-moved", |s| s.log.contains("waiting 2"));
+        assert_ne!(pid_of("t-r-moved"), moved);
+        assert!(!alive(moved));
+        assert!(!alive(gone));
+        assert!(status().iter().all(|s| s.name != "t-r-gone"));
+        assert_eq!(settled("t-r-new", |_| true).state, State::Starting);
+        for name in ["t-r-kept", "t-r-moved", "t-r-new"] {
+            switch_off(name);
+        }
     }
 }

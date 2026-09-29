@@ -826,13 +826,13 @@ fn send_to_helper(helpers: &[Seen], rest: &str) {
 }
 
 /// The MCP servers and how each is doing, or reconnect, enable, disable or
-/// read the log of one.
+/// read the log of one, or read mcp.json again.
 fn mcp_servers(rest: &str) {
     use letronna_core::mcp;
     let (verb, name) = rest.split_once(' ').unwrap_or((rest, ""));
     let name = name.trim();
     render::blank();
-    if !verb.is_empty() && name.is_empty() {
+    if !verb.is_empty() && verb != "reload" && name.is_empty() {
         let which = format!("Which server? /mcp {verb} <name>");
         render::said(&render::blue("●"), &render::bold(&which));
         return;
@@ -840,11 +840,14 @@ fn mcp_servers(rest: &str) {
     let done = match verb {
         "" => Ok(()),
         "log" => return mcp_log(name),
+        "reload" => mcp::reload().map(|done| {
+            render::line(&render::dim(&format!("Reloaded mcp.json: {done}")));
+        }),
         "reconnect" => mcp::reconnect(name),
         "enable" => mcp::set_enabled(name, true),
         "disable" => mcp::set_enabled(name, false),
         _ => Err(format!(
-            "/mcp {verb} is not one of reconnect, enable, disable or log."
+            "/mcp {verb} is not one of reconnect, enable, disable, log or reload."
         )),
     };
     if let Err(error) = done {
@@ -852,7 +855,7 @@ fn mcp_servers(rest: &str) {
         return;
     }
     // One just started gets as long to answer as a question asked once waits.
-    if verb == "reconnect" || verb == "enable" {
+    if matches!(verb, "reconnect" | "enable" | "reload") {
         mcp::ready(crate::MCP_WAIT);
     }
     if let Some(error) = mcp::unreadable() {
@@ -873,7 +876,9 @@ fn mcp_servers(rest: &str) {
             crate::mcp::health(server)
         ));
     }
-    render::line(&render::dim("/mcp reconnect|enable|disable|log <name>"));
+    render::line(&render::dim(
+        "/mcp reconnect|enable|disable|log <name>, or /mcp reload after editing mcp.json",
+    ));
 }
 
 /// The newest of what one server printed on stderr.
