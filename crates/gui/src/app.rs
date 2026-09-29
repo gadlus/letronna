@@ -1530,8 +1530,12 @@ impl Chat {
                 if let Some(ix) = self.streaming_id.and_then(|id| self.store.index_of(id)) {
                     let conversation = &mut self.store.conversations[ix];
                     conversation.messages.extend(results);
+                    let halted = letronna_core::hooks::halted(conversation.id);
+                    // The files the tools wrote are noted on these results,
+                    // which are in the conversation only from here.
+                    self.refresh_changes(cx);
                     // A hook's `continue: false`, shown with the results.
-                    if letronna_core::hooks::halted(conversation.id) {
+                    if halted {
                         self.save();
                         self.finish(cx);
                     } else {
@@ -1647,7 +1651,8 @@ impl Chat {
         if let Some(turn) = self.turn.as_mut() {
             turn.finish_call(result);
         }
-        // A tool may have written a file or run git.
+        // A tool may have run git; the files it wrote are counted once its
+        // results join the conversation.
         self.refresh_changes(cx);
         self.show_hook_problems();
         self.advance_tools(cx);
