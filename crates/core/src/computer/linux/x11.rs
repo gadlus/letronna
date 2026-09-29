@@ -31,6 +31,11 @@ x11rb::atom_manager! {
 /// managers nest one or two levels.
 const PARENTS_MOST: usize = 16;
 
+/// The most of a window's name or class read, in four-byte units: an app
+/// can make its title any length, and the gate lists the apps on the
+/// window's UI thread.
+const NAME_MOST: u32 = 1024;
+
 /// One top-level window with an app behind it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct Window {
@@ -531,11 +536,12 @@ impl X {
         Ok(tree.map(|tree| tree.children).unwrap_or_default())
     }
 
-    /// `window`'s property `name` in bytes, None where it has none.
+    /// `window`'s property `name` in bytes, at most `NAME_MOST` units of
+    /// them, None where it has none.
     fn property(&self, window: u32, name: u32) -> Result<Option<Vec<u8>>, String> {
         let reply = self
             .conn
-            .get_property(false, window, name, AtomEnum::ANY, 0, u32::MAX / 4)
+            .get_property(false, window, name, AtomEnum::ANY, 0, NAME_MOST)
             .map_err(lost)?
             .reply();
         Ok(reply
