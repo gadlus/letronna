@@ -1215,6 +1215,21 @@ fn thinking_page(chat: &Entity<Chat>, store: &Store, cx: &App) -> Div {
         std::rc::Rc::new(move |this: &mut Chat| this.store.settings.search = !searching),
     );
 
+    let speaking = settings.voice;
+    let voice = toggle_row(
+        "voice",
+        "Read replies aloud",
+        "Speak each reply as it streams, and answer a chat app's voice note with one. \
+         Paid from your Letronna credit by the character.",
+        speaking,
+        chat,
+        cx,
+        std::rc::Rc::new(move |this: &mut Chat| {
+            this.store.settings.voice = !speaking;
+            this.match_voice();
+        }),
+    );
+
     v_flex()
         .gap_4()
         .child(heading(
@@ -1225,6 +1240,7 @@ fn thinking_page(chat: &Entity<Chat>, store: &Store, cx: &App) -> Div {
         .child(v_flex().gap_1().child(label("Effort", cx)).child(levels))
         .child(show)
         .child(search)
+        .child(voice)
 }
 
 /// A switch with a name and a line about what it does.

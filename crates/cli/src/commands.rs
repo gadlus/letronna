@@ -163,6 +163,10 @@ pub fn command(
             }));
             Flow::Handled
         }
+        "/voice" => {
+            voice(runner);
+            Flow::Handled
+        }
         "/jobs" => {
             jobs(rest);
             Flow::Handled
@@ -361,6 +365,30 @@ fn help() {
     }
     render::blank();
     render::line(&render::dim("The guide: https://letronna.ai/docs"));
+}
+
+/// Turn reading replies aloud on or off.
+fn voice(runner: &mut Runner) {
+    render::blank();
+    let on = !runner.store.settings.voice;
+    // The speech is made on the hosted models only an account can use.
+    if on && !letronna_core::auth::signed_in() {
+        render::line(&render::red(
+            "Replies are read aloud by Letronna's hosted voice, which needs an account: \
+             sign in with /login first.",
+        ));
+        return;
+    }
+    runner.store.settings.voice = on;
+    runner.persist();
+    runner.match_voice();
+    let note = footer(runner);
+    runner.bar.set_footer(note);
+    render::line(&render::dim(if on {
+        "Replies are read aloud as they stream, paid from your Letronna credit by the character."
+    } else {
+        "Replies are no longer read aloud."
+    }));
 }
 
 /// Who is signed in, checked with the API; what was known last is shown when

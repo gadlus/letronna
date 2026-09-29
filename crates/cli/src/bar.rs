@@ -88,6 +88,10 @@ pub const COMMANDS: &[Command] = &[
         blurb: "let the model search the web; /search services for your own",
     },
     Command {
+        name: "/voice",
+        blurb: "read replies aloud as they stream, paid from your credit",
+    },
+    Command {
         name: "/jobs",
         blurb: "commands still running in the background",
     },

@@ -11,6 +11,7 @@ use letronna_core::cancel::Cancel;
 use letronna_core::chat::{self, Connection, Event, Message, ToolCall};
 use letronna_core::gate::{self, Gate, Grants, Mode};
 use letronna_core::inbox;
+use letronna_core::speech::{self, Voice};
 use letronna_core::store::{Conversation, Store};
 use letronna_core::{hooks, permissions, tools};
 use std::sync::mpsc;
@@ -43,6 +44,8 @@ pub struct Runner {
     pub stopped: bool,
     /// Pictures `/image` attached, which go with the next message.
     pub images: Vec<std::path::PathBuf>,
+    /// The queue that reads replies aloud, there only while `/voice` is on.
+    pub voice: Option<Voice>,
 }
 
 impl Runner {
@@ -75,6 +78,21 @@ impl Runner {
             unattended: false,
             wrap_up: false,
         }
+    }
+
+    /// Start or stop reading replies aloud to match the setting.
+    pub fn match_voice(&mut self) {
+        // Only for someone at a terminal: a piped run would be heard by
+        // nobody, and ends before the speech would.
+        let wanted = self.store.settings.voice && self.human;
+        if wanted == self.voice.is_some() {
+            return;
+        }
+        self.voice = wanted.then(|| {
+            Voice::start(Box::new(|| {
+                Ok(Box::new(speech::System) as Box<dyn speech::Output>)
+            }))
+        });
     }
 
     /// Send one prompt and run the agent to completion. Returns the final
@@ -164,12 +182,19 @@ impl Runner {
         hooks::new_turn(connection.conversation);
         let mut turn = Turn::new(connection);
         self.stopped = false;
+        // What is still being said of the last answer is not wanted now.
+        if let Some(voice) = &mut self.voice {
+            voice.hush();
+        }
         self.bar.working(true);
         // The tab says so too, for whoever has switched away to something
         // else while this runs.
         let busy = crate::title::Busy::start();
         let answer = self.work(&mut turn, session);
         drop(busy);
+        if let Some(why) = self.voice.as_ref().and_then(Voice::trouble) {
+            render::line(&render::red(&format!("Not read aloud: {why}")));
+        }
         // Stopping is not a go-ahead for what was queued: it goes back in
         // the box rather than being sent, as it does in the window.
         if self.stopped {
@@ -322,6 +347,9 @@ impl Runner {
                 Err(Unheard::Stopped) if self.bar.hurried() => {
                     self.bar.wait_line(false);
                     out.end();
+                    if let Some(voice) = &mut self.voice {
+                        voice.end();
+                    }
                     turn.live.calls.clear();
                     break;
                 }
@@ -330,6 +358,9 @@ impl Runner {
                     // into a channel nobody is listening to and goes away.
                     self.bar.wait_line(false);
                     out.end();
+                    if let Some(voice) = &mut self.voice {
+                        voice.hush();
+                    }
                     return Ok(None);
                 }
                 Err(Unheard::Gone) => {
@@ -379,6 +410,9 @@ impl Runner {
                     opened = true;
                 }
                 out.push(text);
+                if let Some(voice) = &mut self.voice {
+                    voice.hear(text);
+                }
             }
             // Kept with the session, so a restart need not ask for it again.
             if let Event::Summarized { upto, text } = &event {
@@ -388,6 +422,9 @@ impl Runner {
             if let Event::Finished(result) = event {
                 self.bar.wait_line(false);
                 out.end();
+                if let Some(voice) = &mut self.voice {
+                    voice.end();
+                }
                 // Catch up on anything a throttled paint skipped.
                 crate::screen::settle();
                 result.map_err(|failure| failure.to_string())?;

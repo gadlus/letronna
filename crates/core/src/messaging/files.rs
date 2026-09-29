@@ -637,7 +637,8 @@ fn multipart(boundary: &str) -> String {
 }
 
 /// The Bot API method and field a file goes by: a picture Telegram can show
-/// as a photo, audio it plays as a track, and anything else as a document.
+/// as a photo, audio it plays as a track or a voice note, and anything else
+/// as a document.
 fn telegram_method(path: &Path, size: u64) -> (&'static str, &'static str) {
     let extension = path
         .extension()
@@ -646,6 +647,9 @@ fn telegram_method(path: &Path, size: u64) -> (&'static str, &'static str) {
     match extension.as_str() {
         "png" | "jpg" | "jpeg" | "webp" if size <= TELEGRAM_PHOTO_BYTES => ("sendPhoto", "photo"),
         "mp3" | "m4a" => ("sendAudio", "audio"),
+        // A spoken reply comes as Opus in Ogg, which Telegram shows as a
+        // voice note to play in place rather than a track.
+        "ogg" | "oga" | "opus" => ("sendVoice", "voice"),
         _ => ("sendDocument", "document"),
     }
 }
@@ -1151,6 +1155,10 @@ mod tests {
         assert_eq!(
             super::telegram_method(Path::new("a.PNG"), 1),
             ("sendPhoto", "photo")
+        );
+        assert_eq!(
+            super::telegram_method(Path::new("reply.ogg"), 1),
+            ("sendVoice", "voice")
         );
         std::fs::remove_dir_all(dir).unwrap();
     }

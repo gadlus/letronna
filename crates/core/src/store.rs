@@ -256,6 +256,10 @@ pub struct Settings {
     /// its full `mcp__server__tool` name; a name no tool has is passed over.
     #[serde(default, deserialize_with = "tool_names")]
     pub disabled_tools: Vec<String>,
+    /// Read replies aloud as they stream and answer a chat app's voice note
+    /// with one, off by default because the speech is paid from credit.
+    #[serde(default)]
+    pub voice: bool,
 }
 
 // Written out rather than derived so the film grain starts on for a first
@@ -284,6 +288,7 @@ impl Default for Settings {
             browse_unseen: false,
             appearance: String::new(),
             grain: true,
+            voice: false,
         }
     }
 }

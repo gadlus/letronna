@@ -125,7 +125,9 @@ fn main() {
         bar: bar::Bar::new(String::new()),
         stopped: false,
         images: Vec::new(),
+        voice: None,
     };
+    runner.match_voice();
     letronna_core::browser::share_browser(runner.store.settings.browser_shared);
     std::thread::spawn(letronna_core::browser::close_left_over);
     // With nothing set up there is nothing to talk to, so the first run is
