@@ -1,5 +1,8 @@
 use crate::prelude::*;
-use gpui_component::Selectable;
+use gpui_component::{Selectable, menu::PopupMenu, popover::Popover};
+use letronna_core::gate::Mode;
+
+actions!(composer, [LeaveComposer]);
 
 impl Chat {
     /// The (gateway, model) pairs the picker shows for what is typed in its
@@ -463,6 +466,90 @@ impl Chat {
         )
     }
 
+    /// The session's mode, which opens the list of modes to pick from on a
+    /// click, or on Enter or Space while it has the focus.
+    fn mode_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (chat, mode) = (cx.entity(), self.active_mode());
+        let icon = if mode == Mode::Plan {
+            AppIcon::Checklist
+        } else {
+            AppIcon::Shield
+        };
+        let chip = Button::new("mode")
+            .ghost()
+            .xsmall()
+            .tooltip(format!(
+                "{} mode: {}. Click to change.",
+                mode.label(),
+                mode.about()
+            ))
+            .text_color(if mode == Mode::Default {
+                cx.theme().muted_foreground
+            } else {
+                cx.theme().primary
+            })
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(Icon::new(icon).size_3())
+                    .child(mode.label()),
+            )
+            // The popover opens on a mouse press only, so a key opens it here.
+            .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
+                if event.is_keyboard() {
+                    this.open_mode_menu(window, cx);
+                }
+            }));
+        Popover::new("mode-menu")
+            .appearance(false)
+            .overlay_closable(false)
+            .open(self.mode_menu.is_some())
+            .on_open_change(move |open, window, cx| {
+                chat.update(cx, |this, cx| {
+                    if *open {
+                        this.open_mode_menu(window, cx);
+                    } else {
+                        this.mode_menu = None;
+                        cx.notify();
+                    }
+                })
+            })
+            .trigger(chip)
+            .when_some(self.mode_menu.clone(), |popover, menu| {
+                popover.content(move |_, _, _| menu.clone())
+            })
+    }
+
+    /// Open the list of modes with the keys in it, as the chip's popover
+    /// shows it.
+    fn open_mode_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mode_menu.is_some() {
+            return;
+        }
+        let (chat, mode) = (cx.entity(), self.active_mode());
+        let menu = PopupMenu::build(window, cx, move |menu, _, _| {
+            Mode::OFFERED.into_iter().fold(menu, |menu, choice| {
+                let chat = chat.clone();
+                menu.item(
+                    PopupMenuItem::new(choice.label())
+                        .checked(choice == mode)
+                        .on_click(move |_, _, cx| {
+                            chat.update(cx, |this, cx| this.set_mode(choice, cx))
+                        }),
+                )
+            })
+        });
+        menu.focus_handle(cx).focus(window);
+        cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| {
+            this.mode_menu = None;
+            cx.notify();
+        })
+        .detach();
+        self.mode_menu = Some(menu);
+        cx.notify();
+    }
+
     /// The box a message is written in, with its controls. `compact` puts
     /// the controls under the text, for a narrow pane.
     pub(crate) fn composer(&self, compact: bool, cx: &mut Context<Self>) -> impl IntoElement {
@@ -522,33 +609,9 @@ impl Chat {
         let controls = h_flex()
             .items_center()
             .gap_1()
-            .child(
-                Button::new("plan-mode")
-                    .plain(cx)
-                    .xsmall()
-                    .tooltip(if self.plan_mode {
-                        "Plan mode on: reads and asks only. Click to let it act."
-                    } else {
-                        "Plan mode off. Click to keep it to reading and read-only commands."
-                    })
-                    .selected(self.plan_mode)
-                    .text_color(if self.plan_mode {
-                        cx.theme().link
-                    } else {
-                        cx.theme().muted_foreground
-                    })
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .items_center()
-                            .child(Icon::new(AppIcon::Checklist).size_3())
-                            .child("Plan"),
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.plan_mode = !this.plan_mode;
-                        cx.notify();
-                    })),
-            )
+            // The session's mode sits where the message is written, since it
+            // decides what the reply may do without asking.
+            .child(self.mode_chip(cx))
             // Searching is a setting, but it changes what an answer is made
             // of, so it belongs where the answer is asked for rather than
             // three clicks away in a dialog.

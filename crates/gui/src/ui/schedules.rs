@@ -1,6 +1,7 @@
 //! The Scheduled jobs page: prompts that run on a timer.
 
 use crate::prelude::*;
+use letronna_core::gate::Mode;
 use letronna_core::schedule::{self, Schedule, Trigger};
 
 /// The intervals offered for "every so often". A free-form number would need
@@ -28,7 +29,7 @@ impl Chat {
             },
             enabled: false,
             last_run: 0,
-            unattended: false,
+            mode: Mode::Default,
         };
         schedule::armed_now(&mut fresh);
         self.editing = Some(fresh.id);
@@ -41,7 +42,10 @@ impl Chat {
         let job = &self.schedules[index];
         let id = job.id;
         let trigger = job.trigger.clone();
-        let unattended = job.unattended;
+        // Until Auto is offered the switch is "Run everything" or "Wait
+        // for me"; a mode set in the file by hand reads as off, since only
+        // Bypass runs everything.
+        let unattended = job.mode == Mode::Bypass;
 
         let every: Vec<_> = INTERVALS
             .iter()
@@ -180,7 +184,11 @@ impl Chat {
                                     if let Some(job) =
                                         this.schedules.iter_mut().find(|s| s.id == id)
                                     {
-                                        job.unattended = !unattended;
+                                        job.mode = if unattended {
+                                            Mode::Default
+                                        } else {
+                                            Mode::Bypass
+                                        };
                                     }
                                     this.save_schedules(cx);
                                 })),

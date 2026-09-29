@@ -66,6 +66,7 @@ fn main() {
             // window.
             KeyBinding::new("tab", ui::browser::PageTab, Some("Browser")),
             KeyBinding::new("shift-tab", ui::browser::PageTabBack, Some("Browser")),
+            KeyBinding::new("tab", ui::composer::LeaveComposer, Some("Composer > Input")),
         ]);
         platform::tray::init(cx);
         cx.on_window_closed(|cx| {

@@ -111,9 +111,11 @@ impl Chat {
                     this.drafts.remove(&id);
                     this.panel.forget(id);
                     // The next new session can be given this id again, and
-                    // must not start out with what was allowed here.
+                    // must not start out with what was allowed here, nor in
+                    // this one's mode.
                     this.session_allow
                         .remove(&this.store.conversations[index].id);
+                    this.modes.remove(&this.store.conversations[index].id);
                     this.store.remove(index);
                     if this.store.conversations.is_empty() {
                         this.new_chat(window, cx);

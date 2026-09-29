@@ -1,5 +1,7 @@
 //! What `letronna` was asked for on the command line.
 
+use letronna_core::gate::Mode;
+
 pub const HELP: &str = "\
 Letronna — a small agent in your terminal
 
@@ -18,8 +20,10 @@ Options
   -p, --print <prompt>     ask one question, print the answer, exit
   -c, --continue           resume the most recent session
   -r, --resume [id]        choose a session, or open the one with this id
-      --yes                run tools without asking, bar some risky ones
-      --plan               read and search only; never write or run
+      --mode <mode>        how much runs without asking: default, accept-edits,
+                           plan, dont-ask or bypass
+      --yes                --mode bypass: run tools without asking, bar risky ones
+      --plan               --mode plan: read and search only; never write or run
       --offline            with doctor: leave the network alone
   -h, --help               this
   -V, --version            which version this is
@@ -41,8 +45,9 @@ pub enum Start {
 pub struct Args {
     pub prompt: Option<String>,
     pub start: Start,
-    pub yes: bool,
-    pub plan: bool,
+    /// The mode from `--mode`, `--yes` or `--plan`, or why `--mode` named
+    /// none.
+    pub mode: Result<Mode, String>,
     pub help: bool,
     pub version: bool,
     pub gui: bool,
@@ -54,11 +59,11 @@ pub struct Args {
 }
 
 pub fn parse(mut raw: impl Iterator<Item = String>) -> Args {
+    let (mut mode, mut yes, mut plan) = (None, false, false);
     let mut args = Args {
         prompt: None,
         start: Start::Fresh,
-        yes: false,
-        plan: false,
+        mode: Ok(Mode::Default),
         help: false,
         version: false,
         gui: false,
@@ -84,8 +89,9 @@ pub fn parse(mut raw: impl Iterator<Item = String>) -> Args {
                     _ => Start::Choose,
                 }
             }
-            "--yes" => args.yes = true,
-            "--plan" => args.plan = true,
+            "--mode" => mode = Some(Mode::parse(&raw.next().unwrap_or_default())),
+            "--yes" => yes = true,
+            "--plan" => plan = true,
             "setup" | "--install" => args.install = true,
             "--uninstall" => args.uninstall = true,
             "-h" | "--help" => args.help = true,
@@ -97,12 +103,34 @@ pub fn parse(mut raw: impl Iterator<Item = String>) -> Args {
             _ => {}
         }
     }
+    args.mode = picked(mode, yes, plan);
     args
+}
+
+/// The mode the flags pick, or which flag to drop when `--mode` and a
+/// shorthand for one both pick it.
+fn picked(mode: Option<Result<Mode, String>>, yes: bool, plan: bool) -> Result<Mode, String> {
+    let drop = |flag: &str, name: &str| {
+        Err(format!(
+            "`--mode` and `{flag}` both pick the mode; drop `{flag}`, which is `--mode {name}`."
+        ))
+    };
+    match mode {
+        Some(_) if yes => drop("--yes", "bypass"),
+        Some(_) if plan => drop("--plan", "plan"),
+        Some(mode) => mode,
+        // Before modes, `--plan --yes` planned with no cards; it never
+        // wrote, so it does not become a mode that does.
+        None if plan => Ok(Mode::Plan),
+        None if yes => Ok(Mode::Bypass),
+        None => Ok(Mode::Default),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::parse;
+    use letronna_core::gate::Mode;
 
     fn args(words: &[&str]) -> super::Args {
         parse(words.iter().map(|w| w.to_string()))
@@ -111,7 +139,8 @@ mod tests {
     #[test]
     fn reads_the_forms_people_actually_type() {
         let bare = args(&[]);
-        assert!(bare.prompt.is_none() && bare.start == super::Start::Fresh && !bare.yes);
+        assert!(bare.prompt.is_none() && bare.start == super::Start::Fresh);
+        assert_eq!(bare.mode, Ok(Mode::Default));
 
         assert_eq!(args(&["-p", "hello"]).prompt.as_deref(), Some("hello"));
         assert_eq!(args(&["--print", "hello"]).prompt.as_deref(), Some("hello"));
@@ -122,7 +151,7 @@ mod tests {
         );
         // A flag after it must not be swallowed as the prompt.
         let mixed = args(&["--plan", "look around"]);
-        assert!(mixed.plan);
+        assert_eq!(mixed.mode, Ok(Mode::Plan));
         assert_eq!(mixed.prompt.as_deref(), Some("look around"));
 
         assert_eq!(args(&["-c"]).start, super::Start::Last);
@@ -135,10 +164,23 @@ mod tests {
         assert_eq!(worded.start, super::Start::Choose);
         assert!(args(&["gui"]).gui);
         assert!(args(&["update"]).update && args(&["update"]).prompt.is_none());
-        let doctor = args(&["doctor", "--offline"]);
-        assert!(doctor.doctor && doctor.offline && doctor.prompt.is_none());
-        assert!(args(&["--yes"]).yes);
+        assert_eq!(args(&["--yes"]).mode, Ok(Mode::Bypass));
+        let edits = args(&["--mode", "accept-edits", "tidy up"]);
+        assert_eq!(edits.mode, Ok(Mode::AcceptEdits));
+        assert_eq!(edits.prompt.as_deref(), Some("tidy up"));
+        assert!(args(&["--mode", "auto"]).mode.is_err());
+        assert!(args(&["--mode"]).mode.is_err());
         assert!(args(&["-h"]).help);
         assert!(args(&["--version"]).version && args(&["-V"]).version);
+    }
+
+    #[test]
+    fn plan_with_yes_stays_plan_and_mode_with_a_shorthand_says_which_to_drop() {
+        assert_eq!(args(&["--plan", "--yes"]).mode, Ok(Mode::Plan));
+        assert_eq!(args(&["--yes", "--plan", "look"]).mode, Ok(Mode::Plan));
+        let yes = args(&["--mode", "plan", "--yes"]).mode.unwrap_err();
+        assert!(yes.contains("drop `--yes`"), "{yes}");
+        let plan = args(&["--plan", "--mode", "bypass"]).mode.unwrap_err();
+        assert!(plan.contains("drop `--plan`"), "{plan}");
     }
 }

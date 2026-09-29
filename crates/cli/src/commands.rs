@@ -1,6 +1,7 @@
 //! The slash commands: everything you can ask of Letronna itself rather
 //! than of the model.
 
+use letronna_core::gate::Mode;
 use letronna_core::skills::{Skill, Source};
 use letronna_core::{history, store};
 
@@ -45,15 +46,46 @@ pub fn command(
             Flow::Handled
         }
         "/plan" => {
-            runner.plan = !runner.plan;
+            runner.mode = if runner.mode == Mode::Plan {
+                Mode::Default
+            } else {
+                Mode::Plan
+            };
             let note = footer(runner);
             runner.bar.set_footer(note);
             render::blank();
-            render::line(&render::dim(if runner.plan {
+            render::line(&render::dim(if runner.mode == Mode::Plan {
                 "Plan mode on: reads, searches and runs read-only commands, never edits your files."
             } else {
                 "Plan mode off."
             }));
+            Flow::Handled
+        }
+        "/mode" => {
+            render::blank();
+            if !rest.is_empty() {
+                match Mode::parse(rest) {
+                    Ok(mode) => runner.mode = mode,
+                    Err(error) => {
+                        render::line(&render::red(&error));
+                        return Flow::Handled;
+                    }
+                }
+                let note = footer(runner);
+                runner.bar.set_footer(note);
+            }
+            let mode = runner.mode;
+            render::line(&render::dim(&format!(
+                "{}: {}.",
+                mode.label(),
+                mode.about()
+            )));
+            if rest.is_empty() {
+                let names = Mode::OFFERED.map(Mode::name).join(", ");
+                render::line(&render::dim(&format!(
+                    "Change it with /mode and one of {names}."
+                )));
+            }
             Flow::Handled
         }
         "/model" => {

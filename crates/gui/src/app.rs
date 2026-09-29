@@ -145,19 +145,20 @@ pub(crate) struct Chat {
     /// was read, so that the queue moving reads them again only once one
     /// changed.
     pub(crate) rules_read: Option<[Option<std::time::SystemTime>; 2]>,
-    /// Sessions running an unattended schedule, which run tools without
-    /// asking. Keyed by session so the grant cannot reach the user's own
-    /// chats: a job saying "do not ask me at 9am" is not permission to stop
-    /// asking everywhere else.
-    pub(crate) unattended: std::collections::HashSet<u64>,
+    /// Sessions running a schedule that decides without the user, in the
+    /// schedule's mode. Keyed by session so the grant cannot reach the
+    /// user's own chats: a job saying "do not ask me at 9am" is not
+    /// permission to stop asking everywhere else.
+    pub(crate) unattended: std::collections::HashMap<u64, letronna_core::gate::Mode>,
     /// Text field on the `ask_user` card.
     pub(crate) answer: Entity<InputState>,
     /// Whether the footer is already polling background jobs.
     pub(crate) job_tick: bool,
-    /// Plan mode: the model may read and ask, but not change anything.
-    pub(crate) plan_mode: bool,
     /// Whether the message box holds nothing to send.
     pub(crate) composer_empty: bool,
+    /// The mode picked on each session's chip; a session not in here is in
+    /// the Default mode setting.
+    pub(crate) modes: std::collections::HashMap<u64, letronna_core::gate::Mode>,
     pub(crate) schedules: Vec<letronna_core::schedule::Schedule>,
     /// Id of the schedule being edited on the Scheduled jobs page.
     pub(crate) editing: Option<u64>,
@@ -255,6 +256,8 @@ pub(crate) struct Chat {
     /// Where the chat was scrolled to at the last draw, to tell which way
     /// it has moved since.
     pub(crate) followed_offset: Pixels,
+    /// The list of modes, while the mode chip has it open.
+    pub(crate) mode_menu: Option<Entity<gpui_component::menu::PopupMenu>>,
     pub(crate) _subscriptions: Vec<Subscription>,
 }
 
@@ -492,11 +495,11 @@ impl Chat {
             rules_trouble: None,
             rules: Ok(Vec::new()),
             rules_read: None,
-            unattended: std::collections::HashSet::new(),
+            unattended: std::collections::HashMap::new(),
             answer,
             job_tick: false,
-            plan_mode: false,
             composer_empty: true,
+            modes: std::collections::HashMap::new(),
             schedules: letronna_core::schedule::load(),
             editing: None,
             job_name,
@@ -546,6 +549,7 @@ impl Chat {
             scroll: ScrollHandle::new(),
             following: true,
             followed_offset: px(0.),
+            mode_menu: None,
             _subscriptions: subscriptions,
         };
         let widen = this.follow_browser_layout(window, cx);
@@ -714,13 +718,14 @@ impl Chat {
             &self.store.settings.custom_endpoint,
             &saved,
         );
+        let session = self.store.conversations[self.store.active].id;
         let connection = Connection {
             endpoint,
             model: self.model.read(cx).value().to_string(),
             key,
             tools: true,
             workspace: None,
-            plan: self.plan_mode,
+            plan: self.mode(session) == letronna_core::gate::Mode::Plan,
             effort: self.store.settings.effort.clone(),
             search: self.store.settings.search,
             // A schedule's run and a chat app's turn may have nobody watching.
@@ -729,7 +734,7 @@ impl Chat {
                     .scheduled
                     .contains(&self.store.conversations[self.store.active].id),
             remote,
-            conversation: self.store.conversations[self.store.active].id,
+            conversation: session,
         };
         if let Err(error) = backend::validate(&connection) {
             self.error = Some(error);
@@ -827,11 +832,14 @@ impl Chat {
         self.page = Page::Chat;
         let session = self.store.conversations[self.store.active].id;
         self.scheduled.insert(session);
-        // Nobody is necessarily watching, so an unattended schedule skips the
-        // approval cards that would otherwise stall it -- but only in the
-        // session it just opened.
-        if schedule.unattended {
-            self.unattended.insert(session);
+        // The run is in the schedule's own mode, never the Default mode
+        // setting; a schedule picking any mode, Auto among them, goes here.
+        self.modes.insert(session, schedule.mode);
+        // Nobody is necessarily watching, so a schedule that decides
+        // without the user skips the approval cards that would otherwise
+        // stall it -- but only in the session it just opened.
+        if schedule.mode != letronna_core::gate::Mode::Default {
+            self.unattended.insert(session, schedule.mode);
         }
         if self.dispatch(schedule.prompt.clone(), None, cx).is_err() {
             // The gateway is not usable, so the run never started and
@@ -1127,6 +1135,7 @@ impl Chat {
     /// approved is held for approval rather than acted on; Discord only ever
     /// delivers the owner's DMs, so there is nothing to approve.
     fn on_remote(&mut self, message: letronna_core::messaging::Incoming, cx: &mut Context<Self>) {
+        use letronna_core::gate::Mode;
         use letronna_core::messaging::Source;
         let source = message.source;
         if let Source::Telegram(chat) = source
@@ -1209,10 +1218,16 @@ impl Chat {
         self.remote.insert(id, source);
         // Nobody on the far end can answer an approval card, so unless the
         // user has said otherwise a remote message may look but not touch.
-        let was_plan = self.plan_mode;
-        self.plan_mode = !allow_tools;
+        // With tools it gets the Default mode setting, but never above
+        // Default: whoever writes in the chat drives it, and the chip that
+        // would say what runs unasked is not in front of them.
+        let mode = if allow_tools {
+            Mode::narrow(Mode::Default, self.store.settings.mode)
+        } else {
+            Mode::Plan
+        };
+        self.modes.insert(id, mode);
         let _ = self.dispatch(message.text, Some(message.remote), cx);
-        self.plan_mode = was_plan;
     }
 
     /// A scheduled run has no one watching, so post how it ended to every
@@ -1294,7 +1309,10 @@ impl Chat {
     ) -> letronna_core::gate::Outcome {
         let unattended = self
             .streaming_id
-            .is_some_and(|id| self.unattended.contains(&id));
+            .and_then(|id| self.unattended.get(&id).copied());
+        let mode = self
+            .streaming_id
+            .map_or(self.store.settings.mode, |id| self.mode(id));
         // A chat app is kept in plan mode by its owner's setting, which nobody
         // on the far end may lift, so nobody there can approve a plan either:
         // run, the tool refuses and says so.
@@ -1315,7 +1333,7 @@ impl Chat {
             &ctx,
             &self.session_allow,
             rules,
-            self.store.settings.skip_approvals,
+            mode,
             unattended,
         );
         letronna_core::gate::decide(call, &gate)
@@ -1377,10 +1395,10 @@ impl Chat {
         let offer = self.offer.take();
         if call.name == letronna_core::tools::EXIT_PLAN {
             let approved = matches!(verdict, Verdict::Allow { .. });
-            // The Plan switch goes off with it, so the next message carries
-            // on out of plan mode too.
-            if approved {
-                self.plan_mode = false;
+            // The session leaves plan mode with it, so the next message
+            // carries on out of plan mode too.
+            if approved && let Some(id) = self.streaming_id {
+                self.modes.insert(id, letronna_core::gate::Mode::Default);
             }
             if let Some(turn) = self.turn.as_mut() {
                 turn.answer_plan(approved);
@@ -1413,6 +1431,31 @@ impl Chat {
                 self.execute_call(call, true, cx);
             }
         }
+    }
+
+    /// The mode `session` is in: its schedule's while that runs, which the
+    /// gate follows, then its chip's, then the Default mode setting.
+    pub(crate) fn mode(&self, session: u64) -> letronna_core::gate::Mode {
+        let running = self.unattended.get(&session);
+        let picked = running.or(self.modes.get(&session)).copied();
+        picked.unwrap_or(self.store.settings.mode)
+    }
+
+    /// The mode the session on screen is in.
+    pub(crate) fn active_mode(&self) -> letronna_core::gate::Mode {
+        let session = self.store.conversations.get(self.store.active);
+        session.map_or(self.store.settings.mode, |session| self.mode(session.id))
+    }
+
+    /// Puts the session on screen in `mode`, then decides the call a card is
+    /// up for again, so it runs or shows its refusal if the mode says so.
+    pub(crate) fn set_mode(&mut self, mode: letronna_core::gate::Mode, cx: &mut Context<Self>) {
+        let Some(session) = self.store.conversations.get(self.store.active) else {
+            return;
+        };
+        self.modes.insert(session.id, mode);
+        self.approvals_changed(cx);
+        cx.notify();
     }
 
     /// Decide the call the card is up for again after an approval setting
@@ -2075,6 +2118,7 @@ pub(crate) fn front_call(
 
 #[cfg(test)]
 mod tests {
+    use letronna_core::gate::Mode;
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
     use super::front_call;
@@ -2125,24 +2169,24 @@ mod tests {
     fn a_card_stays_up_when_approvals_are_switched_off_until_the_call_is_decided_again() {
         let turn = writing();
         let (ctx, none) = (ToolContext::default(), Grants::new());
-        let decided = |skip_approvals| {
+        let decided = |mode| {
             let gate = Gate {
                 ctx: &ctx,
-                skip_approvals,
+                mode,
                 grants: &none,
-                human: true,
                 rules: &[],
                 broken: None,
+                human: true,
             };
             turn.next(|call| decide(call, &gate))
         };
-        let Next::AskUser(asked) = decided(false) else {
+        let Next::AskUser(asked) = decided(Mode::Default) else {
             panic!("write_file should wait for the user while approvals are on");
         };
         // The card keeps its buttons rather than showing a call as running
         // that nothing started.
         assert!(front_call(&turn, Some(&asked.id)).is_some_and(|(_, waiting)| waiting));
         // Deciding again with approvals off runs it.
-        assert!(matches!(decided(true), Next::Run(_)));
+        assert!(matches!(decided(Mode::Bypass), Next::Run(_)));
     }
 }

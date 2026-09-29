@@ -147,9 +147,10 @@ pub struct Settings {
     pub custom_endpoint: String,
     #[serde(default)]
     pub presence: String,
-    /// Run write and command tools without asking.
-    #[serde(default)]
-    pub skip_approvals: bool,
+    /// The mode a session starts in. Saves from before the modes kept
+    /// "Skip tool approvals" here, which reads as Bypass when it was on.
+    #[serde(default, alias = "skip_approvals")]
+    pub mode: crate::gate::Mode,
     /// How hard the model should think: empty, or a level such as low or max;
     /// a model without that level is sent the nearest one it has.
     #[serde(default)]
@@ -202,7 +203,7 @@ impl Default for Settings {
             gateway: String::new(),
             custom_endpoint: String::new(),
             presence: String::new(),
-            skip_approvals: false,
+            mode: crate::gate::Mode::Default,
             effort: String::new(),
             thinking: false,
             search: false,
@@ -949,13 +950,37 @@ pub(crate) fn context_cap() -> u64 {
     settings().0.context_cap
 }
 
+/// The settings file. A file that will not read at all is kept aside by
+/// `state::read` as before.
+fn read_settings_file() -> Settings {
+    let path = settings_path();
+    crate::state::read::<serde_json::Value>(&path)
+        .ok()
+        .filter(|saved| !saved.is_null())
+        .and_then(from_saved)
+        .unwrap_or_else(|| crate::state::read(&path).unwrap_or_default())
+}
+
 /// The settings, and as JSON what the file said before a retired gateway is
 /// moved, so the move is saved like any other change.
 fn settings() -> (Settings, serde_json::Value) {
-    let mut s: Settings = crate::state::read(&settings_path()).unwrap_or_default();
+    let mut s = read_settings_file();
     let read = serde_json::to_value(&s).unwrap_or_default();
     retire_gateway(&mut s);
     (s, read)
+}
+
+/// Settings from their file's `bytes`, or `None` when those do not parse.
+#[cfg(test)]
+pub(crate) fn read_settings(bytes: &[u8]) -> Option<Settings> {
+    from_saved(serde_json::from_slice(bytes).ok()?)
+}
+
+/// Settings from a saved file's JSON, with a mode saved under both its
+/// names -- a newer save beside an old switch -- read as the newer.
+fn from_saved(mut saved: serde_json::Value) -> Option<Settings> {
+    crate::gate::keep_mode(&mut saved, "skip_approvals");
+    serde_json::from_value(saved).ok()
 }
 
 /// A gateway that is no longer offered moves to the Letronna account. Its
@@ -1046,7 +1071,7 @@ fn migrate() {
         #[serde(default)]
         presence: String,
         #[serde(default)]
-        skip_approvals: bool,
+        skip_approvals: crate::gate::Mode,
     }
     let Ok(bytes) = std::fs::read(&legacy) else {
         return;
@@ -1065,7 +1090,7 @@ fn migrate() {
             model: old.model,
             gateway: old.gateway,
             presence: old.presence,
-            skip_approvals: old.skip_approvals,
+            mode: old.skip_approvals,
             active_id: 0,
             // Settings that did not exist when the old file was written.
             ..Default::default()
@@ -1697,36 +1722,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_settings_file_without_appearance_loads_as_night_with_grain() {
-        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = scratch("appearance-old");
-        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
-        let file = dir.join("settings.json");
-        // As a build from before the light theme wrote it.
-        std::fs::write(
-            &file,
-            r#"{"endpoint":"https://api.letronna.ai/v1","model":"a/model","skip_approvals":true}"#,
-        )
-        .unwrap();
-
-        let mut store = load();
-        assert_eq!(store.settings.appearance, "");
-        assert!(store.settings.grain);
-        assert!(store.settings.skip_approvals);
-        // Saved and read again, the grain is still on and nothing else moved.
-        store.save().unwrap();
-        let again = load().settings;
-        assert_eq!(again.appearance, "");
-        assert!(again.grain);
-        assert!(again.skip_approvals);
-        // A first run, with no settings file at all, starts the same way.
-        std::fs::remove_file(&file).unwrap();
-        let first = load().settings;
-        assert_eq!((first.appearance.as_str(), first.grain), ("", true));
-        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
-    }
-
-    #[test]
     fn a_todo_call_sets_the_whole_checklist_and_says_how_far_along_it_is() {
         let mut todos = vec![Todo {
             text: "an old plan".into(),
@@ -2344,6 +2339,36 @@ pub(crate) mod tests {
         store.remove(0);
         assert!(!dir.join("sessions/1.jsonl").exists());
         assert!(!kept.exists());
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_settings_file_without_appearance_loads_as_night_with_grain() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("appearance-old");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let file = dir.join("settings.json");
+        // As a build from before the light theme wrote it.
+        std::fs::write(
+            &file,
+            r#"{"endpoint":"https://api.letronna.ai/v1","model":"a/model","skip_approvals":true}"#,
+        )
+        .unwrap();
+
+        let mut store = load();
+        assert_eq!(store.settings.appearance, "");
+        assert!(store.settings.grain);
+        assert_eq!(store.settings.mode, crate::gate::Mode::Bypass);
+        // Saved and read again, the grain is still on and nothing else moved.
+        store.save().unwrap();
+        let again = load().settings;
+        assert_eq!(again.appearance, "");
+        assert!(again.grain);
+        assert_eq!(again.mode, crate::gate::Mode::Bypass);
+        // A first run, with no settings file at all, starts the same way.
+        std::fs::remove_file(&file).unwrap();
+        let first = load().settings;
+        assert_eq!((first.appearance.as_str(), first.grain), ("", true));
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 }

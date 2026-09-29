@@ -1,4 +1,5 @@
 use crate::prelude::*;
+use letronna_core::gate::Mode;
 
 type ApplyMode = std::rc::Rc<dyn Fn(plugins::PresenceMode, &mut App)>;
 
@@ -630,7 +631,7 @@ fn privacy_page(
     settings: &Settings,
     cx: &App,
 ) -> Div {
-    let (skip, shared) = (settings.skip_approvals, settings.browser_shared);
+    let (default_mode, shared) = (settings.mode, settings.browser_shared);
     let unseen = settings.browse_unseen;
     let current = plugins::PresenceMode::from_str(presence.read(cx));
     let enabled = plugins::list(cx)
@@ -722,34 +723,50 @@ fn privacy_page(
                 .flex_1()
                 .min_w_0()
                 .gap_0p5()
-                .child(div().text_sm().child("Skip tool approvals"))
+                .child(div().text_sm().child("Default mode"))
                 .child(
                     div()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
                         .child(
-                            "Let the agent write files and run commands without asking each time. \
-                             Some commands that are hard to undo, such as recursive deletes and \
-                             force pushes, still ask.",
+                            "The mode a session starts in; its chip by the message box changes \
+                             it for that session. Bypass writes files and runs commands without \
+                             asking, but some commands that are hard to undo, such as recursive \
+                             deletes and force pushes, still ask.",
                         ),
                 ),
         )
         .child(
-            div().flex_shrink_0().cursor_pointer().child(
-                gpui_component::switch::Switch::new("skip-approvals")
-                    .checked(skip)
-                    .on_click({
-                        let chat = chat.clone();
-                        move |_, _, cx| {
-                            chat.update(cx, |this, cx| {
-                                this.store.settings.skip_approvals = !skip;
-                                this.save();
-                                this.approvals_changed(cx);
-                                cx.notify();
-                            })
-                        }
-                    }),
-            ),
+            Button::new("default-mode")
+                .ghost()
+                .small()
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(default_mode.label())
+                        .child(Icon::new(IconName::ChevronDown).size_3()),
+                )
+                .dropdown_menu({
+                    let chat = chat.clone();
+                    move |menu, _, _| {
+                        Mode::OFFERED.into_iter().fold(menu, |menu, choice| {
+                            let chat = chat.clone();
+                            menu.item(
+                                PopupMenuItem::new(choice.label())
+                                    .checked(choice == default_mode)
+                                    .on_click(move |_, _, cx| {
+                                        chat.update(cx, |this, cx| {
+                                            this.store.settings.mode = choice;
+                                            this.save();
+                                            this.approvals_changed(cx);
+                                            cx.notify();
+                                        })
+                                    }),
+                            )
+                        })
+                    }
+                }),
         );
 
     let browser = h_flex()
