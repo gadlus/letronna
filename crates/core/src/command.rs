@@ -2105,9 +2105,8 @@ fn in_reach(
                 .strip_prefix('~')
                 .is_some_and(|rest| !rest.is_empty() && !rest.starts_with(['/', '\\']));
             let provider = dialect == Dialect::PowerShell && raw.find(':').is_some_and(|at| at > 1);
-            let reached = !tilde
-                && !provider
-                && !(dialect != Dialect::Sh && windows_alias(raw))
+            let aliased = dialect != Dialect::Sh && windows_alias(raw);
+            let reached = !(tilde || provider || aliased)
                 && places.path(raw).is_some_and(|path| {
                     within(&path, root)
                         && !places.own(&path)
@@ -2170,7 +2169,7 @@ fn expand(path: &Path, deep: bool) -> Option<Vec<PathBuf>> {
     for (at, part) in parts.iter().enumerate() {
         let name = part.as_os_str().to_string_lossy();
         let last = at + 1 == parts.len();
-        if !glob(&name) && !(deep && last) {
+        if !(glob(&name) || deep && last) {
             found.iter_mut().for_each(|f| f.push(part));
             continue;
         }

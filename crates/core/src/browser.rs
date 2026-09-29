@@ -956,11 +956,7 @@ pub fn give_window(window: bool) -> Result<(), String> {
     own_window().store(window, Ordering::Relaxed);
     let mut all = lock()?;
     // Not running, or already so: it starts as asked when next needed.
-    if !all
-        .browser
-        .as_ref()
-        .is_some_and(|browser| browser.reach.headless == window)
-    {
+    if (all.browser.as_ref()).is_none_or(|browser| browser.reach.headless != window) {
         return Ok(());
     }
     let owner = owner_of(shown().load(Ordering::Relaxed));
