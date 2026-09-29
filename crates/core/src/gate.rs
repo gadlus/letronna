@@ -323,6 +323,9 @@ fn ladder(call: &ToolCall, gate: &Gate, judge: Option<&dyn Fn(&str) -> Verdict>)
     if let Some(why) = unavailable(tool.as_ref(), risk, gate.ctx, plan) {
         return Outcome::Refuse(why);
     }
+    if let Some(why) = marked(tool.as_ref(), &args) {
+        return Outcome::Refuse(why);
+    }
     // Layer 1, the floor. It comes before every setting and grant: a command
     // that is hard to take back needs a person's yes even when approvals are
     // skipped or the tool is allowed.
@@ -446,6 +449,9 @@ pub fn refusal(tool: &dyn Tool, args: &Value, ctx: &ToolContext) -> Option<Strin
     if let Some(why) = unavailable(tool, risk, ctx, ctx.plan) {
         return Some(why);
     }
+    if let Some(why) = marked(tool, args) {
+        return Some(why);
+    }
     match risk {
         Some(Risk::Hardline(why)) => Some(never(why)),
         _ => None,
@@ -486,6 +492,16 @@ fn unavailable(
         ));
     }
     None
+}
+
+/// Why a call carrying the marker a hidden key or token became never runs,
+/// or `None`: it would write, type or send the marker in the key's place.
+/// write_file and edit_file count the file's markers instead, since a file
+/// can hold the marker's text itself.
+fn marked(tool: &dyn Tool, args: &Value) -> Option<String> {
+    let counted = matches!(tool.name(), "write_file" | "edit_file");
+    let carried = args.to_string().contains(crate::redact::MARKER);
+    (carried && !counted).then(|| crate::redact::carried(tool.name()))
 }
 
 /// What `run_command`'s line would do where the session works; `None` for
@@ -2008,5 +2024,39 @@ mod tests {
         std::fs::write(dir.join("project/notes.txt"), "a").unwrap();
         std::fs::write(dir.join("outside.txt"), "a").unwrap();
         dir
+    }
+
+    #[test]
+    fn a_call_carrying_the_secret_marker_is_refused_before_any_card() {
+        let ctx = ToolContext::default();
+        let none = Grants::new();
+        let gate = Gate {
+            ctx: &ctx,
+            mode: Mode::Bypass,
+            grants: &none,
+            rules: &[],
+            broken: None,
+            human: true,
+        };
+        let marker = crate::redact::MARKER;
+        for carrying in [
+            command(&format!("echo '{marker}' > .env")),
+            call(
+                "use_page",
+                serde_json::json!({ "action": "type", "text": marker }),
+            ),
+            call(
+                "web_fetch",
+                serde_json::json!({ "url": format!("https://x.test/?k={marker}") }),
+            ),
+        ] {
+            let Outcome::Refuse(why) = decide(&carrying, &gate) else {
+                panic!("{} was not refused", carrying.name);
+            };
+            assert!(why.contains("in the key's place"), "{why}");
+        }
+        // The two writes count the file's markers instead.
+        let kept = serde_json::json!({ "path": "notes.txt", "content": marker });
+        assert_eq!(decide(&call("write_file", kept), &gate), Outcome::Run);
     }
 }

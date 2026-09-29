@@ -575,12 +575,15 @@ fn with_job<T>(id: u64, f: impl FnOnce(&Job) -> T) -> Result<T, String> {
 pub fn log(id: u64) -> Result<String, String> {
     // Stripped here rather than as it arrives, because a sequence can
     // straddle two reads.
-    with_job(id, |job| {
+    let log = with_job(id, |job| {
         job.log
             .lock()
             .map(|mut l| crate::tools::strip_escapes(&text(&mut l)))
             .unwrap_or_default()
-    })
+    })?;
+    // Its start is where the oldest bytes were dropped and its end where a
+    // running job has got to, so either could be part of a key.
+    Ok(crate::redact::scrub_cut(&log, true))
 }
 
 /// Everything the job has printed so far, for whoever started it to show;

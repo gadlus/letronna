@@ -129,6 +129,13 @@ pub trait Tool: Send + Sync {
     fn untrusted(&self) -> bool {
         false
     }
+
+    /// Whether the output comes from outside the user's files -- a command,
+    /// a page, a server -- so words shaped like any vendor's key are hidden
+    /// in it too, not only the keys Letronna holds.
+    fn hides_key_shapes(&self) -> bool {
+        false
+    }
     /// What the approval card shows: a diff, the file body, the command line.
     fn preview(&self, args: &Value, ctx: &ToolContext) -> String {
         let _ = ctx;
@@ -416,14 +423,16 @@ pub fn concurrent(name: &str) -> bool {
 }
 
 pub fn preview(name: &str, args: &str, ctx: &ToolContext) -> String {
-    match (find(name), parse_args(args)) {
+    let shown = match (find(name), parse_args(args)) {
         (Some(t), Ok(mut v)) => {
             // The card shows what will run, under the names the tool reads.
             repair(&*t, &mut v);
             t.preview(&v, ctx)
         }
         _ => args.to_owned(),
-    }
+    };
+    // A card can go to a chat app as well as to the screen.
+    crate::redact::scrub(&shown, false)
 }
 
 /// The plan an `exit_plan` call puts to the user, or why the call cannot be
@@ -511,7 +520,13 @@ pub(crate) fn run_found(tool: &dyn Tool, args: &str, ctx: &ToolContext) -> Resul
     if let Some(why) = crate::gate::refusal(tool, &args, ctx) {
         return Err(why);
     }
-    let ran = tool.run(&args, ctx).map_err(|e| e + &note)?;
+    // Hidden before the cut, which could split a key and leave half of it
+    // showing, and before anything is wrapped around the result.
+    let shapes = tool.hides_key_shapes();
+    let ran = tool
+        .run(&args, ctx)
+        .map_err(|e| crate::redact::scrub(&e, shapes) + &note)?;
+    let ran = crate::redact::scrub(&ran, shapes);
     // The note goes after the cut and outside any fence: it is Letronna's,
     // and never the part that gets lost. An untrusted tool's result is never
     // saved aside to page through: read back, it would come unfenced.
@@ -1052,7 +1067,12 @@ impl Captured {
     /// What was kept, as text without escape sequences, and the gap in it
     /// when anything between the start and the end was dropped.
     fn into_text(mut self) -> (String, Option<Gap>) {
-        let text = |bytes: &[u8]| strip_escapes(&String::from_utf8_lossy(bytes));
+        // A pipe cut short, by the kill or by what is kept, can end partway
+        // through a key, and what is left of it can be told only while the
+        // cut is still the end.
+        let text = |bytes: &[u8]| {
+            crate::redact::scrub_cut(&strip_escapes(&String::from_utf8_lossy(bytes)), true)
+        };
         if self.bytes == self.head.len() + self.tail.len() {
             self.head.extend(self.tail);
             return (text(&self.head), None);
@@ -1163,6 +1183,9 @@ impl Tool for WriteFile {
         let change = crate::filestate::overwrite(ctx.conversation, &path, path_arg(args))?;
         let before = change.before().map(str::as_bytes);
         let text = crate::write::keep_format(before.unwrap_or_default(), content);
+        if crate::redact::rewrites_marker(change.before().unwrap_or_default(), &text) {
+            return Err(crate::redact::refused("`content`"));
+        }
         crate::write::check_syntax(&path, before, &text)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -1225,9 +1248,20 @@ impl Tool for EditFile {
         let edits = edits(args)?;
         let change = crate::filestate::edit(ctx.conversation, &path, path_arg(args))?;
         let text = change.before().unwrap_or_default();
+        let marker = crate::redact::MARKER;
+        if !text.contains(marker) && edits.iter().any(|edit| edit.old.contains(marker)) {
+            return Err(format!(
+                "`old` has {marker} in it, which stands for a key or token the file holds \
+                 and you were not shown, so it matches nothing. Match the text around it \
+                 instead."
+            ));
+        }
         let done = crate::edit::apply(text, &edits)?;
         if done.replaced == 0 {
             return Ok("Already applied; nothing changed.".into());
+        }
+        if crate::redact::adds_marker(text, &done.text) {
+            return Err(crate::redact::refused("`new`"));
         }
         crate::write::check_syntax(&path, Some(text.as_bytes()), &done.text)?;
         change.write(done.text.as_bytes(), &ctx.files)?;
@@ -1263,6 +1297,9 @@ fn edits(args: &Value) -> Result<Vec<crate::edit::Edit<'_>>, String> {
 
 struct RunCommand;
 impl Tool for RunCommand {
+    fn hides_key_shapes(&self) -> bool {
+        true
+    }
     fn mutates(&self) -> bool {
         true
     }
@@ -1478,6 +1515,9 @@ impl Tool for SearchSessions {
 
 struct ReadJob;
 impl Tool for ReadJob {
+    fn hides_key_shapes(&self) -> bool {
+        true
+    }
     fn name(&self) -> &'static str {
         "read_job"
     }
@@ -1561,6 +1601,9 @@ impl Tool for StopJob {
 
 struct Wait;
 impl Tool for Wait {
+    fn hides_key_shapes(&self) -> bool {
+        true
+    }
     fn name(&self) -> &'static str {
         "wait"
     }
@@ -1938,8 +1981,15 @@ fn page(
         }
         let text = String::from_utf8_lossy(&line);
         let shown = match text.char_indices().nth(LINE_CHARS) {
-            Some((at, _)) => {
+            Some(_) => {
                 long = true;
+                // Hidden before the cut, which could leave part of a key
+                // showing; `next_line` may have cut the line already.
+                let text = crate::redact::scrub_cut(&text, false);
+                let at = text
+                    .char_indices()
+                    .nth(LINE_CHARS)
+                    .map_or(text.len(), |(at, _)| at);
                 format!("{n}|{} … [line cut]\n", &text[..at])
             }
             None => format!("{n}|{text}\n"),
@@ -3666,5 +3716,45 @@ mod tests {
         // A page titled like the line, looked at rather than photographed.
         let look = fenced(crate::browser::BROWSE, &json!({"action": "look"}), &shot).unwrap();
         assert_eq!(crate::media::saved_by(crate::browser::BROWSE, &look), None);
+    }
+
+    #[test]
+    fn no_write_puts_the_secret_marker_where_a_key_was() {
+        let dir = std::env::temp_dir().join(format!("letronna-marker-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = "url = \"https://example.com\"\nkey = \"sk-real-0123456789abcdef\"\n";
+        std::fs::write(dir.join("app.toml"), config).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let on_disk = || std::fs::read_to_string(dir.join("app.toml")).unwrap();
+        let marker = crate::redact::MARKER;
+        // What the model saw, written back whole.
+        let seen = config.replace("sk-real-0123456789abcdef", marker);
+        let write = json!({"path": "app.toml", "content": seen});
+        let refused = WriteFile.run(&write, &ctx).unwrap_err();
+        assert!(refused.contains(marker), "{refused}");
+        let fresh = json!({"path": "new.toml", "content": format!("key = \"{marker}\"")});
+        assert!(WriteFile.run(&fresh, &ctx).is_err());
+        assert!(!dir.join("new.toml").exists());
+
+        let line = format!("key = \"{marker}\"");
+        let edit = json!({"path": "app.toml", "old": line, "new": "key = \"\""});
+        let refused = EditFile.run(&edit, &ctx).unwrap_err();
+        assert!(refused.contains("matches nothing"), "{refused}");
+        let edit = json!({"path": "app.toml", "old": "https://example.com", "new": marker});
+        assert!(EditFile.run(&edit, &ctx).is_err());
+        assert_eq!(on_disk(), config);
+        // The lines around it can still be changed.
+        let edit = json!({"path": "app.toml", "old": "example.com", "new": "example.org"});
+        EditFile.run(&edit, &ctx).unwrap();
+        assert!(on_disk().contains("sk-real-"));
+
+        let command = json!({"command": format!("echo '{marker}' > app.toml")}).to_string();
+        let refused = run("run_command", &command, &ctx).unwrap_err();
+        assert!(refused.starts_with("Refused"), "{refused}");
+        assert!(on_disk().contains("sk-real-"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

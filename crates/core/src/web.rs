@@ -69,6 +69,9 @@ const BLOCKS: &[&str] = &[
 pub struct WebFetch;
 
 impl Tool for WebFetch {
+    fn hides_key_shapes(&self) -> bool {
+        true
+    }
     fn name(&self) -> &'static str {
         "web_fetch"
     }
@@ -83,7 +86,7 @@ impl Tool for WebFetch {
     fn run(&self, args: &Value, _: &ToolContext) -> Result<String, String> {
         fetch(
             args["url"].as_str().unwrap_or_default(),
-            &crate::browser::secrets(),
+            &crate::redact::secrets(),
         )
     }
     fn needs_approval(&self) -> bool {
@@ -155,7 +158,12 @@ fn fetch(raw: &str, secrets: &[String]) -> Result<String, String> {
         .take(MAX_BYTES)
         .read_to_end(&mut bytes)
         .map_err(|e| format!("The page stopped arriving: {e}"))?;
-    let body = String::from_utf8_lossy(&bytes);
+    let mut body = String::from_utf8_lossy(&bytes).into_owned();
+    if bytes.len() as u64 == MAX_BYTES {
+        // The limit may have cut a key short, which can be told only while
+        // the cut is still the end.
+        body = crate::redact::scrub_cut(&body, true);
+    }
     let text = if kind.contains("html") {
         match title_of(&body) {
             Some(title) => format!("{title}\n\n{}", text_of(&body)),
@@ -166,7 +174,7 @@ fn fetch(raw: &str, secrets: &[String]) -> Result<String, String> {
         || kind.contains("json")
         || kind.contains("xml")
     {
-        body.into_owned()
+        body
     } else {
         return Err(format!("That is not a page of text ({kind})."));
     };
