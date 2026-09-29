@@ -6,10 +6,11 @@
 //! `ask_user` is answered by the user, never run here.
 
 use crate::chat::{Connection, Remote};
+use crate::grep::{SEARCH_FILES, SEARCH_TIME};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// Where a session is allowed to look.
 #[derive(Clone, Default)]
@@ -77,21 +78,14 @@ pub const TODO: &str = "todo";
 /// The tool result the model gets when the user denies a call.
 pub const DECLINED: &str = "The user declined this action. Ask before trying a different approach.";
 const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-/// A search stops after this long or this many files, and says so, rather
-/// than walking a whole home folder while the session waits on it.
-const SEARCH_TIME: Duration = Duration::from_secs(15);
-const SEARCH_FILES: usize = 20_000;
-/// Bigger files are skipped by search and cut short by read_file: neither
-/// can show more than `MAX_OUTPUT`, and reading gigabytes to find that out
-/// is how a tool hangs.
-const SEARCH_FILE_BYTES: u64 = 1_000_000;
+/// Bigger files are cut short by read_file: it cannot show more than
+/// `MAX_OUTPUT`, and reading gigabytes to find that out is how a tool hangs.
 const READ_BYTES: u64 = 256 * 1024;
 /// How long a background command gets to print something before the tool
 /// replies, so the first message can carry a port or an early crash.
 const SETTLE: std::time::Duration = std::time::Duration::from_millis(1200);
 
 const MAX_OUTPUT: usize = 24_000;
-const SKIP_DIRS: &[&str] = &[".git", "node_modules", "target", ".next", "dist", "build"];
 
 /// Tools contributed by enabled plugins. Kept here rather than read from the
 /// plugin registry because tools run on worker threads with no `App` to hand.
@@ -243,9 +237,11 @@ pub fn clamp_lines(text: &str, max: usize) -> String {
 pub fn summary(name: &str, args: &str) -> String {
     let v: Value = serde_json::from_str(args).unwrap_or(Value::Null);
     let text = match name {
-        "search" | "search_sessions" => v["query"]
+        "search" | "search_sessions" => v["pattern"]
             .as_str()
+            .or(v["query"].as_str())
             .map(|q| format!("\"{q}\""))
+            .or(v["glob"].as_str().map(str::to_owned))
             .unwrap_or_default(),
         "run_command" => v["command"].as_str().unwrap_or_default().to_owned(),
         "web_fetch" => v["url"].as_str().unwrap_or_default().to_owned(),
@@ -850,22 +846,28 @@ fn private(path: &Path, data: &Path) -> bool {
     std::fs::canonicalize(data).is_ok_and(|data| path.starts_with(data))
 }
 
-/// Folders and files that hold keys, passwords or other agents' sign-in
-/// tokens, matched as a run of names anywhere in a path so that a folder
-/// covers everything in it; `_netrc` is what curl and Git read on Windows.
+/// Folders and files that hold keys, passwords or tokens (package
+/// registries, the GitHub CLI, Docker, Kubernetes, other agents' sign-in),
+/// matched as a run of names anywhere in a path so that a folder covers
+/// everything in it; `_netrc` is what curl and Git read on Windows.
 const SECRETS: &[&str] = &[
     ".ssh",
     ".aws",
     ".netrc",
     "_netrc",
     ".git-credentials",
+    ".npmrc",
+    ".pypirc",
+    ".config/gh/hosts.yml",
+    ".docker/config.json",
+    ".kube/config",
     ".claude/.credentials.json",
     ".codex/auth.json",
 ];
 
 /// Whether `path` is or lies in one of `SECRETS`, or is a `.env` file other
 /// than the example and sample ones that projects commit.
-fn secret(path: &Path) -> bool {
+pub(crate) fn secret(path: &Path) -> bool {
     // Without case, because Windows and macOS open `.SSH` as `.ssh`.
     let names: Vec<&std::ffi::OsStr> = path.iter().collect();
     let listed = SECRETS.iter().any(|entry| {
@@ -961,130 +963,55 @@ impl Tool for Search {
         "search"
     }
     fn description(&self) -> &'static str {
-        "Case-insensitive text search across files under a folder. Returns path:line: text."
+        "Search file contents under a folder with a regex (Rust syntax), matched line by \
+         line, leaving out what .gitignore ignores and, outside a Git repository, target, \
+         dist and build folders unless the glob names them. Mode content (the default) shows \
+         each file's matching lines as `12: text` and context lines as `13- text`; files \
+         lists the matching files, newest first; count gives matching lines per file. Mode \
+         files with no pattern lists the files a glob or type picks. Ignores case unless \
+         case_sensitive is set. Paths come back ready for read_file."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
-            "query": {"type": "string"},
-            "path": {"type": "string", "description": "Folder to search. Defaults to the workspace root."}
-        }, "required": ["query"]})
+            "pattern": {"type": "string", "description": "A regex. One that does not parse, or finds nothing, is tried as plain text."},
+            "path": {"type": "string", "description": "Folder or file to search. Defaults to the workspace root."},
+            "glob": {"type": "string", "description": "Only paths under `path` matching this, e.g. `*.rs` or `src/**/*.{ts,tsx}`; a leading `!` leaves them out instead."},
+            "type": {"type": "string", "description": "Only files of this type: rust, py, ts, js, go, java, cpp, md and so on, or a bare extension."},
+            "mode": {"type": "string", "enum": ["content", "files", "count"]},
+            "context": {"type": "integer", "description": "Lines shown either side of each match, up to 5."},
+            "case_sensitive": {"type": "boolean"},
+            "limit": {"type": "integer", "description": "Results per page, 100 unless set."},
+            "offset": {"type": "integer", "description": "Results to skip, to reach the next page."}
+        }})
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
-        let query = args["query"].as_str().unwrap_or("").to_lowercase();
-        if query.is_empty() {
-            return Err("Query is empty.".into());
-        }
         let root = resolve(path_arg(args), ctx)?;
-        Ok(search(&root, &query, SEARCH_TIME, SEARCH_FILES))
+        // A workspace that holds the home folder is searched like the home
+        // folder, whose hidden files are other programs' settings and tokens.
+        let home = home().and_then(|h| std::fs::canonicalize(h).ok());
+        let space = ctx
+            .workspace
+            .as_ref()
+            .and_then(|w| std::fs::canonicalize(w).ok());
+        let workspace = space
+            .as_ref()
+            .filter(|w| root.starts_with(w) && !home.as_ref().is_some_and(|h| h.starts_with(w)));
+        // Outside the workspace the walk leaves hidden entries out, but it
+        // never looks at its own root, which would be walked all the same.
+        let base = home
+            .iter()
+            .chain(&space)
+            .find(|base| root.starts_with(base));
+        if workspace.is_none() && base.is_some_and(|base| crate::grep::hidden_below(base, &root)) {
+            return Err(format!(
+                "`{}` is hidden or in a hidden folder outside the workspace, where other \
+                 programs keep their settings and tokens, so search leaves it out.",
+                path_arg(args)
+            ));
+        }
+        let query = crate::grep::Query::from_args(args, &root, workspace.map(PathBuf::as_path))?;
+        crate::grep::search(&query, Instant::now() + SEARCH_TIME, SEARCH_FILES)
     }
-}
-
-/// The search itself, with its budget passed in so a test can use a tiny one.
-fn search(root: &Path, query: &str, time: Duration, files: usize) -> String {
-    let started = Instant::now();
-    let mut scanned = 0;
-    let mut stopped = false;
-    let mut hits = Vec::new();
-    let mut skipped = 0;
-    walk(root, &mut skipped, &mut |path, is_dir| {
-        // Checked on folders too, or a deep tree of them runs unbounded.
-        if scanned >= files || started.elapsed() >= time {
-            stopped = true;
-            return false;
-        }
-        if is_dir {
-            return true;
-        }
-        scanned += 1;
-        let Some(text) = searchable(path) else {
-            return true;
-        };
-        // Most files hold no match at all, and lowercasing the whole file once
-        // says so; lowercasing it line by line made a new string for every
-        // line of every file searched.
-        if !text.to_lowercase().contains(query) {
-            return true;
-        }
-        for (n, line) in text.lines().enumerate() {
-            if line.to_lowercase().contains(query) {
-                let rel = path.strip_prefix(root).unwrap_or(path).display();
-                hits.push(format!("{rel}:{}: {}", n + 1, line.trim()));
-                if hits.len() >= 200 {
-                    return false;
-                }
-            }
-        }
-        true
-    });
-    let mut out = match hits.is_empty() {
-        true => "No matches.".to_owned(),
-        false => hits.join("\n"),
-    };
-    if stopped {
-        out.push_str(&format!(
-            "\n… Stopped early after {scanned} files; search a narrower folder for \
-             complete results."
-        ));
-    }
-    if skipped > 0 {
-        out.push_str(&format!(
-            "\n… Secret files and folders left out: {skipped}. Ask the user to paste \
-             what you need from them."
-        ));
-    }
-    out
-}
-
-/// A file worth searching: small enough, and text. The size comes from the
-/// metadata so a huge file is never opened; a NUL byte marks a binary one.
-fn searchable(path: &Path) -> Option<String> {
-    if std::fs::metadata(path).ok()?.len() > SEARCH_FILE_BYTES {
-        return None;
-    }
-    let bytes = std::fs::read(path).ok()?;
-    if bytes[..bytes.len().min(8192)].contains(&0) {
-        return None;
-    }
-    String::from_utf8(bytes).ok()
-}
-
-/// Depth-first walk skipping build, VCS and hidden folders, and secrets,
-/// which it counts in `skipped`. A symlink is never followed, so a link back
-/// up the tree cannot loop it. The callback sees each folder before it is
-/// entered and each file, and returns false to stop.
-fn walk(dir: &Path, skipped: &mut usize, f: &mut dyn FnMut(&Path, bool) -> bool) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return true;
-    };
-    for entry in entries.filter_map(Result::ok) {
-        let Ok(kind) = entry.file_type() else {
-            continue;
-        };
-        if kind.is_symlink() {
-            continue;
-        }
-        let path = entry.path();
-        if secret(&path) {
-            *skipped += 1;
-            continue;
-        }
-        if kind.is_dir() {
-            let name = entry.file_name();
-            let hidden = name.to_string_lossy().starts_with('.');
-            if hidden
-                || SKIP_DIRS.iter().any(|s| name == *s)
-                || private(&path, &crate::chat::data_dir())
-            {
-                continue;
-            }
-            if !f(&path, true) || !walk(&path, skipped, f) {
-                return false;
-            }
-        } else if !f(&path, false) {
-            return false;
-        }
-    }
-    true
 }
 
 #[cfg(test)]
@@ -1107,7 +1034,7 @@ mod tests {
         assert_eq!(run("list_dir", "{}", &ctx).unwrap(), "src/");
         assert_eq!(
             run("search", r#"{"query":"world"}"#, &ctx).unwrap(),
-            "src\\a.txt:2: World".replace('\\', std::path::MAIN_SEPARATOR_STR)
+            "src\\a.txt\n  2: World".replace('\\', std::path::MAIN_SEPARATOR_STR)
         );
         // The filesystem root is outside both the workspace and home.
         assert!(run("list_dir", r#"{"path":"/"}"#, &ctx).is_err());
@@ -1189,53 +1116,6 @@ World"
         );
         set_plugin_tools(Vec::new());
         assert!(run("extra", "{}", &ctx).is_err());
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn search_stays_bounded() {
-        let dir = std::env::temp_dir().join(format!("letronna-search-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join(".hidden")).unwrap();
-        std::fs::write(dir.join("ok.txt"), "a needle here").unwrap();
-        std::fs::write(dir.join(".hidden/a.txt"), "needle").unwrap();
-        std::fs::write(dir.join("bin.dat"), b"needle\0binary").unwrap();
-        let big = format!("needle\n{}", "x".repeat(SEARCH_FILE_BYTES as usize));
-        std::fs::write(dir.join("big.txt"), big).unwrap();
-        // A link back up the tree would recurse until paths ran out.
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&dir, dir.join("loop")).unwrap();
-
-        assert_eq!(
-            search(&dir, "needle", SEARCH_TIME, SEARCH_FILES),
-            "ok.txt:1: a needle here"
-        );
-        // Out of budget: stops at once and says why, rather than wandering on.
-        for out in [
-            search(&dir, "needle", SEARCH_TIME, 0),
-            search(&dir, "needle", Duration::ZERO, SEARCH_FILES),
-        ] {
-            assert!(out.starts_with("No matches."), "{out}");
-            assert!(out.contains("Stopped early after 0 files"), "{out}");
-        }
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn search_passes_over_files_without_a_match_and_numbers_the_rest() {
-        let dir = std::env::temp_dir().join(format!("letronna-lines-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("none.txt"), "nothing\nto see\nhere").unwrap();
-        std::fs::write(
-            dir.join("some.txt"),
-            "one\ntwo\nThe Needle\nfour\nneedle again",
-        )
-        .unwrap();
-        assert_eq!(
-            search(&dir, "needle", SEARCH_TIME, SEARCH_FILES),
-            "some.txt:3: The Needle\nsome.txt:5: needle again"
-        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1333,11 +1213,59 @@ World"
         assert!(refused.contains("not available here"), "{refused}");
     }
 
+    // Windows keeps the temp folder under AppData, which is hidden itself.
+    #[cfg(unix)]
+    #[test]
+    fn a_workspace_holding_home_is_searched_like_home() {
+        let dir = std::env::temp_dir().join(format!("letronna-holds-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".config/tool")).unwrap();
+        for name in ["notes.txt", ".zshrc", ".config/tool/state"] {
+            std::fs::write(dir.join(name), "token").unwrap();
+        }
+        let dir = std::fs::canonicalize(dir).unwrap();
+        let top = dir.ancestors().last().unwrap().to_path_buf();
+        let ctx = ToolContext {
+            workspace: Some(top),
+            ..Default::default()
+        };
+        let search = |path: &Path| Search.run(&json!({"pattern": "token", "path": path}), &ctx);
+        let found = search(&dir).unwrap();
+        assert!(
+            found.contains("notes.txt") && !found.contains(".zshrc"),
+            "{found}"
+        );
+        let refused = search(&dir.join(".config/tool")).unwrap_err();
+        assert!(
+            refused.contains("hidden folder outside the workspace"),
+            "{refused}"
+        );
+        // A workspace that does not hold it searches its own hidden files.
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let found = Search.run(&json!({"pattern": "token"}), &ctx).unwrap();
+        assert!(
+            found.contains(".zshrc") && found.contains("state"),
+            "{found}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn secret_files_are_refused_but_env_examples_are_not() {
         let dir = std::env::temp_dir().join(format!("letronna-secrets-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        for folder in [".ssh", ".aws", ".claude", ".codex"] {
+        for folder in [
+            ".ssh",
+            ".aws",
+            ".claude",
+            ".codex",
+            ".config/gh",
+            ".docker",
+            ".kube",
+        ] {
             std::fs::create_dir_all(dir.join(folder)).unwrap();
         }
         let secrets = [
@@ -1346,13 +1274,23 @@ World"
             ".aws/credentials",
             ".netrc",
             ".git-credentials",
+            ".npmrc",
+            ".pypirc",
+            ".config/gh/hosts.yml",
+            ".docker/config.json",
+            ".kube/config",
             ".claude/.credentials.json",
             ".codex/auth.json",
             ".env",
             ".env.local",
             ".ENV.production",
         ];
-        let open = [".env.example", ".env.sample", ".claude/settings.json"];
+        let open = [
+            ".env.example",
+            ".env.sample",
+            ".claude/settings.json",
+            ".config/gh/config.yml",
+        ];
         for name in secrets.iter().skip(1).chain(&open) {
             std::fs::write(dir.join(name), "KEY=value").unwrap();
         }
@@ -1368,25 +1306,6 @@ World"
             let text = ReadFile.run(&json!({"path": name}), &ctx).unwrap();
             assert_eq!(text, "KEY=value", "{name}");
         }
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn search_leaves_out_secret_files_and_says_how_many() {
-        let dir = std::env::temp_dir().join(format!("letronna-unsearched-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("app/.ssh")).unwrap();
-        std::fs::write(dir.join("app/.ssh/id_rsa"), "TOKEN=1").unwrap();
-        std::fs::write(dir.join("app/.env.local"), "TOKEN=2").unwrap();
-        std::fs::write(dir.join(".env"), "TOKEN=3").unwrap();
-        std::fs::write(dir.join(".git-credentials"), "https://me:TOKEN@host").unwrap();
-        std::fs::write(dir.join(".env.example"), "TOKEN=").unwrap();
-        // The folder counts once; nothing inside it is looked at.
-        assert_eq!(
-            search(&dir, "token", SEARCH_TIME, SEARCH_FILES),
-            ".env.example:1: TOKEN=\n… Secret files and folders left out: 4. Ask the user \
-             to paste what you need from them."
-        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
