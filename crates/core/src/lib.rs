@@ -13,6 +13,7 @@ mod cdp;
 pub mod chat;
 pub mod compact;
 mod edit;
+mod filestate;
 pub mod gateway;
 pub mod jobs;
 pub mod mcp;

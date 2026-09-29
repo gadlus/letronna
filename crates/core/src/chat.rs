@@ -637,6 +637,9 @@ pub fn list_models(base: &str, key: &str) -> Result<Vec<String>, String> {
 }
 
 pub fn start(connection: Connection, messages: Vec<Message>) -> async_channel::Receiver<Event> {
+    // Before the reply exists, so every call it makes is stamped with it.
+    let window = window_start(&messages);
+    crate::filestate::asked(connection.conversation, messages.len(), window);
     let (sender, receiver) = async_channel::bounded(64);
     std::thread::spawn(move || {
         let result = stream(&connection, &messages, &sender);

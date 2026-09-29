@@ -156,6 +156,8 @@ impl Conversation {
             return;
         }
         self.messages.truncate(len);
+        // Replies from here on take the places of those taken back.
+        crate::filestate::forget(self.id);
         // Rewound to nothing, the messages are empty and the listing's count
         // is read again: left as it was, `length` would report the old
         // history and `fill` would read it back in.
@@ -220,6 +222,8 @@ impl Store {
         }
         let gone = self.conversations.remove(index);
         let _ = std::fs::remove_file(session_path(gone.id));
+        // A new session can be given the same id.
+        crate::filestate::forget(gone.id);
     }
 }
 
