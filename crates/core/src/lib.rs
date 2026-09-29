@@ -41,6 +41,7 @@ pub mod memory;
 pub mod messaging;
 pub mod models;
 mod page;
+pub mod palette;
 pub mod paths;
 pub mod permissions;
 mod redact;

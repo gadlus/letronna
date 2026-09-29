@@ -3041,6 +3041,11 @@ impl Render for Chat {
             .on_action(
                 cx.listener(|this, _: &OpenActivity, window, cx| this.open_activity(window, cx)),
             )
+            .on_action(
+                cx.listener(|this, _: &crate::ui::palette::OpenPalette, window, cx| {
+                    this.open_palette(window, cx)
+                }),
+            )
             .child(
                 div()
                     .relative()
