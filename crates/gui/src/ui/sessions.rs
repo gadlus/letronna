@@ -109,6 +109,7 @@ impl Chat {
                     let id = this.store.conversations[index].id;
                     letronna_core::browser::forget(id);
                     this.drafts.remove(&id);
+                    this.panel.forget(id);
                     // The next new session can be given this id again, and
                     // must not start out with what was allowed here.
                     this.session_allow

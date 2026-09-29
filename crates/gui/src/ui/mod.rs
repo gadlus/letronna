@@ -7,6 +7,7 @@ pub(crate) mod chrome;
 pub(crate) mod composer;
 pub(crate) mod messages;
 pub(crate) mod messaging;
+pub(crate) mod panel;
 pub(crate) mod schedules;
 pub(crate) mod sessions;
 pub(crate) mod settings;

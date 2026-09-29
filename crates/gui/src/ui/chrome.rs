@@ -50,6 +50,20 @@ impl Chat {
                                 this.child(self.session_title(cx))
                             }),
                     )
+                    .child(
+                        Button::new("toggle-panel")
+                            .plain(cx)
+                            .small()
+                            .icon(Icon::new(IconName::PanelRight).size_4())
+                            .tooltip_with_action(
+                                "Toggle right panel",
+                                &crate::ui::panel::TogglePanel,
+                                Some("Chat"),
+                            )
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.toggle_panel(window, cx)),
+                            ),
+                    )
                     .child(self.account_chip(cx)),
             )
     }
