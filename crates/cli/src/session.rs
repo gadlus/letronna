@@ -8,7 +8,7 @@ use letronna_core::agent::{Next, Turn};
 use letronna_core::chat::{self, Connection, Event, Message};
 use letronna_core::gate::{self, Gate, Grants};
 use letronna_core::store::{Conversation, Store};
-use letronna_core::tools;
+use letronna_core::{permissions, tools};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -28,6 +28,8 @@ pub struct Runner {
     /// Someone can see a card and answer it; false for `-p` with no
     /// terminal on either end.
     pub human: bool,
+    /// The rules file error last shown, so that one is shown once.
+    pub trouble: Option<String>,
     /// Read and search only; no writing, no running.
     pub plan: bool,
     /// The box at the foot of the window, pumped while a reply streams so
@@ -257,7 +259,16 @@ impl Runner {
     fn work_through(&mut self, turn: &mut Turn, session: usize) -> Result<bool, String> {
         loop {
             let ctx = tools::ToolContext::of(&turn.connection);
-            let gate = Gate::for_terminal(&ctx, &self.allowed, self.yes, self.human);
+            // Read afresh each time, since the window may have added one.
+            let rules = permissions::load(&permissions::user_file());
+            let trouble = permissions::trouble(&rules, ctx.workspace.as_deref());
+            if trouble != self.trouble {
+                if let Some(error) = &trouble {
+                    render::line(&render::red(error));
+                }
+                self.trouble = trouble;
+            }
+            let gate = Gate::for_terminal(&ctx, &self.allowed, &rules, self.yes, self.human);
             match turn.next(|call| gate::decide(call, &gate)) {
                 Next::Done => return Ok(true),
                 Next::Ask => {
@@ -268,7 +279,7 @@ impl Runner {
                 }
                 Next::Run(call) if call.name == tools::TODO => self.apply_todo(turn, session, call),
                 Next::Run(call) => {
-                    if !self.run_call(turn, call) {
+                    if !self.run_call(turn, call, false) {
                         self.keep_stopped(turn, session);
                         return Ok(false);
                     }
@@ -302,10 +313,18 @@ impl Runner {
         self.persist();
     }
 
-    /// Runs `call` and shows what came of it. False when the user stopped it,
-    /// which ends the turn.
-    fn run_call(&mut self, turn: &mut Turn, call: letronna_core::chat::ToolCall) -> bool {
-        let ctx = tools::ToolContext::of(&turn.connection);
+    /// Runs `call` and shows what came of it; `approved` when the user said
+    /// yes to it just now. False when the user stopped it, which ends the turn.
+    fn run_call(
+        &mut self,
+        turn: &mut Turn,
+        call: letronna_core::chat::ToolCall,
+        approved: bool,
+    ) -> bool {
+        let ctx = tools::ToolContext {
+            approved,
+            ..tools::ToolContext::of(&turn.connection)
+        };
         let summary = tools::summary(&call.name, &call.arguments);
         let ran = self.run_off_the_loop(&call, ctx, &summary);
         let stopped = ran.is_none();
@@ -473,30 +492,40 @@ impl Runner {
         }
 
         let question = format!("Letronna wants to {}", intent(&call.name, &summary));
-        let picked = self.bar.choose(
-            &question,
-            detail,
-            &[
-                "Yes",
-                "Yes, and stop asking for this",
-                "No, tell it why not",
-                "No, and stop here",
-            ],
-        );
+        // Offered only where a rule could cover the call, as the third
+        // choice, so the others keep their places.
+        let rule = permissions::suggest(&call, &ctx);
+        let here = rule
+            .as_ref()
+            .map(|rule| format!("Yes, and always allow `{}` here", rule.pattern));
+        let mut choices = vec!["Yes", "Yes, and stop asking for this"];
+        choices.extend(here.as_deref());
+        choices.extend(["No, tell it why not", "No, and stop here"]);
+        let picked = self.bar.choose(&question, detail, &choices);
 
-        match picked {
-            Some(0) => Ok(self.run_call(turn, call)),
-            Some(1) => {
+        match picked.and_then(|at| choices.get(at).copied()) {
+            Some("Yes") => Ok(self.run_call(turn, call, true)),
+            Some("Yes, and stop asking for this") => {
                 self.allowed
                     .entry(turn.connection.conversation)
                     .or_default()
                     .insert(call.name.clone());
-                Ok(self.run_call(turn, call))
+                Ok(self.run_call(turn, call, true))
             }
-            Some(3) | None => Ok(false),
-            _ => {
+            Some("No, and stop here") | None => Ok(false),
+            Some("No, tell it why not") => {
                 render::tool(&call.name, &summary, "declined", true);
                 turn.finish_call(Err(tools::DECLINED.into()));
+                Ok(true)
+            }
+            Some(_) => {
+                // Into the user's own rules, held to this project: the
+                // project's file may not allow anything.
+                let kept = rule.map(|rule| permissions::keep(&permissions::user_file(), rule));
+                if let Some(Err(error)) = kept {
+                    render::line(&render::red(&error));
+                }
+                self.run_call(turn, call, true);
                 Ok(true)
             }
         }

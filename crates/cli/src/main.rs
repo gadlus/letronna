@@ -77,6 +77,7 @@ fn main() {
         // drawn or read where nobody sees it, and wait forever.
         human: args.prompt.is_none()
             || (std::io::stdin().is_terminal() && std::io::stdout().is_terminal()),
+        trouble: None,
         plan: args.plan,
         bar: bar::Bar::new(String::new()),
     };

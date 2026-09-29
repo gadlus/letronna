@@ -221,6 +221,15 @@ impl Chat {
                             this.resolve_call(Verdict::Allow { remember: true }, cx)
                         })),
                 )
+                .children(self.offer.as_ref().map(|rule| {
+                    Button::new("allow-here")
+                        .framed(cx)
+                        .small()
+                        .label(format!("Always allow `{}` here", rule.pattern))
+                        .on_click(
+                            cx.listener(|this, _, _, cx| this.resolve_call(Verdict::AllowHere, cx)),
+                        )
+                }))
                 .child(
                     Button::new("deny")
                         .plain(cx)

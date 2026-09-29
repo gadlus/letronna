@@ -34,6 +34,7 @@ pub mod messaging;
 pub mod models;
 mod page;
 pub mod paths;
+pub mod permissions;
 pub mod retry;
 pub mod schedule;
 pub mod search;

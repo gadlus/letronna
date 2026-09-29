@@ -422,6 +422,8 @@ mod tests {
                 skip_approvals,
                 grants: &granted,
                 human,
+                rules: &[],
+                broken: None,
             };
             decide(&call(tools::EXIT_PLAN), &gate)
         };
@@ -442,6 +444,8 @@ mod tests {
                 skip_approvals: false,
                 grants: &none,
                 human: true,
+                rules: &[],
+                broken: None,
             };
             decide(queued, &gate)
         };
