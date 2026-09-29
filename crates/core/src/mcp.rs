@@ -26,25 +26,38 @@
 //! answer. A server that restarts has forgotten the session it gave, and is
 //! greeted again; the session is ended when the app quits. The older way, a
 //! stream opened first at an address ending in /sse, is not spoken.
+//!
+//! A server's config may name `${VAR}` or `${VAR:-default}` in its command,
+//! args, cwd, url, env and headers, filled in from Letronna's environment
+//! when it starts, so a key need not be written into the file; one unset
+//! with no default keeps the server from starting and says which. Its
+//! `includeTools` and `excludeTools` -- the names Gemini CLI reads, taking
+//! `*` globs here -- keep tools the model is never to see from costing a
+//! word of every request. `autoApprove: "readOnly"` takes a server's word
+//! that a tool only looks, as a server run here is taken at its word
+//! already. A child inherits Letronna's environment, as Claude Code's do,
+//! unless `env_scrub` gives it only where things are and its own `env`.
 
 use crate::tools::{Tool, ToolContext};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Once, OnceLock, mpsc};
 use std::time::Duration;
 
-/// How long a server gets to start and list its tools. The first run of an
-/// npx server downloads it, which is most of this.
+/// How long a server gets to start and list its tools, unless its
+/// `startup_timeout_ms` says otherwise. The first run of an npx server
+/// downloads it, which is most of this.
 const START_TIME: Duration = Duration::from_secs(60);
 /// How long one tool call may take, the same as a command, unless the
 /// server's `timeout_ms` says otherwise.
 const CALL_TIME: Duration = Duration::from_secs(120);
-/// The longest a call may be given, whatever `timeout_ms` says: a day,
-/// which no call needs, and which keeps every deadline far inside what a
-/// clock can add up to.
+/// The longest a call or a start may be given, whatever `timeout_ms` or
+/// `startup_timeout_ms` says: a day, which none needs, and which keeps
+/// every deadline far inside what a clock can add up to.
 const LONGEST_CALL: Duration = Duration::from_secs(24 * 60 * 60);
 /// How much longer a POST to a server reached by URL may run than a call
 /// may take. Whoever asked gives up first, naming what went unanswered, and
@@ -69,6 +82,29 @@ const SECRET_NAMES: &[&str] = &[
     "credential",
     "authorization",
     "cookie",
+];
+/// All a server started with `env_scrub` keeps of Letronna's environment:
+/// where programs, home and scratch space are and which language, plus the
+/// Windows folders node, npx and python fail to start without. None of
+/// them holds a key.
+const KEPT_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "SYSTEMDRIVE",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+    "PROGRAMFILES",
 ];
 
 /// `mcp.json`, as Claude Desktop writes it.
@@ -95,21 +131,160 @@ struct ServerConfig {
     env: HashMap<String, String>,
     #[serde(default)]
     disabled: bool,
-    /// Tools that run without asking, by their name on the server.
+    /// Tools that run without asking.
     #[serde(default, rename = "autoApprove")]
-    auto_approve: Vec<String>,
+    auto_approve: AutoApprove,
     /// How long one call to this server may take, in milliseconds.
     #[serde(default)]
     timeout_ms: Option<u64>,
+    /// How long it may take to start and list its tools, in milliseconds.
+    #[serde(default)]
+    startup_timeout_ms: Option<u64>,
+    /// The folder a server run here starts in, from the config's own folder.
+    #[serde(default)]
+    cwd: Option<String>,
+    /// Globs of the tool names offered; empty offers every tool.
+    #[serde(default, rename = "includeTools")]
+    include_tools: Vec<String>,
+    /// Globs of the tool names never offered, whatever `includeTools` says.
+    #[serde(default, rename = "excludeTools")]
+    exclude_tools: Vec<String>,
+    /// Start the server with only `KEPT_ENV` of Letronna's environment.
+    #[serde(default)]
+    env_scrub: bool,
+}
+
+/// `autoApprove`: which of a server's tools run without asking.
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+#[serde(untagged)]
+enum AutoApprove {
+    /// Those named, by their names on the server.
+    Names(Vec<String>),
+    /// `"readOnly"`: those the server says only look; any other word, none.
+    Word(String),
+}
+
+impl Default for AutoApprove {
+    fn default() -> Self {
+        Self::Names(Vec::new())
+    }
+}
+
+impl AutoApprove {
+    /// Whether the tool `own`, with these `annotations`, runs without asking.
+    fn approves(&self, own: &str, annotations: &Value) -> bool {
+        match self {
+            Self::Names(names) => names.iter().any(|name| name == own),
+            Self::Word(word) => word == "readOnly" && only_looks(annotations),
+        }
+    }
 }
 
 impl ServerConfig {
     /// How long one call to this server may take: `timeout_ms`, or the usual.
     fn call_time(&self) -> Duration {
-        self.timeout_ms
-            .filter(|&ms| ms > 0)
-            .map_or(CALL_TIME, |ms| Duration::from_millis(ms).min(LONGEST_CALL))
+        within_a_day(self.timeout_ms, CALL_TIME)
     }
+
+    /// How long it may take to start and list its tools:
+    /// `startup_timeout_ms`, or the usual.
+    fn start_time(&self) -> Duration {
+        within_a_day(self.startup_timeout_ms, START_TIME)
+    }
+
+    /// Whether its tool `own` is offered at all, by the include and exclude
+    /// globs.
+    fn offers(&self, own: &str) -> bool {
+        let any = |globs: &[String]| globs.iter().any(|glob| matches_glob(glob, own));
+        (self.include_tools.is_empty() || any(&self.include_tools)) && !any(&self.exclude_tools)
+    }
+
+    /// The folder it starts in: `cwd` from `base`, the config's folder.
+    fn folder(&self, base: &Path) -> Option<PathBuf> {
+        let cwd = self.cwd.as_deref().map(str::trim)?;
+        (!cwd.is_empty()).then(|| base.join(cwd))
+    }
+
+    /// This config with every `${VAR}` in its command, args, cwd, url, env
+    /// and headers filled in from `var`.
+    fn expanded(&self, var: &dyn Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let one = |text: &String| expand(text, var);
+        let values = |map: &HashMap<String, String>| {
+            map.iter()
+                .map(|(name, value)| Ok((name.clone(), one(value)?)))
+                .collect::<Result<HashMap<_, _>, String>>()
+        };
+        Ok(Self {
+            command: one(&self.command)?,
+            url: one(&self.url)?,
+            headers: values(&self.headers)?,
+            args: self.args.iter().map(one).collect::<Result<_, _>>()?,
+            env: values(&self.env)?,
+            cwd: self.cwd.as_ref().map(one).transpose()?,
+            ..self.clone()
+        })
+    }
+}
+
+/// `ms` as a length of time: `usual` when unset or 0, and never more than
+/// `LONGEST_CALL`.
+fn within_a_day(ms: Option<u64>, usual: Duration) -> Duration {
+    ms.filter(|&ms| ms > 0)
+        .map_or(usual, |ms| Duration::from_millis(ms).min(LONGEST_CALL))
+}
+
+/// `text` with each `${VAR}` replaced by that variable's value, and each
+/// `${VAR:-default}` by its value or, when it is unset or empty, the
+/// default. A `$` without braces, or braces never closed, stay as written;
+/// a variable unset with no default is an error naming it.
+fn expand(text: &str, var: &dyn Fn(&str) -> Option<String>) -> Result<String, String> {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("${") {
+        let Some(length) = rest[start..].find('}') else {
+            break;
+        };
+        out.push_str(&rest[..start]);
+        let inner = &rest[start + 2..start + length];
+        let (name, default) = match inner.split_once(":-") {
+            Some((name, default)) => (name, Some(default)),
+            None => (inner, None),
+        };
+        // As in a shell, `:-` stands in for a value set but empty too.
+        let value = var(name).filter(|value| default.is_none() || !value.is_empty());
+        match (value, default) {
+            (Some(value), _) => out.push_str(&value),
+            (None, Some(default)) => out.push_str(default),
+            (None, None) => {
+                return Err(format!(
+                    "${{{name}}} is not set, and no default is given as ${{{name}:-default}}."
+                ));
+            }
+        }
+        rest = &rest[start + length + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// Whether `name` matches `glob`, in which `*` stands for any run of
+/// characters, none included.
+fn matches_glob(glob: &str, name: &str) -> bool {
+    let Some((first, rest)) = glob.split_once('*') else {
+        return glob == name;
+    };
+    let Some(mut left) = name.strip_prefix(first) else {
+        return false;
+    };
+    let mut parts: Vec<&str> = rest.split('*').collect();
+    let last = parts.pop().unwrap_or_default();
+    for part in parts {
+        let Some(at) = left.find(part) else {
+            return false;
+        };
+        left = &left[at + part.len()..];
+    }
+    left.ends_with(last)
 }
 
 /// The tools of every server that has answered so far.
@@ -162,12 +337,13 @@ fn config() -> Config {
 /// The values in `mcp.json` whose names say they are secret, for hiding
 /// wherever they turn up.
 pub(crate) fn secrets() -> Vec<String> {
-    secret_values(&config())
+    secret_values(&config(), &|name| std::env::var(name).ok())
 }
 
 /// Each server's `env` and `headers` values named for a key, a token or a
-/// password; of `Bearer <token>`, the token.
-fn secret_values(config: &Config) -> Vec<String> {
+/// password, with their variables filled in from `var`; of
+/// `Bearer <token>`, the token.
+fn secret_values(config: &Config, var: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
     let secret = |name: &String| {
         let name = name.to_lowercase();
         SECRET_NAMES.iter().any(|word| name.contains(word))
@@ -177,7 +353,9 @@ fn secret_values(config: &Config) -> Vec<String> {
         .values()
         .flat_map(|server| server.env.iter().chain(&server.headers))
         .filter(|(name, _)| secret(name))
-        .filter_map(|(_, value)| value.split_whitespace().last().map(str::to_owned))
+        // A server with a variable unset never starts, so none of it goes out.
+        .filter_map(|(_, value)| expand(value, var).ok())
+        .filter_map(|value| value.split_whitespace().last().map(str::to_owned))
         // A path named for a key, as SSH_KEY_PATH is, is no secret, and hiding
         // it would hide the file wherever it is named.
         .filter(|value| !path_like(value))
@@ -236,10 +414,13 @@ fn registry() -> &'static Mutex<Vec<Arc<dyn Tool>>> {
 
 /// Start one server and list its tools.
 fn launch(name: &str, config: &ServerConfig) -> Result<Vec<Arc<dyn Tool>>, String> {
+    let config = &config
+        .expanded(&|var| std::env::var(var).ok())
+        .map_err(|e| format!("{name}: {e}"))?;
     if !config.url.trim().is_empty() {
         return reach(name, config);
     }
-    let mut child = spawn(config)?;
+    let mut child = spawn(config, &crate::chat::data_dir())?;
     let (Some(stdin), Some(stdout), Some(mut stderr)) =
         (child.stdin.take(), child.stdout.take(), child.stderr.take())
     else {
@@ -250,11 +431,33 @@ fn launch(name: &str, config: &ServerConfig) -> Result<Vec<Arc<dyn Tool>>, Strin
     connect(name, config, stdout, stdin)
 }
 
-/// The server's process, with its pipes.
-fn spawn(config: &ServerConfig) -> Result<std::process::Child, String> {
+/// The server's process, with its pipes, started in its `cwd` from `base`,
+/// the config's folder.
+fn spawn(config: &ServerConfig, base: &Path) -> Result<std::process::Child, String> {
     use std::process::{Command, Stdio};
+    let folder = config.folder(base);
+    if let Some(folder) = &folder
+        && !folder.is_dir()
+    {
+        return Err(format!(
+            "Cannot start `{}` in {}: there is no such folder.",
+            config.command,
+            folder.display()
+        ));
+    }
     let build = |program: &str, args: &[String]| {
         let mut command = Command::new(program);
+        if config.env_scrub {
+            command.env_clear();
+            for name in KEPT_ENV {
+                if let Some(value) = std::env::var_os(name) {
+                    command.env(name, value);
+                }
+            }
+        }
+        if let Some(folder) = &folder {
+            command.current_dir(folder);
+        }
         command
             .args(args)
             .envs(&config.env)
@@ -301,7 +504,7 @@ fn reach(name: &str, config: &ServerConfig) -> Result<Vec<Arc<dyn Tool>>, String
         url: config.url.trim().to_owned(),
         headers: config.headers.clone(),
         client,
-        wait: config.call_time(),
+        wait: config.call_time().max(config.start_time()),
         session: Mutex::default(),
         greeting: Mutex::default(),
         greeting_again: Mutex::default(),
@@ -360,7 +563,7 @@ struct Link {
     url: String,
     headers: HashMap<String, String>,
     client: reqwest::blocking::Client,
-    /// How long a call may take.
+    /// How long a request may take: a call, or the start if that is longer.
     wait: Duration,
     session: Mutex<Session>,
     /// The greeting as first sent, sent again when the server has forgotten
@@ -639,7 +842,7 @@ fn connect(
             "capabilities": {},
             "clientInfo": {"name": "letronna", "version": env!("CARGO_PKG_VERSION")},
         }),
-        START_TIME,
+        config.start_time(),
     )?;
     server.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))?;
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
@@ -649,9 +852,9 @@ fn connect(
             Some(cursor) => json!({ "cursor": cursor }),
             None => json!({}),
         };
-        let page = server.request("tools/list", params, START_TIME)?;
+        let page = server.request("tools/list", params, config.start_time())?;
         for tool in page["tools"].as_array().into_iter().flatten() {
-            let Some(own) = tool["name"].as_str() else {
+            let Some(own) = tool["name"].as_str().filter(|own| config.offers(own)) else {
                 continue;
             };
             let (description, schema) = vetted(name, own, tool);
@@ -663,7 +866,7 @@ fn connect(
                 schema,
                 // A server elsewhere is only its word, and a tool that
                 // reaches other machines can send what it is given there.
-                ask: !config.auto_approve.iter().any(|t| t == own)
+                ask: !config.auto_approve.approves(own, &tool["annotations"])
                     && !(config.url.trim().is_empty() && only_looks(&tool["annotations"])),
                 read_only: tool["annotations"]["readOnlyHint"].as_bool() == Some(true),
                 wait: config.call_time(),
@@ -1530,7 +1733,7 @@ mod tests {
         let (from_server, to_client) = std::io::pipe().unwrap();
         scripted_server(from_client, to_client);
         let config = ServerConfig {
-            auto_approve: vec!["look up".into()],
+            auto_approve: AutoApprove::Names(vec!["look up".into()]),
             ..Default::default()
         };
         let tools = connect("demo", &config, from_server, to_server).unwrap();
@@ -1616,7 +1819,7 @@ mod tests {
             let (from_server, to_client) = std::io::pipe().unwrap();
             scripted_server(from_client, to_client);
             let config = ServerConfig {
-                auto_approve,
+                auto_approve: AutoApprove::Names(auto_approve),
                 ..Default::default()
             };
             let tools = connect("demo", &config, from_server, to_server).unwrap();
@@ -1650,7 +1853,7 @@ mod tests {
             scripted_server(from_client, to_client);
             let config = ServerConfig {
                 url: "https://example.com/mcp".into(),
-                auto_approve,
+                auto_approve: AutoApprove::Names(auto_approve),
                 ..Default::default()
             };
             let tools = connect("demo", &config, from_server, to_server).unwrap();
@@ -1691,7 +1894,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.servers["fs"].args, ["-y", "pkg"]);
-        assert_eq!(config.servers["fs"].auto_approve, ["read"]);
+        assert_eq!(
+            config.servers["fs"].auto_approve,
+            AutoApprove::Names(vec!["read".into()])
+        );
         // A server reached by URL has no command, and is passed over.
         assert!(config.servers["web"].command.is_empty());
     }
@@ -1734,7 +1940,7 @@ mod tests {
             }}
         }}))
         .unwrap();
-        let mut found = secret_values(&config);
+        let mut found = secret_values(&config, &|_| None);
         found.sort();
         assert_eq!(
             found,
@@ -1744,5 +1950,254 @@ mod tests {
                 "remote-0123456789abcdef"
             ]
         );
+    }
+
+    /// The environment the variable tests see.
+    fn var(name: &str) -> Option<String> {
+        match name {
+            "TOKEN" => Some("tok-0123456789abcdef".into()),
+            "EMPTY" => Some(String::new()),
+            "HOME" => Some("/home/someone".into()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn variables_are_filled_in_from_the_environment_or_their_defaults() {
+        for (text, filled) in [
+            ("Bearer ${TOKEN}", "Bearer tok-0123456789abcdef"),
+            ("${TOKEN:-unused}", "tok-0123456789abcdef"),
+            ("${UNSET:-8080}", "8080"),
+            ("${EMPTY:-fallback}", "fallback"),
+            ("[${EMPTY}]", "[]"),
+            ("${HOME}/work, ${HOME}", "/home/someone/work, /home/someone"),
+            ("$TOKEN and ${never closed", "$TOKEN and ${never closed"),
+        ] {
+            assert_eq!(expand(text, &var).unwrap(), filled, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_variable_unset_with_no_default_keeps_its_server_from_starting_and_is_named() {
+        let error = expand("--token=${GITHUB_TOKEN}", &var).unwrap_err();
+        assert!(error.starts_with("${GITHUB_TOKEN} is not set"), "{error}");
+        let config = ServerConfig {
+            command: "never-run".into(),
+            env: HashMap::from([("KEY".into(), "${LETRONNA_TEST_NEVER_SET}".into())]),
+            ..Default::default()
+        };
+        let Err(error) = launch("files", &config) else {
+            panic!("a server started without its variable");
+        };
+        assert!(
+            error.starts_with("files: ${LETRONNA_TEST_NEVER_SET} is not set"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn every_part_of_a_servers_config_has_its_variables_filled_in() {
+        let config: ServerConfig = serde_json::from_value(json!({
+            "command": "${HOME}/bin/server", "args": ["--token", "${TOKEN}"],
+            "cwd": "${HOME}/work", "url": "https://${HOST:-example.com}/mcp",
+            "env": {"API_KEY": "${TOKEN}"},
+            "headers": {"Authorization": "Bearer ${TOKEN}"}
+        }))
+        .unwrap();
+        let config = config.expanded(&var).unwrap();
+        assert_eq!(config.command, "/home/someone/bin/server");
+        assert_eq!(config.args, ["--token", "tok-0123456789abcdef"]);
+        assert_eq!(config.cwd.as_deref(), Some("/home/someone/work"));
+        assert_eq!(config.url, "https://example.com/mcp");
+        assert_eq!(config.env["API_KEY"], "tok-0123456789abcdef");
+        assert_eq!(
+            config.headers["Authorization"],
+            "Bearer tok-0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn a_secret_given_as_a_variable_is_hidden_as_its_value() {
+        let config: Config = serde_json::from_value(json!({"mcpServers": {
+            "remote": {"url": "https://mcp.example.com",
+                "headers": {"Authorization": "Bearer ${TOKEN}"}},
+            "files": {"command": "files-server", "env": {
+                "API_KEY": "${UNSET_KEY:-default-key-0123456789}",
+                "OTHER_TOKEN": "${UNSET_TOKEN}"
+            }}
+        }}))
+        .unwrap();
+        let mut found = secret_values(&config, &var);
+        found.sort();
+        assert_eq!(found, ["default-key-0123456789", "tok-0123456789abcdef"]);
+    }
+
+    #[test]
+    fn globs_match_any_run_of_characters_where_a_star_stands() {
+        for (glob, name, matches) in [
+            ("read_file", "read_file", true),
+            ("read_file", "read_files", false),
+            ("read_*", "read_file", true),
+            ("read_*", "read_", true),
+            ("*_file", "write_file", true),
+            ("*", "anything", true),
+            ("get_*_by_*", "get_issue_by_id", true),
+            ("get_*_by_*", "get_issue", false),
+            ("a*a", "a", false),
+            ("*b*b", "b", false),
+            ("Read*", "read_file", false),
+        ] {
+            assert_eq!(matches_glob(glob, name), matches, "{glob} {name}");
+        }
+    }
+
+    #[test]
+    fn include_and_exclude_globs_choose_which_tools_a_server_offers() {
+        let (from_client, to_server) = std::io::pipe().unwrap();
+        let (from_server, to_client) = std::io::pipe().unwrap();
+        scripted_server(from_client, to_client);
+        let config: ServerConfig = serde_json::from_value(json!({
+            "includeTools": ["echo", "look*", "planted"],
+            "excludeTools": ["plant*"]
+        }))
+        .unwrap();
+        let tools = connect("demo", &config, from_server, to_server).unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert_eq!(names, ["mcp__demo__echo", "mcp__demo__look_up"]);
+        assert!(ServerConfig::default().offers("anything"));
+        let config = ServerConfig {
+            exclude_tools: vec!["delete_*".into()],
+            ..Default::default()
+        };
+        assert!(config.offers("read_file") && !config.offers("delete_file"));
+    }
+
+    #[test]
+    fn auto_approve_read_only_takes_a_remote_servers_word_that_a_tool_only_looks() {
+        let config: ServerConfig = serde_json::from_value(json!({
+            "url": "https://example.com/mcp", "autoApprove": "readOnly"
+        }))
+        .unwrap();
+        let (from_client, to_server) = std::io::pipe().unwrap();
+        let (from_server, to_client) = std::io::pipe().unwrap();
+        scripted_server(from_client, to_client);
+        let tools = connect("demo", &config, from_server, to_server).unwrap();
+        let (echo, look_up, planted) = (&tools[0], &tools[1], &tools[2]);
+        assert!(!look_up.needs_approval());
+        assert!(echo.needs_approval() && planted.needs_approval());
+        let looks = json!({"readOnlyHint": true, "openWorldHint": false});
+        assert!(!AutoApprove::Word("readonly".into()).approves("look up", &looks));
+        assert!(!AutoApprove::Word("look up".into()).approves("look up", &looks));
+    }
+
+    #[test]
+    fn a_server_that_does_not_answer_within_its_startup_time_is_given_up_on() {
+        let (_from_client, to_server) = std::io::pipe().unwrap();
+        let (from_server, _to_client) = std::io::pipe().unwrap();
+        let config = ServerConfig {
+            startup_timeout_ms: Some(300),
+            ..Default::default()
+        };
+        let asked = std::time::Instant::now();
+        let Err(error) = connect("mute", &config, from_server, to_server) else {
+            panic!("a mute server started");
+        };
+        assert!(error.contains("did not answer initialize"), "{error}");
+        assert!(asked.elapsed() < Duration::from_secs(5));
+        for (ms, start_time) in [
+            (None, START_TIME),
+            (Some(0), START_TIME),
+            (Some(300_000), Duration::from_secs(300)),
+            (Some(u64::MAX), LONGEST_CALL),
+        ] {
+            let config = ServerConfig {
+                startup_timeout_ms: ms,
+                ..Default::default()
+            };
+            assert_eq!(config.start_time(), start_time, "{ms:?}");
+        }
+    }
+
+    /// The names in the environment a server started with `config` is given.
+    #[cfg(unix)]
+    fn environment_of(config: &ServerConfig) -> Vec<String> {
+        let config = ServerConfig {
+            command: "env".into(),
+            ..config.clone()
+        };
+        let printed = spawn(&config, Path::new("/"))
+            .unwrap()
+            .wait_with_output()
+            .unwrap();
+        String::from_utf8_lossy(&printed.stdout)
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .map(|(name, _)| name.to_owned())
+            .collect()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_scrubbed_server_is_given_only_where_things_are_and_its_own_env() {
+        let config = ServerConfig {
+            env: HashMap::from([("SERVER_ONLY".into(), "yes".into())]),
+            env_scrub: true,
+            ..Default::default()
+        };
+        let names = environment_of(&config);
+        let has = |name: &str| names.iter().any(|n| n == name);
+        assert!(has("PATH") && has("SERVER_ONLY"), "{names:?}");
+        assert!(
+            names
+                .iter()
+                .all(|n| n == "SERVER_ONLY" || KEPT_ENV.contains(&n.as_str())),
+            "{names:?}"
+        );
+        // Unscrubbed, it inherits every variable, as before.
+        let inherited = environment_of(&ServerConfig {
+            env_scrub: false,
+            ..config
+        });
+        // macOS drops DYLD_ variables on the way into a system program.
+        let outside = std::env::vars_os()
+            .filter_map(|(name, _)| name.into_string().ok())
+            .filter(|name| !KEPT_ENV.contains(&name.as_str()) && !name.starts_with("DYLD_"));
+        for name in outside {
+            assert!(inherited.contains(&name), "{name}");
+        }
+        assert!(inherited.iter().any(|n| n == "SERVER_ONLY"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_server_starts_in_its_cwd_taken_from_the_config_folder() {
+        let base = std::env::temp_dir().join(format!("letronna-mcp-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("work")).unwrap();
+        let config = ServerConfig {
+            command: "pwd".into(),
+            args: vec!["-P".into()],
+            cwd: Some("work".into()),
+            ..Default::default()
+        };
+        let printed = spawn(&config, &base).unwrap().wait_with_output().unwrap();
+        let said = String::from_utf8_lossy(&printed.stdout);
+        assert_eq!(
+            Path::new(said.trim()),
+            base.join("work").canonicalize().unwrap()
+        );
+        let absolute = ServerConfig {
+            cwd: Some(base.display().to_string()),
+            ..Default::default()
+        };
+        assert_eq!(absolute.folder(Path::new("/elsewhere")), Some(base.clone()));
+        assert_eq!(ServerConfig::default().folder(&base), None);
+        // One that is not there is said before anything starts.
+        let gone = ServerConfig {
+            cwd: Some("gone".into()),
+            ..config
+        };
+        let error = spawn(&gone, &base).unwrap_err();
+        assert!(error.contains("no such folder"), "{error}");
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }

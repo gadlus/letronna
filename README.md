@@ -178,6 +178,27 @@ A server that runs elsewhere -- a hosted one, or one on another machine -- is gi
 
 It is spoken to over HTTP as the protocol now has it (streamable HTTP: an address that usually ends in `/mcp`). The older way, an address ending in `/sse`, is not supported.
 
+A server's `command`, `args`, `cwd`, `url`, `env` and `headers` may name `${VAR}` or `${VAR:-default}`, filled in from Letronna's environment when the server starts, so a key need not be written into the file; a variable that is not set and has no default keeps that server from starting. A server also takes:
+
+- `timeout_ms`: how long one call may take (2 minutes unless set), and `startup_timeout_ms`: how long it may take to start and list its tools (1 minute unless set); a day at most.
+- `includeTools` and `excludeTools`: tool names, where `*` matches any run of characters, to offer the model only some of a server's tools; an excluded tool is never offered.
+- `"autoApprove": "readOnly"`: every tool the server marks read-only, not destructive and closed to the world runs without asking. A server run here is taken at its word on that already; this takes a server elsewhere at its word too.
+- `cwd`: the folder a server run here starts in, from the data folder when relative.
+- `"env_scrub": true`: start it with only `PATH`, `HOME`, the language, the temp folder and, on Windows, the system folders, plus its own `env`, rather than all of Letronna's environment.
+
+```json
+{
+  "mcpServers": {
+    "hosted": {
+      "url": "https://example.com/mcp",
+      "headers": { "Authorization": "Bearer ${HOSTED_KEY}" },
+      "excludeTools": ["delete_*"],
+      "autoApprove": "readOnly"
+    }
+  }
+}
+```
+
 ### A lighter browser
 
 On Linux and macOS, [Lightpanda](https://github.com/lightpanda-io/browser) is a browser made for agents that draws nothing, which makes it far lighter than Chrome or Edge with no window: on a Mac mini, about 20 MB idle and under 60 MB with Wikipedia open, where a hidden Edge takes over 160 MB with a small page. It comes with an MCP server, so with `lightpanda` on the PATH this is all it needs (it sends usage telemetry unless told not to, as here):
