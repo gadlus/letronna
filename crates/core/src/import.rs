@@ -52,6 +52,7 @@ pub struct Source {
 
 /// A session offered for import, read cheaply: its head, and as much of the
 /// file as it took to find the first thing said.
+#[derive(Clone)]
 pub struct Candidate {
     pub tool: Tool,
     pub session_id: String,
@@ -137,6 +138,21 @@ pub fn into_conversation(imported: Imported, id: u64) -> Conversation {
         imported_from: Some(imported.source),
         ..Default::default()
     }
+}
+
+/// Why a file yielded no messages at all, with how much of it was skipped:
+/// a file of nothing but unreadable lines is a format this build does not
+/// know rather than an empty session, and the count is what tells them apart.
+fn nothing_to_import(path: &Path, skipped: usize) -> String {
+    let what = match skipped {
+        0 => return format!("{} has nothing Letronna can import.", path.display()),
+        1 => "1 part of it".to_owned(),
+        n => format!("{n} parts of it"),
+    };
+    format!(
+        "{} has nothing Letronna can import: {what} could not be read.",
+        path.display()
+    )
 }
 
 fn claude_code_root() -> Option<PathBuf> {
@@ -245,10 +261,7 @@ fn import_claude_code(path: &Path) -> Result<Imported, String> {
         }
     }
     if messages.is_empty() {
-        return Err(format!(
-            "{} has nothing Letronna can import.",
-            path.display()
-        ));
+        return Err(nothing_to_import(path, skipped));
     }
     let title = first_user_title(&messages);
     Ok(Imported {
@@ -555,10 +568,7 @@ fn import_codex(path: &Path) -> Result<Imported, String> {
         return Err(format!("{} has no session id.", path.display()));
     }
     if messages.is_empty() {
-        return Err(format!(
-            "{} has nothing Letronna can import.",
-            path.display()
-        ));
+        return Err(nothing_to_import(path, skipped));
     }
     let title = first_user_title(&messages);
     Ok(Imported {
@@ -890,6 +900,24 @@ mod tests {
         assert_eq!(messages[2].name, "shell");
         assert_eq!(messages[2].content, "app.py\nREADME.md");
         assert_eq!(messages[3].content, "Added the endpoint.");
+    }
+
+    #[test]
+    fn a_file_with_nothing_readable_says_how_much_was_skipped() {
+        let dir = scratch("nothing-readable");
+        let path = write(&dir, "def456.jsonl", "not json\n{\"type\":\"summary\"}\n");
+
+        let Err(error) = import_claude_code(&path) else {
+            panic!("a file with no turns in it imported");
+        };
+        assert!(
+            error.ends_with("has nothing Letronna can import: 2 parts of it could not be read.")
+        );
+        let empty = write(&dir, "empty.jsonl", "");
+        let Err(error) = import_claude_code(&empty) else {
+            panic!("an empty file imported");
+        };
+        assert!(error.ends_with("has nothing Letronna can import."));
     }
 
     #[test]

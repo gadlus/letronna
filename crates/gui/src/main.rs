@@ -74,6 +74,11 @@ fn main() {
             KeyBinding::new("shift-tab", ui::browser::PageTabBack, Some("Browser")),
             KeyBinding::new("tab", ui::composer::LeaveComposer, Some("Composer > Input")),
             KeyBinding::new("enter", ui::search::OpenHit, Some("SearchHit")),
+            // Bound after the input's own, and so tried first: the picker's
+            // box keeps the keys while the list moves under it.
+            KeyBinding::new("up", ui::import::PickPrevious, Some("ImportPicker > Input")),
+            KeyBinding::new("down", ui::import::PickNext, Some("ImportPicker > Input")),
+            KeyBinding::new("enter", ui::import::PickThis, Some("ImportPicker > Input")),
         ]);
         platform::tray::init(cx);
         cx.on_window_closed(|cx| {
