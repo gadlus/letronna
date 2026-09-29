@@ -603,8 +603,13 @@ impl BrowserView {
                 .spawn(async move { letronna_core::browser::point_at(x, y) })
                 .await;
             let _ = view.update_in(cx, |view, window, cx| {
+                // Only while still waiting for it: Escape, or a first click's
+                // answer, may have come in the meantime.
                 match found {
-                    Ok(element) => view.choose_point(element, window, cx),
+                    Ok(element) if matches!(view.pointing, Some(Pointing::Armed)) => {
+                        view.choose_point(element, window, cx)
+                    }
+                    Ok(_) => {}
                     Err(why) => view.note = Some(why),
                 }
                 cx.notify();
