@@ -41,6 +41,9 @@ impl Chat {
                     if page == Page::Skills {
                         this.reload_skills();
                     }
+                    if page == Page::Plugins {
+                        this.reload_plugins();
+                    }
                     this.focus_composer(window, cx);
                     cx.notify();
                 }))
@@ -230,6 +233,13 @@ impl Chat {
                         AppIcon::Sparkles,
                         "Skills",
                         Some(Page::Skills),
+                        cx,
+                    ))
+                    .child(self.nav_item(
+                        "plugins",
+                        AppIcon::Puzzle,
+                        "Plugins",
+                        Some(Page::Plugins),
                         cx,
                     ))
                     .child(self.nav_item(

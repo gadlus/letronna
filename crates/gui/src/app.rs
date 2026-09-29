@@ -61,6 +61,7 @@ pub(crate) struct Aside {
 pub(crate) enum Page {
     Chat,
     Skills,
+    Plugins,
     Messaging,
     Artifacts,
     Jobs,
@@ -71,6 +72,7 @@ impl Page {
         match self {
             Page::Chat => "Chat",
             Page::Skills => "Skills",
+            Page::Plugins => "Plugins",
             Page::Messaging => "Messaging",
             Page::Artifacts => "Artifacts",
             Page::Jobs => "Scheduled jobs",
@@ -83,6 +85,7 @@ impl Page {
             Page::Skills => {
                 "Reusable playbooks Letronna can load into a session. Nothing installed yet."
             }
+            Page::Plugins => "Skills, commands, styles and MCP servers that come as one.",
             Page::Messaging => "Message Letronna from a chat app, and get answers back there.",
             Page::Artifacts => "Files, images and links produced in sessions will collect here.",
             // Jobs renders its own page; this blurb is only a fallback.
@@ -285,6 +288,8 @@ pub(crate) struct Chat {
     pub(crate) skills_note: Option<Result<String, String>>,
     /// The skills the last add left out, each with why.
     pub(crate) skills_refused: Vec<String>,
+    /// The Plugins page: what is installed and the marketplaces.
+    pub(crate) plugins: crate::ui::plugin_page::PluginsPage,
     /// The side question on show, if one is.
     pub(crate) aside: Option<Aside>,
     /// Sessions a notice woke, marked in the sidebar until they are next on
@@ -463,6 +468,7 @@ impl Chat {
                 .auto_grow(3, 10)
                 .placeholder("What should Letronna do?")
         });
+        let plugins = crate::ui::plugin_page::PluginsPage::new(window, cx);
         let skill_source = cx.new(|cx| {
             InputState::new(window, cx).placeholder("GitHub repo, link to a SKILL.md, or a folder")
         });
@@ -533,6 +539,20 @@ impl Chat {
                     this.add_skills(window, cx);
                 }
             }),
+            cx.subscribe_in(&plugins.source, window, |this, _, event, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.add_plugin(window, cx);
+                }
+            }),
+            cx.subscribe_in(
+                &plugins.market_source,
+                window,
+                |this, _, event, window, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. }) {
+                        this.add_market(window, cx);
+                    }
+                },
+            ),
             // Only a window left to follow the system hears it change; the
             // other settings pin the window's own look.
             cx.observe_window_appearance(window, |this, window, cx| {
@@ -653,6 +673,7 @@ impl Chat {
             adding_skills: false,
             skills_note: None,
             skills_refused: Vec::new(),
+            plugins,
             aside: None,
             unseen: std::collections::HashSet::new(),
             stopping: false,
@@ -2772,6 +2793,8 @@ impl Render for Chat {
             self.artifacts_page(cx).into_any_element()
         } else if self.page == Page::Skills {
             self.skills_page(cx).into_any_element()
+        } else if self.page == Page::Plugins {
+            self.plugins_page(cx).into_any_element()
         } else if self.page == Page::Messaging {
             self.messaging_page(cx).into_any_element()
         } else if self.page == Page::Activity {
