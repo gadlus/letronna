@@ -180,6 +180,7 @@ impl ImportPicker {
         Some(
             v_flex()
                 .id(("import", row))
+                .w_full()
                 .h(ROW)
                 .px_2()
                 .justify_center()
