@@ -1,4 +1,5 @@
 use crate::failure::{Failure, FailureKind, classify};
+use crate::models::Limit;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -305,6 +306,9 @@ struct Budget {
     tool_chars: usize,
     /// The longest reply asked for, as `max_tokens`.
     reply: usize,
+    /// Sent again after an overflow: every tool result but the newest few
+    /// goes out cleared, and another overflow stands.
+    squeezed: bool,
 }
 
 impl Budget {
@@ -315,6 +319,7 @@ impl Budget {
         messages: MAX_MESSAGES,
         tool_chars: MAX_TOOL_CHARS,
         reply: REPLY_TOKENS,
+        squeezed: false,
     };
 }
 
@@ -327,9 +332,14 @@ fn budget(connection: &Connection, cap: u64) -> Budget {
         0 => CAP_TOKENS,
         cap => cap as usize,
     };
-    // A request without messages is the part every request carries.
-    let fixed = tokens(&body(connection, &[], None, &Budget::SMALL).to_string());
+    let fixed = fixed_tokens(connection);
     sized(facts.context, facts.max_output, cap, fixed)
+}
+
+/// What the system prompt and the tools take of every request over
+/// `connection`: a request without messages.
+fn fixed_tokens(connection: &Connection) -> usize {
+    tokens(&body(connection, &[], None, &Budget::SMALL).to_string())
 }
 
 /// The budget for a model that reads `context` tokens and writes `output`,
@@ -382,6 +392,7 @@ fn sized(context: Option<u64>, output: Option<u64>, cap: usize, fixed: usize) ->
         // 24,000 characters, goes out whole.
         tool_chars: (room / 2).max(MAX_TOOL_CHARS),
         reply,
+        squeezed: false,
     }
 }
 
@@ -673,7 +684,8 @@ const STUB_STEP: usize = 8;
 /// Where the old part of `window` ends. Nothing is old until the window,
 /// with every result whole, costs more than half the budget; then what is
 /// old ends at the round holding the result on the last whole step of
-/// `STUB_STEP` results that leaves the newest `KEEP_RESULTS` out.
+/// `STUB_STEP` results that leaves the newest `KEEP_RESULTS` out. A squeezed
+/// budget makes every result but those newest old at once.
 ///
 /// The cost is taken without stubs, so the room they free cannot turn them
 /// off again on the next request, and results are only ever added, so the
@@ -681,13 +693,16 @@ const STUB_STEP: usize = 8;
 /// a reply's calls and their results -- is never split, so the one the model
 /// has not answered yet is never old.
 fn old_before(window: &[Message], budget: &Budget) -> usize {
-    if token_sums(window, budget.tool_chars)[window.len()] <= budget.tokens / 2 {
+    if !budget.squeezed && token_sums(window, budget.tool_chars)[window.len()] <= budget.tokens / 2
+    {
         return 0;
     }
     let results: Vec<usize> = (0..window.len())
         .filter(|&i| window[i].role == "tool")
         .collect();
-    let boundary = results.len().saturating_sub(KEEP_RESULTS) / STUB_STEP * STUB_STEP;
+    // After an overflow the cache is missed anyway, so nothing waits for a step.
+    let step = if budget.squeezed { 1 } else { STUB_STEP };
+    let boundary = results.len().saturating_sub(KEEP_RESULTS) / step * step;
     if boundary == 0 {
         return 0;
     }
@@ -1000,11 +1015,86 @@ pub fn start(connection: Connection, messages: Vec<Message>) -> async_channel::R
     let (sender, receiver) = async_channel::bounded(64);
     std::thread::spawn(move || {
         let budget = budget(&connection, crate::store::settings().context_cap);
-        let start = window_start(&messages, &budget);
-        let result = stream(&connection, &messages, start, &budget, &sender);
+        let result = send_window(&connection, &messages, &budget, &sender);
         let _ = sender.send_blocking(Event::Finished(result));
     });
     receiver
+}
+
+/// Send `messages` in the window `budget` gives, unless what no window
+/// leaves out is already more than the model reads at once.
+fn send_window(
+    connection: &Connection,
+    messages: &[Message],
+    budget: &Budget,
+    sender: &async_channel::Sender<Event>,
+) -> Result<(), Failure> {
+    if let Some(failure) = doomed(connection, messages, budget) {
+        return Err(failure);
+    }
+    let start = window_start(messages, budget);
+    stream(connection, messages, start, budget, sender)
+}
+
+/// A refusal, when the model's window is known, for a request whose fixed
+/// part -- the system prompt, the tools and the newest message, which no
+/// window leaves out -- is more than the window holds, so that sending it
+/// could only be turned down.
+fn doomed(connection: &Connection, messages: &[Message], budget: &Budget) -> Option<Failure> {
+    let model = connection.model.trim();
+    let context = crate::models::facts(&connection.endpoint, model).context?;
+    let newest = messages
+        .last()
+        .map_or(0, |m| message_tokens(m, budget.tool_chars));
+    let fixed = fixed_tokens(connection) + newest;
+    (fixed as u64 > context).then(|| {
+        Failure::new(
+            FailureKind::ContextTooLong,
+            format!("This is too long for {model}, which reads {context} tokens at once: the instructions, the tools and the newest message alone come to about {fixed}. Start a new session with /new, or rewind to before the long message and send a shorter one."),
+        )
+    })
+}
+
+/// A reply shorter than this, in tokens, is of little use, so an overflow
+/// that leaves less room than this for the reply cuts the prompt instead.
+const LEAST_REPLY: usize = 1_024;
+
+/// The budget to send again with after `failure`, once, when it is an
+/// overflow a smaller window or a shorter reply can mend. What the error gave
+/// away is learned for the model first, so the requests after it are sized
+/// by it too.
+fn refit(connection: &Connection, failure: &Failure, sent: &Budget) -> Option<Budget> {
+    let overflow = failure.overflow.filter(|_| !sent.squeezed)?;
+    let model = connection.model.trim();
+    if let Some(tokens) = overflow.context {
+        crate::models::learn(&connection.endpoint, model, Limit::Context(tokens));
+    }
+    if let Some(tokens) = overflow.output {
+        crate::models::learn(&connection.endpoint, model, Limit::Output(tokens));
+    }
+    let mut next = Budget {
+        squeezed: true,
+        ..budget(connection, crate::store::settings().context_cap)
+    };
+    let left = overflow
+        .context
+        .zip(overflow.input)
+        .map(|(context, input)| context.saturating_sub(input) as usize)
+        .filter(|left| *left >= LEAST_REPLY);
+    if overflow.output.is_some() || left.is_some() {
+        // The prompt fitted and the reply asked for did not.
+        next.reply = next.reply.min(left.unwrap_or(usize::MAX));
+        return (next.reply < sent.reply).then_some(next);
+    }
+    // The estimate is no tokenizer, so a window re-sized to the limit may
+    // still be too big, and an error that named none re-sizes nothing: the
+    // window is also at most half the one turned down, which moves it on by
+    // a step at least.
+    next.tokens = next.tokens.min(sent.tokens / 2);
+    while next.step > next.tokens {
+        next.step /= 2;
+    }
+    Some(next)
 }
 
 fn stream(
@@ -1082,6 +1172,12 @@ fn stream(
             return Err(failure);
         }
         let Some(retry) = crate::retry::after(&failure, tried, connection.unattended) else {
+            // An overflow never passes by itself, so it is never waited out:
+            // it gets here on the try it came back on. The one request sent
+            // again after it has tries of its own for what does pass.
+            if let Some(budget) = refit(connection, &failure, budget) {
+                return send_window(connection, messages, &budget, sender);
+            }
             return Err(failure);
         };
         sender
@@ -2968,5 +3064,170 @@ mod tests {
         assert!(ran_out_reading(&broken(send().unwrap())));
         assert!(!ran_out_reading(&broken(send().unwrap())));
         worker.join().unwrap();
+    }
+
+    /// The tool results the request in `body` sent that went out cleared,
+    /// and the reply it asked for.
+    fn cleared_and_asked(body: &str) -> (usize, u64) {
+        let body: Value = serde_json::from_str(body).unwrap();
+        let sent: Vec<String> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .map(|m| m["content"].as_str().unwrap().to_owned())
+            .collect();
+        (cleared(&sent), body["max_tokens"].as_u64().unwrap())
+    }
+
+    #[test]
+    fn an_overflow_is_sent_again_once_sized_to_the_limit_it_named() {
+        let (endpoint, worker) = serve(vec![
+            (
+                "400 Bad Request",
+                "application/json",
+                r#"{"error":{"message":"This model's maximum context length is 16000 tokens. However, your messages resulted in 20000 tokens. Please reduce the length of the messages.","type":"invalid_request_error","code":"context_length_exceeded"}}"#,
+            ),
+            (
+                "200 OK",
+                "text/event-stream",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: [DONE]\n\n",
+            ),
+        ]);
+        // A model of its own, so no other test on this port learns its limit.
+        let c = Connection {
+            endpoint: endpoint.clone(),
+            model: "names-its-limit".into(),
+            ..connection()
+        };
+        let rx = start(c.clone(), reads(12, 1_000));
+        assert!(matches!(rx.recv_blocking().unwrap(), Event::Delta(s) if s == "Hello"));
+        assert!(matches!(
+            rx.recv_blocking().unwrap(),
+            Event::Finished(Ok(()))
+        ));
+        let bodies = worker.join().unwrap();
+        // The limit is kept for the model, and the requests after this one
+        // are sized by it: a reply of a quarter of the window at most.
+        let facts = crate::models::facts(&endpoint, "names-its-limit");
+        assert_eq!(facts.context, Some(16_000));
+        assert_eq!(budget(&c, 0).reply, 4_000);
+        // Sent again sized by it, with all but the newest five results cleared.
+        assert_eq!(cleared_and_asked(&bodies[0]), (0, 8_192));
+        assert_eq!(cleared_and_asked(&bodies[1]), (7, 4_000));
+    }
+
+    #[test]
+    fn an_overflow_is_not_waited_out_and_a_second_one_stands() {
+        // Ollama's words, with the 500 it gives them, which is otherwise
+        // a server error that passes.
+        let overflow = r#"{"error":{"message":"the input length exceeds the context length","type":"api_error","param":null,"code":null}}"#;
+        let (endpoint, worker) = serve(vec![
+            ("500 Internal Server Error", "application/json", overflow),
+            ("500 Internal Server Error", "application/json", overflow),
+        ]);
+        let rx = start(
+            Connection {
+                endpoint,
+                ..connection()
+            },
+            reads(12, 1_000),
+        );
+        let Event::Finished(Err(failure)) = rx.recv_blocking().unwrap() else {
+            panic!("an overflow was waited out, or the retry went through");
+        };
+        assert_eq!(failure.kind, FailureKind::ContextTooLong);
+        assert_eq!(
+            failure.to_string(),
+            "the input length exceeds the context length"
+        );
+        let bodies = worker.join().unwrap();
+        // Nothing named a limit, so only the results were cleared.
+        assert_eq!(cleared_and_asked(&bodies[1]), (7, 8_192));
+    }
+
+    #[test]
+    fn an_output_limit_clamps_the_reply_asked_for() {
+        let (endpoint, worker) = serve(vec![
+            (
+                "400 Bad Request",
+                "application/json",
+                r#"{"error":{"message":"max_tokens is too large: 8192. This model supports at most 4000 completion tokens, whereas you provided 8192.","type":"invalid_request_error","param":"max_tokens","code":null}}"#,
+            ),
+            (
+                "200 OK",
+                "text/event-stream",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: [DONE]\n\n",
+            ),
+        ]);
+        let rx = start(
+            Connection {
+                endpoint,
+                model: "writes-4000".into(),
+                ..connection()
+            },
+            reads(1, 10),
+        );
+        assert!(matches!(rx.recv_blocking().unwrap(), Event::Delta(s) if s == "Hello"));
+        let bodies = worker.join().unwrap();
+        assert_eq!(cleared_and_asked(&bodies[0]).1, 8_192);
+        assert_eq!(cleared_and_asked(&bodies[1]).1, 4_000);
+    }
+
+    #[test]
+    fn a_prompt_that_fits_gets_the_reply_its_window_has_left() {
+        let c = Connection {
+            endpoint: "http://leaves-room.test/v1".into(),
+            ..connection()
+        };
+        let body = serde_json::json!({"type": "error", "error": {"type": "invalid_request_error", "message": "input length and `max_tokens` exceed context limit: 196000 + 21333 > 200000, decrease input length or `max_tokens` and try again"}});
+        let failure = classify(Some(400), &reqwest::header::HeaderMap::new(), &body);
+        let sent = Budget {
+            reply: 21_333,
+            ..budget(&c, 0)
+        };
+        let next = refit(&c, &failure, &sent).unwrap();
+        // The window stays as it was; only the reply is cut.
+        assert_eq!(next.reply, 4_000);
+        assert_eq!(next.tokens, budget(&c, 0).tokens);
+        assert!(next.squeezed);
+        // Once squeezed, a request is not sent again.
+        assert!(refit(&c, &failure, &next).is_none());
+    }
+
+    #[test]
+    fn a_request_no_window_can_hold_is_refused_before_it_is_sent() {
+        // The first request teaches a window smaller than the newest message.
+        let (endpoint, worker) = serve(vec![(
+            "400 Bad Request",
+            "application/json",
+            r#"{"error":{"code":400,"message":"the request exceeds the available context size, try increasing it","type":"exceed_context_size_error","n_prompt_tokens":520,"n_ctx":300}}"#,
+        )]);
+        let c = Connection {
+            endpoint,
+            model: "reads-300".into(),
+            ..connection()
+        };
+        let long = vec![Message {
+            role: "user".into(),
+            content: "word ".repeat(400),
+            ..Default::default()
+        }];
+        let rx = start(c.clone(), long.clone());
+        let Event::Finished(Err(failure)) = rx.recv_blocking().unwrap() else {
+            panic!("a doomed request was sent again");
+        };
+        assert_eq!(failure.kind, FailureKind::ContextTooLong);
+        assert!(failure.to_string().contains("/new"), "{failure}");
+        assert!(failure.to_string().contains("rewind"), "{failure}");
+        // Only the first went out; the next is refused before it is sent.
+        assert_eq!(worker.join().unwrap().len(), 1);
+        assert!(doomed(&c, &long, &budget(&c, 0)).is_some());
+        let short = [Message {
+            role: "user".into(),
+            content: "Hi".into(),
+            ..Default::default()
+        }];
+        assert!(doomed(&c, &short, &budget(&c, 0)).is_none());
     }
 }
