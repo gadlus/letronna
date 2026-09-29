@@ -7,6 +7,13 @@
 //! `memory` tool. When a project folder is attached, its `AGENTS.md` (or
 //! `CLAUDE.md`) joins them.
 //!
+//! The model also keeps notes on the attached project -- how to build and
+//! test it, its layout and quirks -- which would otherwise crowd out
+//! everything else in MEMORY.md. They live in the data folder, not in the
+//! repository where they could be committed by mistake, in a folder named by
+//! a hash of the main checkout's path, which its linked worktrees and
+//! subfolders share.
+//!
 //! USER.md and MEMORY.md go into every request, so each has a small budget --
 //! Hermes Agent's, which has run this way for a long time -- and a full one
 //! makes the model rewrite rather than pile up. Their entries are separated
@@ -19,7 +26,7 @@
 use crate::chat::Connection;
 use crate::tools::{Tool, ToolContext};
 use serde_json::{Value, json};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The line between entries, as Hermes Agent writes it.
 const SEPARATOR: &str = "\n§\n";
@@ -27,12 +34,15 @@ const SEPARATOR: &str = "\n§\n";
 const USER_LIMIT: usize = 1_375;
 /// MEMORY.md's budget in characters: about 800 tokens.
 const MEMORY_LIMIT: usize = 2_200;
+/// A project's budget in characters: MEMORY.md's, as it is the same kind of
+/// notes, only about one project.
+const PROJECT_LIMIT: usize = 2_200;
 /// A cap on SOUL.md and project instructions. People write these rather than
 /// the model, so it only stops a huge one crowding out the conversation.
 const FILE_LIMIT: usize = 20_000;
 
 /// How the model is told to use its memory, when it has the tool to.
-const GUIDANCE: &str = " You have a memory that outlasts this session: what you know about the user (USER.md) and your own notes (MEMORY.md), shown below when there is anything in them, and kept with the memory tool. Save what will still matter in a later session -- the user's name and preferences, their setup, corrections they gave you -- and not the progress of the task at hand. Write facts, not instructions to yourself.";
+const GUIDANCE: &str = " You have a memory that outlasts this session: what you know about the user (USER.md), your own notes (MEMORY.md) and, when a project folder is attached, your notes on that project (Project memory), shown below when there is anything in them, and kept with the memory tool. Save what will still matter in a later session -- the user's name and preferences, their setup, corrections they gave you -- and not the progress of the task at hand. Keep what is true of one project alone, such as how to build and test it, in its project memory. Write facts, not instructions to yourself.";
 
 /// Who Letronna is, from SOUL.md, when the user has written one.
 pub fn soul() -> Option<String> {
@@ -54,13 +64,24 @@ fn context_in(dir: &Path, connection: &Connection) -> String {
     if connection.tools {
         out.push_str(GUIDANCE);
     }
-    for target in [Target::User, Target::Memory] {
-        let entries = entries(&dir.join(target.file()));
+    let project_notes = connection
+        .workspace
+        .as_deref()
+        .map(|workspace| project_dir(dir, &project_root(workspace)));
+    let stores = [(Target::User, dir), (Target::Memory, dir)]
+        .into_iter()
+        .chain(
+            project_notes
+                .as_deref()
+                .map(|folder| (Target::Project, folder)),
+        );
+    for (target, folder) in stores {
+        let entries = entries(&folder.join(target.file()));
         if !entries.is_empty() {
             out.push_str(&format!(
                 "\n\n{} ({}, {}/{} characters):\n{}",
                 target.title(),
-                target.file(),
+                target.name(),
                 size(&entries),
                 target.limit(),
                 entries.join(SEPARATOR)
@@ -130,6 +151,7 @@ fn read_capped(path: &Path) -> Option<String> {
 enum Target {
     User,
     Memory,
+    Project,
 }
 
 impl Target {
@@ -137,14 +159,24 @@ impl Target {
         match name {
             "user" => Ok(Self::User),
             "memory" => Ok(Self::Memory),
-            _ => Err("target is \"user\" or \"memory\".".into()),
+            "project" => Ok(Self::Project),
+            _ => Err("target is \"user\", \"memory\" or \"project\".".into()),
         }
     }
 
     fn file(self) -> &'static str {
         match self {
             Self::User => "USER.md",
-            Self::Memory => "MEMORY.md",
+            Self::Memory | Self::Project => "MEMORY.md",
+        }
+    }
+
+    /// What the store is called to the model; a project's file has the same
+    /// name as Letronna's own notes, in a folder named by a hash.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Project => "Project memory",
+            _ => self.file(),
         }
     }
 
@@ -152,6 +184,7 @@ impl Target {
         match self {
             Self::User => USER_LIMIT,
             Self::Memory => MEMORY_LIMIT,
+            Self::Project => PROJECT_LIMIT,
         }
     }
 
@@ -159,7 +192,55 @@ impl Target {
         match self {
             Self::User => "What you know about the user",
             Self::Memory => "Your notes",
+            Self::Project => "Your notes on this project",
         }
+    }
+}
+
+/// Where the notes on the project at `root` are kept: a folder named by the
+/// SHA-256 of its path, which can be too long or too odd to name one itself.
+fn project_dir(data: &Path, root: &Path) -> PathBuf {
+    let digest = ring::digest::digest(&ring::digest::SHA256, root.as_os_str().as_encoded_bytes());
+    let name: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+    data.join("projects").join(name)
+}
+
+/// The folder a project's notes are kept for: the main checkout of the git
+/// repository `workspace` is in, so its linked worktrees and subfolders share
+/// them, or `workspace` itself outside git.
+fn project_root(workspace: &Path) -> PathBuf {
+    let workspace = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    let Some(top) = workspace
+        .ancestors()
+        .find(|dir| dir.join(".git").symlink_metadata().is_ok())
+    else {
+        return workspace;
+    };
+    main_checkout(top).unwrap_or_else(|| top.to_path_buf())
+}
+
+/// The main checkout of the linked worktree at `top`. Its `.git` file names a
+/// folder in that checkout's `.git/worktrees`, which must name this `.git`
+/// back: a `.git` file written into a folder could otherwise point anywhere,
+/// and show it another project's notes.
+fn main_checkout(top: &Path) -> Option<PathBuf> {
+    let dot_git = top.join(".git");
+    // A file, not a folder, so read_capped passes over the main checkout's.
+    let pointer = read_capped(&dot_git)?;
+    let linked = std::fs::canonicalize(top.join(pointer.strip_prefix("gitdir:")?.trim())).ok()?;
+    let back = read_capped(&linked.join("gitdir"))?;
+    if std::fs::canonicalize(linked.join(back)).ok()? != std::fs::canonicalize(&dot_git).ok()? {
+        return None;
+    }
+    let worktrees = linked.parent()?;
+    if worktrees.file_name()? != "worktrees" {
+        return None;
+    }
+    let common = worktrees.parent()?;
+    // A bare repository has no checkout, so its worktrees share its folder.
+    match common.file_name() {
+        Some(name) if name == ".git" => common.parent().map(Path::to_path_buf),
+        _ => Some(common.to_path_buf()),
     }
 }
 
@@ -204,11 +285,11 @@ fn hand_written(text: &str, entries: &[String], limit: usize) -> bool {
 /// What a store holds, as the tool reports it.
 fn listing(target: Target, entries: &[String]) -> String {
     if entries.is_empty() {
-        return format!("{} is empty.", target.file());
+        return format!("{} is empty.", target.name());
     }
     format!(
         "{} ({}/{} characters):\n{}",
-        target.file(),
+        target.name(),
         size(entries),
         target.limit(),
         entries.join(SEPARATOR)
@@ -236,7 +317,8 @@ fn find(entries: &[String], old_text: &str) -> Result<usize, String> {
 }
 
 /// Change one store and report what it holds now. Over budget, nothing is
-/// written and the model is shown the store so it can make room.
+/// written and the model is shown the store so it can make room. Every write
+/// to a store, whichever it is, comes through here.
 fn apply(
     dir: &Path,
     target: Target,
@@ -245,12 +327,15 @@ fn apply(
     old_text: &str,
 ) -> Result<String, String> {
     let path = dir.join(target.file());
+    // The lock is kept beside the store, and a project's folder is only made
+    // for its first note.
+    std::fs::create_dir_all(dir).map_err(|e| format!("Could not save {}: {e}", target.name()))?;
     // The window and the terminal both save here, so the store is read again
     // under the lock and neither writes over what the other just kept.
     let _lock = crate::store::Lock::take(&path).map_err(|e| {
         format!(
             "{} is being written by another Letronna, so nothing was changed: {e}",
-            target.file()
+            target.name()
         )
     })?;
     // Taken as empty, a file that is there but cannot be read would be
@@ -258,7 +343,7 @@ fn apply(
     let raw = read_store(&path).map_err(|e| {
         format!(
             "{} could not be read, so nothing was changed: {e}",
-            target.file()
+            target.name()
         )
     })?;
     let before = split(&raw);
@@ -283,7 +368,7 @@ fn apply(
     if used > target.limit() {
         return Err(format!(
             "That would make {} {used} of {} characters. Replace or remove an entry first.\n\n{}",
-            target.file(),
+            target.name(),
             target.limit(),
             listing(target, &before)
         ));
@@ -304,12 +389,12 @@ fn apply(
         std::fs::copy(&path, dir.join(&backup)).map_err(|e| {
             format!(
                 "Could not back up {}, so nothing was changed: {e}",
-                target.file()
+                target.name()
             )
         })?;
         format!(
             "{} may have held notes written by hand, so that version was copied to {backup} first.\n\n",
-            target.file()
+            target.name()
         )
     } else {
         String::new()
@@ -317,17 +402,16 @@ fn apply(
     // Written beside and moved over, so a crash cannot leave half a file. The
     // name is per process because a lock that waited too long is taken anyway.
     let temp = path.with_extension(format!("{}.tmp", std::process::id()));
-    std::fs::create_dir_all(dir)
-        .and_then(|_| std::fs::write(&temp, text))
+    std::fs::write(&temp, text)
         .and_then(|_| std::fs::rename(&temp, &path))
         .map_err(|e| {
             let _ = std::fs::remove_file(&temp);
-            format!("Could not save {}: {e}", target.file())
+            format!("Could not save {}: {e}", target.name())
         })?;
     Ok(format!("{backed_up}{}", listing(target, &after)))
 }
 
-/// The model's hand on USER.md and MEMORY.md.
+/// The model's hand on USER.md, MEMORY.md and the project's memory.
 pub struct Remember;
 
 impl Tool for Remember {
@@ -335,26 +419,45 @@ impl Tool for Remember {
         "memory"
     }
     fn description(&self) -> &'static str {
-        "Keep something for later sessions, or correct what is kept. target \"user\" is what you know about the user (USER.md); target \"memory\" is your own notes (MEMORY.md). Both are shown to you at the start of every session and have small budgets. action \"add\" keeps content as a new entry; \"replace\" swaps the entry containing old_text for content; \"remove\" deletes the entry containing old_text. When one is full, replace or remove before adding."
+        "Keep something for later sessions, or correct what is kept. target \"user\" is what you know about the user (USER.md); target \"memory\" is your own notes (MEMORY.md); target \"project\" is your notes on the project folder attached to this session, for what is true of it alone. They are shown to you at the start of every session (a project's only while it is attached) and have small budgets. action \"add\" keeps content as a new entry; \"replace\" swaps the entry containing old_text for content; \"remove\" deletes the entry containing old_text. When one is full, replace or remove before adding."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
             "action": {"type": "string", "enum": ["add", "replace", "remove"]},
-            "target": {"type": "string", "enum": ["user", "memory"]},
+            "target": {"type": "string", "enum": ["user", "memory", "project"]},
             "content": {"type": "string", "description": "The entry to keep, or what the entry becomes."},
             "old_text": {"type": "string", "description": "Part of the entry to replace or remove, unique to it."}
         }, "required": ["action", "target"]})
     }
-    fn run(&self, args: &Value, _: &ToolContext) -> Result<String, String> {
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         let text = |key: &str| args[key].as_str().unwrap_or_default();
         let target = Target::parse(text("target"))?;
-        apply(
-            &crate::chat::data_dir(),
+        let data = crate::chat::data_dir();
+        let (dir, root) = match target {
+            Target::Project => {
+                let Some(workspace) = ctx.workspace.as_deref() else {
+                    return Err(
+                        "No project folder is attached, so there is no project memory.".into(),
+                    );
+                };
+                let root = project_root(workspace);
+                (project_dir(&data, &root), Some(root))
+            }
+            Target::User | Target::Memory => (data, None),
+        };
+        let out = apply(
+            &dir,
             target,
             text("action"),
             text("content"),
             text("old_text"),
-        )
+        )?;
+        // Says whose notes the folder holds to a person who opens it. Without
+        // it the notes still work, so a failure is not the model's to handle.
+        if let Some(root) = root {
+            let _ = std::fs::write(dir.join("root.txt"), format!("{}\n", root.display()));
+        }
+        Ok(out)
     }
 }
 
@@ -616,5 +719,115 @@ mod tests {
         std::fs::write(other.join("USER.md"), "Likes tea.\n\n\n").unwrap();
         apply(&other, Target::User, "add", "Works late.", "").unwrap();
         assert_eq!(backups(&other).len(), 1);
+    }
+
+    /// A repository at `main` with a linked worktree at `linked`, laid out
+    /// the way git lays them out.
+    fn repository(dir: &Path) -> (PathBuf, PathBuf) {
+        let main = dir.join("main");
+        let linked = dir.join("linked");
+        let admin = main.join(".git").join("worktrees").join("linked");
+        std::fs::create_dir_all(&admin).unwrap();
+        std::fs::create_dir_all(main.join("src")).unwrap();
+        std::fs::create_dir_all(&linked).unwrap();
+        std::fs::write(
+            linked.join(".git"),
+            format!("gitdir: {}\n", admin.display()),
+        )
+        .unwrap();
+        let back = linked.join(".git");
+        std::fs::write(admin.join("gitdir"), format!("{}\n", back.display())).unwrap();
+        (main, linked)
+    }
+
+    #[test]
+    fn a_worktree_and_a_subfolder_share_the_main_checkouts_notes() {
+        let dir = scratch("worktree");
+        let (main, linked) = repository(&dir);
+        let root = std::fs::canonicalize(&main).unwrap();
+        assert_eq!(project_root(&main), root);
+        assert_eq!(project_root(&main.join("src")), root);
+        assert_eq!(project_root(&linked), root);
+        // git can write both pointers relative to where they are.
+        std::fs::write(
+            linked.join(".git"),
+            "gitdir: ../main/.git/worktrees/linked\r\n",
+        )
+        .unwrap();
+        std::fs::write(
+            main.join(".git/worktrees/linked/gitdir"),
+            "../../../../linked/.git",
+        )
+        .unwrap();
+        assert_eq!(project_root(&linked), root);
+        // A folder outside git is a project of its own.
+        let loose = dir.join("loose");
+        std::fs::create_dir_all(&loose).unwrap();
+        assert_eq!(project_root(&loose), std::fs::canonicalize(&loose).unwrap());
+    }
+
+    #[test]
+    fn a_git_file_the_repository_does_not_name_back_keeps_its_own_notes() {
+        let dir = scratch("pointer");
+        let (main, linked) = repository(&dir);
+        // Anyone can write a .git file; the repository's own record of its
+        // worktree names another folder.
+        let planted = dir.join("planted");
+        std::fs::create_dir_all(&planted).unwrap();
+        std::fs::copy(linked.join(".git"), planted.join(".git")).unwrap();
+        assert_eq!(
+            project_root(&planted),
+            std::fs::canonicalize(&planted).unwrap()
+        );
+        // A submodule's .git points into its parent's modules, and it is a
+        // repository of its own.
+        std::fs::create_dir_all(main.join(".git/modules/lib")).unwrap();
+        let lib = main.join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(lib.join(".git"), "gitdir: ../.git/modules/lib\n").unwrap();
+        assert_eq!(project_root(&lib), std::fs::canonicalize(&lib).unwrap());
+    }
+
+    #[test]
+    fn project_notes_reach_only_that_projects_prompt() {
+        let dir = scratch("project");
+        let (main, linked) = repository(&dir);
+        let notes = project_dir(&dir, &project_root(&linked));
+        let out = apply(&notes, Target::Project, "add", "Build with make.", "").unwrap();
+        assert!(
+            out.starts_with("Project memory (16/2200 characters)"),
+            "{out}"
+        );
+        // Kept in the data folder, never in the repository.
+        assert!(notes.starts_with(dir.join("projects")));
+        assert!(!main.join("MEMORY.md").exists());
+
+        let other = dir.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let prompt = |workspace: Option<PathBuf>| {
+            let connection = Connection {
+                tools: true,
+                workspace,
+                ..Default::default()
+            };
+            context_in(&dir, &connection)
+        };
+        let text = prompt(Some(main.join("src")));
+        assert!(
+            text.contains(
+                "Your notes on this project (Project memory, 16/2200 characters):\nBuild with make."
+            ),
+            "{text}"
+        );
+        assert!(!prompt(Some(other)).contains("Build with make."));
+        assert!(!prompt(None).contains("Build with make."));
+    }
+
+    #[test]
+    fn the_project_target_is_refused_without_a_project() {
+        let args = json!({"action": "add", "target": "project", "content": "Build with make."});
+        let context = ToolContext::of(&Connection::default());
+        let refused = Remember.run(&args, &context).unwrap_err();
+        assert!(refused.contains("No project folder"), "{refused}");
     }
 }
