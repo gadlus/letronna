@@ -576,7 +576,10 @@ impl Conversation {
 
     /// Flush into the file at `path` rather than the session's own.
     fn flush_to(&mut self, path: &std::path::Path) -> std::io::Result<()> {
-        self.append_to(path, false)
+        // A run from the terminal writes on into the session's own file, whose
+        // set would otherwise go stale with every run and wait for a search.
+        let session = path.parent() == Some(sessions_dir().as_path());
+        self.append_to(path, session)
     }
 
     /// Flush into the file at `path`, keeping its term set up to date with
@@ -2875,6 +2878,38 @@ pub(crate) mod tests {
 
         store.remove(0);
         assert!(!crate::prefilter::path_for(&path).exists());
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_run_writing_into_the_session_file_keeps_its_term_set() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("prefilter-run");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let path = dir.join("sessions").join("1.jsonl");
+        let mut store = Store::default();
+        store.conversations.push(Conversation {
+            id: 1,
+            title: "Run".into(),
+            messages: vec![said("user", "plant a fig")],
+            ..Default::default()
+        });
+        store.save().unwrap();
+
+        // As the terminal's one-shot run writes on into the session.
+        let mut run = Transcript {
+            path: path.clone(),
+            conversation: store.conversations.remove(0),
+        };
+        run.conversation.messages.push(said("assistant", "planted"));
+        run.save().unwrap();
+        let set = crate::prefilter::read(&path, stamp(&path)).unwrap();
+        assert!(set.may_hold("planted"));
+        // A helper's conversation is never searched, and gets no set.
+        let (_, mut helper) = Transcript::create(1, "helper", None).unwrap();
+        helper.conversation.messages.push(said("user", "hello"));
+        helper.save().unwrap();
+        assert!(!crate::prefilter::path_for(&helper.path).exists());
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 
