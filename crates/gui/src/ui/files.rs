@@ -308,6 +308,13 @@ impl Chat {
         };
         self.insert(&format!("{gap}{reference} "), window, cx);
         self.focus_composer(window, cx);
+        // Setting a many-line box's text puts its cursor at the start, and
+        // what is typed next goes on after the reference.
+        self.composer.update(cx, |input, cx| {
+            use gpui_component::input::RopeExt;
+            let end = input.text().offset_to_position(input.value().len());
+            input.set_cursor_position(end, window, cx);
+        });
     }
 
     /// Open the picked row in the user's editor, or with the system when
