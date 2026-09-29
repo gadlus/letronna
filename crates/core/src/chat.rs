@@ -1926,6 +1926,9 @@ fn send_window(
         return Err(failure);
     }
     let start = window_start(messages, budget);
+    // A fallback or a refit can start later than the window stamped before
+    // the call, and a read it leaves out must not let an edit through.
+    crate::filestate::asked(connection.conversation, messages.len(), start);
     stream(connection, messages, start, budget, extra, sender)
 }
 
@@ -5914,6 +5917,60 @@ mod tests {
         assert!(next.squeezed);
         // Once squeezed, a request is not sent again.
         assert!(refit(&c, &failure, &next).is_none());
+    }
+
+    #[test]
+    fn a_read_a_narrower_window_leaves_out_no_longer_lets_an_edit_through() {
+        let answer = r#"{"choices":[{"message":{"role":"assistant","content":"Done."}}]}"#;
+        // The summary of what the narrower window leaves out, then the reply.
+        let (endpoint, worker) = serve(vec![
+            ("200 OK", "application/json", answer),
+            ("200 OK", "application/json", answer),
+        ]);
+        let dir = std::env::temp_dir().join(format!("letronna-narrower-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "one").unwrap();
+        let conversation = 259_001;
+        let ctx = crate::tools::ToolContext {
+            workspace: Some(dir.clone()),
+            conversation,
+            ..Default::default()
+        };
+        // The first reply reads the file.
+        crate::filestate::asked(conversation, 1, 0);
+        crate::tools::run("read_file", r#"{"path":"a.txt"}"#, &ctx).unwrap();
+        let said = |role: &str, content: &str| Message {
+            role: role.into(),
+            content: content.into(),
+            ..Default::default()
+        };
+        let messages = vec![
+            said("user", "Read a.txt."),
+            said("assistant", "It says one."),
+            said("user", "Now make it two."),
+        ];
+        // Stamped as start_with does, with the session model's roomy window.
+        crate::filestate::asked(conversation, messages.len(), 0);
+        // A fallback's window that holds only the newest turn.
+        let narrow = Budget {
+            step: 1,
+            messages: 1,
+            ..Budget::SMALL
+        };
+        let c = Connection {
+            endpoint,
+            model: "reads-little".into(),
+            conversation,
+            ..connection()
+        };
+        let (sender, _receiver) = async_channel::unbounded();
+        send_window(&c, &messages, &narrow, &Extra::default(), &sender).unwrap();
+        assert_eq!(worker.join().unwrap().len(), 2);
+        let edit = r#"{"path":"a.txt","old":"one","new":"two"}"#;
+        let refused = crate::tools::run("edit_file", edit, &ctx).unwrap_err();
+        assert!(refused.contains("has left the part"), "{refused}");
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "one");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
