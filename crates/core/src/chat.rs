@@ -1,7 +1,9 @@
+use crate::cancel::Cancel;
 use crate::failure::{Failure, FailureKind, classify};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    any::Any,
     collections::{HashMap, HashSet},
     io::{BufRead, BufReader},
     path::PathBuf,
@@ -317,11 +319,23 @@ pub(crate) fn opens_turn(message: &Message) -> bool {
     message.role == "user" && !message.folded
 }
 
+#[cfg(test)]
 fn body(
     connection: &Connection,
     window: &[Message],
     summary: Option<&str>,
     plan: Option<&str>,
+) -> Value {
+    body_with(connection, window, summary, plan, &[])
+}
+
+/// The request, offering `extra` after every tool the connection offers.
+fn body_with(
+    connection: &Connection,
+    window: &[Message],
+    summary: Option<&str>,
+    plan: Option<&str>,
+    extra: &[Value],
 ) -> Value {
     // The user's SOUL.md, when there is one, says who Letronna is instead.
     let mut system = crate::memory::soul().unwrap_or_else(|| {
@@ -440,6 +454,9 @@ fn body(
             // answer comes back with the pages it read attached.
             tools.push(json!({"type": "web_search"}));
         }
+        // Last, so the tools before them go out byte for byte as they would
+        // without them, and a provider's cached prefix holds up to here.
+        tools.extend_from_slice(extra);
         body["tools"] = Value::Array(tools);
     }
     // Most models that cannot be told how hard to think ignore this, so it
@@ -873,12 +890,16 @@ fn name_unnamed(calls: &mut [ToolCall]) {
 /// Some gateways hand the name back in a case of their own -- `ListDir` for
 /// `list_dir` -- and a call that cannot be found by name fails. Only case and
 /// underscores are forgiven, so a tool the model made up still fails.
-fn name_as_offered(calls: &mut [ToolCall]) {
+fn name_as_offered(calls: &mut [ToolCall], extra: &[Value]) {
     let loose = |name: &str| name.replace('_', "").to_lowercase();
     let tools = crate::tools::all();
+    let extra = extra
+        .iter()
+        .filter_map(|spec| spec.pointer("/function/name")?.as_str());
+    let offered: Vec<&str> = tools.iter().map(|t| t.name()).chain(extra).collect();
     for call in calls {
-        if let Some(tool) = tools.iter().find(|t| loose(t.name()) == loose(&call.name)) {
-            call.name = tool.name().to_owned();
+        if let Some(name) = offered.iter().find(|n| loose(n) == loose(&call.name)) {
+            call.name = (*name).to_owned();
         }
     }
 }
@@ -1034,11 +1055,40 @@ pub fn list_models(base: &str, key: &str) -> Result<Vec<String>, String> {
     Ok(models)
 }
 
+/// What a caller can add to a model call beyond the connection and messages.
+#[derive(Default)]
+pub struct Extra {
+    /// Offered after the connection's own tools, and not at all where it offers none.
+    pub tools: Vec<Value>,
+    /// Once set, ends the call before its next request or at the next line it receives.
+    pub cancel: Cancel,
+    /// Held until the stream is over, so whatever it carries lasts as long as the call.
+    pub guard: Option<Box<dyn Any + Send>>,
+}
+
 pub fn start(connection: Connection, messages: Vec<Message>) -> async_channel::Receiver<Event> {
+    start_with(connection, messages, Extra::default())
+}
+
+/// `start`, with tools, a stop signal and a guard of the caller's own.
+pub fn start_with(
+    connection: Connection,
+    messages: Vec<Message>,
+    extra: Extra,
+) -> async_channel::Receiver<Event> {
     let (sender, receiver) = async_channel::bounded(64);
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
-        let result = stream(&connection, &messages, window_start(&messages), &sender);
+        let result = stream(
+            &connection,
+            &messages,
+            window_start(&messages),
+            &extra,
+            &sender,
+        );
+        // The call is over by now. Letting go before saying so means whoever
+        // hears `Finished` never finds the guard still held.
+        drop(extra.guard);
         crate::diag::event(
             "model_request",
             &[
@@ -1063,6 +1113,7 @@ fn stream(
     connection: &Connection,
     messages: &[Message],
     start: usize,
+    extra: &Extra,
     sender: &async_channel::Sender<Event>,
 ) -> Result<(), Failure> {
     let endpoint = validate(connection).map_err(|e| Failure::new(FailureKind::Settings, e))?;
@@ -1070,11 +1121,12 @@ fn stream(
     // all. It is made here, on the worker, so the wait is part of the reply's.
     let (dropped, window) = messages.split_at(start);
     let summary = crate::compact::summary(connection, dropped);
-    let sent = body(
+    let sent = body_with(
         connection,
         window,
         summary.as_deref(),
         checklist(messages).as_deref(),
+        &extra.tools,
     );
     let mut request = client()
         .map_err(|e| Failure::new(FailureKind::Unknown, e))?
@@ -1088,16 +1140,23 @@ fn stream(
     let mut attempt = 0;
     let response = loop {
         attempt += 1;
+        // A stop that comes during the summary, the pause below (which it
+        // cuts short) or ahead of a resend sends nothing.
+        if extra.cancel.is_set() {
+            return Err(Failure::new(FailureKind::Stopped, "Stopped."));
+        }
         let send = request
             .try_clone()
             .ok_or_else(|| Failure::new(FailureKind::Unknown, "Could not prepare the request."))?
             .send();
         match send {
             Ok(response) if transient(response.status()) && attempt == 1 => {
-                std::thread::sleep(Duration::from_millis(600));
+                extra.cancel.sleep(Duration::from_millis(600));
             }
             Ok(response) => break response,
-            Err(_) if attempt == 1 => std::thread::sleep(Duration::from_millis(600)),
+            Err(_) if attempt == 1 => {
+                extra.cancel.sleep(Duration::from_millis(600));
+            }
             Err(_) => {
                 return Err(Failure::new(
                     FailureKind::Network,
@@ -1114,7 +1173,7 @@ fn stream(
         // this model leave out from then on -- unless the turn was stopped
         // while this one was out.
         if status.is_client_error() && learn(connection, &sent, &error) && !sender.is_closed() {
-            return stream(connection, messages, start, sender);
+            return stream(connection, messages, start, extra, sender);
         }
         let body = serde_json::from_str::<Value>(&error).unwrap_or_default();
         return Err(classify(Some(status.as_u16()), &headers, &body));
@@ -1154,6 +1213,11 @@ fn stream(
                 "Connection interrupted before the response completed.",
             )
         })?;
+        // A read waiting on the provider cannot be woken, so a stop is heard
+        // when the next line arrives.
+        if extra.cancel.is_set() {
+            return Err(Failure::new(FailureKind::Stopped, "Stopped."));
+        }
         let Some(data) = line.strip_prefix("data:").map(str::trim) else {
             continue;
         };
@@ -1202,7 +1266,7 @@ fn stream(
     let mut calls = assembler.calls;
     calls.retain(|c| !c.name.is_empty());
     name_unnamed(&mut calls);
-    name_as_offered(&mut calls);
+    name_as_offered(&mut calls, &extra.tools);
     if !calls.is_empty() {
         received = true;
         sender
@@ -1548,7 +1612,7 @@ mod tests {
             ..Default::default()
         };
         let mut calls = vec![call("ListDir"), call("read_file"), call("ListEverything")];
-        super::name_as_offered(&mut calls);
+        super::name_as_offered(&mut calls, &[]);
         assert_eq!(calls[0].name, "list_dir");
         assert_eq!(calls[1].name, "read_file");
         // Not one of ours under any case, so it still fails as unknown.
@@ -2812,5 +2876,193 @@ mod tests {
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(reply, "word ".repeat(26));
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn an_extra_tool_the_gateway_renamed_is_called_by_its_own_name() {
+        let mut calls = vec![ToolCall {
+            name: "StructuredOutput".into(),
+            ..Default::default()
+        }];
+        let answer = json!({"type": "function", "function": {"name": "structured_output"}});
+        super::name_as_offered(&mut calls, &[answer]);
+        assert_eq!(calls[0].name, "structured_output");
+    }
+
+    /// One question from the user.
+    fn hi() -> Vec<Message> {
+        vec![Message {
+            role: "user".into(),
+            content: "Hi".into(),
+            ..Default::default()
+        }]
+    }
+
+    /// `text` as one line of a streamed reply.
+    fn line_of(text: &str) -> String {
+        format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}}}}]}}\n\n")
+    }
+
+    /// Reads `rx` to its end, and says how it ended.
+    fn outcome(rx: async_channel::Receiver<Event>) -> Result<(), String> {
+        loop {
+            if let Event::Finished(result) = rx.recv_blocking().unwrap() {
+                return result.map_err(|e| e.to_string());
+            }
+        }
+    }
+
+    /// A provider that answers `calls` requests with "Hello", and hands back
+    /// what each one was sent.
+    fn provider(calls: usize) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::Write;
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1", server.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let reply = line_of("Hello") + "data: [DONE]\n\n";
+            (0..calls)
+                .map(|_| {
+                    let (mut socket, _) = server.accept().unwrap();
+                    let sent = request_body(&mut socket);
+                    write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+                    sent
+                })
+                .collect()
+        });
+        (endpoint, worker)
+    }
+
+    /// A provider that streams "Hello", sends `then` when told to, and keeps
+    /// the connection open until the sender it hands back is dropped.
+    fn held(then: String) -> (String, std::sync::mpsc::Sender<()>) {
+        use std::io::Write;
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1", server.local_addr().unwrap());
+        let (go, told) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut socket, _) = server.accept().unwrap();
+            request_body(&mut socket);
+            // No length, so the reply runs until the connection closes, as a
+            // provider's stream does.
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{}",
+                line_of("Hello")
+            )
+            .unwrap();
+            if told.recv().is_ok() {
+                // A stopped call may have hung up already.
+                let _ = socket.write_all(then.as_bytes());
+                let _ = told.recv();
+            }
+        });
+        (endpoint, go)
+    }
+
+    #[test]
+    fn a_call_without_extras_sends_the_same_bytes() {
+        // Store's tests point the data folder elsewhere for a moment, which
+        // can change the prompt between two calls; a real difference shows on
+        // every try.
+        let same = (0..3).any(|_| {
+            let (endpoint, worker) = provider(2);
+            let c = Connection {
+                endpoint,
+                tools: true,
+                ..connection()
+            };
+            assert_eq!(outcome(start(c.clone(), hi())), Ok(()));
+            assert_eq!(
+                outcome(start_with(c.clone(), hi(), Extra::default())),
+                Ok(())
+            );
+            let before = serde_json::to_string(&body(&c, &hi(), None, None)).unwrap();
+            worker.join().unwrap() == [before.clone(), before]
+        });
+        assert!(same, "a call without extras sent something else");
+    }
+
+    #[test]
+    fn a_stopped_stream_ends_at_the_next_line() {
+        let (endpoint, go) = held(line_of(" and more"));
+        let extra = Extra::default();
+        let stop = extra.cancel.clone();
+        let c = Connection {
+            endpoint,
+            ..connection()
+        };
+        let rx = start_with(c, hi(), extra);
+        assert!(matches!(rx.recv_blocking().unwrap(), Event::Delta(s) if s == "Hello"));
+        stop.set();
+        go.send(()).unwrap();
+        // The provider never finishes, and what it sends after the stop is
+        // not passed on.
+        assert!(matches!(
+            rx.recv_blocking().unwrap(),
+            Event::Finished(Err(e)) if e.to_string() == "Stopped."
+        ));
+    }
+
+    #[test]
+    fn a_call_stopped_before_it_is_sent_sends_nothing() {
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let extra = Extra::default();
+        extra.cancel.set();
+        let c = Connection {
+            endpoint: format!("http://{}/v1", server.local_addr().unwrap()),
+            ..connection()
+        };
+        assert_eq!(outcome(start_with(c, hi(), extra)), Err("Stopped.".into()));
+        server.set_nonblocking(true).unwrap();
+        assert!(server.accept().is_err(), "a request went out");
+    }
+
+    #[test]
+    fn the_guard_is_dropped_when_the_stream_ends() {
+        use std::sync::Arc;
+        let (endpoint, go) = held("data: [DONE]\n\n".into());
+        let permit = Arc::new(());
+        let extra = Extra {
+            guard: Some(Box::new(permit.clone())),
+            ..Default::default()
+        };
+        let c = Connection {
+            endpoint,
+            ..connection()
+        };
+        let rx = start_with(c, hi(), extra);
+        assert!(matches!(rx.recv_blocking().unwrap(), Event::Delta(s) if s == "Hello"));
+        assert_eq!(Arc::strong_count(&permit), 2, "let go mid-stream");
+        go.send(()).unwrap();
+        assert!(matches!(
+            rx.recv_blocking().unwrap(),
+            Event::Finished(Ok(()))
+        ));
+        assert_eq!(Arc::strong_count(&permit), 1, "held after the end");
+    }
+
+    #[test]
+    fn extra_tools_go_after_the_registered_ones() {
+        let (endpoint, worker) = provider(1);
+        let c = Connection {
+            endpoint,
+            tools: true,
+            search: true,
+            ..connection()
+        };
+        let answer = json!({"type": "function", "function": {
+            "name": "structured_output", "parameters": {"type": "object"}
+        }});
+        let extra = Extra {
+            tools: vec![answer.clone()],
+            ..Default::default()
+        };
+        assert_eq!(outcome(start_with(c, hi(), extra)), Ok(()));
+        let sent: Value = serde_json::from_str(&worker.join().unwrap()[0]).unwrap();
+        let tools = sent["tools"].as_array().unwrap();
+        assert_eq!(tools[0]["function"]["name"], "read_file");
+        // After the gateway's own search as well, which follows the registry.
+        assert_eq!(tools[tools.len() - 2], json!({"type": "web_search"}));
+        assert_eq!(tools.last(), Some(&answer));
     }
 }
