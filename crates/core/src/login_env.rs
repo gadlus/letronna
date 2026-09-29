@@ -320,14 +320,26 @@ mod tests {
             "hangs",
             "echo 'Checking for updates...'\nsleep 60 &\necho $! > \"$(dirname \"$0\")/child\"\nwait",
         );
-        let started = Instant::now();
+        let written = shell.with_file_name("child");
 
-        let error = capture(&shell, Duration::from_secs(1)).unwrap_err();
+        // macOS checks a new executable the first time it runs, which on a
+        // loaded machine can take the whole limit before the shell's first
+        // line, so the limit doubles until the shell starts its child in time.
+        let child = [1, 2, 4, 8, 16]
+            .into_iter()
+            .find_map(|secs| {
+                let limit = Duration::from_secs(secs);
+                let _ = std::fs::remove_file(&written);
+                let started = Instant::now();
+                let error = capture(&shell, limit).unwrap_err();
+                assert!(error.contains("timed out"), "{error}");
+                // Far short of the 60 s the shell would wait for its child.
+                assert!(started.elapsed() < limit + Duration::from_secs(10));
+                let child = std::fs::read_to_string(&written).ok()?;
+                child.trim().parse::<libc::pid_t>().ok()
+            })
+            .expect("the shell never started its child");
 
-        assert!(error.contains("timed out"), "{error}");
-        assert!(started.elapsed() < Duration::from_secs(10));
-        let child = std::fs::read_to_string(shell.with_file_name("child")).unwrap();
-        let child: libc::pid_t = child.trim().parse().unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         // SAFETY: signal 0 only asks whether the process is there.
         while unsafe { libc::kill(child, 0) } == 0 && Instant::now() < deadline {
