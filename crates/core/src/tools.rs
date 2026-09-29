@@ -57,6 +57,9 @@ pub(crate) struct Caller {
     pub budget: Option<Arc<Budget>>,
     /// The tree of helpers the call is made in, which an approval for the run covers.
     pub run: Option<u64>,
+    /// The tools the calling helper may use, or None when it may use all;
+    /// `find_tools` finds it no others.
+    pub allowed: Option<Arc<[String]>>,
 }
 
 impl ToolContext {
@@ -256,6 +259,9 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(crate::agents::Agent),
         Arc::new(crate::agents::Agents),
     ];
+    // In place of the MCP tools when those are too many to send; see
+    // `specs`. Here, so that no plugin can take their names.
+    tools.extend(crate::mcp_find::tools());
     // The user's own search service, once one is set up.
     if crate::search::ready() {
         tools.push(Arc::new(crate::search::SearchWeb));
@@ -271,6 +277,8 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
     // MCP servers' tools, once they have answered. Their names all start
     // with `mcp__`, so they cannot shadow one of the above either.
     tools.extend(crate::mcp::tools());
+    #[cfg(test)]
+    tools.extend(crate::mcp::served());
     tools
 }
 
@@ -457,27 +465,44 @@ pub fn offers_plan(connection: &Connection) -> bool {
 /// where other people read the replies, so is everything that touches this
 /// computer; `read_chat` exists only where there is a chat to read, and
 /// `exit_plan` only where there is a plan to hand over and someone to take it.
+/// MCP tools too many to send go out on demand, through `find_tools` and
+/// `call_mcp_tool` (see `mcp_find`).
 pub fn specs(connection: &Connection) -> Vec<Value> {
+    let tools = all();
+    let on_demand = crate::mcp_find::on_demand(&tools);
+    specs_of(&tools, connection, on_demand)
+}
+
+/// `specs` of `tools`, with the MCP tools among them `on_demand` or not.
+pub(crate) fn specs_of(
+    tools: &[Arc<dyn Tool>],
+    connection: &Connection,
+    on_demand: bool,
+) -> Vec<Value> {
     let shared = connection.remote.as_ref().is_some_and(|r| r.shared);
     let history = connection
         .remote
         .as_ref()
         .is_some_and(|r| r.history.is_some());
-    all()
+    tools
         .iter()
+        .filter(|t| crate::mcp_find::in_array(t.name(), on_demand))
         .filter(|t| !connection.plan || !t.mutates() || t.name() == "run_command")
         .filter(|t| t.name() != EXIT_PLAN || offers_plan(connection))
         .filter(|t| !shared || !t.machine())
         .filter(|t| history || !t.needs_history())
         .filter(|t| t.offered(connection))
-        .map(|t| {
-            json!({"type": "function", "function": {
-                "name": t.name(),
-                "description": t.description(),
-                "parameters": t.parameters(),
-            }})
-        })
+        .map(|t| spec(t.as_ref()))
         .collect()
+}
+
+/// How `tool` is offered in a request's `tools` array.
+pub(crate) fn spec(tool: &dyn Tool) -> Value {
+    json!({"type": "function", "function": {
+        "name": tool.name(),
+        "description": tool.description(),
+        "parameters": tool.parameters(),
+    }})
 }
 
 pub fn run(name: &str, args: &str, ctx: &ToolContext) -> Result<String, String> {
@@ -697,7 +722,7 @@ pub fn summary(name: &str, args: &str) -> String {
     let mut v: Value = serde_json::from_str(args).unwrap_or(Value::Null);
     rename_aliases(name, &mut v);
     let text = match name {
-        "search" | "search_sessions" => v["pattern"]
+        "search" | "search_sessions" | crate::mcp_find::FIND_TOOLS => v["pattern"]
             .as_str()
             .or(v["query"].as_str())
             .map(|q| format!("\"{q}\""))
