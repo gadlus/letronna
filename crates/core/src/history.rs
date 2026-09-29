@@ -641,7 +641,12 @@ fn lines_of(dir: &Path, file: &Restore) -> Option<Lines> {
 
 /// The diff from `old` to `new`, line by line.
 pub fn diff(old: &str, new: &str) -> Lines {
-    let (old, new): (Vec<&str>, Vec<&str>) = (old.lines().collect(), new.lines().collect());
+    // Lines are compared with their endings, so a turn that only added the
+    // last newline or turned CRLF into LF is not counted as no change.
+    let (old, new): (Vec<&str>, Vec<&str>) = (
+        old.split_inclusive('\n').collect(),
+        new.split_inclusive('\n').collect(),
+    );
     // What both ends share is set aside first, so an edit in a long file is
     // matched over the few lines around it rather than the whole file.
     let head = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
@@ -652,18 +657,14 @@ pub fn diff(old: &str, new: &str) -> Lines {
         .take_while(|(a, b)| a == b)
         .count();
     let (gone, came) = (&old[head..old.len() - tail], &new[head..new.len() - tail]);
-    let mut rows: Vec<Row> = old[..head].iter().map(|l| Row::Same((*l).into())).collect();
+    let mut rows: Vec<Row> = old[..head].iter().map(|l| Row::Same(text(l))).collect();
     if gone.len().max(came.len()) > MATCHED {
-        rows.extend(gone.iter().map(|l| Row::Removed((*l).into())));
-        rows.extend(came.iter().map(|l| Row::Added((*l).into())));
+        rows.extend(gone.iter().map(|l| Row::Removed(text(l))));
+        rows.extend(came.iter().map(|l| Row::Added(text(l))));
     } else {
         rows.extend(matched(gone, came));
     }
-    rows.extend(
-        old[old.len() - tail..]
-            .iter()
-            .map(|l| Row::Same((*l).into())),
-    );
+    rows.extend(old[old.len() - tail..].iter().map(|l| Row::Same(text(l))));
     let count = |f: fn(&Row) -> bool| rows.iter().filter(|row| f(row)).count();
     Lines {
         added: count(|row| matches!(row, Row::Added(_))),
@@ -688,19 +689,25 @@ fn matched(old: &[&str], new: &[&str]) -> Vec<Row> {
     let (mut rows, mut i, mut j) = (Vec::new(), 0, 0);
     while i < old.len() && j < new.len() {
         if old[i] == new[j] {
-            rows.push(Row::Same(old[i].into()));
+            rows.push(Row::Same(text(old[i])));
             (i, j) = (i + 1, j + 1);
         } else if common[i + 1][j] >= common[i][j + 1] {
-            rows.push(Row::Removed(old[i].into()));
+            rows.push(Row::Removed(text(old[i])));
             i += 1;
         } else {
-            rows.push(Row::Added(new[j].into()));
+            rows.push(Row::Added(text(new[j])));
             j += 1;
         }
     }
-    rows.extend(old[i..].iter().map(|l| Row::Removed((*l).into())));
-    rows.extend(new[j..].iter().map(|l| Row::Added((*l).into())));
+    rows.extend(old[i..].iter().map(|l| Row::Removed(text(l))));
+    rows.extend(new[j..].iter().map(|l| Row::Added(text(l))));
     rows
+}
+
+/// A line as the diff shows it, without its ending.
+fn text(line: &str) -> String {
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    line.strip_suffix('\r').unwrap_or(line).into()
 }
 
 /// Fold the unchanged lines further than `CONTEXT` from any change.
@@ -1622,6 +1629,23 @@ mod tests {
         let lines = files[0].lines.as_ref().unwrap();
         assert_eq!((lines.added, lines.removed), (0, 2));
         assert_eq!(files[0].restore.fate, Fate::Back);
+    }
+
+    #[test]
+    fn a_diff_counts_a_change_to_line_endings_alone() {
+        let lines = diff("one\ntwo", "one\ntwo\n");
+        assert_eq!((lines.added, lines.removed), (1, 1));
+        assert_eq!(
+            lines.rows,
+            [
+                Row::Same("one".into()),
+                Row::Removed("two".into()),
+                Row::Added("two".into()),
+            ]
+        );
+        let lines = diff("a\r\nb\r\n", "a\nb\n");
+        assert_eq!((lines.added, lines.removed), (2, 2));
+        assert_eq!(diff("same\n", "same\n").added, 0);
     }
 
     #[test]
