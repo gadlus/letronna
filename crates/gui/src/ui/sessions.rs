@@ -105,8 +105,10 @@ impl Chat {
                         return;
                     }
                     // Through the store, so the session's file goes too,
-                    // and its private browser with it.
-                    letronna_core::browser::forget(this.store.conversations[index].id);
+                    // and its private browser and draft with it.
+                    let id = this.store.conversations[index].id;
+                    letronna_core::browser::forget(id);
+                    this.drafts.remove(&id);
                     // The next new session can be given this id again, and
                     // must not start out with what was allowed here.
                     this.session_allow

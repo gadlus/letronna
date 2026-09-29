@@ -32,8 +32,17 @@ impl Chat {
         };
         let prompt = skill.body.clone();
         self.page = Page::Chat;
-        self.composer
-            .update(cx, |input, cx| input.set_value(prompt, window, cx));
+        self.composer.update(cx, |input, cx| {
+            let typed = input.value().trim_end().to_owned();
+            let value = if typed.is_empty() {
+                prompt
+            } else {
+                format!("{typed}\n\n{prompt}")
+            };
+            // With the caret after it, where adjusting it starts.
+            input.set_value("", window, cx);
+            input.insert(value, window, cx);
+        });
         self.composer
             .update(cx, |input, cx| input.focus(window, cx));
         cx.notify();
