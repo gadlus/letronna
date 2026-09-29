@@ -85,7 +85,7 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "/skills",
-        blurb: "saved instructions you can hand the model",
+        blurb: "skills: use one, switch them on or off, add from GitHub",
     },
     Command {
         name: "/resume",
