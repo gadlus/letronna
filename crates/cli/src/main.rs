@@ -178,6 +178,7 @@ fn main() {
         letronna_core::browser::close_hidden();
         letronna_core::jobs::stop_all();
         letronna_core::mcp::stop_all();
+        letronna_core::lsp::stop_all();
         if !finished {
             letronna_core::diag::stop();
             std::process::exit(1);
@@ -283,6 +284,7 @@ fn main() {
     // would carry on with nobody left to stop it.
     letronna_core::jobs::stop_all();
     letronna_core::mcp::stop_all();
+    letronna_core::lsp::stop_all();
     letronna_core::browser::close_hidden();
     render::title("");
     render::blank();

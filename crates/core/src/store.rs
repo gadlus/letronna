@@ -546,6 +546,7 @@ impl Store {
         // A new session can be given the same id.
         crate::filestate::forget(gone.id);
         crate::history::forget(gone.id);
+        crate::lsp::stop(gone.id);
         crate::tasklist::forget(gone.id);
     }
 }
