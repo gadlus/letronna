@@ -163,6 +163,8 @@ impl Chat {
             self.files.tree.show(workspace.as_deref());
             self.files.shown_for = workspace;
             self.files.shown = None;
+            // A file still being read would otherwise land in the new project.
+            self.files.previewing = None;
             self.files.trouble = None;
             self.files.stale = true;
         }
