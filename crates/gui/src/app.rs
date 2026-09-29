@@ -135,9 +135,10 @@ pub(crate) struct Chat {
     pub(crate) settings_closing: bool,
     pub(crate) rename: Entity<InputState>,
     pub(crate) page: Page,
-    /// The first-run setup page, shown in place of the empty chat with
-    /// nothing reachable yet, or brought back from the account menu.
-    pub(crate) show_setup: bool,
+    /// The session the first-run setup page is drawn over: the empty chat
+    /// with nothing reachable yet, or the one open when the account menu
+    /// brought it back. Any other session shows its own conversation.
+    pub(crate) show_setup: Option<u64>,
     pub(crate) sidebar_open: bool,
     pub(crate) greeting: &'static str,
     /// Who is signed in, as `account.json` last said; shared with the terminal.
@@ -564,9 +565,14 @@ impl Chat {
         let account = letronna_core::auth::account();
         // Nothing reachable yet: no account, and no key or URL saved for a
         // gateway that needs one. Ollama needs neither, so it is not asked.
-        let show_setup = account.is_none()
-            && keys.values().all(|k| k.trim().is_empty())
-            && store.settings.custom_endpoint.trim().is_empty();
+        let active = &store.conversations[store.active];
+        let show_setup = crate::ui::setup::needed(
+            account.is_some(),
+            keys.values().any(|k| !k.trim().is_empty()),
+            !store.settings.custom_endpoint.trim().is_empty(),
+            active.messages.is_empty(),
+        )
+        .then_some(active.id);
         let mut this = Self {
             page: Page::Chat,
             show_setup,
@@ -935,7 +941,7 @@ impl Chat {
         cx: &mut Context<Self>,
     ) -> std::result::Result<(), ()> {
         // Asking anything at all means the setup page has done its job.
-        self.show_setup = false;
+        self.show_setup = None;
         let connection = match self.connection_for(self.store.active, remote) {
             Ok(connection) => connection,
             Err(error) => {
@@ -2790,7 +2796,7 @@ impl Render for Chat {
             self.activity_page(window, cx)
         } else if self.page != Page::Chat {
             self.page_view(self.page, cx).into_any_element()
-        } else if self.show_setup {
+        } else if self.show_setup == Some(conversation.id) {
             self.setup_page(window, cx).into_any_element()
         } else if conversation.messages.is_empty()
             && !streaming_here

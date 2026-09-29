@@ -7,17 +7,24 @@
 
 use crate::prelude::*;
 
+/// Whether a launch opens on the setup page: nothing reachable, and no
+/// conversation on screen to hide. Someone with history and only Ollama
+/// would otherwise lose it behind the page on every launch.
+pub(crate) fn needed(signed_in: bool, has_key: bool, has_endpoint: bool, empty_chat: bool) -> bool {
+    !signed_in && !has_key && !has_endpoint && empty_chat
+}
+
 impl Chat {
     /// Bring the page back, whatever is reachable by now.
     pub(crate) fn open_setup(&mut self, cx: &mut Context<Self>) {
         self.page = Page::Chat;
-        self.show_setup = true;
+        self.show_setup = Some(self.store.conversations[self.store.active].id);
         cx.notify();
     }
 
     /// Leave the page: Begin, or asking anything at all.
     pub(crate) fn close_setup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_setup = false;
+        self.show_setup = None;
         self.focus_composer(window, cx);
         cx.notify();
     }
@@ -432,8 +439,17 @@ fn price_per_million(price: &letronna_core::models::Price) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::price_per_million;
+    use super::{needed, price_per_million};
     use letronna_core::models::Price;
+
+    #[test]
+    fn a_launch_over_a_conversation_does_not_open_setup() {
+        assert!(needed(false, false, false, true));
+        assert!(!needed(false, false, false, false));
+        assert!(!needed(true, false, false, true));
+        assert!(!needed(false, true, false, true));
+        assert!(!needed(false, false, true, true));
+    }
 
     #[test]
     fn a_price_reads_as_dollars_per_million_tokens() {
