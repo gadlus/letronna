@@ -127,7 +127,12 @@ fn attach(written: &str, ctx: &ToolContext) -> Option<String> {
     let header = format!("--- @{} ---", written.trim_end_matches('.'));
     let body = match tools::resolve(&raw, ctx) {
         Ok(path) if path.is_dir() => denied("list_dir", &raw, ctx).and_then(|()| listing(&path)),
-        Ok(path) => denied("read_file", &raw, ctx).and_then(|()| read(&path, lines)),
+        Ok(path) if path.is_file() => {
+            denied("read_file", &raw, ctx).and_then(|()| read(&path, lines))
+        }
+        // Opening a named pipe waits for a writer, which here would hold the
+        // window or the terminal until one came.
+        Ok(_) => Err(format!("`{raw}` is not a file or a folder.")),
         Err(why) => Err(why),
     };
     Some(match body {
@@ -376,6 +381,23 @@ mod tests {
             "{sent}"
         );
         assert!(!sent.contains("line 1"), "{sent}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_named_pipe_is_refused_rather_than_waited_on() {
+        let dir = project("pipe");
+        let made = std::process::Command::new("mkfifo")
+            .arg(dir.join("pipe"))
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let sent = expand("@pipe", Some(&dir));
+        assert!(
+            sent.contains("--- @pipe ---\nNot attached: `pipe` is not a file"),
+            "{sent}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
