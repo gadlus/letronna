@@ -9,6 +9,8 @@ use letronna_core::chat::{self, Connection, Event, Message};
 use letronna_core::store::{Conversation, Store};
 use letronna_core::tools;
 use std::collections::HashSet;
+use std::sync::mpsc;
+use std::time::Duration;
 
 use crate::bar::Bar;
 
@@ -115,10 +117,10 @@ impl Runner {
     /// One model call, printed as it streams. `None` when the user stopped
     /// waiting for it.
     fn stream_once(&mut self, turn: &mut Turn, session: usize) -> Result<Option<Message>, String> {
-        let receiver = chat::start(
+        let receiver = waitable(chat::start(
             turn.connection.clone(),
             self.store.conversations[session].messages.clone(),
-        );
+        ));
         // The model's name lives under the input box, so an answer only needs
         // its bullet here.
         let mut out = Stream::opening_with(render::bullet());
@@ -126,21 +128,17 @@ impl Runner {
         let mut thought = false;
         self.bar.wait_line(true);
         loop {
-            // Keys first, then whatever the model has sent: the pump waits a
-            // few milliseconds for a keystroke, which is also what keeps this
-            // loop from spinning.
-            self.bar.pump();
-            if self.bar.interrupted() {
-                // Dropping the receiver is enough: the worker finishes into a
-                // channel nobody is listening to and goes away.
-                self.bar.wait_line(false);
-                out.end();
-                return Ok(None);
-            }
-            let event = match receiver.try_recv() {
+            // Keys first, then whatever the model has sent.
+            let event = match self.wait_on(&receiver) {
                 Ok(event) => event,
-                Err(async_channel::TryRecvError::Empty) => continue,
-                Err(async_channel::TryRecvError::Closed) => {
+                Err(Unheard::Stopped) => {
+                    // Dropping the receiver is enough: the worker finishes
+                    // into a channel nobody is listening to and goes away.
+                    self.bar.wait_line(false);
+                    out.end();
+                    return Ok(None);
+                }
+                Err(Unheard::Gone) => {
                     return Err("The model connection closed unexpectedly.".to_owned());
                 }
             };
@@ -277,31 +275,34 @@ impl Runner {
         summary: &str,
     ) -> Result<String, String> {
         let (name, arguments) = (call.name.clone(), call.arguments.clone());
-        let (sender, receiver) = async_channel::bounded(1);
+        let (sender, receiver) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
-            let _ = sender.send_blocking(tools::run(&name, &arguments, &ctx));
+            let _ = sender.send(tools::run(&name, &arguments, &ctx));
         });
 
         self.bar
             .wait_line_about(&format!("{}({summary})", call.name));
-        let outcome = loop {
-            self.bar.pump();
-            if self.bar.interrupted() {
-                break Err(format!(
-                    "The user stopped `{}` while it was running. Ask before starting it again.",
-                    call.name
-                ));
-            }
-            match receiver.try_recv() {
-                Ok(outcome) => break outcome,
-                Err(async_channel::TryRecvError::Empty) => continue,
-                Err(async_channel::TryRecvError::Closed) => {
-                    break Err(format!("`{}` stopped without finishing.", call.name));
-                }
-            }
+        let outcome = match self.wait_on(&receiver) {
+            Ok(outcome) => outcome,
+            Err(Unheard::Stopped) => Err(format!(
+                "The user stopped `{}` while it was running. Ask before starting it again.",
+                call.name
+            )),
+            Err(Unheard::Gone) => Err(format!("`{}` stopped without finishing.", call.name)),
         };
         self.bar.wait_line(false);
         outcome
+    }
+
+    /// What comes over `receiver`, pumping the keys meanwhile, or why nothing
+    /// did. Between pumps it blocks on the channel for as long as the pump
+    /// does not wait for keys itself, so a wait with no box up does not spin.
+    fn wait_on<T>(&mut self, receiver: &mpsc::Receiver<T>) -> Result<T, Unheard> {
+        let patience = self.bar.patience();
+        wait_on(receiver, patience, || {
+            self.bar.pump();
+            self.bar.interrupted()
+        })
     }
 
     /// Ask the user about a call. False means they ended the turn.
@@ -457,6 +458,49 @@ impl Runner {
     }
 }
 
+/// Why a wait on another thread ended with nothing from it.
+#[derive(Debug, PartialEq)]
+enum Unheard {
+    /// The user stopped waiting.
+    Stopped,
+    /// The thread went away without sending anything.
+    Gone,
+}
+
+/// What comes over `receiver`, asking `stopped` before each look at it; a
+/// look blocks up to `patience`.
+fn wait_on<T>(
+    receiver: &mpsc::Receiver<T>,
+    patience: Duration,
+    mut stopped: impl FnMut() -> bool,
+) -> Result<T, Unheard> {
+    loop {
+        if stopped() {
+            return Err(Unheard::Stopped);
+        }
+        match receiver.recv_timeout(patience) {
+            Ok(value) => return Ok(value),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(Unheard::Gone),
+        }
+    }
+}
+
+/// `events` passed on to a channel a wait can block on for a while, which
+/// an `async_channel` cannot do outside an executor. The thread passing
+/// them on ends when either side goes away.
+fn waitable<T: Send + 'static>(events: async_channel::Receiver<T>) -> mpsc::Receiver<T> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        while let Ok(event) = events.recv_blocking() {
+            if sender.send(event).is_err() {
+                return;
+            }
+        }
+    });
+    receiver
+}
+
 /// What the line above a diff says is about to happen.
 fn verb(name: &str) -> &'static str {
     match name {
@@ -493,4 +537,91 @@ fn usage(reply: &Message) -> String {
         }
     }
     parts.join(" · ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Unheard, wait_on, waitable};
+    use std::cell::Cell;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_wait_returns_what_was_sent() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender.send("done").unwrap();
+        let waited = wait_on(&receiver, Duration::from_secs(5), || false);
+        assert_eq!(waited, Ok("done"));
+    }
+
+    #[test]
+    fn a_look_that_times_out_hands_back_to_the_keys() {
+        let (_sender, receiver) = mpsc::sync_channel::<&str>(1);
+        let started = Instant::now();
+        let looks = Cell::new(0);
+        let waited = wait_on(&receiver, Duration::from_millis(20), || {
+            looks.set(looks.get() + 1);
+            looks.get() > 1
+        });
+        // One look found nothing, waited out its patience and asked again.
+        assert_eq!(waited, Err(Unheard::Stopped));
+        assert_eq!(looks.get(), 2);
+        assert!(started.elapsed() >= Duration::from_millis(20));
+    }
+
+    #[test]
+    fn a_thread_that_goes_away_unheard_is_gone() {
+        let (sender, receiver) = mpsc::sync_channel::<&str>(1);
+        drop(sender);
+        let waited = wait_on(&receiver, Duration::from_millis(20), || false);
+        assert_eq!(waited, Err(Unheard::Gone));
+    }
+
+    #[test]
+    fn a_wait_with_no_keys_to_read_blocks_rather_than_spins() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let late = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            let _ = sender.send("done");
+        });
+        let started = std::time::Instant::now();
+        let looks = Cell::new(0u128);
+        let waited = wait_on(&receiver, Duration::from_millis(20), || {
+            looks.set(looks.get() + 1);
+            false
+        });
+        assert_eq!(waited, Ok("done"));
+        // Each look but the last waits its 20 ms; a spinning wait would
+        // look millions of times.
+        let most = started.elapsed().as_millis() / 20 + 2;
+        assert!(looks.get() <= most, "{} looks, at most {most}", looks.get());
+        late.join().unwrap();
+    }
+
+    #[test]
+    fn the_models_events_come_through_in_order_and_then_it_is_gone() {
+        let (sender, events) = async_channel::bounded(64);
+        let receiver = waitable(events);
+        sender.send_blocking(1).unwrap();
+        sender.send_blocking(2).unwrap();
+        drop(sender);
+        let patience = Duration::from_millis(20);
+        assert_eq!(wait_on(&receiver, patience, || false), Ok(1));
+        assert_eq!(wait_on(&receiver, patience, || false), Ok(2));
+        assert_eq!(wait_on(&receiver, patience, || false), Err(Unheard::Gone));
+    }
+
+    #[test]
+    fn a_reply_nobody_waits_for_lets_the_models_worker_go() {
+        let (sender, events) = async_channel::bounded(64);
+        drop(waitable(events));
+        // The thread passing events on notices on the next one and lets go
+        // of the model's channel, so the worker's sends start failing.
+        let _ = sender.send_blocking(1);
+        let started = Instant::now();
+        while !sender.is_closed() {
+            assert!(started.elapsed() < Duration::from_secs(5), "still open");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
 }

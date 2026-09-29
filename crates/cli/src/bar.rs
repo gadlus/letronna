@@ -624,6 +624,13 @@ impl Bar {
         self.settle();
     }
 
+    /// How long a wait between pumps may block on its own channel: a pump
+    /// waits a tick for keys while the box is up and returns at once when
+    /// it is not, where a wait that never blocked would spin.
+    pub fn patience(&self) -> Duration {
+        if self.live { Duration::ZERO } else { TICK }
+    }
+
     /// Whether the user has asked to stop the turn, clearing the request.
     pub fn interrupted(&mut self) -> bool {
         std::mem::take(&mut self.interrupt)
