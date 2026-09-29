@@ -268,7 +268,7 @@ impl Chat {
 
     fn plugin_row(&self, index: usize, cx: &mut Context<Self>) -> impl IntoElement {
         let plugin = &self.plugins.list[index];
-        let (enabled, allowed) = (plugin.enabled, plugin.allowed);
+        let enabled = plugin.enabled;
         let busy = self.plugins.busy;
         let named = || plugin.name.clone();
         let (switch_name, update_name, remove_name) = (named(), named(), named());
@@ -374,7 +374,7 @@ impl Chat {
             .when(!brings.is_empty(), |this| {
                 this.child(v_flex().gap_0p5().children(brings))
             })
-            .when(!allowed, |this| {
+            .when(waits_for_consent(plugin), |this| {
                 this.child(
                     h_flex()
                         .w_full()
@@ -639,6 +639,12 @@ impl Chat {
     }
 }
 
+/// Whether the plugin has servers that wait to be allowed. One whose
+/// manifest does not read is not allowed either, but has none to show.
+fn waits_for_consent(plugin: &Plugin) -> bool {
+    !plugin.allowed && !plugin.servers.is_empty()
+}
+
 /// Whether the plugin `shown` is in `now` with the version and servers the
 /// page showed, which is what allowing it consents to.
 fn unchanged(shown: &Plugin, now: &[Plugin]) -> bool {
@@ -665,7 +671,7 @@ fn unread_markets() -> Vec<Market> {
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
-    use super::unchanged;
+    use super::{unchanged, waits_for_consent};
     use letronna_core::plugins::Plugin;
     use std::path::PathBuf;
 
@@ -699,5 +705,16 @@ mod tests {
         let bumped = plugin("1.1", &[("notes:db", "node db.js")]);
         assert!(!unchanged(&shown, &[bumped]));
         assert!(!unchanged(&shown, &[]));
+    }
+
+    #[test]
+    fn a_plugin_whose_manifest_does_not_read_asks_for_no_consent() {
+        let waiting = plugin("1.0", &[("notes:db", "node db.js")]);
+        assert!(waits_for_consent(&waiting));
+        let broken = Plugin {
+            broken: Some("plugin.json will not read".into()),
+            ..plugin("", &[])
+        };
+        assert!(!waits_for_consent(&broken));
     }
 }
