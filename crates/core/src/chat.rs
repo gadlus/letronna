@@ -624,6 +624,22 @@ pub(crate) fn body(
     body_with(connection, window, summary, plan, &Budget::SMALL, &[])
 }
 
+/// Who Letronna is, then the reply style `style` when there is one.
+fn identity(style: Option<String>) -> String {
+    // The user's SOUL.md, when there is one, says who Letronna is instead.
+    let mut system = crate::memory::soul().unwrap_or_else(|| {
+        String::from("You are Letronna, a personal assistant. Be clear, concise, and honest.")
+    });
+    // Right after who Letronna is, since a tone colours all that follows;
+    // choosing another moves the cached prefix, which a pick rarely does.
+    if let Some(style) = style {
+        system.push_str(&format!(
+            "\n\nWrite your replies in this style:\n{style}\n\n"
+        ));
+    }
+    system
+}
+
 /// The request, offering `extra` after every tool the connection offers.
 fn body_with(
     connection: &Connection,
@@ -633,17 +649,7 @@ fn body_with(
     budget: &Budget,
     extra: &[Value],
 ) -> Value {
-    // The user's SOUL.md, when there is one, says who Letronna is instead.
-    let mut system = crate::memory::soul().unwrap_or_else(|| {
-        String::from("You are Letronna, a personal assistant. Be clear, concise, and honest.")
-    });
-    // Right after who Letronna is, since a tone colours all that follows;
-    // choosing another moves the cached prefix, which a pick rarely does.
-    if let Some(style) = crate::styles::chosen() {
-        system.push_str(&format!(
-            "\n\nWrite your replies in this style:\n{style}\n\n"
-        ));
-    }
+    let mut system = identity(crate::styles::chosen());
     let shared = connection.remote.as_ref().is_some_and(|r| r.shared);
     if connection.tools && !shared {
         // A chat app is not the terminal or the window, and /resume means
@@ -2584,28 +2590,26 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join("letronna-chat-style");
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("styles")).unwrap();
-        std::fs::write(dir.join("styles").join("pirate.md"), "Say arr.").unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
         unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
-        let messages = [said("user", "hi")];
-        let system = |style: &str| {
-            let settings = serde_json::json!({"endpoint": "", "model": "m", "style": style});
-            std::fs::write(dir.join("settings.json"), settings.to_string()).unwrap();
-            body(&connection(), &messages, None, None)["messages"][0]["content"]
-                .as_str()
-                .unwrap()
-                .to_owned()
-        };
-        let styled = system("Pirate");
-        let identity = "Be clear, concise, and honest.";
+        // Handed the text rather than saved, since tests running beside this
+        // one read the same settings file and compare their prompts.
+        let styled = identity(Some("Say arr.".into()));
         assert!(
-            styled.contains(&format!(
-                "{identity}\n\nWrite your replies in this style:\nSay arr.\n\n"
-            )),
+            styled.ends_with(
+                "Be clear, concise, and honest.\n\nWrite your replies in this style:\nSay arr.\n\n"
+            ),
             "{styled}"
         );
+        let messages = [said("user", "hi")];
         for none in ["", "default", "no-such-style"] {
-            assert!(!system(none).contains("Write your replies"), "{none}");
+            let settings = serde_json::json!({"endpoint": "", "model": "m", "style": none});
+            std::fs::write(dir.join("settings.json"), settings.to_string()).unwrap();
+            let system = body(&connection(), &messages, None, None)["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(!system.contains("Write your replies"), "{none}");
         }
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }

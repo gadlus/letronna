@@ -2972,13 +2972,12 @@ pub(crate) mod tests {
         unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
         let old = super::read_settings(br#"{"endpoint": "", "model": "m"}"#).unwrap();
         assert_eq!(old.style, "");
+        // A name no style has: one that did would change the prompt of the
+        // tests running beside this one, which read the same settings file.
         let mut store = Store::default();
-        store.settings.style = "teacher".into();
-        store.save().unwrap();
-        assert_eq!(load().settings.style, "teacher");
-        assert!(crate::styles::chosen().is_some());
         store.settings.style = "gone".into();
         store.save().unwrap();
+        assert_eq!(load().settings.style, "gone");
         assert_eq!(crate::styles::chosen(), None);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
@@ -2990,13 +2989,14 @@ pub(crate) mod tests {
         unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
         let mut window = load();
         let mut terminal = load();
-        terminal.choose_style("teacher");
+        // A name no style has, as above.
+        terminal.choose_style("gone");
         terminal.save().unwrap();
-        assert!(crate::styles::chosen().is_some());
+        assert_eq!(super::current_settings().style, "gone");
         // The window never saw that pick, so it already holds "" itself.
         window.choose_style("");
         window.save().unwrap();
-        assert_eq!(crate::styles::chosen(), None);
+        assert_eq!(super::current_settings().style, "");
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 
