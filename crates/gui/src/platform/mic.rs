@@ -84,6 +84,16 @@ fn fit(samples: &mut Vec<i16>, channels: u16, max_bytes: u64) {
     samples.truncate(most);
 }
 
+/// Why a stream error ends the recording, or `None` for an overrun: ALSA and
+/// JACK report one whenever the machine is briefly too busy, and it costs a
+/// few milliseconds of sound, not everything heard so far.
+fn stopped(e: cpal::StreamError) -> Option<String> {
+    match e {
+        cpal::StreamError::BufferUnderrun => None,
+        e => Some(format!("The microphone stopped: {e}")),
+    }
+}
+
 /// A stream that appends what the microphone sends to `samples`, in the
 /// device's own sample format, converted to 16-bit; `failure` catches a
 /// device error heard after recording has already started, such as the OS
@@ -96,8 +106,9 @@ fn build_stream(
 ) -> Result<cpal::Stream, String> {
     let stream_config: cpal::StreamConfig = config.clone().into();
     let on_error = move |e: cpal::StreamError| {
-        *failure.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some(format!("The microphone stopped: {e}"));
+        if let Some(why) = stopped(e) {
+            *failure.lock().unwrap_or_else(|e| e.into_inner()) = Some(why);
+        }
     };
     let built = match config.sample_format() {
         cpal::SampleFormat::I16 => device.build_input_stream(
@@ -139,7 +150,7 @@ fn build_stream(
 
 #[cfg(test)]
 mod tests {
-    use super::fit;
+    use super::{fit, stopped};
 
     #[test]
     fn a_recording_past_the_cap_is_cut_to_whole_frames_within_it() {
@@ -152,5 +163,14 @@ mod tests {
         let mut samples = vec![0i16; 10];
         fit(&mut samples, 1, 1_000);
         assert_eq!(samples.len(), 10);
+    }
+
+    #[test]
+    fn an_overrun_keeps_recording_and_a_lost_device_ends_it() {
+        assert_eq!(stopped(cpal::StreamError::BufferUnderrun), None);
+        assert!(
+            stopped(cpal::StreamError::DeviceNotAvailable)
+                .is_some_and(|why| why.starts_with("The microphone stopped"))
+        );
     }
 }
