@@ -75,14 +75,17 @@ impl Reason {
     }
 }
 
-/// The parts of a request a cached prefix covers, in the order it holds them.
+/// The parts of a request a cached prefix covers, in the order it holds them,
+/// but for the model, which comes first: each model's cache is its own, and
+/// a switch moves the window and so the summary, which would be named
+/// instead.
 const ORDER: [Reason; 6] = [
+    Reason::Model,
     Reason::System,
     Reason::Memory,
     Reason::Skills,
     Reason::Summary,
     Reason::Tools,
-    Reason::Model,
 ];
 
 /// A hash of each part of one request's cached prefix, in `ORDER`.
@@ -242,6 +245,16 @@ mod tests {
         assert_eq!(
             second(prefix_with(None, ""), changed, 30, 0),
             Some(Reason::Summary)
+        );
+    }
+
+    #[test]
+    fn a_new_model_wins_over_the_summary_its_window_moved() {
+        let mut changed = prefix_with(Some(Reason::Summary), "shorter window");
+        changed.set(Reason::Model, "other-model");
+        assert_eq!(
+            second(prefix_with(None, ""), changed, 30, 0),
+            Some(Reason::Model)
         );
     }
 
