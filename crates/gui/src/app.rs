@@ -2566,11 +2566,7 @@ impl Chat {
             return;
         };
         // Something said or asked since makes the failure old news.
-        let failed = self.store.conversations[ix]
-            .messages
-            .last()
-            .is_some_and(|m| m.role == letronna_core::failure::ROLE);
-        if self.busy || !failed {
+        if self.busy || !self.ends_failed(id) {
             cx.notify();
             return;
         }

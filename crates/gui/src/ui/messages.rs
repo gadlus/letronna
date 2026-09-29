@@ -471,6 +471,17 @@ impl Chat {
         true
     }
 
+    /// Whether the session `session` still ends on a failed turn, the one
+    /// thing a retry there carries on from.
+    pub(crate) fn ends_failed(&self, session: u64) -> bool {
+        self.store.index_of(session).is_some_and(|ix| {
+            self.store.conversations[ix]
+                .messages
+                .last()
+                .is_some_and(|m| m.role == failure::ROLE)
+        })
+    }
+
     /// Ask the failed turn in `session` again at `at`, counting down on its
     /// row until then. The count looks once a second and stops as soon as
     /// the wait is cancelled or replaced, so nothing ticks once it is over.
@@ -487,6 +498,11 @@ impl Chat {
                     .timer(std::time::Duration::from_secs(1))
                     .await;
                 let due = this.update(cx, |this, cx| {
+                    // A turn since, or the session gone, leaves nothing to
+                    // wait for, and the count must not tick on until `at`.
+                    if this.waiting_retry.as_ref().is_some_and(same) && !this.ends_failed(session) {
+                        this.waiting_retry = None;
+                    }
                     let waiting = this.waiting_retry.as_ref().is_some_and(same);
                     cx.notify();
                     waiting.then(|| backend::now() >= at)
