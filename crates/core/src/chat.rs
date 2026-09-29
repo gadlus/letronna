@@ -623,6 +623,9 @@ fn body_with(
             }
         }
     }
+    if marks_cache(connection) {
+        mark_cache(&mut context);
+    }
     // The context window can drop the call that made the plan, and a long
     // task is when that happens. The plan rides on the end of the request,
     // after everything a provider could have cached, and only on the wire:
@@ -670,6 +673,12 @@ fn body_with(
         if has_quirk(connection, quirk) {
             apply_quirk(&mut body, quirk);
         }
+    }
+    // OpenAI caches on its own but spreads one prefix over many machines; a
+    // key per session keeps its requests on the ones that hold it. The id
+    // says nothing about what is in the session.
+    if host(&connection.endpoint).as_deref() == Some("api.openai.com") {
+        body["prompt_cache_key"] = format!("letronna-{}", connection.conversation).into();
     }
     body
 }
@@ -908,6 +917,103 @@ fn learn(connection: &Connection, sent: &Value, error: &str) -> bool {
         }
     }
     learned_any
+}
+
+/// The host a URL names, if it is one.
+fn host(url: &str) -> Option<String> {
+    reqwest::Url::parse(url.trim())
+        .ok()?
+        .host_str()
+        .map(str::to_owned)
+}
+
+/// Models whose route turned a cache marker down, which are sent none for
+/// the rest of this run.
+fn unmarked() -> &'static Mutex<HashSet<String>> {
+    static UNMARKED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    UNMARKED.get_or_init(Default::default)
+}
+
+/// Whether requests on this route mark where the prompt cache ends: Claude
+/// models, whose cache holds only what a request marks, reached through
+/// OpenRouter or the hosted gateway, which pass `cache_control` on to
+/// Anthropic. OpenAI and the servers people run cache without being asked.
+fn marks_cache(connection: &Connection) -> bool {
+    let model = connection.model.trim();
+    let claude = model
+        .rsplit('/')
+        .next()
+        .is_some_and(|id| id.to_lowercase().starts_with("claude"));
+    let passes_markers = host(&connection.endpoint).is_some_and(|h| {
+        h == "openrouter.ai" || host(&crate::auth::hosted_base()).is_some_and(|hosted| h == hosted)
+    });
+    claude
+        && passes_markers
+        && unmarked()
+            .lock()
+            .is_ok_and(|models| !models.contains(model))
+}
+
+/// Mark the end of the system message and of the last two messages with
+/// text. The newest marker writes the prefix for the next request, and the
+/// one before it finds what the last request wrote. Three of the four
+/// markers Anthropic allows.
+fn mark_cache(context: &mut [Value]) {
+    let Some((system, rest)) = context.split_first_mut() else {
+        return;
+    };
+    mark(system);
+    let mut marked = 0;
+    for message in rest.iter_mut().rev() {
+        if marked == 2 {
+            break;
+        }
+        if mark(message) {
+            marked += 1;
+        }
+    }
+}
+
+/// Put a cache marker on the last text part of `message` that has any,
+/// turning plain text into the one-part list a marker needs, and say
+/// whether there was one. Anthropic refuses a marker on an empty part, as a
+/// call with no words beside it would be.
+fn mark(message: &mut Value) -> bool {
+    let Some(content) = message.get_mut("content") else {
+        return false;
+    };
+    let marker = json!({"type": "ephemeral"});
+    let has_text = |text: &str| !text.trim().is_empty();
+    if let Some(text) = content.as_str().filter(|t| has_text(t)).map(str::to_owned) {
+        *content = json!([{"type": "text", "text": text, "cache_control": marker}]);
+        return true;
+    }
+    let part = content.as_array_mut().and_then(|parts| {
+        parts
+            .iter_mut()
+            .rev()
+            .find(|p| p["type"] == "text" && p["text"].as_str().is_some_and(has_text))
+    });
+    let Some(part) = part else {
+        return false;
+    };
+    part["cache_control"] = marker;
+    true
+}
+
+/// Whether a refusal was of the cache markers `sent` carried, which are left
+/// off for this model for the rest of the run: a route that passes them on
+/// for most Claude models may still turn them down for one. The system
+/// message is marked on every marked request, and is only then a list.
+fn markers_refused(connection: &Connection, sent: &Value, status: u16, error: &str) -> bool {
+    let marked = sent["messages"][0]["content"].is_array();
+    if status != 400 || !marked || !error.contains("cache_control") {
+        return false;
+    }
+    unmarked().lock().is_ok_and(|mut models| {
+        models.insert(connection.model.trim().to_owned());
+        true
+    })
 }
 
 /// Keep both ends of an oversized tool result; the middle is rarely the point.
@@ -1252,11 +1358,13 @@ fn parse_chunk(value: &Value) -> Result<Chunk, Failure> {
     let prompt_tokens = inner
         .pointer("/usage/prompt_tokens")
         .and_then(Value::as_u64);
-    // OpenAI reports cache hits under prompt_tokens_details; DeepSeek uses its
-    // own field. Gateways pass through whichever the upstream provider sent.
+    // OpenAI reports cache hits under prompt_tokens_details; DeepSeek and
+    // Anthropic use fields of their own. Gateways pass through whichever the
+    // upstream provider sent.
     let cached_tokens = inner
         .pointer("/usage/prompt_tokens_details/cached_tokens")
         .or_else(|| inner.pointer("/usage/prompt_cache_hit_tokens"))
+        .or_else(|| inner.pointer("/usage/cache_read_input_tokens"))
         .and_then(Value::as_u64);
     let tool_calls = delta
         .and_then(|d| d["tool_calls"].as_array())
@@ -1513,6 +1621,10 @@ fn stream(
                 // to this model leave out from then on -- unless the turn was
                 // stopped while this one was out. A timeout or a rate limit is
                 // about no field, and passes by itself.
+                // Once off the markers stay off, so this sends it again at most once.
+                if markers_refused(connection, &sent, status.as_u16(), &error) {
+                    return stream(connection, messages, start, budget, extra, sender);
+                }
                 if status.is_client_error()
                     && !matches!(status.as_u16(), 408 | 429)
                     && learn(connection, &sent, &error)
@@ -4548,5 +4660,242 @@ mod tests {
         );
         // The newest write goes out whole.
         assert_eq!(arguments("w1")["content"].as_str().unwrap().len(), 5_000);
+    }
+
+    /// A turn that ends in a tool round: an opener, a call with no words
+    /// beside it, and the call's result.
+    fn tool_turn() -> Vec<Message> {
+        let text = |role: &str, content: &str| Message {
+            role: role.into(),
+            content: content.into(),
+            ..Default::default()
+        };
+        vec![
+            text("user", "first question"),
+            text("assistant", "first answer"),
+            text("user", "read the file"),
+            Message {
+                role: "assistant".into(),
+                content: "  ".into(),
+                tool_calls: vec![ToolCall {
+                    id: "a".into(),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                }],
+                ..Default::default()
+            },
+            Message {
+                role: "tool".into(),
+                tool_call_id: "a".into(),
+                content: "the file".into(),
+                ..Default::default()
+            },
+        ]
+    }
+
+    /// The text of each part of `message` that carries a cache marker.
+    fn marked(message: &Value) -> Vec<String> {
+        message["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|part| part.get("cache_control").is_some())
+            .map(|part| part["text"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_claude_route_marks_the_system_and_the_last_two_messages_with_text() {
+        for (endpoint, model) in [
+            (
+                "https://openrouter.ai/api/v1",
+                "anthropic/claude-sonnet-4.5",
+            ),
+            (crate::auth::hosted_base().as_str(), "claude-sonnet-5"),
+        ] {
+            let c = Connection {
+                endpoint: endpoint.into(),
+                model: model.into(),
+                ..connection()
+            };
+            let payload = body_with(&c, &tool_turn(), None, None, &Budget::SMALL, &[]);
+            let context = payload["messages"].as_array().unwrap();
+            let marks: Vec<Vec<String>> = context.iter().map(marked).collect();
+            assert_eq!(marks[0].len(), 1, "{model}: the system is marked");
+            // The call with only spaces beside it is passed over for the
+            // opener before it, and nothing earlier is marked.
+            assert_eq!(marks[5], ["the file"], "{model}");
+            assert!(
+                marks[4].is_empty() && context[4]["content"] == "  ",
+                "{model}"
+            );
+            assert_eq!(marks[3], ["read the file"], "{model}");
+            assert!(context[1]["content"].is_string() && context[2]["content"].is_string());
+            let total = payload.to_string().matches("cache_control").count();
+            assert!(total <= 4, "{model}: {total} markers");
+        }
+    }
+
+    #[test]
+    fn other_routes_send_plain_text_and_no_markers() {
+        for (endpoint, model) in [
+            ("https://api.openai.com/v1", "gpt-5"),
+            ("https://openrouter.ai/api/v1", "openai/gpt-4o"),
+            ("http://localhost:11434/v1", "claude-sonnet-5"),
+            ("https://example.test/v1", "claude-sonnet-5"),
+        ] {
+            let c = Connection {
+                endpoint: endpoint.into(),
+                model: model.into(),
+                ..connection()
+            };
+            let payload = body_with(&c, &tool_turn(), None, None, &Budget::SMALL, &[]);
+            assert!(!payload.to_string().contains("cache_control"), "{endpoint}");
+            let context = payload["messages"].as_array().unwrap();
+            assert!(
+                context.iter().all(|m| m["content"].is_string()),
+                "{endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_marker_lands_on_an_empty_part() {
+        let mut empty = json!({"role": "assistant", "content": ""});
+        assert!(!mark(&mut empty));
+        assert_eq!(empty["content"], "");
+        let mut picture = json!({"role": "user", "content": [
+            {"type": "text", "text": "The screenshot browse took:"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,"}},
+            {"type": "text", "text": " "}
+        ]});
+        assert!(mark(&mut picture));
+        assert_eq!(marked(&picture), ["The screenshot browse took:"]);
+        let mut context = vec![
+            json!({"role": "system", "content": "rules"}),
+            json!({"role": "assistant", "content": ""}),
+            json!({"role": "assistant", "content": null}),
+        ];
+        mark_cache(&mut context);
+        assert_eq!(marked(&context[0]), ["rules"]);
+        assert_eq!(context[1]["content"], "");
+        assert!(context[2]["content"].is_null());
+    }
+
+    #[test]
+    fn a_refusal_naming_cache_control_turns_markers_off_and_is_retried_once() {
+        let c = Connection {
+            endpoint: "https://openrouter.ai/api/v1".into(),
+            model: "anthropic/claude-refuses-markers".into(),
+            ..connection()
+        };
+        let sent = body_with(&c, &tool_turn(), None, None, &Budget::SMALL, &[]);
+        let refusal = r#"{"error":{"message":"messages.0.content.0.cache_control: Extra inputs are not permitted"}}"#;
+        assert!(!markers_refused(
+            &c,
+            &sent,
+            400,
+            r#"{"error":{"message":"bad model"}}"#
+        ));
+        assert!(!markers_refused(&c, &sent, 429, refusal));
+        assert!(marks_cache(&c));
+        assert!(markers_refused(&c, &sent, 400, refusal));
+        // The retry goes unmarked, so the same refusal does not send it again.
+        let retry = body_with(&c, &tool_turn(), None, None, &Budget::SMALL, &[]);
+        assert!(!retry.to_string().contains("cache_control"));
+        assert!(!markers_refused(&c, &retry, 400, refusal));
+        // Only that model is spared them.
+        let other = Connection {
+            model: "anthropic/claude-sonnet-4.5".into(),
+            ..c
+        };
+        assert!(marks_cache(&other));
+    }
+
+    #[test]
+    fn openai_gets_a_cache_key_that_stays_the_same_for_a_session() {
+        let c = Connection {
+            endpoint: "https://api.openai.com/v1".into(),
+            model: "gpt-5".into(),
+            conversation: 1_700_000_000_123,
+            ..connection()
+        };
+        let turn = tool_turn();
+        let first = body_with(&c, &turn[..3], None, None, &Budget::SMALL, &[]);
+        let later = body(&c, &turn, Some("what fell out"), None);
+        assert_eq!(first["prompt_cache_key"], "letronna-1700000000123");
+        assert_eq!(first["prompt_cache_key"], later["prompt_cache_key"]);
+        let next = Connection {
+            conversation: 1_700_000_000_124,
+            ..c.clone()
+        };
+        let other = body_with(&next, &turn, None, None, &Budget::SMALL, &[]);
+        assert_ne!(first["prompt_cache_key"], other["prompt_cache_key"]);
+        for endpoint in ["https://openrouter.ai/api/v1", "http://localhost:11434/v1"] {
+            let elsewhere = Connection {
+                endpoint: endpoint.into(),
+                ..c.clone()
+            };
+            let payload = body_with(&elsewhere, &turn, None, None, &Budget::SMALL, &[]);
+            assert!(payload.get("prompt_cache_key").is_none(), "{endpoint}");
+        }
+    }
+
+    #[test]
+    fn cache_hits_are_read_under_each_name_a_gateway_uses() {
+        let cached = |usage: &str| {
+            parse_event(&format!(r#"{{"choices":[],"usage":{usage}}}"#))
+                .unwrap()
+                .cached_tokens
+        };
+        let openai = r#"{"prompt_tokens":5000,"prompt_tokens_details":{"cached_tokens":4800}}"#;
+        assert_eq!(cached(openai), Some(4800));
+        assert_eq!(cached(r#"{"prompt_cache_hit_tokens":64}"#), Some(64));
+        let anthropic = r#"{"prompt_tokens":20,"cache_read_input_tokens":4100,"cache_creation_input_tokens":300}"#;
+        assert_eq!(cached(anthropic), Some(4100));
+        assert_eq!(cached(r#"{"prompt_tokens":20}"#), None);
+    }
+
+    #[test]
+    #[ignore = "Talks to a real Claude route, such as the hosted gateway: set AGENT_BASE_URL, AGENT_API_KEY and AGENT_MODEL"]
+    fn live_a_repeated_request_is_served_from_the_cache() {
+        let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("set {name}"));
+        let c = Connection {
+            endpoint: var("AGENT_BASE_URL"),
+            model: var("AGENT_MODEL"),
+            key: var("AGENT_API_KEY"),
+            conversation: now(),
+            ..connection()
+        };
+        assert!(marks_cache(&c), "not a route that takes markers");
+        // Over the 4096 tokens the smallest Claude models cache at least.
+        let long: String = (0..2500)
+            .map(|i| format!("Line {i} of the notes.\n"))
+            .collect();
+        let messages = vec![Message {
+            role: "user".into(),
+            content: format!("{long}\nReply with just: ok"),
+            ..Default::default()
+        }];
+        let cached = |messages: Vec<Message>| {
+            let rx = start(c.clone(), messages);
+            let mut cached = None;
+            while let Ok(event) = rx.recv_blocking() {
+                match event {
+                    Event::Usage { cached: n, .. } => cached = Some(n),
+                    Event::Finished(result) => {
+                        result.unwrap();
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            cached.expect("the route reported no usage")
+        };
+        cached(messages.clone());
+        assert!(
+            cached(messages) > 0,
+            "the second request read nothing from the cache"
+        );
     }
 }
