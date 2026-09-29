@@ -466,7 +466,7 @@ fn check(connection: &Connection, command: &str, cancel: &Cancel) -> String {
     if let Some(why) = crate::gate::refusal(tool.as_ref(), &args, &ctx) {
         return format!("The check command was not run: {why}");
     }
-    let run = crate::agents::fresh_id();
+    let run = check_run(connection.conversation, command);
     if tools::needs_approval(&call.name)
         && let Err(why) = approvals::ask(connection.conversation, run, "goal check", &call, &ctx)
     {
@@ -484,6 +484,17 @@ fn check(connection: &Connection, command: &str, cancel: &Cancel) -> String {
     let out = crate::redact::scrub(&ran, tool.hides_key_shapes());
     let said = crate::hooks::after(&hooks, &call.name, &args, &out, &ctx);
     out + &heard + &said
+}
+
+/// The run a check's approval is asked under: one per session and command,
+/// so "stop asking" holds for that command's later looks and nothing else,
+/// and a session keeps one grant however many looks it has. The top bit
+/// keeps it apart from the numbers runs and agents are given.
+fn check_run(session: u64, command: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (session, command.trim()).hash(&mut hasher);
+    hasher.finish() | 1 << 63
 }
 
 /// Runs `command` in `cwd` as a process tree of its own until it ends,
@@ -968,5 +979,14 @@ mod tests {
         let mut same = Some(judged.clone());
         assert!(settle(&mut same, &judged, &step));
         assert_eq!(same.unwrap().continuations, 1);
+    }
+
+    #[test]
+    fn stop_asking_holds_for_one_check_command_in_one_session() {
+        let run = check_run(4, "cargo test");
+        assert_eq!(run, check_run(4, " cargo test "));
+        assert_ne!(run, check_run(4, "cargo test --release"));
+        assert_ne!(run, check_run(5, "cargo test"));
+        assert!(run >= 1 << 63);
     }
 }
