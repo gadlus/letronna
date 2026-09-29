@@ -106,6 +106,11 @@ pub trait Tool: Send + Sync {
     fn mutates(&self) -> bool {
         false
     }
+    /// Whether a call may destroy what it touches rather than only add to
+    /// it, which only an MCP server's own word says so far.
+    fn destructive(&self) -> bool {
+        false
+    }
     /// Whether the tool reads or changes this computer. Withheld where other
     /// people can read the replies; a tool has to opt out to be offered there,
     /// so a plugin's tool stays out unless it says otherwise.
@@ -223,6 +228,14 @@ const KEEP_TAIL: usize = 3 * 1024 * 1024;
 fn plugin_tools() -> &'static Mutex<Vec<Arc<dyn Tool>>> {
     static EXTRA: OnceLock<Mutex<Vec<Arc<dyn Tool>>>> = OnceLock::new();
     EXTRA.get_or_init(Default::default)
+}
+
+/// The names of the tools the plugins add now.
+pub fn plugin_names() -> Vec<String> {
+    plugin_tools()
+        .lock()
+        .map(|tools| tools.iter().map(|tool| tool.name().to_owned()).collect())
+        .unwrap_or_default()
 }
 
 /// Replace the plugin-contributed tools. The registry calls this at startup and
@@ -507,7 +520,7 @@ pub(crate) fn specs_of(
         .remote
         .as_ref()
         .is_some_and(|r| r.history.is_some());
-    let disabled = crate::store::disabled_tools();
+    let disabled = turned_off();
     tools
         .iter()
         .filter(|t| !switched_off(t.name(), &disabled))
@@ -521,7 +534,16 @@ pub(crate) fn specs_of(
         .collect()
 }
 
-/// Whether `disabled`, the settings' `disabled_tools`, names the tool `name`.
+/// Every tool the user switched off: those the settings' `disabled_tools`
+/// names, then those a rule in permissions.json denies every call of.
+pub fn turned_off() -> Vec<String> {
+    let mut off = crate::store::disabled_tools();
+    let rules = crate::permissions::load(&crate::permissions::user_file());
+    off.extend(crate::permissions::switched_off(&rules.unwrap_or_default()));
+    off
+}
+
+/// Whether `disabled`, as `turned_off` gives it, names the tool `name`.
 pub(crate) fn switched_off(name: &str, disabled: &[String]) -> bool {
     disabled.iter().any(|off| off.trim() == name)
 }
@@ -4164,6 +4186,21 @@ mod tests {
             &Ok(Default::default()),
         );
         assert_eq!(other.as_deref(), Ok("ran"));
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_tool_switched_off_by_a_rule_is_neither_offered_nor_run_until_switched_on() {
+        let (_turn, _dir) = data_folder("switched-by-rule");
+        let file = crate::permissions::user_file();
+        let tools = ["search_sessions".to_owned()];
+        crate::permissions::switch(&file, &tools, false).unwrap();
+        assert!(!offered_names().contains(&tools[0]));
+        let ctx = ToolContext::default();
+        let refused = run("search_sessions", r#"{"query":"fig"}"#, &ctx).unwrap_err();
+        assert!(refused.contains("permissions.json"), "{refused}");
+        crate::permissions::switch(&file, &tools, true).unwrap();
+        assert!(offered_names().contains(&tools[0]));
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 }

@@ -54,7 +54,7 @@
 //!
 //! What became of each server is kept for the user in its slot: whether it
 //! answered, how many tools it gave, why it failed, and the last 64 KB it
-//! printed on stderr. `/mcp` in the terminal and Settings › MCP in the
+//! printed on stderr. `/mcp` in the terminal and Capabilities › MCP in the
 //! window read it through `status()`. A server can print anything there,
 //! keys included, so the tail is scrubbed as a job's log is and goes only
 //! to the user's screen, never to the model. `mcp.json` is changed as plain
@@ -401,6 +401,31 @@ pub struct ServerStatus {
     pub retry: Option<Retry>,
 }
 
+/// What one of a server's tools does, by its server's word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Kind {
+    /// Only reads.
+    Read,
+    /// Changes things, only adding to them.
+    Write,
+    /// May change or destroy what is there.
+    Destructive,
+}
+
+/// One tool of a server as the user sees it in the window.
+#[derive(Clone, Debug)]
+pub struct ServerTool {
+    /// Letronna's name for it, `mcp__<server>__<tool>`, which rules name.
+    pub name: String,
+    /// The name its server gave it.
+    pub own: String,
+    /// What its server says of it.
+    pub description: String,
+    pub kind: Kind,
+    /// About how many tokens it adds to every request it is offered in.
+    pub tokens: usize,
+}
+
 /// The next start of a server that is retrying.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Retry {
@@ -683,6 +708,42 @@ pub fn status() -> Vec<ServerStatus> {
         }
     }
     all
+}
+
+/// The tools server `name` gave when it last answered, in its order;
+/// none while it is not connected.
+pub fn server_tools(name: &str) -> Vec<ServerTool> {
+    let tools = match slots().lock() {
+        Ok(slots) => slots
+            .get(name)
+            .filter(|slot| slot.state == State::Connected)
+            .map(|slot| slot.tools.clone())
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    let prefix = tool_name(name, "");
+    let from = format!(" (from the {name} MCP server)");
+    tools
+        .iter()
+        .map(|tool| {
+            let name = tool.name();
+            let description = tool.description();
+            ServerTool {
+                name: name.to_owned(),
+                own: name.strip_prefix(&prefix).unwrap_or(name).to_owned(),
+                description: description
+                    .strip_suffix(&from)
+                    .unwrap_or(description)
+                    .to_owned(),
+                kind: match (tool.mutates(), tool.destructive()) {
+                    (false, _) => Kind::Read,
+                    (true, false) => Kind::Write,
+                    (true, true) => Kind::Destructive,
+                },
+                tokens: crate::chat::tokens(&crate::tools::spec(tool.as_ref()).to_string()),
+            }
+        })
+        .collect()
 }
 
 /// Why `mcp.json` itself will not read, if it will not; then no server
@@ -1672,6 +1733,19 @@ fn connect(
     server.list()
 }
 
+/// What a tool's `annotations` say it does. The protocol has a tool that
+/// is not read-only be destructive unless it says otherwise, so one that
+/// says nothing is taken at the worst.
+fn kind(annotations: &Value) -> Kind {
+    if annotations["readOnlyHint"].as_bool() == Some(true) {
+        Kind::Read
+    } else if annotations["destructiveHint"].as_bool() == Some(false) {
+        Kind::Write
+    } else {
+        Kind::Destructive
+    }
+}
+
 /// Whether a tool's `annotations` say it only looks, as `read_file` does:
 /// read-only, not destructive, and explicitly reaching no other machine.
 fn only_looks(annotations: &Value) -> bool {
@@ -1788,6 +1862,7 @@ impl Server {
                     ask: !config.auto_approve.approves(own, &tool["annotations"])
                         && !(config.url.trim().is_empty() && only_looks(&tool["annotations"])),
                     read_only: tool["annotations"]["readOnlyHint"].as_bool() == Some(true),
+                    destructive: kind(&tool["annotations"]) == Kind::Destructive,
                     wait: config.call_time(),
                 }));
             }
@@ -2040,6 +2115,7 @@ struct McpTool {
     schema: Value,
     ask: bool,
     read_only: bool,
+    destructive: bool,
     /// How long a call may take.
     wait: Duration,
 }
@@ -2088,6 +2164,9 @@ impl Tool for McpTool {
     }
     fn mutates(&self) -> bool {
         !self.read_only
+    }
+    fn destructive(&self) -> bool {
+        self.destructive
     }
     fn untrusted(&self) -> bool {
         true
@@ -2977,6 +3056,25 @@ mod tests {
         assert!(only_looks(
             &json!({"readOnlyHint": true, "openWorldHint": false, "destructiveHint": false})
         ));
+    }
+
+    #[test]
+    fn a_tool_is_read_write_or_destructive_by_its_annotations_and_destructive_unsaid() {
+        for (annotations, expected) in [
+            (
+                json!({"readOnlyHint": true, "destructiveHint": true}),
+                Kind::Read,
+            ),
+            (json!({"destructiveHint": false}), Kind::Write),
+            (
+                json!({"readOnlyHint": false, "destructiveHint": true}),
+                Kind::Destructive,
+            ),
+            (json!({"readOnlyHint": "true"}), Kind::Destructive),
+            (json!(null), Kind::Destructive),
+        ] {
+            assert_eq!(kind(&annotations), expected, "{annotations}");
+        }
     }
 
     #[test]
@@ -4084,6 +4182,15 @@ mod tests {
         };
         open("t-grow", Ok(config));
         assert_eq!(settled("t-grow", |s| s.state == State::Connected).tools, 1);
+        // Listed for the user by its own name, as the worst it may be, since
+        // it says nothing of what it does.
+        let listed = server_tools("t-grow");
+        assert_eq!(
+            (listed[0].own.as_str(), listed[0].description.as_str()),
+            ("grow", "grow")
+        );
+        assert_eq!(listed[0].kind, Kind::Destructive);
+        assert!(listed[0].tokens > 0);
         let grow = tools()
             .into_iter()
             .find(|t| t.name() == "mcp__t-grow__grow")

@@ -289,6 +289,53 @@ pub fn trouble(user: &Result<Vec<Rule>, String>, workspace: Option<&Path>) -> Op
 /// Adds `rule` to the rules in `file` unless it is there already, leaving a
 /// file that cannot be read as rules alone rather than writing over it.
 pub fn keep(file: &Path, rule: Rule) -> Result<(), String> {
+    change(file, |rules| {
+        let new = !rules.contains(&rule);
+        if new {
+            rules.push(rule);
+        }
+        new
+    })
+}
+
+/// Switches each of `tools` on or off in every folder by the rules in
+/// `file`: off is a deny rule on every call of it, and on takes that away.
+pub fn switch(file: &Path, tools: &[String], on: bool) -> Result<(), String> {
+    change(file, |rules| {
+        let before = rules.len();
+        rules.retain(|rule| !(switches_off(rule) && tools.contains(&rule.tool)));
+        let removed = rules.len() != before;
+        if on {
+            return removed;
+        }
+        rules.extend(tools.iter().map(|tool| Rule {
+            tool: tool.clone(),
+            pattern: "*".into(),
+            effect: Effect::Deny,
+            project: None,
+        }));
+        true
+    })
+}
+
+/// The tools `rules` switch off: those denied every call in every folder,
+/// which the model is then not offered at all.
+pub fn switched_off(rules: &[Rule]) -> Vec<String> {
+    rules
+        .iter()
+        .filter(|rule| switches_off(rule))
+        .map(|rule| rule.tool.clone())
+        .collect()
+}
+
+/// Whether `rule` switches its tool off, as `switch` writes it.
+fn switches_off(rule: &Rule) -> bool {
+    rule.effect == Effect::Deny && rule.whole() && rule.project.is_none()
+}
+
+/// Changes the rules in `file` by `edit`, which says whether it changed
+/// anything, leaving a file that cannot be read as rules alone.
+fn change(file: &Path, edit: impl FnOnce(&mut Vec<Rule>) -> bool) -> Result<(), String> {
     let failed = |error: &dyn std::fmt::Display| {
         format!("Could not save the rule to {}: {error}", file.display())
     };
@@ -301,10 +348,9 @@ pub fn keep(file: &Path, rule: Rule) -> Result<(), String> {
     let lock = std::fs::File::create(file.with_extension("lock")).map_err(|e| failed(&e))?;
     lock.lock().map_err(|e| failed(&e))?;
     let mut rules = load(file)?;
-    if rules.contains(&rule) {
+    if !edit(&mut rules) {
         return Ok(());
     }
-    rules.push(rule);
     let bytes = serde_json::to_vec_pretty(&rules).map_err(|e| failed(&e))?;
     // Written whole and then moved into place, so a crash leaves the old
     // rules rather than half a file; under a name of this save's own, so it
@@ -1033,6 +1079,38 @@ mod tests {
             saver.join().unwrap().unwrap();
         }
         assert_eq!(load(&file).unwrap().len(), 8);
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn switching_tools_off_and_on_leaves_the_other_rules_as_they_were() {
+        let folder = scratch("switch");
+        let file = folder.join(USER_FILE);
+        let kept = [
+            rule("git push", Effect::Deny),
+            Rule {
+                tool: "web_fetch".into(),
+                pattern: "*".into(),
+                effect: Effect::Deny,
+                project: Some(folder.clone()),
+            },
+        ];
+        for rule in kept.clone() {
+            keep(&file, rule).unwrap();
+        }
+        let tools = ["web_fetch".to_owned(), "speak".to_owned()];
+        switch(&file, &tools, false).unwrap();
+        // Twice off is still one rule each.
+        switch(&file, &tools, false).unwrap();
+        let rules = load(&file).unwrap();
+        assert_eq!(switched_off(&rules), ["web_fetch", "speak"]);
+        assert_eq!(rules.len(), 4);
+        // A rule on part of the calls, or in one folder, switches nothing.
+        assert!(!switched_off(&kept).contains(&"web_fetch".to_owned()));
+        switch(&file, &tools[..1], true).unwrap();
+        let rules = load(&file).unwrap();
+        assert_eq!(switched_off(&rules), ["speak"]);
+        assert!(kept.iter().all(|rule| rules.contains(rule)));
         std::fs::remove_dir_all(folder).unwrap();
     }
 }

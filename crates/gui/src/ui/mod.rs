@@ -4,6 +4,7 @@ pub(crate) mod activity;
 pub(crate) mod approval;
 pub(crate) mod artifacts;
 pub(crate) mod browser;
+pub(crate) mod capabilities;
 pub(crate) mod chrome;
 pub(crate) mod composer;
 pub(crate) mod grain;

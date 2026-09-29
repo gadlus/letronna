@@ -1080,6 +1080,53 @@ fn tail_hash(bytes: &[u8]) -> u64 {
 /// kept its time is marked a copy wherever it is seen after its first place.
 /// Sessions are numbered as they are made, which puts the original first.
 pub fn spent(since: u64, session: u64) -> Vec<crate::usage::Spent> {
+    let mut seen = std::collections::HashSet::new();
+    transcripts()
+        .into_iter()
+        .filter(|(id, path)| *id == session || written_since(path, since))
+        .flat_map(|(id, path)| spent_in(&path, id, &mut seen))
+        .collect()
+}
+
+/// How many times the model called each tool, by name, in the sessions and
+/// their helpers' conversations since `since`. A branch copies the calls of
+/// the session it came from, so each call is counted once by its id.
+pub fn tool_calls(since: u64) -> std::collections::BTreeMap<String, usize> {
+    let mut counts = std::collections::BTreeMap::new();
+    let mut seen = std::collections::HashSet::new();
+    for (_, path) in transcripts() {
+        if !written_since(&path, since) {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        for line in String::from_utf8_lossy(&bytes).lines() {
+            // Only replies carry calls; see `spent_in`.
+            if !line.starts_with("{\"type\":\"message\",\"role\":\"assistant\"") {
+                continue;
+            }
+            let Ok(Record::Message(reply)) = serde_json::from_str::<Record>(line) else {
+                continue;
+            };
+            // A reply saved before replies kept their time is in a file
+            // written since, which is as near as it can be told.
+            if reply.at != 0 && reply.at < since {
+                continue;
+            }
+            for call in reply.tool_calls {
+                if seen.insert(call.id) {
+                    *counts.entry(call.name).or_default() += 1;
+                }
+            }
+        }
+    }
+    counts
+}
+
+/// Every conversation file, each with the session it belongs to: the
+/// sessions', then their helpers', in session order.
+fn transcripts() -> Vec<(u64, PathBuf)> {
     let mut files: Vec<(u64, PathBuf)> = session_ids()
         .into_iter()
         .map(|id| (id, session_path(id)))
@@ -1100,12 +1147,7 @@ pub fn spent(since: u64, session: u64) -> Vec<crate::usage::Spent> {
         );
     }
     files.sort();
-    let mut seen = std::collections::HashSet::new();
     files
-        .into_iter()
-        .filter(|(id, path)| *id == session || written_since(path, since))
-        .flat_map(|(id, path)| spent_in(&path, id, &mut seen))
-        .collect()
 }
 
 /// Whether the file at `path` was written to at `since` or later, or might
@@ -4032,6 +4074,42 @@ pub(crate) mod tests {
         // Files not written to since are passed over, but for the session asked about.
         assert_eq!(super::spent(u64::MAX, 1).len(), 4);
         assert!(super::spent(u64::MAX, 3).is_empty());
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn tool_calls_count_each_call_once_and_only_since_asked() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("tool-calls");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        std::fs::create_dir_all(dir.join("sessions")).unwrap();
+        std::fs::create_dir_all(dir.join("agents").join("1")).unwrap();
+        let calls = |at: u64, calls: &[(&str, &str)]| {
+            let calls: Vec<_> = calls
+                .iter()
+                .map(|(id, name)| serde_json::json!({"id": id, "name": name, "arguments": "{}"}))
+                .collect();
+            serde_json::json!({"type": "message", "role": "assistant", "content": "",
+                "at": at, "tool_calls": calls})
+            .to_string()
+        };
+        let old = calls(100, &[("a", "read_file")]);
+        let new = calls(500, &[("b", "read_file"), ("c", "web_fetch")]);
+        let session = [r#"{"type":"head","id":1,"created":100}"#, &old, &new];
+        std::fs::write(dir.join("sessions").join("1.jsonl"), session.join("\n")).unwrap();
+        // A branch copied the newer reply, and a helper made a call of its own.
+        let branch = [r#"{"type":"head","id":2,"created":600}"#, &new];
+        std::fs::write(dir.join("sessions").join("2.jsonl"), branch.join("\n")).unwrap();
+        let helper = calls(700, &[("d", "run_command")]);
+        std::fs::write(dir.join("agents").join("1").join("1.jsonl"), helper).unwrap();
+
+        let counted = super::tool_calls(300);
+        let counted: Vec<(&str, usize)> = counted.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        assert_eq!(
+            counted,
+            [("read_file", 1), ("run_command", 1), ("web_fetch", 1)]
+        );
+        assert_eq!(super::tool_calls(0)["read_file"], 2);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 
