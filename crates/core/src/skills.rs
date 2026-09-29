@@ -77,10 +77,10 @@ const REQUEST_SKILLS: usize = 400;
 /// How much of each SKILL.md the model's index reads: the frontmatter and
 /// the start of the body, never the whole of a long one on every request.
 const HEAD_BYTES: u64 = 16_384;
-/// A page the `skill` tool returns stays under this many bytes as well, or a
-/// page of wide characters would be cut before its note by the 24,000 bytes
-/// a tool result may be.
-const PAGE_BYTES: usize = 20_000;
+/// A page the `skill` tool returns stays under this many bytes as well: a
+/// tool's reply over the chat's cap, counted in bytes, loses its middle, and
+/// a page of wide characters would lose part of itself.
+const PAGE_BYTES: usize = crate::chat::MAX_TOOL_CHARS - 500;
 
 /// Where a skill comes from.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1883,8 +1883,13 @@ mod tests {
         let page = load(&data, None, "wide", None, 0).unwrap();
         assert!(page.len() <= super::PAGE_BYTES, "{}", page.len());
         assert!(page.contains("and offset"));
-        // Whatever cuts a tool result leaves it whole.
-        assert!(page.len() < 24_000);
+        // The cut every tool's reply goes through leaves it whole.
+        assert!(page.len() < crate::chat::MAX_TOOL_CHARS);
+        // And so does a page of plain text.
+        create_in(&data, "plain", "Words.", &"word ".repeat(4_000)).unwrap();
+        let page = load(&data, None, "plain", None, 0).unwrap();
+        assert!(page.len() < crate::chat::MAX_TOOL_CHARS, "{}", page.len());
+        assert!(page.contains("and offset"));
     }
 
     #[test]
