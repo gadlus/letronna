@@ -340,7 +340,7 @@ fn waiting_card(chat: &Entity<Chat>, url: String, cx: &App) -> Div {
                 )
                 .child(
                     Button::new("sign-in-copy")
-                        .outline()
+                        .framed(cx)
                         .small()
                         .label("Copy link")
                         .on_click(move |_, window, cx| {
@@ -355,7 +355,7 @@ fn waiting_card(chat: &Entity<Chat>, url: String, cx: &App) -> Div {
                 )
                 .child(
                     Button::new("sign-in-cancel")
-                        .ghost()
+                        .plain(cx)
                         .small()
                         .label("Cancel")
                         .on_click(move |_, _, cx| {

@@ -89,9 +89,9 @@ impl Chat {
                     .items_center()
                     .justify_between()
                     .gap_3()
-                    .p_3()
-                    .rounded(cx.theme().radius)
-                    .bg(cx.theme().secondary.opacity(0.3))
+                    .py_3()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
                     .child(
                         v_flex()
                             .flex_1()
@@ -137,7 +137,7 @@ impl Chat {
                             .items_center()
                             .child(
                                 Button::new(("open", index))
-                                    .ghost()
+                                    .plain(cx)
                                     .xsmall()
                                     .label("Open")
                                     .disabled(!exists)
@@ -145,7 +145,7 @@ impl Chat {
                             )
                             .child(
                                 Button::new(("reveal", index))
-                                    .ghost()
+                                    .plain(cx)
                                     .xsmall()
                                     .icon(Icon::new(AppIcon::Folder))
                                     .tooltip("Show in folder")
@@ -179,7 +179,7 @@ impl Chat {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .child(v_flex().gap_2().children(rows)),
+                    .child(v_flex().children(rows)),
             )
     }
 }

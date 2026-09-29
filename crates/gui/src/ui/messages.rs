@@ -40,12 +40,12 @@ impl Chat {
         let is_user = message.role == "user";
         let session = self.store.conversations[self.store.active].id;
         let editing = is_user && self.editing_message == Some((session, index));
-        // Where the turn's buttons go: over your card's corner, in a reply's
-        // copy-and-usage line, or under a reply that has neither. Over and
-        // in, they take no room of their own while hidden.
+        // Where the turn's buttons go: at the end of your prompt's label, in
+        // a reply's copy-and-usage line, or under a reply that has neither.
+        // In the two lines they take no room of their own.
         let usage_row =
             !is_user && !message.content.is_empty() && (!streaming || message.tokens > 0);
-        let (on_card, in_usage, under) = match (is_user, usage_row) {
+        let (on_label, in_usage, under) = match (is_user, usage_row) {
             (true, _) => (bar.filter(|_| !editing), None, None),
             (false, true) => (None, bar, None),
             (false, false) => (None, None, bar),
@@ -74,7 +74,7 @@ impl Chat {
                         .justify_end()
                         .child(
                             Button::new("edit-cancel")
-                                .ghost()
+                                .plain(cx)
                                 .small()
                                 .label("Cancel")
                                 .on_click(
@@ -95,6 +95,8 @@ impl Chat {
         } else if is_user {
             TextView::markdown(md, message.content.clone(), window, cx)
                 .selectable(selectable)
+                .text_size(px(15.))
+                .font_weight(FontWeight::MEDIUM)
                 .line_height(leading)
                 .into_any_element()
         } else if message.content.is_empty() {
@@ -144,7 +146,20 @@ impl Chat {
         v_flex()
             .w_full()
             .gap_2p5()
-            // Your own messages carry no label: the card says whose they are.
+            // Your prompt is a plain row under its own label, its buttons at
+            // the label's end; the line keeps their height so nothing moves
+            // when they show.
+            .when(is_user, |this| {
+                this.child(
+                    h_flex()
+                        .h_5()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(crate::ui::micro("You", cx))
+                        .children(on_label),
+                )
+            })
             .when(labeled && !is_user, |this| {
                 this.child(
                     h_flex()
@@ -188,27 +203,7 @@ impl Chat {
             // which pushes the whole chat past the composer. Clipping here
             // clamps it; min_w_0 would instead collapse list layout.
             .when(!tool_only, |this| {
-                this.child(
-                    div()
-                        .w_full()
-                        .overflow_hidden()
-                        .pb_1()
-                        // Your prompt sits in a card, so a long exchange
-                        // reads as turns rather than one run of text.
-                        .when(is_user, |card| {
-                            card.relative()
-                                .px_4()
-                                .py_3()
-                                .rounded(cx.theme().radius_lg)
-                                .bg(cx.theme().secondary.opacity(0.5))
-                                .border_1()
-                                .border_color(cx.theme().border)
-                        })
-                        .child(body)
-                        .when_some(on_card, |card, bar| {
-                            card.child(div().absolute().top_1().right_1().child(bar))
-                        }),
-                )
+                this.child(div().w_full().overflow_hidden().pb_1().child(body))
             })
             // A reply is often wanted whole, and selecting it across
             // paragraphs and code blocks is fiddly.
@@ -350,7 +345,7 @@ impl Chat {
                     .cursor_pointer()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .hover(|s| s.bg(cx.theme().secondary.opacity(0.5)))
+                    .active(|s| s.bg(cx.theme().secondary.opacity(0.5)))
                     .child(
                         Icon::new(if open {
                             IconName::ChevronDown
@@ -430,7 +425,7 @@ impl Chat {
                     .cursor_pointer()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .hover(|s| s.bg(cx.theme().secondary.opacity(0.5)))
+                    .active(|s| s.bg(cx.theme().secondary.opacity(0.5)))
                     .child(
                         Icon::new(if open {
                             IconName::ChevronDown
@@ -489,7 +484,7 @@ impl Chat {
             .when(no_project, |this| {
                 this.child(
                     Button::new("choose-project")
-                        .outline()
+                        .framed(cx)
                         .small()
                         .mt_4()
                         .icon(Icon::new(AppIcon::Folder))
@@ -717,14 +712,14 @@ fn made_file(
                 })
                 .child(
                     Button::new(("open-made", index))
-                        .ghost()
+                        .plain(cx)
                         .xsmall()
                         .label("Open")
                         .on_click(move |_, _, cx| cx.open_with_system(&open)),
                 )
                 .child(
                     Button::new(("reveal-made", index))
-                        .ghost()
+                        .plain(cx)
                         .xsmall()
                         .icon(Icon::new(AppIcon::Folder))
                         .tooltip("Show in folder")
@@ -738,7 +733,7 @@ fn made_file(
 fn sound_button(index: usize, path: PathBuf, cx: &mut Context<Chat>) -> Button {
     let playing = crate::platform::audio::playing(&path);
     Button::new(("play-made", index))
-        .ghost()
+        .plain(cx)
         .xsmall()
         .icon(Icon::new(if playing {
             AppIcon::Stop

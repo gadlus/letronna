@@ -210,7 +210,7 @@ impl Chat {
         let out = matches!(self.updating, Updating::Out(_));
         Some(
             Button::new("update-chip")
-                .ghost()
+                .plain(cx)
                 .xsmall()
                 .label(label)
                 .disabled(self.busy)

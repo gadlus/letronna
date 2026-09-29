@@ -70,7 +70,7 @@ impl Chat {
                 let pick = option.clone();
                 chips = chips.child(
                     Button::new(("option", i))
-                        .outline()
+                        .framed(cx)
                         .small()
                         .label(option)
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -191,16 +191,22 @@ impl Chat {
                         )
                         .child(
                             Button::new("allow-session")
-                                .outline()
+                                .framed(cx)
                                 .small()
                                 .label("Allow for this session")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.resolve_call(Verdict::Allow { remember: true }, cx)
                                 })),
                         )
-                        .child(Button::new("deny").ghost().small().label("Deny").on_click(
-                            cx.listener(|this, _, _, cx| this.resolve_call(Verdict::Deny, cx)),
-                        )),
+                        .child(
+                            Button::new("deny")
+                                .plain(cx)
+                                .small()
+                                .label("Deny")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.resolve_call(Verdict::Deny, cx)
+                                })),
+                        ),
                 )
                 .into_any_element(),
         )

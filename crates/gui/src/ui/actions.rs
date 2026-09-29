@@ -310,15 +310,30 @@ impl Chat {
         }
     }
 
-    /// The row of small buttons under a turn. It shows while the turn is
-    /// hovered, and always under the newest reply, which is the one most
-    /// often asked again.
-    pub(crate) fn turn_bar(&self, span: Span, always: bool, cx: &Context<Self>) -> AnyElement {
+    /// What lets a turn be picked out with Tab, kept per session and place
+    /// so it lives as long as the turn is drawn.
+    pub(crate) fn turn_focus(
+        &self,
+        first: usize,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> FocusHandle {
+        window
+            .use_keyed_state(self.row_id("turn-focus", first), cx, |_, cx| {
+                cx.focus_handle().tab_stop(true)
+            })
+            .read(cx)
+            .clone()
+    }
+
+    /// The row of small buttons for a turn, always laid out so nothing moves
+    /// when it shows, and drawn only where `shows_bar` says.
+    pub(crate) fn turn_bar(&self, span: Span, shown: bool, cx: &Context<Self>) -> AnyElement {
         let (retry, rewind) = self.can_retry_and_rewind(span);
         let button =
             |name: &'static str, icon: Icon, tip: &'static str, enabled: bool, act: Act| {
                 Button::new(self.row_id(name, span.first))
-                    .ghost()
+                    .plain(cx)
                     .xsmall()
                     .icon(icon)
                     .tooltip(tip)
@@ -328,17 +343,7 @@ impl Chat {
         h_flex()
             .gap_0p5()
             .items_center()
-            // Over your card it sits on the text, so it needs a ground.
-            .when(span.yours, |bar| {
-                bar.px_0p5()
-                    .rounded(cx.theme().radius)
-                    .bg(cx.theme().background)
-                    .border_1()
-                    .border_color(cx.theme().border)
-            })
-            .when(!always, |bar| {
-                bar.invisible().group_hover("turn", |style| style.visible())
-            })
+            .when(!shown, |bar| bar.invisible())
             .when(span.yours, |bar| {
                 bar.child(button(
                     "edit",
@@ -391,6 +396,13 @@ impl Chat {
     }
 }
 
+/// Whether a turn shows its buttons: the newest one once nothing is coming
+/// in, since it is the one most often asked again, and the one that holds
+/// focus, picked out with Tab or by selecting its text.
+pub(crate) fn shows_bar(span: Span, messages: usize, streaming: bool, focused: bool) -> bool {
+    focused || (!streaming && span.last + 1 == messages)
+}
+
 /// "1 message" or "N messages".
 fn message_count(n: usize) -> String {
     if n == 1 {
@@ -404,7 +416,7 @@ fn message_count(n: usize) -> String {
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
-    use super::{Span, message_count};
+    use super::{Span, message_count, shows_bar};
 
     #[test]
     fn a_turn_keeps_what_comes_before_your_message_or_up_to_its_reply() {
@@ -426,6 +438,23 @@ mod tests {
             yours: false,
         };
         assert_eq!(opening.prompt(), None);
+    }
+
+    #[test]
+    fn the_bar_shows_under_the_newest_turn_and_the_focused_one() {
+        let turn = |first, last, yours| Span { first, last, yours };
+        let (prompt, reply) = (turn(4, 4, true), turn(5, 8, false));
+        // Nine messages, the reply last: only it shows, until one is picked.
+        assert!(shows_bar(reply, 9, false, false));
+        assert!(!shows_bar(prompt, 9, false, false));
+        assert!(shows_bar(prompt, 9, false, true));
+        // A prompt nothing answered is the newest turn itself.
+        assert!(shows_bar(prompt, 5, false, false));
+        // While a reply comes in, the prompt it answers waits to be picked.
+        assert!(!shows_bar(prompt, 5, true, false));
+        assert!(shows_bar(prompt, 5, true, true));
+        // An earlier reply stays bare until it is picked.
+        assert!(!shows_bar(turn(0, 3, false), 9, false, false));
     }
 
     #[test]

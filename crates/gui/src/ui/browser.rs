@@ -598,7 +598,7 @@ impl BrowserView {
         // A way to go somewhere, which shows the page loading at once.
         let go = |id: &'static str, icon: Icon, tooltip: &'static str, to: fn() -> Control| {
             Button::new(id)
-                .ghost()
+                .plain(cx)
                 .xsmall()
                 .icon(icon)
                 .tooltip(tooltip)
@@ -610,7 +610,7 @@ impl BrowserView {
         let (back, forward) = self.history;
         let reload = match self.loading {
             Some(_) => Button::new("page-stop")
-                .ghost()
+                .plain(cx)
                 .xsmall()
                 .icon(Icon::new(IconName::Close))
                 .tooltip("Stop loading")
@@ -623,7 +623,7 @@ impl BrowserView {
         let view = cx.entity();
         let (layout, zoom) = (self.layout, self.zoom);
         let view_menu = Button::new("page-view")
-            .ghost()
+            .plain(cx)
             .xsmall()
             .icon(Icon::new(AppIcon::View))
             .dropdown_menu_with_anchor(gpui::Corner::TopRight, move |menu, _, _| {
@@ -672,14 +672,14 @@ impl BrowserView {
         // The zoom, while it is not the page's own size; clicked, it is again.
         let zoomed = ((self.zoom - 1.).abs() > 0.001).then(|| {
             Button::new("page-zoom")
-                .ghost()
+                .plain(cx)
                 .xsmall()
                 .label(format!("{:.0}%", self.zoom * 100.))
                 .tooltip("Back to actual size")
                 .on_click(cx.listener(|view, _, window, cx| view.set_zoom(1., window, cx)))
         });
         let own_window = Button::new("page-window")
-            .ghost()
+            .plain(cx)
             .xsmall()
             .map(|button| match self.own_window {
                 true => button
@@ -730,7 +730,7 @@ impl BrowserView {
             .child(own_window)
             .child(
                 Button::new("hide-browser")
-                    .ghost()
+                    .plain(cx)
                     .xsmall()
                     .icon(Icon::new(IconName::Close))
                     .tooltip("Hide the browser")
@@ -929,7 +929,6 @@ impl BrowserView {
                 .bg(cx.theme().popover)
                 .border_1()
                 .border_color(cx.theme().border)
-                .shadow_md()
                 .text_xs()
         };
         let asked = self.dialog.as_ref().map(|asked| {
@@ -956,7 +955,7 @@ impl BrowserView {
                 )
                 .child(
                     Button::new("page-cancel")
-                        .ghost()
+                        .plain(cx)
                         .xsmall()
                         .label("Cancel")
                         .on_click(answer(false)),
@@ -1039,7 +1038,6 @@ impl BrowserView {
             .bg(colour)
             .border_2()
             .border_color(gpui::white())
-            .shadow_md()
             .with_animation(("dot", id), animation(), move |dot, t| {
                 let way = travelled(t);
                 dot.left(relative(from.0 + (to.0 - from.0) * way))
@@ -1124,7 +1122,6 @@ impl Render for BrowserView {
                 .w(FLOAT_WIDTH)
                 .rounded(cx.theme().radius_lg)
                 .border_1()
-                .shadow_lg()
                 .overflow_hidden()
                 .occlude()
                 .into_any_element()
