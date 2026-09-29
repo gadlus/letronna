@@ -14,6 +14,9 @@ pub(crate) fn needed(signed_in: bool, has_key: bool, has_endpoint: bool, empty_c
     !signed_in && !has_key && !has_endpoint && empty_chat
 }
 
+/// How many models the setup page lists before pointing at the picker.
+const SETUP_MODELS: usize = 50;
+
 impl Chat {
     /// Bring the page back, whatever is reachable by now.
     pub(crate) fn open_setup(&mut self, cx: &mut Context<Self>) {
@@ -302,7 +305,12 @@ impl Chat {
         let (on, current) = self.store.model(self.store.active);
         let (on, current) = (on.to_owned(), current.to_owned());
         let custom = self.store.settings.custom_endpoint.clone();
-        let matches = self.model_matches(cx);
+        // Not the picker's search text: its box is not on this page, so a
+        // leftover query would hide models with nothing to clear it. And a
+        // gateway can list hundreds, each a button built every frame.
+        let mut matches = self.models_named("");
+        let more = matches.len().saturating_sub(SETUP_MODELS);
+        matches.truncate(SETUP_MODELS);
         let mut list = v_flex()
             .id("setup-models")
             .max_h(px(260.))
@@ -367,6 +375,18 @@ impl Chat {
                 div()
                     .when(i > 0, |d| d.border_t_1().border_color(cx.theme().border))
                     .child(row),
+            );
+        }
+        if more > 0 {
+            list = list.child(
+                div()
+                    .px_4()
+                    .py_3()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!("{more} more in the model picker.")),
             );
         }
         let begin = chat.clone();
