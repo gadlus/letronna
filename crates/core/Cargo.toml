@@ -19,3 +19,12 @@ semver = "1"
 # Discord's Gateway, for hearing server mentions as they happen. Blocking
 # like reqwest here, and on the same rustls.
 tungstenite = { version = "0.30", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
+
+# Stopping a background job ends everything it started: a Job Object on
+# Windows, a process group elsewhere. Both are already in the lock file,
+# windows-sys at the version the window uses.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
