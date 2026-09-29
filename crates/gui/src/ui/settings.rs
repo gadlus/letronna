@@ -1039,7 +1039,7 @@ fn appearance_page(
                     cx.theme().border
                 })
                 .focus(|s| s.border_color(cx.theme().ring))
-                .child(div().flex_1().text_sm().child(text))
+                .child(div().flex_1().min_w_0().text_sm().child(text))
                 // Paper's focus ring is its primary blue, so the chosen row
                 // is told apart by its tick.
                 .when(active, |row| {
@@ -1206,7 +1206,11 @@ fn toggle_row(
         .items_center()
         .gap_4()
         .child(
+            // Shrinks and wraps, so a long line never pushes the switch
+            // off the page.
             v_flex()
+                .flex_1()
+                .min_w_0()
                 .gap_0p5()
                 .child(div().text_sm().child(title))
                 .child(
