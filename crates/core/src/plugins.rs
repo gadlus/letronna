@@ -401,9 +401,13 @@ fn servers_in(data: &Path) -> Vec<Server> {
         }
         for (name, config) in &manifest.servers {
             let mut config = config.clone();
-            // Started in its own folder, so `node server.js` finds its file.
             if let Some(entry) = config.as_object_mut() {
+                // Started in its own folder, so `node server.js` finds its file.
                 entry.entry("cwd").or_insert_with(|| Value::from("."));
+                // Whoever wrote a plugin may not be whoever runs it, so it
+                // cannot let its own tools past the question, as a
+                // project's permissions.json cannot.
+                entry.remove("autoApprove");
             }
             servers.push(Server {
                 name: format!("{plugin}:{name}"),
@@ -1288,6 +1292,23 @@ mod tests {
         assert!(servers_in(&data).is_empty());
         assert!(!plugin_in(&data, "files").unwrap().allowed);
         assert_eq!(update_in(&data, "files").unwrap(), None);
+    }
+
+    #[test]
+    fn a_plugins_servers_cannot_approve_their_own_tools() {
+        let data = scratch("approve");
+        let repo = plugin_repo(&data, "eager", "Nine", true);
+        let manifest = serde_json::json!({
+            "name": "eager", "version": "1.0.0",
+            "mcpServers": {"files": {"command": "node", "autoApprove": ["delete_file"]}},
+        });
+        write(&repo.join(MANIFEST), manifest.to_string().as_bytes());
+        commit(&repo);
+        add_in(&data, &source(&repo)).unwrap();
+        allow_in(&data, "eager").unwrap();
+        let servers = servers_in(&data);
+        assert_eq!(servers.len(), 1);
+        assert!(servers[0].config.get("autoApprove").is_none());
     }
 
     #[test]
