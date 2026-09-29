@@ -21,8 +21,11 @@
 //! with any `headers` it needs, such as a key. It is spoken to over HTTP as
 //! the protocol now has it: each message is POSTed, and the reply -- one
 //! message, or a stream of events -- is read back as if it had come down a
-//! pipe, so nothing past that knows the difference. The older way, a stream
-//! opened first at an address ending in /sse, is not spoken.
+//! pipe, so nothing past that knows the difference. Each event is handed on
+//! as it arrives, so a server can ask something mid-reply and hear the
+//! answer. A server that restarts has forgotten the session it gave, and is
+//! greeted again; the session is ended when the app quits. The older way, a
+//! stream opened first at an address ending in /sse, is not spoken.
 
 use crate::tools::{Tool, ToolContext};
 use serde::Deserialize;
@@ -36,8 +39,22 @@ use std::time::Duration;
 /// How long a server gets to start and list its tools. The first run of an
 /// npx server downloads it, which is most of this.
 const START_TIME: Duration = Duration::from_secs(60);
-/// How long one tool call may take, the same as a command.
+/// How long one tool call may take, the same as a command, unless the
+/// server's `timeout_ms` says otherwise.
 const CALL_TIME: Duration = Duration::from_secs(120);
+/// The longest a call may be given, whatever `timeout_ms` says: a day,
+/// which no call needs, and which keeps every deadline far inside what a
+/// clock can add up to.
+const LONGEST_CALL: Duration = Duration::from_secs(24 * 60 * 60);
+/// How much longer a POST to a server reached by URL may run than a call
+/// may take. Whoever asked gives up first, naming what went unanswered, and
+/// the POST is let go of soon after.
+const GRACE_TIME: Duration = Duration::from_secs(5);
+/// How long quitting waits for servers reached by URL to hear their
+/// sessions end: long enough for a hosted server's handshake, short enough
+/// that one gone quiet does not hold up the app; a session not ended
+/// expires on the server anyway.
+const END_TIME: Duration = Duration::from_secs(2);
 /// The protocol revision asked for; a server answers with one it speaks.
 const PROTOCOL: &str = "2025-06-18";
 /// The words in an `env` or `headers` name that say its value is a secret.
@@ -81,6 +98,18 @@ struct ServerConfig {
     /// Tools that run without asking, by their name on the server.
     #[serde(default, rename = "autoApprove")]
     auto_approve: Vec<String>,
+    /// How long one call to this server may take, in milliseconds.
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+impl ServerConfig {
+    /// How long one call to this server may take: `timeout_ms`, or the usual.
+    fn call_time(&self) -> Duration {
+        self.timeout_ms
+            .filter(|&ms| ms > 0)
+            .map_or(CALL_TIME, |ms| Duration::from_millis(ms).min(LONGEST_CALL))
+    }
 }
 
 /// The tools of every server that has answered so far.
@@ -259,36 +288,87 @@ fn spawn(config: &ServerConfig) -> Result<std::process::Child, String> {
 /// Greet a server reached by URL and wrap each tool it lists.
 fn reach(name: &str, config: &ServerConfig) -> Result<Vec<Arc<dyn Tool>>, String> {
     let (from, replies) = std::io::pipe().map_err(|e| format!("{name}: {e}"))?;
+    // Each request carries its own deadline, from the server's call time,
+    // rather than the client cutting every call off at one length.
+    // Redirects are not followed: a key in a header of its own would go
+    // along to wherever the server pointed.
     let client = reqwest::blocking::Client::builder()
-        .timeout(CALL_TIME)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| e.to_string())?;
-    let link = Http {
+    let link = Arc::new(Link {
         name: name.to_owned(),
         url: config.url.trim().to_owned(),
         headers: config.headers.clone(),
         client,
-        session: Arc::default(),
+        wait: config.call_time(),
+        session: Mutex::default(),
+        greeting: Mutex::default(),
+        greeting_again: Mutex::default(),
+    });
+    if let Ok(mut links) = links().lock() {
+        links.push(link.clone());
+    }
+    let http = Http {
+        link,
         replies: Arc::new(Mutex::new(replies)),
         line: Vec::new(),
     };
-    connect(name, config, from, link)
+    connect(name, config, from, http)
+}
+
+/// Every server reached by URL, for ending their sessions when the app quits.
+fn links() -> &'static Mutex<Vec<Arc<Link>>> {
+    static LINKS: OnceLock<Mutex<Vec<Arc<Link>>>> = OnceLock::new();
+    LINKS.get_or_init(Default::default)
+}
+
+/// End the session of every server reached by URL, so it can let go of
+/// what it keeps for it. Called when the app quits.
+pub fn stop_all() {
+    let links = links()
+        .lock()
+        .map(|mut links| std::mem::take(&mut *links))
+        .unwrap_or_default();
+    // All at once, so quitting waits END_TIME at most however many there are.
+    let ending: Vec<_> = links
+        .into_iter()
+        .map(|link| std::thread::spawn(move || link.end()))
+        .collect();
+    for end in ending {
+        let _ = end.join();
+    }
 }
 
 /// A server reached by URL, spoken to as if over pipes: each message written
 /// to it is POSTed, and every message in the reply is handed on as a line to
-/// read. A request is sent on a thread of its own, since its reply can take
-/// as long as a tool call and the server may want an answer meanwhile;
-/// anything else is sent at once, so the greeting comes before what follows.
+/// read as soon as it arrives. A request is sent on a thread of its own,
+/// since its reply can take as long as a tool call and the server may want
+/// an answer meanwhile; anything else is sent at once, so the greeting comes
+/// before what follows.
 struct Http {
+    link: Arc<Link>,
+    replies: Arc<Mutex<std::io::PipeWriter>>,
+    /// What has been written of the next message so far.
+    line: Vec<u8>,
+}
+
+/// A server reached by URL: where it is, how to speak to it, and the
+/// session it gave.
+struct Link {
     name: String,
     url: String,
     headers: HashMap<String, String>,
     client: reqwest::blocking::Client,
-    session: Arc<Mutex<Session>>,
-    replies: Arc<Mutex<std::io::PipeWriter>>,
-    /// What has been written of the next message so far.
-    line: Vec<u8>,
+    /// How long a call may take.
+    wait: Duration,
+    session: Mutex<Session>,
+    /// The greeting as first sent, sent again when the server has forgotten
+    /// the session.
+    greeting: Mutex<Option<Vec<u8>>>,
+    /// Held while the server is greeted again, so requests that all found
+    /// the session gone greet it once between them.
+    greeting_again: Mutex<()>,
 }
 
 /// What a server reached by URL gave back when greeted, which goes with
@@ -297,6 +377,14 @@ struct Http {
 struct Session {
     id: Option<String>,
     version: Option<String>,
+}
+
+/// Why a POST failed.
+enum Failed {
+    /// In words for whoever asked.
+    Said(String),
+    /// The server no longer knows the session it was sent, whose id this is.
+    Forgot(String),
 }
 
 impl Write for Http {
@@ -325,25 +413,23 @@ impl Http {
             .then(|| parsed.get("id").cloned())
             .flatten();
         let waits = request.is_some();
-        let (name, url, headers) = (self.name.clone(), self.url.clone(), self.headers.clone());
-        let (client, session, replies) = (
-            self.client.clone(),
-            self.session.clone(),
-            self.replies.clone(),
-        );
+        if parsed["method"] == "initialize"
+            && let Ok(mut greeting) = self.link.greeting.lock()
+        {
+            *greeting = Some(message.clone());
+        }
+        let (link, replies) = (self.link.clone(), self.replies.clone());
         let send = move || {
-            let messages = match exchange(&client, &url, &headers, &session, message) {
-                Ok(messages) => messages,
-                Err(why) => match &request {
-                    Some(id) => vec![json!({"jsonrpc": "2.0", "id": id,
-                        "error": {"code": -32000, "message": format!("{name}: {why}")}})],
-                    None => Vec::new(),
-                },
-            };
-            if let Ok(mut replies) = replies.lock() {
-                for message in messages {
+            let mut hand_on = |message: Value| {
+                if let Ok(mut replies) = replies.lock() {
                     let _ = writeln!(replies, "{message}");
                 }
+            };
+            if let Err(why) = link.send(&message, &mut hand_on)
+                && let Some(id) = &request
+            {
+                hand_on(json!({"jsonrpc": "2.0", "id": id,
+                    "error": {"code": -32000, "message": format!("{}: {why}", link.name)}}));
             }
         };
         match waits {
@@ -355,89 +441,170 @@ impl Http {
     }
 }
 
-/// Send one message to a server reached by URL, and the messages it answers
-/// with.
-fn exchange(
-    client: &reqwest::blocking::Client,
-    url: &str,
-    headers: &HashMap<String, String>,
-    session: &Mutex<Session>,
-    message: Vec<u8>,
-) -> Result<Vec<Value>, String> {
-    let mut request = client
-        .post(url)
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json, text/event-stream")
-        .body(message);
-    for (name, value) in headers {
-        request = request.header(name, value);
+impl Link {
+    /// POST one message, handing on each message in the reply as it comes.
+    /// A server that has forgotten the session, as one that restarted has,
+    /// is greeted again and the message sent once more.
+    fn send(&self, message: &[u8], hand_on: &mut dyn FnMut(Value)) -> Result<(), String> {
+        match self.exchange(message, hand_on) {
+            Err(Failed::Forgot(stale)) => {
+                self.greet_again(&stale)?;
+                self.exchange(message, hand_on)
+                    .map_err(|failed| self.said(failed))
+            }
+            other => other.map_err(|failed| self.said(failed)),
+        }
     }
-    if let Ok(session) = session.lock() {
+
+    /// Greet the server again after it forgot session `stale`, unless
+    /// another request has already.
+    fn greet_again(&self, stale: &str) -> Result<(), String> {
+        let _alone = self
+            .greeting_again
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = self.session.lock().ok().and_then(|s| s.id.clone());
+        if current.as_deref() != Some(stale) {
+            return Ok(());
+        }
+        let Some(greeting) = self.greeting.lock().ok().and_then(|g| g.clone()) else {
+            return Err(self.said(Failed::Forgot(stale.to_owned())));
+        };
+        if let Ok(mut session) = self.session.lock() {
+            *session = Session::default();
+        }
+        // The first answer went to whoever asked; this one only brings the
+        // new session.
+        let initialized = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+        self.exchange(&greeting, &mut |_| {})
+            .and_then(|()| self.exchange(initialized.to_string().as_bytes(), &mut |_| {}))
+            .map_err(|failed| self.said(failed))
+    }
+
+    /// A failure in words for whoever asked.
+    fn said(&self, failed: Failed) -> String {
+        match failed {
+            Failed::Said(why) => why,
+            Failed::Forgot(_) => format!(
+                "{} forgot its session (HTTP 404) and did not keep a new one.",
+                self.url
+            ),
+        }
+    }
+
+    /// `request` with the configured headers and the session, and the
+    /// session's id when it has one.
+    fn headed(
+        &self,
+        mut request: reqwest::blocking::RequestBuilder,
+    ) -> (reqwest::blocking::RequestBuilder, Option<String>) {
+        for (name, value) in &self.headers {
+            request = request.header(name, value);
+        }
+        let Ok(session) = self.session.lock() else {
+            return (request, None);
+        };
         if let Some(id) = &session.id {
             request = request.header("Mcp-Session-Id", id);
         }
         if let Some(version) = &session.version {
             request = request.header("MCP-Protocol-Version", version);
         }
+        (request, session.id.clone())
     }
-    let reply = request
-        .send()
-        .map_err(|e| format!("could not reach {url}: {e}"))?;
-    let status = reply.status();
-    if let Some(id) = reply
-        .headers()
-        .get("mcp-session-id")
-        .and_then(|v| v.to_str().ok())
-        && let Ok(mut session) = session.lock()
-    {
-        session.id = Some(id.to_owned());
+
+    /// Tell the server the session is over; one that keeps none, or has
+    /// gone, is left be.
+    fn end(&self) {
+        let (request, Some(_)) = self.headed(self.client.delete(&self.url).timeout(END_TIME))
+        else {
+            return;
+        };
+        let _ = request.send();
     }
-    if !status.is_success() {
-        return Err(match status.as_u16() {
-            401 | 403 => format!(
-                "{url} refused (HTTP {status}): check the headers given for it in mcp.json."
-            ),
-            404 | 405 => format!("{url} has no MCP server that speaks HTTP (HTTP {status})."),
-            _ => format!("{url} answered HTTP {status}."),
-        });
-    }
-    let streamed = reply
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|kind| kind.contains("text/event-stream"));
-    let body = reply
-        .text()
-        .map_err(|e| format!("{url} stopped answering: {e}"))?;
-    let messages = match streamed {
-        true => events(&body),
-        false => match serde_json::from_str::<Value>(&body) {
-            Ok(Value::Array(batch)) => batch,
-            Ok(one) => vec![one],
+
+    /// POST one message, handing on each message in the reply as it arrives.
+    fn exchange(&self, message: &[u8], hand_on: &mut dyn FnMut(Value)) -> Result<(), Failed> {
+        let url = &self.url;
+        let request = self
+            .client
+            .post(url)
+            .timeout(self.wait + GRACE_TIME)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(message.to_vec());
+        let (request, sent_with) = self.headed(request);
+        let reply = request
+            .send()
+            .map_err(|e| Failed::Said(format!("could not reach {url}: {e}")))?;
+        let status = reply.status();
+        // What a server that restarted says of a session from before.
+        if status == reqwest::StatusCode::NOT_FOUND
+            && let Some(stale) = sent_with
+        {
+            return Err(Failed::Forgot(stale));
+        }
+        if let Some(id) = reply
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+            && let Ok(mut session) = self.session.lock()
+        {
+            session.id = Some(id.to_owned());
+        }
+        if !status.is_success() {
+            return Err(Failed::Said(match status.as_u16() {
+                300..=399 => format!(
+                    "{url} sends its requests elsewhere (HTTP {status}), which is not followed: give the address it moved to in mcp.json."
+                ),
+                401 | 403 => format!(
+                    "{url} refused (HTTP {status}): check the headers given for it in mcp.json."
+                ),
+                404 | 405 => format!("{url} has no MCP server that speaks HTTP (HTTP {status})."),
+                _ => format!("{url} answered HTTP {status}."),
+            }));
+        }
+        let streamed = reply
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|kind| kind.contains("text/event-stream"));
+        let mut take = |message: Value| {
+            // The answer to the greeting says which version to speak from
+            // now on.
+            if let Some(version) = message["result"]["protocolVersion"].as_str()
+                && let Ok(mut session) = self.session.lock()
+            {
+                session.version = Some(version.to_owned());
+            }
+            hand_on(message);
+        };
+        if streamed {
+            return events(BufReader::new(reply), &mut take)
+                .map_err(|e| Failed::Said(format!("{url} stopped answering: {e}")));
+        }
+        let body = reply
+            .text()
+            .map_err(|e| Failed::Said(format!("{url} stopped answering: {e}")))?;
+        match serde_json::from_str::<Value>(&body) {
+            Ok(Value::Array(batch)) => batch.into_iter().for_each(&mut take),
+            Ok(one) => take(one),
             // A notification is taken with no body at all.
-            Err(_) => Vec::new(),
-        },
-    };
-    // The answer to the greeting says which version to speak from now on.
-    if let Some(version) = messages
-        .iter()
-        .find_map(|m| m["result"]["protocolVersion"].as_str())
-        && let Ok(mut session) = session.lock()
-    {
-        session.version = Some(version.to_owned());
+            Err(_) => {}
+        }
+        Ok(())
     }
-    Ok(messages)
 }
 
-/// The messages in a stream of server-sent events: each event's data lines,
-/// joined.
-fn events(body: &str) -> Vec<Value> {
-    let mut messages = Vec::new();
+/// Hand on the messages in a stream of server-sent events as each event
+/// ends: its data lines, joined.
+fn events(from: impl BufRead, hand_on: &mut dyn FnMut(Value)) -> std::io::Result<()> {
     let mut data = String::new();
-    for line in body.lines().chain([""]) {
+    for line in from.lines().chain([Ok(String::new())]) {
+        let line = line?;
         if line.is_empty() {
             if let Ok(message) = serde_json::from_str(&data) {
-                messages.push(message);
+                hand_on(message);
             }
             data.clear();
         } else if let Some(part) = line.strip_prefix("data:") {
@@ -447,7 +614,7 @@ fn events(body: &str) -> Vec<Value> {
             data.push_str(part.strip_prefix(' ').unwrap_or(part));
         }
     }
-    messages
+    Ok(())
 }
 
 /// Greet a server over its pipes and wrap each tool it lists.
@@ -499,6 +666,7 @@ fn connect(
                 ask: !config.auto_approve.iter().any(|t| t == own)
                     && !(config.url.trim().is_empty() && only_looks(&tool["annotations"])),
                 read_only: tool["annotations"]["readOnlyHint"].as_bool() == Some(true),
+                wait: config.call_time(),
             }));
         }
         match page["nextCursor"].as_str() {
@@ -622,6 +790,8 @@ struct McpTool {
     schema: Value,
     ask: bool,
     read_only: bool,
+    /// How long a call may take.
+    wait: Duration,
 }
 
 impl Tool for McpTool {
@@ -641,7 +811,7 @@ impl Tool for McpTool {
         let reply = self.server.reply(
             "tools/call",
             json!({"name": self.own, "arguments": args}),
-            CALL_TIME,
+            self.wait,
         )?;
         // What the server says went wrong is its own words, as its results
         // are, and fenced as they are.
@@ -949,7 +1119,9 @@ mod tests {
                     }
                     let mut body = vec![0; length];
                     reader.read_exact(&mut body).unwrap();
-                    let message: Value = serde_json::from_slice(&body).unwrap();
+                    // Quitting in another test ends this one's session too,
+                    // with a DELETE that has no body.
+                    let message: Value = serde_json::from_slice(&body).unwrap_or_default();
                     let _ = heard.send(format!("{head}{message}"));
                     let id = message["id"].clone();
                     let reply = match message["method"].as_str().unwrap_or_default() {
@@ -1048,6 +1220,11 @@ mod tests {
 
     #[test]
     fn a_stream_of_events_is_read_as_its_messages() {
+        let events = |body: &str| {
+            let mut messages = Vec::new();
+            events(body.as_bytes(), &mut |message| messages.push(message)).unwrap();
+            messages
+        };
         let body = "event: message\ndata: {\"a\":1}\n\n: a comment\ndata: {\"b\":\ndata: 2}\n\ndata: {\"c\":3}";
         assert_eq!(
             events(body),
@@ -1057,6 +1234,278 @@ mod tests {
             events("event: message\r\ndata: {\"d\":4}\r\n\r\n"),
             vec![json!({"d": 4})]
         );
+    }
+
+    /// A local HTTP server that hands each request -- its head, lowercased,
+    /// and its JSON body, or null -- to `answer`, which writes the reply.
+    fn serve(
+        answer: impl Fn(&str, Value, &mut std::net::TcpStream) + Send + Sync + 'static,
+    ) -> String {
+        use std::io::{BufRead, BufReader, Read};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let answer = Arc::new(answer);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let answer = answer.clone();
+                std::thread::spawn(move || {
+                    let mut stream = stream.unwrap();
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut head = String::new();
+                    while !head.ends_with("\r\n\r\n") {
+                        if reader.read_line(&mut head).unwrap() == 0 {
+                            return;
+                        }
+                    }
+                    let head = head.to_ascii_lowercase();
+                    let length = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .map_or(0, |n| n.trim().parse().unwrap());
+                    let mut body = vec![0; length];
+                    reader.read_exact(&mut body).unwrap();
+                    let message = serde_json::from_slice(&body).unwrap_or_default();
+                    answer(&head, message, &mut stream);
+                });
+            }
+        });
+        url
+    }
+
+    /// A whole reply of JSON, after any more header lines given.
+    fn json_reply(body: &Value, more: &str) -> String {
+        let body = body.to_string();
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{more}Connection: close\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    const ACCEPTED: &str =
+        "HTTP/1.1 202 Accepted\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+
+    /// The reply every test server gives alike to the greeting, the
+    /// notification after it and the tool list, which has one tool; none
+    /// for anything else.
+    fn usual(message: &Value, session: &str) -> Option<String> {
+        let id = &message["id"];
+        match message["method"].as_str()? {
+            "initialize" => Some(json_reply(
+                &json!({"jsonrpc": "2.0", "id": id, "result": {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}}}),
+                &format!("Mcp-Session-Id: {session}\r\n"),
+            )),
+            "notifications/initialized" => Some(ACCEPTED.to_owned()),
+            "tools/list" => Some(json_reply(
+                &json!({"jsonrpc": "2.0", "id": id, "result": {"tools": [{"name": "work", "inputSchema": {"type": "object"}}]}}),
+                "",
+            )),
+            _ => None,
+        }
+    }
+
+    /// A tool call's answer: the text given.
+    fn answer(message: &Value, text: &str) -> String {
+        json_reply(
+            &json!({"jsonrpc": "2.0", "id": message["id"], "result": {"content": [{"type": "text", "text": text}]}}),
+            "",
+        )
+    }
+
+    #[test]
+    fn a_streamed_reply_is_handed_on_while_the_stream_is_still_open() {
+        // The call's stream pings the client and ends only once the answer
+        // to the ping is in: read whole, it would wait for itself.
+        let (answered, pinged) = mpsc::channel();
+        let (answered, pinged) = (Mutex::new(answered), Mutex::new(pinged));
+        let url = serve(move |_, message, stream| {
+            if let Some(reply) = usual(&message, "s-1") {
+                let _ = stream.write_all(reply.as_bytes());
+                return;
+            }
+            if message["id"] == "p1" {
+                let _ = answered.lock().unwrap().send(());
+                let _ = stream.write_all(ACCEPTED.as_bytes());
+                return;
+            }
+            let chunk = |event: &Value| {
+                let data = format!("event: message\ndata: {event}\n\n");
+                format!("{:x}\r\n{data}\r\n", data.len())
+            };
+            let ping = json!({"jsonrpc": "2.0", "id": "p1", "method": "ping"});
+            let _ = stream.write_all(
+                format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{}", chunk(&ping))
+                    .as_bytes(),
+            );
+            let heard = pinged.lock().unwrap().recv_timeout(Duration::from_secs(10));
+            let text = if heard.is_ok() {
+                "answered"
+            } else {
+                "not answered"
+            };
+            let done = json!({"jsonrpc": "2.0", "id": message["id"], "result": {"content": [{"type": "text", "text": text}]}});
+            let _ = stream.write_all(format!("{}0\r\n\r\n", chunk(&done)).as_bytes());
+        });
+        let config = ServerConfig {
+            url,
+            ..ServerConfig::default()
+        };
+        let tools = launch("streams", &config).unwrap();
+        let said = tools[0].run(&json!({}), &ToolContext::default());
+        assert_eq!(said.unwrap(), "answered");
+    }
+
+    /// What a test server that restarts remembers.
+    #[derive(Default)]
+    struct Restarts {
+        /// The one session it knows, if any.
+        live: Mutex<Option<String>>,
+        greetings: AtomicU64,
+        /// Set to keep none of the sessions it gives.
+        forgets: std::sync::atomic::AtomicBool,
+    }
+
+    /// A server that answers 404 to a session it does not know, and a call
+    /// with the session it came in.
+    fn restarting(state: Arc<Restarts>) -> String {
+        serve(move |head, message, stream| {
+            let sent = head
+                .lines()
+                .find_map(|line| line.strip_prefix("mcp-session-id:"))
+                .map(|id| id.trim().to_owned());
+            if message["method"] == "initialize" {
+                let n = state.greetings.fetch_add(1, Ordering::SeqCst) + 1;
+                let session = format!("s-{n}");
+                if !state.forgets.load(Ordering::SeqCst) {
+                    *state.live.lock().unwrap() = Some(session.clone());
+                }
+                let _ = stream.write_all(usual(&message, &session).unwrap().as_bytes());
+                return;
+            }
+            if sent.is_some() && sent != *state.live.lock().unwrap() {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                );
+                return;
+            }
+            let reply = usual(&message, "").unwrap_or_else(|| {
+                answer(&message, &format!("called in {}", sent.unwrap_or_default()))
+            });
+            let _ = stream.write_all(reply.as_bytes());
+        })
+    }
+
+    #[test]
+    fn a_server_that_restarted_is_greeted_again_and_the_call_sent_once_more() {
+        let state = Arc::new(Restarts::default());
+        let config = ServerConfig {
+            url: restarting(state.clone()),
+            ..ServerConfig::default()
+        };
+        let tools = launch("restarts", &config).unwrap();
+        *state.live.lock().unwrap() = None;
+        let said = tools[0].run(&json!({}), &ToolContext::default());
+        assert_eq!(said.unwrap(), "called in s-2");
+        assert_eq!(state.greetings.load(Ordering::SeqCst), 2);
+        // The new session holds from then on.
+        let said = tools[0].run(&json!({}), &ToolContext::default());
+        assert_eq!(said.unwrap(), "called in s-2");
+        assert_eq!(state.greetings.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_server_that_keeps_forgetting_is_greeted_again_only_once() {
+        let state = Arc::new(Restarts::default());
+        let config = ServerConfig {
+            url: restarting(state.clone()),
+            ..ServerConfig::default()
+        };
+        let tools = launch("forgets", &config).unwrap();
+        state.forgets.store(true, Ordering::SeqCst);
+        *state.live.lock().unwrap() = None;
+        let failed = tools[0]
+            .run(&json!({}), &ToolContext::default())
+            .unwrap_err();
+        assert!(failed.contains("HTTP 404"), "{failed}");
+        assert_eq!(state.greetings.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_server_that_redirects_is_not_followed() {
+        let (went, followed) = mpsc::channel();
+        let went = Mutex::new(went);
+        let elsewhere = serve(move |_, _, stream| {
+            let _ = went.lock().unwrap().send(());
+            let _ = stream.write_all(ACCEPTED.as_bytes());
+        });
+        let url = serve(move |_, _, stream| {
+            let _ = stream.write_all(
+                format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: {elsewhere}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+                    .as_bytes(),
+            );
+        });
+        let config = ServerConfig {
+            url,
+            headers: HashMap::from([("X-Api-Key".into(), "key-3".into())]),
+            ..ServerConfig::default()
+        };
+        let refused = launch("moved", &config).err().unwrap();
+        assert!(
+            refused.contains("HTTP 307") && refused.contains("not followed"),
+            "{refused}"
+        );
+        assert!(followed.try_recv().is_err());
+    }
+
+    #[test]
+    fn quitting_ends_the_session_of_a_server_reached_by_url() {
+        let (heard, asked) = mpsc::channel();
+        let heard = Mutex::new(heard);
+        let url = serve(move |head, message, stream| {
+            let _ = heard.lock().unwrap().send(head.to_owned());
+            let reply = usual(&message, "s-9").unwrap_or_else(|| ACCEPTED.to_owned());
+            let _ = stream.write_all(reply.as_bytes());
+        });
+        let config = ServerConfig {
+            url,
+            headers: HashMap::from([("X-Api-Key".into(), "key-2".into())]),
+            ..ServerConfig::default()
+        };
+        launch("ends", &config).unwrap();
+        stop_all();
+        let deleted = std::iter::from_fn(|| asked.recv_timeout(Duration::from_secs(5)).ok())
+            .find(|head| head.starts_with("delete "))
+            .unwrap();
+        assert!(
+            deleted.contains("mcp-session-id: s-9") && deleted.contains("x-api-key: key-2"),
+            "{deleted}"
+        );
+    }
+
+    #[test]
+    fn a_call_takes_as_long_as_its_server_is_given_and_no_longer() {
+        let url = serve(|_, message, stream| {
+            if let Some(reply) = usual(&message, "s-1") {
+                let _ = stream.write_all(reply.as_bytes());
+                return;
+            }
+            let pause = message["params"]["arguments"]["ms"].as_u64().unwrap_or(0);
+            std::thread::sleep(Duration::from_millis(pause));
+            let _ = stream.write_all(answer(&message, "done").as_bytes());
+        });
+        let config = ServerConfig {
+            url,
+            timeout_ms: Some(2_000),
+            ..ServerConfig::default()
+        };
+        let tools = launch("slow", &config).unwrap();
+        let said = tools[0].run(&json!({"ms": 1_000}), &ToolContext::default());
+        assert_eq!(said.unwrap(), "done");
+        let asked = std::time::Instant::now();
+        let failed = tools[0]
+            .run(&json!({"ms": 6_000}), &ToolContext::default())
+            .unwrap_err();
+        assert!(failed.contains("within 2 seconds"), "{failed}");
+        assert!(asked.elapsed() < Duration::from_secs(4));
     }
 
     /// Needs the network: DeepWiki's free MCP server, which asks for no key.

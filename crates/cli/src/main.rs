@@ -163,6 +163,7 @@ fn main() {
         // outlive this run unseen.
         letronna_core::browser::close_hidden();
         letronna_core::jobs::stop_all();
+        letronna_core::mcp::stop_all();
         if !finished {
             letronna_core::diag::stop();
             std::process::exit(1);
@@ -253,6 +254,7 @@ fn main() {
     // A job's process is not ended with ours, so a dev server left running
     // would carry on with nobody left to stop it.
     letronna_core::jobs::stop_all();
+    letronna_core::mcp::stop_all();
     letronna_core::browser::close_hidden();
     render::title("");
     render::blank();

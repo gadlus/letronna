@@ -83,6 +83,7 @@ fn main() {
         // Nor does a browser with no window, which nobody could close.
         cx.on_app_quit(|_| {
             letronna_core::jobs::stop_all();
+            letronna_core::mcp::stop_all();
             letronna_core::browser::close_hidden();
             letronna_core::diag::stop();
             async {}
