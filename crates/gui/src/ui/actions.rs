@@ -66,6 +66,9 @@ pub(crate) struct TurnFiles {
     /// Where the turn's reply starts.
     first: usize,
     files: Vec<history::Changed>,
+    /// Each file's path as the card shows it, worked out with the files:
+    /// it resolves the project folder on disk, which a frame cannot wait on.
+    labels: Vec<String>,
     /// Whether the turn ran commands, whose changes are not put back.
     ran_commands: bool,
     /// Makes each file a tab stop, so Enter can open its diff.
@@ -646,18 +649,22 @@ impl Chat {
             .iter()
             .rposition(|m| m.role == "user")
             .map_or(0, |at| at + 1);
-        let turn = open.messages[first..].to_vec();
-        if turn.iter().all(|m| m.files.is_empty()) {
+        if open.messages[first..].iter().all(|m| m.files.is_empty()) {
             self.show_turn_files(None);
             return;
         }
+        let turn = open.messages[first..].to_vec();
         let folder = open.workspace.clone();
         let read = cx.background_executor().spawn(async move {
             let files = history::changed(key.0, &turn, folder.as_deref());
-            (files, history::ran_commands(&turn))
+            let labels = files
+                .iter()
+                .map(|file| history::label(&file.restore.path, folder.as_deref()))
+                .collect();
+            (files, labels, history::ran_commands(&turn))
         });
         cx.spawn(async move |this, cx| {
-            let (files, ran_commands) = read.await;
+            let (files, labels, ran_commands) = read.await;
             let _ = this.update(cx, |this, cx| {
                 // Another read has started since, for what is there now.
                 if this.turn_files_for != Some(key) {
@@ -671,6 +678,7 @@ impl Chat {
                         .map(|_| cx.focus_handle().tab_stop(true))
                         .collect(),
                     files,
+                    labels,
                     ran_commands,
                     open: HashSet::new(),
                 });
@@ -722,12 +730,12 @@ impl Chat {
             .enumerate()
             .map(|(n, file)| {
                 let shown = card.open.contains(&n);
-                let path = history::label(&file.restore.path, open.workspace.as_deref());
+                let path = &card.labels[n];
                 v_flex()
                     .w_full()
                     .border_t_1()
                     .border_color(cx.theme().border)
-                    .child(self.changed_file_row(n, file, &path, shown, &card.focus[n], cx))
+                    .child(self.changed_file_row(n, file, path, shown, &card.focus[n], cx))
                     .when_some(file.lines.as_ref().filter(|_| shown), |row, lines| {
                         row.child(diff_rows(lines, cx))
                     })
