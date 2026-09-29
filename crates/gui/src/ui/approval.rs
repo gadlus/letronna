@@ -1,5 +1,5 @@
 //! The card the chat shows when a tool needs the user: approve a write or a
-//! command, or answer an `ask_user` question.
+//! command, answer an `ask_user` question, or approve a plan.
 
 use crate::prelude::*;
 use letronna_core::tools;
@@ -101,6 +101,52 @@ impl Chat {
                             ),
                     )
                     .into_any_element(),
+            );
+        }
+
+        if call.name == tools::EXIT_PLAN {
+            let plan = tools::preview(&call.name, &call.arguments, &ctx);
+            return Some(
+                card.child(
+                    div()
+                        .text_sm()
+                        .font_family(HEADING_FONT)
+                        .font_weight(FontWeight::MEDIUM)
+                        .child("Letronna has a plan"),
+                )
+                .child(
+                    // Clipped as a reply is: the markdown renderer can report
+                    // a width wider than the card.
+                    div().w_full().overflow_hidden().child(TextView::markdown(
+                        SharedString::from(format!("plan-{}", call.id)),
+                        plan,
+                        window,
+                        cx,
+                    )),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("approve-plan")
+                                .primary()
+                                .small()
+                                .label("Approve and carry on")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.resolve_call(Verdict::Allow { remember: false }, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("keep-planning")
+                                .outline()
+                                .small()
+                                .label("Keep planning")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.resolve_call(Verdict::Deny, cx)
+                                })),
+                        ),
+                )
+                .into_any_element(),
             );
         }
 

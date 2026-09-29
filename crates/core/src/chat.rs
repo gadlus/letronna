@@ -362,7 +362,14 @@ fn body_with(
         system.push_str(" You have no tools or filesystem access on this gateway.");
     }
     if connection.plan && !shared {
-        system.push_str(" Plan mode is on: you can read, search and ask, but you cannot write files or run commands, and those tools are unavailable. Work out what you would do and lay out the plan, then let the user turn plan mode off to carry it out.");
+        system.push_str(" Plan mode is on: you can read, search and ask, but you cannot write files or run commands, and those tools are unavailable.");
+        // Where exit_plan is offered, a plan also written into the reply
+        // would reach the user twice.
+        if connection.tools && crate::tools::offers_plan(connection) {
+            system.push_str(" Work out what you would do, and when the plan is ready, put it to the user with exit_plan instead of writing it out in your reply; if they approve, plan mode turns off and you carry it out.");
+        } else {
+            system.push_str(" Work out what you would do and lay out the plan, then let the user turn plan mode off to carry it out.");
+        }
     }
     // Without this the model takes "the conversation" to mean something on
     // disk, and goes looking for it there.
@@ -1980,6 +1987,44 @@ mod tests {
         assert!(shared.contains("Today is "));
         assert!(shared.contains("The model behind you is test-model."));
         assert!(!shared.contains("This computer runs"), "{shared}");
+    }
+
+    #[test]
+    fn plan_mode_names_exit_plan_only_where_it_is_offered() {
+        let sent = |remote: Option<Remote>| -> (String, bool) {
+            let payload = body(
+                &Connection {
+                    tools: true,
+                    plan: true,
+                    remote,
+                    ..connection()
+                },
+                &[],
+                None,
+                None,
+            );
+            let offered = payload["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["function"]["name"] == crate::tools::EXIT_PLAN);
+            let system = payload["messages"][0]["content"].as_str().unwrap();
+            (system.to_owned(), offered)
+        };
+        let (window, offered) = sent(None);
+        assert!(offered);
+        assert!(
+            window.contains("with exit_plan instead of writing it out"),
+            "{window}"
+        );
+        // A chat app's DM sits in plan mode but has nobody to hand a plan to.
+        let (dm, offered) = sent(Some(Remote {
+            place: "a Telegram chat".into(),
+            ..Default::default()
+        }));
+        assert!(!offered);
+        assert!(dm.contains("Plan mode is on"), "{dm}");
+        assert!(!dm.contains("exit_plan"), "{dm}");
     }
     #[test]
     fn window_holds_still_so_the_cache_prefix_survives() {
