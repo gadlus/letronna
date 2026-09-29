@@ -487,6 +487,7 @@ pub fn offers_plan(connection: &Connection) -> bool {
 /// where other people read the replies, so is everything that touches this
 /// computer; `read_chat` exists only where there is a chat to read, and
 /// `exit_plan` only where there is a plan to hand over and someone to take it.
+/// The tools the user switched off are never offered.
 /// MCP tools too many to send go out on demand, through `find_tools` and
 /// `call_mcp_tool` (see `mcp_find`).
 pub fn specs(connection: &Connection) -> Vec<Value> {
@@ -506,8 +507,10 @@ pub(crate) fn specs_of(
         .remote
         .as_ref()
         .is_some_and(|r| r.history.is_some());
+    let disabled = crate::store::disabled_tools();
     tools
         .iter()
+        .filter(|t| !switched_off(t.name(), &disabled))
         .filter(|t| crate::mcp_find::in_array(t.name(), on_demand))
         .filter(|t| !connection.plan || !t.mutates() || t.name() == "run_command")
         .filter(|t| t.name() != EXIT_PLAN || offers_plan(connection))
@@ -516,6 +519,11 @@ pub(crate) fn specs_of(
         .filter(|t| t.offered(connection))
         .map(|t| spec(t.as_ref()))
         .collect()
+}
+
+/// Whether `disabled`, the settings' `disabled_tools`, names the tool `name`.
+pub(crate) fn switched_off(name: &str, disabled: &[String]) -> bool {
+    disabled.iter().any(|off| off.trim() == name)
 }
 
 /// How `tool` is offered in a request's `tools` array.
@@ -4013,5 +4021,104 @@ mod tests {
         assert!(refused.starts_with("Refused"), "{refused}");
         assert!(on_disk().contains("sk-real-"));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The names of the tools a plain local session is offered.
+    fn offered_names() -> Vec<String> {
+        specs(&Connection {
+            tools: true,
+            ..Default::default()
+        })
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap().to_owned())
+        .collect()
+    }
+
+    #[test]
+    fn media_tools_are_offered_only_while_signed_in() {
+        let (_turn, dir) = data_folder("media-offered");
+        let media = ["make_image", "speak", "transcribe", "make_video"];
+        let signed_out = offered_names();
+        assert!(signed_out.contains(&"read_file".to_owned()));
+        assert!(
+            media.iter().all(|m| !signed_out.contains(&m.to_string())),
+            "{signed_out:?}"
+        );
+        // One the model remembers is refused before it reaches the API.
+        let args = r#"{"prompt":"a lighthouse"}"#;
+        let refused = run("make_image", args, &ToolContext::default()).unwrap_err();
+        assert!(refused.contains("not available"), "{refused}");
+
+        let account = crate::auth::Account {
+            token: "t-1".into(),
+            ..Default::default()
+        };
+        let account = serde_json::to_string(&account).unwrap();
+        std::fs::write(dir.join("account.json"), account).unwrap();
+        let signed_in = offered_names();
+        assert!(
+            media.iter().all(|m| signed_in.contains(&m.to_string())),
+            "{signed_in:?}"
+        );
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    /// A tool of any name that answers "ran", for what is decided by name.
+    struct Named(&'static str);
+    impl Tool for Named {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn description(&self) -> &'static str {
+            "Answers ran."
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn run(&self, _: &Value, _: &ToolContext) -> Result<String, String> {
+            Ok("ran".into())
+        }
+    }
+
+    #[test]
+    fn a_switched_off_tool_is_neither_offered_nor_run_and_other_names_are_passed_over() {
+        use crate::gate::{Gate, Grants, Mode, Outcome, decide};
+        let (_turn, dir) = data_folder("switched-off");
+        let off = ["search_sessions", " mcp__demo__echo ", "no_such_tool"];
+        let settings = json!({"endpoint": "", "model": "", "disabled_tools": off});
+        std::fs::write(dir.join("settings.json"), settings.to_string()).unwrap();
+        let names = offered_names();
+        assert!(!names.contains(&"search_sessions".to_owned()), "{names:?}");
+        assert!(names.contains(&"list_sessions".to_owned()), "{names:?}");
+
+        // One the model remembers from earlier is refused, saying why, before
+        // any card and whatever the mode.
+        let ctx = ToolContext::default();
+        let args = r#"{"query":"fig"}"#;
+        let refused = run("search_sessions", args, &ctx).unwrap_err();
+        assert!(refused.contains("`disabled_tools`"), "{refused}");
+        let call = crate::chat::ToolCall {
+            id: "c-1".into(),
+            name: "search_sessions".into(),
+            arguments: args.into(),
+        };
+        let gate = Gate {
+            ctx: &ctx,
+            mode: Mode::Bypass,
+            grants: &Grants::new(),
+            rules: &[],
+            broken: None,
+            human: true,
+        };
+        assert!(
+            matches!(decide(&call, &gate), Outcome::Refuse(why) if why.contains("switched off"))
+        );
+
+        // An MCP server's tool goes by its full name, and only that one.
+        let refused = run_found(&Named("mcp__demo__echo"), "{}", &ctx).unwrap_err();
+        assert!(refused.contains("switched off"), "{refused}");
+        let other = run_found(&Named("mcp__demo__other"), "{}", &ctx);
+        assert_eq!(other.as_deref(), Ok("ran"));
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 }
