@@ -19,6 +19,7 @@ use crate::chat::Message;
 use ignore::WalkBuilder;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 /// The largest text file previewed. Past this a file is data or generated,
@@ -184,6 +185,10 @@ fn preview_in(root: &Path, path: &Path, data: &Path) -> Result<Preview, String> 
     if meta.is_dir() {
         return Err(format!("{} is a folder.", label(root, path)));
     }
+    // Opening a named pipe waits for a writer that may never come.
+    if !meta.is_file() {
+        return Ok(Preview::Elsewhere("It is not a regular file.".into()));
+    }
     if crate::tools::secret(&real) {
         return Ok(Preview::Elsewhere(
             "It holds keys, passwords or tokens, so it is not shown here.".into(),
@@ -208,8 +213,17 @@ fn preview_in(root: &Path, path: &Path, data: &Path) -> Result<Preview, String> 
             PREVIEW_BYTES / 1024
         )));
     }
-    let bytes = std::fs::read(&real)
+    // Read no more than the limit even if the file grew since it was measured.
+    let mut bytes = Vec::new();
+    std::fs::File::open(&real)
+        .and_then(|file| file.take(PREVIEW_BYTES + 1).read_to_end(&mut bytes))
         .map_err(|e| format!("{} could not be read: {e}", label(root, path)))?;
+    if bytes.len() as u64 > PREVIEW_BYTES {
+        return Ok(Preview::Elsewhere(format!(
+            "It is over {} KB, too big to preview.",
+            PREVIEW_BYTES / 1024
+        )));
+    }
     let Some(text) = text_of(bytes) else {
         return Ok(Preview::Elsewhere("It is not text.".into()));
     };
@@ -612,6 +626,19 @@ mod tests {
             assert!(matches!(at(name), Preview::Elsewhere(_)), "{name}");
         }
         assert!(preview_in(&root, &root, &data).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_named_pipe_is_handed_to_the_system_not_waited_on() {
+        let (root, data) = project("pipe", &[("a.txt", b"a")]);
+        let pipe = root.join("jobs");
+        let made = std::process::Command::new("mkfifo").arg(&pipe).status();
+        assert!(made.is_ok_and(|status| status.success()));
+        let Ok(Preview::Elsewhere(why)) = preview_in(&root, &pipe, &data) else {
+            panic!("a pipe should be handed on");
+        };
+        assert_eq!(why, "It is not a regular file.");
     }
 
     #[test]
