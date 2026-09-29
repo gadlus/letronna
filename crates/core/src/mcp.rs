@@ -226,8 +226,12 @@ fn spawn(config: &ServerConfig) -> Result<std::process::Child, String> {
     use std::process::{Command, Stdio};
     let build = |program: &str, args: &[String]| {
         let mut command = Command::new(program);
+        // The server's own variables win over the login shell's, which give
+        // it, and the search for `npx` or `uvx`, the user's PATH.
+        let login = crate::login_env::vars().iter();
         command
             .args(args)
+            .envs(login.map(|(name, value)| (name, value)))
             .envs(&config.env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
