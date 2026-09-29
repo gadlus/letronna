@@ -9,6 +9,7 @@ mod banner;
 mod bar;
 mod commands;
 mod diff;
+mod doctor;
 mod edit;
 mod input;
 mod install;
@@ -59,6 +60,10 @@ fn main() {
         update_now();
         return;
     }
+    if args.doctor {
+        std::process::exit(doctor::run(args.offline));
+    }
+    letronna_core::diag::init("cli");
     // MCP servers can take seconds to start; started now, their tools are
     // there by the first question.
     letronna_core::mcp::start();
@@ -120,9 +125,11 @@ fn main() {
             Ok(_) => runner.persist(),
             Err(error) => {
                 render::line(&render::red(&error));
+                letronna_core::diag::stop();
                 std::process::exit(1);
             }
         }
+        letronna_core::diag::stop();
         return;
     }
 
@@ -192,6 +199,7 @@ fn main() {
     letronna_core::browser::close_hidden();
     render::title("");
     render::blank();
+    letronna_core::diag::stop();
 }
 
 /// Hand the terminal back if we panic. Without this a crash leaves the

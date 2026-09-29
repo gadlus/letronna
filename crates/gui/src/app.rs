@@ -533,7 +533,11 @@ impl Chat {
     }
 
     pub(crate) fn save(&mut self) {
-        if self.store.save().is_err() {
+        if let Err(error) = self.store.save() {
+            letronna_core::diag::event(
+                "save_failed",
+                &[("error", error.kind().to_string().into())],
+            );
             self.error =
                 Some("Could not save chat history. Your current chat remains in memory.".into());
         }
@@ -1611,6 +1615,25 @@ fn allowed_in(
     session.and_then(|id| session_allow.get(&id))
 }
 
+/// The call at the front of the queue, and whether the approval card is up
+/// for it rather than it running.
+pub(crate) fn front_call(
+    turn: &agent::Turn,
+    asking: Option<&str>,
+) -> Option<(backend::ToolCall, bool)> {
+    // `true` shows whatever is at the front, running or not. Which of the two
+    // it is was decided when the queue stopped on it; the card shows that
+    // rather than deciding again on every frame, which looked the tool up in
+    // a freshly built tool list each time.
+    match turn.next(|_| true) {
+        agent::Next::AskUser(call) => {
+            let waiting = asking == Some(call.id.as_str());
+            Some((call, waiting))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
@@ -1649,24 +1672,5 @@ mod tests {
         // Stopped on an earlier call, which has left the queue since.
         assert!(front_call(&turn, Some("call-0")).is_some_and(|(_, waiting)| !waiting));
         assert!(front_call(&Turn::new(Connection::default()), Some("call-1")).is_none());
-    }
-}
-
-/// The call at the front of the queue, and whether the approval card is up
-/// for it rather than it running.
-pub(crate) fn front_call(
-    turn: &agent::Turn,
-    asking: Option<&str>,
-) -> Option<(backend::ToolCall, bool)> {
-    // `true` shows whatever is at the front, running or not. Which of the two
-    // it is was decided when the queue stopped on it; the card shows that
-    // rather than deciding again on every frame, which looked the tool up in
-    // a freshly built tool list each time.
-    match turn.next(|_| true) {
-        agent::Next::AskUser(call) => {
-            let waiting = asking == Some(call.id.as_str());
-            Some((call, waiting))
-        }
-        _ => None,
     }
 }

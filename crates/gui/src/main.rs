@@ -31,6 +31,7 @@ fn main() {
             .spawn();
         return;
     }
+    letronna_core::diag::init("gui");
     Application::new().with_assets(Assets).run(|cx| {
         gpui_component::init(cx);
         theme::apply(cx);
@@ -77,6 +78,7 @@ fn main() {
         cx.on_app_quit(|_| {
             letronna_core::jobs::stop_all();
             letronna_core::browser::close_hidden();
+            letronna_core::diag::stop();
             async {}
         })
         .detach();

@@ -1015,7 +1015,23 @@ pub fn list_models(base: &str, key: &str) -> Result<Vec<String>, String> {
 pub fn start(connection: Connection, messages: Vec<Message>) -> async_channel::Receiver<Event> {
     let (sender, receiver) = async_channel::bounded(64);
     std::thread::spawn(move || {
+        let started = std::time::Instant::now();
         let result = stream(&connection, &messages, window_start(&messages), &sender);
+        crate::diag::event(
+            "model_request",
+            &[
+                ("model", connection.model.as_str().into()),
+                // The failure's own kind, known here since #65, not guessed from its words.
+                (
+                    "outcome",
+                    match &result {
+                        Ok(()) => "ok".into(),
+                        Err(failure) => format!("{:?}", failure.kind).to_lowercase().into(),
+                    },
+                ),
+                ("ms", crate::diag::millis(started)),
+            ],
+        );
         let _ = sender.send_blocking(Event::Finished(result));
     });
     receiver

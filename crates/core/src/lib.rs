@@ -13,6 +13,7 @@ mod cdp;
 pub mod chat;
 pub mod command;
 pub mod compact;
+pub mod diag;
 mod edit;
 pub mod failure;
 pub mod gateway;

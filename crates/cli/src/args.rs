@@ -11,6 +11,7 @@ Letronna — a small agent in your terminal
   letronna gui             open the window instead
   letronna setup           name, sign in, provider, model, install
   letronna update          install the newest version
+  letronna doctor          check the setup, the disk and the gateway
   letronna --uninstall     take it off again
 
 Options
@@ -19,6 +20,7 @@ Options
   -r, --resume [id]        choose a session, or open the one with this id
       --yes                run tools without asking (careful)
       --plan               read and search only; never write or run
+      --offline            with doctor: leave the network alone
   -h, --help               this
   -V, --version            which version this is
 ";
@@ -47,6 +49,8 @@ pub struct Args {
     pub install: bool,
     pub uninstall: bool,
     pub update: bool,
+    pub doctor: bool,
+    pub offline: bool,
 }
 
 pub fn parse(mut raw: impl Iterator<Item = String>) -> Args {
@@ -61,11 +65,15 @@ pub fn parse(mut raw: impl Iterator<Item = String>) -> Args {
         install: false,
         uninstall: false,
         update: false,
+        doctor: false,
+        offline: false,
     };
     while let Some(arg) = raw.next() {
         match arg.as_str() {
             "gui" => args.gui = true,
             "update" => args.update = true,
+            "doctor" => args.doctor = true,
+            "--offline" => args.offline = true,
             "-p" | "--print" => args.prompt = raw.next(),
             "-c" | "--continue" => args.start = Start::Last,
             // `--resume` on its own offers the recent sessions; with an id it
@@ -127,6 +135,8 @@ mod tests {
         assert_eq!(worded.start, super::Start::Choose);
         assert!(args(&["gui"]).gui);
         assert!(args(&["update"]).update && args(&["update"]).prompt.is_none());
+        let doctor = args(&["doctor", "--offline"]);
+        assert!(doctor.doctor && doctor.offline && doctor.prompt.is_none());
         assert!(args(&["--yes"]).yes);
         assert!(args(&["-h"]).help);
         assert!(args(&["--version"]).version && args(&["-V"]).version);
