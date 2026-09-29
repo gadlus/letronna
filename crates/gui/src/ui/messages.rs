@@ -322,7 +322,10 @@ impl Chat {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let key = self.open_key(index);
-        let open = self.thinking_open.contains(&key);
+        // A failure is the output you need to read, so it starts open, in
+        // full. One you declined yourself is no news, so it stays shut.
+        let failed = message.is_error && message.content != letronna_core::tools::DECLINED;
+        let open = self.thinking_open.contains(&key) != failed;
         let summary = letronna_core::tools::summary(&message.name, &message.args);
         let lines = message.content.lines().count();
         let content = message.content.clone();
@@ -332,8 +335,10 @@ impl Chat {
             .then(|| letronna_core::media::saved_by(&message.name, &message.content))
             .flatten()
             .filter(|path| path.exists());
-        let (status, color) = if message.is_error {
-            (one_line(&message.content), cx.theme().danger)
+        let (status, color) = if failed {
+            ("failed".to_owned(), cx.theme().danger)
+        } else if message.is_error {
+            ("declined".to_owned(), cx.theme().muted_foreground)
         } else if message.name == letronna_core::tools::ASK_USER {
             (
                 format!("→ {}", one_line(&message.content)),
@@ -416,7 +421,11 @@ impl Chat {
                         .min_w_0()
                         .border_l_2()
                         .border_color(cx.theme().border)
-                        .text_color(cx.theme().muted_foreground)
+                        .text_color(if failed {
+                            cx.theme().danger
+                        } else {
+                            cx.theme().muted_foreground
+                        })
                         .child(crate::ui::code_block(
                             ("tool-out", index),
                             letronna_core::tools::clamp_lines(&content, 400),
