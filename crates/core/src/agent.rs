@@ -451,7 +451,7 @@ impl Turn {
         }
         // Parsed first, so spacing or key order does not make a call new.
         let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments)
-            .map(|args| args.to_string())
+            .map(|args| sorted(args).to_string())
             .unwrap_or_else(|_| call.arguments.clone());
         let key = (
             call.name.clone(),
@@ -534,6 +534,25 @@ fn hash(value: &impl Hash) -> u64 {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);
     hasher.finish()
+}
+
+/// `value` with every object's keys in order, so it is written out the same
+/// whatever order they came in.
+fn sorted(value: serde_json::Value) -> serde_json::Value {
+    // Done by hand: with serde_json's `preserve_order`, which the window's
+    // dependencies turn on, an object keeps the order it was read in.
+    match value {
+        serde_json::Value::Object(object) => {
+            let mut fields: Vec<_> = object.into_iter().collect();
+            fields.sort_by(|a, b| a.0.cmp(&b.0));
+            fields
+                .into_iter()
+                .map(|(key, value)| (key, sorted(value)))
+                .collect()
+        }
+        serde_json::Value::Array(items) => items.into_iter().map(sorted).collect(),
+        other => other,
+    }
 }
 
 /// A notice for the model, with the line that tells the user why.
@@ -1232,6 +1251,16 @@ mod tests {
         // Only spacing differs, so it is the same call and its third time.
         other.arguments = r#"{ "path":"b.rs" }"#.into();
         assert!(repeat(&mut turn, &other, "same", 1)[0].contains("3 times"));
+    }
+
+    #[test]
+    fn arguments_in_another_key_order_are_the_same_call() {
+        let mut turn = turn();
+        let mut read = call("read_file");
+        read.arguments = r#"{"path": "a.rs", "range": {"from": 1, "to": 9}}"#.into();
+        repeat(&mut turn, &read, "same", 2);
+        read.arguments = r#"{"range": {"to": 9, "from": 1}, "path": "a.rs"}"#.into();
+        assert!(repeat(&mut turn, &read, "same", 1)[0].contains("3 times"));
     }
 
     #[test]
