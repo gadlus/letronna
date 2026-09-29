@@ -207,8 +207,10 @@ const MAX_OUTPUT: usize = crate::chat::MAX_TOOL_CHARS;
 /// the name of the file the whole output was saved to.
 const MARKER_ROOM: usize = 100;
 /// A saved output keeps its first this many bytes: some 600 pages of
-/// `read_file`, past anything a model reads through, while a command that
-/// prints without end costs the disk no more than this for the call.
+/// `read_file`, past anything a model reads through, while a result without
+/// end costs the disk no more than this for the call. A command's output
+/// cut while it was read is saved as it is read instead, up to
+/// `PIPE_SPILL_BYTES`.
 const SPILL_BYTES: usize = 4 * 1024 * 1024;
 /// A command's output to one pipe is kept this far from its start, and
 /// `KEEP_TAIL` from its end, with only a count of the bytes and lines in
@@ -217,6 +219,11 @@ const SPILL_BYTES: usize = 4 * 1024 * 1024;
 /// command printing gigabytes keeps no more than 8 MiB for its two pipes.
 const KEEP_HEAD: usize = 1024 * 1024;
 const KEEP_TAIL: usize = 3 * 1024 * 1024;
+/// A command's output that outgrows what is kept is saved to disk as it is
+/// read, up to this many bytes for its two pipes together: far past what a
+/// model pages through, while a command printing without end still costs
+/// the disk a bounded amount.
+const PIPE_SPILL_BYTES: usize = 64 * 1024 * 1024;
 
 /// Tools contributed by enabled plugins. Kept here rather than read from the
 /// plugin registry because tools run on worker threads with no `App` to hand.
@@ -658,24 +665,30 @@ pub(crate) fn results_dir(conversation: u64) -> PathBuf {
 /// outside a session, where nothing would ever remove it, or in a shared
 /// chat, where `read_file` is out of reach.
 fn spill(text: &str, ctx: &ToolContext) -> Option<PathBuf> {
-    static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    if ctx.conversation == 0 || ctx.shared() {
-        return None;
-    }
-    let dir = results_dir(ctx.conversation);
-    std::fs::create_dir_all(&dir).ok()?;
-    // Not the model's call id: some servers repeat theirs every turn, and it
-    // is no safe file name. Calls at the same moment differ in the count, and
-    // the window and the terminal in the process.
-    let millis = std::time::UNIX_EPOCH.elapsed().ok()?.as_millis();
-    let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let path = dir.join(format!("{millis}-{}-{call}.txt", std::process::id()));
+    let path = spill_path(ctx)?;
+    std::fs::create_dir_all(path.parent()?).ok()?;
     let kept = &text[..text.floor_char_boundary(SPILL_BYTES)];
     if crate::store::write_private(&path, kept.as_bytes()).is_err() {
         let _ = std::fs::remove_file(&path);
         return None;
     }
     Some(path)
+}
+
+/// A new name for an output saved in `ctx`'s session, its folder not yet
+/// made; None where `spill` saves nothing.
+fn spill_path(ctx: &ToolContext) -> Option<PathBuf> {
+    static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if ctx.conversation == 0 || ctx.shared() {
+        return None;
+    }
+    // Not the model's call id: some servers repeat theirs every turn, and it
+    // is no safe file name. Calls at the same moment differ in the count, and
+    // the window and the terminal in the process.
+    let millis = std::time::UNIX_EPOCH.elapsed().ok()?.as_millis();
+    let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = format!("{millis}-{}-{call}.txt", std::process::id());
+    Some(results_dir(ctx.conversation).join(name))
 }
 
 /// `text` as it is when it fits in `max` bytes; otherwise its first and last
@@ -1027,7 +1040,45 @@ fn with_utf8_output(command: &str) -> String {
     format!("{UTF8_PRELUDE}{command}")
 }
 
+#[cfg(test)]
 fn run_shell(command: &str, cwd: Option<&Path>, cancel: &Cancel) -> Result<String, String> {
+    run_shell_saving(command, cwd, cancel, None)
+}
+
+/// Where a command's output is saved whole when it is too long to keep, and
+/// how many bytes of it at most.
+struct SaveTo {
+    path: PathBuf,
+    cap: usize,
+}
+
+/// `run_shell`, with output cut while it was read saved whole to `save`, up
+/// to its cap, and the cut saying where.
+fn run_shell_saving(
+    command: &str,
+    cwd: Option<&Path>,
+    cancel: &Cancel,
+    save: Option<SaveTo>,
+) -> Result<String, String> {
+    let result = run_shell_into(command, cwd, cancel, save.as_ref());
+    // What the pipes were streamed to only goes into the saved file.
+    if let Some(save) = &save {
+        for pipe in PIPE_NAMES {
+            let _ = std::fs::remove_file(save.path.with_extension(pipe));
+        }
+    }
+    result
+}
+
+/// What each pipe's output is streamed to, next to the file it ends up in.
+const PIPE_NAMES: [&str; 2] = ["stdout", "stderr"];
+
+fn run_shell_into(
+    command: &str,
+    cwd: Option<&Path>,
+    cancel: &Cancel,
+    save: Option<&SaveTo>,
+) -> Result<String, String> {
     use std::process::Stdio;
     let mut child = shell(command, cwd)
         .stdin(Stdio::null())
@@ -1040,15 +1091,28 @@ fn run_shell(command: &str, cwd: Option<&Path>, cancel: &Cancel) -> Result<Strin
         return Err("Cannot read the command's output.".into());
     };
     let (sender, open) = std::sync::mpsc::channel();
-    let kept = [forward(stdout, sender.clone()), forward(stderr, sender)];
+    // One room for both pipes, so the cap holds for the call.
+    let room = Arc::new(std::sync::atomic::AtomicUsize::new(
+        save.map_or(0, |s| s.cap),
+    ));
+    let start = |pipe: &str| Captured {
+        spill: save.map(|s| Spill::new(s.path.with_extension(pipe), room.clone())),
+        ..Default::default()
+    };
+    let kept = [
+        forward_into(stdout, sender.clone(), start(PIPE_NAMES[0])),
+        forward_into(stderr, sender, start(PIPE_NAMES[1])),
+    ];
     let started = std::time::Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-            break status;
+    let waited = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {}
+            Err(e) => break Err(e.to_string()),
         }
         if started.elapsed() > COMMAND_TIMEOUT {
             let _ = child.kill();
-            return Err(format!(
+            break Err(format!(
                 "Timed out after {}s and was stopped. If this command is meant to \
                  keep running, such as a dev server, call it again with \
                  background: true.",
@@ -1057,23 +1121,60 @@ fn run_shell(command: &str, cwd: Option<&Path>, cancel: &Cancel) -> Result<Strin
         }
         if !cancel.sleep(std::time::Duration::from_millis(50)) {
             let _ = child.kill();
-            return Err("Stopped, and the command was ended before it finished.".into());
+            break Err("Stopped, and the command was ended before it finished.".into());
+        }
+    };
+    let status = match waited {
+        Ok(status) => status,
+        Err(e) => {
+            // Closes what the pipes were streamed to, which Windows cannot
+            // remove while it is open.
+            kept.iter().for_each(|pipe| drop(take(pipe)));
+            return Err(e);
         }
     };
     let held_open = !pipes_closed(&open);
-    let (mut text, gap) = take(&kept[0]).into_text();
+    let [mut out, mut err] = [take(&kept[0]), take(&kept[1])];
+    let pipes = [(out.spill.take(), out.bytes), (err.spill.take(), err.bytes)];
+    let (mut text, gap) = out.into_text();
     let mut gaps: Vec<Gap> = gap.into_iter().collect();
-    let (err, gap) = take(&kept[1]).into_text();
-    if !err.trim().is_empty() {
+    let (err, err_gap) = err.into_text();
+    let err_shown = !err.trim().is_empty();
+    let code =
+        (!status.success()).then(|| format!("\n[exit code {}]", status.code().unwrap_or(-1)));
+    let mut note = String::new();
+    // Saved before the cut below, which names the file.
+    if (gap.is_some() || err_gap.is_some() && err_shown)
+        && let Some(save) = save
+    {
+        let err = err_shown.then_some(err.as_str());
+        let whole = save_whole(save, &text, err, pipes, code.as_deref());
+        note = match whole {
+            Ok(true) => format!(
+                "; its first {} bytes are in {}, which read_file pages through",
+                save.cap,
+                save.path.display()
+            ),
+            Ok(false) => format!(
+                "; all of it is in {}, which read_file pages through",
+                save.path.display()
+            ),
+            Err(_) => {
+                let _ = std::fs::remove_file(&save.path);
+                String::new()
+            }
+        };
+    }
+    if err_shown {
         text.push_str("\n[stderr]\n");
-        gaps.extend(gap.map(|g| Gap {
+        gaps.extend(err_gap.map(|g| Gap {
             at: text.len() + g.at,
             ..g
         }));
         text.push_str(&err);
     }
-    if !status.success() {
-        text.push_str(&format!("\n[exit code {}]", status.code().unwrap_or(-1)));
+    if let Some(code) = &code {
+        text.push_str(code);
     }
     if held_open {
         // First, so the cut `run` makes to a long result cannot drop it.
@@ -1092,9 +1193,104 @@ fn run_shell(command: &str, cwd: Option<&Path>, cancel: &Cancel) -> Result<Strin
     if !gaps.is_empty() {
         // Only this knows where the gaps are, so it makes the cut, and the
         // one `run` makes then finds the result short enough.
-        text = keep_ends_around(text, &gaps, MAX_OUTPUT, "");
+        text = keep_ends_around(text, &gaps, MAX_OUTPUT, &note);
     }
     Ok(text)
+}
+
+/// Puts a command's output together in `save` as the model would read it
+/// uncut: a pipe cut while it was read comes from the file it was streamed
+/// to, which then ends in a line saying what the cap left out, and one that
+/// was not from its text, `out` or `err`. `pipes` are each pipe's spill and
+/// the bytes it printed. Whether the cap left anything out.
+fn save_whole(
+    save: &SaveTo,
+    out: &str,
+    err: Option<&str>,
+    pipes: [(Option<Spill>, usize); 2],
+    code: Option<&str>,
+) -> std::io::Result<bool> {
+    use std::io::Write;
+    let mut file = open_spill(&save.path)?;
+    let mut capped = false;
+    let [(out_spill, out_bytes), (err_spill, err_bytes)] = pipes;
+    let parts = [
+        Some((out, out_spill, out_bytes)),
+        err.map(|err| (err, err_spill, err_bytes)),
+    ];
+    for (at, part) in parts.into_iter().enumerate() {
+        let Some((text, spill, bytes)) = part else {
+            continue;
+        };
+        if at == 1 {
+            file.write_all(b"\n[stderr]\n")?;
+        }
+        let Some(spill) = spill.filter(|s| s.opened) else {
+            file.write_all(text.as_bytes())?;
+            continue;
+        };
+        if spill.broken {
+            return Err(std::io::Error::other("a pipe's output was not saved"));
+        }
+        copy_clean(&spill.path, &mut file)?;
+        if spill.saved < bytes {
+            capped = true;
+            let left = bytes - spill.saved;
+            writeln!(
+                file,
+                "\n… [{left} more bytes printed here were not saved: a saved output \
+                 keeps at most {} bytes]",
+                save.cap
+            )?;
+        }
+    }
+    if let Some(code) = code {
+        file.write_all(code.as_bytes())?;
+    }
+    Ok(capped)
+}
+
+/// Copies the output streamed to `raw` into `to` as `Captured::into_text`
+/// makes it text, whole lines at a time so no escape sequence or saved key
+/// is split, and a line longer than a block cut where a character ends.
+fn copy_clean(raw: &Path, to: &mut std::fs::File) -> std::io::Result<()> {
+    use std::io::Write;
+    const BLOCK: usize = 1024 * 1024;
+    let mut from = std::fs::File::open(raw)?;
+    let mut block = vec![0u8; BLOCK];
+    let mut held = Vec::new();
+    loop {
+        let n = match from.read(&mut block) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        held.extend_from_slice(&block[..n]);
+        let end = match held.iter().rposition(|&b| b == b'\n') {
+            _ if n == 0 => held.len(),
+            Some(i) => i + 1,
+            None if held.len() < BLOCK => continue,
+            // A byte that starts a character, or the end.
+            None => (1..held.len())
+                .rev()
+                .find(|&i| held[i] & 0xC0 != 0x80)
+                .unwrap_or(held.len()),
+        };
+        to.write_all(clean(&held[..end]).as_bytes())?;
+        held.drain(..end);
+        if n == 0 {
+            return Ok(());
+        }
+    }
+}
+
+/// A new file only its owner can read, open for appending, its folder made.
+fn open_spill(path: &Path) -> std::io::Result<std::fs::File> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    crate::store::write_private(path, &[])?;
+    std::fs::OpenOptions::new().append(true).open(path)
 }
 
 /// Removes CSI and OSC escape sequences, keeping the text between them.
@@ -1139,6 +1335,72 @@ pub(crate) struct Captured {
     tail: std::collections::VecDeque<u8>,
     bytes: usize,
     lines: usize,
+    spill: Option<Spill>,
+}
+
+/// Where a pipe's output is streamed once it outgrows what is kept, so a
+/// file can hold what the capture drops.
+pub(crate) struct Spill {
+    path: PathBuf,
+    /// Bytes the call may still write, shared with its other pipe.
+    room: Arc<std::sync::atomic::AtomicUsize>,
+    file: Option<std::fs::File>,
+    opened: bool,
+    broken: bool,
+    saved: usize,
+}
+
+impl Spill {
+    fn new(path: PathBuf, room: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        Spill {
+            path,
+            room,
+            file: None,
+            opened: false,
+            broken: false,
+            saved: 0,
+        }
+    }
+
+    /// Writes what was printed past what the file holds: the first time, all
+    /// of it so far, `head` and `tail`, and after that only `chunk`.
+    fn save(&mut self, head: &[u8], tail: &std::collections::VecDeque<u8>, chunk: &[u8]) {
+        if self.broken {
+            return;
+        }
+        let parts = if self.opened {
+            [chunk, &[][..], &[][..]]
+        } else {
+            self.opened = true;
+            let (front, back) = tail.as_slices();
+            match open_spill(&self.path) {
+                Ok(file) => self.file = Some(file),
+                Err(_) => self.broken = true,
+            }
+            [head, front, back]
+        };
+        for part in parts {
+            if self.write(part).is_err() {
+                self.broken = true;
+                self.file = None;
+                return;
+            }
+        }
+    }
+
+    /// Writes as much of `bytes` as the room left allows.
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(file) = self.file.as_mut() else {
+            return Ok(());
+        };
+        let take = |left: usize| Some(left - left.min(bytes.len()));
+        let (Ok(left) | Err(left)) = self.room.fetch_update(Relaxed, Relaxed, take);
+        let n = left.min(bytes.len());
+        self.saved += n;
+        file.write_all(&bytes[..n])
+    }
 }
 
 /// Bytes and line breaks printed but not kept, and where in the text they
@@ -1160,21 +1422,20 @@ impl Captured {
         self.head.extend_from_slice(head);
         self.tail.extend(rest);
         let over = self.tail.len().saturating_sub(KEEP_TAIL);
+        if over > 0
+            && let Some(spill) = &mut self.spill
+        {
+            spill.save(&self.head, &self.tail, rest);
+        }
         self.tail.drain(..over);
     }
 
     /// What was kept, as text without escape sequences, and the gap in it
     /// when anything between the start and the end was dropped.
     pub(crate) fn into_text(mut self) -> (String, Option<Gap>) {
-        // A pipe cut short, by the kill or by what is kept, can end partway
-        // through a key, and what is left of it can be told only while the
-        // cut is still the end.
-        let text = |bytes: &[u8]| {
-            crate::redact::scrub_cut(&strip_escapes(&String::from_utf8_lossy(bytes)), true)
-        };
         if self.bytes == self.head.len() + self.tail.len() {
             self.head.extend(self.tail);
-            return (text(&self.head), None);
+            return (clean(&self.head), None);
         }
         // Whole lines on both sides keep the count of lines in the gap
         // exact; a line longer than what is kept is cut inside instead.
@@ -1186,15 +1447,24 @@ impl Captured {
             .iter()
             .position(|&b| b == b'\n')
             .map_or(&tail[..], |i| &tail[i + 1..]);
-        let mut out = text(&self.head);
+        let mut out = clean(&self.head);
         let gap = Gap {
             at: out.len(),
             bytes: self.bytes - self.head.len() - tail.len(),
             lines: self.lines - line_breaks(&self.head) - line_breaks(tail),
         };
-        out.push_str(&text(tail));
+        out.push_str(&clean(tail));
         (out, Some(gap))
     }
+}
+
+/// Output bytes as the model reads them: text without escape sequences or
+/// saved keys.
+fn clean(bytes: &[u8]) -> String {
+    // A pipe cut short, by the kill or by what is kept, can end partway
+    // through a key, and what is left of it can be told only while the cut
+    // is still the end.
+    crate::redact::scrub_cut(&strip_escapes(&String::from_utf8_lossy(bytes)), true)
 }
 
 fn line_breaks(bytes: &[u8]) -> usize {
@@ -1204,10 +1474,19 @@ fn line_breaks(bytes: &[u8]) -> usize {
 /// Keep what `pipe` yields in the returned capture until it closes or the
 /// capture is taken, then drop `open`.
 pub(crate) fn forward(
-    mut pipe: impl std::io::Read + Send + 'static,
+    pipe: impl std::io::Read + Send + 'static,
     open: std::sync::mpsc::Sender<()>,
 ) -> Arc<Mutex<Option<Captured>>> {
-    let kept = Arc::new(Mutex::new(Some(Captured::default())));
+    forward_into(pipe, open, Captured::default())
+}
+
+/// `forward`, keeping in `start`, which may carry a spill.
+fn forward_into(
+    mut pipe: impl std::io::Read + Send + 'static,
+    open: std::sync::mpsc::Sender<()>,
+    start: Captured,
+) -> Arc<Mutex<Option<Captured>>> {
+    let kept = Arc::new(Mutex::new(Some(start)));
     let slot = kept.clone();
     std::thread::spawn(move || {
         let _open = open;
@@ -1453,7 +1732,11 @@ impl Tool for RunCommand {
                     .into());
             }
             let before = crate::filestate::before(ctx.conversation);
-            let out = run_shell(command, Some(cwd), &ctx.cancel);
+            let save = spill_path(ctx).map(|path| SaveTo {
+                path,
+                cap: PIPE_SPILL_BYTES,
+            });
+            let out = run_shell_saving(command, Some(cwd), &ctx.cancel, save);
             let note = crate::filestate::note(ctx.conversation, before, cwd);
             // The note goes first, so cutting long output short cannot drop it.
             return match out {
@@ -3906,6 +4189,66 @@ mod tests {
         assert!(out.ends_with("999998\n999999\n"), "{out}");
         let (last, first, lines, bytes) = around_the_cut(&out);
         assert_eq!((lines, bytes), seq_between(last, first), "{out}");
+    }
+
+    /// What `seq 1 {last}` prints.
+    #[cfg(unix)]
+    fn seq_text(last: usize) -> String {
+        (1..=last).map(|n| format!("{n}\n")).collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_command_printing_past_what_is_kept_is_saved_whole() {
+        let (_turn, dir) = data_folder("pipe");
+        let ctx = in_conversation(9, &dir);
+        let command = r#"{"command":"seq 1 999999; echo failed >&2; exit 3"}"#;
+        let out = run("run_command", command, &ctx).unwrap();
+        assert!(out.len() <= MAX_OUTPUT, "{}", out.len());
+        assert!(out.contains(" bytes) left out; all of it is in "), "{out}");
+        let path = saved_in(&out);
+        let whole = seq_text(999999) + "\n[stderr]\nfailed\n\n[exit code 3]";
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), whole);
+        // What each pipe was streamed to is gone once the file is made.
+        let files = std::fs::read_dir(results_dir(9)).unwrap().count();
+        assert_eq!(files, 1);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_short_command_output_is_unchanged_and_saves_nothing() {
+        let (_turn, dir) = data_folder("pipe-short");
+        let ctx = in_conversation(9, &dir);
+        let out = run("run_command", r#"{"command":"seq 1 3"}"#, &ctx).unwrap();
+        assert_eq!(out, "1\n2\n3\n");
+        assert!(!results_dir(9).exists(), "saved an output that was not cut");
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_command_past_the_disk_cap_is_saved_up_to_it_and_says_so() {
+        let dir = std::env::temp_dir().join(format!("letronna-pipe-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cap = 1024 * 1024;
+        let save = SaveTo {
+            path: dir.join("out.txt"),
+            cap,
+        };
+        let out = run_shell_saving("seq 1 999999", None, &Cancel::default(), Some(save)).unwrap();
+        let path = dir.join("out.txt");
+        let note = format!("; its first {cap} bytes are in {}, which", path.display());
+        assert!(out.contains(&note), "{out}");
+        let all = seq_text(999999);
+        let left = all.len() - cap;
+        let saved = format!(
+            "{}\n… [{left} more bytes printed here were not saved: a saved output \
+             keeps at most {cap} bytes]\n",
+            &all[..cap]
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
