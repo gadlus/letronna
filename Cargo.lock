@@ -3705,6 +3705,7 @@ dependencies = [
  "gpui-component",
  "image",
  "letronna-core",
+ "notify",
  "objc",
  "raw-window-handle",
  "reqwest",

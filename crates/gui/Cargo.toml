@@ -20,6 +20,9 @@ gpui = "=0.2.2"
 gpui-component = "=0.5.1"
 discord-rich-presence = "1"
 image = "0.25"
+# Already in the tree via gpui-component. The system says when the terminal
+# writes a session, so the window follows it without polling the folder.
+notify = "7"
 # Plays speech a tool made, in the chat: playback and the formats voices come
 # back in, and no recording.
 rodio = { version = "0.22", default-features = false, features = ["playback", "mp3", "wav", "flac", "vorbis"] }
