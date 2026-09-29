@@ -79,9 +79,11 @@ pub fn exposed() -> Vec<Arc<dyn Tool>> {
         workspace: std::env::current_dir().ok(),
         ..Default::default()
     };
+    let disabled = crate::store::disabled_tools();
     tools::all()
         .into_iter()
         .filter(|tool| EXPOSED.contains(&tool.name()) && tool.offered(&connection))
+        .filter(|tool| !tools::switched_off(tool.name(), &disabled))
         .collect()
 }
 
@@ -104,6 +106,12 @@ impl Server {
     pub fn answer(&mut self, message: &Value) -> Option<Value> {
         // Replies to nothing we asked, and notifications, `initialized`
         // among them, need no answer.
+        // A batch, which one revision allowed, or anything else that is not
+        // one message would otherwise leave the client waiting.
+        if !message.is_object() {
+            let why = "Letronna answers one JSON-RPC object a line, not a batch.";
+            return Some(failure(Value::Null, -32600, why));
+        }
         let method = message.get("method").and_then(Value::as_str)?;
         let id = message.get("id").cloned()?;
         let params = message.get("params").cloned().unwrap_or(Value::Null);
@@ -172,7 +180,12 @@ impl Server {
             let Some(prompt) = args["prompt"].as_str().filter(|p| !p.trim().is_empty()) else {
                 return Ok(outcome(Err("letronna_turn needs a prompt.".into())));
             };
-            return Ok(outcome(turn(prompt)));
+            // Every result inside the turn was scrubbed, but its answer is
+            // the model's own words, which reach another program here.
+            let said = turn(prompt)
+                .map(|text| crate::redact::scrub(&text, false))
+                .map_err(|why| crate::redact::scrub(&why, false));
+            return Ok(outcome(said));
         }
         let Some(tool) = self.tools.iter().find(|tool| tool.name() == name) else {
             return Err((
@@ -238,14 +251,17 @@ fn failure(id: Value, code: i64, why: &str) -> Value {
 
 /// Answers every message read from `from` on `to` until `from` ends.
 pub fn serve(server: &mut Server, from: impl BufRead, mut to: impl Write) -> Result<(), String> {
-    for line in from.lines() {
+    // Bytes rather than lines of text, so one line that is not UTF-8 is
+    // answered as a parse error instead of ending the server.
+    for line in from.split(b'\n') {
         let line = line.map_err(|e| format!("Could not read the client: {e}"))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let reply = match serde_json::from_str::<Value>(&line) {
-            Ok(message) => server.answer(&message),
-            Err(e) => Some(failure(Value::Null, -32700, &format!("Not JSON: {e}"))),
+        let reply = match std::str::from_utf8(&line) {
+            Err(_) => Some(failure(Value::Null, -32700, "Not UTF-8.")),
+            Ok(text) if text.trim().is_empty() => continue,
+            Ok(text) => match serde_json::from_str::<Value>(text) {
+                Ok(message) => server.answer(&message),
+                Err(e) => Some(failure(Value::Null, -32700, &format!("Not JSON: {e}"))),
+            },
         };
         if let Some(reply) = reply {
             write_message(&mut to, &reply)
@@ -492,6 +508,43 @@ mod tests {
         assert_eq!(answers[0]["id"], Value::Null);
         assert_eq!(answers[1]["error"]["code"], -32601);
         assert_eq!(answers[1]["id"], 9);
+    }
+
+    #[test]
+    fn a_line_that_is_not_utf8_or_not_one_object_is_answered_and_reading_goes_on() {
+        let mut output = Vec::new();
+        let input: &[u8] = b"\xff\xfe\n[{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"ping\"}]\n\
+            {\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"ping\"}\n";
+        assert_eq!(serve(&mut server(false, None), input, &mut output), Ok(()));
+        let answers: Vec<Value> = String::from_utf8_lossy(&output)
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(answers.len(), 3);
+        assert_eq!(answers[0]["error"]["code"], -32700);
+        assert_eq!(answers[1]["error"]["code"], -32600);
+        assert_eq!(answers[2]["id"], 9);
+        assert_eq!(answers[2]["result"], json!({}));
+    }
+
+    #[test]
+    fn the_turns_answer_has_the_users_keys_hidden() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let data = scratch("keys");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &data) };
+        let keys = r#"{"OpenAI":"a-saved-key-of-no-known-shape"}"#;
+        std::fs::write(data.join("keys.json"), keys).unwrap();
+        let turn: Turn = Box::new(|_| Ok("It is a-saved-key-of-no-known-shape.".into()));
+        let answered = server(false, Some(turn))
+            .answer(&call(2, TURN, json!({"prompt": "which key?"})))
+            .unwrap();
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        let _ = std::fs::remove_dir_all(&data);
+        let text = answered["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("a-saved-key"), "{text}");
+        assert!(text.contains(crate::redact::MARKER), "{text}");
     }
 
     #[test]
