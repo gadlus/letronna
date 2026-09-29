@@ -336,7 +336,10 @@ fn pictures(args: &Value) -> Vec<String> {
 
 /// Whether `endpoint` is Letronna's own hosted gateway.
 fn hosted(endpoint: &str) -> bool {
-    endpoint.trim().trim_end_matches('/') == crate::auth::hosted_base()
+    // Named with the chat route too, as `run` takes it, so the card and the
+    // offer say who is paid as the call does.
+    let base = endpoint.trim().trim_end_matches('/');
+    base.strip_suffix("/chat/completions").unwrap_or(base) == crate::auth::hosted_base()
 }
 
 /// The picture at `path` as it is uploaded, and the name it goes by: as it
@@ -1694,6 +1697,20 @@ mod tests {
         asked.join().unwrap();
         assert!(why.contains("answered 307"), "{why}");
         assert!(!reached.is_finished() && !project.join("media").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn letronna_named_with_its_chat_route_is_still_paid_from_the_credit() {
+        let (_turn, dir) = scratch("hosted");
+        let letronna = Connection {
+            endpoint: format!("{}/chat/completions", crate::auth::hosted_base()),
+            ..Default::default()
+        };
+        let args = json!({"images": ["cat.png"], "prompt": "a hat"});
+        let card = EditImage.preview(&args, &ToolContext::of(&letronna));
+        assert!(card.ends_with("paid from your Letronna credit."), "{card}");
+        assert!(!EditImage.offered(&letronna));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
