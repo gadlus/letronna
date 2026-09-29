@@ -997,18 +997,26 @@ impl Chat {
     /// The quick entry bar's send: like [`Self::dispatch`], but window-free,
     /// since it runs from a window other than the one this `Chat` renders in.
     /// `new_session` opens a fresh conversation first; otherwise the prompt
-    /// lands in whichever one was last active.
+    /// lands in whichever one was last active. `Err` is the reason for the
+    /// bar to show, and leaves the sessions as they were.
     pub(crate) fn quick_dispatch(
         &mut self,
         prompt: String,
         images: Vec<PathBuf>,
         new_session: bool,
         cx: &mut Context<Self>,
-    ) -> std::result::Result<(), ()> {
+    ) -> Result<(), String> {
+        // A second turn started over a running one would replace its agent
+        // loop; the composer queues a follow-up here, which the bar cannot.
+        if self.busy {
+            return Err("A reply is still running. Send this when it is done.".into());
+        }
+        if prompt.chars().count() > 12_000 {
+            return Err("Please keep each message under 12,000 characters.".into());
+        }
+        let previous = self.store.active;
         if new_session {
-            let workspace = self.store.conversations[self.store.active]
-                .workspace
-                .clone();
+            let workspace = self.store.conversations[previous].workspace.clone();
             self.store.conversations.push(Conversation {
                 id: self.store.reserve_id(),
                 title: "New session".into(),
@@ -1018,7 +1026,24 @@ impl Chat {
             });
             self.store.active = self.store.conversations.len() - 1;
         }
-        self.dispatch(prompt, images, None, cx)
+        let sent = match self.prompt_for(prompt, cx) {
+            Some(prompt) => self.dispatch(prompt, images, None, cx).is_ok(),
+            None => false,
+        };
+        if sent {
+            return Ok(());
+        }
+        // Shown in the bar, which stays open, not behind it in the window.
+        let why = self
+            .error
+            .take()
+            .unwrap_or_else(|| "That could not be sent.".into());
+        if new_session {
+            self.store.conversations.pop();
+            self.store.active = previous;
+        }
+        cx.notify();
+        Err(why)
     }
 
     /// A checked connection for a turn in the session at `ix`, on the gateway

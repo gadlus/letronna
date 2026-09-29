@@ -71,6 +71,8 @@ struct QuickEntry {
     new_session: bool,
     /// Pictures pasted into the bar, waiting to go with the next send.
     images: Vec<PathBuf>,
+    /// Why the last send did not go, shown until the next edit or send.
+    error: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -79,10 +81,10 @@ impl QuickEntry {
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("Ask Letronna\u{2026}"));
         input.update(cx, |input, cx| input.focus(window, cx));
         let subscriptions = vec![
-            cx.subscribe_in(&input, window, |this, _, event, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.send(window, cx);
-                }
+            cx.subscribe_in(&input, window, |this, _, event, window, cx| match event {
+                InputEvent::PressEnter { .. } => this.send(window, cx),
+                InputEvent::Change if this.error.take().is_some() => cx.notify(),
+                _ => {}
             }),
         ];
         Self {
@@ -90,6 +92,7 @@ impl QuickEntry {
             input,
             new_session: false,
             images: Vec::new(),
+            error: None,
             _subscriptions: subscriptions,
         }
     }
@@ -99,12 +102,19 @@ impl QuickEntry {
         if prompt.is_empty() && self.images.is_empty() {
             return;
         }
-        let images = std::mem::take(&mut self.images);
+        let images = self.images.clone();
         let new_session = self.new_session;
-        self.main.update(cx, |chat, cx| {
-            let _ = chat.quick_dispatch(prompt, images, new_session, cx);
+        let sent = self.main.update(cx, |chat, cx| {
+            chat.quick_dispatch(prompt, images, new_session, cx)
         });
-        self.hide(window, cx);
+        match sent {
+            Ok(()) => self.hide(window, cx),
+            // Kept as typed, so nothing is lost to a reply still running.
+            Err(why) => {
+                self.error = Some(why);
+                cx.notify();
+            }
+        }
     }
 
     fn hide(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -185,6 +195,16 @@ impl Render for QuickEntry {
                     .min_w_0()
                     .child(Input::new(&self.input).appearance(false).w_full()),
             )
+            .when_some(self.error.clone(), |row, why| {
+                row.child(
+                    div()
+                        .max_w(px(220.))
+                        .truncate()
+                        .text_xs()
+                        .text_color(cx.theme().danger)
+                        .child(why),
+                )
+            })
             .when(!self.images.is_empty(), |row| {
                 row.child(
                     div()
