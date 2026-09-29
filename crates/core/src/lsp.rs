@@ -807,15 +807,12 @@ impl Server {
                 known.dead.get_or_insert(why);
             }
         }
-        lock(&self.to).take();
-        if let Some(process) = lock(&self.process).take() {
-            process.end();
-        }
+        self.end();
         self.heard.notify_all();
     }
 
     /// Ask the server to shut down and exit, then end it whatever it did.
-    fn shut_down(&self) {
+    fn shut_down(self: &Arc<Self>) {
         let alive = {
             let mut known = lock(&self.known);
             known.stopping = true;
@@ -823,9 +820,16 @@ impl Server {
         };
         // The worker ends once it has finished what it is doing.
         lock(&self.jobs).take();
-        if alive && self.request("shutdown", Value::Null, STOP_WAIT).is_ok() {
-            let _ = self.notify("exit", Value::Null);
-            let deadline = Instant::now() + STOP_WAIT;
+        if alive {
+            // Asked on a thread of its own: a server that stopped reading
+            // holds a write, and the pipe with it, until its process ends.
+            let server = self.clone();
+            std::thread::spawn(move || {
+                if server.request("shutdown", Value::Null, STOP_WAIT).is_ok() {
+                    let _ = server.notify("exit", Value::Null);
+                }
+            });
+            let deadline = Instant::now() + 2 * STOP_WAIT;
             let mut known = lock(&self.known);
             while !known.gone
                 && let Some(left) = left(deadline)
@@ -833,10 +837,16 @@ impl Server {
                 known = self.wait(known, left);
             }
         }
-        lock(&self.to).take();
+        self.end();
+    }
+
+    /// End the process, then let go of the pipe: ending it is what frees a
+    /// write stuck on a server that stopped reading.
+    fn end(&self) {
         if let Some(process) = lock(&self.process).take() {
             process.end();
         }
+        lock(&self.to).take();
     }
 
     fn send(&self, message: &Value) -> Result<(), String> {
@@ -1363,6 +1373,44 @@ mod tests {
             Some(json!({"method": "a\r\n\r\nb"}))
         );
         assert_eq!(read_frame(&mut from).unwrap(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quitting_does_not_wait_on_a_server_that_stopped_reading() {
+        let dir = scratch("stuck");
+        // Answers `initialize` unread, then reads nothing more.
+        let body = json!({"jsonrpc": "2.0", "id": 1, "result": {"capabilities": {}}});
+        let answer = format!("Content-Length: {}\r\n\r\n{body}", body.to_string().len());
+        let config: ServerConfig = serde_json::from_value(json!({"command": "sh",
+            "args": ["-c", "printf '%s' \"$0\"; exec sleep 600", answer]}))
+        .unwrap();
+        let root = dir.clone();
+        let server = Server::start("stuck", &dir, move || launch(&config, &root));
+        let path = dir.join("a.rs");
+        // Far more than a pipe holds, so the worker is left writing it.
+        server.queue(Job {
+            conversation: session(),
+            uri: uri(&path),
+            path,
+            language: "rust".into(),
+            before: None,
+            after: "x".repeat(4 << 20),
+        });
+        std::thread::sleep(Duration::from_millis(500));
+
+        let (done, ended) = mpsc::channel();
+        let stopping = server.clone();
+        std::thread::spawn(move || {
+            stopping.shut_down();
+            let _ = done.send(());
+        });
+        let ended = ended.recv_timeout(4 * STOP_WAIT).is_ok();
+        // Ended here if not, so a failure leaves nothing running.
+        if let Some(process) = lock(&server.process).take() {
+            process.end();
+        }
+        assert!(ended, "still shutting down");
     }
 
     #[test]
