@@ -153,6 +153,7 @@ fn main() {
     letronna_core::mcp::start();
     letronna_core::diag::mark("mcp");
 
+    store::prune_old();
     let mut runner = Runner {
         store: store::load_listing(),
         allowed: Default::default(),

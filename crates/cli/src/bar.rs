@@ -111,6 +111,10 @@ pub const COMMANDS: &[Command<'static>] = &[
         blurb: "ask the model to build or test after it changes files, or not",
     },
     Command {
+        name: "/retention",
+        blurb: "delete sessions older than N days, or off to keep them",
+    },
+    Command {
         name: "/jobs",
         blurb: "commands still running in the background",
     },
@@ -2032,7 +2036,7 @@ mod tests {
     fn added_commands_follow_letronna_s_own_in_the_menu() {
         let added = [("/review".to_owned(), "look over a change".to_owned())];
         let names: Vec<&str> = matches("/re", &added).iter().map(|c| c.name).collect();
-        assert_eq!(names, ["/resume", "/retry", "/review"]);
+        assert_eq!(names, ["/retention", "/resume", "/retry", "/review"]);
         let long = [("/a-long-command-name".to_owned(), String::new())];
         assert_eq!(name_width(&long), "/a-long-command-name".len());
         // A name past the cap is cut, not every row pushed along by it.

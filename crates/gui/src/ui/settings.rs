@@ -65,6 +65,29 @@ impl Chat {
         self.save_browser_address(cx);
     }
 
+    /// Keep sessions for the number of days in the field, or for ever when it
+    /// is empty or 0. Deleting happens at the next start.
+    pub(crate) fn save_keep_days(&mut self, cx: &mut Context<Self>) {
+        let text = self.keep_days.read(cx).value().trim().to_string();
+        let days = if text.is_empty() {
+            0
+        } else {
+            match text.parse::<u32>() {
+                Ok(days) => days,
+                Err(_) => {
+                    self.error = Some(format!(
+                        "\"{text}\" is not a number of days. Leave it empty to keep sessions."
+                    ));
+                    cx.notify();
+                    return;
+                }
+            }
+        };
+        self.store.settings.keep_days = days;
+        self.save();
+        cx.notify();
+    }
+
     /// Save the window's key for `slot`, or its removal, and nothing else, so
     /// a key the terminal saved meanwhile is kept and seen here too; one that
     /// could not be saved or removed is said, and the keys shown are the
@@ -463,6 +486,7 @@ impl Chat {
                 &chat,
                 &presence,
                 &self.browser_address,
+                &self.keep_days,
                 &self.store.settings,
                 cx,
             )
@@ -701,10 +725,54 @@ fn elsewhere_row(chat: &Entity<Chat>, address: &Entity<InputState>, cx: &App) ->
         )
 }
 
+fn keep_row(chat: &Entity<Chat>, days: &Entity<InputState>, kept: u32, cx: &App) -> Div {
+    let now = match kept {
+        0 => "Now every session is kept.".to_owned(),
+        1 => "Now sessions untouched for a day are deleted.".to_owned(),
+        n => format!("Now sessions untouched for {n} days are deleted."),
+    };
+    let save = chat.clone();
+    v_flex()
+        .gap_2()
+        .px_3()
+        .py_2p5()
+        .rounded(cx.theme().radius)
+        .bg(cx.theme().secondary.opacity(0.3))
+        .child(
+            v_flex()
+                .gap_0p5()
+                .child(div().text_sm().child("Delete sessions older than N days"))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!(
+                            "Looked for when Letronna starts, at most once a day. Pinned \
+                             sessions and one in use are kept. Empty keeps them all. {now}"
+                        )),
+                ),
+        )
+        .child(
+            h_flex()
+                .gap_2()
+                .child(div().flex_1().child(Input::new(days)))
+                .child(
+                    Button::new("keep-days-save")
+                        .primary()
+                        .small()
+                        .label("Save")
+                        .on_click(move |_, _, cx| {
+                            save.update(cx, |this, cx| this.save_keep_days(cx))
+                        }),
+                ),
+        )
+}
+
 fn privacy_page(
     chat: &Entity<Chat>,
     presence: &Entity<String>,
     address: &Entity<InputState>,
+    keep_days: &Entity<InputState>,
     settings: &Settings,
     cx: &App,
 ) -> Div {
@@ -956,6 +1024,12 @@ fn privacy_page(
                 this.store.settings.notifications = !notifications
             }),
         ))
+        .child(heading(
+            "Sessions",
+            "Sessions stay on this computer until you delete them, unless you choose otherwise.",
+            cx,
+        ))
+        .child(keep_row(chat, keep_days, settings.keep_days, cx))
         .child(heading(
             "Browser",
             "Each session browses in a browser of its own, as a separate agent would.",

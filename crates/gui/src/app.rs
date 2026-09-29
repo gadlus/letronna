@@ -131,6 +131,8 @@ pub(crate) struct Chat {
     pub(crate) hotkey: Entity<InputState>,
     /// Where the browser is when it is not on this computer.
     pub(crate) browser_address: Entity<InputState>,
+    /// Days a session is kept untouched before it is deleted; empty for ever.
+    pub(crate) keep_days: Entity<InputState>,
     /// Every model on every set-up gateway, as (gateway, model).
     pub(crate) models: Vec<(String, String)>,
     /// Which list the model menu shows: `chat`, or one of the media kinds.
@@ -452,6 +454,7 @@ impl Chat {
         // session rather than the history. Only listed: each is read in
         // when it is opened, so starting costs the same however much was
         // said before.
+        letronna_core::store::prune_old();
         let started = std::time::Instant::now();
         let (mut store, error) = (letronna_core::store::load_listing(), None);
         store.active = store
@@ -540,6 +543,16 @@ impl Chat {
                         .cloned()
                         .unwrap_or_default(),
                 )
+        });
+        let keep_days = cx.new(|cx| {
+            let days = store.settings.keep_days;
+            InputState::new(window, cx)
+                .placeholder("Never")
+                .default_value(if days == 0 {
+                    String::new()
+                } else {
+                    days.to_string()
+                })
         });
         let model_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search models…"));
         let gateway_pick = cx.new(|_| store.settings.gateway.clone());
@@ -759,6 +772,7 @@ impl Chat {
             key,
             hotkey,
             browser_address,
+            keep_days,
             models: Vec::new(),
             model_kind: "chat",
             media_models: Vec::new(),

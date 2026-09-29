@@ -1,13 +1,14 @@
 //! Sessions on disk.
 //!
 //! One append-only file per session, `sessions/<id>.jsonl`, a JSON record per
-//! line. Everything shared between sessions lives in `settings.json`, and
+//! line, rewritten whole only to take back what a rewind cut. Everything
+//! shared between sessions lives in `settings.json`, and
 //! `sessions/index.json` caches what each file sums up to for the listing.
 //!
 //! The shape matters because two Letronnas will run at once -- the window and
 //! the terminal. A single file holding every session, rewritten whole on each
 //! save, means whichever process writes last erases the other's work. Here a
-//! session is only ever appended to, and only by whoever is running it, so
+//! session is appended to, and only by whoever is running it, so
 //! two of them never tread on each other. A crash mid-write costs at most the
 //! last line instead of the whole history.
 
@@ -188,11 +189,15 @@ enum Record {
     /// The descriptive fields; the last one in the file wins.
     Meta(Meta),
     Message(Message),
-    /// From here on the session is its first `to` messages. Taking messages
-    /// back is appended like everything else rather than cutting the file.
+    /// From here on the session is its first `to` messages. Written where
+    /// both Letronnas said something and this copy's history wins, and by
+    /// builds from before a rewind rewrote the file; still read.
     Rewind {
         to: usize,
     },
+    /// The usage of a reply a rewind took out of the file, kept for the
+    /// costs since it was paid for all the same. Never part of the session.
+    Paid(Message),
     /// A summary the model made of the first `upto` messages, which stands
     /// in for them once the context window no longer holds them. The newest
     /// one a later rewind has not cut into is used.
@@ -326,6 +331,10 @@ pub struct Settings {
     /// medium.
     #[serde(default)]
     pub crew: String,
+    /// Sessions untouched for longer than this many days are deleted when
+    /// Letronna starts, at most once a day; 0 keeps them forever.
+    #[serde(default)]
+    pub keep_days: u32,
 }
 
 // Written out rather than derived so the film grain and notifications start
@@ -341,6 +350,7 @@ impl Default for Settings {
             helper_depth: 0,
             helper_budget: 0,
             disabled_tools: Vec::new(),
+            keep_days: 0,
             computer_use: false,
             keys_in: String::new(),
             fallbacks: Vec::new(),
@@ -436,15 +446,15 @@ impl Conversation {
         // is read again: left as it was, `length` would report the old
         // history and `fill` would read it back in.
         self.counted = self.counted.min(len);
-        // What is already written stays in the file; a rewind record goes
-        // after it, and anything said from here on after that. Rewinding
-        // again before a save only moves the record back.
+        // The next save rewrites the file without what was taken back, and
+        // appends anything said from here on. Rewinding again before a save
+        // only cuts further.
         if self.flushed > len {
             self.flushed = len;
             self.rewound = Some(len);
         }
         // A summary of messages taken back no longer sums up the session.
-        // The one in the file is dropped by the rewind record written after it.
+        // The one in the file goes when the save cuts it.
         if self.summary.as_ref().is_some_and(|(upto, _)| *upto > len) {
             self.summary = None;
         }
@@ -690,23 +700,7 @@ impl Store {
             return;
         }
         let gone = self.conversations.remove(index);
-        let path = session_path(gone.id);
-        let lock = Lock::take(&path);
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(crate::prefilter::path_for(&path));
-        // A lock file someone else holds stays: removed, the next writer
-        // would lock a new file beside them and both would write.
-        if lock.is_ok() {
-            let _ = std::fs::remove_file(path.with_extension("lock"));
-        }
-        let _ = std::fs::remove_dir_all(helpers_dir(gone.id));
-        let _ = std::fs::remove_dir_all(crate::tools::results_dir(gone.id));
-        // A new session can be given the same id.
-        crate::filestate::forget(gone.id);
-        crate::compact::forget(gone.id, 0);
-        crate::history::forget(gone.id);
-        crate::lsp::forget(gone.id);
-        crate::tasklist::forget(gone.id);
+        erase(gone.id, Lock::take(&session_path(gone.id)).ok());
     }
 
     /// Take in what another process wrote to the sessions since this one
@@ -738,6 +732,82 @@ impl Store {
     }
 }
 
+/// Remove session `id`'s file and what is kept beside it for it. Its lock
+/// file goes only with `lock` held on it.
+fn erase(id: u64, lock: Option<Lock>) {
+    let path = session_path(id);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(crate::prefilter::path_for(&path));
+    // A lock file someone else holds stays: removed, the next writer
+    // would lock a new file beside them and both would write.
+    if lock.is_some() {
+        let _ = std::fs::remove_file(path.with_extension("lock"));
+    }
+    let _ = std::fs::remove_dir_all(helpers_dir(id));
+    let _ = std::fs::remove_dir_all(crate::tools::results_dir(id));
+    // A new session can be given the same id.
+    crate::filestate::forget(id);
+    crate::compact::forget(id, 0);
+    crate::history::forget(id);
+    crate::lsp::forget(id);
+    crate::tasklist::forget(id);
+}
+
+/// The file marking when old sessions were last looked for.
+fn pruned_path() -> PathBuf {
+    backend::data_dir().join("pruned")
+}
+
+/// Delete the sessions untouched for longer than the settings' `keep_days`,
+/// if that is set and this has not run in the last day. Called at startup,
+/// before the sessions are read, so none of them is open yet but the one
+/// the settings say was open last, which is kept.
+pub fn prune_old() {
+    let settings = current_settings();
+    if settings.keep_days == 0 {
+        return;
+    }
+    let marker = pruned_path();
+    let recent = std::fs::metadata(&marker)
+        .and_then(|meta| meta.modified())
+        .is_ok_and(|at| at.elapsed().is_ok_and(|age| age.as_secs() < DAY));
+    if recent {
+        return;
+    }
+    // Marked first, so the window and the terminal starting together do not
+    // both look; if they do, the second finds less to delete.
+    let _ = std::fs::write(&marker, b"");
+    prune(settings.keep_days, backend::now(), &[settings.active_id]);
+}
+
+/// Seconds in a day.
+const DAY: u64 = 24 * 60 * 60;
+
+/// Delete every session last touched more than `keep_days` before `now`,
+/// except those in `open`, pinned ones and any another process is writing
+/// to. Gives the ids deleted.
+fn prune(keep_days: u32, now: u64, open: &[u64]) -> Vec<u64> {
+    let before = now.saturating_sub(u64::from(keep_days) * DAY);
+    let mut deleted = Vec::new();
+    for summary in summaries() {
+        let path = session_path(summary.id);
+        // The file's time as well as the meta's: a save that changed no
+        // descriptive field still touched the session.
+        let written = std::fs::metadata(&path).map_or(0, |stat| modified(&stat) / 1_000_000_000);
+        if summary.pinned || open.contains(&summary.id) || summary.updated.max(written) >= before {
+            continue;
+        }
+        // Held means another Letronna is writing it right now, so it is in
+        // use whatever its times say.
+        let Ok(lock) = Lock::take(&path) else {
+            continue;
+        };
+        erase(summary.id, Some(lock));
+        deleted.push(summary.id);
+    }
+    deleted
+}
+
 impl Conversation {
     fn meta(&self) -> Meta {
         Meta {
@@ -754,8 +824,9 @@ impl Conversation {
         }
     }
 
-    /// Append the head (first time), any rewind and new messages, and the
-    /// descriptive fields if they have moved since the last write.
+    /// Append the head (first time), new messages and the descriptive fields
+    /// if they have moved since the last write, after rewriting the file
+    /// without what a rewind took back.
     fn flush(&mut self) -> std::io::Result<()> {
         if self.gone {
             return Ok(());
@@ -814,25 +885,35 @@ impl Conversation {
             .append(true)
             .read(true)
             .open(path)?;
-        // What another process added since this copy was read or written.
-        let theirs = match &self.seen {
+        // How many of the messages this copy wrote the other process left,
+        // when it wrote here since this copy was read or written.
+        let standing = match &self.seen {
             Some(seen) => match added_since(&mut file, seen)? {
-                Some(bytes) => bytes,
-                // Replaced under this copy, as when a new session took the
-                // freed id: writing on would put this one's lines in it.
+                Some(theirs) => kept_by(&theirs, self.flushed),
                 None => {
-                    self.gone = true;
-                    return Ok(());
+                    let had = &self.messages[..self.flushed.min(self.messages.len())];
+                    // Replaced under this copy, as when a new session took
+                    // the freed id: writing on would put this one's lines in
+                    // it. Rewritten by the other's rewind, it is still this
+                    // session, holding what the two share.
+                    let Some(shared) = rewritten(&std::fs::read(path)?, seen.head, had) else {
+                        self.gone = true;
+                        return Ok(());
+                    };
+                    Some(shared)
                 }
             },
-            None => Vec::new(),
+            None => None,
         };
-        let standing = kept_by(&theirs, self.flushed);
         let mine = self.flushed < self.messages.len() || self.rewound.is_some();
-        // Both said something since: this copy wins. A rewind to what the
-        // two share goes after their lines, and this copy's own from there,
-        // so the file reads back as this copy -- with their lines still in
-        // it, as nothing is ever rewritten.
+        // A rewind here rewrites the file without what it took back, so that
+        // is gone from the disk and not only from the replay. A new file has
+        // nothing to take back.
+        let cutting = self.rewound.is_some() && !fresh;
+        // Both said something since: this copy wins. Unless this copy is
+        // rewriting the file anyway, a rewind to what the two share goes
+        // after their lines, and this copy's own from there, so the file
+        // reads back as this copy -- with their lines still in it.
         let clash = mine && standing.is_some();
         if clash && let Some(to) = standing {
             self.flushed = to;
@@ -847,11 +928,17 @@ impl Conversation {
             .ok()
             .map(|stat| (stat.len(), modified(&stat)));
         let mut out = String::new();
-        // A crash part way through a line leaves the file without its last
-        // newline. Appending straight after it would glue the next record to
-        // the torn one and lose both; ending the torn line first loses one.
-        if torn(&mut file)? {
-            out.push('\n');
+        match self.rewound {
+            Some(to) if cutting => out = cut(&std::fs::read(path)?, to),
+            // A crash part way through a line leaves the file without its
+            // last newline. Appending straight after it would glue the next
+            // record to the torn one and lose both; ending the torn line
+            // first loses one.
+            _ => {
+                if torn(&mut file)? {
+                    out.push('\n');
+                }
+            }
         }
         if fresh {
             push(
@@ -865,7 +952,7 @@ impl Conversation {
         if meta_changed {
             push(&mut out, &Record::Meta(meta.clone()));
         }
-        if let Some(to) = self.rewound {
+        if !cutting && let Some(to) = self.rewound {
             push(&mut out, &Record::Rewind { to });
         }
         for message in &self.messages[self.flushed.min(self.messages.len())..] {
@@ -882,14 +969,24 @@ impl Conversation {
                 },
             );
         }
-        file.write_all(out.as_bytes())?;
-        // Stamped once the file is closed, as Windows may only then settle
-        // its modification time, and still under the lock.
-        drop(file);
+        // Closed before the rewrite too, as Windows will not move a file
+        // over one that is open.
+        if cutting {
+            drop(file);
+            replace(path, out.as_bytes())?;
+        } else {
+            file.write_all(out.as_bytes())?;
+            // Stamped once the file is closed, as Windows may only then
+            // settle its modification time, and still under the lock.
+            drop(file);
+        }
         if terms
             && let Some(before) = before
             && let Ok(after) = std::fs::metadata(path)
         {
+            // A rewritten file's set is made again from all of it, so none of
+            // what was cut can still be searched for.
+            let before = if cutting { (0, 0) } else { before };
             crate::prefilter::appended(path, before, (after.len(), modified(&after)), &out);
         }
         self.flushed = self.messages.len();
@@ -897,7 +994,9 @@ impl Conversation {
         self.rewound = None;
         self.summary_saved = true;
         // With their lines in the file and not in this copy, the mark stays
-        // before them, so following takes them in.
+        // before them, so following takes them in; a file the other rewrote
+        // is then read in full. A file this copy rewrote is marked again at
+        // its new end, or its next save would take it for replaced.
         // Read again from the closed file, whose modification time is settled.
         if self.seen.is_some() && (standing.is_none() || clash) {
             self.seen = std::fs::File::open(path)
@@ -962,6 +1061,7 @@ impl Conversation {
                     summaries.push((upto, text));
                 }
             }
+            Record::Paid(_) => {}
         }
     }
 
@@ -1024,6 +1124,7 @@ impl Conversation {
             // All in `bytes`: they start that far before the old end.
             tail: tail_hash(&bytes[taken.saturating_sub(TAIL_CHECK as usize)..taken]),
             messages: self.messages.len(),
+            head: seen.head,
         });
         self.caught_up(summaries);
         taken > start
@@ -1044,6 +1145,111 @@ fn push(out: &mut String, record: &Record) {
         out.push_str(&line);
         out.push('\n');
     }
+}
+
+/// The session file `bytes` with every message past the first `to` taken
+/// out, and the summaries of them, the rewinds already in it applied too.
+/// A reply taken out leaves a `paid` record of its usage and nothing it
+/// said, since it was paid for all the same. A line that will not parse is
+/// left out, as replaying skips it anyway.
+fn cut(bytes: &[u8], to: usize) -> String {
+    enum Kept<'a> {
+        Message(&'a str),
+        Summary(usize, &'a str),
+        Paid(&'a str),
+    }
+    /// Take out of `kept` what lies past the first `to` messages.
+    fn back(kept: &mut Vec<Kept>, paid: &mut Vec<String>, to: usize) {
+        let mut messages = 0;
+        kept.retain(|entry| match entry {
+            Kept::Message(line) => {
+                messages += 1;
+                if messages <= to {
+                    return true;
+                }
+                if let Ok(Record::Message(reply)) = serde_json::from_str::<Record>(line)
+                    && crate::usage::calls(&reply).next().is_some()
+                {
+                    let mut line = String::new();
+                    push(&mut line, &Record::Paid(usage_only(reply)));
+                    paid.push(line);
+                }
+                false
+            }
+            Kept::Summary(upto, _) => *upto <= to,
+            Kept::Paid(_) => true,
+        });
+    }
+    let text = String::from_utf8_lossy(bytes);
+    let (mut head, mut meta) = (None, None);
+    let mut kept = Vec::new();
+    // Where these go does not matter: only the costs read them.
+    let mut paid = Vec::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        match serde_json::from_str::<Record>(line) {
+            Ok(Record::Head { .. }) => head = head.or(Some(line)),
+            Ok(Record::Meta(_)) => meta = Some(line),
+            Ok(Record::Message(_)) => kept.push(Kept::Message(line)),
+            Ok(Record::Summary { upto, .. }) => kept.push(Kept::Summary(upto, line)),
+            Ok(Record::Paid(_)) => kept.push(Kept::Paid(line)),
+            Ok(Record::Rewind { to }) => back(&mut kept, &mut paid, to),
+            Err(_) => {}
+        }
+    }
+    back(&mut kept, &mut paid, to);
+    let mut out = String::new();
+    for line in head.into_iter().chain(meta) {
+        out.push_str(line);
+        out.push('\n');
+    }
+    for entry in kept {
+        let (Kept::Message(line) | Kept::Summary(_, line) | Kept::Paid(line)) = entry;
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.extend(paid);
+    out
+}
+
+/// `reply` with its counts and cost, and the tools it called for the counts
+/// of those, and none of its words.
+fn usage_only(reply: Message) -> Message {
+    let tool_calls = reply
+        .tool_calls
+        .into_iter()
+        .map(|call| crate::chat::ToolCall {
+            id: call.id,
+            name: call.name,
+            arguments: String::new(),
+        });
+    Message {
+        role: reply.role,
+        model: reply.model,
+        tokens: reply.tokens,
+        prompt_tokens: reply.prompt_tokens,
+        cached_tokens: reply.cached_tokens,
+        cache_write_tokens: reply.cache_write_tokens,
+        reasoning_tokens: reply.reasoning_tokens,
+        cost: reply.cost,
+        cost_estimated: reply.cost_estimated,
+        summary_usage: reply.summary_usage,
+        cache_miss: reply.cache_miss,
+        at: reply.at,
+        tool_calls: tool_calls.collect(),
+        ..Default::default()
+    }
+}
+
+/// Put `bytes` in place of the file at `path` whole, through a temporary
+/// file beside it, so a reader never sees half of it. The caller holds the
+/// session's lock, which keeps writers off it meanwhile.
+fn replace(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+    let written = std::fs::write(&temp, bytes).and_then(|()| std::fs::rename(&temp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    written
 }
 
 /// Whether the file stops part way through a line, as a write cut short leaves it.
@@ -1082,6 +1288,7 @@ fn replay(path: &std::path::Path) -> Option<Conversation> {
         len: len as u64,
         tail: tail_hash(&bytes[len.saturating_sub(TAIL_CHECK as usize)..len]),
         messages: conversation.messages.len(),
+        head: head_hash(&bytes),
     });
     conversation.caught_up(summaries);
     Some(conversation)
@@ -1275,6 +1482,9 @@ pub struct Seen {
     /// How many messages the file held up to `len`, to tell a copy that has
     /// been read in again another way since.
     messages: usize,
+    /// A hash of the file's first line, its head, which a rewind's rewrite
+    /// keeps and a new session given the same id does not.
+    head: u64,
 }
 
 fn index_path() -> PathBuf {
@@ -1402,7 +1612,7 @@ fn tally(summary: &mut Summary, bytes: &[u8]) {
             }
             Ok(Record::Message(_)) => summary.messages += 1,
             Ok(Record::Rewind { to }) => summary.messages = summary.messages.min(to),
-            Ok(Record::Summary { .. }) | Err(_) => {}
+            Ok(Record::Summary { .. } | Record::Paid(_)) | Err(_) => {}
         }
     }
 }
@@ -1567,8 +1777,11 @@ fn whole_lines(bytes: &[u8]) -> usize {
 /// bytes added when it only grew, and None when it no longer holds what
 /// `seen` was taken from.
 fn added_since(file: &mut std::fs::File, seen: &Seen) -> std::io::Result<Option<Vec<u8>>> {
-    let size = file.metadata()?.len();
-    if size == seen.size {
+    let stat = file.metadata()?;
+    let size = stat.len();
+    // The size alone would not tell: a rewind's rewrite can leave the file
+    // as long as it was.
+    if (size, modified(&stat)) == (seen.size, seen.mtime) {
         return Ok(Some(Vec::new()));
     }
     let read = read_on(file, seen.len, seen.tail, size)?;
@@ -1601,6 +1814,11 @@ fn kept_by(bytes: &[u8], had: usize) -> Option<usize> {
 fn seen_at_end(file: &mut std::fs::File, messages: usize) -> std::io::Result<Seen> {
     let stat = file.metadata()?;
     let size = stat.len();
+    file.seek(SeekFrom::Start(0))?;
+    let mut start = Vec::new();
+    Read::by_ref(file)
+        .take(HEAD_MAX as u64)
+        .read_to_end(&mut start)?;
     let from = size.saturating_sub(TAIL_CHECK);
     file.seek(SeekFrom::Start(from))?;
     let mut end = Vec::new();
@@ -1611,7 +1829,47 @@ fn seen_at_end(file: &mut std::fs::File, messages: usize) -> std::io::Result<See
         len: size,
         tail: tail_hash(&end),
         messages,
+        head: head_hash(&start),
     })
+}
+
+/// The most of a file's first line `head_hash` reads: a head record is far
+/// shorter, and a first line that is not one need not be read to its end.
+const HEAD_MAX: usize = 256;
+
+/// A hash of the first line of `bytes`, a session file from its start.
+fn head_hash(bytes: &[u8]) -> u64 {
+    let start = &bytes[..bytes.len().min(HEAD_MAX)];
+    let end = start
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(start.len(), |at| at + 1);
+    tail_hash(&start[..end])
+}
+
+/// How many of `had`, the messages a copy last wrote to its file, `bytes`
+/// still starts with, if `bytes` is that file as another process's rewind
+/// rewrote it since: under the head the copy saw, `head`, and starting with
+/// the copy's first message or holding none. None for another session.
+fn rewritten(bytes: &[u8], head: u64, had: &[Message]) -> Option<usize> {
+    if head_hash(bytes) != head {
+        return None;
+    }
+    let mut file = Conversation::default();
+    file.apply(bytes, &mut Vec::new());
+    // Compared as written, as a message read back is the one written.
+    let line = |message: &Message| serde_json::to_string(message).ok();
+    let shared = file
+        .messages
+        .iter()
+        .zip(had)
+        .take_while(|(theirs, ours)| line(theirs).is_some_and(|l| Some(l) == line(ours)))
+        .count();
+    // A head is an id and the second it was made, which a new session given
+    // the freed id could share; its first message it would not. A rewind to
+    // the start leaves no message to tell by, and none of another's to write
+    // this copy's among.
+    (shared > 0 || file.messages.is_empty()).then_some(shared)
 }
 
 /// The model calls saved in the sessions and their helpers' conversations
@@ -1645,11 +1903,15 @@ pub fn tool_calls(since: u64) -> std::collections::BTreeMap<String, usize> {
             continue;
         };
         for line in String::from_utf8_lossy(&bytes).lines() {
-            // Only replies carry calls; see `spent_in`.
-            if !line.starts_with("{\"type\":\"message\",\"role\":\"assistant\"") {
+            // Only replies carry calls, and those a rewind took back keep
+            // theirs; see `spent_in`.
+            if !line.starts_with("{\"type\":\"message\",\"role\":\"assistant\"")
+                && !line.starts_with("{\"type\":\"paid\"")
+            {
                 continue;
             }
-            let Ok(Record::Message(reply)) = serde_json::from_str::<Record>(line) else {
+            let Ok(Record::Message(reply) | Record::Paid(reply)) = serde_json::from_str(line)
+            else {
                 continue;
             };
             // A reply saved before replies kept their time is in a file
@@ -1778,7 +2040,7 @@ fn spent_in(
         match serde_json::from_str::<Record>(line) {
             Ok(Record::Head { created, .. }) => updated = updated.max(created),
             Ok(Record::Meta(meta)) => updated = updated.max(meta.updated),
-            Ok(Record::Message(reply)) => {
+            Ok(Record::Message(reply) | Record::Paid(reply)) => {
                 // Two replies are not made in one second with the same model
                 // and the same counts, but a reply and its copy are.
                 let (at, model) = (reply.at, reply.model.clone());
@@ -1853,7 +2115,7 @@ fn replies_in(
         match serde_json::from_str::<Record>(line) {
             Ok(Record::Head { created, .. }) => updated = updated.max(created),
             Ok(Record::Meta(meta)) => updated = updated.max(meta.updated),
-            Ok(Record::Message(mut reply)) => {
+            Ok(Record::Message(mut reply) | Record::Paid(mut reply)) => {
                 if reply.at == 0 {
                     // Only the counts and the tool names are wanted from it
                     // later, and clearing would keep what the text took.
@@ -3336,11 +3598,12 @@ pub(crate) mod tests {
         let path = dir.join("sessions/1.jsonl");
         let before = std::fs::read_to_string(&path).unwrap();
 
-        // The rewind is one more line; nothing already written changes.
+        // The file is cut back to the head, the meta and what is left.
         store.conversations[0].rewind(2);
         store.save().unwrap();
         let after = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(after, format!("{before}{{\"type\":\"rewind\",\"to\":2}}\n"));
+        let kept: String = before.split_inclusive('\n').take(4).collect();
+        assert_eq!(after, kept);
 
         // It is written once: saving again with nothing new adds nothing.
         store.save().unwrap();
@@ -6097,6 +6360,326 @@ pub(crate) mod tests {
             ]
         );
         assert_eq!(super::tool_calls(0)["read_file"], 2);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_rewind_leaves_none_of_what_it_took_back_in_the_file() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("rewind-cut");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let path = dir.join("sessions/3.jsonl");
+        std::fs::create_dir_all(dir.join("sessions")).unwrap();
+        // An older build's rewind record, with what it took back still there.
+        let mut text = session_text("cut", 2);
+        text.push_str("{\"type\":\"message\",\"role\":\"user\",\"content\":\"secret one\"}\n");
+        text.push_str("{\"type\":\"rewind\",\"to\":2}\n");
+        std::fs::write(&path, text).unwrap();
+
+        let mut conversation = super::session(3).unwrap();
+        conversation.messages.push(said("user", "asked"));
+        conversation.messages.push(Message {
+            tokens: 7,
+            prompt_tokens: 11,
+            at: 9,
+            ..said("assistant", "secret two")
+        });
+        conversation.flush().unwrap();
+        conversation.rewind(2);
+        conversation.flush().unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("secret") && !text.contains("asked"));
+        // Nor in the terms a search looks at before it reads the file.
+        let stat = std::fs::metadata(&path).unwrap();
+        let stamp = (stat.len(), super::modified(&stat));
+        let terms = crate::prefilter::read(&path, stamp).unwrap();
+        assert!(!terms.may_hold("secret two"));
+        assert!(!text.contains("rewind"));
+        assert_eq!(replay(&path).unwrap().messages.len(), 2);
+        // The reply taken back was paid for, so the costs still count it.
+        let spent = super::spent(0, 3);
+        assert_eq!(spent.len(), 1);
+        assert_eq!((spent[0].usage.output, spent[0].at), (7, 9));
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn the_index_reads_a_session_again_after_a_rewind_shrinks_it() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("rewind-index");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        store.conversations.push(numbered(6));
+        store.save().unwrap();
+        assert_eq!(summaries()[0].messages, 6);
+        store.conversations[0].rewind(2);
+        store.save().unwrap();
+        assert_eq!(summaries()[0].messages, 2);
+        let size = std::fs::metadata(dir.join("sessions/1.jsonl"))
+            .unwrap()
+            .len();
+        let index = super::read_index(&super::index_path());
+        assert_eq!((index[&1].size, index[&1].len), (size, size));
+
+        // Grown past where the index stood before the cut, it is still read
+        // in full rather than from that old place.
+        let long = "y".repeat(2 * super::TAIL_CHECK as usize);
+        store.conversations[0].messages.push(said("user", &long));
+        store.save().unwrap();
+        assert_eq!(summaries()[0].messages, 3);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    /// Session `id` saved `days` ago by both its meta and its file's time.
+    fn saved_days_ago(store: &mut Store, id: u64, days: u64, now: u64) {
+        let updated = now - days * super::DAY;
+        store.conversations.push(Conversation {
+            id,
+            updated,
+            ..numbered(1)
+        });
+        store.save().unwrap();
+        let path = super::session_path(id);
+        let file = std::fs::File::options().write(true).open(path).unwrap();
+        let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(updated);
+        file.set_modified(at).unwrap();
+    }
+
+    #[test]
+    fn old_sessions_are_deleted_with_what_is_kept_beside_them() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("prune");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let now = crate::chat::now();
+
+        let mut store = Store::default();
+        saved_days_ago(&mut store, 1, 40, now);
+        saved_days_ago(&mut store, 2, 5, now);
+        saved_days_ago(&mut store, 3, 40, now);
+        saved_days_ago(&mut store, 4, 40, now);
+        saved_days_ago(&mut store, 5, 40, now);
+        let path = super::session_path(3);
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(std::time::SystemTime::now()).unwrap();
+        // Pinned after its file was made old: the pin is a meta line.
+        store.conversations[3].pinned = true;
+        store.save().unwrap();
+        let file = std::fs::File::options()
+            .write(true)
+            .open(super::session_path(4))
+            .unwrap();
+        file.set_modified(std::time::UNIX_EPOCH).unwrap();
+        let sidecars = [
+            super::helpers_dir(1),
+            crate::tools::results_dir(1),
+            crate::history::folder(1),
+        ];
+        for folder in &sidecars {
+            std::fs::create_dir_all(folder).unwrap();
+            std::fs::write(folder.join("1.jsonl"), "kept for 1").unwrap();
+        }
+        let tasklist = dir.join("tasklists/1.jsonl");
+        std::fs::create_dir_all(dir.join("tasklists")).unwrap();
+        std::fs::write(&tasklist, "").unwrap();
+
+        // Session 1 is old, 2 is recent, 3 was written to lately, 4 is
+        // pinned and 5 is the one open.
+        let deleted = super::prune(30, now, &[5]);
+        assert_eq!(deleted, [1]);
+        assert!(!super::session_path(1).exists());
+        assert!(!super::session_path(1).with_extension("lock").exists());
+        assert!(sidecars.iter().all(|folder| !folder.exists()));
+        assert!(!tasklist.exists());
+        let mut left: Vec<u64> = summaries().iter().map(|s| s.id).collect();
+        left.sort();
+        assert_eq!(left, [2, 3, 4, 5]);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_session_another_process_is_writing_is_not_deleted() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("prune-locked");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let now = crate::chat::now();
+
+        let mut store = Store::default();
+        saved_days_ago(&mut store, 1, 40, now);
+        let path = super::session_path(1);
+        let held = Lock::take(&path).unwrap();
+        assert!(super::prune(30, now, &[]).is_empty());
+        assert!(path.exists() && path.with_extension("lock").exists());
+        drop(held);
+        assert_eq!(super::prune(30, now, &[]), [1]);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn old_sessions_are_kept_unless_asked_and_looked_for_once_a_day() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("prune-off");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let now = crate::chat::now();
+        assert_eq!(super::Settings::default().keep_days, 0);
+
+        let mut store = Store::default();
+        saved_days_ago(&mut store, 1, 4000, now);
+        super::prune_old();
+        assert!(super::session_path(1).exists());
+        assert!(!super::pruned_path().exists());
+
+        std::fs::write(
+            super::settings_path(),
+            "{\"endpoint\":\"\",\"model\":\"\",\"keep_days\":30}",
+        )
+        .unwrap();
+        // Looked for less than a day ago, so not again yet.
+        std::fs::write(super::pruned_path(), "").unwrap();
+        super::prune_old();
+        assert!(super::session_path(1).exists());
+        std::fs::remove_file(super::pruned_path()).unwrap();
+        super::prune_old();
+        assert!(!super::session_path(1).exists());
+        assert!(super::pruned_path().exists());
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_rewind_in_the_window_leaves_it_following_the_file() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("follow-own-rewind");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let (mut window, _) = window_and_terminal(4);
+        let path = dir.join("sessions/1.jsonl");
+
+        window.conversations[0].rewind(2);
+        window.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("\"content\":\"3\""));
+        // Marked again at the rewritten end, so nothing is read back.
+        assert!(!window.follow(|_| false));
+
+        let mut terminal = load_listing();
+        fill(&mut terminal.conversations[0]);
+        terminal.conversations[0]
+            .messages
+            .push(said("user", "after"));
+        terminal.save().unwrap();
+        assert!(window.follow(|_| false));
+        assert_eq!(contents(&window.conversations[0]), ["0", "1", "after"]);
+
+        window.conversations[0]
+            .messages
+            .push(said("assistant", "and on"));
+        window.save().unwrap();
+        let open = &window.conversations[0];
+        assert!(!open.gone && !open.diverged);
+        assert_eq!(
+            contents(&replay(&path).unwrap()),
+            ["0", "1", "after", "and on"]
+        );
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_rewind_in_the_terminal_reaches_the_window_in_full() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("follow-their-rewind");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let (mut window, mut terminal) = window_and_terminal(4);
+        let path = dir.join("sessions/1.jsonl");
+
+        terminal.conversations[0].rewind(2);
+        terminal.conversations[0]
+            .messages
+            .push(said("user", "instead"));
+        terminal.save().unwrap();
+        assert!(window.follow(|_| false));
+        assert_eq!(contents(&window.conversations[0]), ["0", "1", "instead"]);
+
+        // Read in again, it writes on into the rewritten file.
+        window.conversations[0]
+            .messages
+            .push(said("assistant", "reply"));
+        window.save().unwrap();
+        let open = &window.conversations[0];
+        assert!(!open.gone && !open.diverged);
+        assert_eq!(
+            contents(&replay(&path).unwrap()),
+            ["0", "1", "instead", "reply"]
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("\"content\":\"3\""));
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_rename_in_the_window_after_a_rewind_there_keeps_both() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("follow-rename-rewound");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let (mut window, mut terminal) = window_and_terminal(3);
+        let path = dir.join("sessions/1.jsonl");
+
+        terminal.conversations[0].rewind(1);
+        terminal.save().unwrap();
+        window.conversations[0].title = "renamed here".into();
+        window.save().unwrap();
+        let open = &window.conversations[0];
+        assert!(!open.gone && !open.diverged);
+        let back = replay(&path).unwrap();
+        assert_eq!(back.title, "renamed here");
+        assert_eq!(contents(&back), ["0"]);
+
+        // The file the terminal rewrote is then taken in whole.
+        assert!(window.follow(|_| false));
+        let open = &window.conversations[0];
+        assert_eq!(open.title, "renamed here");
+        assert_eq!(contents(open), ["0"]);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_session_the_terminal_rewound_to_the_start_is_still_the_window_s() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("follow-rewound-empty");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let (mut window, mut terminal) = window_and_terminal(2);
+        let path = dir.join("sessions/1.jsonl");
+
+        terminal.conversations[0].rewind(0);
+        terminal.save().unwrap();
+        window.conversations[0].messages.push(said("user", "more"));
+        window.save().unwrap();
+        let open = &window.conversations[0];
+        assert!(!open.gone && open.diverged);
+        assert_eq!(contents(&replay(&path).unwrap()), ["0", "1", "more"]);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_rewrite_that_leaves_the_file_as_long_is_still_noticed() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("follow-same-size");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let (mut window, _) = window_and_terminal(2);
+        let path = dir.join("sessions/1.jsonl");
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let changed = text.replace("\"content\":\"1\"", "\"content\":\"x\"");
+        assert_eq!(changed.len(), text.len());
+        std::fs::write(&path, changed).unwrap();
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))
+            .unwrap();
+        drop(file);
+
+        window.conversations[0].messages.push(said("user", "more"));
+        window.save().unwrap();
+        assert!(window.conversations[0].diverged);
+        assert_eq!(contents(&replay(&path).unwrap()), ["0", "1", "more"]);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 }
