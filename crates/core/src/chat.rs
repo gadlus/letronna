@@ -303,6 +303,19 @@ fn body(connection: &Connection, messages: &[Message], summary: Option<&str>) ->
             }
         }
     }
+    // The context window can drop the call that made the plan, and a long
+    // task is when that happens. The plan rides on the end of the request,
+    // after everything a provider could have cached, and only on the wire:
+    // the stored message never carries it.
+    if let Some(note) = checklist(messages)
+        && let Some(last) = context.last_mut()
+    {
+        match &mut last["content"] {
+            Value::String(text) => text.push_str(&format!("\n\n{note}")),
+            Value::Array(parts) => parts.push(json!({"type": "text", "text": note})),
+            _ => {}
+        }
+    }
     let mut body = json!({
         "model": connection.model.trim(),
         "messages": context,
@@ -329,6 +342,32 @@ fn body(connection: &Connection, messages: &[Message], summary: Option<&str>) ->
         body["reasoning_effort"] = connection.effort.clone().into();
     }
     body
+}
+
+/// The model's checklist as a note to end the request with, or none once
+/// nothing on it is left to do.
+fn checklist(messages: &[Message]) -> Option<String> {
+    let todos = crate::store::todos_in(messages);
+    if todos.iter().all(|t| t.status == "done") {
+        return None;
+    }
+    let items: Vec<String> = todos
+        .iter()
+        .map(|t| {
+            let mark = match t.status.as_str() {
+                "done" => "[x]",
+                "doing" => "[>]",
+                _ => "[ ]",
+            };
+            format!("{mark} {}", t.text)
+        })
+        .collect();
+    // Said to be from Letronna: it lands after a tool's output or the user's
+    // words, and must not read as part of either.
+    Some(format!(
+        "(From Letronna, not part of the above: your checklist as your last todo call left it.)\n{}",
+        items.join("\n")
+    ))
 }
 
 /// The newest screenshot `browse` took in `window`: where it goes -- after
@@ -1049,6 +1088,77 @@ mod tests {
         let without = body(&connection(), &messages, None);
         let plain = without["messages"][0]["content"].as_str().unwrap();
         assert!(!plain.contains("summarized"));
+    }
+    fn said(role: &str, content: &str) -> Message {
+        Message {
+            role: role.into(),
+            content: content.into(),
+            ..Default::default()
+        }
+    }
+    fn planned(items: &str) -> Message {
+        Message {
+            role: "assistant".into(),
+            tool_calls: vec![ToolCall {
+                id: "plan".into(),
+                name: crate::tools::TODO.into(),
+                arguments: format!(r#"{{"items":[{items}]}}"#),
+            }],
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn the_open_checklist_rides_on_the_last_message_sent_and_is_never_stored() {
+        let mut messages = vec![
+            said("user", "build it"),
+            planned(
+                r#"{"text":"Read the code","status":"done"},{"text":"Write the parser","status":"doing"},{"text":"Test it","status":"pending"}"#,
+            ),
+            Message {
+                tool_call_id: "plan".into(),
+                ..said("tool", "Checklist updated: 1 of 3 done.")
+            },
+        ];
+        // Long enough after the plan that the window steps past the call
+        // that made it.
+        for _ in 0..10 {
+            messages.push(said("user", "go on"));
+            messages.push(said("assistant", &"x".repeat(CONTEXT_CHARS / 8)));
+        }
+        messages.push(said("user", "and now?"));
+        assert!(window_start(&messages) > 1);
+
+        let payload = body(&connection(), &messages, None);
+        let context = payload["messages"].as_array().unwrap();
+        let last = context.last().unwrap()["content"].as_str().unwrap();
+        assert!(last.starts_with("and now?\n\n(From Letronna"), "{last}");
+        assert!(
+            last.ends_with("left it.)\n[x] Read the code\n[>] Write the parser\n[ ] Test it"),
+            "{last}"
+        );
+        let carrying = context
+            .iter()
+            .filter(|m| m["content"].as_str().is_some_and(|c| c.contains("[>]")))
+            .count();
+        assert_eq!(carrying, 1);
+        assert_eq!(messages.last().unwrap().content, "and now?");
+    }
+    #[test]
+    fn a_finished_checklist_is_not_sent() {
+        let messages = [
+            said("user", "build it"),
+            planned(r#"{"text":"Read the code","status":"done"}"#),
+            Message {
+                tool_call_id: "plan".into(),
+                ..said("tool", "Checklist updated: 1 of 1 done.")
+            },
+        ];
+        let payload = body(&connection(), &messages, None);
+        let context = payload["messages"].as_array().unwrap();
+        assert_eq!(
+            context.last().unwrap()["content"],
+            "Checklist updated: 1 of 1 done."
+        );
     }
     #[test]
     fn the_two_ways_a_route_says_it_cannot_do_tools_read_the_same() {

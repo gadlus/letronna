@@ -391,17 +391,6 @@ impl Chat {
     }
 }
 
-/// The checklist the last `todo` call in `messages` set, or none.
-fn todos_in(messages: &[Message]) -> Vec<Todo> {
-    messages
-        .iter()
-        .rev()
-        .flat_map(|m| m.tool_calls.iter().rev())
-        .find(|call| call.name == letronna_core::tools::TODO)
-        .and_then(|call| parse_todos(&call.arguments).ok())
-        .unwrap_or_default()
-}
-
 /// "1 message" or "N messages".
 fn message_count(n: usize) -> String {
     if n == 1 {
@@ -415,8 +404,7 @@ fn message_count(n: usize) -> String {
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
-    use super::{Span, message_count, todos_in};
-    use letronna_core::chat::{Message, ToolCall};
+    use super::{Span, message_count};
 
     #[test]
     fn a_turn_keeps_what_comes_before_your_message_or_up_to_its_reply() {
@@ -438,24 +426,6 @@ mod tests {
             yours: false,
         };
         assert_eq!(opening.prompt(), None);
-    }
-
-    #[test]
-    fn the_checklist_is_the_last_one_left_standing() {
-        let todo = |items: &str| Message {
-            role: "assistant".into(),
-            tool_calls: vec![ToolCall {
-                id: "call".into(),
-                name: letronna_core::tools::TODO.into(),
-                arguments: format!(r#"{{"items":[{items}]}}"#),
-            }],
-            ..Default::default()
-        };
-        let first = todo(r#"{"text":"plan","status":"done"}"#);
-        let second = todo(r#"{"text":"build","status":"doing"}"#);
-        assert_eq!(todos_in(&[first.clone(), second])[0].text, "build");
-        assert_eq!(todos_in(&[first])[0].text, "plan");
-        assert!(todos_in(&[]).is_empty());
     }
 
     #[test]

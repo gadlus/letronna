@@ -205,6 +205,7 @@ impl Runner {
                     self.persist();
                     return Ok(true);
                 }
+                Next::Run(call) if call.name == tools::TODO => self.apply_todo(turn, session, call),
                 Next::Run(call) => self.run_call(turn, call),
                 Next::AskUser(call) => {
                     if !self.consult(turn, call)? {
@@ -236,6 +237,21 @@ impl Runner {
                     render::detail(text, DETAIL_LINES);
                 }
             }
+            Err(error) => render::tool(&call.name, &summary, &tools::one_line(error), true),
+        }
+        turn.finish_call(outcome);
+    }
+
+    /// Keep the model's checklist on the session, as the window does, and
+    /// show it over the box.
+    fn apply_todo(&mut self, turn: &mut Turn, session: usize, call: letronna_core::chat::ToolCall) {
+        let todos = &mut self.store.conversations[session].todos;
+        let outcome = letronna_core::store::apply_todo(todos, &call.arguments);
+        self.bar.set_plan(&self.store.conversations[session].todos);
+        let summary = tools::summary(&call.name, &call.arguments);
+        render::blank();
+        match &outcome {
+            Ok(said) => render::tool(&call.name, &summary, said, false),
             Err(error) => render::tool(&call.name, &summary, &tools::one_line(error), true),
         }
         turn.finish_call(outcome);
@@ -417,6 +433,7 @@ impl Runner {
         self.store.active = index;
         if let Some(conversation) = self.store.conversations.get_mut(index) {
             letronna_core::store::fill(conversation);
+            self.bar.set_plan(&conversation.todos);
         }
     }
 
@@ -431,6 +448,7 @@ impl Runner {
         });
         let index = self.store.conversations.len() - 1;
         self.store.active = index;
+        self.bar.set_plan(&[]);
         index
     }
 }
