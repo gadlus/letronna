@@ -121,6 +121,7 @@ impl Driven {
             // Nothing here may reach the real data folder or home.
             .env("AGENT_DATA_DIR", data)
             .env("HOME", data)
+            .env("USERPROFILE", data)
             .env_remove("LOCALAPPDATA")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -311,7 +312,9 @@ fn a_call_denied_over_stdin_does_not_run_and_the_model_hears_why() {
     assert!(!out.exists());
     let (role, result) = told.last().unwrap();
     assert_eq!(role, "tool");
-    assert!(result.contains("not today"), "{result}");
+    // Labelled as the program's, since the user never said it.
+    let why = "The program driving this run said why: not today";
+    assert!(result.contains(why), "{result}");
 }
 
 #[test]
@@ -319,7 +322,7 @@ fn a_line_that_cannot_be_read_exits_2() {
     let (data, work) = scratch("malformed");
     let (endpoint, bodies) = provider(vec![]);
     let mut run = Driven::streaming(&data, &work, &endpoint, &[]);
-    run.send(&json!({"type": "user"}));
+    run.send(&json!({"kind": "user"}));
     assert_eq!(run.close(), 2);
     let mut run = Driven::streaming(&data, &work, &endpoint, &[]);
     writeln!(run.stdin.as_mut().unwrap(), "not json").unwrap();
@@ -338,4 +341,120 @@ fn closing_stdin_with_nothing_sent_ends_cleanly() {
     let run = Driven::streaming(&data, &work, &endpoint, &[]);
     assert_eq!(run.close(), 0);
     assert!(bodies.try_recv().is_err(), "the model was asked");
+}
+
+/// The program's answer to the request `asked`, with `behavior`.
+fn answer(asked: &Value, behavior: Value) -> Value {
+    json!({"type": "control_response", "response": {
+        "request_id": asked["request_id"], "subtype": "success", "response": behavior}})
+}
+
+/// A run asked on stdin about its calls, with `rules` as the user's
+/// permission rules and `flags` added, whose model asks to write `out.txt`
+/// and then says "Over."; gives the run and its workspace.
+fn writer(name: &str, rules: Value, flags: &[&str]) -> (Driven, PathBuf) {
+    let (data, work) = scratch(name);
+    std::fs::write(data.join("permissions.json"), rules.to_string()).unwrap();
+    let write = ("write_file", json!({"path": "out.txt", "content": "hi"}));
+    let (endpoint, _) = provider(vec![reply("", &[write]), reply("Over.", &[])]);
+    let mut all = vec!["--permission-prompt-tool", "stdio"];
+    all.extend(flags);
+    let mut run = Driven::streaming(&data, &work, &endpoint, &all);
+    run.say("write it");
+    (run, work)
+}
+
+#[test]
+fn the_users_rules_and_mode_refuse_before_the_program_is_asked() {
+    let deny = json!([{"tool": "write_file", "effect": "deny"}]);
+    let cases = [
+        ("deny-rule", deny, &[][..]),
+        ("plan", json!([]), &["--plan"][..]),
+        ("dont-ask", json!([]), &["--mode", "dont-ask"][..]),
+    ];
+    for (name, rules, flags) in cases {
+        let (run, work) = writer(name, rules, flags);
+        // A can_use_tool line would come first, and an allow could run it.
+        let result = run.next();
+        assert_eq!(
+            (&result["type"], &result["answer"]),
+            (&json!("result"), &json!("Over.")),
+            "{name}"
+        );
+        assert_eq!(run.close(), 0);
+        assert!(!work.join("out.txt").exists(), "{name}: the call ran");
+    }
+}
+
+#[test]
+fn an_allow_with_changed_input_runs_the_change_only_within_the_rules() {
+    let rules = json!([{"tool": "write_file", "pattern": "secret.txt", "effect": "deny"}]);
+    for (name, path, runs) in [
+        ("changed", "other.txt", true),
+        ("changed-denied", "secret.txt", false),
+    ] {
+        let (mut run, work) = writer(name, rules.clone(), &[]);
+        let asked = run.next();
+        assert_eq!(asked["request"]["subtype"], "can_use_tool");
+        let changed = json!({"path": path, "content": "changed"});
+        run.send(&answer(
+            &asked,
+            json!({"behavior": "allow", "updatedInput": changed}),
+        ));
+        assert_eq!(run.next()["answer"], "Over.");
+        assert_eq!(run.close(), 0);
+        assert!(
+            !work.join("out.txt").exists(),
+            "{name}: the model's own input ran"
+        );
+        assert_eq!(work.join(path).exists(), runs, "{name}");
+    }
+}
+
+#[test]
+fn the_budget_covers_every_message_of_the_run() {
+    let (data, work) = scratch("budget");
+    let (endpoint, bodies) = provider(vec![reply("First.", &[]), reply("Second.", &[])]);
+    // One reply spends 1,050 tokens, more than the whole budget.
+    let mut run = Driven::streaming(&data, &work, &endpoint, &["--budget", "1000"]);
+    run.say("one");
+    run.say("two");
+    assert_eq!(run.next()["answer"], "First.");
+    assert_eq!(run.next()["status"], "over_budget");
+    assert_eq!(run.close(), 0);
+    let _ = bodies.recv_timeout(WAIT).unwrap();
+    assert!(
+        bodies.try_recv().is_err(),
+        "the second message reached the model"
+    );
+}
+
+#[test]
+fn other_lines_are_left_alone_and_a_message_it_cannot_send_is_refused_alone() {
+    let (data, work) = scratch("unknown");
+    let (endpoint, _bodies) = provider(vec![reply("Fine.", &[])]);
+    let mut run = Driven::streaming(&data, &work, &endpoint, &[]);
+    // A byte order mark in front and CRLF behind, as Windows editors write.
+    let stdin = run.stdin.as_mut().unwrap();
+    write!(stdin, "\u{feff}{}\r\n", json!({"type": "keep_alive"})).unwrap();
+    run.send(&json!({"type": "system", "subtype": "status"}));
+    let image = json!([{"type": "image", "source": {"type": "base64", "data": ""}}]);
+    run.send(&json!({"type": "user", "message": {"role": "user", "content": image}}));
+    run.say("still there?");
+    assert_eq!(run.next()["status"], "failed");
+    assert_eq!(run.next()["answer"], "Fine.");
+    assert_eq!(run.close(), 1);
+}
+
+#[test]
+fn an_interrupt_with_no_turn_running_leaves_the_next_message_alone() {
+    let (data, work) = scratch("idle-interrupt");
+    let (endpoint, _bodies) = provider(vec![reply("Done.", &[])]);
+    let mut run = Driven::streaming(&data, &work, &endpoint, &[]);
+    run.send(&json!({"type": "control_request", "request_id": "stop-1",
+        "request": {"subtype": "interrupt"}}));
+    assert_eq!(run.next()["response"]["request_id"], "stop-1");
+    run.say("go on");
+    assert_eq!(run.next()["status"], "done");
+    assert_eq!(run.close(), 0);
 }

@@ -392,13 +392,12 @@ fn work_through(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result
             Next::Refuse(_, why) => Some(Err(why)),
             Next::AskUser(call) => {
                 match approvals::ask(spec.root, spec.run, &spec.label, &call, &context(spec)) {
-                    Ok(()) => dispatch(spec, &call, report),
+                    Ok(None) => dispatch(spec, &call, report),
+                    // Only what was agreed to runs, never the model's own.
+                    Ok(Some(arguments)) => dispatch(spec, &ToolCall { arguments, ..call }, report),
                     Err(_) if spec.cancel.is_set() => None,
-                    Err(reason) if reason.trim().is_empty() => Some(Err(NOT_APPROVED.into())),
-                    Err(reason) => Some(Err(format!(
-                        "{NOT_APPROVED} The user said why: {}",
-                        reason.trim()
-                    ))),
+                    Err(why) if why.is_empty() => Some(Err(NOT_APPROVED.into())),
+                    Err(why) => Some(Err(format!("{NOT_APPROVED} {why}"))),
                 }
             }
         };

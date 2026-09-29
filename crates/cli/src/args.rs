@@ -34,10 +34,11 @@ Options
 
 With -p
       --output <form>      text (the answer), json, or stream-json
-      --max-rounds <n>     tool rounds before it stops (25)
+      --max-rounds <n>     tool rounds a message gets before it stops (25)
       --model <name>       use this model instead of the one set up
       --tools <a,b>        only these tools, by name
-      --budget <tokens>    stop once this many tokens are spent
+      --budget <tokens>    stop once this many tokens are spent, over every
+                           message the run is sent
       --input-format <form>
                            text (the question), or stream-json: messages,
                            interrupts and answers as JSON lines on stdin
@@ -183,7 +184,8 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
                 }
             }
             // Named as other agents' command lines name it, so a program that
-            // drives one of them can drive this; stdio is the only way to ask.
+            // drives one of them needs fewer changes to drive this; stdio is
+            // the only way to ask.
             "--permission-prompt-tool" => match raw.next().as_deref() {
                 Some("stdio") => args.ask_stdio = true,
                 _ => return Err("--permission-prompt-tool takes stdio.".into()),

@@ -61,9 +61,10 @@ fn main() {
     let args = match parse(std::env::args().skip(1)) {
         Ok(args) => args,
         // 2, apart from a run that went wrong, so a script can tell it
-        // called Letronna wrongly.
+        // called Letronna wrongly; on stderr, where a script looks for it
+        // and a reader of JSON lines does not trip on it.
         Err(error) => {
-            render::line(&render::red(&error));
+            eprintln!("{}", render::red(&error));
             std::process::exit(2);
         }
     };
@@ -102,7 +103,7 @@ fn main() {
     let gateway = match args.gateway.as_deref().map(gateway_named).transpose() {
         Ok(gateway) => gateway,
         Err(error) => {
-            render::line(&render::red(&error));
+            eprintln!("{}", render::red(&error));
             std::process::exit(1);
         }
     };
@@ -110,7 +111,7 @@ fn main() {
     let mode = match &args.mode {
         Ok(mode) => *mode,
         Err(error) => {
-            render::line(&render::red(error));
+            eprintln!("{}", render::red(error));
             std::process::exit(1);
         }
     };
@@ -298,7 +299,8 @@ fn main() {
 /// Runs one prompt on the driver and prints what came of it in the form
 /// asked for, saying whether it ended without failing.
 fn ask_once(runner: &mut Runner, session: usize, prompt: &str, args: &Args) -> bool {
-    let (spec, context, before) = match begin(runner, session, prompt, args) {
+    let budget = args.budget.map(|limit| Arc::new(Budget::new(limit, None)));
+    let (spec, context, before) = match begin(runner, session, prompt, args, budget) {
         Ok(begun) => begun,
         Err(error) => {
             show(args.output, &failed(error));
@@ -319,13 +321,15 @@ fn ask_once(runner: &mut Runner, session: usize, prompt: &str, args: &Args) -> b
     finish(runner, session, id, before, report, args.output)
 }
 
-/// Puts `prompt` on the session and hands the session to a run, giving the
-/// run, what its calls work in, and where its own messages start.
+/// Puts `prompt` on the session and hands the session to a run spending
+/// from `budget`, giving the run, what its calls work in, and where its own
+/// messages start.
 fn begin(
     runner: &mut Runner,
     session: usize,
     prompt: &str,
     args: &Args,
+    budget: Option<Arc<Budget>>,
 ) -> Result<(Spec, tools::ToolContext, usize), String> {
     let mut connection = runner.connection(session);
     if let Some(model) = &args.model {
@@ -379,7 +383,7 @@ fn begin(
         allow: args.tools.clone().map_or(Allow::All, Allow::Only),
         rounds: args.max_rounds.unwrap_or(agent::MAX_ROUNDS),
         cancel: Cancel::default(),
-        budget: args.budget.map(|limit| Arc::new(Budget::new(limit, None))),
+        budget,
         status: Arc::default(),
     };
     Ok((spec, context, before))
@@ -669,8 +673,11 @@ fn choose_by_flags(runner: &mut Runner, session: usize, gateway: Option<&str>, a
 fn rescue_terminal() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        // Full scrolling region, cursor back, raw mode off.
-        print!("\x1b[r\x1b[?2004l\x1b[?25h");
+        // Full scrolling region, cursor back, raw mode off. Only on a
+        // terminal: a program reading JSON lines would get them glued on.
+        if std::io::stdout().is_terminal() {
+            print!("\x1b[r\x1b[?2004l\x1b[?25h");
+        }
         let _ = crossterm::terminal::disable_raw_mode();
         render::set_raw(false);
         render::title("");
