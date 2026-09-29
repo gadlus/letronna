@@ -30,9 +30,13 @@
 //! not held anywhere, so on an older kernel no command is confined and the
 //! gate asks as before. Ioctls on devices are held from ABI 5 and signals
 //! to processes outside the sandbox from ABI 6; on an older kernel a
-//! confined command may still signal the user's other processes. Whatever
-//! the ABI, it runs in a session of its own, without a terminal to push
-//! keys into.
+//! confined command may still signal the user's other processes. No ABI
+//! yet has a right over a file's mode, owner or times, so, unlike on macOS,
+//! a confined command can still `chmod` or `touch` a file of the user's
+//! outside the project, though not change or read what a hidden one holds;
+//! refusing those calls would refuse them in the project too. Whatever the
+//! ABI, it runs in a session of its own, without a terminal to push keys
+//! into.
 //!
 //! The network is a seccomp filter, not Landlock's own rules: those need
 //! ABI 4 (Linux 6.7) and hold only TCP, so DNS and any other UDP would get
