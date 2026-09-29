@@ -12,7 +12,7 @@
 //! back what the patch had already written. A file the patch deletes goes
 //! through `write::remove`, which keeps it for a rewind to bring back.
 
-use crate::filestate::Mark;
+use crate::filestate::{Batch, Mark};
 use crate::tools::{Tool, ToolContext};
 use serde_json::{Value, json};
 use std::path::{Component, Path, PathBuf};
@@ -377,6 +377,7 @@ enum Step {
         path: PathBuf,
         raw: String,
         before: String,
+        mark: Mark,
     },
 }
 
@@ -409,11 +410,12 @@ fn apply(actions: &[Action], ctx: &ToolContext) -> Result<String, String> {
             }
             Action::Delete { path: raw } => {
                 let path = target(raw, ctx, &mut claimed)?;
-                let (before, _) = batch.open(&path, raw).map_err(|e| missing(&path, raw, e))?;
+                let (before, mark) = batch.open(&path, raw).map_err(|e| missing(&path, raw, e))?;
                 steps.push(Step::Remove {
                     path,
                     raw: raw.clone(),
                     before,
+                    mark,
                 });
                 said.push(format!("deleted {raw}"));
             }
@@ -456,6 +458,7 @@ fn apply(actions: &[Action], ctx: &ToolContext) -> Result<String, String> {
                     path,
                     raw: raw.clone(),
                     before,
+                    mark,
                 });
                 said.push(format!("moved {raw} to {to}"));
             }
@@ -465,16 +468,20 @@ fn apply(actions: &[Action], ctx: &ToolContext) -> Result<String, String> {
     for step in &steps {
         let result = match step {
             Step::Write {
-                path, after, mark, ..
+                path,
+                raw,
+                after,
+                mark,
+                ..
             } => path
                 .parent()
                 .map_or(Ok(()), std::fs::create_dir_all)
-                .map_err(|e| e.to_string())
+                .map_err(|e| format!("Could not make the folder for `{raw}`: {e}."))
                 .and_then(|()| batch.write(path, after.as_bytes(), *mark, &ctx.files)),
             Step::Remove { path, raw, .. } => batch.remove(path, raw, &ctx.files),
         };
         if let Err(e) = result {
-            return Err(format!("{e}{}", undo(&done)));
+            return Err(format!("{e}{}", undo(&done, &mut batch)));
         }
         done.push(step);
     }
@@ -584,31 +591,30 @@ fn after_line(text: &str, from: usize, anchor: &str) -> Option<usize> {
 }
 
 /// Puts back what the steps in `done` changed, after a later one failed,
-/// and says how that went, to follow the failure.
-fn undo(done: &[&Step]) -> String {
+/// each file as the conversation had seen it, and says how that went, to
+/// follow the failure.
+fn undo(done: &[&Step], batch: &mut Batch) -> String {
     let quiet = crate::history::Log::default();
     let mut left = Vec::new();
     for step in done.iter().rev() {
-        let (path, raw, result) = match step {
+        let (raw, result) = match step {
             Step::Write {
                 path,
                 raw,
                 before: Some(before),
+                mark,
                 ..
             }
-            | Step::Remove { path, raw, before } => (
+            | Step::Remove {
                 path,
                 raw,
-                crate::write::atomic(path, before.as_bytes(), &quiet),
-            ),
-            Step::Write { path, raw, .. } => (
-                path,
-                raw,
-                std::fs::remove_file(path).map_err(|e| e.to_string()),
-            ),
+                before,
+                mark,
+            } => (raw, batch.write(path, before.as_bytes(), *mark, &quiet)),
+            Step::Write { path, raw, .. } => (raw, batch.remove(path, raw, &quiet)),
         };
         if let Err(e) = result {
-            left.push(format!("`{raw}` ({}: {e})", path.display()));
+            left.push(format!("`{raw}` ({e})"));
         }
     }
     match (done.len(), left.is_empty()) {
@@ -772,6 +778,35 @@ mod tests {
         assert_eq!(read(&dir, "b.txt"), "beta\n");
         assert_eq!(read(&dir, "c.txt"), "gamma\n");
         assert!(!dir.join("new.txt").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_write_that_fails_part_way_puts_every_file_back_as_it_was_read() {
+        let (dir, mut ctx) = project("undo");
+        ctx.conversation = 9_102;
+        crate::filestate::asked(ctx.conversation, 1, 0);
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+        std::fs::write(dir.join("gone.txt"), "bye\n").unwrap();
+        // A file where the last step needs a folder: found only when written.
+        std::fs::write(dir.join("blocker"), "a file\n").unwrap();
+        for name in ["a.txt", "gone.txt"] {
+            run("read_file", &json!({ "path": name }).to_string(), &ctx).unwrap();
+        }
+        crate::filestate::asked(ctx.conversation, 2, 0);
+        let text = "*** Begin Patch\n*** Update File: a.txt\n@@\n-a\n+b\n\
+                    *** Delete File: gone.txt\n*** Add File: blocker/x.txt\n+x\n*** End Patch";
+        let err = patch(&ctx, text).unwrap_err();
+        assert!(err.contains("`blocker/x.txt`"), "{err}");
+        assert!(err.ends_with("were put back."), "{err}");
+        assert_eq!(read(&dir, "a.txt"), "a\n");
+        assert_eq!(read(&dir, "gone.txt"), "bye\n");
+        // What the model read still stands, so it goes on from there.
+        for name in ["a.txt", "gone.txt"] {
+            let edit = json!({ "path": name, "old": "\n", "new": "!\n" });
+            run("edit_file", &edit.to_string(), &ctx).unwrap();
+        }
+        crate::filestate::forget(ctx.conversation);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
