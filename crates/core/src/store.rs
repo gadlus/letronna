@@ -135,7 +135,7 @@ enum Record {
 }
 
 /// Everything that is not a session.
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Settings {
     pub endpoint: String,
     pub model: String,
@@ -173,6 +173,42 @@ pub struct Settings {
     /// when it uses the browser, though it can still be opened to look.
     #[serde(default)]
     pub browse_unseen: bool,
+    /// The window's colours: empty for Night, "paper", or "system" to follow
+    /// the computer's light or dark mode.
+    #[serde(default)]
+    pub appearance: String,
+    /// A faint film grain on the window's chrome and empty pages, never over
+    /// the transcript, code or diffs.
+    #[serde(default = "yes")]
+    pub grain: bool,
+}
+
+// Written out rather than derived so the film grain starts on for a first
+// run too, as it does for a settings file from before it existed.
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            endpoint: String::new(),
+            model: String::new(),
+            gateway: String::new(),
+            custom_endpoint: String::new(),
+            presence: String::new(),
+            skip_approvals: false,
+            effort: String::new(),
+            thinking: false,
+            search: false,
+            active_id: 0,
+            manual_updates: false,
+            browser_shared: false,
+            browse_unseen: false,
+            appearance: String::new(),
+            grain: true,
+        }
+    }
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// Settings that are chosen as one and so saved as one: a model id belongs
@@ -1486,6 +1522,36 @@ mod tests {
             (back.model.as_str(), back.effort.as_str()),
             ("b/two", "high")
         );
+    }
+
+    #[test]
+    fn a_settings_file_without_appearance_loads_as_night_with_grain() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("appearance-old");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let file = dir.join("settings.json");
+        // As a build from before the light theme wrote it.
+        std::fs::write(
+            &file,
+            r#"{"endpoint":"https://api.letronna.ai/v1","model":"a/model","skip_approvals":true}"#,
+        )
+        .unwrap();
+
+        let mut store = load();
+        assert_eq!(store.settings.appearance, "");
+        assert!(store.settings.grain);
+        assert!(store.settings.skip_approvals);
+        // Written back, the file says so rather than switching the grain off.
+        store.save().unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(written["appearance"], "");
+        assert_eq!(written["grain"], true);
+        assert_eq!(written["skip_approvals"], true);
+        // A first run, with no settings file at all, starts the same way.
+        std::fs::remove_file(&file).unwrap();
+        let first = load().settings;
+        assert_eq!((first.appearance.as_str(), first.grain), ("", true));
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 
@@ -1731,6 +1797,22 @@ mod tests {
             .push(said("user", "anyone?"));
         terminal.save().unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), new);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn appearance_round_trips() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("appearance");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        for (appearance, grain) in [("paper", false), ("system", true), ("", false)] {
+            let mut store = Store::default();
+            store.settings.appearance = appearance.into();
+            store.settings.grain = grain;
+            store.save().unwrap();
+            let back = load().settings;
+            assert_eq!((back.appearance.as_str(), back.grain), (appearance, grain));
+        }
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 }

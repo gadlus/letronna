@@ -1615,7 +1615,9 @@ fn allowed_in(
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
-    use super::allowed_in;
+    use super::{allowed_in, front_call};
+    use letronna_core::agent::Turn;
+    use letronna_core::chat::{Connection, ToolCall};
     use std::collections::{HashMap, HashSet};
 
     #[test]
@@ -1628,6 +1630,25 @@ mod tests {
         assert!(allowed(Some(1)));
         assert!(!allowed(Some(2)));
         assert!(!allowed(None));
+    }
+
+    #[test]
+    fn the_card_is_up_only_for_the_call_the_queue_stopped_on() {
+        let mut turn = Turn::new(Connection::default());
+        turn.begin(vec![ToolCall {
+            id: "call-1".into(),
+            name: "write_file".into(),
+            arguments: "{}".into(),
+        }]);
+        assert!(
+            front_call(&turn, Some("call-1"))
+                .is_some_and(|(call, waiting)| call.id == "call-1" && waiting)
+        );
+        // Answered, or let run when the queue reached it.
+        assert!(front_call(&turn, None).is_some_and(|(_, waiting)| !waiting));
+        // Stopped on an earlier call, which has left the queue since.
+        assert!(front_call(&turn, Some("call-0")).is_some_and(|(_, waiting)| !waiting));
+        assert!(front_call(&Turn::new(Connection::default()), Some("call-1")).is_none());
     }
 }
 
@@ -1647,33 +1668,5 @@ pub(crate) fn front_call(
             Some((call, waiting))
         }
         _ => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
-    // would shadow the built-in attribute.
-    use super::front_call;
-    use letronna_core::agent::Turn;
-    use letronna_core::chat::{Connection, ToolCall};
-
-    #[test]
-    fn the_card_is_up_only_for_the_call_the_queue_stopped_on() {
-        let mut turn = Turn::new(Connection::default());
-        turn.begin(vec![ToolCall {
-            id: "call-1".into(),
-            name: "write_file".into(),
-            arguments: "{}".into(),
-        }]);
-        assert!(
-            front_call(&turn, Some("call-1"))
-                .is_some_and(|(call, waiting)| call.id == "call-1" && waiting)
-        );
-        // Answered, or let run when the queue reached it.
-        assert!(front_call(&turn, None).is_some_and(|(_, waiting)| !waiting));
-        // Stopped on an earlier call, which has left the queue since.
-        assert!(front_call(&turn, Some("call-0")).is_some_and(|(_, waiting)| !waiting));
-        assert!(front_call(&Turn::new(Connection::default()), Some("call-1")).is_none());
     }
 }
