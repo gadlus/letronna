@@ -540,12 +540,14 @@ pub(crate) fn run_found(tool: &dyn Tool, args: &str, ctx: &ToolContext) -> Resul
 }
 
 /// What an untrusted tool returned, fenced. A browse screenshot's first line
-/// is Letronna's own, naming the file it saved, and stays above the fence,
-/// where the window looks for it and nothing a page writes can reach.
+/// is Letronna's own, naming the file it saved, as is an MCP result's that
+/// names a picture its server sent; it stays above the fence, where the
+/// window looks for it and nothing a page or server writes can reach.
 fn fenced(name: &str, args: &Value, text: &str) -> Result<String, String> {
     let shot = name == crate::browser::BROWSE && args["action"] == "screenshot";
+    let saves = shot || crate::mcp::is_tool(name);
     match text.split_once('\n') {
-        Some((own, rest)) if shot && crate::media::saved(own).is_some() => {
+        Some((own, rest)) if saves && crate::media::saved(own).is_some() => {
             let room = MAX_OUTPUT.saturating_sub(own.len() + 1);
             Ok(format!("{own}\n{}", crate::untrusted::fence(rest, room)?))
         }
@@ -1901,7 +1903,7 @@ impl Tool for ReadFile {
         true
     }
     fn description(&self) -> &'static str {
-        "Read a text file. Paths are relative to the workspace. Each line is shown as `N|text`, N being its line number; the `N|` is not part of the file. A long file comes a page at a time, and the page ends with the offset to continue from."
+        "Read a text file, or look at a PNG, JPEG, GIF or WebP picture. Paths are relative to the workspace. Each line is shown as `N|text`, N being its line number; the `N|` is not part of the file. A long file comes a page at a time, and the page ends with the offset to continue from."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -1915,6 +1917,9 @@ impl Tool for ReadFile {
         let path = resolve(raw, ctx).map_err(|e| e + &similar(raw, ctx))?;
         let offset = args["offset"].as_u64().unwrap_or(1).max(1) as usize;
         let limit = args["limit"].as_u64().unwrap_or(u64::MAX).max(1) as usize;
+        if let Some(copy) = open_picture(&path, raw)? {
+            return Ok(copy);
+        }
         let before = crate::filestate::stat(&path);
         let (mut text, cut) = open_text(&path)?;
         let (shown, whole) = page(&mut text, offset, limit, cut)?;
@@ -1923,6 +1928,36 @@ impl Tool for ReadFile {
         crate::filestate::read(ctx.conversation, &path, before, whole);
         Ok(shown)
     }
+}
+
+/// A picture read_file was pointed at, copied as it is now into Letronna's
+/// own `media/`, from where the next request shows it to the model; None
+/// for a file that is not a picture every provider takes.
+fn open_picture(path: &Path, raw: &str) -> Result<Option<String>, String> {
+    let mut start = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|file| file.take(12).read_to_end(&mut start))
+        .map_err(|e| e.to_string())?;
+    let Some(kind) = crate::media::picture_kind(&start) else {
+        return Ok(None);
+    };
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let size = crate::media::size(bytes.len());
+    if bytes.len() > crate::media::PICTURE_BYTES {
+        return Err(format!(
+            "`{raw}` is a picture of {size}, more than the {} a model is sent. A smaller copy of it can be read.",
+            crate::media::size(crate::media::PICTURE_BYTES)
+        ));
+    }
+    let about = path.file_stem().unwrap_or_default().to_string_lossy();
+    // Not into the project, as a media tool's are: looking at a picture
+    // leaves the user's files as they were, in plan mode too.
+    let copy = crate::media::save(&ToolContext::default(), &about, kind, &bytes)?;
+    Ok(Some(format!(
+        "{}{}\nA copy of the picture `{raw}`, {size}. It follows the results when this model takes pictures.",
+        crate::media::SAVED,
+        copy.display()
+    )))
 }
 
 /// A file's text as UTF-8, without a byte order mark and with UTF-16 decoded,
@@ -2555,6 +2590,45 @@ mod tests {
         let outside = if cfg!(windows) { "/Windo" } else { "/us" };
         assert_eq!(missing(outside), format!("`{outside}` does not exist."));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn read_file_saves_a_copy_of_a_picture_and_names_it() {
+        let (_turn, data) = data_folder("picture");
+        // Outside the data folder, whose files read_file refuses.
+        let dir = std::env::temp_dir().join(format!("letronna-picture-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+        std::fs::write(dir.join("chart.png"), png).unwrap();
+        std::fs::write(dir.join(".env"), png).unwrap();
+        std::fs::write(dir.join("big.gif"), b"GIF89a").unwrap();
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("big.gif"));
+        file.unwrap()
+            .set_len(crate::media::PICTURE_BYTES as u64 + 1)
+            .unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let read = run("read_file", r#"{"path":"chart.png"}"#, &ctx).unwrap();
+        let copy = crate::media::saved_by("read_file", &read).unwrap();
+        assert!(copy.starts_with(data.join("media")) && copy.to_string_lossy().ends_with(".png"));
+        assert_eq!(std::fs::read(&copy).unwrap(), png);
+        assert!(!read.contains("PNG") && read.contains("`chart.png`, 1 KB"));
+        // A secret-named file is refused whatever it holds, one too big to
+        // send is refused with its size, and other bytes are still no text.
+        let refused = run("read_file", r#"{"path":".env"}"#, &ctx).unwrap_err();
+        assert!(refused.contains("out of reach"), "{refused}");
+        let big = run("read_file", r#"{"path":"big.gif"}"#, &ctx).unwrap_err();
+        assert!(big.contains("a picture of 3.8 MB"), "{big}");
+        std::fs::write(dir.join("blob.bin"), b"\0\x01\x02").unwrap();
+        let blob = run("read_file", r#"{"path":"blob.bin"}"#, &ctx).unwrap_err();
+        assert_eq!(blob, "Not a text file.");
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(data).unwrap();
     }
 
     #[test]
@@ -3716,6 +3790,13 @@ mod tests {
         // A page titled like the line, looked at rather than photographed.
         let look = fenced(crate::browser::BROWSE, &json!({"action": "look"}), &shot).unwrap();
         assert_eq!(crate::media::saved_by(crate::browser::BROWSE, &look), None);
+        // An MCP result naming the picture its server sent keeps it too; the
+        // server's own words shaped like it start with a space, so they don't.
+        let sent = format!("{}/p/media/mcp-1.png\nHere it is.", crate::media::SAVED);
+        let out = fenced("mcp__demo__shoot", &json!({}), &sent).unwrap();
+        assert!(crate::media::saved_by("mcp__demo__shoot", &out).is_some());
+        let forged = fenced("mcp__demo__shoot", &json!({}), &format!(" {sent}")).unwrap();
+        assert_eq!(crate::media::saved_by("mcp__demo__shoot", &forged), None);
     }
 
     #[test]

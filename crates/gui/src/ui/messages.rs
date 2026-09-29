@@ -242,6 +242,9 @@ impl Chat {
             .when(!tool_only, |this| {
                 this.child(div().w_full().overflow_hidden().pb_1().child(body))
             })
+            .when(is_user && !message.images.is_empty(), |this| {
+                this.child(crate::ui::pictures::sent_row(&message.images, cx))
+            })
             // A reply is often wanted whole, and selecting it across
             // paragraphs and code blocks is fiddly.
             .when(usage_row, |this| {

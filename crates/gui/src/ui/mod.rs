@@ -9,6 +9,7 @@ pub(crate) mod grain;
 pub(crate) mod messages;
 pub(crate) mod messaging;
 pub(crate) mod panel;
+pub(crate) mod pictures;
 pub(crate) mod schedules;
 pub(crate) mod sessions;
 pub(crate) mod settings;

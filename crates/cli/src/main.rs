@@ -112,6 +112,7 @@ fn main() {
         trouble: None,
         bar: bar::Bar::new(String::new()),
         stopped: false,
+        images: Vec::new(),
     };
     letronna_core::browser::share_browser(runner.store.settings.browser_shared);
     std::thread::spawn(letronna_core::browser::close_left_over);
