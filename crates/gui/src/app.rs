@@ -188,6 +188,9 @@ pub(crate) struct Chat {
     /// Selected row on the Messaging page.
     pub(crate) channel: usize,
     pub(crate) skills: Vec<letronna_core::skills::Skill>,
+    /// Why the skills, or the old skills.json, could not be read; shown
+    /// above the list.
+    pub(crate) skills_error: Option<String>,
     /// The name of the skill being edited, or empty for a new one.
     pub(crate) editing_skill: Option<String>,
     pub(crate) skill_name: Entity<InputState>,
@@ -200,6 +203,14 @@ pub(crate) struct Chat {
     /// into the box; set where there is no window to hand, put there when
     /// the window next draws.
     pub(crate) returned_follow_ups: Option<String>,
+    /// Where to add skills from: a GitHub repository, a link or a path.
+    pub(crate) skill_source: Entity<InputState>,
+    /// Skills are being added, which waits on the network.
+    pub(crate) adding_skills: bool,
+    /// What the last add or removal of skills came to, or why it failed.
+    pub(crate) skills_note: Option<Result<String, String>>,
+    /// The skills the last add left out, each with why.
+    pub(crate) skills_refused: Vec<String>,
     /// Your message being changed in place, by session id and place.
     pub(crate) editing_message: Option<(u64, usize)>,
     /// The box a message is changed in.
@@ -340,6 +351,9 @@ impl Chat {
                 .auto_grow(3, 10)
                 .placeholder("What should Letronna do?")
         });
+        let skill_source = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("GitHub repo, link to a SKILL.md, or a folder")
+        });
         let job_prompt = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
@@ -390,12 +404,18 @@ impl Chat {
                     this.submit_answer(window, cx);
                 }
             }),
+            cx.subscribe_in(&skill_source, window, |this, _, event, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.add_skills(window, cx);
+                }
+            }),
         ];
-        // An empty list and the message when the old skills.json will not
-        // parse; a copy of it has already been kept.
+        // The message when the old skills.json will not move across, or the
+        // skills cannot be read at all; the Skills page shows it too.
         let workspace = store.conversations[store.active].workspace.as_deref();
+        let moved = letronna_core::skills::migrate();
         let (skills, skills_error) = match letronna_core::skills::list(workspace) {
-            Ok(skills) => (skills, None),
+            Ok(skills) => (skills, moved.err()),
             Err(why) => (Vec::new(), Some(why)),
         };
         let draft_for = store.conversations[store.active].id;
@@ -470,11 +490,16 @@ impl Chat {
             discord_bot_name: None,
             channel: 0,
             skills,
+            skills_error: skills_error.clone(),
             editing_skill: None,
             skill_name,
             skill_prompt,
             follow_ups: Vec::new(),
             returned_follow_ups: None,
+            skill_source,
+            adding_skills: false,
+            skills_note: None,
+            skills_refused: Vec::new(),
             editing_message: None,
             edit_message,
             thinking_open: std::collections::HashSet::new(),

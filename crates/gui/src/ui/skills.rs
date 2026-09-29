@@ -1,8 +1,14 @@
-//! The Skills page: skill folders, whose instructions load into the composer
-//! on demand.
+//! The Skills page: SKILL.md folders, added from GitHub, a link or a folder
+//! and switched on and off. The agent loads one that is on when a task calls
+//! for it, and Use puts its instructions in the composer.
 
 use crate::prelude::*;
-use letronna_core::skills;
+use letronna_core::skills::{self, Installed, Source};
+
+/// Skills an add left out that are listed under the box, each with why; the
+/// rest are counted. A whole repository clashing is the user's to sort out
+/// in the list, not to read here.
+const REFUSALS_SHOWN: usize = 3;
 
 impl Chat {
     /// Read the skills again, as the active session's project sees them.
@@ -10,10 +16,87 @@ impl Chat {
         let workspace = self.store.conversations[self.store.active]
             .workspace
             .clone();
-        match skills::list(workspace.as_deref()) {
-            Ok(list) => self.skills = list,
+        // An old skills.json that will not move across is said above the
+        // skills already in folders, which are listed all the same.
+        let moved = skills::migrate();
+        (self.skills, self.skills_error) = match skills::list(workspace.as_deref()) {
+            Ok(list) => (list, moved.err()),
+            Err(why) => (Vec::new(), Some(why)),
+        };
+    }
+
+    /// Add the skills the box names. The download runs in the background,
+    /// and a failure leaves the box as it was so it can be corrected.
+    pub(crate) fn add_skills(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let source = self.skill_source.read(cx).value().trim().to_owned();
+        if source.is_empty() || self.adding_skills {
+            return;
+        }
+        self.adding_skills = true;
+        self.skills_note = None;
+        self.skills_refused.clear();
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let added = cx
+                .background_executor()
+                .spawn(async move { skills::install(&source) })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.adding_skills = false;
+                if added.is_ok() {
+                    this.skill_source
+                        .update(cx, |input, cx| input.set_value("", window, cx));
+                }
+                this.skills_note = Some(added.map(|installed| {
+                    let note = install_note(&installed);
+                    this.skills_refused = installed.refused;
+                    note
+                }));
+                this.reload_skills();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Add the skills in a folder picked on this computer. Windows' picker
+    /// shows folders or files, never both, so there it is folders; a single
+    /// file's path can be typed into the box.
+    fn choose_skills(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: true,
+            multiple: false,
+            prompt: None,
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                let path = path.display().to_string();
+                this.skill_source
+                    .update(cx, |input, cx| input.set_value(path, window, cx));
+                this.add_skills(window, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Switch a skill on or off, for every session that can see it.
+    fn switch_skill(&mut self, name: &str, on: bool, cx: &mut Context<Self>) {
+        match skills::set_enabled(name, on) {
+            Ok(()) => {
+                if let Some(skill) = self.skills.iter_mut().find(|s| s.name == name) {
+                    skill.enabled = on;
+                }
+            }
             Err(why) => self.error = Some(why),
         }
+        cx.notify();
     }
 
     fn new_skill(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -57,9 +140,11 @@ impl Chat {
         let chat = cx.entity();
         crate::ui::confirm_delete("Delete skill", body, window, cx, move |_, cx| {
             chat.update(cx, |this, cx| {
-                if let Err(why) = skills::remove(&name) {
-                    this.error = Some(why);
-                }
+                this.skills_note = Some(
+                    skills::remove(&name)
+                        .map(|place| format!("Moved {name} to {}", place.display())),
+                );
+                this.skills_refused.clear();
                 this.reload_skills();
                 cx.notify();
             })
@@ -86,7 +171,7 @@ impl Chat {
         let name = self.skill_name.read(cx).value().trim().to_owned();
         let prompt = self.skill_prompt.read(cx).value().trim().to_owned();
         if prompt.is_empty() {
-            self.error = Some("A skill needs a prompt.".into());
+            self.error = Some("A skill needs instructions.".into());
             cx.notify();
             return;
         }
@@ -137,7 +222,7 @@ impl Chat {
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child("Prompt"),
+                            .child("Instructions"),
                     )
                     .child(Input::new(&self.skill_prompt).small().w_full()),
             )
@@ -166,8 +251,10 @@ impl Chat {
 
     fn skill_row(&self, index: usize, cx: &mut Context<Self>) -> impl IntoElement {
         let skill = &self.skills[index];
-        let name = skill.name.clone();
-        let (edit_name, delete_name) = (name.clone(), name.clone());
+        let (name, enabled) = (skill.name.clone(), skill.enabled);
+        // A project's skills are changed in the project's folder.
+        let yours = skill.source == Source::User;
+        let (edit_name, delete_name, switch_name) = (name.clone(), name.clone(), name.clone());
         h_flex()
             .w_full()
             .items_center()
@@ -182,22 +269,50 @@ impl Chat {
                     .min_w_0()
                     .gap_0p5()
                     .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .truncate()
-                            .child(skill.name.clone()),
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .truncate()
+                                    .when(!enabled, |this| {
+                                        this.text_color(cx.theme().muted_foreground)
+                                    })
+                                    .child(skill.name.clone()),
+                            )
+                            .when(!yours, |this| {
+                                this.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .px_1p5()
+                                        .rounded(cx.theme().radius)
+                                        .border_1()
+                                        .border_color(cx.theme().border)
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("Project"),
+                                )
+                            }),
                     )
                     .child(
+                        // Two lines at most, cut between words: gpui places
+                        // its ellipsis before it knows the row's width, and
+                        // here that cut letters in half.
                         div()
+                            .max_h(px(36.))
+                            .overflow_hidden()
                             .text_xs()
+                            .line_height(px(18.))
                             .text_color(cx.theme().muted_foreground)
-                            .truncate()
                             .child(skill.description.clone()),
                     ),
             )
             .child(
                 h_flex()
+                    .flex_shrink_0()
                     .gap_1()
                     .items_center()
                     .child(
@@ -209,31 +324,73 @@ impl Chat {
                                 this.use_skill(&name, window, cx)
                             })),
                     )
+                    .when(yours, |this| {
+                        this.child(
+                            Button::new(("edit-skill", index))
+                                .ghost()
+                                .xsmall()
+                                .icon(Icon::new(AppIcon::Pencil))
+                                .tooltip("Edit")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.edit_skill(&edit_name, window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new(("delete-skill", index))
+                                .ghost()
+                                .xsmall()
+                                .icon(Icon::new(AppIcon::Trash))
+                                .tooltip("Delete")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.delete_skill(&delete_name, window, cx)
+                                })),
+                        )
+                    })
                     .child(
-                        Button::new(("edit-skill", index))
-                            .plain(cx)
-                            .xsmall()
-                            .icon(Icon::new(AppIcon::Pencil))
-                            .tooltip("Edit")
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.edit_skill(&edit_name, window, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new(("delete-skill", index))
-                            .plain(cx)
-                            .xsmall()
-                            .icon(Icon::new(AppIcon::Trash))
-                            .tooltip("Delete")
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.delete_skill(&delete_name, window, cx)
-                            })),
+                        div().ml_1().cursor_pointer().child(
+                            gpui_component::switch::Switch::new(("skill-on", index))
+                                .checked(enabled)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.switch_skill(&switch_name, !enabled, cx)
+                                })),
+                        ),
                     ),
             )
     }
 
+    /// The box and buttons that add skills from elsewhere.
+    fn skill_adder(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let adding = self.adding_skills;
+        h_flex()
+            .gap_2()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Input::new(&self.skill_source).small().disabled(adding)),
+            )
+            .child(
+                Button::new("install-skills")
+                    .primary()
+                    .small()
+                    .label(if adding { "Adding…" } else { "Add" })
+                    .loading(adding)
+                    .disabled(adding)
+                    .on_click(cx.listener(|this, _, window, cx| this.add_skills(window, cx))),
+            )
+            .child(
+                Button::new("choose-skills")
+                    .ghost()
+                    .small()
+                    .icon(Icon::new(AppIcon::Folder))
+                    .label("Choose folder…")
+                    .disabled(adding)
+                    .on_click(cx.listener(|this, _, window, cx| this.choose_skills(window, cx))),
+            )
+    }
+
     pub(crate) fn skills_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut rows: Vec<AnyElement> = (0..self.skills.len())
+        let rows: Vec<AnyElement> = (0..self.skills.len())
             .map(|index| {
                 if self.editing_skill.as_ref() == Some(&self.skills[index].name) {
                     self.skill_editor(cx).into_any_element()
@@ -243,10 +400,62 @@ impl Chat {
             })
             .collect();
         // A new skill is written only once it is saved, so its editor stands
-        // at the top until then.
-        if self.editing_skill.as_ref().is_some_and(String::is_empty) {
-            rows.insert(0, self.skill_editor(cx).into_any_element());
+        // above the list until then, in sight however far that is scrolled.
+        let new_skill = self
+            .editing_skill
+            .as_ref()
+            .is_some_and(String::is_empty)
+            .then(|| self.skill_editor(cx).into_any_element());
+        let mut notes: Vec<Div> = Vec::new();
+        if let Some(note) = &self.skills_note {
+            let (text, color) = match note {
+                Ok(text) => (text.clone(), cx.theme().muted_foreground),
+                Err(why) => (why.clone(), cx.theme().danger),
+            };
+            notes.push(div().text_color(color).child(text));
         }
+        for why in self.skills_refused.iter().take(REFUSALS_SHOWN) {
+            notes.push(div().text_color(cx.theme().warning).child(why.clone()));
+        }
+        if let Some(more) = self
+            .skills_refused
+            .len()
+            .checked_sub(REFUSALS_SHOWN)
+            .filter(|more| *more > 0)
+        {
+            notes.push(
+                div()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!("and {more} more left out")),
+            );
+        }
+        let problem = self.skills_error.as_ref().map(|why| {
+            div()
+                .text_sm()
+                .text_color(cx.theme().danger)
+                .child(why.clone())
+        });
+        let on = self.skills.iter().filter(|s| s.enabled).count();
+        let summary = if !self.skills.is_empty() {
+            Some(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!("{on} of {} on", self.skills.len())),
+            )
+        } else if problem.is_none() {
+            Some(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(
+                        "No skills yet. Add a GitHub repository of them, such as \
+                         anthropics/skills, or write your own.",
+                    ),
+            )
+        } else {
+            None
+        };
         v_flex()
             .flex_1()
             .min_h_0()
@@ -275,8 +484,9 @@ impl Chat {
                                     .text_sm()
                                     .text_color(cx.theme().muted_foreground)
                                     .child(
-                                        "Prompts you reach for often. Using one puts it in the \
-                                         composer so you can adjust it before sending.",
+                                        "Instructions for a kind of task. Letronna loads a skill \
+                                         that is on when a task calls for it, and Use puts one \
+                                         in the composer to adjust first.",
                                     ),
                             ),
                     )
@@ -293,12 +503,93 @@ impl Chat {
                     ),
             )
             .child(
-                div()
+                v_flex()
+                    .gap_2()
+                    .child(self.skill_adder(cx))
+                    .when(!notes.is_empty(), |this| {
+                        this.child(v_flex().gap_1().text_sm().children(notes))
+                    }),
+            )
+            .children(new_skill)
+            .children(problem)
+            .children(summary)
+            .child(
+                // A column itself, so a row with little to say still
+                // stretches the full width.
+                v_flex()
                     .id("skill-list")
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .child(v_flex().children(rows)),
+                    .gap_2()
+                    .children(rows),
             )
+    }
+}
+
+/// What an add did, in a line: "Added 18 skills, updated 2 skills", and
+/// where the copies it replaced went.
+fn install_note(installed: &Installed) -> String {
+    let count = |n: usize, one: &str| match n {
+        1 => one.to_owned(),
+        n => format!("{n} skills"),
+    };
+    let added = installed
+        .added
+        .first()
+        .map(|one| count(installed.added.len(), one));
+    let updated = installed
+        .updated
+        .first()
+        .map(|(one, _)| count(installed.updated.len(), one));
+    let mut note = match (added, updated) {
+        (Some(added), Some(updated)) => format!("Added {added}, updated {updated}"),
+        (Some(added), None) => format!("Added {added}"),
+        (None, Some(updated)) => format!("Updated {updated}"),
+        (None, None) => "Nothing was added".to_owned(),
+    };
+    if let Some((_, kept)) = installed.updated.first() {
+        let archive = kept.parent().unwrap_or(kept);
+        note.push_str(&format!(
+            "; the copies replaced are kept in {}",
+            archive.display()
+        ));
+    }
+    note
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
+    // would shadow the built-in attribute.
+    use super::install_note;
+    use letronna_core::skills::Installed;
+    use std::path::PathBuf;
+
+    #[test]
+    fn an_install_note_counts_what_came_and_names_a_single_one() {
+        let names = |n: usize| (0..n).map(|i| format!("skill-{i}")).collect::<Vec<_>>();
+        let kept = |name: &str| (name.to_owned(), PathBuf::from("archive").join(name));
+        let many = Installed {
+            added: names(18),
+            updated: vec![kept("pdf"), kept("docx")],
+            refused: Vec::new(),
+        };
+        let note = install_note(&many);
+        assert!(
+            note.starts_with("Added 18 skills, updated 2 skills; "),
+            "{note}"
+        );
+        assert!(note.ends_with("archive"), "{note}");
+        let one = Installed {
+            added: vec!["haiku".into()],
+            ..Default::default()
+        };
+        assert_eq!(install_note(&one), "Added haiku");
+        let again = Installed {
+            updated: vec![kept("pdf")],
+            ..Default::default()
+        };
+        assert!(install_note(&again).starts_with("Updated pdf; "));
     }
 }
