@@ -517,6 +517,25 @@ pub fn tools() -> Vec<Arc<dyn Tool>> {
         .unwrap_or_default()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tools a test serves as a server's, seen on its own thread only, so
+    /// that no other test's tools array changes.
+    static SERVED: std::cell::RefCell<Vec<Arc<dyn Tool>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Serves `tools` as a server's to the rest of this test's thread.
+#[cfg(test)]
+pub(crate) fn serve(tools: Vec<Arc<dyn Tool>>) {
+    SERVED.set(tools);
+}
+
+/// What this test's thread serves; see `serve`.
+#[cfg(test)]
+pub(crate) fn served() -> Vec<Arc<dyn Tool>> {
+    SERVED.with_borrow(Vec::clone)
+}
+
 /// Start the configured servers, the first time only, without waiting for
 /// them. The frontends call this as they open, so that servers which take
 /// seconds to start have their tools ready by the first message.

@@ -245,7 +245,8 @@ fn work_through(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result
         }
         // A tool allowed for the whole run would get its yes at once from
         // `approvals::ask`, so it counts as allowed here and can join a batch.
-        let batchable = |name: &str| {
+        let batchable = |call: &ToolCall| {
+            let name = call.name.as_str();
             refusal(&spec.allow, name).is_none()
                 && tools::needs_approval(name)
                 && !approvals::granted(spec.run, name)
@@ -352,7 +353,7 @@ fn together(spec: &Spec, batch: &[ToolCall]) -> Vec<Option<Result<String, String
 }
 
 /// Why this agent may not call `name`, when it may not.
-fn refusal(allow: &Allow, name: &str) -> Option<String> {
+pub(crate) fn refusal(allow: &Allow, name: &str) -> Option<String> {
     if name == tools::ASK_USER {
         return Some(NO_QUESTIONS.into());
     }
@@ -379,6 +380,10 @@ fn context(spec: &Spec) -> ToolContext {
             depth: spec.depth,
             budget: spec.budget.clone(),
             run: Some(spec.run),
+            allowed: match &spec.allow {
+                Allow::All => None,
+                Allow::Only(names) => Some(names.as_slice().into()),
+            },
             ..ctx.caller.clone()
         },
         ..ctx

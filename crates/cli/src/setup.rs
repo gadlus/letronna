@@ -168,7 +168,7 @@ fn choose_provider(runner: &mut Runner) -> bool {
 
 fn choose_model(runner: &mut Runner) {
     step(3, "Which model?");
-    crate::commands::switch_model(runner, "");
+    crate::commands::switch_model(runner, None, "");
     // A provider that would not list its models -- a local server, or a key
     // it did not like -- still needs something to talk to.
     if runner.store.settings.model.is_empty() {
