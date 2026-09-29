@@ -121,6 +121,12 @@ pub trait Tool: Send + Sync {
     fn offered(&self, _: &Connection) -> bool {
         true
     }
+    /// Whether to offer the tool to `model`, for a tool one family of models
+    /// is trained on. A call is not re-checked: the model can be switched
+    /// mid-session, and the calls before the switch still stand.
+    fn suits(&self, _model: &str) -> bool {
+        true
+    }
 
     /// Whether it may run at the same time as other such calls from one reply,
     /// off unless a tool opts in so one that writes, waits or drives the
@@ -240,6 +246,7 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(Search),
         Arc::new(WriteFile),
         Arc::new(EditFile),
+        Arc::new(crate::patch::ApplyPatch),
         Arc::new(RunCommand),
         Arc::new(ReadJob),
         Arc::new(StopJob),
@@ -517,6 +524,7 @@ pub(crate) fn specs_of(
         .filter(|t| !shared || !t.machine())
         .filter(|t| history || !t.needs_history())
         .filter(|t| t.offered(connection))
+        .filter(|t| t.suits(&connection.model))
         .map(|t| spec(t.as_ref()))
         .collect()
 }
@@ -785,6 +793,7 @@ pub fn summary(name: &str, args: &str) -> String {
             .unwrap_or_default(),
         "run_command" => v["command"].as_str().unwrap_or_default().to_owned(),
         "web_fetch" => v["url"].as_str().unwrap_or_default().to_owned(),
+        crate::patch::APPLY_PATCH => crate::patch::paths(&v).unwrap_or_default().join(", "),
         "read_job" | "stop_job" => format!("#{}", v["id"].as_u64().unwrap_or(0)),
         "wait" => match (v["job"].as_u64(), v["until"].as_str()) {
             (Some(id), Some(until)) => format!("job #{id} until \"{until}\""),
@@ -847,7 +856,7 @@ pub fn one_line(text: &str) -> String {
 
 /// Where a write may land: inside the workspace only, and never in
 /// Letronna's own folder or on the program that is running.
-fn resolve_write(raw: &str, ctx: &ToolContext) -> Result<PathBuf, String> {
+pub(crate) fn resolve_write(raw: &str, ctx: &ToolContext) -> Result<PathBuf, String> {
     let me = std::env::current_exe().ok();
     resolve_write_in(raw, ctx, &crate::chat::data_dir(), me.as_deref())
 }

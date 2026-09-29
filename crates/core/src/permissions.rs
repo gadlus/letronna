@@ -135,6 +135,9 @@ enum Target {
     /// A file tool's `path`, from the project folder where it lies in it,
     /// and whether that is sure; see `place`.
     Path(String, bool),
+    /// Every path an `apply_patch` call adds, changes, moves or deletes,
+    /// each as `Path` holds one.
+    Paths(Vec<(String, bool)>),
     /// Any other tool, which only a rule with no pattern covers.
     Call,
 }
@@ -143,7 +146,7 @@ enum Target {
 /// for its project and the project's own file.
 pub fn check(rules: &[Rule], tool: &dyn Tool, args: &Value, ctx: &ToolContext) -> Ruling {
     let workspace = ctx.workspace.as_deref();
-    let here = |rule: &&Rule| rule.tool == tool.name() && in_project(rule, workspace);
+    let here = |rule: &&Rule| holds_for(rule, tool.name()) && in_project(rule, workspace);
     let mut found: Vec<Rule> = rules.iter().filter(here).cloned().collect();
     let project = workspace.map(project_rules).unwrap_or(Ok(Vec::new()));
     let broken = project.as_ref().err().cloned();
@@ -151,7 +154,7 @@ pub fn check(rules: &[Rule], tool: &dyn Tool, args: &Value, ctx: &ToolContext) -
         project
             .unwrap_or_default()
             .into_iter()
-            .filter(|rule| rule.tool == tool.name()),
+            .filter(|rule| holds_for(rule, tool.name())),
     );
     if found.is_empty() {
         return Ruling {
@@ -176,6 +179,17 @@ pub fn check(rules: &[Rule], tool: &dyn Tool, args: &Value, ctx: &ToolContext) -
             .cloned(),
         broken,
     }
+}
+
+/// Whether `rule` holds for a call of the tool `name`: its own rules, and for
+/// `apply_patch` the deny and ask rules of write_file and edit_file too, or a
+/// patch would get around them. Their allow rules stay theirs, since a patch
+/// can reach further than the one file they were given for.
+fn holds_for(rule: &Rule, name: &str) -> bool {
+    rule.tool == name
+        || (name == crate::patch::APPLY_PATCH
+            && rule.effect != Effect::Allow
+            && matches!(rule.tool.as_str(), "write_file" | "edit_file"))
 }
 
 /// The deny and ask rules in `<workspace>/.letronna/permissions.json`, each
@@ -360,6 +374,10 @@ fn target(tool: &dyn Tool, args: &Value, ctx: &ToolContext) -> Target {
         let (path, sure) = place(tools::path_arg(args), ctx);
         return Target::Path(path, sure);
     }
+    if tool.name() == crate::patch::APPLY_PATCH {
+        let paths = crate::patch::paths(args).unwrap_or_default();
+        return Target::Paths(paths.iter().map(|raw| place(raw, ctx)).collect());
+    }
     Target::Call
 }
 
@@ -375,6 +393,9 @@ fn touches(rule: &Rule, target: &Target) -> bool {
         // another folder only stops more, one missing it where it is the
         // same folder would let the call by.
         Target::Path(path, _) => fits(&rule.pattern, path, true),
+        Target::Paths(paths) => paths
+            .iter()
+            .any(|(path, _)| fits(&rule.pattern, path, true)),
         Target::Call => false,
     }
 }
@@ -409,6 +430,15 @@ fn covered(rules: &[Rule], target: &Target) -> bool {
                 && allows
                     .iter()
                     .any(|rule| fits(&rule.pattern, path, FOLDS_CASE))
+        }
+        Target::Paths(paths) => {
+            !paths.is_empty()
+                && paths.iter().all(|(path, sure)| {
+                    *sure
+                        && allows
+                            .iter()
+                            .any(|rule| fits(&rule.pattern, path, FOLDS_CASE))
+                })
         }
         Target::Call => false,
     }

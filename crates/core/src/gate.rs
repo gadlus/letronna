@@ -684,15 +684,26 @@ const PROTECTED: &[&str] = &[
 /// project is as much the user's own as anywhere else.
 const SYNCED: &[&str] = &["mobile documents", "cloudstorage"];
 
-/// Whether `write_file` or `edit_file` may change what `args` names without
-/// asking: inside the project once links are followed, and neither on a
-/// protected path, in the home folder's own settings, nor in Letronna's own
-/// folder.
+/// Whether `write_file`, `edit_file` or `apply_patch` may change what `args`
+/// names without asking: every path inside the project once links are
+/// followed, and neither on a protected path, in the home folder's own
+/// settings, nor in Letronna's own folder.
 fn editable(name: &str, args: &Value, ctx: &ToolContext) -> bool {
-    if !matches!(name, "write_file" | "edit_file") {
+    let paths = match name {
+        "write_file" | "edit_file" => args["path"].as_str().map(|raw| vec![raw.to_owned()]),
+        crate::patch::APPLY_PATCH => crate::patch::paths(args),
+        _ => None,
+    };
+    let Some(paths) = paths.filter(|paths| !paths.is_empty()) else {
         return false;
-    }
-    let (Some(workspace), Some(raw)) = (&ctx.workspace, args["path"].as_str()) else {
+    };
+    paths.iter().all(|raw| editable_path(raw, ctx))
+}
+
+/// Whether an edit may change the file `raw` names without asking, as
+/// `editable` judges each path.
+fn editable_path(raw: &str, ctx: &ToolContext) -> bool {
+    let Some(workspace) = &ctx.workspace else {
         return false;
     };
     let (Ok(root), Some(path)) = (

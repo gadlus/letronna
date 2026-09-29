@@ -144,8 +144,60 @@ fn replace(
     Ok(Some((out, spans.len())))
 }
 
+/// Replace the whole lines `old` with `new` at the one place in `file` past
+/// byte `from` where they start a line, and say where the new lines end:
+/// a patch's hunks come in file order, each after the one before, and one
+/// matched mid-line would change the wrong code.
+pub(crate) fn replace_lines(
+    file: &str,
+    from: usize,
+    old: &str,
+    new: &str,
+) -> Result<(String, usize), String> {
+    let text = &file[from..];
+    let starts_line = |span: &Range<usize>| span.start == 0 || text[..span.start].ends_with('\n');
+    let Some((strategy, spans)) = find_where(text, old, &starts_line) else {
+        return Err(
+            "its ` ` and `-` lines are not in the file after the hunks before it. \
+             Read the file again and copy them exactly."
+                .into(),
+        );
+    };
+    let [span] = spans.as_slice() else {
+        return Err(format!(
+            "its ` ` and `-` lines are in {} places. Add context lines, or an `@@` line \
+             naming the function or section they are in.",
+            spans.len()
+        ));
+    };
+    let mut piece = match strategy {
+        Strategy::Indent => reindent(new, old, &text[span.clone()])?,
+        _ => new.to_owned(),
+    };
+    if let Some(ending) = line_ending(file) {
+        piece = piece.replace("\r\n", "\n").replace('\n', ending);
+    }
+    let end = from + span.start + piece.len();
+    let out = format!(
+        "{}{}{piece}{}",
+        &file[..from],
+        &text[..span.start],
+        &text[span.end..]
+    );
+    Ok((out, end))
+}
+
 /// Where `old` is in `text`, by the first comparison that finds it anywhere.
 fn find(text: &str, old: &str) -> Option<(Strategy, Vec<Range<usize>>)> {
+    find_where(text, old, &|_| true)
+}
+
+/// `find`, counting only the places `keep` takes.
+fn find_where(
+    text: &str,
+    old: &str,
+    keep: &dyn Fn(&Range<usize>) -> bool,
+) -> Option<(Strategy, Vec<Range<usize>>)> {
     let order = [
         Strategy::Exact,
         Strategy::LineEndings,
@@ -176,6 +228,7 @@ fn find(text: &str, old: &str) -> Option<(Strategy, Vec<Range<usize>>)> {
             Strategy::Indent => whole_lines(text, old, true),
             Strategy::Quotes => folded(text, old, true),
         };
+        let spans: Vec<_> = spans.into_iter().filter(|span| keep(span)).collect();
         (!spans.is_empty()).then_some((strategy, spans))
     })
 }
@@ -390,7 +443,7 @@ fn unnumbered(old: &str) -> Option<String> {
 }
 
 /// The line break a file uses, judged by its first; `None` when it has none.
-fn line_ending(text: &str) -> Option<&'static str> {
+pub(crate) fn line_ending(text: &str) -> Option<&'static str> {
     let at = text.find('\n')?;
     Some(if text[..at].ends_with('\r') {
         "\r\n"

@@ -313,16 +313,88 @@ impl Change {
     /// as what the model has seen of it.
     pub(crate) fn write(mut self, bytes: &[u8], log: &crate::history::Log) -> Result<(), String> {
         crate::write::atomic(&self.path, bytes, log)?;
-        let seen = Seen {
-            len: bytes.len() as u64,
-            print: print_of(bytes, &self.path),
+        let mark = Mark {
             whole: self.whole,
             reply: self.reply,
             own: self.own,
-            at: 0,
         };
-        let key = key(&self.path);
-        self.state.record(self.conversation, key, seen);
+        wrote(&mut self.state, self.conversation, &self.path, bytes, mark);
+        Ok(())
+    }
+}
+
+/// What a change builds on: whether the model saw all of the file, in which
+/// reply, and whether it wrote it; carried over to what it writes.
+#[derive(Clone, Copy)]
+pub(crate) struct Mark {
+    whole: bool,
+    reply: usize,
+    own: bool,
+}
+
+/// Records `bytes`, just written to `path`, as what the conversation has
+/// seen of it.
+fn wrote(state: &mut State, conversation: u64, path: &Path, bytes: &[u8], mark: Mark) {
+    let seen = Seen {
+        len: bytes.len() as u64,
+        print: print_of(bytes, path),
+        whole: mark.whole,
+        reply: mark.reply,
+        own: mark.own,
+        at: 0,
+    };
+    state.record(conversation, key(path), seen);
+}
+
+/// Several files one apply_patch call changes, held under one lock from the
+/// first check to the last write, so the patch is judged on the bytes it
+/// then replaces.
+pub(crate) struct Batch {
+    state: MutexGuard<'static, State>,
+    conversation: u64,
+}
+
+/// Opens a batch of changes for the conversation.
+pub(crate) fn batch(conversation: u64) -> Batch {
+    Batch {
+        state: state(),
+        conversation,
+    }
+}
+
+impl Batch {
+    /// What `path` holds, refused as edit_file refuses it.
+    pub(crate) fn open(&self, path: &Path, raw: &str) -> Result<(String, Mark), String> {
+        existing(&self.state, self.conversation, path, raw)
+    }
+
+    /// The mark of a file the call creates: seen whole, and the model's own.
+    pub(crate) fn fresh(&self) -> Mark {
+        Mark {
+            whole: true,
+            reply: self.state.reply(self.conversation).at,
+            own: true,
+        }
+    }
+
+    /// Writes `bytes` over `path`, whole or not at all, and records them.
+    pub(crate) fn write(
+        &mut self,
+        path: &Path,
+        bytes: &[u8],
+        mark: Mark,
+        log: &crate::history::Log,
+    ) -> Result<(), String> {
+        crate::write::atomic(path, bytes, log)?;
+        wrote(&mut self.state, self.conversation, path, bytes, mark);
+        Ok(())
+    }
+
+    /// Deletes `path` and forgets what was seen of it.
+    pub(crate) fn remove(&mut self, path: &Path, raw: &str) -> Result<(), String> {
+        let key = key(path);
+        std::fs::remove_file(path).map_err(|e| format!("Could not delete `{raw}`: {e}"))?;
+        self.state.seen.remove(&(self.conversation, key));
         Ok(())
     }
 }
@@ -383,6 +455,26 @@ pub(crate) fn overwrite(conversation: u64, path: &Path, raw: &str) -> Result<Cha
 /// result.
 pub(crate) fn edit(conversation: u64, path: &Path, raw: &str) -> Result<Change, String> {
     let state = state();
+    let (text, mark) = existing(&state, conversation, path, raw)?;
+    Ok(Change {
+        state,
+        conversation,
+        path: path.to_path_buf(),
+        before: Some(text),
+        whole: mark.whole,
+        reply: mark.reply,
+        own: mark.own,
+    })
+}
+
+/// What `path` holds and what the conversation saw of it, for a change that
+/// builds on it; refused as `edit` refuses it.
+fn existing(
+    state: &State,
+    conversation: u64,
+    path: &Path,
+    raw: &str,
+) -> Result<(String, Mark), String> {
     let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
     // Opening a pipe would wait for a writer, holding up every other change.
     if !meta.is_file() {
@@ -390,24 +482,23 @@ pub(crate) fn edit(conversation: u64, path: &Path, raw: &str) -> Result<Change, 
     }
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     let text = text(bytes, raw)?;
-    let mut change = Change {
-        state,
-        conversation,
-        path: path.to_path_buf(),
-        before: None,
+    let mut mark = Mark {
         whole: false,
         reply: 0,
         own: false,
     };
     if conversation != NONE {
-        let seen = seen(&change.state, conversation, path, raw, "make the edit")?;
+        let seen = seen(state, conversation, path, raw, "make the edit")?;
         if !matches(seen, text.as_bytes(), path) {
             return Err(changed(raw));
         }
-        (change.whole, change.reply, change.own) = (seen.whole, seen.reply, seen.own);
+        mark = Mark {
+            whole: seen.whole,
+            reply: seen.reply,
+            own: seen.own,
+        };
     }
-    change.before = Some(text);
-    Ok(change)
+    Ok((text, mark))
 }
 
 /// How the files this conversation has seen stand, taken before a command
