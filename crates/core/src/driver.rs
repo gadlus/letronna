@@ -329,15 +329,16 @@ fn steps(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result<Outcom
         report.rounds += 1;
         spec.status.rounds.store(report.rounds, Ordering::Relaxed);
         work_through(spec, turn, report)?;
-        if let Some(why) = turn.looping() {
-            return Ok(Outcome::Failed(why.to_owned()));
-        }
         // A hook's `continue: false`, whose results are kept.
         if crate::hooks::halted(spec.connection.conversation) {
             return Ok(Outcome::Stopped);
         }
         if let Some(outcome) = settled(spec, report) {
             return Ok(outcome);
+        }
+        // After the answer, which a repeat in the same reply must not throw away.
+        if let Some(why) = turn.looping() {
+            return Ok(Outcome::Failed(why.to_owned()));
         }
     }
 }
@@ -2070,5 +2071,22 @@ mod tests {
         let told = results(&sent[3]);
         assert!(!told[1].contains("Change your approach"));
         assert!(told[2].contains("made this exact call 3 times"));
+    }
+
+    #[test]
+    fn an_answer_given_with_the_fifth_repeat_is_still_taken() {
+        let dir = scratch("loops-answer");
+        std::fs::create_dir(dir.join("empty")).unwrap();
+        let look = ("list_dir", json!({"path": "empty"}));
+        let given = json!({"real": true, "reason": "the folder is empty"});
+        let mut replies = vec![reply("", std::slice::from_ref(&look)); 4];
+        replies.push(reply("", &[look, answering(given.clone())]));
+        let (endpoint, provider) = provider(replies);
+        let mut spec = spec(endpoint, &dir, AGENTS + 91);
+        spec.schema = Some(vote());
+        let report = finished(spec);
+        provider.sent();
+
+        assert_eq!((report.status, report.value), (Outcome::Done, Some(given)));
     }
 }
