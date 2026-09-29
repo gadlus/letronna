@@ -91,15 +91,18 @@ fn replace(
         return Err("`old` is empty. To write a whole file, use write_file.".into());
     }
     // Line numbers copied from read_file come off only when the text as sent
-    // is nowhere, because a file can hold `1|` itself.
+    // is nowhere, because a file can hold `1|` itself. A `new` made from the
+    // same copy has them too, and they would be written into the file.
     let stripped = unnumbered(edit.old);
+    let stripped_new = unnumbered(edit.new);
     let found = find(text, edit.old)
-        .map(|found| (edit.old, found))
+        .map(|found| (edit.old, edit.new, found))
         .or_else(|| {
             let old = stripped.as_deref()?;
-            Some((old, find(text, old)?))
+            let new = stripped_new.as_deref().unwrap_or(edit.new);
+            Some((old, new, find(text, old)?))
         });
-    let Some((old, (strategy, spans))) = found else {
+    let Some((old, new, (strategy, spans))) = found else {
         // A repeated call meets its own result: saying so keeps the model
         // from hunting for text it has already replaced.
         if !edit.new.is_empty() && find(text, edit.new).is_some_and(|(_, at)| at.len() == 1) {
@@ -127,8 +130,8 @@ fn replace(
     let mut last = 0;
     for span in &spans {
         let mut piece = match strategy {
-            Strategy::Indent => reindent(edit.new, old, &text[span.clone()])?,
-            _ => edit.new.to_owned(),
+            Strategy::Indent => reindent(new, old, &text[span.clone()])?,
+            _ => new.to_owned(),
         };
         if let Some(ending) = ending {
             piece = piece.replace("\r\n", "\n").replace('\n', ending);
@@ -362,7 +365,7 @@ fn indent_of(line: &str) -> &str {
     &line[..line.len() - line.trim_start().len()]
 }
 
-/// `old` without the `N|` read_file shows before each line, when every line
+/// Text without the `N|` read_file shows before each line, when every line
 /// has one and they count up by one.
 fn unnumbered(old: &str) -> Option<String> {
     let (body, end) = match old.strip_suffix('\n') {
@@ -535,6 +538,21 @@ mod tests {
         assert!(one(file, "2|b\n5|c", "x").is_err());
         // A file that holds the numbers itself is edited as it stands.
         assert_eq!(one("1|b\nb\n", "1|b", "x").unwrap(), "x\nb\n");
+    }
+
+    #[test]
+    fn line_numbers_copied_into_new_as_well_stay_out_of_the_file() {
+        let file = "fn a() {\n    x();\n}\n";
+        assert_eq!(
+            one(file, "2|    x();", "2|    y();").unwrap(),
+            "fn a() {\n    y();\n}\n"
+        );
+        assert_eq!(
+            one(file, "2|    x();\n3|}", "2|    y();\n3|    z();\n4|}").unwrap(),
+            "fn a() {\n    y();\n    z();\n}\n"
+        );
+        // An `old` found as sent means the numbers are the file's own.
+        assert_eq!(one("1|b\n", "1|b", "2|c").unwrap(), "2|c\n");
     }
 
     #[test]

@@ -181,7 +181,7 @@ pub fn validate(connection: &Connection) -> Result<String, String> {
 const CONTEXT_CHARS: usize = 24_000;
 /// A single tool result can be far larger than anything the model needs to
 /// read. The chat keeps the whole thing; the request gets the ends.
-const MAX_TOOL_CHARS: usize = 8_000;
+pub(crate) const MAX_TOOL_CHARS: usize = 8_000;
 
 fn budget(messages: &[Message]) -> usize {
     messages
