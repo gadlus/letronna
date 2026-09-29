@@ -347,12 +347,14 @@ fn work_through(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result
             return Ok(());
         }
         // A tool allowed for the whole run would get its yes at once from
-        // `approvals::ask`, so it counts as allowed here and can join a batch.
+        // `approvals::ask` for a call that clears on its own, so such a
+        // call counts as allowed here and can join a batch.
         let batchable = |call: &ToolCall| {
             let name = call.name.as_str();
             refusal(&spec.allow, name).is_none()
                 && tools::needs_approval(name)
-                && !approvals::granted(spec.run, name)
+                && !(approvals::granted(spec.run, name)
+                    && crate::gate::cleared(call, &context(spec)))
         };
         let batch = turn.next_batch(batchable, MAX_BATCH);
         if !batch.is_empty() {
@@ -1291,6 +1293,55 @@ mod tests {
             got.iter()
                 .all(|page| page.starts_with("<untrusted-content-"))
         );
+    }
+
+    #[test]
+    fn a_fetch_the_projects_rule_denies_asks_despite_the_runs_grant() {
+        let _serving = crate::approvals::tests::SERVING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("fetch-denied");
+        std::fs::create_dir_all(dir.join(".letronna")).unwrap();
+        std::fs::write(
+            dir.join(".letronna/permissions.json"),
+            r#"[{"tool": "web_fetch", "effect": "deny"}]"#,
+        )
+        .unwrap();
+        let id = AGENTS + 95;
+        let requests = approvals::serve();
+        let earlier = ToolCall {
+            id: "earlier".into(),
+            name: "web_fetch".into(),
+            arguments: "{}".into(),
+        };
+        let asked = std::thread::spawn(move || {
+            approvals::ask(7, id, "helper", &earlier, &ToolContext::default())
+        });
+        let request = requests.recv_timeout(WAIT).unwrap();
+        request.answer(approvals::Decision::ForRun);
+        assert!(asked.join().unwrap().is_ok());
+
+        // Nothing listens there, so a fetch that went out unasked would
+        // come back as an error and end the run without a request.
+        let fetch = ("web_fetch", json!({"url": "http://127.0.0.1:9/secret"}));
+        let (endpoint, provider) = provider(vec![
+            reply("", &[fetch.clone(), fetch]),
+            reply("Left it.", &[]),
+        ]);
+        let run = spec(endpoint, &dir, id);
+        let (tx, report) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(finished(run));
+        });
+        for _ in 0..2 {
+            let request = requests
+                .recv_timeout(WAIT)
+                .expect("a denied fetch went out without asking");
+            assert_eq!(request.call.name, "web_fetch");
+            request.answer(approvals::Decision::Deny(String::new()));
+        }
+        assert_eq!(report.recv_timeout(WAIT).unwrap().status, Outcome::Done);
+        assert_eq!(results(&provider.sent()[1]), [NOT_APPROVED, NOT_APPROVED]);
     }
 
     #[test]
