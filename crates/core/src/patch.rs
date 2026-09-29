@@ -9,8 +9,8 @@
 //! is held to write_file's rules and to the rules on write_file and
 //! edit_file, and the whole patch is approved on one card. Writes go through
 //! `write::atomic` like the other file tools'; one that fails part way puts
-//! back what the patch had already written. A file the patch deletes is not
-//! brought back by a rewind, which knows only files a tool left on disk.
+//! back what the patch had already written. A file the patch deletes goes
+//! through `write::remove`, which keeps it for a rewind to bring back.
 
 use crate::filestate::Mark;
 use crate::tools::{Tool, ToolContext};
@@ -471,7 +471,7 @@ fn apply(actions: &[Action], ctx: &ToolContext) -> Result<String, String> {
                 .map_or(Ok(()), std::fs::create_dir_all)
                 .map_err(|e| e.to_string())
                 .and_then(|()| batch.write(path, after.as_bytes(), *mark, &ctx.files)),
-            Step::Remove { path, raw, .. } => batch.remove(path, raw),
+            Step::Remove { path, raw, .. } => batch.remove(path, raw, &ctx.files),
         };
         if let Err(e) = result {
             return Err(format!("{e}{}", undo(&done)));

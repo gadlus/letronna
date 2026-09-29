@@ -390,10 +390,16 @@ impl Batch {
         Ok(())
     }
 
-    /// Deletes `path` and forgets what was seen of it.
-    pub(crate) fn remove(&mut self, path: &Path, raw: &str) -> Result<(), String> {
+    /// Deletes `path`, kept in `log` for a rewind, and forgets what was seen
+    /// of it.
+    pub(crate) fn remove(
+        &mut self,
+        path: &Path,
+        raw: &str,
+        log: &crate::history::Log,
+    ) -> Result<(), String> {
         let key = key(path);
-        std::fs::remove_file(path).map_err(|e| format!("Could not delete `{raw}`: {e}"))?;
+        crate::write::remove(path, log).map_err(|e| format!("Could not delete `{raw}`: {e}"))?;
         self.state.seen.remove(&(self.conversation, key));
         Ok(())
     }

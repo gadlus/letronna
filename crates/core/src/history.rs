@@ -7,6 +7,8 @@
 //! The hashes before and after each write ride on the call's result message
 //! ([`FileChange`] in `Message::files`) rather than in a record of their own,
 //! so this history is cut back, copied and replayed with the session itself.
+//! A file apply_patch deletes goes through `write::remove`, which keeps its
+//! bytes the same way and notes an empty hash after, so it comes back too.
 //!
 //! Going back to a turn looks at the messages it drops: each file they wrote
 //! goes back to the oldest `before` among them, or away if a tool created it.
@@ -41,6 +43,9 @@ pub struct FileChange {
     /// What was there, or `None` when the call created the file.
     #[serde(default)]
     pub before: Option<String>,
+    /// What it holds after, or empty when the call removed it: no SHA-256
+    /// is empty, and a build that predates removals takes the empty hash
+    /// for a file changed since and leaves it alone.
     pub after: String,
 }
 
@@ -99,6 +104,21 @@ impl Log {
                 path,
                 before,
                 after: hash(bytes),
+            });
+        }
+    }
+
+    /// Note that the file at `real`, its real path taken while it was still
+    /// there, is gone, where `keep` found `before`.
+    pub(crate) fn gone(&self, real: &Path, before: Option<Option<String>>) {
+        let Some(before) = before else {
+            return;
+        };
+        if let Ok(mut changes) = self.changes.lock() {
+            changes.push(FileChange {
+                path: real.to_owned(),
+                before,
+                after: String::new(),
             });
         }
     }
@@ -264,7 +284,7 @@ pub struct Restore {
     pub fate: Fate,
     /// The hash it goes back to, or `None` to remove it.
     to: Option<String>,
-    /// The hash Letronna last left it with.
+    /// The hash Letronna last left it with, empty when it removed it.
     last: String,
 }
 
@@ -288,7 +308,7 @@ fn plan_in(dir: &Path, dropped: &[Message], workspace: Option<&Path>) -> Vec<Res
                 // A write that did not start from what the one before left
                 // means someone changed the file between the two, and going
                 // back past both would take their change with it.
-                if change.before.as_deref() != Some(file.last.as_str()) {
+                if change.before.as_deref() != present(&file.last) {
                     file.fate = Fate::Changed;
                 }
                 file.last.clone_from(&change.after);
@@ -309,7 +329,7 @@ fn plan_in(dir: &Path, dropped: &[Message], workspace: Option<&Path>) -> Vec<Res
         file.fate = match &file.to {
             _ if !reachable(&file.path, root.as_deref()) => Fate::Outside,
             _ if file.fate == Fate::Changed => Fate::Changed,
-            _ if now.as_deref() != Some(file.last.as_str()) => Fate::Changed,
+            _ if now.as_deref() != present(&file.last) => Fate::Changed,
             None => Fate::Remove,
             Some(hash) if dir.join(hash).is_file() => Fate::Back,
             Some(_) => Fate::NoCopy,
@@ -400,17 +420,17 @@ fn put_back(dir: &Path, file: &Restore, root: Option<&Path>) -> Result<(), Strin
         return Err("it is a link or outside the project folder, so it was left alone".into());
     }
     let old = file.to.as_deref().map(|to| kept(dir, to)).transpose()?;
-    let now = std::fs::read(&file.path)
-        .ok()
-        .map(|bytes| (hash(&bytes), bytes));
-    let Some((last, now)) = now.filter(|(last, _)| *last == file.last) else {
+    let now = std::fs::read(&file.path).ok();
+    if now.as_deref().map(hash).as_deref() != present(&file.last) {
         return Err("it changed in the meantime, so it was left alone".into());
-    };
+    }
     // Letronna's version goes into the same folder before it is replaced,
-    // so the rewind can itself be undone by hand.
-    let _ = store(dir, &last, &now);
-    if !dir.join(&last).is_file() {
-        return Err("its current version could not be kept, so it was left alone".into());
+    // so the rewind can itself be undone by hand; a removed file has none.
+    if let Some(now) = &now {
+        let _ = store(dir, &file.last, now);
+        if !dir.join(&file.last).is_file() {
+            return Err("its current version could not be kept, so it was left alone".into());
+        }
     }
     let Some(old) = old else {
         return std::fs::remove_file(&file.path).map_err(|e| format!("could not remove it: {e}"));
@@ -428,6 +448,12 @@ fn kept(dir: &Path, name: &str) -> Result<Vec<u8>, String> {
         return Err("its kept copy is damaged, so it was left alone".into());
     }
     Ok(bytes)
+}
+
+/// A noted hash as what is on disk: `None` for the empty one a removed file
+/// is noted with.
+fn present(hash: &str) -> Option<&str> {
+    (!hash.is_empty()).then_some(hash)
 }
 
 /// The hash of what is at `path` now, or `None` when nothing readable is.
@@ -595,6 +621,53 @@ mod tests {
             std::fs::read_to_string(project.join("a.txt")).unwrap(),
             "two\n"
         );
+    }
+
+    #[test]
+    fn a_rewind_brings_back_what_a_patch_deleted_or_moved_away() {
+        let (project, kept) = scratch("patch");
+        std::fs::write(project.join("gone.txt"), "bye\n").unwrap();
+        std::fs::write(project.join("old.txt"), "keep\n").unwrap();
+        let ctx = context(&project, &kept);
+        let patch = "*** Begin Patch\n*** Delete File: gone.txt\n*** Update File: old.txt\n\
+                     *** Move to: new.txt\n@@\n-keep\n+kept\n*** End Patch";
+        let turns = [call(
+            &ctx,
+            "apply_patch",
+            serde_json::json!({ "patch": patch }),
+        )];
+        assert_eq!(turns[0].files[0].before, Some(hash(b"bye\n")));
+        assert_eq!(turns[0].files[0].after, "");
+
+        // A file made again where one was deleted is someone else's.
+        std::fs::write(project.join("gone.txt"), "mine\n").unwrap();
+        let plan = plan_in(&kept, &turns, Some(&project));
+        assert_eq!(
+            fates(&plan, &project)[0],
+            ("gone.txt".into(), Fate::Changed)
+        );
+        std::fs::remove_file(project.join("gone.txt")).unwrap();
+
+        let plan = plan_in(&kept, &turns, Some(&project));
+        assert_eq!(
+            fates(&plan, &project),
+            [
+                ("gone.txt".to_owned(), Fate::Back),
+                ("new.txt".to_owned(), Fate::Remove),
+                ("old.txt".to_owned(), Fate::Back)
+            ]
+        );
+        let done = restore_in(&kept, &plan, Some(&project));
+        assert!(done.left.is_empty(), "{done:?}");
+        assert_eq!(
+            std::fs::read_to_string(project.join("gone.txt")).unwrap(),
+            "bye\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join("old.txt")).unwrap(),
+            "keep\n"
+        );
+        assert!(!project.join("new.txt").exists());
     }
 
     #[test]
