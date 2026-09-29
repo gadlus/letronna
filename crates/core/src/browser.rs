@@ -144,6 +144,9 @@ impl Tool for Browse {
             None => what,
         }
     }
+    fn judge_input(&self, args: &Value, ctx: &ToolContext) -> String {
+        judged(args, ctx)
+    }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         mark_agent_use();
         let view = View {
@@ -233,6 +236,9 @@ impl Tool for UsePage {
             text.push_str(&format!("\n\non {page}"));
         }
         text
+    }
+    fn judge_input(&self, args: &Value, ctx: &ToolContext) -> String {
+        judged(args, ctx)
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         mark_agent_use();
@@ -331,6 +337,30 @@ pub fn summary(args: &Value) -> String {
         "eval" => format!("run JavaScript: {}", text("script")),
         other => other.to_owned(),
     }
+}
+
+/// A call to either tool as the auto-mode judge is shown it: what the agent
+/// asked for, and where. Never the page's own words -- its title, its
+/// elements' labels -- which the web wrote and may have aimed at the judge.
+fn judged(args: &Value, ctx: &ToolContext) -> String {
+    let mut text = format!("Browser: {}", summary(args));
+    if args["action"] == "type" {
+        let typed = args["text"].as_str().unwrap_or_default();
+        text.push_str(&format!("\nTyped: {typed}"));
+    }
+    if args["submit"].as_bool() == Some(true) {
+        text.push_str("\nThen Enter is pressed");
+    }
+    if args["confirm"].as_bool() == Some(true) {
+        text.push_str("\nA question the page asks is answered OK");
+    }
+    if args["action"] != "open" {
+        match current_address(ctx.conversation) {
+            Some(address) => text.push_str(&format!("\nOn {address}")),
+            None => text.push_str("\nOn a page whose address is not known"),
+        }
+    }
+    text
 }
 
 /// How much of a page to show.
@@ -521,6 +551,9 @@ struct Session {
     last: String,
     /// "Title — address" of the page, for approval cards.
     page: String,
+    /// The page's address alone, for the auto-mode judge, which is never
+    /// shown what a page says, its title included.
+    address: String,
     /// Tabs seen so far, to tell a new one when it opens.
     known: Vec<String>,
 }
@@ -1039,6 +1072,17 @@ fn current_page(conversation: u64) -> Option<String> {
         .filter(|page| !page.is_empty())
 }
 
+/// The address of a conversation's page, if the browser is free to say.
+fn current_address(conversation: u64) -> Option<String> {
+    let all = state().try_lock().ok()?;
+    let owner = owner_of(conversation);
+    all.sessions
+        .iter()
+        .find(|session| session.owner == owner)
+        .map(|session| session.address.clone())
+        .filter(|address| !address.is_empty())
+}
+
 /// How an element of a conversation's page reads, if the browser is free to
 /// say.
 fn label_of(conversation: u64, number: u32) -> Option<String> {
@@ -1105,6 +1149,7 @@ impl Session {
             refs: Refs::default(),
             last: String::new(),
             page: String::new(),
+            address: String::new(),
             known,
         };
         session.follow();
@@ -1313,6 +1358,7 @@ impl Session {
             page.url = self.url();
         }
         self.page = page.named();
+        self.address = page.url.clone();
         if watch::watched() && self.on_screen() {
             watch::show(Sight::Page {
                 title: page.title.clone(),

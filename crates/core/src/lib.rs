@@ -26,6 +26,7 @@ pub mod gateway;
 mod grep;
 pub mod inbox;
 pub mod jobs;
+pub mod judge;
 pub mod mcp;
 pub mod media;
 pub mod memory;

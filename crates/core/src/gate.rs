@@ -12,12 +12,14 @@
 //! allowed, then asking.
 //!
 //! It is plain code with no network and nothing slow, so the window calls it
-//! on its UI thread each time the queue moves. Later layers -- rules by
-//! argument, known read-only commands, the modes, the judge -- slot in at
-//! the places marked below, in the order the comments give.
+//! on its UI thread each time the queue moves; only `settle`, auto mode's
+//! way in, waits on the judge. Later layers -- rules by argument, known
+//! read-only commands, the modes -- slot in at the places marked below, in
+//! the order the comments give.
 
-use crate::chat::ToolCall;
+use crate::chat::{Connection, ToolCall};
 use crate::command::{self, Dialect, Risk};
+use crate::judge::{self, Verdict};
 use crate::tools::{self, Tool, ToolContext};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -88,6 +90,23 @@ impl<'a> Gate<'a> {
 
 /// Decides `call` from its tool, its arguments and `gate`, layer by layer.
 pub fn decide(call: &ToolCall, gate: &Gate) -> Outcome {
+    decide_with(call, gate, None)
+}
+
+/// `decide` in auto mode: what would ask is put to the judge on the
+/// session's own model instead, given `typed`, every message the user typed
+/// in the session. It waits on the network, so it never runs on a UI thread.
+pub fn settle(call: &ToolCall, gate: &Gate, connection: &Connection, typed: &[String]) -> Outcome {
+    // Other people's messages would count as the user's wishes there.
+    if gate.ctx.shared() {
+        return decide(call, gate);
+    }
+    let judge = |why: &str| judge::judge(call, why, typed, connection, gate.ctx);
+    decide_with(call, gate, Some(&judge))
+}
+
+/// `decide`, with the judge for what no earlier layer settles, if there is one.
+fn decide_with(call: &ToolCall, gate: &Gate, judge: Option<&dyn Fn(&str) -> Verdict>) -> Outcome {
     let Some(tool) = tools::find(&call.name) else {
         return Outcome::Refuse(format!("Unknown tool `{}`.", call.name));
     };
@@ -138,6 +157,16 @@ pub fn decide(call: &ToolCall, gate: &Gate) -> Outcome {
     }
     // Layers 5 (known read-only commands), 6 (edits inside the workspace)
     // and the judge go here, in that order.
+    if let Some(judge) = judge
+        && !spends(tool.name())
+    {
+        let why = if opaque {
+            "the command hides what it runs, so no allowance covers it"
+        } else {
+            "no rule or allowance covers it"
+        };
+        return ruling(tool.name(), judge(why), gate.human);
+    }
     if gate.human {
         return Outcome::Ask;
     }
@@ -146,6 +175,29 @@ pub fn decide(call: &ToolCall, gate: &Gate) -> Outcome {
          Carry on without it and say what was left undone.",
         tool.name()
     ))
+}
+
+/// Whether the tool named `name` spends the user's credit, which is theirs
+/// to decide rather than a question of safety for the judge.
+fn spends(name: &str) -> bool {
+    matches!(name, "make_image" | "speak" | "transcribe" | "make_video")
+}
+
+/// What the judge's `verdict` on `tool` means for the call.
+fn ruling(tool: &str, verdict: Verdict, human: bool) -> Outcome {
+    match verdict {
+        Verdict::Allow => Outcome::Run,
+        Verdict::Block(category) => Outcome::Refuse(format!(
+            "Auto mode did not allow this: {}. Do not retry it or reach the \
+             same result another way; carry on with other work or ask the user.",
+            category.meaning()
+        )),
+        Verdict::Unsure(_) if human => Outcome::Ask,
+        Verdict::Unsure(why) => Outcome::Refuse(format!(
+            "Refused: auto mode could not approve `{tool}` ({why}), and nobody is \
+             here to decide. Carry on without it and say what was left undone."
+        )),
+    }
 }
 
 /// Why `tool` may not run with `args` in `ctx` whoever answers, or `None`.
@@ -225,6 +277,7 @@ mod tests {
     use super::*;
     use crate::agent::{Next, Turn};
     use crate::chat::{Connection, Remote};
+    use crate::judge::Category;
 
     /// Deletes the home folder, in sh and in PowerShell alike.
     const HARDLINE: &str = "Remove-Item -Recurse -Force ~";
@@ -570,5 +623,75 @@ mod tests {
             answer.starts_with("Nobody is available to answer"),
             "{answer}"
         );
+    }
+
+    #[test]
+    fn auto_mode_puts_what_would_ask_to_the_judge() {
+        let ctx = ToolContext::default();
+        let none = Grants::new();
+        let allow = |_: &str| Verdict::Allow;
+        let deny = |_: &str| Verdict::Block(Category::BeyondRequest);
+        let unsure = |_: &str| Verdict::Unsure("no answer".into());
+        let unasked = |_: &str| -> Verdict { panic!("the judge was asked") };
+        let opaque = |why: &str| {
+            assert!(why.contains("hides what it runs"), "{why}");
+            Verdict::Allow
+        };
+        for human in [true, false] {
+            let gate = Gate {
+                ctx: &ctx,
+                skip_approvals: false,
+                grants: &none,
+                human,
+            };
+            assert_eq!(decide_with(&write(), &gate, Some(&allow)), Outcome::Run);
+            assert_eq!(
+                decide_with(&command(OPAQUE), &gate, Some(&opaque)),
+                Outcome::Run
+            );
+            let Outcome::Refuse(why) = decide_with(&write(), &gate, Some(&deny)) else {
+                panic!("a denied write was not refused");
+            };
+            assert!(why.contains("beyond what was asked"), "{why}");
+            let unsure = decide_with(&write(), &gate, Some(&unsure));
+            assert_eq!(unsure == Outcome::Ask, human, "{unsure:?}");
+            // The floor comes first, and spending credit is the user's call.
+            let hardline = decide_with(&command(HARDLINE), &gate, Some(&unasked));
+            assert!(matches!(hardline, Outcome::Refuse(_)));
+            let dangerous = decide_with(&command(DANGEROUS), &gate, Some(&unasked));
+            assert_eq!(dangerous, decide(&command(DANGEROUS), &gate));
+            let image = call(
+                "make_image",
+                serde_json::json!({ "prompt": "a lighthouse" }),
+            );
+            let image = decide_with(&image, &gate, Some(&unasked));
+            assert_eq!(image == Outcome::Ask, human, "{image:?}");
+        }
+    }
+
+    #[test]
+    fn a_shared_chat_never_gets_the_judge() {
+        let ctx = ToolContext {
+            remote: Some(Remote {
+                shared: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let none = Grants::new();
+        let gate = Gate {
+            ctx: &ctx,
+            skip_approvals: false,
+            grants: &none,
+            human: false,
+        };
+        let fetch = call(
+            "web_fetch",
+            serde_json::json!({ "url": "https://example.com" }),
+        );
+        let Outcome::Refuse(why) = settle(&fetch, &gate, &Connection::default(), &[]) else {
+            panic!("a fetch nobody can approve was not refused");
+        };
+        assert!(!why.contains("auto mode"), "{why}");
     }
 }
