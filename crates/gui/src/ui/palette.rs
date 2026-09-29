@@ -503,7 +503,7 @@ impl Chat {
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
-    use super::{FOLDERS, Pick, Row, sift};
+    use super::{FOLDERS, Pick, Row, folder_row, sift};
     use crate::{app::Page, assets::AppIcon};
 
     fn labels(shown: &[(&'static str, Vec<Row>)]) -> Vec<(&'static str, Vec<String>)> {
@@ -571,11 +571,17 @@ mod tests {
     #[test]
     fn a_typed_folder_is_offered_once_among_the_folders() {
         let dir = std::env::temp_dir();
-        let shown = sift(&groups(), &dir.display().to_string());
-        let folders = shown.iter().find(|(title, _)| *title == FOLDERS);
-        assert!(
-            folders.is_some_and(|(_, rows)| rows.len() == 1
-                && matches!(&rows[0].pick, Pick::Folder(f) if *f == dir))
-        );
+        let offered = |groups: &[(&'static str, Vec<Row>)]| {
+            let shown = sift(groups, &dir.display().to_string());
+            let folders = shown.iter().find(|(title, _)| *title == FOLDERS);
+            folders.is_some_and(|(_, rows)| {
+                rows.len() == 1 && matches!(&rows[0].pick, Pick::Folder(f) if *f == dir)
+            })
+        };
+        assert!(offered(&groups()));
+        // Already a recent folder, it is not listed a second time.
+        let mut recent = groups();
+        recent[2].1.push(folder_row(dir.clone()));
+        assert!(offered(&recent));
     }
 }
