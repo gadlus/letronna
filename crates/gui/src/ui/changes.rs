@@ -9,6 +9,10 @@ use letronna_core::history;
 /// generated file's thousands of lines would each be an element.
 const SHOWN_LINES: usize = 1500;
 
+/// Characters drawn of one patch line: a minified file is one line of the
+/// whole patch, laid out again on every frame the tab is open.
+const LINE_CHARS: usize = 1000;
+
 /// The file whose diff is open, and what git said of it.
 #[derive(Default)]
 pub(crate) struct Changes {
@@ -145,7 +149,7 @@ fn patch(open: &Open, cx: &App) -> AnyElement {
             Some(' ') => cx.theme().foreground,
             _ => cx.theme().muted_foreground,
         };
-        div().text_color(colour).child(line.replace('\t', "    "))
+        div().text_color(colour).child(shown_line(line))
     });
     v_flex()
         .px_2()
@@ -163,6 +167,15 @@ fn patch(open: &Open, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
+/// A patch line as drawn: tabs spread out, and cut after `LINE_CHARS`.
+fn shown_line(line: &str) -> String {
+    let mut shown: String = line.chars().take(LINE_CHARS).collect();
+    if shown.len() < line.len() {
+        shown.push('…');
+    }
+    shown.replace('\t', "    ")
+}
+
 /// A quiet line of text in place of a list or a diff.
 fn note(text: &str, cx: &App) -> AnyElement {
     div()
@@ -171,4 +184,18 @@ fn note(text: &str, cx: &App) -> AnyElement {
         .text_color(cx.theme().muted_foreground)
         .child(text.to_owned())
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LINE_CHARS, shown_line};
+
+    #[test]
+    fn a_long_patch_line_is_cut_and_a_short_one_kept() {
+        assert_eq!(shown_line("+\tkept"), "+    kept");
+        let long = format!("+{}", "é".repeat(5000));
+        let shown = shown_line(&long);
+        assert_eq!(shown.chars().count(), LINE_CHARS + 1);
+        assert!(shown.ends_with('…'));
+    }
 }
