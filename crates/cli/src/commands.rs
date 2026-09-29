@@ -17,6 +17,8 @@ pub enum Flow {
     Handled,
     Stop,
     Unknown,
+    /// Send this prompt to the model, as though it had been typed.
+    Ask(&'static str),
 }
 
 pub fn command(
@@ -203,6 +205,17 @@ pub fn command(
         "/branch" => {
             branch(runner, session, rest);
             Flow::Handled
+        }
+        "/init" => {
+            let conversation = &runner.store.conversations[*session];
+            match letronna_core::init::prompt(conversation.workspace.as_deref()) {
+                Ok(prompt) => Flow::Ask(prompt),
+                Err(why) => {
+                    render::blank();
+                    render::line(&render::dim(&why));
+                    Flow::Handled
+                }
+            }
         }
         "/where" => {
             render::blank();
@@ -1222,7 +1235,8 @@ fn undo(runner: &mut Runner, session: usize, workspace: Option<&std::path::Path>
 }
 
 /// Take the session back to just before the last thing you said, and the
-/// screen with it. Returns what you said, or `None` when nothing has been.
+/// screen with it. Returns what you said -- a command as it was typed -- or
+/// `None` when nothing has been.
 fn take_back(
     runner: &mut Runner,
     session: usize,
@@ -1244,7 +1258,7 @@ fn take_back(
     }
     // After the redraw, so a failure to save is not cleared off the screen.
     runner.persist();
-    Some(prompt)
+    Some(letronna_core::init::typed(&prompt).map_or(prompt, str::to_owned))
 }
 
 /// Where the last thing you said sits among `messages`, and what it said.

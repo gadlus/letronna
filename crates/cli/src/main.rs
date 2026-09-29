@@ -235,6 +235,7 @@ fn main() {
         if line.is_empty() {
             continue;
         }
+        let mut prompt = line.as_str();
         if line.starts_with('/') {
             let flow = command(&mut runner, &line, &mut session, workspace.as_deref());
             // Every turn follows its own session's helpers; this is for the
@@ -254,10 +255,12 @@ fn main() {
             screen::settle();
             match flow {
                 Flow::Stop => break,
+                // The command stays on screen as typed; the model gets its prompt.
+                Flow::Ask(asked) => prompt = asked,
                 _ => continue,
             }
         }
-        if let Err(error) = runner.ask(session, &line) {
+        if let Err(error) = runner.ask(session, prompt) {
             render::blank();
             render::line(&render::red(&error));
             // Nothing is painted after this until the next key, so without

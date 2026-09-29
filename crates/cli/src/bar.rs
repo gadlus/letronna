@@ -116,6 +116,10 @@ pub const COMMANDS: &[Command] = &[
         blurb: "carry on in a copy of this session",
     },
     Command {
+        name: "/init",
+        blurb: "have the model write or fill in the project's AGENTS.md",
+    },
+    Command {
         name: "/where",
         blurb: "show the project folder and session file",
     },

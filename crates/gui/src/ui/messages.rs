@@ -117,8 +117,12 @@ impl Chat {
                 )
                 .into_any_element()
         } else if is_user {
-            // A chat app's message can quote someone else's, fenced.
-            let (said, _) = letronna_core::untrusted::shown("", &message.content);
+            // `/init` shows as typed, not as the prompt it sent; a chat app's
+            // message can quote someone else's, fenced.
+            let said = match letronna_core::init::typed(&message.content) {
+                Some(typed) => typed.to_owned(),
+                None => letronna_core::untrusted::shown("", &message.content).0,
+            };
             TextView::markdown(md, said, window, cx)
                 .selectable(selectable)
                 .text_size(px(15.))
