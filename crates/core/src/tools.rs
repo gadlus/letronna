@@ -473,22 +473,65 @@ pub fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Where a write may land: inside the workspace only. The file need not
-/// exist yet, so the check is on the nearest existing ancestor.
+/// Where a write may land: inside the workspace only, and never in
+/// Letronna's own folder or on the program that is running.
 fn resolve_write(raw: &str, ctx: &ToolContext) -> Result<PathBuf, String> {
+    let me = std::env::current_exe().ok();
+    resolve_write_in(raw, ctx, &crate::chat::data_dir(), me.as_deref())
+}
+
+/// `resolve_write` with Letronna's folder at `data` and its program at `me`,
+/// checked on the nearest existing ancestor since the file need not exist yet.
+fn resolve_write_in(
+    raw: &str,
+    ctx: &ToolContext,
+    data: &Path,
+    me: Option<&Path>,
+) -> Result<PathBuf, String> {
     let workspace = ctx
         .workspace
         .as_ref()
         .ok_or("No project folder is attached. Ask the user to attach one first.")?;
     let root = std::fs::canonicalize(workspace).map_err(|_| "The project folder is missing.")?;
+    // Refused, not folded: on Linux and macOS a missing folder hid the `..`
+    // after it from the check below, so `new/../../x` was written beside the
+    // project. Folding by hand would judge `link/..` unlike the system, which
+    // follows the link first.
+    if Path::new(raw)
+        .components()
+        .any(|part| part == std::path::Component::ParentDir)
+    {
+        return Err(format!(
+            "`{raw}` climbs up with `..`; give the path from the project folder without it."
+        ));
+    }
     let target = workspace.join(raw);
     let mut probe = target.clone();
-    while !probe.exists() {
+    // Not `exists`, which follows links: a link to a missing file was passed
+    // over, and the write then went through it to wherever it pointed.
+    while probe.symlink_metadata().is_err() {
         probe = probe.parent().map(Path::to_path_buf).ok_or("Bad path.")?;
     }
-    let existing = std::fs::canonicalize(&probe).map_err(|e| e.to_string())?;
+    let existing = std::fs::canonicalize(&probe).map_err(|_| {
+        format!(
+            "`{raw}` goes through a link that leads nowhere, so where it lands cannot be checked."
+        )
+    })?;
     if !existing.starts_with(&root) {
         return Err(format!("`{raw}` is outside the project folder."));
+    }
+    if private(&existing, data) {
+        return Err(format!(
+            "`{raw}` is in Letronna's own folder, with its keys and settings; it stays out of reach."
+        ));
+    }
+    let Ok(rest) = target.strip_prefix(&probe) else {
+        return Err("Bad path.".into());
+    };
+    if me.is_some_and(|me| own_program(&existing.join(rest), me)) {
+        return Err(format!(
+            "`{raw}` is Letronna's own program or an update to it; it stays out of reach."
+        ));
     }
     Ok(target)
 }
@@ -501,6 +544,29 @@ const SHELL_ENV: [(&str, &str); 5] = [
     ("NO_COLOR", "1"),
     ("TERM", "dumb"),
 ];
+/// Whether `path` is the program `me`, or the `.new` or `.old` copy of it
+/// that an update later moves into its place.
+fn own_program(path: &Path, me: &Path) -> bool {
+    let Ok(me) = std::fs::canonicalize(me) else {
+        return false;
+    };
+    // The folder is canonical on both sides; the name is compared without
+    // case, because Windows and macOS open `LETRONNA.NEW.EXE` as
+    // `Letronna.new.exe`.
+    [
+        crate::update::beside(&me, "new"),
+        crate::update::beside(&me, "old"),
+        me,
+    ]
+    .iter()
+    .any(|own| {
+        own.parent() == path.parent()
+            && own
+                .file_name()
+                .zip(path.file_name())
+                .is_some_and(|(own, name)| own.eq_ignore_ascii_case(name))
+    })
+}
 
 /// The platform shell, configured the way every caller needs it.
 pub fn shell(command: &str, cwd: Option<&Path>) -> std::process::Command {
@@ -2491,6 +2557,137 @@ mod tests {
             let text = ReadFile.run(&json!({"path": name}), &ctx).unwrap();
             assert_eq!(text, "1|KEY=value", "{name}");
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_write_that_climbs_with_dots_is_refused_on_every_system() {
+        let dir = std::env::temp_dir().join(format!("letronna-climb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(project.clone()),
+            ..Default::default()
+        };
+        for path in [
+            "nonexistent/../../x.txt",
+            "nonexistent/../x.txt",
+            "../x.txt",
+        ] {
+            let args = json!({"path": path, "content": "escaped"});
+            let refused = WriteFile.run(&args, &ctx).unwrap_err();
+            assert!(refused.contains("`..`"), "{path}: {refused}");
+        }
+        assert!(!dir.join("x.txt").exists());
+        assert!(!project.join("x.txt").exists());
+        assert!(!project.join("nonexistent").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_write_that_lands_outside_the_project_is_refused_and_creates_nothing() {
+        let dir = std::env::temp_dir().join(format!("letronna-outside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(project.clone()),
+            ..Default::default()
+        };
+        let refuses = |path: &str| {
+            let args = json!({"path": path, "content": "escaped"});
+            let refused = WriteFile.run(&args, &ctx).unwrap_err();
+            assert!(
+                refused.contains("outside the project folder"),
+                "{path}: {refused}"
+            );
+        };
+        refuses(&dir.join("x.txt").display().to_string());
+        // A link inside the project is judged by the folder it leads to.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&dir, project.join("up")).unwrap();
+            refuses("up/x.txt");
+        }
+        assert!(!dir.join("x.txt").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn writes_stay_out_of_letronnas_folder_and_off_its_program() {
+        let dir = std::env::temp_dir().join(format!("letronna-guarded-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let data = dir.join("Letronna");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(data.join("settings.json"), "{}").unwrap();
+        let me = dir.join("bin/letronna.exe");
+        std::fs::write(&me, "program").unwrap();
+        // The home folder attached as the project holds both.
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let write = |path: &str| resolve_write_in(path, &ctx, &data, Some(&me));
+        for path in [
+            "Letronna/settings.json",
+            "Letronna/mcp.json",
+            "Letronna/new/SOUL.md",
+        ] {
+            let refused = write(path).unwrap_err();
+            assert!(refused.contains("own folder"), "{path}: {refused}");
+        }
+        for path in [
+            "bin/letronna.exe",
+            "bin/letronna.new.exe",
+            "bin/letronna.old.exe",
+            "bin/Letronna.NEW.exe",
+        ] {
+            let refused = write(path).unwrap_err();
+            assert!(refused.contains("own program"), "{path}: {refused}");
+        }
+        for path in [
+            "Letronna.md",
+            "bin/other.exe",
+            "bin/letronna.exe.txt",
+            "notes/a.md",
+        ] {
+            assert_eq!(write(path).unwrap(), dir.join(path), "{path}");
+        }
+
+        // And the real thing refuses the program these tests run as.
+        let running = std::env::current_exe().unwrap();
+        let ctx = ToolContext {
+            workspace: running.parent().map(Path::to_path_buf),
+            ..Default::default()
+        };
+        let name = running.file_name().unwrap().to_string_lossy();
+        let refused = resolve_write(&name, &ctx).unwrap_err();
+        assert!(refused.contains("own program"), "{refused}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_write_through_a_link_that_leads_nowhere_is_refused_and_creates_nothing() {
+        let dir = std::env::temp_dir().join(format!("letronna-dangling-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let data = dir.join("Letronna");
+        std::fs::create_dir_all(&data).unwrap();
+        // A cloned repo can carry this link; writing through it would create
+        // the file it names, in Letronna's folder or anywhere else.
+        std::os::unix::fs::symlink(data.join("mcp.json"), dir.join("notes.md")).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let refused = resolve_write_in("notes.md", &ctx, &data, None).unwrap_err();
+        assert!(refused.contains("leads nowhere"), "{refused}");
+        let args = json!({"path": "notes.md", "content": "{}"});
+        let refused = WriteFile.run(&args, &ctx).unwrap_err();
+        assert!(refused.contains("leads nowhere"), "{refused}");
+        assert!(!data.join("mcp.json").exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
