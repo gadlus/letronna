@@ -72,6 +72,9 @@ fn main() {
             // window.
             KeyBinding::new("tab", ui::browser::PageTab, Some("Browser")),
             KeyBinding::new("shift-tab", ui::browser::PageTabBack, Some("Browser")),
+            // Escape cancels Point mode here, nearer than Chat's own escape,
+            // which stops the reply.
+            KeyBinding::new("escape", ui::browser::CancelPoint, Some("Browser")),
             KeyBinding::new("tab", ui::composer::LeaveComposer, Some("Composer > Input")),
             KeyBinding::new("enter", ui::search::OpenHit, Some("SearchHit")),
         ]);

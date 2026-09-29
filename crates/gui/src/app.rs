@@ -688,6 +688,8 @@ impl Chat {
         };
         let widen = this.follow_browser_layout(window, cx);
         this._subscriptions.push(widen);
+        let point_comment = this.follow_point_comments(window, cx);
+        this._subscriptions.push(point_comment);
         this.load_models(window, cx);
         // Directly, not through `focus_composer`: the window's root does
         // not exist yet to ask about dialogs, and there can be none.

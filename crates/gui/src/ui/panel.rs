@@ -11,7 +11,7 @@
 //! it covers the least.
 
 use crate::prelude::*;
-use crate::ui::browser::Widen;
+use crate::ui::browser::{PointComment, Widen};
 use gpui_component::tab::{Tab, TabBar};
 use std::collections::HashMap;
 
@@ -332,6 +332,23 @@ impl Chat {
             this.panel.widen(*wide, window.viewport_size().width);
             cx.notify();
         })
+    }
+
+    /// Put what Point mode found, with its comment, in the composer.
+    pub(crate) fn follow_point_comments(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        cx.subscribe_in(
+            &self.browser,
+            window,
+            |this, _, PointComment(text), window, cx| {
+                this.insert(text, window, cx);
+                this.focus_composer(window, cx);
+                cx.notify();
+            },
+        )
     }
 }
 
