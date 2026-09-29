@@ -437,11 +437,17 @@ fn body(
         }
         body["tools"] = Value::Array(tools);
     }
-    // Models that cannot be told how hard to think ignore this, which is why
-    // it is safe to send to all of them. Measured on one that can: sixty-four
-    // reasoning tokens at low against seven hundred at high.
+    // Most models that cannot be told how hard to think ignore this, so it
+    // goes to all of them; one that refuses it is sent none after. Measured
+    // on one that can: sixty-four reasoning tokens at low against seven
+    // hundred at high.
     if !connection.effort.is_empty() {
         body["reasoning_effort"] = connection.effort.clone().into();
+    }
+    for (quirk, _) in QUIRKS {
+        if has_quirk(connection, quirk) {
+            apply_quirk(&mut body, quirk);
+        }
     }
     body
 }
@@ -508,9 +514,178 @@ fn forget_images(model: &str) {
     }
 }
 
-/// Whether a request for this window carries a picture.
-fn shows_picture(connection: &Connection, window: &[Message]) -> bool {
-    sees_images(&connection.model) && screenshot(window).is_some_and(|(_, path)| path.is_file())
+/// Whether the request `sent` carries a picture.
+fn shows_picture(sent: &Value) -> bool {
+    sent["messages"].as_array().is_some_and(|messages| {
+        messages.iter().any(|m| {
+            m["content"]
+                .as_array()
+                .is_some_and(|parts| parts.iter().any(|part| part["type"] == "image_url"))
+        })
+    })
+}
+
+/// A field some servers turn a whole request down for, which the request
+/// can do without.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Quirk {
+    /// The output cap goes as `max_completion_tokens`, the only name
+    /// OpenAI's reasoning models take it by.
+    CompletionTokens,
+    Effort,
+    StreamOptions,
+    WebSearch,
+    CacheControl,
+}
+
+/// Each quirk by what a refusal says when its field is the one at fault: the
+/// field's name, or for the cap the name it asks for instead, since a server
+/// out of room names both caps and a new name would not give it more.
+const QUIRKS: [(Quirk, &str); 5] = [
+    (Quirk::CompletionTokens, "'max_completion_tokens' instead"),
+    (Quirk::Effort, "reasoning_effort"),
+    (Quirk::StreamOptions, "stream_options"),
+    (Quirk::WebSearch, "web_search"),
+    (Quirk::CacheControl, "cache_control"),
+];
+
+/// The cap sent as `max_completion_tokens`, which counts a model's thinking
+/// as well as its answer: the 8192 an answer gets elsewhere and as much again
+/// to think in, the most every model `reasons_on_openai` matches will take
+/// (GPT-5's chat models stop at 16384).
+const COMPLETION_TOKENS: u64 = 16384;
+
+/// Quirks learned from refusals, by endpoint and model, for the rest of this
+/// run. Like `sightless` they are never saved: a refusal matched by mistake
+/// then costs a feature until the next start rather than for good, and
+/// learning it again costs one request.
+fn learned() -> &'static Mutex<HashSet<(String, String, Quirk)>> {
+    static LEARNED: OnceLock<Mutex<HashSet<(String, String, Quirk)>>> = OnceLock::new();
+    LEARNED.get_or_init(Default::default)
+}
+
+/// The endpoint and model a quirk is learned for: a field one server turns
+/// down, another serving the same model may take.
+fn route(connection: &Connection) -> (String, String) {
+    (
+        connection.endpoint.trim().trim_end_matches('/').to_owned(),
+        connection.model.trim().to_owned(),
+    )
+}
+
+/// Whether requests to this model need `quirk`, learned this run or known
+/// before the first one is sent.
+fn has_quirk(connection: &Connection, quirk: Quirk) -> bool {
+    if quirk == Quirk::CompletionTokens && reasons_on_openai(connection) {
+        return true;
+    }
+    let (endpoint, model) = route(connection);
+    learned()
+        .lock()
+        .is_ok_and(|quirks| quirks.contains(&(endpoint, model, quirk)))
+}
+
+/// OpenAI's o-series and GPT-5 models on OpenAI's own API, which refuse
+/// `max_tokens`. Another route to them that does too says so, and is learned.
+fn reasons_on_openai(connection: &Connection) -> bool {
+    let on_openai = reqwest::Url::parse(connection.endpoint.trim())
+        .is_ok_and(|url| url.host_str() == Some("api.openai.com"));
+    let model = connection.model.trim().to_lowercase();
+    on_openai
+        && ["o1", "o3", "o4", "gpt-5"]
+            .iter()
+            .any(|family| model.starts_with(family))
+}
+
+/// Change `body` as `quirk` asks, saying whether it carried the field.
+fn apply_quirk(body: &mut Value, quirk: Quirk) -> bool {
+    let Some(fields) = body.as_object_mut() else {
+        return false;
+    };
+    match quirk {
+        Quirk::CompletionTokens => {
+            if fields.remove("max_tokens").is_none() {
+                return false;
+            }
+            fields.insert("max_completion_tokens".into(), COMPLETION_TOKENS.into());
+            true
+        }
+        Quirk::Effort => fields.remove("reasoning_effort").is_some(),
+        Quirk::StreamOptions => fields.remove("stream_options").is_some(),
+        Quirk::WebSearch => {
+            let Some(tools) = fields.get_mut("tools").and_then(Value::as_array_mut) else {
+                return false;
+            };
+            let offered = tools.len();
+            tools.retain(|tool| tool["type"] != "web_search");
+            tools.len() < offered
+        }
+        // Markers ride on message parts, not at the top.
+        Quirk::CacheControl => remove_everywhere(body, "cache_control"),
+    }
+}
+
+/// Take `key` out of every object in `value`, saying whether there was one.
+fn remove_everywhere(value: &mut Value, key: &str) -> bool {
+    let mut found = false;
+    match value {
+        Value::Object(fields) => {
+            found = fields.remove(key).is_some();
+            for inner in fields.values_mut() {
+                found |= remove_everywhere(inner, key);
+            }
+        }
+        Value::Array(items) => {
+            for inner in items {
+                found |= remove_everywhere(inner, key);
+            }
+        }
+        _ => {}
+    }
+    found
+}
+
+/// Learn from a refusal what the request `sent` can do without, saying
+/// whether sending it again would now go differently.
+///
+/// A strict server turns the whole request down over one field it does not
+/// take, and names it, in snake or camel case. A model that cannot see turns
+/// a picture down in words of its own, most of which say image; any other
+/// refusal of a request that happens to carry one is no reason to stop
+/// showing that model pictures, though one that never says image ("content
+/// must be a string") is then shown to the user rather than retried. Only
+/// what the error names and the request carried is learned, and the next
+/// request leaves it out, so each field costs at most one retry and a refusal
+/// that repeats itself ends it.
+fn learn(connection: &Connection, sent: &Value, error: &str) -> bool {
+    // An HTML error page from a proxy says image in its icons and previews.
+    let json = serde_json::from_str::<Value>(error).is_ok();
+    let error = error.to_lowercase().replace('_', "");
+    let mut learned_any = false;
+    // Not "vision": it is also in "provisioned", as in a throughput limit.
+    let about_images = json
+        && ["image", "multimodal"]
+            .iter()
+            .any(|word| error.contains(word));
+    if about_images && shows_picture(sent) {
+        forget_images(&connection.model);
+        learned_any = !sees_images(&connection.model);
+    }
+    let (endpoint, model) = route(connection);
+    for (quirk, field) in QUIRKS {
+        // A request that went out alongside this one may have learned it
+        // first; this one still goes again without it.
+        if error.contains(&field.replace('_', ""))
+            && apply_quirk(&mut sent.clone(), quirk)
+            && learned().lock().is_ok_and(|mut quirks| {
+                quirks.insert((endpoint.clone(), model.clone(), quirk));
+                true
+            })
+        {
+            learned_any = true;
+        }
+    }
+    learned_any
 }
 
 /// Keep both ends of an oversized tool result; the middle is rarely the point.
@@ -857,16 +1032,17 @@ fn stream(
     // all. It is made here, on the worker, so the wait is part of the reply's.
     let (dropped, window) = messages.split_at(start);
     let summary = crate::compact::summary(connection, dropped);
+    let sent = body(
+        connection,
+        window,
+        summary.as_deref(),
+        checklist(messages).as_deref(),
+    );
     let mut request = client()
         .map_err(|e| Failure::new(FailureKind::Unknown, e))?
         .post(endpoint)
         .timeout(Duration::from_secs(120))
-        .json(&body(
-            connection,
-            window,
-            summary.as_deref(),
-            checklist(messages).as_deref(),
-        ));
+        .json(&sent);
     if !connection.key.trim().is_empty() {
         request = request.bearer_auth(connection.key.trim());
     }
@@ -895,15 +1071,15 @@ fn stream(
     };
     let status = response.status();
     if !status.is_success() {
-        // A model that cannot take pictures turns the whole request down,
-        // each provider in words of its own. Send it again without the
-        // screenshot, which that model is spared from then on.
-        if status.is_client_error() && shows_picture(connection, window) {
-            forget_images(&connection.model);
+        let headers = response.headers().clone();
+        let error = response.text().unwrap_or_default();
+        // Send it again without what the refusal named, which requests to
+        // this model leave out from then on -- unless the turn was stopped
+        // while this one was out.
+        if status.is_client_error() && learn(connection, &sent, &error) && !sender.is_closed() {
             return stream(connection, messages, start, sender);
         }
-        let headers = response.headers().clone();
-        let body = response.json::<Value>().unwrap_or_default();
+        let body = serde_json::from_str::<Value>(&error).unwrap_or_default();
         return Err(classify(Some(status.as_u16()), &headers, &body));
     }
     if response
@@ -2213,5 +2389,205 @@ mod tests {
             sums[last + 1] - sums[last],
             message_tokens(&messages[last]) + PICTURE_TOKENS
         );
+    }
+
+    /// A server on this computer that answers each request with the next of
+    /// `replies` (status, content type, body), then hands back the bodies it
+    /// was sent.
+    fn replay(
+        replies: Vec<(&'static str, &'static str, &'static str)>,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::Write;
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1", server.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let mut bodies = Vec::new();
+            for (status, kind, reply) in replies {
+                let (mut socket, _) = server.accept().unwrap();
+                bodies.push(request_body(&mut socket));
+                write!(socket, "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+            }
+            bodies
+        });
+        (endpoint, worker)
+    }
+
+    /// How a turn over `messages` ends, and the text it streamed.
+    fn finish(connection: &Connection, messages: Vec<Message>) -> (Result<(), Failure>, String) {
+        let rx = start(connection.clone(), messages);
+        let mut text = String::new();
+        loop {
+            match rx.recv_blocking().unwrap() {
+                Event::Delta(t) => text.push_str(&t),
+                Event::Finished(result) => return (result, text),
+                _ => {}
+            }
+        }
+    }
+
+    fn hello() -> Vec<Message> {
+        vec![Message {
+            role: "user".into(),
+            content: "Hi".into(),
+            ..Default::default()
+        }]
+    }
+
+    #[test]
+    fn reasoning_models_on_openai_get_max_completion_tokens() {
+        let sent = |endpoint: &str, model: &str| {
+            let c = Connection {
+                endpoint: endpoint.into(),
+                model: model.into(),
+                ..connection()
+            };
+            body(&c, &[], None, None)
+        };
+        for model in ["o1", "o3-mini", "o4-mini", "gpt-5", "gpt-5-mini", "gpt-5.1"] {
+            let body = sent("https://api.openai.com/v1", model);
+            assert_eq!(body["max_completion_tokens"], COMPLETION_TOKENS, "{model}");
+            assert!(body.get("max_tokens").is_none(), "{model}");
+        }
+        // Older models there, and the same names on other routes, keep the
+        // field every other server knows.
+        for (endpoint, model) in [
+            ("https://api.openai.com/v1", "gpt-4o"),
+            ("https://openrouter.ai/api/v1", "openai/o3"),
+            ("http://localhost:11434/v1", "gpt-5"),
+        ] {
+            let body = sent(endpoint, model);
+            assert_eq!(body["max_tokens"], 8192, "{model} at {endpoint}");
+            assert!(body.get("max_completion_tokens").is_none(), "{model}");
+        }
+    }
+
+    #[test]
+    fn a_400_naming_stream_options_drops_it_and_retries_once() {
+        // What a server that validates its input strictly says to the field.
+        let refusal = r#"{"error":{"message":"[{'type': 'extra_forbidden', 'loc': ('body', 'stream_options'), 'msg': 'Extra inputs are not permitted', 'input': {'include_usage': True}}]","type":"BadRequestError","param":null,"code":400}}"#;
+        let (endpoint, worker) = replay(vec![
+            ("400 Bad Request", "application/json", refusal),
+            (
+                "200 OK",
+                "text/event-stream",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: [DONE]\n\n",
+            ),
+            ("400 Bad Request", "application/json", refusal),
+        ]);
+        let c = Connection {
+            endpoint,
+            model: "strict-about-stream-options".into(),
+            ..connection()
+        };
+        let (result, text) = finish(&c, hello());
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(text, "Hello");
+        // The next turn leaves it out from the start, so the same refusal
+        // again is not something another try would change: it ends the turn
+        // after one request instead of reaching for a fourth.
+        let (result, _) = finish(&c, hello());
+        assert!(result.is_err_and(|e| e.to_string().contains("extra_forbidden")));
+        let bodies = worker.join().unwrap();
+        assert!(bodies[0].contains("stream_options"));
+        assert!(!bodies[1].contains("stream_options"));
+        assert!(!bodies[2].contains("stream_options"));
+    }
+
+    #[test]
+    fn each_quirk_leaves_out_its_own_field_and_nothing_else() {
+        let mut body = json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}
+            ]}],
+            "max_tokens": 8192,
+            "stream_options": {"include_usage": true},
+            "reasoning_effort": "high",
+            "tools": [{"type": "function"}, {"type": "web_search"}]
+        });
+        for (quirk, _) in QUIRKS {
+            assert!(apply_quirk(&mut body, quirk));
+            // Once is enough: what is gone cannot be the reason for a retry.
+            assert!(!apply_quirk(&mut body, quirk));
+        }
+        assert_eq!(
+            body,
+            json!({
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+                "max_completion_tokens": COMPLETION_TOKENS,
+                "tools": [{"type": "function"}]
+            })
+        );
+    }
+
+    #[test]
+    fn the_image_latch_needs_the_error_to_name_images() {
+        let dir = std::env::temp_dir().join(format!("letronna-latch-{}", std::process::id()));
+        let messages = screenshots(&dir);
+        let (endpoint, worker) = replay(vec![(
+            "400 Bad Request",
+            "application/json",
+            r#"{"error":{"message":"This model's maximum context length is 65536 tokens. However, you requested 70412 tokens.","type":"invalid_request_error"}}"#,
+        )]);
+        let c = Connection {
+            endpoint,
+            model: "sees-but-is-full".into(),
+            ..connection()
+        };
+        // A refusal for anything else is shown as it is, not answered by
+        // sending the request again without the picture.
+        let (result, _) = finish(&c, messages);
+        assert!(result.is_err_and(|e| e.to_string().contains("maximum context length")));
+        let bodies = worker.join().unwrap();
+        assert!(bodies[0].contains("image_url"));
+        assert!(sees_images("sees-but-is-full"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn learning_goes_by_what_the_refusal_says_about_the_field() {
+        let c = Connection {
+            model: "says-what-it-refuses".into(),
+            effort: "high".into(),
+            ..connection()
+        };
+        let sent = body(&c, &hello(), None, None);
+        // A server out of room names both caps, and the same cap under the
+        // other name would not give it more.
+        assert!(!learn(
+            &c,
+            &sent,
+            r#"{"error":{"message":"'max_tokens' or 'max_completion_tokens' is too large: 8192. This model's maximum context length is 32768 tokens and your request has 30000 input tokens (8192 > 32768 - 30000)."}}"#,
+        ));
+        assert!(learn(
+            &c,
+            &sent,
+            r#"{"error":{"message":"Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.","param":"max_tokens"}}"#,
+        ));
+        // Some servers spell the field in camel case.
+        assert!(learn(
+            &c,
+            &sent,
+            r#"{"error":"Argument not supported on this model: reasoningEffort"}"#,
+        ));
+        let next = body(&c, &hello(), None, None);
+        assert_eq!(next["max_completion_tokens"], COMPLETION_TOKENS);
+        assert!(next.get("max_tokens").is_none());
+        assert!(next.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn a_refusal_is_retried_even_when_another_request_learned_it_first() {
+        let c = Connection {
+            model: "refuses-stream-options".into(),
+            ..connection()
+        };
+        let sent = body(&c, &hello(), None, None);
+        let refusal =
+            r#"{"error":{"message":"Unrecognized request argument supplied: stream_options"}}"#;
+        // Two requests that went out together, each refused in turn.
+        assert!(learn(&c, &sent, refusal));
+        assert!(learn(&c, &sent, refusal));
+        // Sent without it, the same refusal is no reason to go again.
+        assert!(!learn(&c, &body(&c, &hello(), None, None), refusal));
     }
 }
