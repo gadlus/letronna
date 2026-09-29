@@ -1090,7 +1090,7 @@ pub fn spent(since: u64, session: u64) -> Vec<crate::usage::Spent> {
 
 /// How many times the model called each tool, by name, in the sessions and
 /// their helpers' conversations since `since`. A branch copies the calls of
-/// the session it came from, so each call is counted once by its id.
+/// the session it came from, so each call is counted once.
 pub fn tool_calls(since: u64) -> std::collections::BTreeMap<String, usize> {
     let mut counts = std::collections::BTreeMap::new();
     let mut seen = std::collections::HashSet::new();
@@ -1115,7 +1115,13 @@ pub fn tool_calls(since: u64) -> std::collections::BTreeMap<String, usize> {
                 continue;
             }
             for call in reply.tool_calls {
-                if seen.insert(call.id) {
+                // Ids are only unique within a reply, and are `call_0` for a
+                // provider that gives none, so a copy is told by the time of
+                // its reply too. One saved before replies kept their time
+                // cannot be told from a copy, and is counted.
+                let copy = reply.at != 0
+                    && !seen.insert((reply.at, call.id, call.name.clone(), call.arguments));
+                if !copy {
                     *counts.entry(call.name).or_default() += 1;
                 }
             }
@@ -4089,13 +4095,25 @@ pub(crate) mod tests {
                 .iter()
                 .map(|(id, name)| serde_json::json!({"id": id, "name": name, "arguments": "{}"}))
                 .collect();
-            serde_json::json!({"type": "message", "role": "assistant", "content": "",
-                "at": at, "tool_calls": calls})
-            .to_string()
+            // Written as the store writes it, the role straight after the tag,
+            // which is what the reader looks for before parsing a line.
+            format!(
+                r#"{{"type":"message","role":"assistant","content":"","at":{at},"tool_calls":{}}}"#,
+                serde_json::Value::Array(calls)
+            )
         };
         let old = calls(100, &[("a", "read_file")]);
         let new = calls(500, &[("b", "read_file"), ("c", "web_fetch")]);
-        let session = [r#"{"type":"head","id":1,"created":100}"#, &old, &new];
+        // A provider that gives no ids has every reply call its first `call_0`.
+        let bare = calls(800, &[("call_0", "list_dir")]);
+        let bare_later = calls(900, &[("call_0", "list_dir")]);
+        let session = [
+            r#"{"type":"head","id":1,"created":100}"#,
+            &old,
+            &new,
+            &bare,
+            &bare_later,
+        ];
         std::fs::write(dir.join("sessions").join("1.jsonl"), session.join("\n")).unwrap();
         // A branch copied the newer reply, and a helper made a call of its own.
         let branch = [r#"{"type":"head","id":2,"created":600}"#, &new];
@@ -4107,7 +4125,12 @@ pub(crate) mod tests {
         let counted: Vec<(&str, usize)> = counted.iter().map(|(k, v)| (k.as_str(), *v)).collect();
         assert_eq!(
             counted,
-            [("read_file", 1), ("run_command", 1), ("web_fetch", 1)]
+            [
+                ("list_dir", 2),
+                ("read_file", 1),
+                ("run_command", 1),
+                ("web_fetch", 1)
+            ]
         );
         assert_eq!(super::tool_calls(0)["read_file"], 2);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
