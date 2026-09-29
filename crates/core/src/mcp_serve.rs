@@ -54,6 +54,13 @@ pub const TURN: &str = "letronna_turn";
 /// is answered with `PROTOCOL`, and the client decides whether to go on.
 const SPOKEN: &[&str] = &[PROTOCOL, "2025-03-26", "2024-11-05"];
 
+/// The conversation served calls are made in. Conversation 0 is the one
+/// that always takes the browser's shared session, sign-ins and all; this
+/// id, which no session (counting up from 1) nor helper (from 2^40) meets,
+/// gets a private browser of its own unless the user shares one browser
+/// between every conversation.
+const CALLER: u64 = u64::MAX;
+
 /// Runs one turn on a prompt and gives its final text.
 pub type Turn = Box<dyn FnMut(&str) -> Result<String, String>>;
 
@@ -87,6 +94,7 @@ impl Server {
             turn,
             ctx: ToolContext {
                 workspace: std::env::current_dir().ok(),
+                conversation: CALLER,
                 ..Default::default()
             },
         }
@@ -352,6 +360,15 @@ mod tests {
         );
         assert_eq!(answers[2]["result"]["isError"], false);
         assert_eq!(answers[2]["result"]["content"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn served_calls_are_made_in_a_conversation_of_their_own() {
+        // Not 0, which takes the browser's shared session whatever the
+        // setting, nor any session's or helper's.
+        let served = server(true, None);
+        assert_eq!(served.ctx.conversation, CALLER);
+        assert_ne!(served.ctx.conversation, 0);
     }
 
     #[test]
