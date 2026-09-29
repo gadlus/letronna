@@ -1129,6 +1129,11 @@ fn stream(
     sender: &async_channel::Sender<Event>,
 ) -> Result<(), Failure> {
     let endpoint = validate(connection).map_err(|e| Failure::new(FailureKind::Settings, e))?;
+    // The facts about a model come from its gateway's list, which the window
+    // reads when it opens and the terminal only for /model and /gateways, so
+    // the first request to a host whose list is not known asks for it. This
+    // request does not wait for it.
+    crate::models::ask_for_list(&endpoint, &connection.key);
     // What the window no longer holds goes in as a summary rather than not at
     // all. It is made here, on the worker, so the wait is part of the reply's.
     let (dropped, window) = messages.split_at(start);
