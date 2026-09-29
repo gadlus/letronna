@@ -5,6 +5,7 @@
 //! run a command return `needs_approval`, and the chat shows a card first.
 //! `ask_user` is answered by the user, never run here.
 
+use crate::cancel::Cancel;
 use crate::chat::{Connection, Remote};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -22,6 +23,8 @@ pub struct ToolContext {
     /// The conversation the call is made in, which keeps a browser of its
     /// own; 0 for none in particular.
     pub conversation: u64,
+    /// Stops this call and anything it started.
+    pub cancel: Cancel,
 }
 
 impl ToolContext {
@@ -30,6 +33,7 @@ impl ToolContext {
             workspace: connection.workspace.clone(),
             remote: connection.remote.clone(),
             conversation: connection.conversation,
+            cancel: Cancel::default(),
         }
     }
 
@@ -540,7 +544,7 @@ fn with_utf8_output(command: &str) -> String {
     format!("{UTF8_PRELUDE}{command}")
 }
 
-fn run_shell(command: &str, cwd: Option<&Path>) -> Result<String, String> {
+fn run_shell(command: &str, cwd: Option<&Path>, cancel: &Cancel) -> Result<String, String> {
     use std::process::Stdio;
     let mut child = shell(command, cwd)
         .stdin(Stdio::null())
@@ -569,7 +573,10 @@ fn run_shell(command: &str, cwd: Option<&Path>) -> Result<String, String> {
                 COMMAND_TIMEOUT.as_secs()
             ));
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        if !cancel.sleep(std::time::Duration::from_millis(50)) {
+            let _ = child.kill();
+            return Err("Stopped, and the command was ended before it finished.".into());
+        }
     };
     let (out, err, held_open) = collect(&chunks);
     let mut text = strip_escapes(&String::from_utf8_lossy(&out));
@@ -828,12 +835,13 @@ impl Tool for RunCommand {
             .as_deref()
             .ok_or("No project folder is attached. Ask the user to attach one first.")?;
         if !args["background"].as_bool().unwrap_or(false) {
-            return run_shell(command, Some(cwd));
+            return run_shell(command, Some(cwd), &ctx.cancel);
         }
         let id = crate::jobs::start(command, cwd)?;
         // Give it a moment to fail or announce a port, so the first reply says
-        // something more useful than "started".
-        std::thread::sleep(SETTLE);
+        // something more useful than "started". A stop cuts the moment short,
+        // but the job runs on either way, so it is still reported.
+        ctx.cancel.sleep(SETTLE);
         let log = crate::jobs::log(id).unwrap_or_default();
         let state = if crate::jobs::running(id).unwrap_or(false) {
             "running"
@@ -1037,11 +1045,13 @@ impl Tool for Wait {
             "until": {"type": "string", "description": "Text to watch for in the job's output, such as `ready` or `listening`."}
         }})
     }
-    fn run(&self, args: &Value, _: &ToolContext) -> Result<String, String> {
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         let seconds = args["seconds"].as_f64().unwrap_or(10.).clamp(0., 120.);
         let limit = std::time::Duration::from_secs_f64(seconds);
         let Some(id) = args["job"].as_u64() else {
-            std::thread::sleep(limit);
+            if !ctx.cancel.sleep(limit) {
+                return Err("Stopped before the wait was over.".into());
+            }
             return Ok(format!("Waited {seconds:.0}s."));
         };
         let until = args["until"].as_str().unwrap_or_default();
@@ -1071,7 +1081,9 @@ impl Tool for Wait {
                     log.trim_end()
                 ));
             }
-            std::thread::sleep(std::time::Duration::from_millis(250));
+            if !ctx.cancel.sleep(std::time::Duration::from_millis(250)) {
+                return Err(format!("Stopped waiting. Job #{id} is still running."));
+            }
         }
     }
 }
@@ -1535,7 +1547,7 @@ World"
         } else {
             r"printf 'caf\351\n'; printf 'bad\351\n' >&2"
         };
-        let out = run_shell(print, None).unwrap();
+        let out = run_shell(print, None, &Cancel::default()).unwrap();
         assert_eq!(out, "caf\u{FFFD}\n\n[stderr]\nbad\u{FFFD}\n");
     }
 
@@ -1546,7 +1558,7 @@ World"
         } else {
             r#"printf 'café %s\n' "$PYTHONIOENCODING""#
         };
-        let out = run_shell(print, None).unwrap();
+        let out = run_shell(print, None, &Cancel::default()).unwrap();
         assert_eq!(out.trim_end(), "café utf-8:surrogateescape");
     }
 
@@ -1748,7 +1760,7 @@ World"
         } else {
             r#"printf '\033]0;title\007\033[31mred\033[0m plain\n'"#
         };
-        let out = run_shell(print, None).unwrap();
+        let out = run_shell(print, None, &Cancel::default()).unwrap();
         assert_eq!(out.trim_end(), "red plain");
     }
 
@@ -1765,7 +1777,7 @@ World"
     #[test]
     fn a_background_child_holding_the_pipe_does_not_hang_the_command() {
         let started = Instant::now();
-        let out = run_shell("echo before; sleep 30 & echo $!", None).unwrap();
+        let out = run_shell("echo before; sleep 30 & echo $!", None, &Cancel::default()).unwrap();
         let took = started.elapsed();
         let lines: Vec<&str> = out.lines().collect();
         if let Some(pid) = lines.get(2) {
@@ -1786,6 +1798,7 @@ World"
         let out = run_shell(
             "sleep 2 & head -c 20000 /dev/zero | tr '\\0' a; echo; echo warned >&2; exit 3",
             None,
+            &Cancel::default(),
         )
         .unwrap();
         let (note, rest) = out.split_once('\n').unwrap();
@@ -1922,5 +1935,66 @@ World"
         // A tool it does not know is parsed as sent.
         let unknown = parse_args_for("nope", r#"{"id": "3"}"#).unwrap();
         assert_eq!(unknown, json!({"id": "3"}));
+    }
+
+    #[test]
+    fn a_stopped_wait_returns_at_once() {
+        let ctx = ToolContext::default();
+        let stop = ctx.cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            stop.set();
+        });
+        let started = Instant::now();
+        let out = Wait.run(&json!({"seconds": 60}), &ctx).unwrap_err();
+        assert!(out.contains("Stopped"), "{out}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "waited {:?}",
+            started.elapsed()
+        );
+
+        // Waiting on a job hears it too, and says the job is still running.
+        let sleeper = if cfg!(windows) {
+            "Start-Sleep 30"
+        } else {
+            "sleep 30"
+        };
+        let id = crate::jobs::start(sleeper, &std::env::temp_dir()).unwrap();
+        let out = Wait.run(&json!({"job": id, "seconds": 60, "until": "ready"}), &ctx);
+        crate::jobs::stop(id).unwrap();
+        let out = out.unwrap_err();
+        assert!(out.contains("still running"), "{out}");
+    }
+
+    #[test]
+    fn a_stopped_command_is_killed_and_says_so() {
+        let dir = std::env::temp_dir().join(format!("letronna-stop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Only the first mark may appear: the second would mean it ran on.
+        let command = if cfg!(windows) {
+            "Set-Content started x; Start-Sleep 1; Set-Content finished x"
+        } else {
+            "echo x > started; sleep 1; echo x > finished"
+        };
+        let cancel = Cancel::default();
+        let stop = cancel.clone();
+        let mark = dir.join("started");
+        std::thread::spawn(move || {
+            // A cold PowerShell start can take seconds, and a stop before the
+            // command runs would prove nothing.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !mark.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            stop.set();
+        });
+        let out = run_shell(command, Some(&dir), &cancel).unwrap_err();
+        assert!(out.contains("Stopped"), "{out}");
+        assert!(dir.join("started").exists(), "stopped before it ran");
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(!dir.join("finished").exists(), "it ran on after the stop");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
