@@ -23,7 +23,10 @@ const MAX_ROWS: usize = 28;
 
 /// The diff for a call, or `None` for a tool that does not change a file.
 pub fn of(name: &str, args: &str, ctx: &ToolContext) -> Option<Vec<String>> {
-    let args: Value = serde_json::from_str(args).ok()?;
+    let mut args: Value = serde_json::from_str(args).ok()?;
+    // Read under the names the tool runs with, or an edit sent as
+    // `old_string` would be approved as an empty diff.
+    letronna_core::tools::rename_aliases(name, &mut args);
     let path = args["path"].as_str().unwrap_or_default();
     match name {
         "write_file" => {
@@ -270,5 +273,15 @@ mod tests {
                 .iter()
                 .any(|r| matches!(r, Row::Same(text) if text.contains("unchanged")))
         );
+    }
+
+    #[test]
+    fn an_edit_sent_with_other_names_shows_its_diff() {
+        let edit = r#"{"file_path": "a.txt", "old_string": "two", "new_string": "three"}"#;
+        let rows = of("edit_file", edit, &ToolContext::default())
+            .unwrap()
+            .join("\n");
+        assert!(rows.contains("- two"), "{rows}");
+        assert!(rows.contains("+ three"), "{rows}");
     }
 }

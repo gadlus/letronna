@@ -19,6 +19,78 @@ use gpui_component::{button::ButtonVariant, dialog::DialogButtonProps};
 
 const CODE_LINE: Pixels = px(18.);
 
+/// Micro labels: the site's 10px `.micro` half a pixel larger, since gpui
+/// cannot space the letters out as the site does.
+const MICRO: Pixels = px(10.5);
+
+/// Page titles, the dashboard's smallest `.dash-title`.
+const PAGE_TITLE: Pixels = px(40.);
+
+/// wordmark.svg's width over its height, 5427 by 785 in its own units.
+const WORDMARK_ASPECT: f32 = 5427. / 785.;
+
+/// A small label in DM Mono capitals, the site's `.micro`: sidebar groups,
+/// the model over a reply, key hints.
+pub(crate) fn micro(text: &str, cx: &App) -> Div {
+    div()
+        .font_family(data_font(cx))
+        .text_size(MICRO)
+        .text_color(cx.theme().muted_foreground)
+        .child(capitals(text))
+}
+
+/// A section label in Barlow Condensed capitals: dialog titles and the heads
+/// of settings pages and forms.
+pub(crate) fn section(text: &str, cx: &App) -> Div {
+    div()
+        .font_family(display_font(cx))
+        .font_weight(FontWeight::MEDIUM)
+        .text_size(px(14.))
+        .child(capitals(text))
+}
+
+/// The site's display type, light condensed capitals with no leading: page
+/// titles and the empty chat's greeting. Only at 28px and up, as weight 200
+/// breaks up on a dark page below that.
+pub(crate) fn display(text: &str, size: Pixels, cx: &App) -> Div {
+    div()
+        .font_family(display_font(cx))
+        .font_weight(FontWeight::EXTRA_LIGHT)
+        .text_size(size)
+        .line_height(size)
+        .child(capitals(text))
+}
+
+/// A page's head, after the dashboard's `.dash-top`: its title over a muted
+/// line saying what the page is for.
+pub(crate) fn page_header(title: &str, blurb: &'static str, cx: &App) -> Div {
+    v_flex()
+        .gap_2()
+        .child(display(title, PAGE_TITLE, cx))
+        .child(
+            div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(blurb),
+        )
+}
+
+/// letronna.ai's wordmark, its star and "Letronna" in Bodoni Moda outlines,
+/// `height` tall.
+pub(crate) fn wordmark(height: Pixels, cx: &App) -> Svg {
+    svg()
+        .path("icons/wordmark.svg")
+        .h(height)
+        .w(height * WORDMARK_ASPECT)
+        .text_color(cx.theme().foreground)
+}
+
+/// Words in capitals, raised as they are drawn: gpui has no text-transform,
+/// and this way every label stays in sentence case where it is written.
+fn capitals(text: &str) -> SharedString {
+    text.to_uppercase().into()
+}
+
 /// Ask before something is removed for good. The button says what it does
 /// and is red, where a plain "OK" read as agreeing to carry on.
 pub(crate) fn confirm_delete(
@@ -32,7 +104,7 @@ pub(crate) fn confirm_delete(
     window.open_dialog(cx, move |dialog, _, cx| {
         let delete = delete.clone();
         dialog
-            .title(div().font_family(HEADING_FONT).child(title))
+            .title(section(title, cx))
             .w(px(420.))
             .confirm()
             .button_props(
@@ -98,4 +170,19 @@ pub(crate) fn code_block(
         )
         .vertical_scrollbar(&scroll)
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::capitals;
+
+    #[test]
+    fn micro_uppercases_at_draw_time() {
+        // Written in sentence case, drawn in capitals: accents and the
+        // letters that grow (ß to SS) follow Unicode, numbers and marks stay.
+        assert_eq!(capitals("Today"), "TODAY");
+        assert_eq!(capitals("Plan · 2 of 5 done"), "PLAN · 2 OF 5 DONE");
+        assert_eq!(capitals("gpt-5.1-mini"), "GPT-5.1-MINI");
+        assert_eq!(capitals("Résumé straße"), "RÉSUMÉ STRASSE");
+    }
 }

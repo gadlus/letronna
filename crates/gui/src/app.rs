@@ -116,11 +116,18 @@ pub(crate) struct Chat {
     pub(crate) busy: bool,
     /// The turn in flight, if any. Owns the streamed reply and the tool queue.
     pub(crate) turn: Option<agent::Turn>,
+    /// Stops the tool the turn in flight is running, when set.
+    pub(crate) turn_stop: letronna_core::cancel::Cancel,
     /// The session id currently receiving a streamed reply, if any.
     pub(crate) streaming_id: Option<u64>,
-    /// Tools the user allowed for the rest of this run of the app.
-    pub(crate) session_allow: std::collections::HashSet<String>,
-    /// Sessions started by an unattended schedule, which run tools without
+    /// The id of the queued call the approval card is up for, decided once
+    /// when the queue stopped on it.
+    pub(crate) asking: Option<String>,
+    /// Tools the user allowed for the rest of this run of the app, by the
+    /// session they were allowed in. Keyed like `unattended`: "stop asking"
+    /// about a tool in one chat is not a yes to it in every other chat.
+    pub(crate) session_allow: std::collections::HashMap<u64, std::collections::HashSet<String>>,
+    /// Sessions running an unattended schedule, which run tools without
     /// asking. Keyed by session so the grant cannot reach the user's own
     /// chats: a job saying "do not ask me at 9am" is not permission to stop
     /// asking everywhere else.
@@ -146,10 +153,14 @@ pub(crate) struct Chat {
     /// The session each remote chat is talking in, so a follow-up keeps its
     /// context. `/new` from the chat starts another.
     pub(crate) remote_session: std::collections::HashMap<letronna_core::messaging::Source, u64>,
-    /// Bumped when a turn is stopped. The stream and tool threads of the
-    /// stopped turn cannot be interrupted, so they run on; what they send
-    /// back carries the old number and is dropped.
+    /// Bumped when a turn is stopped. The stream thread of the stopped turn
+    /// cannot be interrupted, and a tool that does not listen to `turn_stop`
+    /// runs on; what they send back carries the old number and is dropped.
     pub(crate) generation: u64,
+    /// What reads the reply in flight. Kept rather than detached, so that
+    /// Stop drops the receiver at once, which is how the worker learns to
+    /// give up, even in the middle of a wait to try again.
+    pub(crate) reading: Option<Task<()>>,
     /// A remote chat that has been sent the card the turn is waiting on, and
     /// the call it is about. Its next message answers it.
     pub(crate) remote_waiting: Option<(
@@ -171,9 +182,18 @@ pub(crate) struct Chat {
     /// Selected row on the Messaging page.
     pub(crate) channel: usize,
     pub(crate) skills: Vec<letronna_core::skills::Skill>,
-    pub(crate) editing_skill: Option<u64>,
+    /// The name of the skill being edited, or empty for a new one.
+    pub(crate) editing_skill: Option<String>,
     pub(crate) skill_name: Entity<InputState>,
     pub(crate) skill_prompt: Entity<InputState>,
+    /// What you sent while a reply was running in its session, oldest
+    /// first. It goes in at the reply's next step, as Claude Code does, or
+    /// as the next prompt if the reply ends first.
+    pub(crate) follow_ups: Vec<String>,
+    /// Queued text a stopped or failed reply never took, on its way back
+    /// into the box; set where there is no window to hand, put there when
+    /// the window next draws.
+    pub(crate) returned_follow_ups: Option<String>,
     /// Your message being changed in place, by session id and place.
     pub(crate) editing_message: Option<(u64, usize)>,
     /// The box a message is changed in.
@@ -210,6 +230,7 @@ impl Chat {
         std::thread::spawn(letronna_core::browser::close_left_over);
         if store.conversations.is_empty() {
             store.conversations.push(Conversation {
+                id: store.reserve_id(),
                 title: "New session".into(),
                 updated: backend::now(),
                 ..Default::default()
@@ -348,6 +369,13 @@ impl Chat {
                 }
             }),
         ];
+        // An empty list and the message when the old skills.json will not
+        // parse; a copy of it has already been kept.
+        let workspace = store.conversations[store.active].workspace.as_deref();
+        let (skills, skills_error) = match letronna_core::skills::list(workspace) {
+            Ok(skills) => (skills, None),
+            Err(why) => (Vec::new(), Some(why)),
+        };
         let mut this = Self {
             page: Page::Chat,
             sidebar_open: true,
@@ -385,8 +413,10 @@ impl Chat {
             rename,
             busy: false,
             turn: None,
+            turn_stop: Default::default(),
             streaming_id: None,
-            session_allow: std::collections::HashSet::new(),
+            asking: None,
+            session_allow: std::collections::HashMap::new(),
             unattended: std::collections::HashSet::new(),
             answer,
             job_tick: false,
@@ -401,6 +431,7 @@ impl Chat {
             remote: std::collections::HashMap::new(),
             remote_session: std::collections::HashMap::new(),
             generation: 0,
+            reading: None,
             remote_waiting: None,
             messaging_stop: None,
             token_input,
@@ -412,10 +443,12 @@ impl Chat {
             bot_name: None,
             discord_bot_name: None,
             channel: 0,
-            skills: letronna_core::skills::load(),
+            skills,
             editing_skill: None,
             skill_name,
             skill_prompt,
+            follow_ups: Vec::new(),
+            returned_follow_ups: None,
             editing_message: None,
             edit_message,
             thinking_open: std::collections::HashSet::new(),
@@ -423,7 +456,7 @@ impl Chat {
             video_frame: None,
             browser: cx.new(|cx| crate::ui::browser::BrowserView::new(window, cx)),
             browser_for: 0,
-            error,
+            error: error.or(skills_error),
             updating: Default::default(),
             update_note: None,
             scroll: ScrollHandle::new(),
@@ -520,7 +553,11 @@ impl Chat {
     }
 
     pub(crate) fn save(&mut self) {
-        if self.store.save().is_err() {
+        if let Err(error) = self.store.save() {
+            letronna_core::diag::event(
+                "save_failed",
+                &[("error", error.kind().to_string().into())],
+            );
             self.error =
                 Some("Could not save chat history. Your current chat remains in memory.".into());
         }
@@ -532,7 +569,7 @@ impl Chat {
             .workspace
             .clone();
         self.store.conversations.push(Conversation {
-            id: self.store.next_id(),
+            id: self.store.reserve_id(),
             title: "New session".into(),
             updated: backend::now(),
             workspace,
@@ -549,10 +586,13 @@ impl Chat {
     }
 
     pub(crate) fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let prompt = self.composer.read(cx).value().trim().to_owned();
+        if self.busy && !prompt.is_empty() {
+            return self.queue_follow_up(prompt, window, cx);
+        }
         if self.busy {
             return;
         }
-        let prompt = self.composer.read(cx).value().trim().to_owned();
         if prompt.is_empty() {
             self.composer
                 .update(cx, |input, cx| input.set_value("", window, cx));
@@ -598,6 +638,11 @@ impl Chat {
             plan: self.plan_mode,
             effort: self.store.settings.effort.clone(),
             search: self.store.settings.search,
+            // A schedule's run and a chat app's turn may have nobody watching.
+            unattended: remote.is_some()
+                || self
+                    .scheduled
+                    .contains(&self.store.conversations[self.store.active].id),
             remote,
             conversation: self.store.conversations[self.store.active].id,
         };
@@ -687,7 +732,7 @@ impl Chat {
         cx: &mut Context<Self>,
     ) {
         self.store.conversations.push(Conversation {
-            id: self.store.next_id(),
+            id: self.store.reserve_id(),
             title: schedule.name.clone(),
             updated: backend::now(),
             workspace: schedule.workspace.clone(),
@@ -707,6 +752,7 @@ impl Chat {
             // The gateway is not usable, so the run never started and
             // `finish` will not come round to report it.
             self.scheduled.remove(&session);
+            self.unattended.remove(&session);
             let error = self.error.clone().unwrap_or_default();
             self.send_report(schedule.name.clone(), format!("Did not start: {error}"), cx);
         }
@@ -731,7 +777,7 @@ impl Chat {
         turn.live = agent::Live::default();
         cx.notify();
         let generation = self.generation;
-        cx.spawn(async move |this, cx| {
+        self.reading = Some(cx.spawn(async move |this, cx| {
             while let Ok(event) = receiver.recv().await {
                 let finished = matches!(event, Event::Finished(_));
                 let current = this.update(cx, |this, cx| {
@@ -745,8 +791,7 @@ impl Chat {
                     break;
                 }
             }
-        })
-        .detach();
+        }));
     }
 
     fn on_event(&mut self, event: Event, cx: &mut Context<Self>) {
@@ -756,7 +801,7 @@ impl Chat {
         turn.absorb(&event);
         match event {
             Event::Finished(Err(error)) => {
-                self.error = Some(error);
+                self.error = Some(error.to_string());
                 self.finish(cx);
             }
             Event::Finished(Ok(())) => self.on_reply(cx),
@@ -773,6 +818,7 @@ impl Chat {
         };
         let reply = turn.take_reply(&model);
         let calls = reply.tool_calls.clone();
+        let continuation = turn.continuation();
         // The session may have been switched or deleted while it streamed.
         let Some(ix) = self.streaming_id.and_then(|id| self.store.index_of(id)) else {
             self.finish(cx);
@@ -780,7 +826,21 @@ impl Chat {
         };
         let conversation = &mut self.store.conversations[ix];
         conversation.updated = backend::now();
-        conversation.messages.push(reply);
+        // A reply cut off inside a tool call, with no text before it, leaves
+        // nothing to keep.
+        if !reply.content.is_empty() || !calls.is_empty() {
+            conversation.messages.push(reply);
+        }
+        match continuation {
+            Ok(Some(notice)) => {
+                conversation.messages.push(notice);
+                self.save();
+                self.run_turn(cx);
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => self.error = Some(error),
+        }
         self.save();
         let more = self.turn.as_mut().is_some_and(|turn| turn.begin(calls));
         if more {
@@ -797,12 +857,23 @@ impl Chat {
         };
         let gate = |name: &str| self.needs_user(name);
         let next = turn.next(gate);
+        self.asking = match &next {
+            agent::Next::AskUser(call) => Some(call.id.clone()),
+            _ => None,
+        };
         if let agent::Next::AskUser(call) | agent::Next::Run(call) = &next {
             self.show_browser(&call.name, cx);
         }
         match next {
             agent::Next::Done => self.finish(cx),
             agent::Next::AskUser(call) => {
+                // A plan that did not come through whole goes back to the
+                // model; approving it would lift plan mode for nothing.
+                if call.name == letronna_core::tools::EXIT_PLAN
+                    && let Err(error) = letronna_core::tools::plan_of(&call.arguments)
+                {
+                    return self.record_result(Err(error), cx);
+                }
                 self.ask_remote(call, cx);
                 cx.notify()
             }
@@ -817,7 +888,19 @@ impl Chat {
                     .map(|turn| turn.take_results())
                     .unwrap_or_default();
                 if let Some(ix) = self.streaming_id.and_then(|id| self.store.index_of(id)) {
-                    self.store.conversations[ix].messages.extend(results);
+                    let conversation = &mut self.store.conversations[ix];
+                    conversation.messages.extend(results);
+                    // What you sent while it worked goes in now: after the
+                    // tool results, before the model is asked again, so it
+                    // reads it before going on.
+                    conversation
+                        .messages
+                        .extend(self.follow_ups.drain(..).map(|text| Message {
+                            role: "user".into(),
+                            content: text,
+                            folded: true,
+                            ..Default::default()
+                        }));
                     self.save();
                     self.run_turn(cx);
                 } else {
@@ -829,11 +912,12 @@ impl Chat {
 
     /// Run one call off the UI thread and continue the queue when it returns.
     fn execute_call(&mut self, call: backend::ToolCall, cx: &mut Context<Self>) {
-        let ctx = self
+        let mut ctx = self
             .turn
             .as_ref()
             .map(agent::Turn::tool_context)
             .unwrap_or_default();
+        ctx.cancel = self.turn_stop.clone();
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
             let _ = tx.send_blocking(letronna_core::tools::run(&call.name, &call.arguments, &ctx));
@@ -982,7 +1066,7 @@ impl Chat {
                     .workspace
                     .clone();
                 self.store.conversations.push(Conversation {
-                    id: self.store.next_id(),
+                    id: self.store.reserve_id(),
                     title: message.text.chars().take(40).collect(),
                     updated: backend::now(),
                     workspace,
@@ -1068,37 +1152,38 @@ impl Chat {
         self.tell_remote(&source, &reply, cx);
     }
 
-    /// Whether this call has to wait for the user. `ask_user` always does:
-    /// it is a question, not an action to permit.
+    /// Whether this call has to wait for the user. `ask_user` does unless the
+    /// session is unattended: it is a question, not an action to permit.
     pub(crate) fn needs_user(&self, name: &str) -> bool {
         let unattended = self
             .streaming_id
             .is_some_and(|id| self.unattended.contains(&id));
+        // A chat app is kept in plan mode by its owner's setting, which nobody
+        // on the far end may lift, so nobody there can approve a plan either.
+        let chat_app = name == letronna_core::tools::EXIT_PLAN
+            && self
+                .turn
+                .as_ref()
+                .is_some_and(|turn| turn.connection.remote.is_some());
+        let none = std::collections::HashSet::new();
         agent::needs_user(
             name,
             self.store.settings.skip_approvals,
-            &self.session_allow,
-            unattended,
+            allowed_in(&self.session_allow, self.streaming_id).unwrap_or(&none),
+            unattended || chat_app,
         )
     }
 
     /// Store the model's checklist on the session so the composer can show it.
     fn apply_todo(&mut self, arguments: &str, cx: &mut Context<Self>) {
-        let result = parse_todos(arguments).map(|todos| {
-            let done = todos.iter().filter(|t| t.status == "done").count();
-            (todos, done)
-        });
-        let message = match result {
-            Ok((todos, done)) => {
-                let total = todos.len();
-                if let Some(ix) = self.streaming_id.and_then(|id| self.store.index_of(id)) {
-                    self.store.conversations[ix].todos = todos;
-                    self.save();
-                }
-                Ok(format!("Checklist updated: {done} of {total} done."))
-            }
-            Err(error) => Err(error),
-        };
+        let mut todos = Vec::new();
+        let message = letronna_core::store::apply_todo(&mut todos, arguments);
+        if message.is_ok()
+            && let Some(ix) = self.streaming_id.and_then(|id| self.store.index_of(id))
+        {
+            self.store.conversations[ix].todos = todos;
+            self.save();
+        }
         self.record_result(message, cx);
     }
 
@@ -1134,25 +1219,60 @@ impl Chat {
     /// The user answered the approval card, here or from a chat.
     pub(crate) fn resolve_call(&mut self, verdict: Verdict, cx: &mut Context<Self>) {
         self.remote_waiting = None;
-        let Some(call) = self
+        let Some((call, true)) = self
             .turn
             .as_ref()
-            .and_then(|turn| match turn.next(|_| true) {
-                agent::Next::AskUser(call) => Some(call),
-                _ => None,
-            })
+            .and_then(|turn| front_call(turn, self.asking.as_deref()))
         else {
             return;
         };
+        self.asking = None;
+        if call.name == letronna_core::tools::EXIT_PLAN {
+            let approved = matches!(verdict, Verdict::Allow { .. });
+            // The Plan switch goes off with it, so the next message carries
+            // on out of plan mode too.
+            if approved {
+                self.plan_mode = false;
+            }
+            if let Some(turn) = self.turn.as_mut() {
+                turn.answer_plan(approved);
+            }
+            self.advance_tools(cx);
+            return;
+        }
+        // Answered: until the queue moves on, the card shows the call running.
+        cx.notify();
         match verdict {
             Verdict::Answer(text) => self.record_result(Ok(text), cx),
             Verdict::Deny => self.record_result(Err(letronna_core::tools::DECLINED.into()), cx),
             Verdict::Allow { remember } => {
-                if remember {
-                    self.session_allow.insert(call.name.clone());
+                if remember && let Some(id) = self.streaming_id {
+                    self.session_allow
+                        .entry(id)
+                        .or_default()
+                        .insert(call.name.clone());
                 }
                 self.execute_call(call, cx);
             }
+        }
+    }
+
+    /// Decide the call the card is up for again after an approval setting
+    /// changed, so it runs at once if it no longer needs the user.
+    pub(crate) fn approvals_changed(&mut self, cx: &mut Context<Self>) {
+        let waiting = self
+            .turn
+            .as_ref()
+            .and_then(|turn| front_call(turn, self.asking.as_deref()))
+            .is_some_and(|(_, waiting)| waiting);
+        // Advancing past a call that is already running would start it twice.
+        if !waiting {
+            return;
+        }
+        self.advance_tools(cx);
+        // The chat that was sent the card must not answer a call that ran.
+        if self.asking.is_none() {
+            self.remote_waiting = None;
         }
     }
 
@@ -1230,6 +1350,13 @@ impl Chat {
             return;
         }
         self.generation += 1;
+        // Stopping is not a go-ahead for what was queued: it goes back in
+        // the box rather than being sent.
+        self.return_follow_ups();
+        // Reaches the running tool, so a wait or a command ends now rather
+        // than running on unseen. Taken, so the next turn starts unstopped.
+        std::mem::take(&mut self.turn_stop).set();
+        self.reading = None;
         self.remote_waiting = None;
         if let Some(id) = self.streaming_id {
             if let Some(source) = self.remote.remove(&id) {
@@ -1268,11 +1395,109 @@ impl Chat {
     fn finish(&mut self, cx: &mut Context<Self>) {
         self.answer_remote(cx);
         self.report_scheduled(cx);
+        let session = self.streaming_id;
+        // The grant is for the run, not the session: a follow-up typed there
+        // has someone watching, and a deleted session's id is handed out again.
+        if let Some(id) = self.streaming_id {
+            self.unattended.remove(&id);
+        }
         self.busy = false;
         self.streaming_id = None;
         self.turn = None;
         plugins::emit(cx, plugins::AppEvent::ChatIdle);
+        self.send_follow_ups(session, cx);
         cx.notify();
+    }
+
+    /// Queue what was typed while a reply runs, for its next step. Only in
+    /// the session that is working: elsewhere it would land in the wrong
+    /// conversation.
+    fn queue_follow_up(&mut self, prompt: String, window: &mut Window, cx: &mut Context<Self>) {
+        let here = self.store.conversations[self.store.active].id;
+        let refused = if self.streaming_id != Some(here) {
+            Some("Another session is working. Send this when it is done, or stop it first.")
+        } else if prompt.chars().count() > 12_000 {
+            Some("Please keep each message under 12,000 characters.")
+        } else {
+            None
+        };
+        if let Some(why) = refused {
+            // Kept as typed, without the line Enter added.
+            self.composer
+                .update(cx, |input, cx| input.set_value(prompt, window, cx));
+            self.error = Some(why.into());
+            cx.notify();
+            return;
+        }
+        self.follow_ups.push(prompt);
+        self.composer
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.follow();
+        cx.notify();
+    }
+
+    /// A reply that ended before a step could take what was queued: send it
+    /// as the next prompt, in the session it was written for, whichever one
+    /// is on screen now.
+    fn send_follow_ups(&mut self, session: Option<u64>, cx: &mut Context<Self>) {
+        if self.follow_ups.is_empty() {
+            return;
+        }
+        // A reply that failed would most likely fail again.
+        let Some(ix) = session
+            .and_then(|id| self.store.index_of(id))
+            .filter(|_| self.error.is_none())
+        else {
+            return self.return_follow_ups();
+        };
+        let text = std::mem::take(&mut self.follow_ups).join("\n\n");
+        let viewing = self.store.active;
+        self.store.active = ix;
+        let sent = self.dispatch(text.clone(), None, cx).is_ok();
+        self.store.active = viewing;
+        if !sent {
+            self.returned_follow_ups = Some(text);
+        }
+    }
+
+    /// Take a queued message back before it goes: into the box to change it,
+    /// or away altogether.
+    pub(crate) fn unqueue(
+        &mut self,
+        n: usize,
+        to_box: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if n >= self.follow_ups.len() {
+            return;
+        }
+        let text = self.follow_ups.remove(n);
+        if to_box {
+            self.composer.update(cx, |input, cx| {
+                let typed = input.value().trim().to_owned();
+                let value = if typed.is_empty() {
+                    text
+                } else {
+                    format!("{text}\n\n{typed}")
+                };
+                input.set_value(value, window, cx);
+            });
+            self.focus_composer(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Put what was queued back where it was written, for the next draw.
+    fn return_follow_ups(&mut self) {
+        if self.follow_ups.is_empty() {
+            return;
+        }
+        let text = std::mem::take(&mut self.follow_ups).join("\n\n");
+        self.returned_follow_ups = Some(match self.returned_follow_ups.take() {
+            Some(earlier) => format!("{earlier}\n\n{text}"),
+            None => text,
+        });
     }
 }
 
@@ -1285,6 +1510,19 @@ impl Render for Chat {
             letronna_core::browser::show_conversation(on_screen);
         }
         self.keep_following();
+        // What a stopped or failed reply did not take goes back in the box,
+        // ahead of anything typed since.
+        if let Some(text) = self.returned_follow_ups.take() {
+            self.composer.update(cx, |input, cx| {
+                let typed = input.value().trim().to_owned();
+                let value = if typed.is_empty() {
+                    text
+                } else {
+                    format!("{text}\n\n{typed}")
+                };
+                input.set_value(value, window, cx);
+            });
+        }
         // A job starting or exiting happens off the UI thread, so the footer
         // chips need a poll while any of them is alive. It stops on its own.
         if !self.job_tick && letronna_core::jobs::list().iter().any(|job| job.running) {
@@ -1477,6 +1715,9 @@ impl Render for Chat {
                 if let Some(card) = self.approval_card(window, cx) {
                     rows_here.push(card);
                 }
+                for (n, text) in self.follow_ups.iter().enumerate() {
+                    rows_here.push(self.queued_row(n, text, cx));
+                }
             }
             let rows: Vec<AnyElement> = turns
                 .into_iter()
@@ -1554,7 +1795,7 @@ impl Render for Chat {
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .font_family(BODY_FONT)
+            .font(text_font(cx))
             .text_sm()
             .relative()
             .key_context("Chat")
@@ -1585,18 +1826,107 @@ impl Render for Chat {
     }
 }
 
-/// The checklist a `todo` call sets, from its arguments.
-pub(crate) fn parse_todos(arguments: &str) -> std::result::Result<Vec<Todo>, String> {
-    let args = letronna_core::tools::parse_args(arguments)?;
-    let items = args["items"]
-        .as_array()
-        .ok_or_else(|| "`items` is required.".to_owned())?;
-    Ok(items
-        .iter()
-        .map(|item| Todo {
-            text: item["text"].as_str().unwrap_or_default().to_owned(),
-            status: item["status"].as_str().unwrap_or("pending").to_owned(),
-        })
-        .filter(|todo| !todo.text.is_empty())
-        .collect())
+/// The tools the user stopped being asked about in `session`, and none when
+/// no session is running.
+fn allowed_in(
+    session_allow: &std::collections::HashMap<u64, std::collections::HashSet<String>>,
+    session: Option<u64>,
+) -> Option<&std::collections::HashSet<String>> {
+    session.and_then(|id| session_allow.get(&id))
+}
+
+/// The call at the front of the queue, and whether the approval card is up
+/// for it rather than it running.
+pub(crate) fn front_call(
+    turn: &agent::Turn,
+    asking: Option<&str>,
+) -> Option<(backend::ToolCall, bool)> {
+    // `true` shows whatever is at the front, running or not. Which of the two
+    // it is was decided when the queue stopped on it; the card shows that
+    // rather than deciding again on every frame, which looked the tool up in
+    // a freshly built tool list each time.
+    match turn.next(|_| true) {
+        agent::Next::AskUser(call) => {
+            let waiting = asking == Some(call.id.as_str());
+            Some((call, waiting))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
+    // would shadow the built-in attribute.
+    use super::{allowed_in, front_call};
+    use letronna_core::agent::{Next, Turn, needs_user};
+    use letronna_core::chat::{Connection, ToolCall};
+    use std::collections::{HashMap, HashSet};
+
+    /// A turn whose queue holds one `write_file` call.
+    fn writing() -> Turn {
+        let mut turn = Turn::new(Connection::default());
+        turn.begin(vec![ToolCall {
+            id: "call-1".into(),
+            name: "write_file".into(),
+            arguments: "{}".into(),
+        }]);
+        turn
+    }
+
+    #[test]
+    fn a_tool_allowed_in_one_session_is_still_asked_about_in_another() {
+        let mut session_allow = HashMap::new();
+        session_allow.insert(1, HashSet::from(["write_file".to_owned()]));
+        let allowed = |session| {
+            allowed_in(&session_allow, session).is_some_and(|tools| tools.contains("write_file"))
+        };
+        assert!(allowed(Some(1)));
+        assert!(!allowed(Some(2)));
+        assert!(!allowed(None));
+    }
+
+    #[test]
+    fn the_card_is_up_only_for_the_call_the_queue_stopped_on() {
+        let mut turn = Turn::new(Connection::default());
+        turn.begin(vec![ToolCall {
+            id: "call-1".into(),
+            name: "write_file".into(),
+            arguments: "{}".into(),
+        }]);
+        assert!(
+            front_call(&turn, Some("call-1"))
+                .is_some_and(|(call, waiting)| call.id == "call-1" && waiting)
+        );
+        // Answered, or let run when the queue reached it.
+        assert!(front_call(&turn, None).is_some_and(|(_, waiting)| !waiting));
+        // Stopped on an earlier call, which has left the queue since.
+        assert!(front_call(&turn, Some("call-0")).is_some_and(|(_, waiting)| !waiting));
+        assert!(front_call(&Turn::new(Connection::default()), Some("call-1")).is_none());
+    }
+
+    #[test]
+    fn a_call_that_was_answered_or_never_asked_about_has_no_card() {
+        let turn = writing();
+        assert!(front_call(&turn, None).is_some_and(|(_, waiting)| !waiting));
+        assert!(front_call(&turn, Some("an-earlier-call")).is_some_and(|(_, waiting)| !waiting));
+        assert!(front_call(&Turn::new(Connection::default()), Some("call-1")).is_none());
+    }
+
+    #[test]
+    fn a_card_stays_up_when_approvals_are_switched_off_until_the_call_is_decided_again() {
+        let turn = writing();
+        let none = HashSet::new();
+        let Next::AskUser(asked) = turn.next(|name| needs_user(name, false, &none, false)) else {
+            panic!("write_file should wait for the user while approvals are on");
+        };
+        // The card keeps its buttons rather than showing a call as running
+        // that nothing started.
+        assert!(front_call(&turn, Some(&asked.id)).is_some_and(|(_, waiting)| waiting));
+        // Deciding again with approvals off runs it.
+        assert!(matches!(
+            turn.next(|name| needs_user(name, true, &none, false)),
+            Next::Run(_)
+        ));
+    }
 }

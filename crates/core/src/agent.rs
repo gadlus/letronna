@@ -20,6 +20,20 @@ use std::collections::{HashSet, VecDeque};
 /// enough that a looping model stops on its own.
 pub const MAX_ROUNDS: usize = 25;
 
+/// Times one user message may ask a reply cut off at the output limit to go
+/// on. Three more replies make an answer four times the cap; one still
+/// running past that is more likely looping than nearly done.
+const MAX_CONTINUATIONS: usize = 3;
+
+/// The notice that asks a reply cut off at the output limit to go on.
+const CONTINUE: &str =
+    "Your last reply was cut off at the output limit; continue exactly where it stopped.";
+
+/// The notice for a reply cut off inside a tool call, which was not run.
+const CALL_AGAIN: &str = "Your last reply was cut off at the output limit in the middle \
+    of a tool call, so the call was not run. Make it again with less in it, splitting the \
+    work over several calls if it needs more room.";
+
 /// What the caller should do next.
 #[derive(Debug, PartialEq)]
 pub enum Next {
@@ -44,6 +58,8 @@ pub struct Live {
     pub prompt_tokens: u64,
     pub cached_tokens: u64,
     pub calls: Vec<ToolCall>,
+    /// The try about to be made again after a failure, while it waits.
+    pub retrying: Option<crate::retry::Retry>,
 }
 
 /// One user turn in flight.
@@ -51,11 +67,16 @@ pub struct Turn {
     pub connection: Connection,
     pub live: Live,
     rounds: usize,
+    limit: usize,
     queue: VecDeque<ToolCall>,
     /// Tool results for the batch being worked through.
     results: Vec<Message>,
     /// What the calls' file writes kept, taken onto each result.
     files: crate::history::Log,
+    /// Set when the reply being streamed stopped at the output limit: true
+    /// when it stopped inside a tool call.
+    cut_off: Option<bool>,
+    continued: usize,
 }
 
 impl Turn {
@@ -65,8 +86,19 @@ impl Turn {
             connection,
             live: Live::default(),
             rounds: 0,
+            limit: MAX_ROUNDS,
             queue: VecDeque::new(),
             results: Vec::new(),
+            cut_off: None,
+            continued: 0,
+        }
+    }
+
+    /// A turn that may run `rounds` tool rounds instead of `MAX_ROUNDS`.
+    pub fn with_limit(connection: Connection, rounds: usize) -> Self {
+        Self {
+            limit: rounds,
+            ..Self::new(connection)
         }
     }
 
@@ -81,6 +113,8 @@ impl Turn {
 
     /// Fold a streamed event into the reply being built.
     pub fn absorb(&mut self, event: &Event) {
+        // Whatever follows a retry comes from the new try, so it is under way.
+        self.live.retrying = None;
         match event {
             Event::Delta(text) => self.live.content.push_str(text),
             Event::Reasoning(text) => self.live.reasoning.push_str(text),
@@ -96,6 +130,8 @@ impl Turn {
                 self.live.cached_tokens = *cached;
             }
             Event::ToolCalls(calls) => self.live.calls = calls.clone(),
+            Event::Retrying(retry) => self.live.retrying = Some(*retry),
+            Event::CutOff { in_call } => self.cut_off = Some(*in_call),
             Event::Finished(_) => {}
         }
     }
@@ -118,10 +154,32 @@ impl Turn {
         }
     }
 
+    /// The notice asking the model to go on, when the reply just finished
+    /// was cut off at the output limit. An error once it has been asked
+    /// `MAX_CONTINUATIONS` times already, so the turn ends saying why.
+    pub fn continuation(&mut self) -> Result<Option<Message>, String> {
+        let Some(in_call) = self.cut_off.take() else {
+            return Ok(None);
+        };
+        if self.continued >= MAX_CONTINUATIONS {
+            return Err(format!(
+                "The reply was still cut off at the output limit after {MAX_CONTINUATIONS} \
+                 continuations, so it stops here."
+            ));
+        }
+        self.continued += 1;
+        Ok(Some(Message {
+            role: "user".into(),
+            content: if in_call { CALL_AGAIN } else { CONTINUE }.into(),
+            notice: true,
+            ..Default::default()
+        }))
+    }
+
     /// Queue the calls the model asked for. False when the turn should stop
     /// instead: nothing to run, or it has gone round too many times.
     pub fn begin(&mut self, calls: Vec<ToolCall>) -> bool {
-        if calls.is_empty() || self.rounds >= MAX_ROUNDS {
+        if calls.is_empty() || self.rounds >= self.limit {
             return false;
         }
         self.rounds += 1;
@@ -166,19 +224,37 @@ impl Turn {
     pub fn take_results(&mut self) -> Vec<Message> {
         std::mem::take(&mut self.results)
     }
+
+    /// Record the user's answer to the `exit_plan` call at the front of the
+    /// queue; approving turns plan mode off for the rest of the turn, so the
+    /// tools that carry the plan out are offered and allowed again.
+    pub fn answer_plan(&mut self, approved: bool) {
+        let answer = if approved {
+            self.connection.plan = false;
+            tools::PLAN_APPROVED
+        } else {
+            tools::KEEP_PLANNING
+        };
+        self.finish_call(Ok(answer.to_owned()));
+    }
 }
 
 /// Whether a call has to wait for the user.
 ///
 /// `ask_user` always does, whatever else is permitted: it is a question, not
-/// an action to allow. Everything else is a matter of who has already said
-/// yes, and how widely.
+/// an action to allow. `exit_plan` does whenever someone is there to answer,
+/// since no standing permission can approve a plan on the user's behalf; with
+/// nobody there it goes on to run, and is refused. Everything else is a matter
+/// of who has already said yes, and how widely.
 pub fn needs_user(name: &str, skip_all: bool, allowed: &HashSet<String>, unattended: bool) -> bool {
     if !tools::needs_approval(name) {
         return false;
     }
     if name == tools::ASK_USER {
-        return true;
+        return !unattended;
+    }
+    if name == tools::EXIT_PLAN {
+        return !unattended;
     }
     !(skip_all || unattended || allowed.contains(name))
 }
@@ -207,7 +283,21 @@ mod tests {
             effort: String::new(),
             search: false,
             conversation: 0,
+            unattended: false,
         })
+    }
+
+    /// Counts the rounds a turn runs before it refuses another, giving up at
+    /// 1,000 so a turn that never stops fails the test instead of hanging it.
+    fn rounds_before_stopping(mut turn: Turn) -> usize {
+        for round in 0..1_000 {
+            if !turn.begin(vec![call("read_file")]) {
+                return round;
+            }
+            turn.finish_call(Ok("again".into()));
+            turn.take_results();
+        }
+        1_000
     }
 
     #[test]
@@ -231,6 +321,21 @@ mod tests {
         // The next reply must not inherit any of that.
         assert!(turn.live.content.is_empty());
         assert_eq!(turn.take_reply("some-model").tokens, 0);
+    }
+
+    #[test]
+    fn a_retry_is_shown_until_the_next_try_answers() {
+        let mut turn = turn();
+        let retry = crate::retry::Retry {
+            kind: crate::failure::FailureKind::Overloaded,
+            attempt: 2,
+            of: 6,
+            wait: std::time::Duration::from_secs(1),
+        };
+        turn.absorb(&Event::Retrying(retry));
+        assert_eq!(turn.live.retrying, Some(retry));
+        turn.absorb(&Event::Reasoning("thinking".into()));
+        assert_eq!(turn.live.retrying, None);
     }
 
     #[test]
@@ -284,6 +389,17 @@ mod tests {
     }
 
     #[test]
+    fn a_turn_with_a_higher_limit_goes_further() {
+        let turn = Turn::with_limit(turn().connection, 60);
+        assert_eq!(rounds_before_stopping(turn), 60);
+    }
+
+    #[test]
+    fn a_new_turn_still_stops_at_twenty_five() {
+        assert_eq!(rounds_before_stopping(turn()), 25);
+    }
+
+    #[test]
     fn who_gets_asked_and_who_does_not() {
         let none = HashSet::new();
         // Reading never asks.
@@ -294,7 +410,97 @@ mod tests {
         assert!(!needs_user("write_file", false, &none, true));
         let allowed = HashSet::from(["write_file".to_owned()]);
         assert!(!needs_user("write_file", false, &allowed, false));
-        // A question is never auto-answered, however wide the permission.
-        assert!(needs_user(tools::ASK_USER, true, &allowed, true));
+        // A question is never auto-answered, however wide the permission,
+        // unless nobody is there to answer it.
+        assert!(needs_user(tools::ASK_USER, true, &allowed, false));
+        assert!(!needs_user(tools::ASK_USER, false, &none, true));
+    }
+
+    #[test]
+    fn an_unattended_question_is_answered_by_the_tool() {
+        let mut turn = turn();
+        turn.begin(vec![call(tools::ASK_USER)]);
+        let none = HashSet::new();
+        let unattended = |name: &str| needs_user(name, false, &none, true);
+        assert_eq!(turn.next(unattended), Next::Run(call(tools::ASK_USER)));
+        let answer = tools::run(tools::ASK_USER, "{}", &tools::ToolContext::default()).unwrap();
+        assert!(
+            answer.starts_with("Nobody is available to answer"),
+            "{answer}"
+        );
+    }
+
+    #[test]
+    fn approving_a_plan_ends_plan_mode_and_declining_keeps_it() {
+        let plan = HashSet::from([tools::EXIT_PLAN.to_owned()]);
+        // No standing permission approves a plan; with nobody there it runs,
+        // which refuses it.
+        assert!(needs_user(tools::EXIT_PLAN, true, &plan, false));
+        assert!(!needs_user(tools::EXIT_PLAN, false, &plan, true));
+
+        let offers = |turn: &Turn, name: &str| {
+            tools::specs(&turn.connection)
+                .iter()
+                .any(|t| t["function"]["name"] == name)
+        };
+        let gate = |name: &str| needs_user(name, false, &HashSet::new(), false);
+        let mut turn = turn();
+        turn.connection.plan = true;
+        assert!(offers(&turn, tools::EXIT_PLAN) && !offers(&turn, "write_file"));
+
+        turn.begin(vec![call(tools::EXIT_PLAN)]);
+        assert_eq!(turn.next(gate), Next::AskUser(call(tools::EXIT_PLAN)));
+        turn.answer_plan(false);
+        assert!(turn.connection.plan);
+        let kept = turn.take_results();
+        assert_eq!(
+            kept[0].content,
+            "Keep planning: the user wants changes. Ask what to change, or refine the plan."
+        );
+        assert!(!kept[0].is_error);
+
+        turn.begin(vec![call(tools::EXIT_PLAN)]);
+        turn.answer_plan(true);
+        assert!(!turn.connection.plan);
+        assert_eq!(
+            turn.take_results()[0].content,
+            "The user approved this plan. Plan mode is off; carry it out now."
+        );
+        // The rest of the turn can act on the plan, and has no plan to hand over.
+        assert!(offers(&turn, "write_file") && !offers(&turn, tools::EXIT_PLAN));
+    }
+
+    #[test]
+    fn a_reply_cut_off_at_the_limit_goes_on_three_times_then_stops() {
+        let mut turn = turn();
+        // A reply that ended on its own asks for nothing more.
+        turn.absorb(&Event::Delta("Done.".into()));
+        turn.take_reply("some-model");
+        assert!(matches!(turn.continuation(), Ok(None)));
+        for time in 0..MAX_CONTINUATIONS {
+            turn.absorb(&Event::Delta("part".into()));
+            turn.absorb(&Event::CutOff { in_call: false });
+            // The fragment is kept, not thrown away.
+            assert_eq!(turn.take_reply("some-model").content, "part");
+            let notice = turn.continuation().unwrap().expect("a continuation");
+            assert!(notice.notice, "time {time}");
+            assert_eq!(notice.role, "user");
+            assert_eq!(notice.content, CONTINUE);
+        }
+        turn.absorb(&Event::CutOff { in_call: false });
+        assert!(turn.continuation().is_err(), "went on past the cap");
+    }
+
+    #[test]
+    fn a_call_cut_off_at_the_limit_is_asked_for_again() {
+        let mut turn = turn();
+        turn.absorb(&Event::CutOff { in_call: true });
+        let reply = turn.take_reply("some-model");
+        assert!(reply.tool_calls.is_empty());
+        let notice = turn.continuation().unwrap().expect("a continuation");
+        assert!(notice.notice);
+        assert_eq!(notice.content, CALL_AGAIN);
+        // Taken once: the next reply starts clean.
+        assert!(matches!(turn.continuation(), Ok(None)));
     }
 }

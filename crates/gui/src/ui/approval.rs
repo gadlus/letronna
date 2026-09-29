@@ -1,5 +1,5 @@
 //! The card the chat shows when a tool needs the user: approve a write or a
-//! command, or answer an `ask_user` question.
+//! command, answer an `ask_user` question, or approve a plan.
 
 use crate::prelude::*;
 use letronna_core::tools;
@@ -23,15 +23,10 @@ impl Chat {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let turn = self.turn.as_ref()?;
-        // `true` here means "show me whatever is at the front", running or
-        // not; the gate below decides which of the two this is.
-        let call = match turn.next(|_| true) {
-            letronna_core::agent::Next::AskUser(call) => call,
-            _ => return None,
-        };
+        let (call, waiting) = front_call(turn, self.asking.as_deref())?;
         let ctx = tools::ToolContext::of(&turn.connection);
         let summary = tools::summary(&call.name, &call.arguments);
-        if !self.needs_user(&call.name) {
+        if !waiting {
             return Some(
                 h_flex()
                     .gap_2()
@@ -49,7 +44,7 @@ impl Chat {
             );
         }
 
-        let args = tools::parse_args(&call.arguments).unwrap_or_default();
+        let args = tools::parse_args_for(&call.name, &call.arguments).unwrap_or_default();
         let card = v_flex()
             .w_full()
             .gap_3()
@@ -109,6 +104,52 @@ impl Chat {
             );
         }
 
+        if call.name == tools::EXIT_PLAN {
+            let plan = tools::preview(&call.name, &call.arguments, &ctx);
+            return Some(
+                card.child(
+                    div()
+                        .text_sm()
+                        .font_family(BODY_FONT)
+                        .font_weight(FontWeight::MEDIUM)
+                        .child("Letronna has a plan"),
+                )
+                .child(
+                    // Clipped as a reply is: the markdown renderer can report
+                    // a width wider than the card.
+                    div().w_full().overflow_hidden().child(TextView::markdown(
+                        SharedString::from(format!("plan-{}", call.id)),
+                        plan,
+                        window,
+                        cx,
+                    )),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("approve-plan")
+                                .primary()
+                                .small()
+                                .label("Approve and carry on")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.resolve_call(Verdict::Allow { remember: false }, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("keep-planning")
+                                .outline()
+                                .small()
+                                .label("Keep planning")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.resolve_call(Verdict::Deny, cx)
+                                })),
+                        ),
+                )
+                .into_any_element(),
+            );
+        }
+
         let title = match call.name.as_str() {
             "write_file" => format!("Letronna wants to write {summary}"),
             "edit_file" => format!("Letronna wants to edit {summary}"),
@@ -119,55 +160,49 @@ impl Chat {
         };
         let preview = tools::preview(&call.name, &call.arguments, &ctx);
         Some(
-            card.child(
-                div()
-                    .text_sm()
-                    .font_family(HEADING_FONT)
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(title),
-            )
-            .child(
-                // Scrolls only once the preview is long, so a one-line command
-                // does not sit in a tall empty panel.
-                div()
-                    .p_2()
-                    .min_w_0()
-                    .rounded(cx.theme().radius)
-                    .bg(cx.theme().background)
-                    .child(crate::ui::code_block(
-                        "preview",
-                        tools::clamp_lines(&preview, 400),
-                        px(240.),
-                        window,
-                        cx,
-                    )),
-            )
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(
-                        Button::new("allow")
-                            .primary()
-                            .small()
-                            .label("Allow")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.resolve_call(Verdict::Allow { remember: false }, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("allow-session")
-                            .outline()
-                            .small()
-                            .label("Allow for this session")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.resolve_call(Verdict::Allow { remember: true }, cx)
-                            })),
-                    )
-                    .child(Button::new("deny").ghost().small().label("Deny").on_click(
-                        cx.listener(|this, _, _, cx| this.resolve_call(Verdict::Deny, cx)),
-                    )),
-            )
-            .into_any_element(),
+            card.child(div().text_sm().font_weight(FontWeight::MEDIUM).child(title))
+                .child(
+                    // Scrolls only once the preview is long, so a one-line command
+                    // does not sit in a tall empty panel.
+                    div()
+                        .p_2()
+                        .min_w_0()
+                        .rounded(cx.theme().radius)
+                        .bg(cx.theme().background)
+                        .child(crate::ui::code_block(
+                            "preview",
+                            tools::clamp_lines(&preview, 400),
+                            px(240.),
+                            window,
+                            cx,
+                        )),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("allow")
+                                .primary()
+                                .small()
+                                .label("Allow")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.resolve_call(Verdict::Allow { remember: false }, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("allow-session")
+                                .outline()
+                                .small()
+                                .label("Allow for this session")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.resolve_call(Verdict::Allow { remember: true }, cx)
+                                })),
+                        )
+                        .child(Button::new("deny").ghost().small().label("Deny").on_click(
+                            cx.listener(|this, _, _, cx| this.resolve_call(Verdict::Deny, cx)),
+                        )),
+                )
+                .into_any_element(),
         )
     }
 }

@@ -5,7 +5,7 @@
 //! instead. The process keeps running, its output collects in a buffer the
 //! agent can read back, and the chat shows a chip until it is stopped.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Stdio};
@@ -19,8 +19,8 @@ const MAX_LOG: usize = 64_000;
 pub struct Job {
     pub id: u64,
     pub command: String,
-    log: Arc<Mutex<String>>,
-    child: Arc<Mutex<Child>>,
+    log: Arc<Mutex<VecDeque<u8>>>,
+    tree: Tree,
     /// Set once the process has exited and the reader threads are done.
     finished: Arc<AtomicBool>,
     exit_code: Arc<Mutex<Option<i32>>>,
@@ -45,7 +45,7 @@ fn next_id() -> u64 {
 }
 
 /// Drain a pipe into the shared log until the process closes it.
-fn pump(mut source: impl Read + Send + 'static, log: Arc<Mutex<String>>) {
+fn pump(mut source: impl Read + Send + 'static, log: Arc<Mutex<VecDeque<u8>>>) {
     std::thread::spawn(move || {
         let mut block = [0u8; 4096];
         loop {
@@ -53,56 +53,164 @@ fn pump(mut source: impl Read + Send + 'static, log: Arc<Mutex<String>>) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let Ok(mut log) = log.lock() else { break };
-                    log.push_str(&String::from_utf8_lossy(&block[..n]));
-                    if log.len() > MAX_LOG {
-                        // Keep the tail: the newest output is what matters.
-                        let cut = log.len() - MAX_LOG;
-                        let cut = (cut..log.len())
-                            .find(|i| log.is_char_boundary(*i))
-                            .unwrap_or(log.len());
-                        *log = log[cut..].to_owned();
-                    }
+                    append(&mut log, &block[..n]);
                 }
             }
         }
     });
 }
 
+/// Add output to the log, dropping its oldest bytes beyond `MAX_LOG`.
+fn append(log: &mut VecDeque<u8>, bytes: &[u8]) {
+    log.extend(bytes);
+    // Keep the tail: the newest output is what matters.
+    let over = log.len().saturating_sub(MAX_LOG);
+    log.drain(..over);
+}
+
+/// The log as text, starting at its first whole character.
+fn text(log: &mut VecDeque<u8>) -> String {
+    let bytes = log.make_contiguous();
+    // Dropping bytes can leave the tail of a cut character at the front, and a
+    // character is at most four bytes, so at most three of them.
+    let start = bytes
+        .iter()
+        .take(3)
+        .take_while(|b| **b & 0xC0 == 0x80)
+        .count();
+    let mut text = String::from_utf8_lossy(&bytes[start..]).into_owned();
+    // A byte that was never text decodes to a three-byte replacement
+    // character, so keep the limit the text always had as well.
+    if text.len() > MAX_LOG {
+        let cut = (text.len() - MAX_LOG..text.len())
+            .find(|i| text.is_char_boundary(*i))
+            .unwrap_or(text.len());
+        text.drain(..cut);
+    }
+    text
+}
+
+/// A job's shell and everything it starts, held as one Job Object so that
+/// stopping reaches a server the shell launched and not just the shell.
+#[cfg(windows)]
+struct Tree(std::os::windows::io::OwnedHandle);
+
+#[cfg(windows)]
+impl Tree {
+    /// Put a just-started shell in a new Job Object that ends its processes when closed.
+    fn of(child: &Child) -> Result<Tree, String> {
+        use std::os::windows::io::{AsRawHandle, HandleOrNull, OwnedHandle};
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+        let failed = || {
+            format!(
+                "Cannot group the job's processes: {}",
+                std::io::Error::last_os_error()
+            )
+        };
+        // SAFETY: no attributes and no name are both allowed, and the handle
+        // it returns, or null, is ours alone.
+        let job = unsafe {
+            HandleOrNull::from_raw_handle(CreateJobObjectW(std::ptr::null(), std::ptr::null()))
+        };
+        let Ok(job) = OwnedHandle::try_from(job) else {
+            return Err(failed());
+        };
+        // SAFETY: all zeroes is a valid value of this plain C struct.
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        // Letronna holds the only handle, so nothing in the tree outlives it,
+        // even when it exits without stopping its jobs.
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: the job is open, and `limits` is the struct this class
+        // names, passed with its own size.
+        let limited = unsafe {
+            SetInformationJobObject(
+                job.as_raw_handle(),
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_ref(&limits).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if limited == 0 {
+            return Err(failed());
+        }
+        // SAFETY: both handles are open: the job's is owned here and the
+        // child is borrowed.
+        if unsafe { AssignProcessToJobObject(job.as_raw_handle(), child.as_raw_handle()) } == 0 {
+            return Err(failed());
+        }
+        Ok(Tree(job))
+    }
+
+    /// End every process in the tree, with the exit code a killed child gets.
+    fn kill(&self) {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+        // SAFETY: the handle is open for as long as the tree is.
+        unsafe { TerminateJobObject(self.0.as_raw_handle(), 1) };
+    }
+}
+
+/// A job's shell and everything it starts, as the process group the shell
+/// leads.
+#[cfg(unix)]
+struct Tree(libc::pid_t);
+
+#[cfg(unix)]
+impl Tree {
+    /// The group a shell started with `process_group(0)` leads.
+    fn of(child: &Child) -> Result<Tree, String> {
+        Ok(Tree(child.id() as libc::pid_t))
+    }
+
+    /// End every process in the tree, with the signal a killed child gets.
+    fn kill(&self) {
+        // SAFETY: this only sends a signal.
+        unsafe { libc::kill(-self.0, libc::SIGKILL) };
+    }
+}
+
 pub fn start(command: &str, cwd: &Path) -> Result<u64, String> {
-    let mut child = crate::tools::shell(command, Some(cwd))
+    let mut shell = crate::tools::shell(command, Some(cwd));
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut shell, 0);
+    let mut child = shell
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Cannot start the shell: {e}"))?;
+    // At once, so the shell has had as little time as possible to start
+    // anything that would escape the tree.
+    let tree = match Tree::of(&child) {
+        Ok(tree) => tree,
+        Err(e) => {
+            let _ = child.kill();
+            return Err(e);
+        }
+    };
 
-    let log = Arc::new(Mutex::new(String::new()));
+    let log = Arc::new(Mutex::new(VecDeque::new()));
     pump(child.stdout.take().unwrap(), log.clone());
     pump(child.stderr.take().unwrap(), log.clone());
 
     let id = next_id();
-    let child = Arc::new(Mutex::new(child));
     let finished = Arc::new(AtomicBool::new(false));
     let exit_code = Arc::new(Mutex::new(None));
 
-    // Reap the process so `running` turns false on its own.
+    // Reap the process so `running` turns false on its own. Stopping goes
+    // through the tree, so this can own the child and wait for it.
     {
-        let (child, finished, exit_code) = (child.clone(), finished.clone(), exit_code.clone());
+        let (finished, exit_code) = (finished.clone(), exit_code.clone());
         std::thread::spawn(move || {
-            loop {
-                let status = child
-                    .lock()
-                    .ok()
-                    .and_then(|mut c| c.try_wait().ok().flatten());
-                if let Some(status) = status {
-                    if let Ok(mut code) = exit_code.lock() {
-                        *code = status.code();
-                    }
-                    finished.store(true, Ordering::Relaxed);
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(120));
+            let Ok(status) = child.wait() else { return };
+            if let Ok(mut code) = exit_code.lock() {
+                *code = status.code();
             }
+            finished.store(true, Ordering::Relaxed);
         });
     }
 
@@ -115,7 +223,7 @@ pub fn start(command: &str, cwd: &Path) -> Result<u64, String> {
                 id,
                 command: command.to_owned(),
                 log,
-                child,
+                tree,
                 finished,
                 exit_code,
             },
@@ -129,10 +237,15 @@ fn with_job<T>(id: u64, f: impl FnOnce(&Job) -> T) -> Result<T, String> {
     Ok(f(job))
 }
 
-/// Everything the job has printed so far.
+/// Everything the job has printed so far, without escape sequences.
 pub fn log(id: u64) -> Result<String, String> {
+    // Stripped here rather than as it arrives, because a sequence can
+    // straddle two reads.
     with_job(id, |job| {
-        job.log.lock().map(|l| l.clone()).unwrap_or_default()
+        job.log
+            .lock()
+            .map(|mut l| crate::tools::strip_escapes(&text(&mut l)))
+            .unwrap_or_default()
     })
 }
 
@@ -146,8 +259,12 @@ pub fn exit_code(id: u64) -> Result<Option<i32>, String> {
 
 pub fn stop(id: u64) -> Result<(), String> {
     with_job(id, |job| {
-        if let Ok(mut child) = job.child.lock() {
-            let _ = child.kill();
+        // Once the shell is reaped, its Unix process group id can pass to an
+        // unrelated process, so there a finished job is left alone, as it
+        // always was. A Job Object stays Letronna's for the life of the job,
+        // so on Windows stopping still ends what an exited shell left running.
+        if cfg!(windows) || !job.finished.load(Ordering::Relaxed) {
+            job.tree.kill();
         }
     })?;
     Ok(())
@@ -170,8 +287,8 @@ pub fn list() -> Vec<JobInfo> {
 pub fn stop_all() {
     let Ok(jobs) = registry().lock() else { return };
     for job in jobs.values() {
-        if let Ok(mut child) = job.child.lock() {
-            let _ = child.kill();
+        if cfg!(windows) || !job.finished.load(Ordering::Relaxed) {
+            job.tree.kill();
         }
     }
 }
@@ -200,6 +317,95 @@ mod tests {
         false
     }
 
+    /// Whether the process with this id is still running.
+    #[cfg(windows)]
+    fn alive(pid: u32) -> bool {
+        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        // SAFETY: the handle is checked before it is used and closed after.
+        unsafe {
+            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if process.is_null() {
+                return false;
+            }
+            let mut code = 0;
+            let read = GetExitCodeProcess(process, &mut code);
+            CloseHandle(process);
+            read != 0 && code == STILL_ACTIVE as u32
+        }
+    }
+
+    /// Whether the process with this id is still running.
+    #[cfg(unix)]
+    fn alive(pid: u32) -> bool {
+        // SAFETY: signal 0 only asks whether the process is there.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+
+    /// Start a job whose shell prints "grandchild <pid>" of a process it
+    /// started, and return the job and that process once it is running.
+    fn start_with_grandchild(command: &str) -> (u64, u32) {
+        let id = start(command, &std::env::temp_dir()).unwrap();
+        let grandchild = || {
+            let said = log(id).unwrap();
+            let (pid, _) = said.split("grandchild ").nth(1)?.split_once('\n')?;
+            pid.trim().parse::<u32>().ok()
+        };
+        assert!(
+            until(|| grandchild().is_some()),
+            "job never said: {:?}",
+            log(id).unwrap()
+        );
+        let pid = grandchild().unwrap();
+        assert!(alive(pid), "process {pid} was not running");
+        (id, pid)
+    }
+
+    #[test]
+    fn stopping_a_job_ends_its_child_processes() {
+        // The shell starts a second process, says which, and waits.
+        let (id, pid) = start_with_grandchild(if cfg!(windows) {
+            "$p = Start-Process powershell '-NoProfile -Command Start-Sleep 60' \
+             -NoNewWindow -PassThru; Write-Output \"grandchild $($p.Id)\"; Start-Sleep 60"
+        } else {
+            "sleep 60 & echo \"grandchild $!\"; wait"
+        });
+
+        stop(id).unwrap();
+        assert!(
+            until(|| !running(id).unwrap()),
+            "job kept running after stop"
+        );
+        assert!(until(|| !alive(pid)), "process {pid} outlived its job");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stopping_a_job_whose_shell_has_exited_ends_what_it_left_running() {
+        // The shell starts a second process, says which, and exits at once.
+        let (id, pid) = start_with_grandchild(
+            "$p = Start-Process powershell '-NoProfile -Command Start-Sleep 60' \
+             -NoNewWindow -PassThru; Write-Output \"grandchild $($p.Id)\"",
+        );
+        assert!(until(|| !running(id).unwrap()), "shell never exited");
+        assert!(alive(pid), "process {pid} ended with its shell");
+
+        stop(id).unwrap();
+        assert!(until(|| !alive(pid)), "process {pid} outlived its job");
+    }
+
+    #[test]
+    fn a_job_that_exits_is_reaped_without_polling() {
+        let id = start("exit 3", &std::env::temp_dir()).unwrap();
+        assert!(until(|| !running(id).unwrap()), "job never finished");
+        assert_eq!(exit_code(id).unwrap(), Some(3));
+        // Stopping it afterwards changes nothing.
+        stop(id).unwrap();
+        assert_eq!(exit_code(id).unwrap(), Some(3));
+    }
+
     #[test]
     fn runs_collects_and_stops() {
         let dir = std::env::temp_dir();
@@ -223,5 +429,44 @@ mod tests {
             "job kept running after stop"
         );
         assert!(log(999).is_err());
+    }
+
+    #[test]
+    fn a_jobs_log_comes_without_escape_sequences() {
+        let print = if cfg!(windows) {
+            r#"Write-Output "$([char]27)[32mdone$([char]27)[0m""#
+        } else {
+            r#"printf '\033[32mdone\033[0m\n'"#
+        };
+        let id = start(print, &std::env::temp_dir()).unwrap();
+        assert!(
+            until(|| log(id).unwrap().contains("done")),
+            "job never printed: {:?}",
+            log(id).unwrap()
+        );
+        assert_eq!(log(id).unwrap().trim_end(), "done");
+    }
+
+    #[test]
+    fn a_full_log_keeps_the_newest_whole_characters() {
+        // Three-byte characters in pump-sized reads: reads split characters,
+        // and the byte limit lands inside one.
+        let output = "€".repeat(30_000) + "newest";
+        let mut log = VecDeque::new();
+        for read in output.as_bytes().chunks(4096) {
+            append(&mut log, read);
+        }
+        assert_eq!(log.len(), MAX_LOG);
+        let kept = (MAX_LOG - "newest".len()) / "€".len();
+        assert_eq!(text(&mut log), "€".repeat(kept) + "newest");
+    }
+
+    #[test]
+    fn output_that_was_never_text_reads_back_within_the_limit() {
+        let mut log = VecDeque::new();
+        append(&mut log, &[0xFF; MAX_LOG]);
+        let read = text(&mut log);
+        assert!(read.len() <= MAX_LOG, "{} bytes", read.len());
+        assert!(read.chars().all(|c| c == char::REPLACEMENT_CHARACTER));
     }
 }

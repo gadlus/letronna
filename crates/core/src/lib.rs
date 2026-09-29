@@ -7,24 +7,37 @@
 //! instead of growing two that slowly disagree.
 
 pub mod agent;
+pub mod agent_defs;
+pub mod approvals;
 pub mod auth;
 pub mod browser;
+pub mod budget;
+pub mod cancel;
 mod cdp;
 pub mod chat;
+pub mod command;
 pub mod compact;
+pub mod diag;
 mod edit;
+pub mod failure;
 pub mod gateway;
 pub mod history;
+pub mod inbox;
 pub mod jobs;
 pub mod mcp;
 pub mod media;
 pub mod memory;
 pub mod messaging;
+pub mod models;
 mod page;
+pub mod retry;
 pub mod schedule;
 pub mod search;
 pub mod skills;
+mod state;
 pub mod store;
+pub mod structured;
+pub mod timers;
 pub mod tools;
 pub mod update;
 pub mod watch;

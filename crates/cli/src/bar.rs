@@ -9,14 +9,16 @@
 //! box goes with everything else, which is the price and a fair one.
 //!
 //! Keys are read on the same loop that pumps the model's reply, so the next
-//! question can be typed while the current one is still being answered; a
-//! line entered mid-answer waits its turn rather than cutting in.
+//! question can be typed while the current one is still being answered. A
+//! line entered while tools are at work goes to the model with their
+//! results; one entered during the last answer waits its turn instead.
 
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
 use crossterm::terminal;
+use letronna_core::store::Todo;
 use std::collections::VecDeque;
 use std::time::Duration;
 
@@ -129,6 +131,15 @@ const MAX_ROWS: usize = 8;
 /// How long a pump waits for a keystroke before handing the loop back. Short
 /// enough that typing feels immediate, long enough not to spin.
 const TICK: Duration = Duration::from_millis(20);
+
+/// Steps of the plan listed over the box at once. A plan can run to a dozen,
+/// and every row it takes is one the conversation loses; the heading still
+/// counts them all.
+const PLAN_ROWS: usize = 5;
+
+/// Rows of conversation the plan never takes: half of a 24-row terminal, the
+/// shortest in common use, which there still leaves the whole plan its room.
+const PLAN_LEAVES: usize = 12;
 
 fn matches(text: &str) -> Vec<&'static Command> {
     if !text.starts_with('/') || text.contains(char::is_whitespace) {
@@ -258,6 +269,9 @@ pub struct Bar {
     waiting: Option<crate::spinner::Waiting>,
     /// When the waiting line was last moved on.
     ticked: std::time::Instant,
+    /// The open session's checklist, shown over the box while any of it is
+    /// left to do.
+    plan: Vec<Todo>,
 }
 
 impl Bar {
@@ -284,6 +298,7 @@ impl Bar {
             enters: 0,
             waiting: None,
             ticked: std::time::Instant::now(),
+            plan: Vec::new(),
         }
     }
 
@@ -316,6 +331,12 @@ impl Bar {
 
     pub fn set_footer(&mut self, footer: String) {
         self.footer = footer;
+        self.settle();
+    }
+
+    /// Show this checklist over the box, in place of the one before.
+    pub fn set_plan(&mut self, todos: &[Todo]) {
+        self.plan = todos.to_vec();
         self.settle();
     }
 
@@ -531,6 +552,18 @@ impl Bar {
         self.settle();
     }
 
+    /// Take the lines waiting for the model, up to the first command: that
+    /// command, and everything typed after it, stays for the loop to run in
+    /// the order it was typed.
+    pub fn take_typed(&mut self) -> Vec<String> {
+        let plain = self
+            .queued
+            .iter()
+            .take_while(|line| !line.starts_with('/'))
+            .count();
+        self.queued.drain(..plain).collect()
+    }
+
     /// Do `work` without the screen going quiet: the waiting line in the
     /// box while it is up, a wheel printed in place when it is not.
     pub fn busy<T: Send + 'static>(
@@ -575,9 +608,14 @@ impl Bar {
         handle.join().expect("the work panicked")
     }
 
-    /// Show or take away the waiting line.
+    /// Show or take away the waiting line, naming the step of the plan being
+    /// done when there is one.
     pub fn wait_line(&mut self, on: bool) {
-        self.waiting = on.then(crate::spinner::Waiting::new);
+        let step = self.plan.iter().find(|t| t.status == "doing");
+        self.waiting = on.then(|| match step {
+            Some(step) => crate::spinner::Waiting::during(&step.text),
+            None => crate::spinner::Waiting::new(),
+        });
         self.settle();
     }
 
@@ -597,6 +635,13 @@ impl Bar {
         // redrawn now rather than at the next key; that also brings out the
         // last of what the turn printed, "Stopped." included.
         self.settle();
+    }
+
+    /// How long a wait between pumps may block on its own channel: a pump
+    /// waits a tick for keys while the box is up and returns at once when
+    /// it is not, where a wait that never blocked would spin.
+    pub fn patience(&self) -> Duration {
+        if self.live { Duration::ZERO } else { TICK }
     }
 
     /// Whether the user has asked to stop the turn, clearing the request.
@@ -888,18 +933,20 @@ impl Bar {
         if !self.live {
             return;
         }
-        crate::screen::chrome(self.lines());
+        let (_, height) = terminal::size().unwrap_or((80, 24));
+        crate::screen::chrome(self.lines(height as usize));
     }
 
-    /// The waiting line, the box, the menu when one is open, and the footer.
-    fn lines(&self) -> Vec<String> {
+    /// The waiting line, the plan, the box, the menu when one is open, and
+    /// the footer, for a window `height` rows tall.
+    fn lines(&self, height: usize) -> Vec<String> {
         let room = self.room();
         let edge = "─".repeat(room + 2);
         let mut lines = Vec::new();
         // The waiting line sits above the box, where the answer it is waiting
         // for will appear.
         if let Some(waiting) = &self.waiting {
-            lines.push(waiting.line());
+            lines.push(waiting.line(render::width()));
         }
         lines.push(format!(
             "{}{}",
@@ -968,6 +1015,18 @@ impl Bar {
             self.footer.clone()
         };
         lines.push(format!("{}{}", render::PAD, render::dim(&note)));
+
+        // The plan gets only the rows the rest leaves over: what is being
+        // typed or asked comes first, and a screen of chrome would push its
+        // own bottom rows off the window.
+        let mut plan = checklist(&self.plan, room);
+        let spare = height.saturating_sub(lines.len() + PLAN_LEAVES);
+        if plan.len() > spare {
+            // The heading alone still says how far along the plan is.
+            plan.truncate(spare.min(1));
+        }
+        let under = usize::from(self.waiting.is_some());
+        lines.splice(under..under, plan);
         lines
     }
 
@@ -1072,6 +1131,42 @@ impl Drop for Bar {
     }
 }
 
+/// The plan over the box while any of it is left to do: a heading with the
+/// count, then the steps from the first one not done, each cut to `room`
+/// columns so that no row runs past the box's right edge.
+fn checklist(todos: &[Todo], room: usize) -> Vec<String> {
+    if todos.iter().all(|t| t.status == "done") {
+        return Vec::new();
+    }
+    let done = todos.iter().filter(|t| t.status == "done").count();
+    let heading = format!("Plan · {done} of {} done", todos.len());
+    // A row without a mark has the mark's two columns as well.
+    let mut lines = vec![format!(
+        "{}{}",
+        render::PAD,
+        render::dim(&render::fit(&heading, room + 2))
+    )];
+    // Finished steps are counted in the heading, so the list starts where the
+    // work is, filled up from above when that would leave rows spare.
+    let first = todos.iter().position(|t| t.status != "done").unwrap_or(0);
+    let start = first.min(todos.len().saturating_sub(PLAN_ROWS));
+    for todo in todos.iter().skip(start).take(PLAN_ROWS) {
+        let text = render::fit(&todo.text, room);
+        let row = match todo.status.as_str() {
+            "done" => format!("{} {}", render::green("✓"), render::dim(&text)),
+            "doing" => format!("{} {text}", render::blue("◐")),
+            _ => format!("{} {text}", render::dim("○")),
+        };
+        lines.push(format!("{}{row}", render::PAD));
+    }
+    let rest = todos.len().saturating_sub(start + PLAN_ROWS);
+    if rest > 0 {
+        let more = render::fit(&format!("… {rest} more"), room + 2);
+        lines.push(format!("{}{}", render::PAD, render::dim(&more)));
+    }
+    lines
+}
+
 /// Where each stop sits on a track `width` columns wide: spread evenly, the
 /// first at the left end and the last at the right.
 fn stops_at(count: usize, width: usize) -> Vec<usize> {
@@ -1125,8 +1220,29 @@ fn track(stops: &[String], at: usize, room: usize) -> (String, String, usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Bar, MENU_LIMIT, Slider, closest, matches, menu_top, stops_at, track};
+    use super::{
+        Bar, Choice, MENU_LIMIT, PLAN_ROWS, Slider, checklist, closest, matches, menu_top,
+        stops_at, track,
+    };
+    use crate::render::{MARGIN, plain, visible};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use letronna_core::store::Todo;
+
+    fn step(text: &str, status: &str) -> Todo {
+        Todo {
+            text: text.into(),
+            status: status.into(),
+        }
+    }
+
+    /// The plan as it reads, whether or not this run has colour.
+    fn shown(todos: &[Todo], room: usize) -> Vec<String> {
+        checklist(todos, room)
+            .iter()
+            .map(String::as_str)
+            .map(plain)
+            .collect()
+    }
 
     fn press(bar: &mut Bar, code: KeyCode) {
         bar.nudge(KeyEvent::new(code, KeyModifiers::NONE));
@@ -1253,5 +1369,138 @@ mod tests {
         assert!(matches("/nonsense").is_empty());
         // Once it carries an argument it is no longer a name being typed.
         assert!(matches("/model gpt").is_empty());
+    }
+
+    #[test]
+    fn the_plan_counts_what_is_done_and_marks_each_state() {
+        let plan = [
+            step("Read the code", "done"),
+            step("Write the parser", "doing"),
+            step("Test it", "pending"),
+        ];
+        assert_eq!(
+            shown(&plan, 40),
+            [
+                "    Plan · 1 of 3 done",
+                "    ✓ Read the code",
+                "    ◐ Write the parser",
+                "    ○ Test it",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_finished_or_empty_plan_takes_no_room() {
+        assert!(checklist(&[], 40).is_empty());
+        assert!(checklist(&[step("Read the code", "done")], 40).is_empty());
+    }
+
+    #[test]
+    fn the_plan_keeps_inside_the_box_at_narrow_widths() {
+        let mut plan = vec![step("Check the samples", "pending"); 8];
+        plan[0] = step("Read every module the importer touches", "done");
+        plan[1] = step("Write the parser for each format", "doing");
+        plan[2] = step("Test it\nagainst the samples", "pending");
+        // The narrowest room is the one the box never goes below.
+        for room in [8, 12, 20] {
+            let edge = visible(&format!("{MARGIN}╭{}╮", "─".repeat(room + 2)));
+            let lines = shown(&plan, room);
+            for line in &lines {
+                assert!(visible(line) <= edge, "{line:?} in {room}");
+            }
+            assert!(lines[1].starts_with("    ◐ Write"), "{:?}", lines[1]);
+        }
+        let narrow = shown(&plan, 8);
+        assert_eq!(narrow[1], "    ◐ Write t…");
+        assert_eq!(narrow[2], "    ○ Test it…");
+        assert_eq!(narrow.last().unwrap(), "    … 2 more");
+    }
+
+    #[test]
+    fn a_long_plan_lists_from_where_the_work_is_and_counts_the_rest() {
+        let plan = |done: usize| -> Vec<Todo> {
+            (1..=12)
+                .map(|i| match i {
+                    i if i <= done => step(&format!("step {i}"), "done"),
+                    i if i == done + 1 => step(&format!("step {i}"), "doing"),
+                    i => step(&format!("step {i}"), "pending"),
+                })
+                .collect()
+        };
+        let early = shown(&plan(4), 40);
+        assert_eq!(early.len(), 1 + PLAN_ROWS + 1);
+        assert_eq!(early[0], "    Plan · 4 of 12 done");
+        assert_eq!(early[1], "    ◐ step 5");
+        assert_eq!(early.last().unwrap(), "    … 3 more");
+        // Near the end the rows are filled from above instead of left empty.
+        let late = shown(&plan(10), 40);
+        assert_eq!(late.len(), 1 + PLAN_ROWS);
+        assert_eq!(late[1], "    ✓ step 8");
+        assert_eq!(late.last().unwrap(), "    ○ step 12");
+    }
+
+    #[test]
+    fn the_waiting_line_names_the_step_being_done() {
+        let mut bar = Bar::new(String::new());
+        bar.set_plan(&[step("Read the code", "done")]);
+        bar.wait_line(true);
+        assert!(!bar.waiting.as_ref().unwrap().line(80).contains(" · "));
+        bar.set_plan(&[
+            step("Read the code", "done"),
+            step("Write the parser", "doing"),
+        ]);
+        bar.wait_line(true);
+        let line = bar.waiting.as_ref().unwrap().line(80);
+        assert!(line.contains(" · Write the parser"), "{line}");
+    }
+
+    #[test]
+    fn a_question_with_the_plan_open_still_fits_a_24_row_window() {
+        let rows = |bar: &Bar, height: usize| -> Vec<String> {
+            bar.lines(height)
+                .iter()
+                .map(String::as_str)
+                .map(plain)
+                .collect()
+        };
+        let mut plan = vec![step("Check the samples", "pending"); 12];
+        plan[0] = step("Write the parser", "doing");
+        let mut bar = Bar::new(String::new());
+        bar.set_plan(&plan);
+        bar.wait_line(true);
+        // Under the waiting line, with only the box below it, the whole plan fits.
+        let typing = rows(&bar, 24);
+        assert!(typing[1].starts_with("    Plan ·"), "{typing:#?}");
+        assert!(typing.iter().any(|l| l == "    … 7 more"), "{typing:#?}");
+        // A shorter window keeps the heading, which still says how far along it is.
+        let short = rows(&bar, 18);
+        assert!(short[1].starts_with("    Plan ·"), "{short:#?}");
+        assert!(short[2].contains('╭'), "{short:#?}");
+        // A run_command approval of a long script needs every row itself.
+        bar.choice = Some(Choice {
+            question: "Run it?".into(),
+            detail: vec!["echo 1".into(); 12],
+            options: ["Yes", "Always", "No", "Tell it what to do instead"]
+                .map(String::from)
+                .into(),
+            picked: 0,
+        });
+        let asking = rows(&bar, 24);
+        assert!(asking.len() <= 24, "{asking:#?}");
+        assert!(!asking.iter().any(|l| l.contains("Plan ·")), "{asking:#?}");
+        assert!(asking.iter().any(|l| l.contains("4 Tell it what to do")));
+        assert!(asking.last().unwrap().contains("enter to take it"));
+    }
+
+    #[test]
+    fn what_was_typed_goes_in_up_to_the_first_command() {
+        let mut bar = Bar::new(String::new());
+        bar.queued = ["check the tests too", "and the docs", "/where", "then this"]
+            .map(String::from)
+            .into();
+        assert_eq!(bar.take_typed(), ["check the tests too", "and the docs"]);
+        // The command waits for the loop, and so does what came after it.
+        assert_eq!(bar.queued, ["/where", "then this"]);
+        assert!(bar.take_typed().is_empty());
     }
 }

@@ -31,9 +31,11 @@ pub(crate) fn collect(store: &Store) -> Vec<Artifact> {
             if !matches!(message.name.as_str(), "write_file" | "edit_file") {
                 continue;
             }
-            let Ok(args) = tools::parse_args(&message.args) else {
+            let Ok(mut args) = tools::parse_args(&message.args) else {
                 continue;
             };
+            // Under the name the write ran with, `file_path` included.
+            tools::rename_aliases(&message.name, &mut args);
             let Some(relative) = args["path"].as_str() else {
                 continue;
             };
@@ -161,30 +163,16 @@ impl Chat {
             .px_8()
             .py_6()
             .gap_4()
-            .child(
-                v_flex()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_xl()
-                            .font_family(HEADING_FONT)
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Artifacts"),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(if rows.is_empty() {
-                                "Files Letronna writes will be listed here, newest first. \
-                                 Nothing yet."
-                            } else {
-                                "Files Letronna has written, newest first. The list comes \
-                                 from the sessions themselves, so removing a session removes \
-                                 its files from here too."
-                            }),
-                    ),
-            )
+            .child(crate::ui::page_header(
+                "Artifacts",
+                if rows.is_empty() {
+                    "Files Letronna writes will be listed here, newest first. Nothing yet."
+                } else {
+                    "Files Letronna has written, newest first. The list comes from the sessions \
+                     themselves, so removing a session removes its files from here too."
+                },
+                cx,
+            ))
             .child(
                 div()
                     .id("artifact-list")
@@ -261,5 +249,22 @@ mod tests {
         assert_eq!(found[0].writes, 2);
         assert_eq!(found[0].session, "newer");
         assert_eq!(found[1].writes, 1);
+    }
+
+    #[test]
+    fn a_write_sent_with_file_path_is_listed() {
+        let mut message = wrote("", "write_file", false);
+        message.args = r#"{"file_path":"notes.md","content":"x"}"#.into();
+        let store = Store {
+            conversations: vec![Conversation {
+                workspace: Some("/work".into()),
+                messages: vec![message],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let found = collect(&store);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].path.ends_with("notes.md"));
     }
 }

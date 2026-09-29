@@ -12,7 +12,7 @@
 
 use crate::chat::{self as backend, Message};
 use serde::{Deserialize, Serialize};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 #[derive(Default, Serialize, Deserialize)]
@@ -52,6 +52,11 @@ pub struct Conversation {
     /// same reason as `flushed`.
     #[serde(skip)]
     pub rewound: Option<usize>,
+    /// Deleted by the other Letronna while this one had it open, so it is
+    /// never written again, even once a new session takes its id. Only
+    /// `flush` should touch it; it is visible for the same reason as `flushed`.
+    #[serde(skip)]
+    pub gone: bool,
 }
 
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -68,6 +73,46 @@ pub struct Todo {
     pub text: String,
     /// "pending", "doing" or "done".
     pub status: String,
+}
+
+/// Replace `todos` with the checklist a `todo` call sends and answer the
+/// call with how far along it is; a call that cannot be read changes nothing.
+pub fn apply_todo(todos: &mut Vec<Todo>, arguments: &str) -> Result<String, String> {
+    *todos = parse_todos(arguments)?;
+    let done = todos.iter().filter(|t| t.status == "done").count();
+    Ok(format!(
+        "Checklist updated: {done} of {} done.",
+        todos.len()
+    ))
+}
+
+/// The checklist the last readable `todo` call in `messages` set, or none.
+pub fn todos_in(messages: &[Message]) -> Vec<Todo> {
+    // One that cannot be read changed nothing, as `apply_todo` has it, so the
+    // one before it still stands.
+    messages
+        .iter()
+        .rev()
+        .flat_map(|m| m.tool_calls.iter().rev())
+        .filter(|call| call.name == crate::tools::TODO)
+        .find_map(|call| parse_todos(&call.arguments).ok())
+        .unwrap_or_default()
+}
+
+/// The checklist a `todo` call sets, from its arguments.
+fn parse_todos(arguments: &str) -> Result<Vec<Todo>, String> {
+    let args = crate::tools::parse_args_for(crate::tools::TODO, arguments)?;
+    let items = args["items"]
+        .as_array()
+        .ok_or_else(|| "`items` is required.".to_owned())?;
+    Ok(items
+        .iter()
+        .map(|item| Todo {
+            text: item["text"].as_str().unwrap_or_default().to_owned(),
+            status: item["status"].as_str().unwrap_or("pending").to_owned(),
+        })
+        .filter(|todo| !todo.text.is_empty())
+        .collect())
 }
 
 /// A line in a session file.
@@ -90,7 +135,7 @@ enum Record {
 }
 
 /// Everything that is not a session.
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Settings {
     pub endpoint: String,
     pub model: String,
@@ -128,13 +173,56 @@ pub struct Settings {
     /// when it uses the browser, though it can still be opened to look.
     #[serde(default)]
     pub browse_unseen: bool,
+    /// The window's colours: empty for Night, "paper", or "system" to follow
+    /// the computer's light or dark mode.
+    #[serde(default)]
+    pub appearance: String,
+    /// A faint film grain on the window's chrome and empty pages, never over
+    /// the transcript, code or diffs.
+    #[serde(default = "yes")]
+    pub grain: bool,
 }
+
+// Written out rather than derived so the film grain starts on for a first
+// run too, as it does for a settings file from before it existed.
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            endpoint: String::new(),
+            model: String::new(),
+            gateway: String::new(),
+            custom_endpoint: String::new(),
+            presence: String::new(),
+            skip_approvals: false,
+            effort: String::new(),
+            thinking: false,
+            search: false,
+            active_id: 0,
+            manual_updates: false,
+            browser_shared: false,
+            browse_unseen: false,
+            appearance: String::new(),
+            grain: true,
+        }
+    }
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// Settings that are chosen as one and so saved as one: a model id belongs
+/// to its gateway and that gateway's endpoint.
+const CHOSEN_TOGETHER: [&str; 3] = ["gateway", "model", "endpoint"];
 
 #[derive(Default)]
 pub struct Store {
     pub conversations: Vec<Conversation>,
     pub active: usize,
     pub settings: Settings,
+    /// The settings as JSON when last read or written, so a save puts back
+    /// only the fields changed here since; only loading and `save` touch it.
+    pub settings_written: serde_json::Value,
 }
 
 impl Conversation {
@@ -173,10 +261,33 @@ impl Conversation {
 impl Store {
     /// An id no existing session uses. Ids also name files, so a collision
     /// would merge two histories; the folder is checked as well as memory.
-    pub fn next_id(&self) -> u64 {
+    fn next_id(&self) -> u64 {
         let highest = self.conversations.iter().map(|c| c.id).max().unwrap_or(0);
         let on_disk = session_ids().into_iter().max().unwrap_or(0);
         highest.max(on_disk) + 1
+    }
+
+    /// Claim an id for a new session by creating its empty file, so two
+    /// Letronnas starting sessions at the same moment never get the same one.
+    pub fn reserve_id(&self) -> u64 {
+        // The highest id plus one is only where the search starts: another
+        // process can read the same folder in the same instant. Creating the
+        // file with create_new is atomic, so exactly one of them gets it.
+        let _ = std::fs::create_dir_all(sessions_dir());
+        let mut id = self.next_id();
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(session_path(id))
+            {
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => id += 1,
+                // Claimed, or the folder cannot be written at all. Then the
+                // session carries on in memory and its save reports the
+                // failure, as it did before ids were claimed.
+                _ => return id,
+            }
+        }
     }
 
     /// Give every session an id. Older saves have none.
@@ -206,21 +317,57 @@ impl Store {
             .get(self.active)
             .map(|c| c.id)
             .unwrap_or(0);
-        let bytes = serde_json::to_vec_pretty(&self.settings)?;
-        let path = settings_path();
-        let temp = path.with_extension("tmp");
-        std::fs::write(&temp, bytes)?;
-        std::fs::rename(temp, path)
+        let now = serde_json::to_value(&self.settings)?;
+        // Most saves are for a message, with no setting moved, and those are
+        // known without reading the file.
+        if now == self.settings_written {
+            return Ok(());
+        }
+        // Only what moved here goes back, so a setting the other process
+        // changed meanwhile is not put back the way this one last saw it.
+        let mut then = self.settings_written.clone();
+        // But a model goes back with the gateway it was chosen on, or the
+        // file could pair it with the one the other process chose. Only a
+        // new model or gateway does that: a send sets the endpoint again and
+        // the Custom URL is edited on its own, and neither is a pick to put
+        // back over the other process's.
+        let picked = ["gateway", "model"]
+            .iter()
+            .any(|&f| then.get(f) != now.get(f));
+        if picked && let Some(fields) = then.as_object_mut() {
+            for field in CHOSEN_TOGETHER {
+                fields.remove(field);
+            }
+            // A Custom model was listed from the Custom URL, so it goes too.
+            if self.settings.gateway == "Custom" {
+                fields.remove("custom_endpoint");
+            }
+        }
+        crate::state::update::<Settings>(&settings_path(), |disk| {
+            crate::state::merge(disk, &then, &now)
+        })
+        .map_err(std::io::Error::other)?;
+        self.settings_written = now;
+        Ok(())
     }
 
-    /// Forget a session and remove its file, and the copies kept of the
-    /// files it wrote.
+    /// Forget a session and remove its file, its helpers' conversations,
+    /// the copies kept of the files it wrote, and its lock file if it can
+    /// take the lock.
     pub fn remove(&mut self, index: usize) {
         if index >= self.conversations.len() {
             return;
         }
         let gone = self.conversations.remove(index);
-        let _ = std::fs::remove_file(session_path(gone.id));
+        let path = session_path(gone.id);
+        let lock = Lock::take(&path);
+        let _ = std::fs::remove_file(&path);
+        // A lock file someone else holds stays: removed, the next writer
+        // would lock a new file beside them and both would write.
+        if lock.is_ok() {
+            let _ = std::fs::remove_file(path.with_extension("lock"));
+        }
+        let _ = std::fs::remove_dir_all(helpers_dir(gone.id));
         crate::history::forget(gone.id);
     }
 }
@@ -239,6 +386,14 @@ impl Conversation {
     /// Append the head (first time), any rewind and new messages, and the
     /// descriptive fields if they have moved since the last write.
     fn flush(&mut self) -> std::io::Result<()> {
+        if self.gone {
+            return Ok(());
+        }
+        self.flush_to(&session_path(self.id))
+    }
+
+    /// Flush into the file at `path` rather than the session's own.
+    fn flush_to(&mut self, path: &std::path::Path) -> std::io::Result<()> {
         let meta = self.meta();
         let meta_changed = self.written.as_ref() != Some(&meta);
         // Every session is flushed on every save, and most have nothing new.
@@ -251,9 +406,18 @@ impl Conversation {
         {
             return Ok(());
         }
-        let path = session_path(self.id);
-        let _lock = Lock::take(&path);
-        let fresh = !path.exists();
+        let _lock = Lock::take(path)?;
+        // A reserved session's file is there but empty, and still needs its head.
+        let fresh = !std::fs::metadata(path).is_ok_and(|m| m.len() > 0);
+        // Written before and gone now: the other Letronna deleted it. Writing
+        // anyway brought it back as a fragment -- a head and whatever changed
+        // since the last save, with none of the history before it. Remembered
+        // rather than checked each time, because the freed id is handed out
+        // again and this would then write into someone else's session.
+        if fresh && self.written.is_some() {
+            self.gone = true;
+            return Ok(());
+        }
         if !fresh && self.flushed == self.messages.len() && self.rewound.is_none() && !meta_changed
         {
             return Ok(());
@@ -262,8 +426,15 @@ impl Conversation {
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&path)?;
+            .read(true)
+            .open(path)?;
         let mut out = String::new();
+        // A crash part way through a line leaves the file without its last
+        // newline. Appending straight after it would glue the next record to
+        // the torn one and lose both; ending the torn line first loses one.
+        if torn(&mut file)? {
+            out.push('\n');
+        }
         if fresh {
             push(
                 &mut out,
@@ -297,11 +468,26 @@ fn push(out: &mut String, record: &Record) {
     }
 }
 
+/// Whether the file stops part way through a line, as a write cut short leaves it.
+fn torn(file: &mut std::fs::File) -> std::io::Result<bool> {
+    if file.metadata()?.len() == 0 {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0u8];
+    file.read_exact(&mut last)?;
+    Ok(last[0] != b'\n')
+}
+
 /// Rebuild a session by replaying its file. A line that will not parse is
 /// skipped rather than failing the session: losing one message is better than
 /// losing the conversation it was part of.
 fn replay(path: &std::path::Path) -> Option<Conversation> {
-    let text = std::fs::read_to_string(path).ok()?;
+    // Read leniently: a write cut part way through a character leaves bytes
+    // that are not UTF-8, which would otherwise fail the whole file rather
+    // than the one line they are on.
+    let bytes = std::fs::read(path).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
     let mut conversation = Conversation::default();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         match serde_json::from_str::<Record>(line) {
@@ -321,12 +507,88 @@ fn replay(path: &std::path::Path) -> Option<Conversation> {
             Err(_) => continue,
         }
     }
+    // A crash in the first save can tear the head line itself. The file is
+    // named after the session, so its id survives that.
+    if conversation.id == 0 {
+        conversation.id = path.file_stem()?.to_str()?.parse().ok()?;
+    }
     if conversation.id == 0 {
         return None;
     }
     conversation.flushed = conversation.messages.len();
     conversation.written = Some(conversation.meta());
     Some(conversation)
+}
+
+/// A helper's conversation, written in the same lines as a session but never
+/// listed or searched as one.
+pub struct Transcript {
+    pub path: PathBuf,
+    pub conversation: Conversation,
+}
+
+impl Transcript {
+    /// Start a conversation for a new helper of `session`, and say which
+    /// number it got there.
+    pub fn create(
+        session: u64,
+        title: &str,
+        workspace: Option<PathBuf>,
+    ) -> Result<(u32, Self), String> {
+        let dir = helpers_dir(session);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("Could not make a place for the helper's conversation: {e}"))?;
+        let conversation = Conversation {
+            id: session,
+            title: title.into(),
+            updated: backend::now(),
+            workspace,
+            ..Default::default()
+        };
+        for n in 1..=u32::MAX {
+            let path = dir.join(format!("{n}.jsonl"));
+            // Making the file is what claims the number: of two processes
+            // asking at once exactly one gets it, where counting and adding
+            // one, as `next_id` does, would hand both the same.
+            let mut file = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("Could not start the helper's conversation: {e}")),
+            };
+            // The head goes in here because flush writes one only into a file
+            // that is not there yet, and this one now is.
+            let mut head = String::new();
+            push(
+                &mut head,
+                &Record::Head {
+                    id: session,
+                    created: conversation.updated,
+                },
+            );
+            let mut transcript = Self { path, conversation };
+            file.write_all(head.as_bytes())
+                .and_then(|_| transcript.save())
+                .map_err(|e| format!("Could not start the helper's conversation: {e}"))?;
+            return Ok((n, transcript));
+        }
+        Err("This session has no numbers left for another helper.".into())
+    }
+
+    /// Read back helper `n` of `session`, if it is there.
+    pub fn open(session: u64, n: u32) -> Option<Self> {
+        let path = helpers_dir(session).join(format!("{n}.jsonl"));
+        let conversation = replay(&path)?;
+        Some(Self { path, conversation })
+    }
+
+    /// Append whatever is new, as saving a session does.
+    pub fn save(&mut self) -> std::io::Result<()> {
+        self.conversation.flush_to(&self.path)
+    }
 }
 
 /// What a session looks like from the outside: enough to recognise it by,
@@ -350,7 +612,12 @@ pub fn summaries() -> Vec<Summary> {
     let mut out: Vec<Summary> = session_ids()
         .into_iter()
         .filter_map(|id| {
-            let text = std::fs::read_to_string(session_path(id)).ok()?;
+            let bytes = std::fs::read(session_path(id)).ok()?;
+            // Reserved and not yet saved: it belongs to whoever reserved it.
+            if bytes.is_empty() {
+                return None;
+            }
+            let text = String::from_utf8_lossy(&bytes);
             let mut summary = Summary {
                 id,
                 title: String::new(),
@@ -425,16 +692,20 @@ fn search_in(dir: &std::path::Path, query: &str, limit: usize) -> Vec<Hit> {
         if path.extension().is_none_or(|e| e != "jsonl") {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        let Ok(bytes) = std::fs::read(&path) else {
             continue;
         };
+        let text = String::from_utf8_lossy(&bytes);
         // Most sessions never mention it, which the whole file says at once.
         // Quotes and backslashes are escaped on disk, so a query holding
         // either cannot be checked that way and reads the messages instead.
         if !query.contains(['"', '\\']) && !text.to_lowercase().contains(&query) {
             continue;
         }
-        let (mut id, mut title, mut updated) = (0, String::new(), 0);
+        // The file's name gives the id when the head line is torn, as in
+        // `replay`, so a hit still says which session to open.
+        let named = path.file_stem().and_then(|s| s.to_str()?.parse().ok());
+        let (mut id, mut title, mut updated) = (named.unwrap_or(0), String::new(), 0);
         // Each hit keeps its message's place, and the cap waits for the end
         // of the file: a rewind further down can take the first hits back
         // and leave later ones standing.
@@ -446,7 +717,15 @@ fn search_in(dir: &std::path::Path, query: &str, limit: usize) -> Vec<Hit> {
                 Ok(Record::Meta(meta)) => (title, updated) = (meta.title, meta.updated),
                 Ok(Record::Message(message)) => {
                     if let Some(snippet) = around(&message.content, &query) {
-                        hits.push((said, message.role, snippet));
+                        // A notice has the user's role, but the snippet rarely
+                        // reaches its header, and a job's output read back as
+                        // the user's words becomes a request they never made.
+                        let role = if message.notice {
+                            "notice".into()
+                        } else {
+                            message.role
+                        };
+                        hits.push((said, role, snippet));
                     }
                     said += 1;
                 }
@@ -509,6 +788,13 @@ fn session_path(id: u64) -> PathBuf {
     sessions_dir().join(format!("{id}.jsonl"))
 }
 
+/// Where the helpers of a session keep their conversations.
+fn helpers_dir(session: u64) -> PathBuf {
+    // Outside `sessions/`, where every file is taken for a session, and in
+    // the data folder, which no tool may read.
+    backend::data_dir().join("agents").join(session.to_string())
+}
+
 pub fn settings_path() -> PathBuf {
     backend::data_dir().join("settings.json")
 }
@@ -523,45 +809,44 @@ fn legacy_path() -> PathBuf {
 /// The window and the terminal share these files and both append to them, so
 /// two of them can be part way through a line at the same time -- which is
 /// one corrupt record and, because a record is a whole message, one message
-/// lost. The lock is a file beside the session: made with create_new, which
-/// is atomic everywhere, and removed when the guard goes.
-pub struct Lock(PathBuf);
+/// lost. The lock is the operating system's, on a file beside the session
+/// that stays there: the system lets go of it when its holder closes the file
+/// or dies, so no lock is ever stale and no one removes a lock file from
+/// under its holder.
+pub struct Lock(std::fs::File);
 
 impl Lock {
-    /// Wait for the lock, but not forever. A process that died holding one
-    /// would otherwise keep every other process out of that session for good,
-    /// so a lock nobody has touched for a while is taken anyway.
-    fn take(path: &std::path::Path) -> Self {
-        let lock = path.with_extension("lock");
+    /// Wait up to a second for the lock, and fail rather than write without it.
+    pub(crate) fn take(path: &std::path::Path) -> std::io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path.with_extension("lock"))?;
         for _ in 0..40 {
-            if std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&lock)
-                .is_ok()
-            {
-                return Self(lock);
+            match file.try_lock() {
+                Ok(()) => return Ok(Self(file)),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(std::fs::TryLockError::Error(e)) => return Err(e),
             }
-            let stale = std::fs::metadata(&lock)
-                .and_then(|m| m.modified())
-                .map(|t| t.elapsed().unwrap_or_default() > std::time::Duration::from_secs(10))
-                .unwrap_or(true);
-            if stale {
-                let _ = std::fs::remove_file(&lock);
-                continue;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(25));
         }
-        // A second of waiting is long enough that something is wrong. Writing
-        // without the lock risks a torn line; not writing loses the message
-        // for certain, so it writes.
-        Self(lock)
+        // A holder keeps it for one append, so a second of waiting means
+        // something is stuck. Writing anyway could tear a line; failing
+        // leaves the messages unwritten in memory, and the next save sends
+        // them.
+        Err(std::io::Error::other(
+            "another Letronna is still writing this session",
+        ))
     }
 }
 
 impl Drop for Lock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        // Closing the file lets go too, but Windows may take its time over
+        // a lock left to the close.
+        let _ = self.0.unlock();
     }
 }
 
@@ -577,10 +862,13 @@ fn session_ids() -> Vec<u64> {
     };
     entries
         .filter_map(Result::ok)
+        // A lock left by a crash shares its session's stem.
+        .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
         .filter_map(|e| {
-            e.path()
-                .file_stem()
-                .and_then(|s| s.to_str())
+            // Each session's lock file sits beside it under the same number.
+            e.file_name()
+                .to_str()
+                .and_then(|name| name.strip_suffix(".jsonl"))
                 .and_then(|s| s.parse().ok())
         })
         .collect()
@@ -619,10 +907,12 @@ pub fn load_listing() -> Store {
         })
         .collect();
     conversations.sort_by_key(|c| c.updated);
+    let (settings, settings_written) = settings();
     Store {
         conversations,
         active: 0,
-        settings: settings(),
+        settings,
+        settings_written,
     }
 }
 
@@ -640,13 +930,13 @@ pub fn fill(conversation: &mut Conversation) {
     }
 }
 
-fn settings() -> Settings {
-    let mut s: Settings = std::fs::read(settings_path())
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
+/// The settings, and as JSON what the file said before a retired gateway is
+/// moved, so the move is saved like any other change.
+fn settings() -> (Settings, serde_json::Value) {
+    let mut s: Settings = crate::state::read(&settings_path()).unwrap_or_default();
+    let read = serde_json::to_value(&s).unwrap_or_default();
     retire_gateway(&mut s);
-    s
+    (s, read)
 }
 
 /// A gateway that is no longer offered moves to the Letronna account. Its
@@ -703,10 +993,7 @@ pub fn load() -> Store {
         .filter_map(|id| replay(&session_path(id)))
         .collect();
     conversations.sort_by_key(|c| c.updated);
-    let settings: Settings = std::fs::read(settings_path())
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
+    let (settings, settings_written) = settings();
     let active = conversations
         .iter()
         .position(|c| c.id == settings.active_id)
@@ -715,6 +1002,7 @@ pub fn load() -> Store {
         conversations,
         active,
         settings,
+        settings_written,
     }
 }
 
@@ -763,6 +1051,7 @@ fn migrate() {
             // Settings that did not exist when the old file was written.
             ..Default::default()
         },
+        ..Default::default()
     };
     store.assign_ids();
     if store.save().is_ok() {
@@ -778,7 +1067,37 @@ pub fn keys_path() -> PathBuf {
 /// here worth stealing.
 pub fn save_keys(keys: &std::collections::HashMap<String, String>) -> std::io::Result<()> {
     std::fs::create_dir_all(backend::data_dir())?;
-    write_private(&keys_path(), &serde_json::to_vec_pretty(keys)?)
+    let keys = serde_json::to_value(keys)?;
+    crate::state::update::<std::collections::HashMap<String, String>>(&keys_path(), |disk| {
+        *disk = keys
+    })
+    .map_err(std::io::Error::other)
+}
+
+/// Put one key in the keys file, or with `None` take it out, leaving every
+/// other slot as the file has it, and give back the keys it then holds.
+pub fn save_key(
+    slot: &str,
+    key: Option<&str>,
+) -> std::io::Result<std::collections::HashMap<String, String>> {
+    std::fs::create_dir_all(backend::data_dir())?;
+    let mut saved = serde_json::Value::Null;
+    crate::state::update::<std::collections::HashMap<String, String>>(&keys_path(), |disk| {
+        match (disk.as_object_mut(), key) {
+            (Some(keys), Some(key)) => {
+                keys.insert(slot.to_owned(), key.into());
+            }
+            (Some(keys), None) => {
+                keys.remove(slot);
+            }
+            (None, Some(key)) => *disk = serde_json::json!({ slot: key }),
+            (None, None) => {}
+        }
+        saved = disk.clone();
+    })
+    .map_err(std::io::Error::other)?;
+    // Null, with no file and nothing to put in one, is no keys.
+    Ok(serde_json::from_value(saved).unwrap_or_default())
 }
 
 /// Write a file only its owner may read: the keys, the sign-in, bot tokens.
@@ -805,10 +1124,7 @@ pub fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()
 }
 
 pub fn load_keys() -> std::collections::HashMap<String, String> {
-    std::fs::read(keys_path())
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+    crate::state::read(&keys_path()).unwrap_or_default()
 }
 
 pub fn bucket(updated: u64, now: u64) -> &'static str {
@@ -841,8 +1157,11 @@ mod tests {
     // would shadow the built-in attribute.
     #[cfg(unix)]
     use super::write_private;
-    use super::{Conversation, Store, Todo, fill, load_listing, replay, search_in, summaries};
-    use crate::chat::Message;
+    use super::{
+        Conversation, Lock, Store, Todo, Transcript, apply_todo, fill, load, load_listing, replay,
+        search, search_in, summaries, todos_in,
+    };
+    use crate::chat::{Message, ToolCall};
 
     /// Held by every test that points `AGENT_DATA_DIR` somewhere: it is one
     /// variable for the whole process, and tests run side by side.
@@ -992,6 +1311,26 @@ mod tests {
     }
 
     #[test]
+    fn a_retired_gateway_moves_to_letronna_in_the_window_too() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("retired");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"gateway":"Retired","endpoint":"https://retired.example/v1","model":"retired/some-model"}"#,
+        )
+        .unwrap();
+
+        // The window reads everything with `load`, the terminal with
+        // `load_listing`; both must see the same gateway.
+        let window = load().settings;
+        assert_eq!(window.gateway, "Letronna");
+        assert!(window.model.is_empty());
+        assert_eq!(load_listing().settings.gateway, window.gateway);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
     fn a_torn_line_costs_one_message_not_the_session() {
         let dir = scratch("torn");
         let path = dir.join("torn.jsonl");
@@ -1010,6 +1349,80 @@ mod tests {
         // The half-written line is dropped; the ones either side survive.
         assert_eq!(back.messages.len(), 2);
         assert_eq!(back.messages[1].content, "three");
+    }
+
+    #[test]
+    fn a_torn_last_line_is_sealed_before_the_next_append() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("torn-tail");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        store.conversations.push(numbered(2));
+        store.save().unwrap();
+        let path = dir.join("sessions/1.jsonl");
+        // A write cut short: half a record and no newline after it.
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str("{\"type\":\"message\",\"role\":\"us");
+        std::fs::write(&path, text).unwrap();
+
+        store.conversations[0].messages.push(said("user", "again"));
+        store.save().unwrap();
+        let back = replay(&path).unwrap();
+        let contents: Vec<&str> = back.messages.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, ["0", "1", "again"]);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_bad_byte_costs_one_line() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("bad-byte");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let sessions = dir.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join("7.jsonl");
+        // The third line was cut in the middle of the two bytes of an é.
+        let mut bytes = b"{\"type\":\"head\",\"id\":7,\"created\":5}\n\
+            {\"type\":\"meta\",\"title\":\"kept\",\"updated\":5,\"pinned\":false,\"workspace\":null,\"todos\":[]}\n\
+            {\"type\":\"message\",\"role\":\"user\",\"content\":\"one\"}\n\
+            {\"type\":\"message\",\"role\":\"user\",\"content\":\"caf"
+            .to_vec();
+        bytes.push(0xC3);
+        bytes.extend_from_slice(
+            b"\n{\"type\":\"message\",\"role\":\"user\",\"content\":\"three\"}\n",
+        );
+        std::fs::write(&path, bytes).unwrap();
+
+        let back = replay(&path).unwrap();
+        let contents: Vec<&str> = back.messages.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, ["one", "three"]);
+        let listed = summaries();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].title, "kept");
+        assert_eq!(search_in(&sessions, "three", 10).len(), 1);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_session_with_a_broken_head_keeps_its_id() {
+        let dir = scratch("broken-head");
+        let path = dir.join("7.jsonl");
+        std::fs::write(
+            &path,
+            "{\"type\":\"head\",\"id\":7,\"cr\n\
+             {\"type\":\"meta\",\"title\":\"kept\",\"updated\":5,\"pinned\":false,\"workspace\":null,\"todos\":[]}\n\
+             {\"type\":\"message\",\"role\":\"user\",\"content\":\"hello\"}\n",
+        )
+        .unwrap();
+        let back = replay(&path).unwrap();
+        assert_eq!(back.id, 7);
+        assert_eq!(back.title, "kept");
+        assert_eq!(back.messages.len(), 1);
+        let hits = search_in(&dir, "hello", 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, 7);
     }
 
     #[test]
@@ -1046,6 +1459,22 @@ mod tests {
         assert_eq!(hits[1].snippet, "Should we use Postgres or SQLite?");
         assert_eq!(search_in(&dir, "POSTGRES", 1).len(), 1);
         assert!(search_in(&dir, "mysql", 10).is_empty());
+    }
+
+    #[test]
+    fn a_search_hit_on_a_notice_is_not_the_users() {
+        let dir = scratch("search-notice");
+        std::fs::write(
+            dir.join("1.jsonl"),
+            "{\"type\":\"message\",\"role\":\"user\",\"content\":\"run the tests\"}\n\
+             {\"type\":\"message\",\"role\":\"user\",\"content\":\"the tests failed\",\"notice\":true}\n",
+        )
+        .unwrap();
+        let roles: Vec<String> = search_in(&dir, "tests", 10)
+            .into_iter()
+            .map(|hit| hit.role)
+            .collect();
+        assert_eq!(roles, ["user", "notice"]);
     }
 
     #[test]
@@ -1201,6 +1630,662 @@ mod tests {
         listed.save().unwrap();
         let back = replay(&dir.join("sessions/1.jsonl")).unwrap();
         assert!(back.messages.is_empty());
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_leftover_lock_file_does_not_list_a_session_twice() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("leftover-lock");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        store.conversations.push(numbered(2));
+        store.save().unwrap();
+        // What a process that died part way through a save leaves behind.
+        std::fs::write(dir.join("sessions/1.lock"), "").unwrap();
+
+        assert_eq!(summaries().len(), 1);
+        assert_eq!(super::load().conversations.len(), 1);
+    }
+
+    #[test]
+    fn a_setting_changed_in_one_process_survives_the_other_saving() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("settings-merge");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let path = dir.join("settings.json");
+        // Laid out by hand, not the way a save lays it out.
+        let by_hand = "{\"endpoint\":\"\",\"model\":\"a/one\"}";
+        std::fs::write(&path, by_hand).unwrap();
+
+        // The window and the terminal, both started from that file.
+        let mut window = load_listing();
+        let mut terminal = load_listing();
+        // Saving with no setting changed leaves the file as it was.
+        window.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), by_hand);
+
+        terminal.settings.model = "b/two".into();
+        terminal.save().unwrap();
+        window.settings.effort = "high".into();
+        window.save().unwrap();
+        let back = load_listing().settings;
+        assert_eq!(
+            (back.model.as_str(), back.effort.as_str()),
+            ("b/two", "high")
+        );
+    }
+
+    #[test]
+    fn a_settings_file_without_appearance_loads_as_night_with_grain() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("appearance-old");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let file = dir.join("settings.json");
+        // As a build from before the light theme wrote it.
+        std::fs::write(
+            &file,
+            r#"{"endpoint":"https://api.letronna.ai/v1","model":"a/model","skip_approvals":true}"#,
+        )
+        .unwrap();
+
+        let mut store = load();
+        assert_eq!(store.settings.appearance, "");
+        assert!(store.settings.grain);
+        assert!(store.settings.skip_approvals);
+        // Saved and read again, the grain is still on and nothing else moved.
+        store.save().unwrap();
+        let again = load().settings;
+        assert_eq!(again.appearance, "");
+        assert!(again.grain);
+        assert!(again.skip_approvals);
+        // A first run, with no settings file at all, starts the same way.
+        std::fs::remove_file(&file).unwrap();
+        let first = load().settings;
+        assert_eq!((first.appearance.as_str(), first.grain), ("", true));
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_todo_call_sets_the_whole_checklist_and_says_how_far_along_it_is() {
+        let mut todos = vec![Todo {
+            text: "an old plan".into(),
+            status: "doing".into(),
+        }];
+        let said = apply_todo(
+            &mut todos,
+            r#"{"items":[{"text":"read","status":"done"},{"text":"write"},{"text":"","status":"doing"}]}"#,
+        );
+        assert_eq!(said.unwrap(), "Checklist updated: 1 of 2 done.");
+        // A missing status is still to do, and an item with no words is dropped.
+        let items: Vec<_> = todos
+            .iter()
+            .map(|t| (t.text.as_str(), t.status.as_str()))
+            .collect();
+        assert_eq!(items, [("read", "done"), ("write", "pending")]);
+    }
+
+    #[test]
+    fn a_todo_call_that_cannot_be_read_leaves_the_checklist_as_it_was() {
+        let plan = vec![Todo {
+            text: "step".into(),
+            status: "doing".into(),
+        }];
+        let mut todos = plan.clone();
+        assert_eq!(
+            apply_todo(&mut todos, r#"{"text":"step"}"#).unwrap_err(),
+            "`items` is required."
+        );
+        assert!(apply_todo(&mut todos, r#"{"items":[{"text":"#).is_err());
+        assert!(todos == plan);
+    }
+
+    #[test]
+    fn the_checklist_is_the_last_one_left_standing() {
+        let todo = |items: &str| Message {
+            role: "assistant".into(),
+            tool_calls: vec![ToolCall {
+                id: "call".into(),
+                name: crate::tools::TODO.into(),
+                arguments: format!(r#"{{"items":[{items}]}}"#),
+            }],
+            ..Default::default()
+        };
+        let first = todo(r#"{"text":"plan","status":"done"}"#);
+        let second = todo(r#"{"text":"build","status":"doing"}"#);
+        assert_eq!(todos_in(&[first.clone(), second.clone()])[0].text, "build");
+        assert_eq!(todos_in(&[first])[0].text, "plan");
+        assert!(todos_in(&[]).is_empty());
+        // A call that could not be read changed nothing, so the one before stands.
+        let mut garbled = second.clone();
+        garbled.tool_calls[0].arguments = r#"{"items": [{"text": "lost"#.into();
+        assert_eq!(todos_in(&[second, garbled])[0].text, "build");
+    }
+
+    #[test]
+    fn a_settings_file_that_will_not_parse_is_kept_beside_the_new_one() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("settings-corrupt");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let torn = "{\"endpoint\":\"\",\"model\":\"a/one\",\"gatew";
+        std::fs::write(dir.join("settings.json"), torn).unwrap();
+
+        let mut store = load_listing();
+        assert!(store.settings.model.is_empty());
+        store.settings.model = "b/two".into();
+        store.save().unwrap();
+
+        let aside: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|p| p.to_string_lossy().contains("settings.json.corrupt-"))
+            .collect();
+        assert_eq!(aside.len(), 1);
+        assert_eq!(std::fs::read_to_string(&aside[0]).unwrap(), torn);
+        assert_eq!(load_listing().settings.model, "b/two");
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_model_is_saved_with_the_gateway_it_was_chosen_on() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("settings-pair");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        std::fs::write(
+            dir.join("settings.json"),
+            "{\"endpoint\":\"https://api.openai.com/v1\",\"model\":\"gpt-a\",\"gateway\":\"OpenAI\"}",
+        )
+        .unwrap();
+
+        let mut window = load_listing();
+        let mut terminal = load_listing();
+        terminal.settings.gateway = "OpenRouter".into();
+        terminal.settings.model = "x/y".into();
+        terminal.save().unwrap();
+        // The window picks another model on the gateway it was already on.
+        window.settings.model = "gpt-b".into();
+        window.save().unwrap();
+        let back = load_listing().settings;
+        assert_eq!(
+            (back.gateway.as_str(), back.model.as_str()),
+            ("OpenAI", "gpt-b")
+        );
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_new_endpoint_or_custom_url_alone_leaves_the_other_process_model_be() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("settings-endpoint");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        // The terminal's /model leaves the endpoint as it was, here empty.
+        std::fs::write(
+            dir.join("settings.json"),
+            "{\"endpoint\":\"\",\"model\":\"gpt-a\",\"gateway\":\"OpenAI\"}",
+        )
+        .unwrap();
+
+        let mut window = load_listing();
+        let mut terminal = load_listing();
+        terminal.settings.gateway = "OpenRouter".into();
+        terminal.settings.model = "x/y".into();
+        terminal.save().unwrap();
+        // The window edits the Custom URL, then sends, which sets the
+        // endpoint of the gateway it is still on.
+        window.settings.custom_endpoint = "http://localhost:8000/v1".into();
+        window.save().unwrap();
+        window.settings.endpoint = "https://api.openai.com/v1".into();
+        window.save().unwrap();
+        let back = load_listing().settings;
+        assert_eq!(
+            (
+                back.gateway.as_str(),
+                back.model.as_str(),
+                back.custom_endpoint.as_str()
+            ),
+            ("OpenRouter", "x/y", "http://localhost:8000/v1")
+        );
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_custom_model_is_saved_with_the_custom_url_it_was_listed_from() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("settings-custom");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        std::fs::write(
+            dir.join("settings.json"),
+            "{\"endpoint\":\"\",\"model\":\"gpt-a\",\"gateway\":\"OpenAI\",\"custom_endpoint\":\"http://one/v1\"}",
+        )
+        .unwrap();
+
+        let mut window = load_listing();
+        let mut terminal = load_listing();
+        terminal.settings.custom_endpoint = "http://two/v1".into();
+        terminal.save().unwrap();
+        // The window picks a model from the list it loaded from the old URL.
+        window.settings.gateway = "Custom".into();
+        window.settings.model = "local/m".into();
+        window.save().unwrap();
+        let back = load_listing().settings;
+        assert_eq!(
+            (back.model.as_str(), back.custom_endpoint.as_str()),
+            ("local/m", "http://one/v1")
+        );
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_key_saved_for_one_slot_leaves_every_other_slot_as_the_file_has_it() {
+        use std::collections::HashMap;
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("keys-slot");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let path = dir.join("keys.json");
+        // Saved by the terminal after the window last read the file.
+        std::fs::write(&path, "{\"OpenAI\":\"sk-1\",\"Custom\":\"c-2\"}").unwrap();
+
+        let saved = super::save_key("OpenRouter", Some("or-3")).unwrap();
+        let all = HashMap::from([
+            ("OpenAI".to_owned(), "sk-1".to_owned()),
+            ("Custom".to_owned(), "c-2".to_owned()),
+            ("OpenRouter".to_owned(), "or-3".to_owned()),
+        ]);
+        assert_eq!(saved, all);
+        assert_eq!(super::load_keys(), all);
+
+        // Taking a key out takes out that slot and nothing else.
+        let saved = super::save_key("Custom", None).unwrap();
+        assert_eq!(saved.len(), 2);
+        assert!(!saved.contains_key("Custom"));
+        assert_eq!(super::load_keys(), saved);
+
+        // With no file, taking a key out writes none.
+        std::fs::remove_file(&path).unwrap();
+        assert!(super::save_key("OpenAI", None).unwrap().is_empty());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_session_deleted_elsewhere_is_not_written_back() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("deleted-elsewhere");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut terminal = Store::default();
+        terminal.conversations.push(numbered(2));
+        terminal.save().unwrap();
+        let path = dir.join("sessions/1.jsonl");
+
+        // The window lists the same session and deletes it.
+        let mut window = load_listing();
+        window.remove(0);
+        assert!(!path.exists());
+
+        // The terminal still has it open, and more is said and renamed there.
+        terminal.conversations[0]
+            .messages
+            .push(said("user", "still here?"));
+        terminal.conversations[0].title = "renamed".into();
+        terminal.save().unwrap();
+        assert!(!path.exists());
+
+        // The window starts a new session, which is handed the freed id.
+        let id = window.next_id();
+        assert_eq!(id, 1);
+        window.conversations.push(Conversation {
+            id,
+            title: "new".into(),
+            messages: vec![said("user", "fresh")],
+            ..Default::default()
+        });
+        window.save().unwrap();
+        let new = std::fs::read_to_string(&path).unwrap();
+
+        // The terminal says more again; none of it lands in the new session.
+        terminal.conversations[0]
+            .messages
+            .push(said("user", "anyone?"));
+        terminal.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), new);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn appearance_round_trips() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("appearance");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        for (appearance, grain) in [("paper", false), ("system", true), ("", false)] {
+            let mut store = Store::default();
+            store.settings.appearance = appearance.into();
+            store.settings.grain = grain;
+            store.save().unwrap();
+            let back = load().settings;
+            assert_eq!((back.appearance.as_str(), back.grain), (appearance, grain));
+        }
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn two_writers_of_one_session_never_interleave_their_lines() {
+        use std::io::Write;
+        let dir = scratch("lock-interleave");
+        let path = dir.join("1.jsonl");
+        let writer = |tag: &'static str| {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                for _ in 0..20 {
+                    let _lock = Lock::take(&path).unwrap();
+                    // One line in two writes with a pause between, as a slow
+                    // append would be.
+                    let mut file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                        .unwrap();
+                    file.write_all(tag.as_bytes()).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    file.write_all(b" end\n").unwrap();
+                }
+            })
+        };
+        let (first, second) = (writer("first"), writer("second"));
+        first.join().unwrap();
+        second.join().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 40);
+        assert!(text.lines().all(|l| l == "first end" || l == "second end"));
+    }
+
+    #[test]
+    fn a_save_that_cannot_take_the_lock_writes_nothing_and_the_next_catches_up() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("lock-timeout");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        store.conversations.push(Conversation {
+            id: 1,
+            messages: vec![said("user", "hello")],
+            ..Default::default()
+        });
+        store.save().unwrap();
+        let path = dir.join("sessions/1.jsonl");
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        store.conversations[0]
+            .messages
+            .push(said("assistant", "hi"));
+        let held = Lock::take(&path).unwrap();
+        assert!(store.save().is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        drop(held);
+        store.save().unwrap();
+        let back = replay(&path).unwrap();
+        assert_eq!(back.messages.len(), 2);
+        assert_eq!(back.messages[1].content, "hi");
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_lock_whose_holder_is_gone_is_free_at_once() {
+        let dir = scratch("lock-gone");
+        let path = dir.join("1.jsonl");
+        // What a process that dies holding the lock leaves behind: the file,
+        // locked until the system closes it.
+        let holder = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path.with_extension("lock"))
+            .unwrap();
+        holder.lock().unwrap();
+        drop(holder);
+        let started = std::time::Instant::now();
+        assert!(Lock::take(&path).is_ok());
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+    }
+
+    #[test]
+    fn a_lock_file_is_never_removed_from_under_its_holder() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("lock-owner");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        for id in [1, 2] {
+            store.conversations.push(Conversation {
+                id,
+                messages: vec![said("user", "hello")],
+                ..Default::default()
+            });
+        }
+        store.save().unwrap();
+        // The lock files beside them are not sessions.
+        assert_eq!(summaries().len(), 2);
+        let (one, two) = (dir.join("sessions/1.jsonl"), dir.join("sessions/2.jsonl"));
+
+        // Waiting in vain and letting go both leave the file where it is.
+        let held = Lock::take(&one).unwrap();
+        assert!(Lock::take(&one).is_err());
+        assert!(one.with_extension("lock").exists());
+        drop(held);
+        assert!(one.with_extension("lock").exists());
+
+        // Removing a session removes its lock file only if nobody holds it.
+        let held = Lock::take(&two).unwrap();
+        store.remove(1);
+        assert!(!two.exists());
+        assert!(two.with_extension("lock").exists());
+        drop(held);
+        store.remove(0);
+        assert!(!one.exists());
+        assert!(!one.with_extension("lock").exists());
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn ids_reserved_at_the_same_time_differ() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("reserve");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        // Each thread is a Letronna starting up: its own empty store, the
+        // same folder, all let go at once.
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let racers: Vec<_> = (0..16)
+            .map(|_| {
+                let gate = gate.clone();
+                std::thread::spawn(move || {
+                    gate.wait();
+                    Store::default().reserve_id()
+                })
+            })
+            .collect();
+        let mut ids: Vec<u64> = racers.into_iter().map(|r| r.join().unwrap()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 16);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_reserved_session_is_listed_once_saved_and_not_before() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("reserve-save");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        let id = store.reserve_id();
+        assert!(summaries().is_empty());
+
+        // The file is already there, and the first save still writes its head.
+        store.conversations.push(Conversation {
+            id,
+            messages: vec![said("user", "hello")],
+            ..Default::default()
+        });
+        store.save().unwrap();
+        assert_eq!(summaries()[0].messages, 1);
+        let back = replay(&dir.join(format!("sessions/{id}.jsonl"))).unwrap();
+        assert_eq!(back.id, id);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_transcript_replays_like_a_session() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("transcript");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let (n, mut helper) = Transcript::create(7, "explore", Some("work".into())).unwrap();
+        assert_eq!(
+            helper.path,
+            dir.join("agents").join("7").join(format!("{n}.jsonl"))
+        );
+        helper.conversation.messages = numbered(4).messages;
+        helper.conversation.todos = vec![Todo {
+            text: "look".into(),
+            status: "doing".into(),
+        }];
+        helper.save().unwrap();
+        helper.conversation.rewind(2);
+        helper
+            .conversation
+            .messages
+            .push(said("assistant", "again"));
+        helper.save().unwrap();
+
+        let mut back = Transcript::open(7, n).unwrap();
+        assert_eq!(back.path, helper.path);
+        assert_eq!(back.conversation.title, "explore");
+        assert_eq!(back.conversation.workspace, Some("work".into()));
+        assert_eq!(back.conversation.todos.len(), 1);
+        let contents: Vec<&str> = back
+            .conversation
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(contents, ["0", "1", "again"]);
+
+        // Opened again, it appends what is new rather than all of it.
+        let before = std::fs::read_to_string(&back.path).unwrap();
+        back.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&back.path).unwrap(), before);
+        back.conversation.messages.push(said("user", "more"));
+        back.save().unwrap();
+        let after = std::fs::read_to_string(&back.path).unwrap();
+        assert!(after.starts_with(&before));
+        assert_eq!(after.lines().count(), before.lines().count() + 1);
+        assert!(Transcript::open(7, n + 1).is_none());
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn listing_and_search_ignore_transcripts() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("transcript-listing");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        store.conversations.push(Conversation {
+            id: 1,
+            title: "the session".into(),
+            messages: vec![said("user", "a fig in the session")],
+            ..Default::default()
+        });
+        store.save().unwrap();
+        let (_, mut helper) = Transcript::create(1, "the helper", None).unwrap();
+        helper
+            .conversation
+            .messages
+            .push(said("user", "a fig in the helper"));
+        helper.save().unwrap();
+
+        let listed: Vec<u64> = summaries().iter().map(|s| s.id).collect();
+        assert_eq!(listed, [1]);
+        let loaded: Vec<String> = load().conversations.into_iter().map(|c| c.title).collect();
+        assert_eq!(loaded, ["the session"]);
+        assert_eq!(load_listing().conversations.len(), 1);
+        let found: Vec<String> = search("fig", 10).into_iter().map(|h| h.snippet).collect();
+        assert_eq!(found, ["a fig in the session"]);
+
+        let ctx = crate::tools::ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let listed = crate::tools::run("list_sessions", "{}", &ctx).unwrap();
+        assert!(
+            listed.contains("the session") && !listed.contains("the helper"),
+            "{listed}"
+        );
+        let found = crate::tools::run("search_sessions", r#"{"query":"fig"}"#, &ctx).unwrap();
+        assert!(
+            found.contains("in the session") && !found.contains("in the helper"),
+            "{found}"
+        );
+        // Nor can the model open the file by its path: it is in the data
+        // folder, even with that folder as the workspace.
+        let args = serde_json::json!({ "path": helper.path }).to_string();
+        let read = crate::tools::run("read_file", &args, &ctx);
+        assert!(
+            read.as_ref()
+                .is_err_and(|e| e.contains("Letronna's own folder")),
+            "{read:?}"
+        );
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn removing_a_session_removes_its_helpers() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("transcript-remove");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        store.conversations.push(numbered(2));
+        store.conversations.push(Conversation {
+            id: 2,
+            ..numbered(1)
+        });
+        store.save().unwrap();
+        for session in [1, 1, 2] {
+            Transcript::create(session, "helper", None).unwrap();
+        }
+
+        store.remove(0);
+        assert!(!dir.join("sessions").join("1.jsonl").exists());
+        assert!(!dir.join("agents").join("1").exists());
+        assert!(Transcript::open(1, 1).is_none());
+        // Another session's helpers are its own.
+        assert!(Transcript::open(2, 1).is_some());
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn two_transcripts_made_at_once_get_different_numbers() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("transcript-race");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        // More than two, all let go together, to give a race every chance.
+        let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let makers: Vec<_> = (0..8)
+            .map(|_| {
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    Transcript::create(3, "helper", None).unwrap().0
+                })
+            })
+            .collect();
+        let mut numbers: Vec<u32> = makers.into_iter().map(|m| m.join().unwrap()).collect();
+        numbers.sort();
+        assert_eq!(numbers, (1..=8).collect::<Vec<u32>>());
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 

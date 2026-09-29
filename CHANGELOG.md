@@ -13,6 +13,47 @@ This file is also the App tab of https://letronna.ai/changelog.
 
 ## [Unreleased]
 
+### Added
+- **All** — `letronna doctor` checks the setup, and a local log and crash files help find out what went wrong.
+- **App** — The window wears letronna.ai's colours; Settings choose its colours and whether it shows film grain.
+- **All** — Letronna knows each model's context window and output limit.
+- **All** — Helpers can answer in a checked shape.
+- **All** — The model knows today's date.
+- **All** — Send more while Letronna works: it reaches the model at the reply's next step, in the window and the terminal.
+- **All** — Helper types, built in and from your own files, share one token budget across a whole tree of helpers.
+- **All** — Helpers' conversations are kept beside their session, out of the session list.
+
+### Changed
+- **All** — A failed model request says what went wrong: the key, credit, a rate limit, a busy provider, a conversation too long, and so on.
+- **All** — OpenAI's reasoning models work, and a server that turns down a field is sent the request again without it.
+- **All** — The context window counts tool calls, pictures and Chinese, Japanese and Korean text, so long conversations are trimmed where they should be.
+- **All** — Following up while Letronna works keeps the turn's original request in view.
+- **All** — The checklist stays in view, in the window and the terminal, even in a long task.
+- **All** — Approvals you give in one session stay in that session.
+- **All** — Tools accept other agents' argument names and quoted values, and `edit_file` finds text through different line endings and spacing.
+- **All** — Commands run with no pager or editor to wait on, and colour codes are kept out of what the model reads.
+- **App** — The approval card and tool lookups no longer reread files on every frame.
+- **App** — The example plugin starts switched off.
+- **All** — Plan mode refuses tools that change things, however they are asked for.
+- **All** — Secret files such as `.env` and private keys stay out of the model's reach; `.env.example` does not.
+- **All** — Stop reaches waits and running commands, and ends them.
+- **All** — Long replies are no longer cut off at two minutes; only five minutes of silence ends one.
+- **All** — Unattended runs never stall waiting on a question.
+- **All** — Summaries reuse the chat connection, and a busy background job no longer copies its whole log on every read.
+
+### Fixed
+- **All** — Catastrophic commands, such as deleting your home folder, are refused whatever the approval setting.
+- **All** — Two copies of Letronna never mix their writes to one session, and a crash part way through a save costs one line, not the session.
+- **All** — Keys, settings and memory files are never silently reset or wiped by a read that failed, and a broken skills.json is never replaced by the defaults.
+- **All** — A session deleted in one copy of Letronna stays deleted, and a leftover lock file no longer lists a session twice.
+- **All** — Commands never hang on a child process they leave running, and output that is not valid UTF-8 survives.
+- **All** — `web_fetch` checks every address and redirect it follows.
+- **All** — Streamed tool calls are put together per call.
+- **All** — A project's AGENTS.md can no longer hang the app by linking to a device.
+- **Terminal** — `letronna -p` no longer keeps a processor core busy while a reply streams.
+- **All** — Two copies of Letronna starting at once never write into one session.
+- **Terminal** — Background jobs stop when the terminal exits.
+
 ## [0.1.0-alpha.2] - 2026-09-27
 
 ### Added

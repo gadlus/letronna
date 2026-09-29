@@ -129,7 +129,7 @@ pub fn command(
             Flow::Handled
         }
         "/skills" => {
-            skills(runner, rest);
+            skills(runner, rest, workspace);
             Flow::Handled
         }
         "/resume" => {
@@ -516,9 +516,20 @@ fn jobs(rest: &str) {
 ///
 /// Skills are written in the window and were unreachable from here, which
 /// made them a feature of one half of the same program.
-fn skills(runner: &mut Runner, rest: &str) {
-    let saved = letronna_core::skills::load();
+fn skills(runner: &mut Runner, rest: &str, workspace: Option<&std::path::Path>) {
     render::blank();
+    // An old skills.json that will not move across is said, and the skills
+    // already in folders are listed all the same.
+    if let Err(why) = letronna_core::skills::migrate() {
+        render::line(&render::red(&why));
+    }
+    let saved = match letronna_core::skills::list(workspace) {
+        Ok(saved) => saved,
+        Err(why) => {
+            render::line(&render::red(&why));
+            return;
+        }
+    };
     if saved.is_empty() {
         render::said(&render::blue("●"), &render::bold("No skills saved"));
         render::line(&render::dim("The window writes them; they show up here."));
@@ -538,7 +549,7 @@ fn skills(runner: &mut Runner, rest: &str) {
             }) {
             Some(skill) => {
                 render::said(&render::blue("●"), &render::bold(&skill.name));
-                runner.bar.say(&skill.prompt);
+                runner.bar.say(&skill.body);
             }
             None => render::line(&render::dim(&format!("No skill matching \"{rest}\"."))),
         }
@@ -550,7 +561,7 @@ fn skills(runner: &mut Runner, rest: &str) {
         render::line(&format!(
             "{}  {}",
             render::bold(&skill.name),
-            render::dim(&letronna_core::tools::one_line(&skill.prompt))
+            render::dim(&skill.description)
         ));
     }
     render::line(&render::dim("/skills <name> to use one"));
@@ -713,7 +724,11 @@ fn take_back(
     workspace: Option<&std::path::Path>,
 ) -> Option<String> {
     let (at, prompt) = last_prompt(&runner.store.conversations[session].messages)?;
-    runner.store.conversations[session].rewind(at);
+    let conversation = &mut runner.store.conversations[session];
+    conversation.rewind(at);
+    // The checklist is the one the last `todo` left standing.
+    conversation.todos = store::todos_in(&conversation.messages);
+    runner.bar.set_plan(&conversation.todos);
     // What was taken back is still on the screen, where a note saying it is
     // gone would contradict it. Draw the session again from what is left,
     // the way opening it does.
@@ -748,7 +763,7 @@ fn branch(runner: &mut Runner, session: &mut usize, name: &str) {
         name => name.to_owned(),
     };
     let copy = store::Conversation {
-        id: runner.store.next_id(),
+        id: runner.store.reserve_id(),
         title: title.clone(),
         messages: from.messages.clone(),
         updated: letronna_core::chat::now(),
