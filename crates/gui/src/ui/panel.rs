@@ -26,8 +26,9 @@ const DOCK_WIDTH: Pixels = px(1100.);
 const DOCK_SHARE: f32 = 0.34;
 const DOCK_MIN: Pixels = px(340.);
 const DOCK_MAX: Pixels = px(640.);
-/// What the sidebar and the chat keep however wide the panel is dragged:
-/// room enough for the composer.
+/// What the chat keeps beside the sidebar however wide the panel is
+/// dragged: room enough for the composer. Only in the narrowest docking
+/// window with the sidebar open does the panel's own minimum come first.
 const CHAT_ROOM: Pixels = px(560.);
 /// How wide the floating panel is.
 const FLOAT_WIDTH: Pixels = px(320.);
@@ -103,13 +104,14 @@ pub(crate) fn docks(window: Pixels) -> bool {
     window >= DOCK_WIDTH
 }
 
-/// How wide the docked panel is in a window this wide, with its edge
-/// dragged to a width or not; None when the window floats it instead.
-fn dock_width(window: Pixels, dragged: Option<Pixels>) -> Option<Pixels> {
+/// How wide the docked panel is in a window this wide, beside a sidebar
+/// this wide, with its edge dragged to a width or not; None when the
+/// window floats it instead.
+fn dock_width(window: Pixels, sidebar: Pixels, dragged: Option<Pixels>) -> Option<Pixels> {
     if !docks(window) {
         return None;
     }
-    let most = (window - CHAT_ROOM).max(DOCK_MIN);
+    let most = (window - sidebar - CHAT_ROOM).max(DOCK_MIN);
     let (width, most) = match dragged {
         Some(width) => (width, most),
         None => (window * DOCK_SHARE, most.min(DOCK_MAX)),
@@ -181,9 +183,22 @@ impl Chat {
     /// How much of the window the docked panel takes from the chat: none
     /// while it floats or is not drawn.
     pub(crate) fn panel_width(&self, window: &Window, cx: &App) -> Pixels {
-        match dock_width(window.viewport_size().width, self.panel.width) {
+        match dock_width(
+            window.viewport_size().width,
+            self.sidebar_width(),
+            self.panel.width,
+        ) {
             Some(width) if self.panel_view(true, cx).is_some() => width,
             _ => px(0.),
+        }
+    }
+
+    /// How much of the window the sidebar takes.
+    fn sidebar_width(&self) -> Pixels {
+        if self.sidebar_open {
+            crate::ui::sidebar::SIDEBAR_WIDTH
+        } else {
+            px(0.)
         }
     }
 
@@ -243,7 +258,11 @@ impl Chat {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let width = dock_width(window.viewport_size().width, self.panel.width);
+        let width = dock_width(
+            window.viewport_size().width,
+            self.sidebar_width(),
+            self.panel.width,
+        );
         let (shown, open) = self.panel_view(width.is_some(), cx)?;
         let selected = shown.iter().position(|&(tab, _)| tab == open);
         let tabs = shown.into_iter().map(|(tab, waiting)| {
@@ -356,15 +375,47 @@ mod tests {
 
     #[test]
     fn a_wide_window_docks_the_panel_at_a_third_within_its_bounds() {
-        assert_eq!(dock_width(px(1099.), None), None);
-        let third = dock_width(px(1500.), None).map(f32::from);
+        let no_sidebar = px(0.);
+        assert_eq!(dock_width(px(1099.), no_sidebar, None), None);
+        let third = dock_width(px(1500.), no_sidebar, None).map(f32::from);
         assert!(third.is_some_and(|width| (width - 510.).abs() < 0.01));
         // Never under 340 nor, until dragged, over 640.
-        assert_eq!(dock_width(px(1100.), Some(px(100.))), Some(px(340.)));
-        assert_eq!(dock_width(px(2400.), None), Some(px(640.)));
+        assert_eq!(
+            dock_width(px(1100.), no_sidebar, Some(px(100.))),
+            Some(px(340.))
+        );
+        assert_eq!(dock_width(px(2400.), no_sidebar, None), Some(px(640.)));
         // Dragged, it may pass 640 but always leaves the chat its room.
-        assert_eq!(dock_width(px(1600.), Some(px(800.))), Some(px(800.)));
-        assert_eq!(dock_width(px(1200.), Some(px(900.))), Some(px(640.)));
+        assert_eq!(
+            dock_width(px(1600.), no_sidebar, Some(px(800.))),
+            Some(px(800.))
+        );
+        assert_eq!(
+            dock_width(px(1200.), no_sidebar, Some(px(900.))),
+            Some(px(640.))
+        );
+    }
+
+    #[test]
+    fn the_chat_keeps_its_room_beside_the_sidebar() {
+        let sidebar = px(250.);
+        // Dragged as wide as it goes, the panel stops where the chat has
+        // 560 left beside the sidebar.
+        assert_eq!(
+            dock_width(px(1600.), sidebar, Some(px(1200.))),
+            Some(px(790.))
+        );
+        // A page on its side asks for the room the whole window allows.
+        assert_eq!(
+            dock_width(px(1600.), sidebar, Some(px(1600. - 560.))),
+            Some(px(790.))
+        );
+        // In the narrowest docking window the panel's minimum comes first.
+        assert_eq!(dock_width(px(1100.), sidebar, None), Some(px(340.)));
+        assert_eq!(
+            dock_width(px(1100.), sidebar, Some(px(900.))),
+            Some(px(340.))
+        );
     }
 
     #[test]
