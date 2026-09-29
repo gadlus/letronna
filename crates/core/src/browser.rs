@@ -107,9 +107,11 @@ const FRAME_TIME: Duration = Duration::from_secs(2);
 /// How long all of a page's frames may add to listing it; frames not
 /// reached by then are left out.
 const FRAMES_TIME: Duration = Duration::from_secs(5);
-/// How long a frame in another process is given to have its page scrolled
-/// into view, which it asks for by message, before where it is is read.
-const FRAME_SCROLL: Duration = Duration::from_millis(150);
+/// How long a frame in another process is given to come to rest after it
+/// asks its page, by message, to scroll it into view.
+const FRAME_SETTLE: Duration = Duration::from_millis(500);
+/// How often where such a frame is is read meanwhile.
+const FRAME_LOOK: Duration = Duration::from_millis(50);
 /// Groups the page's handles on the nodes an action touched, so they are
 /// let go of together when it is done.
 const HANDLES: &str = "letronna";
@@ -154,12 +156,20 @@ const KEYS: &[(&str, &str, i64, &str)] = &[
 /// events and the frame's are not wired to one another.
 const DRAG_IN_FRAME: &str = "A drag does not reach into frames: drag within the page itself, or \
      ask the user to do it in the browser.";
+/// Why pointing into a frame in another process is refused while it moves:
+/// the point would be counted from where it was.
+const FRAME_MOVING: &str = "The frame is still moving on the page, so where to point in it \
+     cannot be told. Try again once it is still.";
 /// Says whether a click at a point would land on the element or on
 /// something drawn over it, such as a cookie banner, and names the latter.
-const COVERED: &str = "function(x, y) {
+/// For the element a frame is shown in, `exact`, only it or what is in it
+/// will do: a box around it, or a point off the view, is not the frame.
+const COVERED: &str = "function(x, y, exact) {
   const root = this.getRootNode();
   const at = (root.elementFromPoint ? root : document).elementFromPoint(x, y);
-  if (!at || at === this || this.contains(at) || at.contains(this)) return '';
+  if (at === this || (at && this.contains(at))) return '';
+  if (!exact && (!at || at.contains(this))) return '';
+  if (!at) return 'nothing: the point is off the view';
   const name = at.getAttribute('aria-label') || at.innerText || at.tagName;
   return String(name).trim().replace(/\\s+/g, ' ').slice(0, 80);
 }";
@@ -3006,7 +3016,7 @@ impl Session {
         framed_as(number, within.as_deref(), frame)?;
         if let Some(within) = within {
             self.still_there(number, &within)?;
-            self.inside = Some(self.inside_of(within)?);
+            self.inside = Some(self.inside_of(within, false)?);
         }
         self.not_a_frame(number, node)?;
         Ok(node)
@@ -3060,8 +3070,10 @@ impl Session {
     }
 
     /// Where `frame` sits in the page's view now, found from the element
-    /// showing each frame on the way down to it.
-    fn inside_of(&mut self, frame: Arc<Frame>) -> Result<Inside, String> {
+    /// showing each frame on the way down to it. When `aiming` at a point,
+    /// a frame in another process drawn other than as laid out is refused:
+    /// its points are counted as if it were not.
+    fn inside_of(&mut self, frame: Arc<Frame>, aiming: bool) -> Result<Inside, String> {
         let mut offsets = HashMap::from([(None, (0., 0.))]);
         let mut around = (0., 0.);
         let mut shown_in = Vec::new();
@@ -3088,6 +3100,12 @@ impl Session {
                     None,
                 )
                 .map_err(|_| "The frame is not on screen now. Look again.")?;
+            // A frame in the same process has its points counted as the
+            // page draws it, turned or scaled as it may be.
+            if aiming && own != host {
+                let view = self.view_of(own.as_deref(), id)?;
+                drawn_as_laid_out(&model["model"]["content"], view)?;
+            }
             let corner = |at: usize| model["model"]["content"][at].as_f64().unwrap_or(0.);
             let at = (base.0 + corner(0), base.1 + corner(1));
             shown_in.push((host.clone(), node, around));
@@ -3200,21 +3218,95 @@ impl Session {
                 &cover,
             ));
         }
+        self.not_moved()?;
         self.point(node, doing.into(), Some(&quads["quads"]));
         Ok((x, y))
     }
 
     /// Find again where the frame acted in sits, which scrolling its
-    /// element into view may have moved.
+    /// element into view may have moved: a frame in another process asks
+    /// its page to scroll by message, so it is read until two reads agree.
     fn placed_again(&mut self) -> Result<(), String> {
         let Some(frame) = self.inside.as_ref().and_then(|inside| inside.frame.clone()) else {
             return Ok(());
         };
-        if frame.session.is_some() {
-            std::thread::sleep(FRAME_SCROLL);
+        let apart = frame.session.is_some();
+        let started = Instant::now();
+        if apart {
+            std::thread::sleep(FRAME_LOOK);
         }
-        self.inside = Some(self.inside_of(frame)?);
+        let mut inside = self.inside_of(frame.clone(), true)?;
+        let mut still = !apart;
+        while !still {
+            if self.stop.is_set() {
+                return Err(cdp::STOPPED.into());
+            }
+            if started.elapsed() >= FRAME_SETTLE {
+                return Err(FRAME_MOVING.into());
+            }
+            std::thread::sleep(FRAME_LOOK);
+            let again = self.inside_of(frame.clone(), false)?;
+            still = again == inside;
+            inside = again;
+        }
+        self.inside = Some(inside);
         Ok(())
+    }
+
+    /// Refuses once the frame in another process acted in has moved since
+    /// `placed_again` found it: the point checked for a cover is not where
+    /// the pointer would go.
+    fn not_moved(&mut self) -> Result<(), String> {
+        let Some(before) = self.inside.take() else {
+            return Ok(());
+        };
+        let apart = before.frame.clone().filter(|frame| frame.session.is_some());
+        let moved = match apart {
+            Some(frame) => self.inside_of(frame, false).map(|now| now != before),
+            None => Ok(false),
+        };
+        // Kept either way: the frame's handles are let go of through it.
+        self.inside = Some(before);
+        match moved? {
+            false => Ok(()),
+            true => Err(FRAME_MOVING.into()),
+        }
+    }
+
+    /// The size of the view of frame `id`, reached through `session`, as its
+    /// own page counts it, scroll bars included.
+    fn view_of(&mut self, session: Option<&str>, id: &str) -> Result<(f64, f64), String> {
+        let context = self.world(session, id)?;
+        let asked = json!({"expression": "[innerWidth, innerHeight]", "contextId": context,
+                           "returnByValue": true});
+        let stop = self.stop.clone();
+        let size: Value = (self.tab).call_in(
+            session,
+            "Runtime.evaluate",
+            asked,
+            cdp::CALL_TIME,
+            Some(&stop),
+        )?;
+        let side = |at: usize| size["result"]["value"][at].as_f64().unwrap_or(0.);
+        Ok((side(0), side(1)))
+    }
+
+    /// A script context of our own in frame `id`, reached through `session`:
+    /// the page's scripts cannot change what the browser's own objects say
+    /// there, as they can in theirs.
+    fn world(&mut self, session: Option<&str>, id: &str) -> Result<i64, String> {
+        let asked = json!({"frameId": id, "worldName": WORLD});
+        let stop = self.stop.clone();
+        let made: Value = (self.tab).call_in(
+            session,
+            "Page.createIsolatedWorld",
+            asked,
+            cdp::CALL_TIME,
+            Some(&stop),
+        )?;
+        made["executionContextId"]
+            .as_i64()
+            .ok_or_else(|| "The browser gave no place to look at the frame from.".to_owned())
     }
 
     /// The view's size in CSS pixels, which points in it are counted in.
@@ -3401,7 +3493,7 @@ impl Session {
             None => ((0., 0.), Vec::new()),
         };
         for (session, element, (left, top)) in shown_in {
-            let cover = self.drawn_over(session.as_deref(), element, x - left, y - top)?;
+            let cover = self.drawn_over(session.as_deref(), element, (x - left, y - top), true)?;
             if cover.is_some() {
                 return Ok(cover);
             }
@@ -3410,21 +3502,24 @@ impl Session {
             .inside
             .as_ref()
             .and_then(|inside| inside.session.clone());
-        self.drawn_over(session.as_deref(), node, x - origin.0, y - origin.1)
+        let at = (x - origin.0, y - origin.1);
+        self.drawn_over(session.as_deref(), node, at, false)
     }
 
     /// What is drawn over `node`, reached through `session`, at a point
-    /// counted from the top left of the frame it is in.
+    /// counted from the top left of the frame it is in; `exact` for the
+    /// element a frame is shown in.
     fn drawn_over(
         &mut self,
         session: Option<&str>,
         node: i64,
-        x: f64,
-        y: f64,
+        (x, y): (f64, f64),
+        exact: bool,
     ) -> Result<Option<String>, String> {
         let object = self.object_in(session, node)?;
         let asked = json!({"objectId": object, "functionDeclaration": COVERED,
-                           "arguments": [{"value": x}, {"value": y}], "returnByValue": true});
+                           "arguments": [{"value": x}, {"value": y}, {"value": exact}],
+                           "returnByValue": true});
         let answer: Value = (self.tab).call_in(
             session,
             "Runtime.callFunctionOn",
@@ -3655,6 +3750,27 @@ impl Session {
             None => Err("The dropdown did not answer.".into()),
         }
     }
+}
+
+/// Refuses a frame in another process whose element shows it other than
+/// upright and at its own view's `size` -- turned, scaled or zoomed -- by
+/// `quad`, the element's content box in the view of the page it is in: a
+/// point counted from the frame's top left would land off what it is
+/// aimed at. Within a pixel, as sizes are rounded.
+fn drawn_as_laid_out(quad: &Value, (width, height): (f64, f64)) -> Result<(), String> {
+    let at = |index: usize| quad[index].as_f64().unwrap_or(f64::NAN);
+    let near = |a: f64, b: f64| (a - b).abs() <= 1.;
+    let upright = near(at(0), at(6)) && near(at(2), at(4));
+    let upright = upright && near(at(1), at(3)) && near(at(5), at(7));
+    if upright && near(at(2) - at(0), width) && near(at(7) - at(1), height) {
+        return Ok(());
+    }
+    Err(
+        "That frame is drawn turned, scaled or zoomed on the page, so a point in it would land \
+         off what is aimed at. Use `type`, `press` or `select` on its refs, or ask the user to \
+         do it in the browser."
+            .into(),
+    )
 }
 
 /// `quads` from a frame whose points count from `offset` in the page's
@@ -4810,10 +4926,16 @@ mod tests {
     /// pay.test in another process, attached as S1, whose document is
     /// `loader` now; its field is node 3, as the page's heading is. What is
     /// looked at for a cover and where the mouse goes are kept in `seen`.
+    /// The frame's own view is `view` big -- 300 by 100 fits its element --
+    /// and the element moves a pixel each time it is read after the first
+    /// `still` reads.
     fn framed_page(
         loader: Arc<Mutex<&'static str>>,
         seen: Arc<Mutex<Vec<String>>>,
+        view: [u32; 2],
+        still: u64,
     ) -> impl Fn(Option<&str>, &str, &Value) -> (Vec<Value>, Value) + Send + 'static {
+        let reads = AtomicU64::new(0);
         let ax = |id: u32, role: &str, name: &str, kids: &[u32]| {
             json!({"nodeId": id.to_string(), "role": {"value": role}, "name": {"value": name},
                    "backendDOMNodeId": id,
@@ -4842,8 +4964,17 @@ mod tests {
                 (None, "Accessibility.getFullAXTree") => shop.clone(),
                 (Some("S1"), "Accessibility.getFullAXTree") => pay.clone(),
                 (None, "DOM.getFrameOwner") => json!({"backendNodeId": 9}),
-                (None, "DOM.getBoxModel") => json!({"model": {"width": 300, "height": 100,
-                    "content": [10, 200, 310, 200, 310, 300, 10, 300]}}),
+                (None, "DOM.getBoxModel") => {
+                    let left = 10 + reads.fetch_add(1, Ordering::Relaxed).saturating_sub(still);
+                    json!({"model": {"width": 300, "height": 100,
+                        "content": [left, 200, left + 300, 200, left + 300, 300, left, 300]}})
+                }
+                (_, "Page.createIsolatedWorld") => json!({"executionContextId": 7}),
+                (Some("S1"), "Runtime.evaluate")
+                    if params["expression"] == "[innerWidth, innerHeight]" =>
+                {
+                    json!({"result": {"value": view}})
+                }
                 (Some("S1"), "DOM.getContentQuads") => {
                     json!({"quads": [[20, 30, 120, 30, 120, 50, 20, 50]]})
                 }
@@ -4920,7 +5051,12 @@ mod tests {
             ("null", sandboxed),
             ("https://shop.test", "frame https://shop.test (same origin)"),
         ] {
-            let inner = framed_page(Arc::new(Mutex::new("L1")), Arc::default());
+            let inner = framed_page(
+                Arc::new(Mutex::new("L1")),
+                Arc::default(),
+                [300, 100],
+                u64::MAX,
+            );
             let page = move |session: Option<&str>, method: &str, params: &Value| {
                 let (events, mut answer) = inner(session, method, params);
                 match method {
@@ -5037,10 +5173,50 @@ mod tests {
     }
 
     #[test]
+    fn a_frame_drawn_scaled_or_still_moving_is_not_clicked_at_a_point() {
+        let cases = [
+            ([600, 200], u64::MAX, "turned, scaled or zoomed"),
+            ([300, 100], 0, "still moving"),
+            // Still while found again, moved once looked at for a cover.
+            ([300, 100], 3, "still moving"),
+        ];
+        for (view, still, said) in cases {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let page = framed_page(Arc::new(Mutex::new("L1")), seen.clone(), view, still);
+            let (mut session, server) = fake_frames_session(page);
+            session.read(false).unwrap();
+            let node = session.reach("e1", Some("https://pay.test")).unwrap();
+            let refused = session.click(node).unwrap_err();
+            assert!(refused.contains(said), "{refused}");
+            let seen = seen.lock().unwrap().clone();
+            assert!(!seen.iter().any(|at| at.starts_with("mouse")), "{seen:?}");
+            let looked = seen.iter().any(|at| at.contains("covered"));
+            assert_eq!(looked, still == 3, "{seen:?}");
+            drop(session);
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_frame_drawn_other_than_as_laid_out_is_refused_for_points() {
+        let upright = json!([10, 200, 310, 200, 310, 300, 10, 300]);
+        assert_eq!(drawn_as_laid_out(&upright, (300., 100.)), Ok(()));
+        assert_eq!(drawn_as_laid_out(&upright, (300.6, 99.5)), Ok(()));
+        // Scaled to half, turned a quarter, and turned upside down.
+        assert!(drawn_as_laid_out(&upright, (600., 200.)).is_err());
+        let turned = json!([310, 200, 310, 500, 210, 500, 210, 200]);
+        assert!(drawn_as_laid_out(&turned, (300., 100.)).is_err());
+        let flipped = json!([310, 300, 10, 300, 10, 200, 310, 200]);
+        assert!(drawn_as_laid_out(&flipped, (300., 100.)).is_err());
+        assert!(drawn_as_laid_out(&json!([]), (300., 100.)).is_err());
+    }
+
+    #[test]
     fn an_element_in_another_sites_frame_is_listed_under_its_origin_and_clicked_through_it() {
         let loader = Arc::new(Mutex::new("L1"));
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let (mut session, server) = fake_frames_session(framed_page(loader.clone(), seen.clone()));
+        let page = framed_page(loader.clone(), seen.clone(), [300, 100], u64::MAX);
+        let (mut session, server) = fake_frames_session(page);
         let listed = session.read(false).unwrap().text();
         assert_eq!(
             listed,
@@ -5769,8 +5945,20 @@ mod tests {
                 assert!(typed.contains("4242"), "{typed}");
                 let button = ref_of(&typed, "button \"Pay\"");
                 let click = json!({"action": "click", "ref": button, "frame": pay});
-                let paid = act(click).unwrap();
+                let paid = act(click.clone()).unwrap();
                 assert!(paid.contains("Paid 4242"), "{paid}");
+                // Drawn at half its size, the frame's points are not the
+                // page's, so a click in it is refused until it is not.
+                let scale = |to: &str| {
+                    let script =
+                        format!("document.getElementById('pay').style.transform = '{to}'; 1");
+                    act(json!({"action": "eval", "script": script})).unwrap();
+                };
+                scale("scale(0.5)");
+                let refused = act(click.clone()).unwrap_err();
+                assert!(refused.contains("scaled"), "{refused}");
+                scale("none");
+                act(click).unwrap();
                 let leave = ref_of(&paid, "link \"Leave\"");
                 act(json!({"action": "click", "ref": leave, "frame": pay})).unwrap();
                 std::thread::sleep(Duration::from_millis(500));
