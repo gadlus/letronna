@@ -521,8 +521,14 @@ fn jobs(rest: &str) {
 /// Skills are written in the window and were unreachable from here, which
 /// made them a feature of one half of the same program.
 fn skills(runner: &mut Runner, rest: &str) {
-    let saved = letronna_core::skills::load();
     render::blank();
+    let saved = match letronna_core::skills::load() {
+        Ok(saved) => saved,
+        Err(why) => {
+            render::line(&render::red(&why));
+            return;
+        }
+    };
     if saved.is_empty() {
         render::said(&render::blue("●"), &render::bold("No skills saved"));
         render::line(&render::dim("The window writes them; they show up here."));

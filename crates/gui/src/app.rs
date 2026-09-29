@@ -350,6 +350,13 @@ impl Chat {
                 }
             }),
         ];
+        // An empty list rather than the defaults, which the next save would
+        // write over the file; load has already kept a copy of one that will
+        // not parse.
+        let (skills, skills_error) = match letronna_core::skills::load() {
+            Ok(skills) => (skills, None),
+            Err(why) => (Vec::new(), Some(why)),
+        };
         let mut this = Self {
             page: Page::Chat,
             sidebar_open: true,
@@ -414,7 +421,7 @@ impl Chat {
             bot_name: None,
             discord_bot_name: None,
             channel: 0,
-            skills: letronna_core::skills::load(),
+            skills,
             editing_skill: None,
             skill_name,
             skill_prompt,
@@ -425,7 +432,7 @@ impl Chat {
             video_frame: None,
             browser: cx.new(|cx| crate::ui::browser::BrowserView::new(window, cx)),
             browser_for: 0,
-            error,
+            error: error.or(skills_error),
             updating: Default::default(),
             update_note: None,
             scroll: ScrollHandle::new(),
