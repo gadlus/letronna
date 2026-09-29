@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use tungstenite::{Message as Frame, WebSocket};
 
 /// How long one request may take before the browser is taken to be stuck.
-const CALL_TIME: Duration = Duration::from_secs(20);
+pub(crate) const CALL_TIME: Duration = Duration::from_secs(20);
 /// How long a browser has to start and open its debugging port. The first
 /// start makes the profile, which is the slow part.
 const START_TIME: Duration = Duration::from_secs(20);
@@ -57,6 +57,13 @@ const MAX_MESSAGE: usize = 64 << 20;
 /// Events kept for the action in progress. A page that reloads in a loop
 /// cannot grow this without bound.
 const MAX_EVENTS: usize = 500;
+/// Frames from other processes a tab keeps a session on at once. A page
+/// with more -- ads, trackers -- has the rest let go of as they come, so
+/// nothing held grows with what a page embeds.
+pub(crate) const MAX_FRAMES: usize = 16;
+/// How many frames deep inside one another frames are attached: a form in
+/// a frame in a frame is as deep as real pages go.
+pub(crate) const MAX_FRAME_DEPTH: usize = 3;
 /// The file a browser writes its debugging port into, in its profile.
 const PORT_FILE: &str = "DevToolsActivePort";
 /// What the browser is started with, besides its port and profile.
@@ -811,6 +818,9 @@ pub struct Event {
 struct Envelope {
     id: Option<u64>,
     method: Option<String>,
+    /// The session it came from, where one socket carries several.
+    #[serde(rename = "sessionId")]
+    session: Option<String>,
     #[serde(default)]
     params: Value,
 }
@@ -848,6 +858,99 @@ pub struct Tab {
     /// Calls given up on for a stop or their time, whose answers may still
     /// come: one that hands over a stream has it closed then.
     let_go: Vec<u64>,
+    /// Frames from other processes attached to it, as the browser told of
+    /// them, at most `MAX_FRAMES`.
+    pub frames: Vec<Attached>,
+    /// Whether the browser has been asked to attach its frames.
+    attaching: bool,
+}
+
+/// A frame from another process -- another site's, as a rule -- attached
+/// to its tab as a session of its own on the tab's socket.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Attached {
+    /// The session its elements are reached through.
+    pub session: String,
+    /// The frame's id, which is also its target's.
+    pub frame: String,
+    /// The frame it sits in.
+    pub parent: String,
+    /// The frame session it was attached through, if not the tab's own.
+    via: Option<String>,
+    /// How many such frames deep it is: 1 for one the page's process holds.
+    depth: usize,
+}
+
+/// What became of a frame the browser attached.
+#[derive(Debug, PartialEq)]
+enum Told {
+    /// Kept; true when it may attach frames of its own.
+    Kept(bool),
+    /// To be let go of: past the caps, or not a frame.
+    Refused,
+}
+
+/// What a session is asked, to attach the frames inside it: each as a
+/// session on the same socket, not held back from starting, and nothing
+/// else a page runs, such as its workers.
+fn auto_attach() -> Value {
+    json!({"autoAttach": true, "waitForDebuggerOnStart": false, "flatten": true,
+           "filter": [{"type": "iframe"}, {"exclude": true}]})
+}
+
+/// Keep the frame `Target.attachedToTarget` told of, arriving `via` a frame
+/// session or the tab's own, while it is under the caps.
+fn take_frame(frames: &mut Vec<Attached>, via: Option<&str>, params: &Value) -> Told {
+    let text = |value: &Value| value.as_str().unwrap_or_default().to_owned();
+    let info = &params["targetInfo"];
+    let depth = match via {
+        None => 1,
+        Some(via) => match frames.iter().find(|frame| frame.session == via) {
+            Some(outer) => outer.depth + 1,
+            None => return Told::Refused,
+        },
+    };
+    let frame = Attached {
+        session: text(&params["sessionId"]),
+        frame: text(&info["targetId"]),
+        parent: text(&info["parentFrameId"]),
+        via: via.map(str::to_owned),
+        depth,
+    };
+    if info["type"] != "iframe" || frame.session.is_empty() || depth > MAX_FRAME_DEPTH {
+        return Told::Refused;
+    }
+    let nests = depth < MAX_FRAME_DEPTH;
+    // A frame that loads another page may be attached again as it was.
+    if let Some(known) = frames
+        .iter_mut()
+        .find(|known| known.session == frame.session)
+    {
+        *known = frame;
+        return Told::Kept(nests);
+    }
+    if frames.len() >= MAX_FRAMES {
+        return Told::Refused;
+    }
+    frames.push(frame);
+    Told::Kept(nests)
+}
+
+/// Forget the frame attached as `session` and every frame attached through
+/// it, which went with it; their sessions.
+fn drop_frame(frames: &mut Vec<Attached>, session: &str) -> Vec<String> {
+    let mut gone = vec![session.to_owned()];
+    let mut at = 0;
+    while let Some(outer) = gone.get(at).cloned() {
+        for frame in frames.iter() {
+            if frame.via.as_deref() == Some(outer.as_str()) && !gone.contains(&frame.session) {
+                gone.push(frame.session.clone());
+            }
+        }
+        at += 1;
+    }
+    frames.retain(|frame| !gone.contains(&frame.session));
+    gone
 }
 
 /// How a tab is talked to.
@@ -897,6 +1000,8 @@ impl Tab {
             open_dialog: None,
             leaves_dialogs: false,
             let_go: Vec::new(),
+            frames: Vec::new(),
+            attaching: false,
         }
     }
 
@@ -934,7 +1039,7 @@ impl Tab {
         params: Value,
         limit: Duration,
     ) -> Result<T, String> {
-        self.answer(method, params, limit, None)
+        self.answer(None, method, params, limit, None)
     }
 
     /// `call_within`, given up on once `cancel` is set, for what can take
@@ -946,17 +1051,32 @@ impl Tab {
         limit: Duration,
         cancel: &Cancel,
     ) -> Result<T, String> {
-        self.answer(method, params, limit, Some(cancel))
+        self.answer(None, method, params, limit, Some(cancel))
     }
 
-    fn answer<T: DeserializeOwned>(
+    /// Ask one of the page's frames something, by the session it was
+    /// attached as -- or the tab itself, with none -- within `limit`, and
+    /// given up on at a stop if `cancel` is given.
+    pub fn call_in<T: DeserializeOwned>(
         &mut self,
+        session: Option<&str>,
         method: &str,
         params: Value,
         limit: Duration,
         cancel: Option<&Cancel>,
     ) -> Result<T, String> {
-        let id = self.send(method, params)?;
+        self.answer(session, method, params, limit, cancel)
+    }
+
+    fn answer<T: DeserializeOwned>(
+        &mut self,
+        session: Option<&str>,
+        method: &str,
+        params: Value,
+        limit: Duration,
+        cancel: Option<&Cancel>,
+    ) -> Result<T, String> {
+        let id = self.send_in(session, method, params)?;
         let deadline = Instant::now() + limit;
         loop {
             // Looked for before every read, not only when one times out: a
@@ -998,6 +1118,42 @@ impl Tab {
         }
     }
 
+    /// Have the browser attach the page's frames from other processes, once
+    /// for the tab: those there now are told of at once, and new ones as
+    /// they come, until the tab closes.
+    pub fn attach_frames(
+        &mut self,
+        limit: Duration,
+        cancel: Option<&Cancel>,
+    ) -> Result<(), String> {
+        if self.attaching {
+            return Ok(());
+        }
+        // Asked once: frames are told of before the answer, and a browser
+        // that does not answer in time may still have done it.
+        self.attaching = true;
+        self.answer::<Ignored>(None, "Target.setAutoAttach", auto_attach(), limit, cancel)
+            .map(drop)
+    }
+
+    /// Have the one socket to a browser elsewhere hand this tab what the
+    /// frame attached as `session` says.
+    fn adopt(&self, session: &str) {
+        if let Wire::Session { link, to_inbox, .. } = &self.wire
+            && let Ok(mut frames) = link.frames.lock()
+        {
+            frames.insert(session.to_owned(), to_inbox.clone());
+        }
+    }
+
+    fn disown(&self, session: &str) {
+        if let Wire::Session { link, .. } = &self.wire
+            && let Ok(mut frames) = link.frames.lock()
+        {
+            frames.remove(session);
+        }
+    }
+
     /// Ask the browser something without waiting for the answer, which is
     /// let go of when it comes. For input: a click that opens a dialog is
     /// not answered until the dialog is.
@@ -1030,10 +1186,18 @@ impl Tab {
     }
 
     fn send(&mut self, method: &str, params: Value) -> Result<u64, String> {
+        self.send_in(None, method, params)
+    }
+
+    /// `send`, to a frame's session rather than the tab's with `frame`.
+    fn send_in(&mut self, frame: Option<&str>, method: &str, params: Value) -> Result<u64, String> {
         let sent = match &mut self.wire {
             Wire::Socket(socket) => {
                 self.next += 1;
-                let request = json!({"id": self.next, "method": method, "params": params});
+                let mut request = json!({"id": self.next, "method": method, "params": params});
+                if let Some(frame) = frame {
+                    request["sessionId"] = json!(frame);
+                }
                 socket
                     .send(Frame::text(request.to_string()))
                     .map(|_| self.next)
@@ -1048,7 +1212,7 @@ impl Tab {
             } => {
                 let id = link.next.fetch_add(1, Ordering::Relaxed) + 1;
                 let mut request = json!({"id": id, "method": method, "params": params});
-                if let Some(session) = session {
+                if let Some(session) = frame.or(session.as_deref()) {
                     request["sessionId"] = json!(session);
                 }
                 if let Ok(mut waiting) = link.waiting.lock() {
@@ -1134,6 +1298,39 @@ impl Tab {
     fn heard(&mut self, envelope: Envelope) -> Option<usize> {
         let method = envelope.method?;
         let text = |key: &str| envelope.params[key].as_str().unwrap_or_default().to_owned();
+        let own = match &self.wire {
+            Wire::Session { session, .. } => session.as_deref(),
+            Wire::Socket(_) => None,
+        };
+        let via = envelope.session.as_deref().filter(|via| Some(*via) != own);
+        // Only a tab that asked for its frames is told of them.
+        if method == "Target.attachedToTarget" && self.attaching {
+            let (session, via) = (text("sessionId"), via.map(str::to_owned));
+            match take_frame(&mut self.frames, via.as_deref(), &envelope.params) {
+                Told::Kept(nests) => {
+                    self.adopt(&session);
+                    if nests {
+                        let _ = self.send_in(Some(&session), "Target.setAutoAttach", auto_attach());
+                    }
+                }
+                Told::Refused => {
+                    let gone = json!({"sessionId": session});
+                    let _ = self.send_in(via.as_deref(), "Target.detachFromTarget", gone);
+                }
+            }
+            return None;
+        }
+        if method == "Target.detachedFromTarget" && self.attaching {
+            for gone in drop_frame(&mut self.frames, &text("sessionId")) {
+                self.disown(&gone);
+            }
+            return None;
+        }
+        // Nothing is turned on in a frame to tell of, and what one says is
+        // not the page's to act on.
+        if via.is_some() {
+            return None;
+        }
         if method == "Page.javascriptDialogOpening" && !self.leaves_dialogs {
             let (kind, message) = (text("type"), text("message"));
             let reply = json!({
@@ -1169,6 +1366,9 @@ impl Tab {
 impl Drop for Tab {
     /// A session on a browser elsewhere is let go of there too.
     fn drop(&mut self) {
+        for frame in &self.frames {
+            self.disown(&frame.session);
+        }
         if let Wire::Session {
             link,
             session: Some(session),
@@ -1200,6 +1400,8 @@ pub struct Link {
     waiting: Mutex<HashMap<u64, mpsc::Sender<String>>>,
     /// Where each session's events go.
     sessions: Mutex<HashMap<String, mpsc::Sender<String>>>,
+    /// Where what each frame attached to a tab says goes: to its tab.
+    frames: Mutex<HashMap<String, mpsc::Sender<String>>>,
     next: AtomicU64,
     open: AtomicBool,
     /// Private contexts made on it, closed when it is let go of: the browser
@@ -1252,6 +1454,7 @@ impl Link {
             outgoing: Mutex::new(outgoing),
             waiting: Mutex::default(),
             sessions: Mutex::default(),
+            frames: Mutex::default(),
             next: AtomicU64::new(0),
             open: AtomicBool::new(true),
             contexts: Mutex::default(),
@@ -1317,6 +1520,9 @@ impl Link {
         if let Ok(mut sessions) = self.sessions.lock() {
             sessions.clear();
         }
+        if let Ok(mut frames) = self.frames.lock() {
+            frames.clear();
+        }
     }
 
     /// Hand an answer to whoever asked, and an event to its session.
@@ -1348,16 +1554,15 @@ impl Link {
                 .and_then(|detached| self.sessions.lock().ok()?.remove(&detached.params.session));
             if let Some(to) = gone {
                 let _ = to.send(DETACHED.to_owned());
+                return;
             }
-            return;
+            // A frame's session, which its tab is told of as of any event.
         }
         let to = match (routing.id, routing.session) {
             (Some(id), _) => self.waiting.lock().ok().and_then(|mut w| w.remove(&id)),
-            (None, Some(session)) => self
-                .sessions
-                .lock()
-                .ok()
-                .and_then(|s| s.get(&session).cloned()),
+            (None, Some(session)) => (self.sessions.lock().ok())
+                .and_then(|s| s.get(&session).cloned())
+                .or_else(|| self.frames.lock().ok()?.get(&session).cloned()),
             (None, None) => None,
         };
         if let Some(to) = to {
@@ -1485,6 +1690,14 @@ pub(crate) mod tests {
     pub(crate) fn fake_browser(
         reply: impl Fn(&str, &Value) -> (Vec<Value>, Value) + Send + 'static,
     ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        fake_frames(move |_, method, params| reply(method, params))
+    }
+
+    /// `fake_browser`, told the frame session a request is for, if any,
+    /// which its answer carries back; heard as "<session> <method>".
+    pub(crate) fn fake_frames(
+        reply: impl Fn(Option<&str>, &str, &Value) -> (Vec<Value>, Value) + Send + 'static,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = format!("ws://{}/devtools/page/T1", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
@@ -1494,16 +1707,23 @@ pub(crate) mod tests {
             while let Ok(Frame::Text(text)) = socket.read() {
                 let request: Value = serde_json::from_str(text.as_str()).unwrap();
                 let method = request["method"].as_str().unwrap().to_owned();
-                heard.push(method.clone());
-                let (events, result) = reply(&method, &request["params"]);
+                let session = request["sessionId"].as_str();
+                heard.push(match session {
+                    Some(session) => format!("{session} {method}"),
+                    None => method.clone(),
+                });
+                let (events, result) = reply(session, &method, &request["params"]);
                 for event in events {
                     socket.send(Frame::text(event.to_string())).unwrap();
                 }
-                let answer = if result.get("error").is_some() {
+                let mut answer = if result.get("error").is_some() {
                     json!({"id": request["id"], "error": result["error"]})
                 } else {
                     json!({"id": request["id"], "result": result})
                 };
+                if let Some(session) = session {
+                    answer["sessionId"] = json!(session);
+                }
                 socket.send(Frame::text(answer.to_string())).unwrap();
             }
             heard
@@ -1656,5 +1876,158 @@ pub(crate) mod tests {
             heard,
             ["Page.printToPDF", "Page.reload", "IO.close", "Page.enable"]
         );
+    }
+
+    /// What `Target.attachedToTarget` says of the frame `frame` attached as
+    /// `session`, a target of `kind`.
+    pub(crate) fn attached(session: &str, frame: &str, kind: &str) -> Value {
+        json!({"sessionId": session,
+               "targetInfo": {"targetId": frame, "type": kind, "parentFrameId": "TOP"}})
+    }
+
+    #[test]
+    fn frames_are_kept_up_to_their_caps_and_go_with_the_frame_they_came_through() {
+        let mut frames = Vec::new();
+        let frame = |session: &str| attached(session, &format!("F{session}"), "iframe");
+        assert_eq!(
+            take_frame(&mut frames, None, &attached("W", "W", "worker")),
+            Told::Refused
+        );
+        assert_eq!(take_frame(&mut frames, None, &frame("1")), Told::Kept(true));
+        assert_eq!(
+            take_frame(&mut frames, Some("1"), &frame("2")),
+            Told::Kept(true)
+        );
+        assert_eq!(
+            take_frame(&mut frames, Some("2"), &frame("3")),
+            Told::Kept(false)
+        );
+        // Deeper than the cap, or through a frame no longer kept.
+        assert_eq!(
+            take_frame(&mut frames, Some("3"), &frame("4")),
+            Told::Refused
+        );
+        assert_eq!(
+            take_frame(&mut frames, Some("gone"), &frame("5")),
+            Told::Refused
+        );
+        // One attached again, having loaded another page, is still one.
+        assert_eq!(take_frame(&mut frames, None, &frame("1")), Told::Kept(true));
+        assert_eq!(frames.len(), 3);
+        for more in 3..MAX_FRAMES {
+            let session = format!("x{more}");
+            assert_eq!(
+                take_frame(&mut frames, None, &frame(&session)),
+                Told::Kept(true)
+            );
+        }
+        assert_eq!(take_frame(&mut frames, None, &frame("over")), Told::Refused);
+        assert_eq!(frames.len(), MAX_FRAMES);
+        assert_eq!(drop_frame(&mut frames, "1"), ["1", "2", "3"]);
+        assert_eq!(frames.len(), MAX_FRAMES - 3);
+        assert_eq!(frames[0].frame, "Fx3");
+    }
+
+    #[test]
+    fn a_frame_is_asked_through_its_session_and_what_it_says_is_not_the_pages() {
+        let (address, server) = fake_frames(|session, method, _| match (session, method) {
+            (None, "Target.setAutoAttach") => (
+                vec![
+                    json!({"method": "Target.attachedToTarget",
+                           "params": attached("S1", "F1", "iframe")}),
+                    json!({"method": "Target.attachedToTarget",
+                           "params": attached("W1", "W1", "worker")}),
+                    json!({"method": "Page.javascriptDialogOpening", "sessionId": "S1",
+                           "params": {"type": "alert", "message": "Mine"}}),
+                ],
+                json!({}),
+            ),
+            (Some("S1"), "Page.getFrameTree") => {
+                (vec![], json!({"frameTree": {"frame": {"id": "F1"}}}))
+            }
+            (None, "Runtime.evaluate") => (
+                vec![json!({"method": "Target.detachedFromTarget",
+                            "params": {"sessionId": "S1"}})],
+                json!({}),
+            ),
+            _ => (vec![], json!({})),
+        });
+        let mut tab = Tab::connect(&address, "T1").unwrap();
+        let time = Duration::from_secs(2);
+        tab.attach_frames(time, None).unwrap();
+        tab.attach_frames(time, None).unwrap();
+        assert_eq!(tab.frames.len(), 1);
+        assert_eq!(
+            (
+                tab.frames[0].session.as_str(),
+                tab.frames[0].parent.as_str()
+            ),
+            ("S1", "TOP")
+        );
+        // Neither the attaching nor the frame's own words are the page's.
+        assert!(tab.events.is_empty() && tab.dialogs.is_empty());
+        let tree: Value = tab
+            .call_in(Some("S1"), "Page.getFrameTree", json!({}), time, None)
+            .unwrap();
+        assert_eq!(tree["frameTree"]["frame"]["id"], "F1");
+        tab.call::<Ignored>("Runtime.evaluate", json!({})).unwrap();
+        assert!(tab.frames.is_empty());
+        drop(tab);
+        assert_eq!(
+            server.join().unwrap(),
+            [
+                "Target.setAutoAttach",
+                "S1 Target.setAutoAttach",
+                "Target.detachFromTarget",
+                "S1 Page.getFrameTree",
+                "Runtime.evaluate"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_browser_elsewhere_hands_a_frames_words_to_its_tab_and_its_going_leaves_the_tab_open() {
+        let (outgoing, sent) = mpsc::channel();
+        let link = Arc::new(Link {
+            outgoing: Mutex::new(outgoing),
+            waiting: Mutex::default(),
+            sessions: Mutex::default(),
+            frames: Mutex::default(),
+            next: AtomicU64::new(0),
+            open: AtomicBool::new(true),
+            contexts: Mutex::default(),
+        });
+        let mut tab = Tab::over(&link, Some("S".into()), "T1");
+        // As once it has asked the browser for its frames.
+        tab.attaching = true;
+        let told = |via: &str, method: &str, params: Value| {
+            link.hand_on(json!({"method": method, "sessionId": via, "params": params}).to_string());
+        };
+        let read = |tab: &mut Tab| tab.wait(Duration::from_millis(50), |_| false).unwrap();
+        told(
+            "S",
+            "Target.attachedToTarget",
+            attached("C", "F1", "iframe"),
+        );
+        read(&mut tab);
+        // One inside it tells of itself through the frame's session.
+        told(
+            "C",
+            "Target.attachedToTarget",
+            attached("D", "F2", "iframe"),
+        );
+        read(&mut tab);
+        assert_eq!(tab.frames.len(), 2);
+        told("S", "Target.detachedFromTarget", json!({"sessionId": "C"}));
+        read(&mut tab);
+        assert!(tab.frames.is_empty() && !tab.broken);
+        assert!(link.frames.lock().unwrap().is_empty());
+        let asked: Vec<Value> = sent
+            .try_iter()
+            .map(|text| serde_json::from_str(&text).unwrap())
+            .filter(|asked: &Value| asked["method"] == "Target.setAutoAttach")
+            .map(|asked| asked["sessionId"].clone())
+            .collect();
+        assert_eq!(asked, [json!("C"), json!("D")]);
     }
 }

@@ -381,13 +381,16 @@ fn ladder(call: &ToolCall, gate: &Gate, judge: Option<&dyn Fn(&str) -> Verdict>)
         return Outcome::Run;
     }
     // Layer 4: what the user allowed in this session or by rule. A yes to
-    // using pages is not one to send this computer's files to them, so each
-    // upload is asked about, or judged, on its own.
+    // using pages is not one to send this computer's files to them, nor to
+    // act in a frame another site put in one -- its payment or sign-in
+    // form -- so each upload, and each action in such a frame, is asked
+    // about, or judged, on its own.
     let granted = gate
         .grants
         .get(&gate.ctx.conversation)
         .is_some_and(|tools| tools.contains(tool.name()));
-    if !opaque && !uploads(tool.name(), &args) && (granted || ruling.allow) {
+    let apart = uploads(tool.name(), &args) || in_frame(tool.name(), &args);
+    if !opaque && !apart && (granted || ruling.allow) {
         return Outcome::Run;
     }
     // Layer 5: a command that only reads, inside the workspace, needs no
@@ -427,11 +430,21 @@ pub(crate) fn uploads(name: &str, args: &Value) -> bool {
     name == "use_page" && args["action"] == "upload"
 }
 
+/// Whether a call to the tool named `name` with `args` acts inside a frame
+/// from another origin than its page's, as `frame` says; the browser makes
+/// sure the element is in a frame from that origin before acting.
+pub(crate) fn in_frame(name: &str, args: &Value) -> bool {
+    let acts = name == "use_page" || (name == crate::browser::BROWSE && args["action"] == "hover");
+    acts && args["frame"]
+        .as_str()
+        .is_some_and(|frame| !frame.is_empty())
+}
+
 /// Whether a yes on the card for a call to `name` with `args` may be kept
-/// for the rest of the session: an upload is asked about each time, so its
-/// card offers no such choice.
+/// for the rest of the session: an upload, or an action in another site's
+/// frame, is asked about each time, so its card offers no such choice.
 pub fn grants_for_session(name: &str, args: &Value) -> bool {
-    !uploads(name, args)
+    !uploads(name, args) && !in_frame(name, args)
 }
 
 /// Whether the tool named `name` spends the user's credit, which is theirs
@@ -2073,6 +2086,69 @@ mod tests {
         let args = |call: &ToolCall| serde_json::from_str::<Value>(&call.arguments).unwrap();
         assert!(grants_for_session("use_page", &args(&click)));
         assert!(!grants_for_session("use_page", &args(&upload)));
+    }
+
+    #[test]
+    fn a_yes_or_an_allow_for_the_page_does_not_cover_acting_in_another_sites_frame() {
+        let ctx = ToolContext::default();
+        let names = ["use_page".to_owned(), crate::browser::BROWSE.to_owned()];
+        let granted = Grants::from([(0, HashSet::from(names))]);
+        let allowed = [Rule {
+            tool: "use_page".into(),
+            pattern: "*".into(),
+            effect: permissions::Effect::Allow,
+            project: None,
+        }];
+        let typing = |frame: Option<&str>| {
+            let mut args = serde_json::json!({ "action": "type", "ref": "e9", "text": "4242" });
+            if let Some(frame) = frame {
+                args["frame"] = frame.into();
+            }
+            call("use_page", args)
+        };
+        let paying = typing(Some("https://pay.example"));
+        let none = Grants::new();
+        for (grants, rules) in [(&granted, &[][..]), (&none, &allowed[..])] {
+            let gate = |mode: Mode| Gate {
+                ctx: &ctx,
+                mode,
+                grants,
+                rules,
+                broken: None,
+                human: true,
+            };
+            assert_eq!(decide(&typing(None), &gate(Mode::Default)), Outcome::Run);
+            assert_eq!(decide(&paying, &gate(Mode::Default)), Outcome::Ask);
+            // Bypass runs it as it runs an upload; plan mode and Don't ask
+            // refuse it as they refuse any action on the page.
+            assert_eq!(decide(&paying, &gate(Mode::Bypass)), Outcome::Run);
+            for mode in [Mode::Plan, Mode::DontAsk] {
+                assert!(matches!(decide(&paying, &gate(mode)), Outcome::Refuse(_)));
+            }
+        }
+        // A hover there is asked about too; a look that names a frame is not
+        // an action in it.
+        let gate = Gate {
+            ctx: &ctx,
+            mode: Mode::Default,
+            grants: &granted,
+            rules: &[],
+            broken: None,
+            human: true,
+        };
+        let browse = |action: &str| {
+            let args = serde_json::json!({ "action": action, "ref": "e9", "frame": "https://pay.example" });
+            call(crate::browser::BROWSE, args)
+        };
+        assert_eq!(decide(&browse("hover"), &gate), Outcome::Ask);
+        assert_eq!(decide(&browse("look"), &gate), Outcome::Run);
+        let args = |call: &ToolCall| serde_json::from_str::<Value>(&call.arguments).unwrap();
+        assert!(grants_for_session("use_page", &args(&typing(None))));
+        assert!(!grants_for_session("use_page", &args(&paying)));
+        assert!(!grants_for_session(
+            crate::browser::BROWSE,
+            &args(&browse("hover"))
+        ));
     }
 
     #[test]
