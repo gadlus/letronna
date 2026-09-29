@@ -73,6 +73,9 @@ const PROMPTS: &[&str] = &[
     "gcr-prompter",
     "pinentry*",
     "ssh-askpass*",
+    "x11-ssh-askpass",
+    "gnome-ssh-askpass*",
+    "lxqt-openssh-askpass",
     "ksshaskpass",
 ];
 

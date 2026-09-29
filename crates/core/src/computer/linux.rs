@@ -1390,6 +1390,14 @@ mod tests {
         assert_eq!(identity(&urxvt), "urxvt");
         let askpass = window(3, None, "Pinentry-gnome3", rect(0.0, 0.0, 9.0, 9.0));
         assert_eq!(identity(&askpass), "pinentry-gnome3");
+        // The ssh password prompts, by the programs Debian and Fedora run.
+        for program in [
+            "x11-ssh-askpass",
+            "gnome-ssh-askpass3",
+            "lxqt-openssh-askpass",
+        ] {
+            assert!(out_of_reach(program), "{program}");
+        }
         // Any other class leaves the program as the id.
         let editor = window(4, pid, "Gedit", rect(0.0, 0.0, 9.0, 9.0));
         assert_eq!(identity(&editor), program);
