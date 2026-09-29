@@ -5,6 +5,7 @@
 //! frame, and asking the user by reading a line rather than drawing a card.
 
 use letronna_core::agent::{Next, Turn};
+use letronna_core::approvals::{self, Decision, Request};
 use letronna_core::cancel::Cancel;
 use letronna_core::chat::{self, Connection, Event, Message, ToolCall};
 use letronna_core::gate::{self, Gate, Grants, Mode};
@@ -518,6 +519,10 @@ impl Runner {
         let patience = self.bar.patience();
         wait_on(receiver, patience, || {
             self.bar.pump();
+            // Helpers working in the background ask while the model talks
+            // too. Only the rules answer here: a question left open would
+            // hold up the reply, which has a deadline of its own.
+            self.answer_helpers(false);
             self.bar.interrupted() || self.bar.hurried()
         })
     }
@@ -526,6 +531,9 @@ impl Runner {
         let patience = self.bar.patience();
         wait_on(receiver, patience, || {
             self.bar.pump();
+            // A helper started by this call asks for its yes while the call
+            // waits on it, so unanswered here the two would wait on each other.
+            self.answer_helpers(true);
             self.bar.interrupted()
         })
     }
@@ -694,6 +702,55 @@ impl Runner {
         };
         render::tool(&call.name, "", outcome, false);
         true
+    }
+
+    /// Start answering helpers' requests for a yes: in the box's loops when it
+    /// is up, and otherwise on a thread of its own, so that a helper is heard
+    /// however the main thread waits on the call it runs under. `terminal`
+    /// says whether there is someone to ask without the box.
+    pub fn serve_helpers(&mut self, terminal: bool) {
+        if self.bar.serve() {
+            return;
+        }
+        let mode = self.mode;
+        let rules = letronna_core::permissions::load(&letronna_core::permissions::user_file());
+        let requests = approvals::serve();
+        std::thread::spawn(move || {
+            // The session's grants are kept on the main thread, so here only
+            // the mode and the rules answer for the user.
+            let none = Grants::new();
+            for request in requests {
+                let decision = match settled(&request, mode, &none, &rules, terminal) {
+                    Some(Decision::Deny(why)) => {
+                        declined(&request, &why);
+                        Decision::Deny(why)
+                    }
+                    Some(decision) => decision,
+                    // A bar that was never installed asks on the line, as the
+                    // session's own cards are asked without the box.
+                    None => ask_about(&mut Bar::new(String::new()), &request),
+                };
+                request.answer(decision);
+            }
+        });
+    }
+
+    /// Answer every helper waiting on a yes that the session's own rules
+    /// settle, and ask the user about the rest -- or, when `ask` is false,
+    /// keep the first of those back for a later call to ask.
+    pub fn answer_helpers(&mut self, ask: bool) {
+        while let Some(request) = self.bar.asked() {
+            let rules = letronna_core::permissions::load(&letronna_core::permissions::user_file());
+            let decision = match settled(&request, self.mode, &self.allowed, &rules, true) {
+                Some(decision) => decision,
+                None if ask => ask_about(&mut self.bar, &request),
+                None => {
+                    self.bar.hold(request);
+                    return;
+                }
+            };
+            request.answer(decision);
+        }
     }
 
     pub fn persist(&mut self) {
@@ -997,6 +1054,76 @@ pub fn intent(name: &str, summary: &str) -> String {
         "search_web" => "search the web".to_owned(),
         other => format!("use {other}"),
     }
+}
+
+/// What the session's own gate makes of a helper's call, or `None` when
+/// only the user can say: with no terminal to ask on, that is a no.
+fn settled(
+    request: &Request,
+    mode: Mode,
+    allowed: &Grants,
+    rules: &Result<Vec<letronna_core::permissions::Rule>, String>,
+    terminal: bool,
+) -> Option<Decision> {
+    let mut ctx = tools::ToolContext::default();
+    ctx.conversation = request.root;
+    ctx.workspace = std::env::current_dir().ok();
+    let gate = Gate::for_terminal(&ctx, allowed, rules, mode, terminal);
+    match gate::decide(&request.call, &gate) {
+        gate::Outcome::Run => Some(Decision::Once),
+        gate::Outcome::Refuse(why) => Some(Decision::Deny(why)),
+        gate::Outcome::Ask => (!terminal).then(|| Decision::Deny(String::new())),
+    }
+}
+
+/// Put a helper's request to the user: in the box when `bar` is up, on the
+/// line when not.
+fn ask_about(bar: &mut Bar, request: &Request) -> Decision {
+    let call = &request.call;
+    let summary = tools::summary(&call.name, &call.arguments);
+    let question = format!(
+        "Helper {} wants to {}",
+        request.label,
+        intent(&call.name, &summary)
+    );
+    let detail = request
+        .preview
+        .lines()
+        .take(DETAIL_LINES)
+        .map(str::to_owned)
+        .collect();
+    let picked = bar.interject(
+        &question,
+        detail,
+        &["Yes", "Yes, and stop asking it for this", "No"],
+    );
+    match picked {
+        Some(0) => Decision::Once,
+        Some(1) => Decision::ForRun,
+        _ => Decision::Deny(String::new()),
+    }
+}
+
+/// Say under the tool that a helper's call was declined, for `why` or for
+/// want of anyone to ask, since nothing else would show why the helper came
+/// back without what it went for.
+fn declined(request: &Request, why: &str) {
+    let call = &request.call;
+    let summary = tools::summary(&call.name, &call.arguments);
+    let why = if why.is_empty() {
+        format!(
+            "declined for helper {}: nobody is here to ask (a mode that allows it would)",
+            request.label
+        )
+    } else {
+        format!(
+            "declined for helper {}: {}",
+            request.label,
+            tools::one_line(why)
+        )
+    };
+    render::blank();
+    render::tool(&call.name, &summary, &why, true);
 }
 
 fn usage(reply: &Message) -> String {

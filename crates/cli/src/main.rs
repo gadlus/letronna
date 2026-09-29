@@ -178,6 +178,9 @@ fn main() {
     let note = footer(&runner);
     runner.bar.set_footer(note);
     runner.bar.install();
+    // Before anything can start a turn. Without the box, a terminal on both
+    // ends is still someone to ask.
+    runner.serve_helpers(std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
     render::clear();
     banner(&runner, &folder, session);
     if let Some(version) = update::seen() {
@@ -202,6 +205,10 @@ fn main() {
     // turn; `-p` has left by now, with its answer.
     runner.bar.listen();
     while let Some(waited) = runner.bar.wait() {
+        if waited == bar::Waited::Asked {
+            runner.answer_helpers(true);
+            continue;
+        }
         let bar::Waited::Line(line) = waited else {
             // Notices came for the open session while it sat idle, and it
             // takes them as a turn of its own -- unless the user stopped the
