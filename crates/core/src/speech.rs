@@ -414,17 +414,40 @@ pub struct System;
 
 impl Output for System {
     fn play(&mut self, audio: &Audio, stopped: &dyn Fn() -> bool) -> Result<(), String> {
-        let path = std::env::temp_dir().join(format!(
-            "letronna-speech-{}.{}",
-            std::process::id(),
-            audio.extension
-        ));
-        std::fs::write(&path, &audio.bytes)
-            .map_err(|e| format!("Cannot keep the speech to play it: {e}"))?;
+        let path = spool(&std::env::temp_dir(), audio)?;
         let played = play_file(&path, stopped);
         let _ = std::fs::remove_file(&path);
         played
     }
+}
+
+/// Write `audio` to a file of its own in `dir` for a player to open.
+fn spool(dir: &Path, audio: &Audio) -> Result<PathBuf, String> {
+    use std::io::Write;
+    // On Linux the temp folder is shared by every user and the name can be
+    // guessed, so a file only this call created is written: a plain write
+    // would follow a link planted there and overwrite what it points to.
+    for n in 0..100 {
+        let path = dir.join(format!(
+            "letronna-speech-{}-{n}.{}",
+            std::process::id(),
+            audio.extension
+        ));
+        let created = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path);
+        match created {
+            Ok(mut file) => {
+                file.write_all(&audio.bytes)
+                    .map_err(|e| format!("Cannot keep the speech to play it: {e}"))?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(format!("Cannot keep the speech to play it: {e}")),
+        }
+    }
+    Err("Cannot keep the speech to play it: the temp folder is full of old ones.".to_owned())
 }
 
 fn play_file(path: &Path, stopped: &dyn Fn() -> bool) -> Result<(), String> {
@@ -572,6 +595,27 @@ mod tests {
             words("# Result\nIt worked.\n```\nrm -rf x\n```\n| a | b |\nBye."),
             "Result It worked. Bye."
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn speech_kept_for_the_player_does_not_follow_a_planted_link() {
+        let dir = std::env::temp_dir().join(format!("letronna-spool-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "keep me").unwrap();
+        let planted = dir.join(format!("letronna-speech-{}-0.wav", std::process::id()));
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+        let audio = Audio {
+            bytes: b"sound".to_vec(),
+            extension: "wav",
+        };
+        let path = spool(&dir, &audio).unwrap();
+        assert_ne!(path, planted);
+        assert_eq!(std::fs::read(&path).unwrap(), b"sound");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// An output that holds the first sentence until it is stopped, and logs
