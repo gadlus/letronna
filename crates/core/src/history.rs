@@ -275,6 +275,171 @@ pub fn written(messages: &[Message], workspace: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// A file the tools wrote in a session, and how the session found it.
+struct Origin {
+    /// As noted: its real path.
+    path: PathBuf,
+    /// Relative to the project folder.
+    name: PathBuf,
+    /// Its hash before the session's first write, or `None` when a tool
+    /// created it.
+    from: Option<String>,
+}
+
+/// The files the tools wrote in `messages` inside `workspace`, each once,
+/// in the order first written.
+fn origins(messages: &[Message], workspace: &Path) -> Vec<Origin> {
+    let mut files: Vec<Origin> = Vec::new();
+    let changes = messages
+        .iter()
+        .filter(|m| m.role == "tool")
+        .flat_map(|m| &m.files);
+    for change in changes {
+        let name = PathBuf::from(label(&change.path, Some(workspace)));
+        if name.is_relative() && !files.iter().any(|file| file.path == change.path) {
+            files.push(Origin {
+                path: change.path.clone(),
+                name,
+                from: change.before.clone(),
+            });
+        }
+    }
+    files
+}
+
+/// A file as it is now against how the session found it: `None` when it
+/// is back as it was, the patch when both are text, and an empty patch
+/// marked binary when either is not.
+fn compare(dir: &Path, file: &Origin) -> Result<Option<(crate::unified::Patch, bool)>, String> {
+    let old = match &file.from {
+        Some(hash) => kept(dir, hash).map_err(|why| {
+            format!(
+                "{}: {why}, so there is nothing to compare with.",
+                file.name.display()
+            )
+        })?,
+        None => Vec::new(),
+    };
+    let now = std::fs::read(&file.path).ok();
+    if now.as_deref() == Some(old.as_slice()) || (now.is_none() && file.from.is_none()) {
+        return Ok(None);
+    }
+    let now = now.unwrap_or_default();
+    let (Ok(old), Ok(new)) = (std::str::from_utf8(&old), std::str::from_utf8(&now)) else {
+        return Ok(Some((crate::unified::Patch::default(), true)));
+    };
+    let name = file.name.display().to_string().replace('\\', "/");
+    let before = match file.from {
+        Some(_) => format!("a/{name}"),
+        None => "/dev/null".to_owned(),
+    };
+    let after = match file.path.exists() {
+        true => format!("b/{name}"),
+        false => "/dev/null".to_owned(),
+    };
+    let mut patch = crate::unified::patch(old, new, &before, &after);
+    patch.text = crate::git::printable(&patch.text);
+    Ok(Some((patch, false)))
+}
+
+/// The files session `session`'s tools changed in `messages` inside
+/// `workspace`, each counted from how the session found it to how it is
+/// now. One back as it was is left out; one with no kept copy is listed
+/// without counts. This needs no git, so it works in any folder.
+pub fn session_files(
+    session: u64,
+    messages: &[Message],
+    workspace: &Path,
+) -> Vec<crate::git::ChangedFile> {
+    session_files_in(&folder(session), messages, workspace)
+}
+
+fn session_files_in(
+    dir: &Path,
+    messages: &[Message],
+    workspace: &Path,
+) -> Vec<crate::git::ChangedFile> {
+    origins(messages, workspace)
+        .into_iter()
+        .filter_map(|file| {
+            let (patch, binary) = match compare(dir, &file) {
+                Ok(None) => return None,
+                Ok(Some(found)) => found,
+                Err(_) => (crate::unified::Patch::default(), false),
+            };
+            Some(crate::git::ChangedFile {
+                path: file.name,
+                added: patch.added,
+                removed: patch.removed,
+                created: file.from.is_none(),
+                binary,
+            })
+        })
+        .collect()
+}
+
+/// `name`, one of [`session_files`], as a patch from how session `session`
+/// found it to how it is now.
+pub fn session_patch(
+    session: u64,
+    messages: &[Message],
+    workspace: &Path,
+    name: &Path,
+) -> Result<String, String> {
+    session_patch_in(&folder(session), messages, workspace, name)
+}
+
+fn session_patch_in(
+    dir: &Path,
+    messages: &[Message],
+    workspace: &Path,
+    name: &Path,
+) -> Result<String, String> {
+    let Some(file) = origins(messages, workspace)
+        .into_iter()
+        .find(|file| file.name == name)
+    else {
+        return Err(format!("This session did not change {}.", name.display()));
+    };
+    Ok(match compare(dir, &file)? {
+        None => "It is back as the session found it.".to_owned(),
+        Some((_, true)) => "It is not text, so there are no lines to show.".to_owned(),
+        Some((patch, false)) => patch.text,
+    })
+}
+
+/// What reverting `name` would do: the session's own writes to it undone,
+/// back to how the session found it, as a rewind past all of them would.
+/// Empty when it is already as it was.
+pub fn revert_plan(
+    session: u64,
+    messages: &[Message],
+    workspace: &Path,
+    name: &Path,
+) -> Vec<Restore> {
+    plan_in(
+        &folder(session),
+        &writes_to(messages, workspace, name),
+        Some(workspace),
+    )
+}
+
+/// The tool results of `messages` cut down to their writes to `name`, all
+/// a plan looks at.
+fn writes_to(messages: &[Message], workspace: &Path, name: &Path) -> Vec<Message> {
+    messages
+        .iter()
+        .filter(|m| m.role == "tool")
+        .flat_map(|m| &m.files)
+        .filter(|change| Path::new(&label(&change.path, Some(workspace))) == name)
+        .map(|change| Message {
+            role: "tool".into(),
+            files: vec![change.clone()],
+            ..Default::default()
+        })
+        .collect()
+}
+
 /// One file a rewind would touch.
 #[derive(Clone, Debug)]
 pub struct Restore {
@@ -995,5 +1160,102 @@ mod tests {
         };
         let files = written(&[one, two, again, outside], &project);
         assert_eq!(files, vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")]);
+    }
+
+    #[test]
+    fn a_session_s_files_are_counted_from_how_it_found_them_without_git() {
+        let (project, kept) = scratch("session-files");
+        std::fs::write(project.join("a.txt"), "one\n").unwrap();
+        std::fs::write(project.join("c.txt"), "same\n").unwrap();
+        let ctx = context(&project, &kept);
+        let turns = [
+            call(
+                &ctx,
+                "write_file",
+                serde_json::json!({"path": "a.txt", "content": "one\ntwo\n"}),
+            ),
+            call(
+                &ctx,
+                "write_file",
+                serde_json::json!({"path": "b.txt", "content": "new\n"}),
+            ),
+            call(
+                &ctx,
+                "write_file",
+                serde_json::json!({"path": "c.txt", "content": "changed\n"}),
+            ),
+            call(
+                &ctx,
+                "write_file",
+                serde_json::json!({"path": "c.txt", "content": "same\n"}),
+            ),
+        ];
+        let files = session_files_in(&kept, &turns, &project);
+        let counts: Vec<(String, usize, usize, bool)> = files
+            .iter()
+            .map(|f| (f.path.display().to_string(), f.added, f.removed, f.created))
+            .collect();
+        // c.txt is back as it was, so it is not a change.
+        assert_eq!(
+            counts,
+            vec![("a.txt".into(), 1, 0, false), ("b.txt".into(), 1, 0, true)]
+        );
+        let patch = session_patch_in(&kept, &turns, &project, Path::new("a.txt")).unwrap();
+        assert!(patch.contains("--- a/a.txt\n+++ b/a.txt\n"), "{patch}");
+        assert!(patch.contains(" one\n+two\n"), "{patch}");
+        let made = session_patch_in(&kept, &turns, &project, Path::new("b.txt")).unwrap();
+        assert!(made.starts_with("--- /dev/null\n"), "{made}");
+    }
+
+    #[test]
+    fn reverting_one_file_undoes_only_the_session_s_writes_to_it() {
+        let (project, kept) = scratch("revert-one");
+        std::fs::write(project.join("a.txt"), "one\n").unwrap();
+        std::fs::write(project.join("b.txt"), "bee\n").unwrap();
+        let ctx = context(&project, &kept);
+        let turns = [
+            call(
+                &ctx,
+                "write_file",
+                serde_json::json!({"path": "a.txt", "content": "1\n"}),
+            ),
+            call(
+                &ctx,
+                "write_file",
+                serde_json::json!({"path": "b.txt", "content": "2\n"}),
+            ),
+            call(
+                &ctx,
+                "write_file",
+                serde_json::json!({"path": "a.txt", "content": "3\n"}),
+            ),
+        ];
+        let plan = plan_in(
+            &kept,
+            &writes_to(&turns, &project, Path::new("a.txt")),
+            Some(&project),
+        );
+        assert_eq!(fates(&plan, &project), vec![("a.txt".into(), Fate::Back)]);
+        let done = restore_in(&kept, &plan, Some(&project));
+        assert_eq!(done.back, 1, "{:?}", done.left);
+        assert_eq!(
+            std::fs::read_to_string(project.join("a.txt")).unwrap(),
+            "one\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join("b.txt")).unwrap(),
+            "2\n"
+        );
+        // Changed by hand since, it is left alone.
+        std::fs::write(project.join("b.txt"), "mine\n").unwrap();
+        let plan = plan_in(
+            &kept,
+            &writes_to(&turns, &project, Path::new("b.txt")),
+            Some(&project),
+        );
+        assert_eq!(
+            fates(&plan, &project),
+            vec![("b.txt".into(), Fate::Changed)]
+        );
     }
 }

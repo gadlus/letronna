@@ -359,7 +359,7 @@ impl Chat {
     /// Put back the files a rewind of `session` listed, off the UI thread,
     /// and say how it went: what could not be, and what was left alone, by
     /// name.
-    fn put_files_back(
+    pub(crate) fn put_files_back(
         &mut self,
         session: u64,
         files: Vec<history::Restore>,
@@ -375,12 +375,14 @@ impl Chat {
         cx.spawn_in(window, async move |this, cx| {
             let done = restored.await;
             let said = done.lines().join("\n");
-            let _ = this.update_in(cx, |_, window, cx| {
+            let _ = this.update_in(cx, |this, window, cx| {
                 if !done.left.is_empty() {
                     window.push_notification(Notification::warning(said), cx);
                 } else if !said.is_empty() {
                     window.push_notification(Notification::success(said), cx);
                 }
+                // The Changes tab and the status bar count what went back.
+                this.refresh_changes(cx);
             });
         })
         .detach();

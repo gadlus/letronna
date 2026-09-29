@@ -59,6 +59,7 @@ fn main() {
             KeyBinding::new("secondary-shift-l", ui::panel::BrowserTab, Some("Chat")),
             KeyBinding::new("secondary-shift-u", ui::usage::OpenUsage, Some("Chat")),
             KeyBinding::new("secondary-shift-a", OpenActivity, Some("Chat")),
+            KeyBinding::new("secondary-shift-d", ui::changes::ChangesTab, Some("Chat")),
             KeyBinding::new(
                 "shift-enter",
                 gpui_component::input::Enter { secondary: true },
@@ -74,6 +75,14 @@ fn main() {
             KeyBinding::new("shift-tab", ui::browser::PageTabBack, Some("Browser")),
             KeyBinding::new("tab", ui::composer::LeaveComposer, Some("Composer > Input")),
             KeyBinding::new("enter", ui::search::OpenHit, Some("SearchHit")),
+            // The Changes tab's list, once it has the keys.
+            KeyBinding::new("down", ui::changes::NextChange, Some("Changes")),
+            KeyBinding::new("up", ui::changes::PreviousChange, Some("Changes")),
+            KeyBinding::new("enter", ui::changes::OpenChange, Some("Changes")),
+            KeyBinding::new("s", ui::changes::SwitchScope, Some("Changes")),
+            KeyBinding::new("a", ui::changes::AddChange, Some("Changes")),
+            KeyBinding::new("r", ui::changes::RevertChange, Some("Changes")),
+            KeyBinding::new("escape", ui::changes::LeaveChanges, Some("Changes")),
         ]);
         platform::tray::init(cx);
         cx.on_window_closed(|cx| {

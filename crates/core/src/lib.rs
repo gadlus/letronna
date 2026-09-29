@@ -57,6 +57,7 @@ pub mod tasklist;
 pub mod tasks;
 pub mod timers;
 pub mod tools;
+mod unified;
 pub mod untrusted;
 pub mod update;
 pub mod usage;

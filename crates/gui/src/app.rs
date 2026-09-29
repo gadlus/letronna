@@ -316,7 +316,7 @@ pub(crate) struct Chat {
     pub(crate) video_frame: Option<std::sync::Arc<RenderImage>>,
     /// The right panel's state: shown or hidden, its width and its tabs.
     pub(crate) panel: crate::ui::panel::Panel,
-    /// The file open in the panel's Changes tab.
+    /// The panel's Changes tab, and the project's git status.
     pub(crate) changes: crate::ui::changes::Changes,
     /// The browser the agent uses, shown beside the chat while it does, and
     /// the session whose browser it shows: each session has its own.
@@ -545,6 +545,13 @@ impl Chat {
                     crate::theme::apply(&this.store.settings.appearance, window, cx);
                 }
             }),
+            // Back at the window, the user may have committed or edited
+            // elsewhere; this, not a timer, is when the status is read again.
+            cx.observe_window_activation(window, |this, window, cx| {
+                if window.is_window_active() {
+                    this.refresh_changes(cx);
+                }
+            }),
             cx.subscribe_in(&steer, window, |this, _, event, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
                     this.send_steer(window, cx);
@@ -670,7 +677,7 @@ impl Chat {
             video: None,
             video_frame: None,
             panel: Default::default(),
-            changes: Default::default(),
+            changes: crate::ui::changes::Changes::new(cx),
             browser: cx.new(|cx| crate::ui::browser::BrowserView::new(window, cx)),
             browser_for: 0,
             drafts: std::collections::HashMap::new(),
@@ -1640,6 +1647,8 @@ impl Chat {
         if let Some(turn) = self.turn.as_mut() {
             turn.finish_call(result);
         }
+        // A tool may have written a file or run git.
+        self.refresh_changes(cx);
         self.show_hook_problems();
         self.advance_tools(cx);
     }
@@ -2660,6 +2669,8 @@ impl Render for Chat {
         // And the composer holds its draft, however the session was switched
         // to: a click, a schedule, or a message from a chat app.
         self.swap_draft(window, cx);
+        // And the Changes tab and the status bar speak of its folder.
+        self.keep_changes_current(cx);
         if self.page == Page::Chat {
             self.unseen.remove(&on_screen);
         }
@@ -3038,6 +3049,13 @@ impl Render for Chat {
                 cx.listener(|this, _: &crate::ui::panel::BrowserTab, window, cx| {
                     if !window.has_active_dialog(cx) && !this.settings_open {
                         this.show_tab(crate::ui::panel::PanelTab::Browser, window, cx)
+                    }
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::ui::changes::ChangesTab, window, cx| {
+                    if !window.has_active_dialog(cx) && !this.settings_open {
+                        this.show_changes(window, cx)
                     }
                 }),
             )
