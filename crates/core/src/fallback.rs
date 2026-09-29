@@ -182,8 +182,9 @@ pub fn chain(
 
 /// Send with the first of `chain` not cooling down, going on to the next
 /// after a failure `mends` covers, or one of a fallback's `own`, which cools
-/// that one down. `switched` hears of each fallback before it is asked; an
-/// error from it ends the call, as nobody is listening any more.
+/// that one down; a chosen model that was cooling is asked last. `switched`
+/// hears of each switch before the model is asked; an error from it ends the
+/// call, as nobody is listening any more.
 pub fn run(
     chain: &[Connection],
     mut send: impl FnMut(&Connection) -> Result<(), Failure>,
@@ -192,17 +193,18 @@ pub fn run(
     let Some(primary) = chain.first() else {
         return Err(Failure::new(FailureKind::Settings, "No model to ask."));
     };
-    let ready: Vec<&Connection> = chain.iter().filter(|c| !cooling(c)).collect();
-    // With every one cooling down, the chosen model is the one worth a try.
-    let ready = if ready.is_empty() {
-        vec![primary]
-    } else {
-        ready
-    };
+    let (ready, resting): (Vec<&Connection>, Vec<&Connection>) =
+        chain.iter().partition(|c| !cooling(c));
+    // The chosen model, though cooling down, is asked once the rest have
+    // failed too, or are all cooling: it may be back by now, and without it
+    // the task would end on a fallback's failure while it was never asked.
+    let order = (ready.into_iter()).chain(resting.into_iter().filter(|c| same(c, primary)));
     let mut after = None;
     let mut last = None;
-    for connection in ready {
-        if !same(connection, primary) {
+    for connection in order {
+        // Going back to the chosen model after a fallback failed is a
+        // switch too, or its reply would carry the fallback's name.
+        if after.is_some() || !same(connection, primary) {
             switched(Switch {
                 model: connection.model.trim().to_owned(),
                 endpoint: connection.endpoint.clone(),
@@ -428,6 +430,24 @@ mod tests {
         let (result, asked, _) = asked(&chain, |_| Ok(()));
         assert!(result.is_ok());
         assert_eq!(asked, ["big"]);
+    }
+
+    #[test]
+    fn a_cooling_chosen_model_is_asked_once_its_fallbacks_fail() {
+        let chain = [at("rested", "big"), at("rested", "small")];
+        cool(&chain[0], Instant::now() + COOLDOWN);
+        let (result, asked, switches) = asked(&chain, |model| match model {
+            "small" => fails(FailureKind::Overloaded),
+            _ => Ok(()),
+        });
+        assert!(result.is_ok());
+        assert_eq!(asked, ["small", "big"]);
+        let told: Vec<_> = switches.iter().map(|s| s.model.as_str()).collect();
+        assert_eq!(told, ["small", "big"]);
+        assert_eq!(
+            switches[1].after,
+            Some(("small".into(), FailureKind::Overloaded))
+        );
     }
 
     #[test]
