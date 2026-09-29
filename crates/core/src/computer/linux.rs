@@ -171,7 +171,7 @@ impl Backend for Linux {
             });
         };
         // Bottom first, so each window is drawn over those it is above.
-        let shown: Vec<(Window, Bounds)> = own_windows(&x.windows()?, app)
+        let shown: Vec<(Window, Bounds)> = own_windows(&x.windows()?, app, identity)
             .into_iter()
             .rev()
             .filter(|window| overlaps(window.bounds, screen))
@@ -253,7 +253,8 @@ impl Backend for Linux {
         let input = Input {
             x: &x,
             app,
-            windows: own_windows(&windows, app),
+            windows: own_windows(&windows, app, identity),
+            others: others_frames(&windows, app, identity),
         };
         match act {
             Act::Click(Spot::Element(key)) => {
@@ -382,13 +383,34 @@ fn session(display: Option<&str>, wayland: Option<&str>) -> Result<(), String> {
     Err(why.into())
 }
 
-/// The windows of `app`'s that can be seen, the one on top first.
-fn own_windows(windows: &[Window], app: &App) -> Vec<Window> {
+/// The windows of `app`'s that can be seen, the one on top first. One
+/// process can show several apps, as ssh does every app it forwards, so a
+/// window is the app's only where `identify` gives it the app's id too.
+fn own_windows(
+    windows: &[Window],
+    app: &App,
+    mut identify: impl FnMut(&Window) -> String,
+) -> Vec<Window> {
     windows
         .iter()
         .filter(|window| !window.panel && visible(window))
         .filter(|window| window.pid.is_some_and(|pid| app.pids.contains(&pid)))
+        .filter(|window| identify(window).eq_ignore_ascii_case(&app.id))
         .cloned()
+        .collect()
+}
+
+/// The frames of the listed windows that are not `app`'s, which a process
+/// it shares with another app does not make its own.
+fn others_frames(
+    windows: &[Window],
+    app: &App,
+    mut identify: impl FnMut(&Window) -> String,
+) -> Vec<u32> {
+    windows
+        .iter()
+        .filter(|window| !identify(window).eq_ignore_ascii_case(&app.id))
+        .map(|window| window.frame)
         .collect()
 }
 
@@ -396,12 +418,12 @@ fn own_windows(windows: &[Window], app: &App) -> Vec<Window> {
 /// that window frames, else the process that made it, as a menu is.
 fn owner(x: &X, windows: &[Window], top: u32) -> Result<Option<App>, String> {
     if let Some(window) = windows.iter().find(|window| window.frame == top) {
-        let apps = apps_of(windows, identity);
-        let listed = apps
+        let id = identity(window);
+        let listed = apps_of(windows, identity)
             .into_iter()
-            .find(|app| window.pid.is_some_and(|pid| app.pids.contains(&pid)));
+            .find(|app| app.id.eq_ignore_ascii_case(&id));
         return Ok(Some(listed.unwrap_or_else(|| App {
-            id: identity(window),
+            id,
             name: name_of(window),
             pids: window.pid.into_iter().collect(),
         })));
@@ -431,6 +453,8 @@ struct Input<'a> {
     app: &'a App,
     /// The app's windows that can be seen, the one on top first.
     windows: Vec<Window>,
+    /// The frames of the other apps' windows.
+    others: Vec<u32>,
 }
 
 impl Input<'_> {
@@ -469,6 +493,9 @@ impl Input<'_> {
     fn owns(&self, top: u32) -> Result<bool, String> {
         if self.windows.iter().any(|window| window.frame == top) {
             return Ok(true);
+        }
+        if self.others.contains(&top) {
+            return Ok(false);
         }
         let pid = self.x.pid_of(top)?;
         Ok(pid.is_some_and(|pid| self.app.pids.contains(&pid)))
@@ -917,19 +944,36 @@ fn name_of(window: &Window) -> String {
 
 /// The id grants and rules know `window`'s app by: the name of the program
 /// its process runs, as on Windows; its class's instance only where there
-/// is no process to look at, as for an app across the network.
+/// is no process to look at, as for an app across the network, or where
+/// its class names an app that is never controlled.
 fn identity(window: &Window) -> String {
-    window
-        .pid
-        .and_then(program_of)
-        .or_else(|| {
-            [&window.instance, &window.class]
-                .into_iter()
-                .map(|name| name.trim())
-                .find(|name| !name.is_empty())
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| format!("window {:#x}", window.id))
+    let program = window.pid.and_then(program_of);
+    let claimed: Vec<&str> = [&window.instance, &window.class]
+        .into_iter()
+        .map(|name| name.trim())
+        .filter(|name| !name.is_empty())
+        .collect();
+    // Terminator and Guake run under Python, urxvtc's windows are urxvtd's
+    // and a forwarded xterm's are ssh's, so their program names no
+    // terminal. A class is only the app's own claim, but one that names an
+    // app never controlled can get no app refused but the claimant.
+    let refused = claimed.iter().find(|name| out_of_reach(name));
+    match (program, refused) {
+        (Some(program), _) if out_of_reach(&program) => program,
+        (_, Some(refused)) => (*refused).to_owned(),
+        (Some(program), None) => program,
+        (None, None) => claimed.first().map_or_else(
+            || format!("window {:#x}", window.id),
+            |name| (*name).to_owned(),
+        ),
+    }
+}
+
+/// Whether `id` is one of the apps core never lets a call control.
+fn out_of_reach(id: &str) -> bool {
+    [super::LETRONNA, super::TERMINALS, super::PROMPTS]
+        .into_iter()
+        .any(|ids| super::one_of(id, ids))
 }
 
 /// The file name of the program process `pid` runs, or its short name where
@@ -1328,6 +1372,26 @@ mod tests {
     }
 
     #[test]
+    fn a_terminal_whose_program_is_no_terminals_is_known_by_its_class() {
+        // This test's own program stands for Python under Terminator.
+        let pid = Some(std::process::id());
+        let program = program_of(std::process::id()).unwrap();
+        assert!(!out_of_reach(&program), "{program}");
+        let terminator = window(1, pid, "Terminator", rect(0.0, 0.0, 9.0, 9.0));
+        assert_eq!(identity(&terminator), "terminator");
+        let urxvt = Window {
+            instance: "urxvt".into(),
+            ..window(2, pid, "URxvt", rect(0.0, 0.0, 9.0, 9.0))
+        };
+        assert_eq!(identity(&urxvt), "urxvt");
+        let askpass = window(3, None, "Pinentry-gnome3", rect(0.0, 0.0, 9.0, 9.0));
+        assert_eq!(identity(&askpass), "pinentry-gnome3");
+        // Any other class leaves the program as the id.
+        let editor = window(4, pid, "Gedit", rect(0.0, 0.0, 9.0, 9.0));
+        assert_eq!(identity(&editor), program);
+    }
+
+    #[test]
     fn only_the_apps_own_windows_are_drawn_or_acted_on() {
         let app = App {
             id: "firefox".into(),
@@ -1340,8 +1404,24 @@ mod tests {
             window(3, None, "Firefox", rect(0.0, 0.0, 800.0, 600.0)),
             window(4, Some(20), "Firefox", rect(0.0, 0.0, 1.0, 600.0)),
         ];
-        let own: Vec<u32> = own_windows(&windows, &app).iter().map(|w| w.id).collect();
+        let by_instance = |window: &Window| window.instance.clone();
+        let own: Vec<u32> = own_windows(&windows, &app, by_instance)
+            .iter()
+            .map(|w| w.id)
+            .collect();
         assert_eq!(own, [2]);
+        // ssh's one process shows every app it forwards: a forwarded xterm
+        // is not the forwarded Firefox's.
+        let forwarded = [
+            window(5, Some(20), "XTerm", rect(0.0, 0.0, 400.0, 300.0)),
+            window(6, Some(20), "Firefox", rect(0.0, 0.0, 800.0, 600.0)),
+        ];
+        let own: Vec<u32> = own_windows(&forwarded, &app, by_instance)
+            .iter()
+            .map(|w| w.id)
+            .collect();
+        assert_eq!(own, [6]);
+        assert_eq!(others_frames(&forwarded, &app, by_instance), [1005]);
     }
 
     #[test]
