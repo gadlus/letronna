@@ -7,6 +7,7 @@
 //! instead of growing two that slowly disagree.
 
 pub mod agent;
+pub mod agent_defs;
 pub mod auth;
 pub mod browser;
 pub mod budget;
