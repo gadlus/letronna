@@ -94,8 +94,11 @@ pub fn list(limit: usize) -> Vec<Candidate> {
 /// before any head is read: a machine can hold thousands of sessions, and
 /// reading the head of every one to offer a few is what made listing slow.
 fn newest_titled(files: Vec<(Tool, PathBuf)>, limit: usize) -> Vec<Candidate> {
+    // Only plain files: a pipe named like a session would hold the listing
+    // thread for good the moment its head was opened.
     let mut files: Vec<(u64, Tool, PathBuf)> = files
         .into_iter()
+        .filter(|(_, path)| path.is_file())
         .map(|(tool, path)| (modified_secs(&path), tool, path))
         .collect();
     files.sort_by_key(|&(updated, ..)| std::cmp::Reverse(updated));
@@ -1068,5 +1071,29 @@ mod tests {
         assert_eq!(found[0].title, "Fix the login bug");
         assert_eq!(found[0].updated, 3_000);
         assert_eq!(found[1].title, "Add a health check endpoint");
+    }
+
+    /// A pipe never ends and opening one waits for a writer, so a head read
+    /// from it would hold the listing thread for good.
+    #[cfg(unix)]
+    #[test]
+    fn listing_passes_over_what_is_not_a_plain_file() {
+        let dir = scratch("not-a-file");
+        let project = dir.join("projects").join("-home-dev-project");
+        std::fs::create_dir_all(&project).unwrap();
+        write(&project, "abc123.jsonl", CLAUDE_CODE_FIXTURE);
+        let pipe = project.join("pipe.jsonl");
+        let made = std::process::Command::new("mkfifo").arg(&pipe).status();
+        assert!(made.is_ok_and(|s| s.success()), "mkfifo failed");
+
+        let found = newest_titled(
+            claude_code_files(&dir)
+                .into_iter()
+                .map(|p| (Tool::ClaudeCode, p))
+                .collect(),
+            usize::MAX,
+        );
+        let ids: Vec<&str> = found.iter().map(|c| c.session_id.as_str()).collect();
+        assert_eq!(ids, ["abc123"]);
     }
 }
