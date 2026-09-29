@@ -104,6 +104,10 @@ pub const COMMANDS: &[Command] = &[
         blurb: "MCP servers: how each is doing; reconnect, enable, disable, log, reload",
     },
     Command {
+        name: "/plugins",
+        blurb: "plugins: add from git, switch on or off, allow servers, update, remove, market",
+    },
+    Command {
         name: "/resume",
         blurb: "pick up a session; a word finds it by title or what was said",
     },

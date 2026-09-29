@@ -217,6 +217,10 @@ struct ServerConfig {
     /// Start the server with only `KEPT_ENV` of Letronna's environment.
     #[serde(default)]
     env_scrub: bool,
+    /// The folder `cwd` is taken from in place of the data folder: the
+    /// plugin's, for a server a plugin brings.
+    #[serde(skip)]
+    base: Option<PathBuf>,
 }
 
 /// `autoApprove`: which of a server's tools run without asking.
@@ -776,7 +780,7 @@ fn missing(name: &str) -> String {
 }
 
 fn reload_from(path: &Path) -> Result<Reloaded, String> {
-    let servers = entries(&read_config(path)?);
+    let servers = with_plugins(entries(&read_config(path)?));
     let done = {
         let slots = slots()
             .lock()
@@ -891,7 +895,48 @@ fn read_config(path: &std::path::Path) -> Result<Value, String> {
 /// The servers `mcp.json` lists, each read on its own so one bad entry
 /// shows as failed rather than hiding the rest.
 fn configured() -> Result<BTreeMap<String, Result<ServerConfig, String>>, String> {
-    Ok(entries(&read_config(&config_path())?))
+    Ok(with_plugins(entries(&read_config(&config_path())?)))
+}
+
+/// `servers` and those of the plugins switched on whose servers the user
+/// allowed, each named `<plugin>:<server>`; a name `mcp.json` already gives
+/// keeps its entry there.
+fn with_plugins(
+    mut servers: BTreeMap<String, Result<ServerConfig, String>>,
+) -> BTreeMap<String, Result<ServerConfig, String>> {
+    // Tests read the servers they are given, never the plugins installed on
+    // the machine running them.
+    if cfg!(test) {
+        return servers;
+    }
+    for server in crate::plugins::servers() {
+        if servers.contains_key(&server.name) {
+            continue;
+        }
+        let read = ServerConfig::deserialize(&server.config)
+            .map(|config| ServerConfig {
+                base: Some(server.folder),
+                ..config
+            })
+            .map_err(|e| {
+                format!(
+                    "Its entry in {}'s plugin.json will not read: {e}",
+                    server.plugin
+                )
+            });
+        servers.insert(server.name, read);
+    }
+    servers
+}
+
+/// Why a server's entry, as `mcp.json` would hold it, will not read.
+pub(crate) fn readable(server: &Value) -> Result<(), String> {
+    if !server.is_object() {
+        return Err("its entry is not an object.".into());
+    }
+    ServerConfig::deserialize(server)
+        .map(drop)
+        .map_err(|e| format!("its entry will not read: {e}"))
 }
 
 fn entries(config: &Value) -> BTreeMap<String, Result<ServerConfig, String>> {
@@ -1149,7 +1194,8 @@ fn launch(name: &str, config: &ServerConfig, run: u64) -> Result<Vec<Arc<dyn Too
     if !config.url.trim().is_empty() {
         return reach(name, config, run);
     }
-    let mut child = spawn(config, &crate::chat::data_dir())?;
+    let base = config.base.clone().unwrap_or_else(crate::chat::data_dir);
+    let mut child = spawn(config, &base)?;
     // At once, so the server has had as little time as possible to start
     // anything outside the tree.
     let tree = match crate::jobs::Tree::of(&child) {
