@@ -178,17 +178,18 @@ pub fn into_conversation(imported: Imported, id: u64) -> Conversation {
     }
 }
 
-/// Why a file yielded no messages at all, with how much of it was skipped:
-/// a file of nothing but unreadable lines is a format this build does not
-/// know rather than an empty session, and the count is what tells them apart.
+/// Why a file yielded no messages at all, with how much of it was skipped,
+/// so an empty file reads differently from a full one. Skipped is not
+/// unreadable: the count takes in records left out on purpose, like a
+/// summary line, as much as lines this build cannot parse.
 fn nothing_to_import(path: &Path, skipped: usize) -> String {
     let what = match skipped {
         0 => return format!("{} has nothing Letronna can import.", path.display()),
-        1 => "1 part of it".to_owned(),
-        n => format!("{n} parts of it"),
+        1 => "1 part of it was".to_owned(),
+        n => format!("{n} parts of it were"),
     };
     format!(
-        "{} has nothing Letronna can import: {what} could not be read.",
+        "{} has nothing Letronna can import: {what} skipped.",
         path.display()
     )
 }
@@ -934,9 +935,13 @@ mod tests {
         let Err(error) = import_claude_code(&path) else {
             panic!("a file with no turns in it imported");
         };
-        assert!(
-            error.ends_with("has nothing Letronna can import: 2 parts of it could not be read.")
-        );
+        assert!(error.ends_with("has nothing Letronna can import: 2 parts of it were skipped."));
+        // A summary alone is read without trouble, and still not a message.
+        let summary = write(&dir, "ghi789.jsonl", "{\"type\":\"summary\"}\n");
+        let Err(error) = import_claude_code(&summary) else {
+            panic!("a summary alone imported");
+        };
+        assert!(error.ends_with("has nothing Letronna can import: 1 part of it was skipped."));
         let empty = write(&dir, "empty.jsonl", "");
         let Err(error) = import_claude_code(&empty) else {
             panic!("an empty file imported");
