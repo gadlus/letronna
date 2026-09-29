@@ -82,6 +82,11 @@ pub trait Tool: Send + Sync {
     fn needs_history(&self) -> bool {
         false
     }
+    /// Whether to offer the tool in this session; a call is re-checked with
+    /// only the workspace, chat, plan mode and session id it carries.
+    fn offered(&self, _: &Connection) -> bool {
+        true
+    }
     /// What the approval card shows: a diff, the file body, the command line.
     fn preview(&self, args: &Value, ctx: &ToolContext) -> String {
         let _ = ctx;
@@ -177,6 +182,7 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(ReadJob),
         Arc::new(StopJob),
         Arc::new(Wait),
+        Arc::new(crate::wake::WakeMe),
         Arc::new(AskUser),
         Arc::new(ExitPlan),
         Arc::new(Todo),
@@ -399,6 +405,7 @@ pub fn specs(connection: &Connection) -> Vec<Value> {
         .filter(|t| t.name() != EXIT_PLAN || offers_plan(connection))
         .filter(|t| !shared || !t.machine())
         .filter(|t| history || !t.needs_history())
+        .filter(|t| t.offered(connection))
         .map(|t| {
             json!({"type": "function", "function": {
                 "name": t.name(),
@@ -428,6 +435,19 @@ pub fn run(name: &str, args: &str, ctx: &ToolContext) -> Result<String, String> 
 fn run_found(tool: &dyn Tool, args: &str, ctx: &ToolContext) -> Result<String, String> {
     // Only fitting tools are offered, but the model can name any of them;
     // refuse here too rather than trust the offer.
+    let connection = Connection {
+        workspace: ctx.workspace.clone(),
+        remote: ctx.remote.clone(),
+        conversation: ctx.conversation,
+        plan: ctx.plan,
+        ..Default::default()
+    };
+    if !tool.offered(&connection) {
+        return Err(format!(
+            "`{}` is not available in this session.",
+            tool.name()
+        ));
+    }
     let mut args = parse_args(args)?;
     let note = reinterpreted(&repair(tool, &mut args));
     // The gate refuses these before any card, but a call can get here
@@ -1416,7 +1436,7 @@ impl Tool for Wait {
         "wait"
     }
     fn description(&self) -> &'static str {
-        "Pause before continuing: for a number of seconds, or until a background job prints something. Use it to let a server come up before calling it."
+        "Pause before continuing: for a number of seconds, or until a background job prints something. Use it to let a server come up before calling it; waiting for a job's `until` ends as soon as it prints. If you have wake_me, use it instead of a plain pause over 30 seconds."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
