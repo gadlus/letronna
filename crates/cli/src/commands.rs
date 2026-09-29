@@ -395,12 +395,17 @@ fn insights(rest: &str) {
         let width = found
             .tools
             .iter()
-            .map(|(name, _)| name.chars().count())
+            .map(|(name, _)| name_label(name).chars().count())
             .max();
         for (name, calls) in &found.tools {
             let times = if *calls == 1 { "call" } else { "calls" };
             let rest = format!("{calls} {times}");
-            row(name, width.unwrap_or(0), bar(*calls, most, BAR), rest);
+            row(
+                &name_label(name),
+                width.unwrap_or(0),
+                bar(*calls, most, BAR),
+                rest,
+            );
         }
     }
 
@@ -411,17 +416,28 @@ fn insights(rest: &str) {
     let width = found
         .models
         .iter()
-        .map(|(name, _)| name.chars().count())
+        .map(|(name, _)| name_label(name).chars().count())
         .max();
     for (name, totals) in &found.models {
         let rest = format!("{} tokens · {}", count(tokens(totals)), cached(totals));
         row(
-            name,
+            &name_label(name),
             width.unwrap_or(0),
             bar(tokens(totals), most, BAR),
             rest,
         );
     }
+}
+
+/// A tool or model name as its row starts it: one line, cut short, and
+/// without control characters.
+fn name_label(name: &str) -> String {
+    // The names come from the model or its gateway as sent, so an escape in
+    // one would restyle the terminal and one long one would pad every row.
+    render::fit(name, 40)
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect()
 }
 
 /// A side question, answered dim under it from what the session holds so far
@@ -1997,7 +2013,9 @@ pub fn gateways(runner: &mut Runner) {
 
 #[cfg(test)]
 mod tests {
-    use super::{agent_rows, choice_label, from_match, last_prompt, typed_path, with_files};
+    use super::{
+        agent_rows, choice_label, from_match, last_prompt, name_label, typed_path, with_files,
+    };
     use letronna_core::agents::Seen;
     use letronna_core::chat::Message;
     use letronna_core::driver::Status;
@@ -2177,5 +2195,15 @@ mod tests {
             choice_label(&read),
             "untitled  ·  no project  ·  2 messages"
         );
+    }
+
+    #[test]
+    fn an_insights_name_is_one_short_line_with_no_escapes() {
+        assert_eq!(name_label("read_file"), "read_file");
+        assert_eq!(name_label("x\x1b[2J\x1b]0;hi\x07"), "x[2J]0;hi");
+        assert_eq!(name_label("a\nb"), "a b");
+        let long = name_label(&"t".repeat(10_000));
+        assert_eq!(long.chars().count(), 40);
+        assert!(long.ends_with('…'));
     }
 }
