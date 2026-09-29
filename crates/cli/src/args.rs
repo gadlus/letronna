@@ -38,6 +38,12 @@ With -p
       --model <name>       use this model instead of the one set up
       --tools <a,b>        only these tools, by name
       --budget <tokens>    stop once this many tokens are spent
+      --input-format <form>
+                           text (the question), or stream-json: messages,
+                           interrupts and answers as JSON lines on stdin
+      --permission-prompt-tool stdio
+                           with stream-json in, ask stdin about each call
+                           that needs a yes
 ";
 
 /// What to open with.
@@ -64,6 +70,15 @@ pub enum Output {
     StreamJson,
 }
 
+/// Where `-p` takes what to say from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Input {
+    /// The question after `-p`.
+    Text,
+    /// JSON lines on stdin: messages, interrupts and answers to approvals.
+    StreamJson,
+}
+
 pub struct Args {
     pub prompt: Option<String>,
     pub start: Start,
@@ -83,6 +98,10 @@ pub struct Args {
     pub doctor: bool,
     pub offline: bool,
     pub output: Output,
+    pub input: Input,
+    /// Whether a call that needs a yes is asked about on stdout and answered
+    /// on stdin, from `--permission-prompt-tool stdio`.
+    pub ask_stdio: bool,
     pub max_rounds: Option<usize>,
     pub tools: Option<Vec<String>>,
     pub budget: Option<u64>,
@@ -110,6 +129,8 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
         doctor: false,
         offline: false,
         output: Output::Text,
+        input: Input::Text,
+        ask_stdio: false,
         max_rounds: None,
         tools: None,
         budget: None,
@@ -154,6 +175,19 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
                     _ => return Err("--output takes text, json or stream-json.".into()),
                 }
             }
+            "--input-format" => {
+                args.input = match raw.next().as_deref() {
+                    Some("text") => Input::Text,
+                    Some("stream-json") => Input::StreamJson,
+                    _ => return Err("--input-format takes text or stream-json.".into()),
+                }
+            }
+            // Named as other agents' command lines name it, so a program that
+            // drives one of them can drive this; stdio is the only way to ask.
+            "--permission-prompt-tool" => match raw.next().as_deref() {
+                Some("stdio") => args.ask_stdio = true,
+                _ => return Err("--permission-prompt-tool takes stdio.".into()),
+            },
             "--max-rounds" => {
                 args.max_rounds = Some(above_zero(
                     raw.next(),
@@ -187,17 +221,43 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
         }
     }
     args.mode = picked(mode, yes, plan);
-    if print && args.prompt.is_none() {
+    let streamed = args.input == Input::StreamJson;
+    if streamed && !print {
+        return Err("--input-format stream-json only works with -p.".into());
+    }
+    if streamed && args.prompt.is_some() {
+        return Err(
+            "With --input-format stream-json the messages come on stdin, so -p takes no question."
+                .into(),
+        );
+    }
+    if streamed && args.output != Output::StreamJson {
+        return Err("--input-format stream-json needs --output stream-json.".into());
+    }
+    if args.ask_stdio && !streamed {
+        return Err(
+            "--permission-prompt-tool stdio needs --input-format stream-json, which carries the answers."
+                .into(),
+        );
+    }
+    if print && args.prompt.is_none() && !streamed {
         return Err("-p takes the question, like -p \"what is this\".".into());
     }
     let shaped = args.output != Output::Text
         || args.max_rounds.is_some()
         || args.tools.is_some()
         || args.budget.is_some();
-    if shaped && args.prompt.is_none() {
+    if shaped && !args.once() {
         return Err("--output, --max-rounds, --tools and --budget only work with -p.".into());
     }
     Ok(args)
+}
+
+impl Args {
+    /// Whether this is a `-p` run, answered and left rather than a conversation.
+    pub fn once(&self) -> bool {
+        self.prompt.is_some() || self.input == Input::StreamJson
+    }
 }
 
 /// The number after a flag, which has to be a whole one above zero.
@@ -251,7 +311,7 @@ fn picked(mode: Option<Result<Mode, String>>, yes: bool, plan: bool) -> Result<M
 
 #[cfg(test)]
 mod tests {
-    use super::{Output, parse};
+    use super::{Input, Output, parse};
     use letronna_core::gate::Mode;
 
     fn args(words: &[&str]) -> super::Args {
@@ -379,6 +439,52 @@ mod tests {
         assert_eq!(
             refused(&["--budget", "1000"]),
             "--output, --max-rounds, --tools and --budget only work with -p."
+        );
+    }
+
+    #[test]
+    fn stream_json_in_takes_no_question_and_needs_stream_json_out() {
+        let run = args(&[
+            "-p",
+            "--input-format",
+            "stream-json",
+            "--output",
+            "stream-json",
+            "--permission-prompt-tool",
+            "stdio",
+        ]);
+        assert_eq!(run.input, Input::StreamJson);
+        assert!(run.ask_stdio && run.prompt.is_none() && run.once());
+        assert!(!args(&[]).once() && args(&["-p", "hi"]).once());
+
+        assert_eq!(
+            refused(&["-p", "--input-format", "yaml"]),
+            "--input-format takes text or stream-json."
+        );
+        assert!(
+            refused(&["--input-format", "stream-json", "--output", "stream-json"])
+                .ends_with("only works with -p.")
+        );
+        let asked = [
+            "-p",
+            "hi",
+            "--input-format",
+            "stream-json",
+            "--output",
+            "stream-json",
+        ];
+        assert!(refused(&asked).ends_with("so -p takes no question."));
+        assert_eq!(
+            refused(&["-p", "--input-format", "stream-json"]),
+            "--input-format stream-json needs --output stream-json."
+        );
+        assert!(
+            refused(&["-p", "hi", "--permission-prompt-tool", "stdio"])
+                .starts_with("--permission-prompt-tool stdio needs")
+        );
+        assert_eq!(
+            refused(&["-p", "hi", "--permission-prompt-tool", "mcp__ask"]),
+            "--permission-prompt-tool takes stdio."
         );
     }
 }

@@ -6,12 +6,15 @@
 //!
 //! `-p` runs on core's driver rather than the conversation loop: nobody
 //! watches it stream, so it waits on the run and says what came of it at the
-//! end, as the answer alone or as JSON a script can read.
+//! end, as the answer alone or as JSON a script can read. With
+//! `--input-format stream-json` another program drives it over stdin instead;
+//! `control` holds that.
 
 mod args;
 mod banner;
 mod bar;
 mod commands;
+mod control;
 mod diff;
 mod doctor;
 mod edit;
@@ -57,9 +60,11 @@ fn main() {
     rescue_terminal();
     let args = match parse(std::env::args().skip(1)) {
         Ok(args) => args,
+        // 2, apart from a run that went wrong, so a script can tell it
+        // called Letronna wrongly.
         Err(error) => {
             render::line(&render::red(&error));
-            std::process::exit(1);
+            std::process::exit(2);
         }
     };
     if args.help {
@@ -119,8 +124,7 @@ fn main() {
         mode,
         // With the question piped in or the answer piped out, a card would be
         // drawn or read where nobody sees it, and wait forever.
-        human: args.prompt.is_none()
-            || (std::io::stdin().is_terminal() && std::io::stdout().is_terminal()),
+        human: !args.once() || (std::io::stdin().is_terminal() && std::io::stdout().is_terminal()),
         trouble: None,
         bar: bar::Bar::new(String::new()),
         stopped: false,
@@ -132,7 +136,7 @@ fn main() {
     // the setup -- the same one the installers hand over to. Asking a
     // question from a pipe cannot wait for answers, so that one stops here.
     let first_run = runner.store.settings.model.is_empty();
-    if first_run && args.prompt.is_some() {
+    if first_run && args.once() {
         let error = "Nothing is set up yet. Run `letronna setup` first.";
         show(args.output, &failed(error.into()));
         std::process::exit(1);
@@ -169,20 +173,22 @@ fn main() {
     choose_by_flags(&mut runner, session, gateway, &args);
 
     // One question, one answer, no banner: this form gets piped.
-    if let Some(prompt) = &args.prompt {
+    if args.once() {
         // It goes out at once, so the MCP servers' tools would miss it.
         letronna_core::mcp::ready(MCP_WAIT);
-        let finished = ask_once(&mut runner, session, prompt, &args);
+        let code = match &args.prompt {
+            Some(prompt) => i32::from(!ask_once(&mut runner, session, prompt, &args)),
+            None => control::run(&mut runner, session, &args),
+        };
         // A browser with no window, or a job started in the background, would
         // outlive this run unseen.
         letronna_core::browser::close_hidden();
         letronna_core::jobs::stop_all();
         letronna_core::mcp::stop_all();
-        if !finished {
-            letronna_core::diag::stop();
-            std::process::exit(1);
-        }
         letronna_core::diag::stop();
+        if code != 0 {
+            std::process::exit(code);
+        }
         return;
     }
 
@@ -292,14 +298,40 @@ fn main() {
 /// Runs one prompt on the driver and prints what came of it in the form
 /// asked for, saying whether it ended without failing.
 fn ask_once(runner: &mut Runner, session: usize, prompt: &str, args: &Args) -> bool {
+    let (spec, context, before) = match begin(runner, session, prompt, args) {
+        Ok(begun) => begun,
+        Err(error) => {
+            show(args.output, &failed(error));
+            return false;
+        }
+    };
+    let id = spec.id;
+    // Served before the run starts, since a request with nobody serving is
+    // declined at once.
+    let keyboard = args.output == Output::Text && render::interactive();
+    answer_approvals(
+        runner.mode == letronna_core::gate::Mode::Bypass,
+        keyboard,
+        context,
+        spec.cancel.clone(),
+    );
+    let report = run_following(spec, args.output);
+    finish(runner, session, id, before, report, args.output)
+}
+
+/// Puts `prompt` on the session and hands the session to a run, giving the
+/// run, what its calls work in, and where its own messages start.
+fn begin(
+    runner: &mut Runner,
+    session: usize,
+    prompt: &str,
+    args: &Args,
+) -> Result<(Spec, tools::ToolContext, usize), String> {
     let mut connection = runner.connection(session);
     if let Some(model) = &args.model {
         connection.model = model.clone();
     }
-    if let Err(error) = chat::validate(&connection) {
-        show(args.output, &failed(error));
-        return false;
-    }
+    chat::validate(&connection)?;
     // Checked here rather than with the flags, since an MCP server's tools
     // are only known once it has started.
     if let Some(name) = args
@@ -308,11 +340,7 @@ fn ask_once(runner: &mut Runner, session: usize, prompt: &str, args: &Args) -> b
         .flatten()
         .find(|n| tools::find(n).is_none())
     {
-        show(
-            args.output,
-            &failed(format!("There is no tool called `{name}`.")),
-        );
-        return false;
+        return Err(format!("There is no tool called `{name}`."));
     }
     let conversation = &mut runner.store.conversations[session];
     if conversation.messages.is_empty() && conversation.title.is_empty() {
@@ -354,33 +382,43 @@ fn ask_once(runner: &mut Runner, session: usize, prompt: &str, args: &Args) -> b
         budget: args.budget.map(|limit| Arc::new(Budget::new(limit, None))),
         status: Arc::default(),
     };
-    // Served before the run starts, since a request with nobody serving is
-    // declined at once.
-    let keyboard = args.output == Output::Text && render::interactive();
-    answer_approvals(
-        runner.mode == letronna_core::gate::Mode::Bypass,
-        keyboard,
-        context,
-        spec.cancel.clone(),
-    );
+    Ok((spec, context, before))
+}
+
+/// Runs `spec` to its end on this thread, with progress lines while it runs
+/// when the output is stream-json.
+fn run_following(spec: Spec, output: Output) -> Report {
     let (running, ended) = mpsc::channel::<()>();
     let progress =
-        (args.output == Output::StreamJson).then(|| show_progress(spec.status.clone(), ended));
-    let mut report = driver::run(spec);
-    // On stderr, apart from the answer: what a hook said or could not do.
-    for problem in hooks::problems() {
-        eprintln!("{problem}");
-    }
+        (output == Output::StreamJson).then(|| show_progress(spec.status.clone(), ended));
+    let report = driver::run(spec);
     drop(running);
     if let Some(progress) = progress {
         let _ = progress.join();
+    }
+    report
+}
+
+/// Takes the session back from run `id` and prints how the run ended,
+/// saying whether it ended without failing.
+fn finish(
+    runner: &mut Runner,
+    session: usize,
+    id: u64,
+    before: usize,
+    mut report: Report,
+    output: Output,
+) -> bool {
+    // On stderr, apart from the answer: what a hook said or could not do.
+    for problem in hooks::problems() {
+        eprintln!("{problem}");
     }
     // The report's text is the last thing said in the whole session, which
     // after -c is an earlier answer when this run said nothing.
     if let Some(said) = take_back(runner, session, id, before) {
         report.text = said;
     }
-    show(args.output, &report);
+    show(output, &report);
     !matches!(report.status, Outcome::Failed(_))
 }
 
@@ -453,20 +491,26 @@ fn answer_approvals(yes: bool, keyboard: bool, context: tools::ToolContext, canc
     let requests = approvals::serve();
     std::thread::spawn(move || {
         for request in requests {
-            let decision = if yes {
-                Decision::Once
-            } else if keyboard {
+            let decision = if keyboard && !yes {
                 consult(&request, &context, &cancel)
             } else {
-                eprintln!(
-                    "`{}` needs a yes and nobody is here to give it; run with --yes to allow it.",
-                    request.call.name
-                );
-                Decision::Deny(String::new())
+                unattended(yes, &request)
             };
             request.answer(decision);
         }
     });
+}
+
+/// Answers a call with nobody to ask: yes with `--yes`, otherwise no, saying why.
+fn unattended(yes: bool, request: &Request) -> Decision {
+    if yes {
+        return Decision::Once;
+    }
+    eprintln!(
+        "`{}` needs a yes and nobody is here to give it; run with --yes to allow it.",
+        request.call.name
+    );
+    Decision::Deny(String::new())
 }
 
 /// Asks the person at the keyboard about one call, the way the conversation
