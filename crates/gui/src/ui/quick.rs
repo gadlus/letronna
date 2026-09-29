@@ -35,8 +35,14 @@ pub(crate) fn init(cx: &mut App) {
 pub(crate) fn toggle(cx: &mut App) {
     if cx.has_global::<Open>() {
         let Open(handle) = cx.remove_global::<Open>();
-        let _ = handle.update(cx, |_, window, _| window.remove_window());
-        return;
+        // A bar the system closed itself leaves its handle behind; that press
+        // then opens a new one rather than being spent on a window not there.
+        if handle
+            .update(cx, |_, window, _| window.remove_window())
+            .is_ok()
+        {
+            return;
+        }
     }
     let Some(chat) = cx.try_global::<MainChat>().map(|m| m.0.clone()) else {
         return;
@@ -118,7 +124,10 @@ impl QuickEntry {
     }
 
     fn hide(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        cx.remove_global::<Open>();
+        // Already gone when the shortcut dismissed the bar in the same breath.
+        if cx.has_global::<Open>() {
+            cx.remove_global::<Open>();
+        }
         window.remove_window();
     }
 
