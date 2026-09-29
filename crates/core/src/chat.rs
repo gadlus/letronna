@@ -965,18 +965,35 @@ pub fn data_dir() -> std::path::PathBuf {
         .join("Letronna")
 }
 
+/// How long a reply may go quiet before it is given up on: five minutes
+/// covers a local model reading a long prompt, or a reasoning model thinking,
+/// before it says anything.
+const IDLE: Duration = Duration::from_secs(300);
+
 /// The one HTTP client every model call goes through.
 ///
 /// A client per call meant a new runtime thread and a fresh TCP and TLS
 /// handshake for each round of a turn -- up to `MAX_ROUNDS` of them, all to
 /// the same gateway. This one keeps the connection open between rounds.
-/// Timeouts are set per request, since a model list and a reply differ.
+/// A reply is bounded by how long it goes quiet, never by its length, and a
+/// call that needs a deadline, such as a model list, sets its own.
 pub(crate) fn client() -> Result<&'static reqwest::blocking::Client, String> {
     static CLIENT: OnceLock<Result<reqwest::blocking::Client, String>> = OnceLock::new();
     CLIENT
         .get_or_init(|| {
             reqwest::blocking::Client::builder()
                 .connect_timeout(Duration::from_secs(10))
+                // In the blocking client this bounds the wait for the headers
+                // and each read after them, not the whole body. A timeout on
+                // the request instead is a deadline for the entire reply.
+                .timeout(IDLE)
+                // reqwest's own keepalive probes every 15 s and takes a minute
+                // to find a peer that vanished mid-reply (165 s on Windows;
+                // Linux already stops at 30 s). Probing every 5 s finds it in
+                // about 30 s (65 s on Windows, which always makes ten).
+                .tcp_keepalive(Duration::from_secs(15))
+                .tcp_keepalive_interval(Duration::from_secs(5))
+                .tcp_keepalive_retries(3)
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|_| "Could not initialize the HTTP client.".to_owned())
@@ -1062,7 +1079,6 @@ fn stream(
     let mut request = client()
         .map_err(|e| Failure::new(FailureKind::Unknown, e))?
         .post(endpoint)
-        .timeout(Duration::from_secs(120))
         .json(&sent);
     if !connection.key.trim().is_empty() {
         request = request.bearer_auth(connection.key.trim());
@@ -1085,7 +1101,7 @@ fn stream(
             Err(_) => {
                 return Err(Failure::new(
                     FailureKind::Network,
-                    "Cannot reach the model. Check that your server is running and the endpoint is correct (120-second request timeout).",
+                    "Cannot reach the model. Check that your server is running and the endpoint is correct (5-minute wait for the reply to begin).",
                 ));
             }
         }
@@ -2676,5 +2692,125 @@ mod tests {
         assert!(messages[start].notice, "start {start} is not a notice");
         let sums = token_sums(&messages);
         assert!(sums[messages.len()] - sums[start] <= CONTEXT_TOKENS);
+    }
+
+    #[test]
+    fn the_client_timeout_counts_silence_not_the_whole_reply() {
+        // client() leans on this: in reqwest's blocking client the builder's
+        // timeout bounds each read, where a per-request one is a deadline for
+        // the whole body.
+        use std::io::Write;
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("http://{}/", server.local_addr().unwrap());
+        let (hang_up, told) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = server.accept().unwrap();
+            request_body(&mut socket);
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            // Twice the timeout in all, but never quiet for long.
+            for i in 0..40 {
+                writeln!(socket, "data: {i}").unwrap();
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            // Then quiet, which should end the read long before this gives up.
+            let _ = told.recv_timeout(Duration::from_secs(60));
+        });
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let response = client.post(address).body("{}").send().unwrap();
+        let mut lines = BufReader::new(response).lines();
+        for i in 0..40 {
+            assert_eq!(lines.next().unwrap().unwrap(), format!("data: {i}"));
+        }
+        let Some(Err(stall)) = lines.next() else {
+            panic!("a reply that went quiet was never cut");
+        };
+        let timed_out = stall
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<reqwest::Error>())
+            .is_some_and(reqwest::Error::is_timeout);
+        assert!(timed_out, "{stall}");
+        hang_up.send(()).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn a_call_that_sets_its_own_deadline_keeps_it() {
+        // A model list's deadline must beat the shared client's far longer
+        // idle timeout. Were it lost, the server hanging up at 60 s would end
+        // the wait with some other error.
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("http://{}/", server.local_addr().unwrap());
+        let (hang_up, told) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = server.accept().unwrap();
+            request_body(&mut socket);
+            let _ = told.recv_timeout(Duration::from_secs(60));
+        });
+        let sent = super::client()
+            .unwrap()
+            .post(address)
+            .body("{}")
+            .timeout(Duration::from_secs(1))
+            .send();
+        assert!(matches!(&sent, Err(e) if e.is_timeout()), "{sent:?}");
+        hang_up.send(()).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    #[ignore = "takes over two minutes: a local server trickles one reply past the old 120-second cap; run with --ignored arrives_whole"]
+    fn a_reply_longer_than_two_minutes_arrives_whole() {
+        use std::io::Write;
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1", server.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = server.accept().unwrap();
+            request_body(&mut socket);
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            // A word every five seconds, 130 seconds in all.
+            for _ in 0..26 {
+                write!(
+                    socket,
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"word \"}}}}]}}\n\n"
+                )
+                .unwrap();
+                std::thread::sleep(Duration::from_secs(5));
+            }
+            write!(socket, "data: [DONE]\n\n").unwrap();
+        });
+        let c = Connection {
+            endpoint,
+            ..connection()
+        };
+        let rx = start(
+            c,
+            vec![Message {
+                role: "user".into(),
+                content: "Hi".into(),
+                ..Default::default()
+            }],
+        );
+        let mut reply = String::new();
+        let result = loop {
+            match rx.recv_blocking().unwrap() {
+                Event::Delta(text) => reply.push_str(&text),
+                Event::Finished(result) => break result,
+                _ => {}
+            }
+        };
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(reply, "word ".repeat(26));
+        worker.join().unwrap();
     }
 }
