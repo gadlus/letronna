@@ -110,7 +110,7 @@ impl Chat {
                 card.child(
                     div()
                         .text_sm()
-                        .font_family(HEADING_FONT)
+                        .font_family(BODY_FONT)
                         .font_weight(FontWeight::MEDIUM)
                         .child("Letronna has a plan"),
                 )

@@ -818,6 +818,7 @@ impl Chat {
         };
         let reply = turn.take_reply(&model);
         let calls = reply.tool_calls.clone();
+        let continuation = turn.continuation();
         // The session may have been switched or deleted while it streamed.
         let Some(ix) = self.streaming_id.and_then(|id| self.store.index_of(id)) else {
             self.finish(cx);
@@ -825,7 +826,21 @@ impl Chat {
         };
         let conversation = &mut self.store.conversations[ix];
         conversation.updated = backend::now();
-        conversation.messages.push(reply);
+        // A reply cut off inside a tool call, with no text before it, leaves
+        // nothing to keep.
+        if !reply.content.is_empty() || !calls.is_empty() {
+            conversation.messages.push(reply);
+        }
+        match continuation {
+            Ok(Some(notice)) => {
+                conversation.messages.push(notice);
+                self.save();
+                self.run_turn(cx);
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => self.error = Some(error),
+        }
         self.save();
         let more = self.turn.as_mut().is_some_and(|turn| turn.begin(calls));
         if more {

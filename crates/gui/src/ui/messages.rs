@@ -249,7 +249,7 @@ impl Chat {
                     .justify_between()
                     .items_center()
                     .text_xs()
-                    .font_family(HEADING_FONT)
+                    .font_family(BODY_FONT)
                     .text_color(cx.theme().muted_foreground)
                     .child("Queued · goes in after this step")
                     .child(

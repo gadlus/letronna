@@ -20,6 +20,20 @@ use std::collections::{HashSet, VecDeque};
 /// enough that a looping model stops on its own.
 pub const MAX_ROUNDS: usize = 25;
 
+/// Times one user message may ask a reply cut off at the output limit to go
+/// on. Three more replies make an answer four times the cap; one still
+/// running past that is more likely looping than nearly done.
+const MAX_CONTINUATIONS: usize = 3;
+
+/// The notice that asks a reply cut off at the output limit to go on.
+const CONTINUE: &str =
+    "Your last reply was cut off at the output limit; continue exactly where it stopped.";
+
+/// The notice for a reply cut off inside a tool call, which was not run.
+const CALL_AGAIN: &str = "Your last reply was cut off at the output limit in the middle \
+    of a tool call, so the call was not run. Make it again with less in it, splitting the \
+    work over several calls if it needs more room.";
+
 /// What the caller should do next.
 #[derive(Debug, PartialEq)]
 pub enum Next {
@@ -57,6 +71,10 @@ pub struct Turn {
     queue: VecDeque<ToolCall>,
     /// Tool results for the batch being worked through.
     results: Vec<Message>,
+    /// Set when the reply being streamed stopped at the output limit: true
+    /// when it stopped inside a tool call.
+    cut_off: Option<bool>,
+    continued: usize,
 }
 
 impl Turn {
@@ -68,6 +86,8 @@ impl Turn {
             limit: MAX_ROUNDS,
             queue: VecDeque::new(),
             results: Vec::new(),
+            cut_off: None,
+            continued: 0,
         }
     }
 
@@ -99,6 +119,7 @@ impl Turn {
             }
             Event::ToolCalls(calls) => self.live.calls = calls.clone(),
             Event::Retrying(retry) => self.live.retrying = Some(*retry),
+            Event::CutOff { in_call } => self.cut_off = Some(*in_call),
             Event::Finished(_) => {}
         }
     }
@@ -119,6 +140,28 @@ impl Turn {
             tool_calls: live.calls,
             ..Default::default()
         }
+    }
+
+    /// The notice asking the model to go on, when the reply just finished
+    /// was cut off at the output limit. An error once it has been asked
+    /// `MAX_CONTINUATIONS` times already, so the turn ends saying why.
+    pub fn continuation(&mut self) -> Result<Option<Message>, String> {
+        let Some(in_call) = self.cut_off.take() else {
+            return Ok(None);
+        };
+        if self.continued >= MAX_CONTINUATIONS {
+            return Err(format!(
+                "The reply was still cut off at the output limit after {MAX_CONTINUATIONS} \
+                 continuations, so it stops here."
+            ));
+        }
+        self.continued += 1;
+        Ok(Some(Message {
+            role: "user".into(),
+            content: if in_call { CALL_AGAIN } else { CONTINUE }.into(),
+            notice: true,
+            ..Default::default()
+        }))
     }
 
     /// Queue the calls the model asked for. False when the turn should stop
@@ -412,5 +455,39 @@ mod tests {
         );
         // The rest of the turn can act on the plan, and has no plan to hand over.
         assert!(offers(&turn, "write_file") && !offers(&turn, tools::EXIT_PLAN));
+    }
+
+    #[test]
+    fn a_reply_cut_off_at_the_limit_goes_on_three_times_then_stops() {
+        let mut turn = turn();
+        // A reply that ended on its own asks for nothing more.
+        turn.absorb(&Event::Delta("Done.".into()));
+        turn.take_reply("some-model");
+        assert!(matches!(turn.continuation(), Ok(None)));
+        for time in 0..MAX_CONTINUATIONS {
+            turn.absorb(&Event::Delta("part".into()));
+            turn.absorb(&Event::CutOff { in_call: false });
+            // The fragment is kept, not thrown away.
+            assert_eq!(turn.take_reply("some-model").content, "part");
+            let notice = turn.continuation().unwrap().expect("a continuation");
+            assert!(notice.notice, "time {time}");
+            assert_eq!(notice.role, "user");
+            assert_eq!(notice.content, CONTINUE);
+        }
+        turn.absorb(&Event::CutOff { in_call: false });
+        assert!(turn.continuation().is_err(), "went on past the cap");
+    }
+
+    #[test]
+    fn a_call_cut_off_at_the_limit_is_asked_for_again() {
+        let mut turn = turn();
+        turn.absorb(&Event::CutOff { in_call: true });
+        let reply = turn.take_reply("some-model");
+        assert!(reply.tool_calls.is_empty());
+        let notice = turn.continuation().unwrap().expect("a continuation");
+        assert!(notice.notice);
+        assert_eq!(notice.content, CALL_AGAIN);
+        // Taken once: the next reply starts clean.
+        assert!(matches!(turn.continuation(), Ok(None)));
     }
 }
