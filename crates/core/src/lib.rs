@@ -37,6 +37,7 @@ mod page;
 pub mod paths;
 pub mod permissions;
 pub mod retry;
+mod scan;
 pub mod schedule;
 pub mod search;
 pub mod skills;
