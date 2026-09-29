@@ -367,7 +367,8 @@ fn requests(messages: &[Message]) -> Vec<String> {
         .rev()
         .filter(|m| m.role == "user" && !m.notice)
     {
-        let text = m.content.trim();
+        // What `@` references attached is the files, not what was asked.
+        let text = crate::references::typed(&m.content).trim();
         let size = text.chars().count();
         if size <= left {
             left -= size;
@@ -812,6 +813,18 @@ mod tests {
         assert!(!digest.contains("fn main"), "{digest}");
         // What the model wrote goes in one line at a time.
         assert!(!digest.contains("SYSTEM"), "{digest}");
+    }
+
+    #[test]
+    fn what_a_reference_attached_does_not_crowd_out_earlier_requests() {
+        let dir = std::env::temp_dir().join(format!("letronna-digest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("big.txt"), "a line of the file\n".repeat(400)).unwrap();
+        let latest = crate::references::expand("fix @big.txt", Some(&dir));
+        assert!(latest.chars().count() > REQUEST_CHARS, "{latest}");
+        let kept = requests(&[said("user", "use tabs"), said("user", &latest)]);
+        assert_eq!(kept, ["User: use tabs", "User: fix @big.txt"]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
