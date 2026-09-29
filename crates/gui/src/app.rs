@@ -106,6 +106,8 @@ pub(crate) struct Chat {
     pub(crate) endpoint: Entity<InputState>,
     pub(crate) model: Entity<InputState>,
     pub(crate) key: Entity<InputState>,
+    /// The quick entry shortcut, as typed on the Shortcuts settings page.
+    pub(crate) hotkey: Entity<InputState>,
     /// Where the browser is when it is not on this computer.
     pub(crate) browser_address: Entity<InputState>,
     /// Every model on every set-up gateway, as (gateway, model).
@@ -378,6 +380,9 @@ impl Chat {
             store.settings.endpoint = std::env::var("AGENT_BASE_URL")
                 .unwrap_or_else(|_| gateway(&store.settings.gateway).base.into());
         }
+        if store.settings.quick_entry_hotkey.is_empty() {
+            store.settings.quick_entry_hotkey = crate::platform::hotkey::DEFAULT.into();
+        }
         let keys = load_keys();
         let saved_key = keys
             .get(key_slot(&store.settings.gateway))
@@ -408,6 +413,11 @@ impl Chat {
                 .placeholder("API key")
                 .masked(true)
                 .default_value(saved_key)
+        });
+        let hotkey = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(crate::platform::hotkey::DEFAULT)
+                .default_value(store.settings.quick_entry_hotkey.clone())
         });
         let browser_address = cx.new(|cx| {
             InputState::new(window, cx)
@@ -579,6 +589,7 @@ impl Chat {
             endpoint,
             model,
             key,
+            hotkey,
             browser_address,
             models: Vec::new(),
             model_kind: "chat",
@@ -981,6 +992,33 @@ impl Chat {
         self.follow();
         self.run_turn(cx);
         Ok(())
+    }
+
+    /// The quick entry bar's send: like [`Self::dispatch`], but window-free,
+    /// since it runs from a window other than the one this `Chat` renders in.
+    /// `new_session` opens a fresh conversation first; otherwise the prompt
+    /// lands in whichever one was last active.
+    pub(crate) fn quick_dispatch(
+        &mut self,
+        prompt: String,
+        images: Vec<PathBuf>,
+        new_session: bool,
+        cx: &mut Context<Self>,
+    ) -> std::result::Result<(), ()> {
+        if new_session {
+            let workspace = self.store.conversations[self.store.active]
+                .workspace
+                .clone();
+            self.store.conversations.push(Conversation {
+                id: self.store.reserve_id(),
+                title: "New session".into(),
+                updated: backend::now(),
+                workspace,
+                ..Default::default()
+            });
+            self.store.active = self.store.conversations.len() - 1;
+        }
+        self.dispatch(prompt, images, None, cx)
     }
 
     /// A checked connection for a turn in the session at `ix`, on the gateway

@@ -23,6 +23,9 @@ image = "0.25"
 # Plays speech a tool made, in the chat: playback and the formats voices come
 # back in, and no recording.
 rodio = { version = "0.22", default-features = false, features = ["playback", "mp3", "wav", "flac", "vorbis"] }
+# Windows, macOS and X11; Wayland grants no global key at all, so there the
+# tray's "Quick entry" item is the only way in.
+global-hotkey = "0.7"
 
 [target.'cfg(windows)'.dependencies]
 tray-icon = "0.25"

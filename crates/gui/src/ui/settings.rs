@@ -12,6 +12,7 @@ const PAGES: &[(&str, AppIcon)] = &[
     ("Appearance", AppIcon::Palette),
     ("Thinking", AppIcon::Sparkles),
     ("Privacy", AppIcon::Shield),
+    ("Shortcuts", AppIcon::Keyboard),
     ("MCP", AppIcon::PlugsConnected),
     ("Plugins", AppIcon::Puzzle),
     ("About", AppIcon::Info),
@@ -97,6 +98,28 @@ impl Chat {
             cx.notify();
         });
         self.load_models(window, cx);
+    }
+
+    /// Save and register the quick entry shortcut typed on the Shortcuts
+    /// page. Left as it was if the spec does not parse or nothing will grab
+    /// it -- Wayland refuses every global key, so a failure there is expected
+    /// rather than a typo.
+    pub(crate) fn apply_hotkey(&mut self, cx: &mut Context<Self>) {
+        let spec = self.hotkey.read(cx).value().trim().to_string();
+        if spec.is_empty() || !crate::platform::hotkey::rebind(&spec, cx) {
+            self.error = Some(
+                "Couldn't set that shortcut. Check the spelling (e.g. \"ctrl+shift+space\"), \
+                 or use the tray's Quick entry item instead -- Wayland lets nothing grab a \
+                 global key at all."
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
+        self.store.settings.quick_entry_hotkey = spec;
+        self.save();
+        self.error = None;
+        cx.notify();
     }
 
     /// Forget a gateway's key (and URL, for Custom); its models leave the list.
@@ -344,6 +367,7 @@ impl Chat {
         let endpoint = self.endpoint.clone();
         let model = self.model.clone();
         let key = self.key.clone();
+        let hotkey = self.hotkey.clone();
         let chat = cx.entity();
         let pick = self.gateway_pick.clone();
         let presence = self.presence_pick.clone();
@@ -414,6 +438,7 @@ impl Chat {
             "Account" => super::account::account_page(&chat, self, cx).into_any_element(),
             "Usage" => super::usage::usage_page(self.usage_report.as_ref(), cx).into_any_element(),
             "Thinking" => thinking_page(&chat, &self.store, cx).into_any_element(),
+            "Shortcuts" => shortcuts_page(&hotkey, &chat, cx).into_any_element(),
             "Plugins" => plugins_page(&chat, cx).into_any_element(),
             "MCP" => super::mcp::mcp_page(&chat, window, cx).into_any_element(),
             "About" => about_page(&chat, self, cx).into_any_element(),
@@ -1515,6 +1540,43 @@ fn search_page(
             cx,
         ))
         .child(list)
+}
+
+fn shortcuts_page(hotkey: &Entity<InputState>, chat: &Entity<Chat>, cx: &App) -> Div {
+    let save = chat.clone();
+    v_flex()
+        .gap_5()
+        .child(heading(
+            "Quick Entry",
+            "Ctrl+Shift+Space by default. Press it from anywhere to pop a small bar over \
+             whatever you are doing, even with Letronna in the tray.",
+            cx,
+        ))
+        .child(
+            v_flex()
+                .gap_1()
+                .child(label("Shortcut", cx))
+                .child(Input::new(hotkey)),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(
+                    "Modifiers first, then a key, joined with +: \"ctrl+shift+space\". \
+                     Wayland lets nothing grab a global key at all; the tray's Quick entry \
+                     item works there instead.",
+                ),
+        )
+        .child(
+            h_flex().justify_end().child(
+                Button::new("save-hotkey")
+                    .primary()
+                    .small()
+                    .label("Save shortcut")
+                    .on_click(move |_, _, cx| save.update(cx, |this, cx| this.apply_hotkey(cx))),
+            ),
+        )
 }
 
 fn gateway_page(

@@ -181,7 +181,7 @@ fn thumbnail(path: &std::path::Path, cx: &App) -> impl IntoElement {
 /// every provider takes and small enough; otherwise scaled to `LONG_SIDE`, as
 /// a PNG, which keeps a screenshot's text sharp, unless that is still too
 /// big or the picture was a photo to begin with, then as a JPEG.
-fn fit(bytes: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn fit(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let picture = image::load_from_memory(bytes)
         .map_err(|_| "it is not a picture this can read.".to_owned())?;
     let long = picture.width().max(picture.height());

@@ -256,6 +256,10 @@ pub struct Settings {
     /// its full `mcp__server__tool` name; a name no tool has is passed over.
     #[serde(default, deserialize_with = "tool_names")]
     pub disabled_tools: Vec<String>,
+    /// The global shortcut that opens the quick entry bar, e.g.
+    /// "ctrl+shift+space". Empty until the window fills in its default.
+    #[serde(default)]
+    pub quick_entry_hotkey: String,
 }
 
 // Written out rather than derived so the film grain starts on for a first
@@ -284,6 +288,7 @@ impl Default for Settings {
             browse_unseen: false,
             appearance: String::new(),
             grain: true,
+            quick_entry_hotkey: String::new(),
         }
     }
 }
