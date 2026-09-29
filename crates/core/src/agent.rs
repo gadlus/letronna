@@ -99,10 +99,21 @@ pub struct Live {
     pub per_second: f32,
     pub prompt_tokens: u64,
     pub cached_tokens: u64,
+    /// The model's window as the model facts give it, once the usage is in.
+    pub window: u64,
+    pub cache_write_tokens: u64,
+    pub reasoning_tokens: u64,
+    /// What OpenRouter billed for the reply, in dollars.
+    pub cost: Option<f64>,
+    /// What summarizing older turns for the request took.
+    pub summary_usage: Option<crate::usage::Usage>,
     pub calls: Vec<ToolCall>,
     pub replay: Option<Replay>,
     /// The try about to be made again after a failure, while it waits.
     pub retrying: Option<crate::retry::Retry>,
+    /// Set while the turns the window dropped are summarized, until the
+    /// reply starts.
+    pub compacting: bool,
 }
 
 /// One user turn in flight.
@@ -165,8 +176,10 @@ impl Turn {
 
     /// Fold a streamed event into the reply being built.
     pub fn absorb(&mut self, event: &Event) {
-        // Whatever follows a retry comes from the new try, so it is under way.
+        // Whatever follows a retry comes from the new try, and whatever
+        // follows the summary from the reply, so either is under way.
         self.live.retrying = None;
+        self.live.compacting = false;
         match event {
             Event::Delta(text) => self.live.content.push_str(text),
             Event::Reasoning(text) => self.live.reasoning.push_str(text),
@@ -175,25 +188,38 @@ impl Turn {
                 per_second,
                 prompt,
                 cached,
+                cache_write,
+                reasoning,
+                cost,
             } => {
                 self.live.tokens = *completion;
                 self.live.per_second = *per_second;
                 self.live.prompt_tokens = *prompt;
                 self.live.cached_tokens = *cached;
+                let model = self.connection.model.trim();
+                let facts = crate::models::facts(&self.connection.endpoint, model);
+                self.live.window = facts.context.unwrap_or(0);
+                self.live.cache_write_tokens = *cache_write;
+                self.live.reasoning_tokens = *reasoning;
+                self.live.cost = *cost;
             }
+            Event::SummaryUsage(usage) => self.live.summary_usage = Some(*usage),
             Event::ToolCalls(calls) => self.live.calls = calls.clone(),
             Event::Replay(replay) => self.live.replay = Some(replay.clone()),
             Event::Retrying(retry) => self.live.retrying = Some(*retry),
+            Event::Compacting => self.live.compacting = true,
+            // The front end keeps it with the session.
+            Event::Summarized { .. } => {}
             Event::CutOff { in_call } => self.cut_off = Some(*in_call),
             Event::Finished(_) => {}
         }
     }
 
-    /// The assistant message for the reply just finished, and a clean slate
-    /// for the next one.
+    /// The assistant message for the reply just finished, its cost settled,
+    /// and a clean slate for the next one.
     pub fn take_reply(&mut self, model: &str) -> Message {
         let live = std::mem::take(&mut self.live);
-        Message {
+        let mut reply = Message {
             role: "assistant".into(),
             content: live.content,
             model: model.to_owned(),
@@ -202,10 +228,20 @@ impl Turn {
             per_second: live.per_second,
             prompt_tokens: live.prompt_tokens,
             cached_tokens: live.cached_tokens,
+            window: live.window,
+            cache_write_tokens: live.cache_write_tokens,
+            reasoning_tokens: live.reasoning_tokens,
+            cost: live.cost,
+            summary_usage: live.summary_usage,
+            at: crate::chat::now(),
             tool_calls: live.calls,
             replay: live.replay.map(Box::new),
             ..Default::default()
-        }
+        };
+        let usage = crate::usage::Usage::of(&reply).priced(&self.connection.endpoint, model);
+        reply.cost = usage.cost;
+        reply.cost_estimated = usage.estimated;
+        reply
     }
 
     /// The notice sending the model back to work after the reply just
@@ -324,10 +360,11 @@ impl Turn {
 
     /// The calls at the front of the queue that may run at once, at most
     /// `max`, left queued until `finish_id` records each.
-    pub fn next_batch(&self, gate: impl Fn(&str) -> bool, max: usize) -> Vec<ToolCall> {
+    /// `gate` says whether a call must wait for the user, from the whole call.
+    pub fn next_batch(&self, gate: impl Fn(&ToolCall) -> bool, max: usize) -> Vec<ToolCall> {
         self.queue
             .iter()
-            .take_while(|call| tools::concurrent(&call.name) && !gate(&call.name))
+            .take_while(|call| tools::concurrent(&call.name) && !gate(call))
             .take(max)
             .cloned()
             .collect()
@@ -519,11 +556,20 @@ mod tests {
         turn.absorb(&Event::Delta("Hel".into()));
         turn.absorb(&Event::Delta("lo".into()));
         turn.absorb(&Event::Reasoning("thinking".into()));
+        let summary = crate::usage::Usage {
+            input: 900,
+            output: 80,
+            ..Default::default()
+        };
+        turn.absorb(&Event::SummaryUsage(summary));
         turn.absorb(&Event::Usage {
             completion: 12,
             per_second: 4.0,
             prompt: 300,
             cached: 256,
+            cache_write: 30,
+            reasoning: 5,
+            cost: None,
         });
 
         let reply = turn.take_reply("some-model");
@@ -531,9 +577,39 @@ mod tests {
         assert_eq!(reply.reasoning, "thinking");
         assert_eq!(reply.model, "some-model");
         assert_eq!(reply.cached_tokens, 256);
+        assert_eq!((reply.cache_write_tokens, reply.reasoning_tokens), (30, 5));
+        assert_eq!(reply.summary_usage, Some(summary));
+        assert!(reply.at > 0);
+        // No price is known for this model, so no cost is made up.
+        assert_eq!(reply.cost, None);
         // The next reply must not inherit any of that.
         assert!(turn.live.content.is_empty());
-        assert_eq!(turn.take_reply("some-model").tokens, 0);
+        let next = turn.take_reply("some-model");
+        assert_eq!((next.tokens, next.summary_usage), (0, None));
+    }
+
+    #[test]
+    fn a_reply_carries_its_models_window_when_the_facts_know_it() {
+        let usage = Event::Usage {
+            completion: 12,
+            per_second: 4.0,
+            prompt: 76_000,
+            cached: 0,
+            cache_write: 0,
+            reasoning: 0,
+            cost: None,
+        };
+        let mut known = turn();
+        known.connection.endpoint = "https://fullness.test/v1".into();
+        known.connection.model = "claude-sonnet-4-5".into();
+        known.absorb(&usage);
+        let reply = known.take_reply("claude-sonnet-4-5");
+        assert_eq!(reply.window, 200_000);
+        assert_eq!(reply.fullness().as_deref(), Some("38% of 200K"));
+
+        let mut unknown = turn();
+        unknown.absorb(&usage);
+        assert_eq!(unknown.take_reply("test").fullness(), None);
     }
 
     #[test]
@@ -838,7 +914,7 @@ mod tests {
     #[test]
     fn reads_in_one_batch_run_together_and_come_back_in_order() {
         let mut turn = turn();
-        let never = |_: &str| false;
+        let never = |_: &ToolCall| false;
         let names = [
             "read_file",
             "list_dir",
@@ -872,17 +948,32 @@ mod tests {
     }
 
     #[test]
+    fn a_call_asked_about_for_its_arguments_ends_the_batch() {
+        // A read joins a batch by its tool, but a read of a file of keys is
+        // asked about, and the gate sees the whole call to know that.
+        let mut turn = turn();
+        let keys = ToolCall {
+            id: "keys".into(),
+            name: "read_file".into(),
+            arguments: r#"{"path": ".env"}"#.into(),
+        };
+        turn.begin(vec![call("read_file"), keys, call("list_dir")]);
+        let asks = |queued: &ToolCall| queued.arguments.contains(".env");
+        assert_eq!(turn.next_batch(asks, MAX_BATCH), [call("read_file")]);
+    }
+
+    #[test]
     fn a_call_that_needs_asking_ends_the_batch() {
         let mut turn = turn();
         turn.begin(vec![call("read_file"), call("web_fetch"), call("list_dir")]);
-        let asks = |name: &str| name == "web_fetch";
+        let asks = |queued: &ToolCall| queued.name == "web_fetch";
         assert_eq!(turn.next_batch(asks, MAX_BATCH), [call("read_file")]);
         turn.finish_id("read_file-1", Ok("contents".into()));
 
         // Nothing runs past it while it waits for an answer.
         assert!(turn.next_batch(asks, MAX_BATCH).is_empty());
         assert_eq!(
-            turn.next(|queued: &ToolCall| if asks(&queued.name) {
+            turn.next(|queued: &ToolCall| if asks(queued) {
                 Outcome::Ask
             } else {
                 Outcome::Run
@@ -890,7 +981,7 @@ mod tests {
             Next::AskUser(call("web_fetch"))
         );
         // Once allowed, the same fetch joins the read after it.
-        let allowed = |_: &str| false;
+        let allowed = |_: &ToolCall| false;
         assert_eq!(
             turn.next_batch(allowed, MAX_BATCH),
             [call("web_fetch"), call("list_dir")]
@@ -899,7 +990,7 @@ mod tests {
 
     #[test]
     fn browse_and_memory_are_never_batched() {
-        let never = |_: &str| false;
+        let never = |_: &ToolCall| false;
         for alone in [
             "browse",
             "use_page",

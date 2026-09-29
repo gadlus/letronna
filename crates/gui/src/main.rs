@@ -57,6 +57,7 @@ fn main() {
             KeyBinding::new("escape", Dismiss, Some("Chat")),
             KeyBinding::new("secondary-j", ui::panel::TogglePanel, Some("Chat")),
             KeyBinding::new("secondary-shift-l", ui::panel::BrowserTab, Some("Chat")),
+            KeyBinding::new("secondary-shift-u", ui::usage::OpenUsage, Some("Chat")),
             KeyBinding::new(
                 "shift-enter",
                 gpui_component::input::Enter { secondary: true },
@@ -71,6 +72,7 @@ fn main() {
             KeyBinding::new("tab", ui::browser::PageTab, Some("Browser")),
             KeyBinding::new("shift-tab", ui::browser::PageTabBack, Some("Browser")),
             KeyBinding::new("tab", ui::composer::LeaveComposer, Some("Composer > Input")),
+            KeyBinding::new("enter", ui::search::OpenHit, Some("SearchHit")),
         ]);
         platform::tray::init(cx);
         cx.on_window_closed(|cx| {

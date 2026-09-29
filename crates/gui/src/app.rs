@@ -1,5 +1,5 @@
 use crate::prelude::*;
-use letronna_core::{agent, inbox};
+use letronna_core::{agent, approvals, inbox};
 
 pub(crate) const BRAND: &str = "Letronna";
 
@@ -73,6 +73,10 @@ pub(crate) struct Chat {
     pub(crate) store: Store,
     pub(crate) composer: Entity<InputState>,
     pub(crate) search: Entity<InputState>,
+    /// What the sidebar's search found in what was said.
+    pub(crate) found: Vec<crate::ui::search::Found>,
+    /// The search waiting for typing to pause, or running.
+    pub(crate) finding: Option<Task<()>>,
     pub(crate) endpoint: Entity<InputState>,
     pub(crate) model: Entity<InputState>,
     pub(crate) key: Entity<InputState>,
@@ -92,6 +96,8 @@ pub(crate) struct Chat {
     pub(crate) gateway_pick: Entity<String>,
     pub(crate) presence_pick: Entity<String>,
     pub(crate) settings_page: Entity<&'static str>,
+    /// The Usage page's totals, added up when it was last opened.
+    pub(crate) usage_report: Option<letronna_core::usage::Report>,
     pub(crate) settings_open: bool,
     /// Held by the settings panel while it is open, so escape reaches it.
     pub(crate) settings_focus: FocusHandle,
@@ -154,6 +160,9 @@ pub(crate) struct Chat {
     /// user's own chats: a job saying "do not ask me at 9am" is not
     /// permission to stop asking everywhere else.
     pub(crate) unattended: std::collections::HashMap<u64, letronna_core::gate::Mode>,
+    /// Helpers' calls waiting on the user, oldest first, each shown as a card
+    /// in its own session. One dropped unanswered is declined.
+    pub(crate) agent_asks: std::collections::VecDeque<approvals::Request>,
     /// Text field on the `ask_user` card.
     pub(crate) answer: Entity<InputState>,
     /// Text field on a tool's card for why it was denied.
@@ -188,6 +197,9 @@ pub(crate) struct Chat {
     /// Stop drops the receiver at once, which is how the worker learns to
     /// give up, even in the middle of a wait to try again.
     pub(crate) reading: Option<Task<()>>,
+    /// Calls the turn in flight started that have not come back. The queue
+    /// moves on only once none are, so a batch finishes before the next step.
+    pub(crate) outstanding: usize,
     /// A remote chat that has been sent the card the turn is waiting on, and
     /// the call it is about. Its next message answers it.
     pub(crate) remote_waiting: Option<(
@@ -269,6 +281,11 @@ pub(crate) struct Chat {
     /// Where the chat was scrolled to at the last draw, to tell which way
     /// it has moved since.
     pub(crate) followed_offset: Pixels,
+    /// The session and message a search hit opened, which the chat is held
+    /// at until it is scrolled by hand or another session is shown.
+    pub(crate) reveal: Option<(u64, usize)>,
+    /// Where holding it last put the chat, to tell a scroll by hand from it.
+    pub(crate) revealed: Option<Pixels>,
     /// The list of modes, while the mode chip has it open.
     pub(crate) mode_menu: Option<Entity<gpui_component::menu::PopupMenu>>,
     pub(crate) _subscriptions: Vec<Subscription>,
@@ -426,7 +443,12 @@ impl Chat {
                     _ => {}
                 }
             }),
-            cx.subscribe_in(&search, window, |_, _, _: &InputEvent, _, cx| cx.notify()),
+            cx.subscribe_in(&search, window, |this, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.find_in_messages(cx);
+                }
+                cx.notify();
+            }),
             cx.subscribe_in(&edit_message, window, |this, _, event, window, cx| {
                 if matches!(event, InputEvent::PressEnter { secondary: false }) {
                     this.send_edit(window, cx);
@@ -483,6 +505,8 @@ impl Chat {
             store,
             composer,
             search,
+            found: Vec::new(),
+            finding: None,
             endpoint,
             model,
             key,
@@ -497,6 +521,7 @@ impl Chat {
             gateway_pick,
             presence_pick,
             settings_page,
+            usage_report: None,
             settings_open: false,
             settings_focus: cx.focus_handle(),
             page_focus: cx.focus_handle(),
@@ -516,6 +541,7 @@ impl Chat {
             rules: Ok(Vec::new()),
             rules_read: None,
             unattended: std::collections::HashMap::new(),
+            agent_asks: std::collections::VecDeque::new(),
             answer,
             deny_reason,
             job_tick: false,
@@ -532,6 +558,7 @@ impl Chat {
             remote_session: std::collections::HashMap::new(),
             generation: 0,
             reading: None,
+            outstanding: 0,
             remote_waiting: None,
             messaging_stop: None,
             token_input,
@@ -572,6 +599,8 @@ impl Chat {
             scroll: ScrollHandle::new(),
             following: true,
             followed_offset: px(0.),
+            reveal: None,
+            revealed: None,
             mode_menu: None,
             _subscriptions: subscriptions,
         };
@@ -585,6 +614,7 @@ impl Chat {
         Self::watch_schedules(cx);
         Self::watch_updates(cx);
         Self::watch_inbox(cx);
+        Self::serve_approvals(cx);
         this.restart_messaging(cx);
         if this.store.settings.presence == "off" {
             plugins::set_enabled(cx, plugins::DISCORD, false);
@@ -633,7 +663,8 @@ impl Chat {
         .detach();
     }
 
-    /// A model and the gateway it is on, chosen together.
+    /// A model and the gateway it is on, chosen together, for the session on
+    /// screen and new sessions.
     pub(crate) fn choose_model(
         &mut self,
         gateway: String,
@@ -643,8 +674,7 @@ impl Chat {
     ) {
         self.model
             .update(cx, |input, cx| input.set_value(id.clone(), window, cx));
-        self.store.settings.gateway = gateway;
-        self.store.settings.model = id;
+        self.store.choose_model(self.store.active, &gateway, &id);
         self.model_open = false;
         self.focus_composer(window, cx);
         self.save();
@@ -716,10 +746,31 @@ impl Chat {
             cx.notify();
             return;
         }
+        let Some(prompt) = self.prompt_for(prompt, cx) else {
+            return;
+        };
         self.composer
             .update(cx, |input, cx| input.set_value("", window, cx));
         if self.dispatch(prompt, None, cx).is_err() {
             self.open_settings(window, cx);
+        }
+    }
+
+    /// What sending `text` in the active session asks the model: `/init`
+    /// becomes its prompt, or `None` with the reason shown when there is no
+    /// project folder for it.
+    pub(crate) fn prompt_for(&mut self, text: String, cx: &mut Context<Self>) -> Option<String> {
+        let workspace = self.store.conversations[self.store.active]
+            .workspace
+            .as_deref();
+        match letronna_core::init::command(&text, workspace) {
+            Some(Ok(prompt)) => Some(prompt.to_owned()),
+            Some(Err(why)) => {
+                self.error = Some(why);
+                cx.notify();
+                None
+            }
+            None => Some(text),
         }
     }
 
@@ -732,7 +783,7 @@ impl Chat {
         remote: Option<letronna_core::chat::Remote>,
         cx: &mut Context<Self>,
     ) -> std::result::Result<(), ()> {
-        let connection = match self.connection_for(self.store.active, remote, cx) {
+        let connection = match self.connection_for(self.store.active, remote) {
             Ok(connection) => connection,
             Err(error) => {
                 self.error = Some(error);
@@ -741,14 +792,15 @@ impl Chat {
             }
         };
         self.store.settings.endpoint = connection.endpoint.clone();
-        self.store.settings.model = connection.model.clone();
+        self.store.pin(self.store.active);
         let conversation = &mut self.store.conversations[self.store.active];
         // Name an untitled session after its first prompt, but leave a name
         // that was set deliberately, such as a scheduled job's.
         if conversation.messages.is_empty()
             && (conversation.title.is_empty() || conversation.title == "New session")
         {
-            conversation.title = prompt.chars().take(40).collect();
+            let shown = letronna_core::init::typed(&prompt).unwrap_or(&prompt);
+            conversation.title = shown.chars().take(40).collect();
         }
         conversation.updated = backend::now();
         // What came in meanwhile goes first, so the prompt is read last.
@@ -761,6 +813,7 @@ impl Chat {
             ..Default::default()
         });
         let target_id = conversation.id;
+        let model = connection.model.clone();
         self.busy = true;
         self.streaming_id = Some(target_id);
         self.turn = Some(agent::Turn::new(connection));
@@ -771,7 +824,7 @@ impl Chat {
         plugins::emit(
             cx,
             plugins::AppEvent::ChatStarted {
-                model: self.store.settings.model.clone(),
+                model,
                 title: convo_title,
             },
         );
@@ -788,27 +841,24 @@ impl Chat {
         &self,
         ix: usize,
         remote: Option<letronna_core::chat::Remote>,
-        cx: &App,
     ) -> std::result::Result<Connection, String> {
+        // Each session keeps the model it was on, and the gateway with it.
+        let (gateway, model) = self.store.model(ix);
         let saved = self
             .keys
-            .get(key_slot(&self.store.settings.gateway))
+            .get(key_slot(gateway))
             .cloned()
             .unwrap_or_default();
-        let (endpoint, key) = resolve(
-            &self.store.settings.gateway,
-            &self.store.settings.custom_endpoint,
-            &saved,
-        );
+        let (endpoint, key) = resolve(gateway, &self.store.settings.custom_endpoint, &saved);
         let session = self.store.conversations[ix].id;
         let connection = Connection {
             endpoint,
-            model: self.model.read(cx).value().to_string(),
+            model: model.to_owned(),
             key,
             tools: true,
             workspace: None,
             plan: self.mode(session) == letronna_core::gate::Mode::Plan,
-            effort: self.store.settings.effort.clone(),
+            effort: self.store.effort(ix).to_owned(),
             search: self.store.settings.search,
             // A schedule's run and a chat app's turn may have nobody watching.
             unattended: remote.is_some() || self.scheduled.contains(&session),
@@ -842,12 +892,145 @@ impl Chat {
         let doorbell = inbox::listen();
         cx.spawn(async move |this, cx| {
             while doorbell.recv().await.is_ok() {
-                if this.update(cx, |this, cx| this.wake_idle(cx)).is_err() {
+                // A helper that ended rings too, and its card goes with it.
+                let rang = this.update(cx, |this, cx| {
+                    this.drop_ended_asks(cx);
+                    this.wake_idle(cx)
+                });
+                if rang.is_err() {
                     break;
                 }
             }
         })
         .detach();
+    }
+
+    /// Take helpers' approval requests for as long as the window is open.
+    fn serve_approvals(cx: &mut Context<Self>) {
+        let served = approvals::serve();
+        let (tx, rx) = async_channel::unbounded();
+        // `serve` hands back a blocking receiver, so a thread of its own
+        // carries each request over rather than one of the executor's.
+        std::thread::spawn(move || {
+            while let Ok(request) = served.recv() {
+                if tx.send_blocking(request).is_err() {
+                    break;
+                }
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            while let Ok(request) = rx.recv().await {
+                if this
+                    .update(cx, |this, cx| this.on_agent_ask(request, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// A helper's call waiting on a yes: answered at once where its session's
+    /// rules already decide it, otherwise put up as a card in that session.
+    fn on_agent_ask(&mut self, request: approvals::Request, cx: &mut Context<Self>) {
+        // Core has one request out per run and tool at a time, so a card
+        // still up for the same was given up on: its helper stopped waiting.
+        self.agent_asks
+            .retain(|queued| queued.run != request.run || queued.call.name != request.call.name);
+        cx.notify();
+        // With its session gone no card could show; dropped, it is declined.
+        let Some(ix) = self.store.index_of(request.root) else {
+            return;
+        };
+        // Its run may have ended before it got here, since the doorbell that
+        // says so comes by another way.
+        if run_ended(request.root, request.run) {
+            return;
+        }
+        if let Some(decision) = self.decided(&request.call, request.root) {
+            request.answer(decision);
+            return;
+        }
+        // Nobody in a chat app sees a helper's card, and one waiting here
+        // would hold up the chat's answer until someone came to the window.
+        if self.remote_session.values().any(|&id| id == request.root) {
+            return;
+        }
+        if !(self.page == Page::Chat && self.store.active == ix) {
+            let title = &self.store.conversations[ix].title;
+            self.error = Some(format!(
+                "Helper {} in \"{title}\" is waiting for your answer.",
+                request.label
+            ));
+        }
+        self.agent_asks.push_back(request);
+    }
+
+    /// What session `root`'s own rules make of a helper's `call`, or None
+    /// when only the user can say: the gate the session itself goes through,
+    /// in its mode and with what was allowed there.
+    fn decided(&self, call: &backend::ToolCall, root: u64) -> Option<approvals::Decision> {
+        let mut ctx = letronna_core::tools::ToolContext::default();
+        ctx.conversation = root;
+        ctx.workspace = self
+            .store
+            .index_of(root)
+            .and_then(|ix| self.store.conversations[ix].workspace.clone());
+        let gate = letronna_core::gate::Gate::for_window(
+            &ctx,
+            &self.session_allow,
+            &self.rules,
+            self.mode(root),
+            self.unattended.get(&root).copied(),
+        );
+        match letronna_core::gate::decide(call, &gate) {
+            letronna_core::gate::Outcome::Run => Some(approvals::Decision::Once),
+            letronna_core::gate::Outcome::Refuse(why) => Some(approvals::Decision::Deny(why)),
+            letronna_core::gate::Outcome::Ask => None,
+        }
+    }
+
+    /// Answer the helpers' cards their sessions' rules now decide, after a
+    /// rule changed under them.
+    fn decide_agent_asks(&mut self, cx: &mut Context<Self>) {
+        for request in std::mem::take(&mut self.agent_asks) {
+            match self.decided(&request.call, request.root) {
+                Some(decision) => request.answer(decision),
+                None => self.agent_asks.push_back(request),
+            }
+        }
+        cx.notify();
+    }
+
+    /// Take down the cards of helpers that have ended, since nothing waits
+    /// for their answers any more.
+    fn drop_ended_asks(&mut self, cx: &mut Context<Self>) {
+        let before = self.agent_asks.len();
+        self.agent_asks
+            .retain(|request| !run_ended(request.root, request.run));
+        if self.agent_asks.len() != before {
+            cx.notify();
+        }
+    }
+
+    /// The user answered helper `label`'s card for call `call_id` in session
+    /// `root`, if it is still up.
+    pub(crate) fn answer_agent(
+        &mut self,
+        root: u64,
+        label: &str,
+        call_id: &str,
+        decision: approvals::Decision,
+        cx: &mut Context<Self>,
+    ) {
+        let at = self.agent_asks.iter().position(|request| {
+            request.root == root && request.label == label && request.call.id == call_id
+        });
+        if let Some(request) = at.and_then(|at| self.agent_asks.remove(at)) {
+            request.answer(decision);
+        }
+        cx.notify();
     }
 
     fn run_due(&mut self, cx: &mut Context<Self>) {
@@ -952,6 +1135,12 @@ impl Chat {
                 self.finish(cx);
             }
             Event::Finished(Ok(())) => self.on_reply(cx),
+            // Kept with the session, so a restart need not ask for it again.
+            Event::Summarized { upto, text } => {
+                if let Some(ix) = self.streaming_id.and_then(|id| self.store.index_of(id)) {
+                    self.store.conversations[ix].summarized(upto, text);
+                }
+            }
             _ => {}
         }
         cx.notify();
@@ -959,10 +1148,10 @@ impl Chat {
 
     /// A reply finished: store it, then either run what it asked for or stop.
     fn on_reply(&mut self, cx: &mut Context<Self>) {
-        let model = self.store.settings.model.clone();
         let Some(turn) = self.turn.as_mut() else {
             return;
         };
+        let model = turn.connection.model.clone();
         let mut reply = turn.take_reply(&model);
         let continuation = turn.continuation(&mut reply);
         let calls = reply.tool_calls.clone();
@@ -1028,12 +1217,31 @@ impl Chat {
         }
     }
 
-    /// Run the next queued call, or stop on one that needs the user.
+    /// Run the next queued calls, together where they may, or stop on one
+    /// that needs the user.
     pub(crate) fn advance_tools(&mut self, cx: &mut Context<Self>) {
+        // What comes after a batch waits until every call of it is back.
+        if self.outstanding > 0 {
+            return;
+        }
         self.read_rules();
         let Some(turn) = self.turn.as_ref() else {
             return;
         };
+        // A call the gate would not simply run ends the batch, and is dealt
+        // with below once the batch is back.
+        let batch = until_repeated_id(turn.next_batch(
+            |call| self.decide(call, &self.rules) != letronna_core::gate::Outcome::Run,
+            agent::MAX_BATCH,
+        ));
+        if !batch.is_empty() {
+            self.asking = None;
+            for call in batch {
+                self.execute_call(call, false, cx);
+            }
+            cx.notify();
+            return;
+        }
         let next = turn.next(|call| self.decide(call, &self.rules));
         let asking = match &next {
             agent::Next::AskUser(call) => Some(call.id.clone()),
@@ -1160,22 +1368,40 @@ impl Chat {
         ctx.approved = approved;
         ctx.cancel = self.turn_stop.clone();
         self.call_running = true;
+        let (id, name) = (call.id.clone(), call.name.clone());
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
             let _ = tx.send_blocking(letronna_core::tools::run(&call.name, &call.arguments, &ctx));
         });
+        self.outstanding += 1;
         let generation = self.generation;
         cx.spawn(async move |this, cx| {
-            if let Ok(result) = rx.recv().await {
-                let _ = this.update(cx, |this, cx| {
-                    if this.generation == generation {
-                        this.call_running = false;
-                        this.record_result(result, cx)
-                    }
-                });
-            }
+            // A tool that panicked still comes back, or the rest of its
+            // batch would wait for it forever.
+            let result = rx
+                .recv()
+                .await
+                .unwrap_or_else(|_| Err(format!("`{name}` stopped without finishing.")));
+            let _ = this.update(cx, |this, cx| {
+                if this.generation == generation {
+                    this.record_ran(&id, result, cx)
+                }
+            });
         })
         .detach();
+    }
+
+    /// Record the outcome of a call that ran, and move on once the rest of
+    /// its batch is back too.
+    fn record_ran(&mut self, id: &str, result: Result<String, String>, cx: &mut Context<Self>) {
+        self.outstanding = self.outstanding.saturating_sub(1);
+        self.call_running = self.outstanding > 0;
+        if let Some(turn) = self.turn.as_mut() {
+            turn.finish_id(id, result);
+        }
+        // The calls still running are drawn from the queue, which just lost one.
+        cx.notify();
+        self.advance_tools(cx);
     }
 
     /// Record the outcome of the current call and move on.
@@ -1529,6 +1755,8 @@ impl Chat {
                         .entry(id)
                         .or_default()
                         .insert(call.name.clone());
+                    // Its helpers waiting on the same tool are allowed too.
+                    self.decide_agent_asks(cx);
                 }
                 self.execute_call(call, true, cx);
             }
@@ -1573,6 +1801,7 @@ impl Chat {
     /// Decide the call the card is up for again after an approval setting
     /// changed, so it runs at once if it no longer needs the user.
     pub(crate) fn approvals_changed(&mut self, cx: &mut Context<Self>) {
+        self.decide_agent_asks(cx);
         let waiting = self
             .turn
             .as_ref()
@@ -1597,6 +1826,8 @@ impl Chat {
     /// Go to the newest message and stay with it as more arrives.
     pub(crate) fn follow(&mut self) {
         self.following = true;
+        self.reveal = None;
+        self.revealed = None;
         self.scroll.scroll_to_bottom();
     }
 
@@ -1608,6 +1839,12 @@ impl Chat {
     /// moves it up, but pinned to the bottom, and that must not count.
     fn keep_following(&mut self) {
         let offset = self.scroll.offset().y;
+        // Held at a search hit, the chat stays put. Where it is still counts,
+        // so a scroll by hand after it lets go is told the right way round.
+        if self.holding_hit() {
+            self.followed_offset = offset;
+            return;
+        }
         let near_bottom = self.distance_from_bottom() <= FOLLOW_SLACK;
         // The offset grows towards zero going up.
         if offset > self.followed_offset && !near_bottom {
@@ -1691,7 +1928,6 @@ impl Chat {
     /// Save what a stopped turn got to, so the model hears next time what ran
     /// and what did not.
     fn keep_stopped(&mut self) {
-        let model = self.store.settings.model.clone();
         let running = std::mem::take(&mut self.call_running);
         let Some(turn) = self.turn.as_mut() else {
             return;
@@ -1699,6 +1935,7 @@ impl Chat {
         if running {
             turn.finish_call(Err(agent::STOPPED_WHILE_RUNNING.into()));
         }
+        let model = turn.connection.model.clone();
         let kept = turn.stop(&model);
         let Some(ix) = self.streaming_id.and_then(|id| self.store.index_of(id)) else {
             return;
@@ -1744,6 +1981,9 @@ impl Chat {
         self.busy = false;
         self.streaming_id = None;
         self.turn = None;
+        // Calls a stop left running come back to a generation that is gone,
+        // so the next turn must not wait for them.
+        self.outstanding = 0;
         plugins::emit(cx, plugins::AppEvent::ChatIdle);
         self.send_follow_ups(session, cx);
         // Stop means stop, and after a failure the next turn would most
@@ -1787,7 +2027,7 @@ impl Chat {
         conversation.messages.push(notice);
         self.unseen.insert(id);
         self.save();
-        let connection = match self.connection_for(ix, None, cx) {
+        let connection = match self.connection_for(ix, None) {
             Ok(connection) => connection,
             Err(error) => {
                 self.error = Some(error);
@@ -1811,6 +2051,9 @@ impl Chat {
             Some("Another session is working. Send this when it is done, or stop it first.")
         } else if prompt.chars().count() > 12_000 {
             Some("Please keep each message under 12,000 characters.")
+        } else if prompt == letronna_core::init::COMMAND {
+            // Folded into a turn as it runs, it would reach the model as typed.
+            Some("/init starts a turn of its own. Send it when this one is done.")
         } else {
             None
         };
@@ -2015,7 +2258,11 @@ impl Render for Chat {
             self.messaging_page(cx).into_any_element()
         } else if self.page != Page::Chat {
             self.page_view(self.page, cx).into_any_element()
-        } else if conversation.messages.is_empty() && !streaming_here {
+        } else if conversation.messages.is_empty()
+            && !streaming_here
+            // A helper's card needs the chat body even with nothing said.
+            && !self.agent_asks.iter().any(|ask| ask.root == conversation.id)
+        {
             self.empty_state(cx).into_any_element()
         } else {
             // One turn per prompt, like Claude Code: the user's message, then
@@ -2032,7 +2279,11 @@ impl Render for Chat {
                 .any(|context| context.contains("PopupMenu"));
             let mut turns: Vec<(Vec<AnyElement>, Span, FocusHandle)> = Vec::new();
             let mut assistant_turn = false;
+            // The message a search hit opened, marked on the first row drawn
+            // from it on: a reply that only called tools has none of its own.
+            let mut marking = false;
             for (i, m) in messages.iter().enumerate() {
+                marking |= self.reveal == Some((conversation.id, i));
                 let is_user = m.role == "user";
                 if is_user || !assistant_turn {
                     // A notice stands apart as your message does, but it is
@@ -2070,7 +2321,12 @@ impl Render for Chat {
                     let shown = shows_bar(*span, messages.len(), streaming_here, focused);
                     self.turn_bar(*span, shown, cx)
                 });
-                rows.push(self.message_row(i, m, labeled, false, bar, window, cx));
+                let row = self.message_row(i, m, labeled, false, bar, window, cx);
+                rows.push(if std::mem::take(&mut marking) {
+                    self.mark_hit(row, cx)
+                } else {
+                    row
+                });
             }
             // The turn a reply is still coming in to has no buttons or menu:
             // it is not finished, and it owns the session until it is.
@@ -2099,12 +2355,13 @@ impl Render for Chat {
                 if let Some(live) = self.turn.as_ref().filter(|_| idle).map(|turn| Message {
                     role: "assistant".into(),
                     content: turn.live.content.clone(),
-                    model: self.store.settings.model.clone(),
+                    model: turn.connection.model.clone(),
                     reasoning: turn.live.reasoning.clone(),
                     tokens: turn.live.tokens,
                     per_second: turn.live.per_second,
                     prompt_tokens: turn.live.prompt_tokens,
                     cached_tokens: turn.live.cached_tokens,
+                    window: turn.live.window,
                     ..Default::default()
                 }) {
                     // Keyed by the place the reply will have once it is
@@ -2127,7 +2384,7 @@ impl Render for Chat {
                     rows_here.push(self.queued_row(n, text, cx));
                 }
             }
-            let rows: Vec<AnyElement> = turns
+            let mut rows: Vec<AnyElement> = turns
                 .into_iter()
                 .enumerate()
                 // No min_w_0 or clipping here: both break list layout in the
@@ -2160,6 +2417,8 @@ impl Render for Chat {
                         .into_any_element()
                 })
                 .collect();
+            // Last, where the eye is: a helper does not wait on a turn.
+            rows.extend(self.helper_card(conversation.id, window, cx));
             // The scrollbar must sit outside the scrolling element, or it
             // scrolls away with the content. The scrolling box spans the
             // pane, so the bar is at its edge and the wheel works over the
@@ -2237,6 +2496,11 @@ impl Render for Chat {
                 }
             }))
             .on_action(
+                cx.listener(|this, _: &crate::ui::usage::OpenUsage, window, cx| {
+                    this.open_usage(window, cx)
+                }),
+            )
+            .on_action(
                 cx.listener(|this, _: &crate::ui::panel::TogglePanel, window, cx| {
                     if !window.has_active_dialog(cx) && !this.settings_open {
                         this.toggle_panel(window, cx)
@@ -2308,14 +2572,53 @@ pub(crate) fn cuts_in(turn: &agent::Turn) -> bool {
     )
 }
 
+/// Whether the helper heading run `run` in session `root` has ended, which
+/// stops every helper under it. Only helpers in the background are listed,
+/// so the card of one a turn waits on stays until it is answered.
+fn run_ended(root: u64, run: u64) -> bool {
+    use letronna_core::tasks::{self, Key, State};
+    tasks::list(root).iter().any(|task| {
+        task.key == Key::Agent(run) && !matches!(task.state, State::Running | State::Idle)
+    })
+}
+
+/// The calls of `batch` before the first whose id an earlier one shares.
+fn until_repeated_id(mut batch: Vec<backend::ToolCall>) -> Vec<backend::ToolCall> {
+    // Results come back by id, and nothing makes a reply's ids unique, so
+    // two calls that share one would each have the other's result filed
+    // under them. The later one waits for the next batch.
+    let repeated =
+        (1..batch.len()).find(|&at| batch[..at].iter().any(|call| call.id == batch[at].id));
+    if let Some(at) = repeated {
+        batch.truncate(at);
+    }
+    batch
+}
+
+/// The calls running while `outstanding` have not come back, in the order
+/// the model made them.
+pub(crate) fn running_calls(turn: &agent::Turn, outstanding: usize) -> Vec<backend::ToolCall> {
+    // A batch is the leading run of the queue, and each call leaves the
+    // queue as it comes back, so those still out are the first left.
+    let batch = turn.next_batch(|_| false, outstanding);
+    if !batch.is_empty() {
+        return batch;
+    }
+    // A call that may not run beside others only ever runs alone, at the front.
+    front_call(turn, None)
+        .map(|(call, _)| call)
+        .into_iter()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::woken;
     use letronna_core::gate::Mode;
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
-    use super::{cuts_in, front_call};
-    use letronna_core::agent::{Next, Turn};
+    use super::{cuts_in, front_call, run_ended, running_calls, until_repeated_id};
+    use letronna_core::agent::{MAX_BATCH, Next, Turn};
     use letronna_core::chat::{Connection, ToolCall};
     use letronna_core::gate::{Gate, Grants, decide};
     use letronna_core::tools::ToolContext;
@@ -2408,5 +2711,102 @@ mod tests {
         assert!(!cuts_in(&turn), "its result is on the way to the model");
         turn.take_results();
         assert!(cuts_in(&turn), "the next reply is coming in");
+    }
+
+    /// A call to `name` with its own id.
+    fn call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: "{}".into(),
+        }
+    }
+
+    #[test]
+    fn calls_that_run_together_show_until_each_comes_back() {
+        let reads = [
+            call("a", "read_file"),
+            call("b", "list_dir"),
+            call("c", "search"),
+        ];
+        let write = call("d", "write_file");
+        let mut turn = Turn::new(Connection::default());
+        turn.begin([reads.to_vec(), vec![write.clone()]].concat());
+        let batch = turn.next_batch(|_| false, MAX_BATCH);
+        assert_eq!(batch, reads);
+        assert_eq!(running_calls(&turn, batch.len()), reads);
+
+        // The middle one comes back first; the other two still show, in order.
+        turn.finish_id("b", Ok("listed".into()));
+        assert_eq!(
+            running_calls(&turn, 2),
+            [reads[0].clone(), reads[2].clone()]
+        );
+        turn.finish_id("c", Ok("found".into()));
+        turn.finish_id("a", Ok("read".into()));
+        // The write never joined them, and shows alone once it runs.
+        assert!(turn.next_batch(|_| false, MAX_BATCH).is_empty());
+        assert_eq!(running_calls(&turn, 1), [write]);
+        turn.finish_id("d", Ok("written".into()));
+
+        // However they came back, the model reads the results in its own order.
+        assert_eq!(turn.next(|_| letronna_core::gate::Outcome::Run), Next::Ask);
+        let order: Vec<String> = turn
+            .take_results()
+            .into_iter()
+            .map(|result| result.tool_call_id)
+            .collect();
+        assert_eq!(order, ["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn calls_that_share_an_id_run_one_after_the_other() {
+        let first = ToolCall {
+            arguments: r#"{"path":"x.rs"}"#.into(),
+            ..call("same", "read_file")
+        };
+        let second = ToolCall {
+            arguments: r#"{"path":"y.rs"}"#.into(),
+            ..call("same", "read_file")
+        };
+        let mut turn = Turn::new(Connection::default());
+        turn.begin(vec![first.clone(), second.clone(), call("c", "list_dir")]);
+        let batch = until_repeated_id(turn.next_batch(|_| false, MAX_BATCH));
+        assert_eq!(running_calls(&turn, batch.len()), batch);
+        assert_eq!(batch, [first]);
+        turn.finish_id("same", Ok("x".into()));
+
+        // The second goes out once the first is back, with what follows it.
+        let batch = until_repeated_id(turn.next_batch(|_| false, MAX_BATCH));
+        assert_eq!(batch, [second, call("c", "list_dir")]);
+        turn.finish_id("c", Ok("listed".into()));
+        turn.finish_id("same", Ok("y".into()));
+        assert_eq!(turn.next(|_| letronna_core::gate::Outcome::Run), Next::Ask);
+        let results: Vec<(String, String)> = turn
+            .take_results()
+            .into_iter()
+            .map(|result| (result.args, result.content))
+            .collect();
+        assert_eq!(
+            results,
+            [
+                (r#"{"path":"x.rs"}"#.to_owned(), "x".to_owned()),
+                (r#"{"path":"y.rs"}"#.to_owned(), "y".to_owned()),
+                ("{}".to_owned(), "listed".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_card_goes_when_the_helper_heading_its_run_ends() {
+        use letronna_core::tasks::{self, Key, State, Task};
+        // Far from any session or helper id another test uses.
+        let (root, run) = (9_101, (1 << 40) + 9_101);
+        tasks::register(Task::new(Key::Agent(run), root, None, "helper"));
+        assert!(!run_ended(root, run));
+        tasks::finish(&Key::Agent(run), State::Stopped, None);
+        assert!(run_ended(root, run));
+        // A run with nothing listed, as one a turn waits on, never looks ended.
+        assert!(!run_ended(root, run + 1));
     }
 }
