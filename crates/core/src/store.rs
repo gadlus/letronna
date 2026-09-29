@@ -820,12 +820,11 @@ pub fn load() -> Store {
         .filter_map(|id| replay(&session_path(id)))
         .collect();
     conversations.sort_by_key(|c| c.updated);
-    let settings: Settings = crate::state::read(&settings_path()).unwrap_or_default();
+    let (settings, settings_written) = settings();
     let active = conversations
         .iter()
         .position(|c| c.id == settings.active_id)
         .unwrap_or(conversations.len().saturating_sub(1));
-    let settings_written = serde_json::to_value(&settings).unwrap_or_default();
     Store {
         conversations,
         active,
@@ -986,8 +985,8 @@ mod tests {
     #[cfg(unix)]
     use super::write_private;
     use super::{
-        Conversation, Store, Todo, apply_todo, fill, load_listing, replay, search_in, summaries,
-        todos_in,
+        Conversation, Store, Todo, apply_todo, fill, load, load_listing, replay, search_in,
+        summaries, todos_in,
     };
     use crate::chat::{Message, ToolCall};
 
@@ -1135,6 +1134,26 @@ mod tests {
         fill(&mut listed.conversations[0]);
         listed.save().unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_retired_gateway_moves_to_letronna_in_the_window_too() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("retired");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"gateway":"Retired","endpoint":"https://retired.example/v1","model":"retired/some-model"}"#,
+        )
+        .unwrap();
+
+        // The window reads everything with `load`, the terminal with
+        // `load_listing`; both must see the same gateway.
+        let window = load().settings;
+        assert_eq!(window.gateway, "Letronna");
+        assert!(window.model.is_empty());
+        assert_eq!(load_listing().settings.gateway, window.gateway);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 

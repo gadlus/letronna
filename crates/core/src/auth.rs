@@ -255,7 +255,7 @@ pub fn begin(client: Client) -> Result<Pending, String> {
     let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .map_err(|e| format!("Cannot listen for the sign-in: {e}"))?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
-    let state = token(16);
+    let state = token()?;
     let client = match client {
         Client::Cli => "cli",
         Client::App => "app",
@@ -408,31 +408,18 @@ fn now() -> u64 {
         .unwrap_or_default()
 }
 
-/// A random-enough string. This guards a callback on this machine for the
-/// next ten minutes, which does not want a cryptographic generator, and
-/// pulling one in for it would be the only reason to have it.
-fn token(len: usize) -> String {
-    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-    // The clock alone is not enough: two calls in the same second start from
-    // the same number and hand back the same string, which for a state is
-    // the one thing it must never do. The counter carries on from wherever
-    // the last call left it.
-    static STATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let mut seed = STATE.fetch_add(0x9E37_79B9_7F4A_7C15, std::sync::atomic::Ordering::Relaxed)
-        ^ now()
-        ^ (std::process::id() as u64) << 17;
-    if seed == 0 {
-        seed = 0x2545_F491_4F6C_DD1D;
-    }
-    (0..len)
-        .map(|_| {
-            // A small xorshift, which is plenty for picking letters.
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            ALPHABET[(seed % ALPHABET.len() as u64) as usize] as char
-        })
-        .collect()
+/// A state no one can guess: 128 bits from the system's secure generator,
+/// as hex.
+fn token() -> Result<String, String> {
+    use ring::rand::SecureRandom;
+    // The wait takes every knock on the port for ten minutes, so a state
+    // worked out from the clock and the pid would give a process on this
+    // machine all that time to hand us a token we never asked for.
+    let mut bytes = [0u8; 16];
+    ring::rand::SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| "This computer would not give a random number for the sign-in.".to_owned())?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Percent-decoding, enough for the fields a callback carries.
@@ -482,11 +469,11 @@ mod tests {
 
     #[test]
     fn the_state_is_different_every_time() {
-        let a = token(16);
-        let b = token(16);
-        assert_eq!(a.len(), 16);
+        let a = token().unwrap();
+        let b = token().unwrap();
+        assert_eq!(a.len(), 32);
         assert_ne!(a, b);
-        assert!(a.chars().all(|c| c.is_ascii_alphanumeric()));
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     /// The port and state a sign-in sends the browser off with.

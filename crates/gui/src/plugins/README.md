@@ -17,6 +17,7 @@ pub(crate) trait Plugin: 'static {
     fn set_enabled(&self, enabled: bool);  // turn on/off: tear down or resume your own work
     fn enabled(&self) -> bool;             // current state
     fn builtin(&self) -> bool { true }     // false for externally loaded plugins
+    fn default_enabled(&self) -> bool { true } // on or off before the user chooses
     fn settings(&self, cx: &App) -> Option<AnyElement> { None } // your own UI, shown under the row
     fn tools(&self) -> Vec<Arc<dyn Tool>> { Vec::new() }        // tools you give the agent
 }
@@ -81,7 +82,8 @@ nothing, then call it from that spot in the UI. Existing plugins keep compiling.
 
 1. `main` builds the plugin list: `vec![Box::new(MyPlugin::new()), …]`.
 2. `plugins::init` reads `plugins.json`, calls `set_enabled` with the saved
-   choice (default on), then `init` on each, and stores the registry.
+   choice (`default_enabled` when there is none), then `init` on each, and
+   stores the registry.
 3. During the session the app calls `plugins::emit`; enabled plugins get `handle`.
 4. The Plugins settings page calls `plugins::set_enabled`, which flips the plugin
    and rewrites `plugins.json`.
