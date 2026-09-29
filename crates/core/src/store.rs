@@ -1,7 +1,8 @@
 //! Sessions on disk.
 //!
 //! One append-only file per session, `sessions/<id>.jsonl`, a JSON record per
-//! line. Everything shared between sessions lives in `settings.json`.
+//! line. Everything shared between sessions lives in `settings.json`, and
+//! `sessions/index.json` caches what each file sums up to for the listing.
 //!
 //! The shape matters because two Letronnas will run at once -- the window and
 //! the terminal. A single file holding every session, rewritten whole on each
@@ -627,6 +628,7 @@ impl Transcript {
 
 /// What a session looks like from the outside: enough to recognise it by,
 /// and nothing that was said in it.
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Summary {
     pub id: u64,
     pub title: String,
@@ -639,56 +641,227 @@ pub struct Summary {
 
 /// The sessions on disk, newest first, without loading what is in them.
 ///
-/// Only the head and meta records of each file are read, so this stays cheap
-/// with hundreds of sessions and -- more to the point -- a caller asking
-/// "which sessions are there" does not pull old conversations into a new one.
+/// Only the head and meta records of each file are read, so a caller asking
+/// "which sessions are there" does not pull old conversations into a new
+/// one. And only what the index has not seen is read: a file that has not
+/// moved since the last listing is taken from `sessions/index.json`, and
+/// one that has grown is read from where the index left off.
 pub fn summaries() -> Vec<Summary> {
-    let mut out: Vec<Summary> = session_ids()
-        .into_iter()
-        .filter_map(|id| {
-            let bytes = std::fs::read(session_path(id)).ok()?;
-            // Reserved and not yet saved: it belongs to whoever reserved it.
-            if bytes.is_empty() {
-                return None;
-            }
-            let text = String::from_utf8_lossy(&bytes);
-            let mut summary = Summary {
-                id,
-                title: String::new(),
-                updated: 0,
-                messages: 0,
-                workspace: None,
-                pinned: false,
-                todos: Vec::new(),
-            };
-            for line in text.lines().filter(|l| !l.trim().is_empty()) {
-                // Messages are most of the file and none of them are wanted
-                // here, so they are counted by their tag rather than parsed.
-                // The tag is written first, which is what makes this safe;
-                // anything that does not match still goes through serde.
-                if line.starts_with("{\"type\":\"message\"") {
-                    summary.messages += 1;
-                    continue;
-                }
-                match serde_json::from_str::<Record>(line) {
-                    Ok(Record::Head { created, .. }) => summary.updated = created,
-                    Ok(Record::Meta(meta)) => {
-                        summary.title = meta.title;
-                        summary.updated = meta.updated;
-                        summary.workspace = meta.workspace;
-                        summary.pinned = meta.pinned;
-                        summary.todos = meta.todos;
-                    }
-                    Ok(Record::Message(_)) => summary.messages += 1,
-                    Ok(Record::Rewind { to }) => summary.messages = summary.messages.min(to),
-                    Err(_) => {}
-                }
-            }
-            Some(summary)
-        })
-        .collect();
+    let index = index_path();
+    let known = read_index(&index);
+    let (mut kept, mut out) = (Vec::new(), Vec::new());
+    for id in session_ids() {
+        if let Some((entry, summary)) = scan(&session_path(id), id, known.get(&id)) {
+            kept.push(entry);
+            out.push(summary);
+        }
+    }
+    // Sessions deleted since leave it, as they are not in the folder.
+    let moved =
+        kept.len() != known.len() || kept.iter().any(|e| known.get(&e.summary.id) != Some(e));
+    if moved {
+        write_index(&index, kept);
+    }
     out.sort_by_key(|s| std::cmp::Reverse(s.updated));
     out
+}
+
+/// Bumped when what an index entry means changes, so an index an older
+/// build wrote is rebuilt rather than trusted.
+const INDEX_VERSION: u32 = 1;
+
+/// Bytes before the end of what the index read that must be unchanged for a
+/// grown file to be read on from there. A session file only grows at its
+/// end, so a difference means it was replaced -- deleted and its id given to
+/// a new session, or rewritten -- and it is read in full. A kilobyte reaches
+/// back into the last record or two, which in a replaced file are other
+/// words written at another time.
+const TAIL_CHECK: u64 = 1024;
+
+/// `sessions/index.json`: what each session file summed up to when it was
+/// last listed, so the next listing reads only what has changed since.
+///
+/// It is a cache and nothing more. The session files stay the truth, and an
+/// index that is missing, will not parse or is out of date costs a reading
+/// of the files, never a session.
+#[derive(Serialize, Deserialize)]
+struct Index {
+    version: u32,
+    sessions: Vec<Indexed>,
+}
+
+/// One session file as the index knows it.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+struct Indexed {
+    /// The file's size and modification time when it was read: while both
+    /// hold, nothing in it has moved.
+    size: u64,
+    mtime: u64,
+    /// How far the summary goes: the end of the last whole line, so a line
+    /// still being written is read again next time rather than cut in two.
+    len: u64,
+    /// A hash of the `TAIL_CHECK` bytes before `len`.
+    tail: u64,
+    summary: Summary,
+}
+
+fn index_path() -> PathBuf {
+    sessions_dir().join("index.json")
+}
+
+/// The index by session id: empty when there is none, it will not parse, or
+/// an older build wrote it.
+fn read_index(path: &std::path::Path) -> std::collections::HashMap<u64, Indexed> {
+    // Only ever moved into place whole, so reading it needs no lock.
+    let Ok(bytes) = std::fs::read(path) else {
+        return Default::default();
+    };
+    match serde_json::from_slice::<Index>(&bytes) {
+        Ok(index) if index.version == INDEX_VERSION => index
+            .sessions
+            .into_iter()
+            .map(|entry| (entry.summary.id, entry))
+            .collect(),
+        _ => Default::default(),
+    }
+}
+
+/// Replace the index with `sessions`, whole. A failure is let go: the next
+/// listing reads what changed from the files and tries again.
+fn write_index(path: &std::path::Path, sessions: Vec<Indexed>) {
+    // The window and the terminal both write it, and so can two threads of
+    // one: the lock keeps them from sharing a temp file or moving one over
+    // the other at the same moment, which Windows can refuse.
+    let Ok(_lock) = Lock::take(path) else {
+        return;
+    };
+    let index = Index {
+        version: INDEX_VERSION,
+        sessions,
+    };
+    let Ok(bytes) = serde_json::to_vec(&index) else {
+        return;
+    };
+    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+    // Private like the settings: it holds every title and project folder.
+    let written = write_private(&temp, &bytes).and_then(|()| std::fs::rename(&temp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+}
+
+/// Sum up the session file at `path`, reading only what `known` does not
+/// already cover. Gives the index's new entry and the summary to list, which
+/// also counts a last line with no newline yet; None for a file that is
+/// empty or cannot be read.
+fn scan(path: &std::path::Path, id: u64, known: Option<&Indexed>) -> Option<(Indexed, Summary)> {
+    let stat = std::fs::metadata(path).ok()?;
+    let (size, mtime) = (stat.len(), modified(&stat));
+    // Reserved and not yet saved: it belongs to whoever reserved it.
+    if size == 0 {
+        return None;
+    }
+    if let Some(known) = known.filter(|k| (k.size, k.mtime, k.len) == (size, mtime, size)) {
+        return Some((known.clone(), known.summary.clone()));
+    }
+    let mut file = std::fs::File::open(path).ok()?;
+    // Read on from where the index stopped if the file has only been
+    // appended to and what it read is still there. One that shrank or
+    // changed in place was rewritten, and is read from the start.
+    let appended = |k: &&Indexed| size > k.size || (size, mtime) == (k.size, k.mtime);
+    let resumed = known.filter(appended).and_then(|k| {
+        let from = k.len.saturating_sub(TAIL_CHECK);
+        let bytes = read_range(&mut file, from, size)?;
+        let seen = usize::try_from(k.len - from).ok()?;
+        let same = bytes.get(..seen).is_some_and(|b| tail_hash(b) == k.tail);
+        same.then(|| (k.summary.clone(), from, seen, bytes))
+    });
+    let (mut summary, from, start, bytes) = match resumed {
+        Some(resumed) => resumed,
+        None => {
+            let empty = Summary {
+                id,
+                ..Default::default()
+            };
+            (empty, 0, 0, read_range(&mut file, 0, size)?)
+        }
+    };
+    let end = bytes[start..]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(start, |at| start + at + 1);
+    tally(&mut summary, &bytes[start..end]);
+    let entry = Indexed {
+        size,
+        mtime,
+        len: from + end as u64,
+        // All in `bytes`: a resumed read starts that far before the old end.
+        tail: tail_hash(&bytes[end.saturating_sub(TAIL_CHECK as usize)..end]),
+        summary,
+    };
+    let mut listed = entry.summary.clone();
+    tally(&mut listed, &bytes[end..]);
+    Some((entry, listed))
+}
+
+/// Carry `summary` on over the records in `bytes`, lines of a session file.
+fn tally(summary: &mut Summary, bytes: &[u8]) {
+    // Leniently, as `replay` reads: a bad byte costs its own line only.
+    let text = String::from_utf8_lossy(bytes);
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        // Messages are most of the file and none of them are wanted here, so
+        // they are counted by their tag rather than parsed. The tag is
+        // written first, which is what makes this safe; anything that does
+        // not match still goes through serde.
+        if line.starts_with("{\"type\":\"message\"") {
+            summary.messages += 1;
+            continue;
+        }
+        match serde_json::from_str::<Record>(line) {
+            Ok(Record::Head { created, .. }) => summary.updated = created,
+            Ok(Record::Meta(meta)) => {
+                summary.title = meta.title;
+                summary.updated = meta.updated;
+                summary.workspace = meta.workspace;
+                summary.pinned = meta.pinned;
+                summary.todos = meta.todos;
+            }
+            Ok(Record::Message(_)) => summary.messages += 1,
+            Ok(Record::Rewind { to }) => summary.messages = summary.messages.min(to),
+            Err(_) => {}
+        }
+    }
+}
+
+/// The file's bytes from `from` up to `to`, or fewer if it has shrunk since.
+fn read_range(file: &mut std::fs::File, from: u64, to: u64) -> Option<Vec<u8>> {
+    file.seek(SeekFrom::Start(from)).ok()?;
+    let mut bytes = Vec::new();
+    file.take(to.saturating_sub(from))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    Some(bytes)
+}
+
+/// When the file last changed, in nanoseconds since 1970; 0 where the system
+/// does not say, which leaves the size alone to tell.
+fn modified(stat: &std::fs::Metadata) -> u64 {
+    stat.modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|since| u64::try_from(since.as_nanos()).ok())
+        .unwrap_or(0)
+}
+
+/// A hash of `bytes` that every build computes alike, as the index outlives
+/// the build that wrote it.
+fn tail_hash(bytes: &[u8]) -> u64 {
+    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
+    digest
+        .as_ref()
+        .iter()
+        .take(8)
+        .fold(0, |hash, &byte| (hash << 8) | u64::from(byte))
 }
 
 /// A place in an earlier session where a search found what it looked for.
@@ -2393,6 +2566,271 @@ pub(crate) mod tests {
         std::fs::remove_file(&file).unwrap();
         let first = load().settings;
         assert_eq!((first.appearance.as_str(), first.grain), ("", true));
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    /// A session file written by hand: session 3 with `title` and `said`
+    /// messages.
+    fn session_text(title: &str, said: usize) -> String {
+        let mut text = format!(
+            "{{\"type\":\"head\",\"id\":3,\"created\":5}}\n\
+             {{\"type\":\"meta\",\"title\":\"{title}\",\"updated\":5,\"pinned\":false,\"workspace\":null,\"todos\":[]}}\n"
+        );
+        for i in 0..said {
+            text.push_str(&format!(
+                "{{\"type\":\"message\",\"role\":\"user\",\"content\":\"{i}\"}}\n"
+            ));
+        }
+        text
+    }
+
+    #[test]
+    fn listing_the_sessions_indexes_every_one_of_them() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("index-built");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        store.conversations.push(numbered(2));
+        store.conversations.push(Conversation {
+            id: 2,
+            title: "second".into(),
+            messages: vec![said("user", "hello")],
+            ..Default::default()
+        });
+        store.save().unwrap();
+        assert_eq!(summaries().len(), 2);
+
+        let index = super::read_index(&super::index_path());
+        assert_eq!(index.len(), 2);
+        for (id, entry) in &index {
+            let size = std::fs::metadata(dir.join(format!("sessions/{id}.jsonl")))
+                .unwrap()
+                .len();
+            assert_eq!((entry.size, entry.len), (size, size));
+        }
+        assert_eq!(index[&2].summary.title, "second");
+        assert_eq!(index[&1].summary.messages, 2);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn an_unchanged_session_is_listed_from_the_index_without_being_read() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("index-used");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        store.conversations.push(Conversation {
+            title: "kept".into(),
+            ..numbered(2)
+        });
+        store.save().unwrap();
+        assert_eq!(summaries()[0].title, "kept");
+
+        // Changed behind the index's back: the same size and time, other bytes.
+        let path = dir.join("sessions/1.jsonl");
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, text.replace("\"kept\"", "\"lost\"")).unwrap();
+        let touch = |time| {
+            let file = std::fs::File::options().write(true).open(&path).unwrap();
+            file.set_modified(time).unwrap();
+        };
+        touch(before);
+        assert_eq!(summaries()[0].title, "kept");
+
+        // Once its time moves as well, it is read again, and says otherwise.
+        touch(before + std::time::Duration::from_secs(1));
+        assert_eq!(summaries()[0].title, "lost");
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_grown_session_is_read_only_past_what_the_index_has() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("index-grown");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        let long = "x".repeat(2 * super::TAIL_CHECK as usize);
+        store.conversations.push(Conversation {
+            id: 1,
+            title: "kept".into(),
+            messages: vec![said("user", &long)],
+            ..Default::default()
+        });
+        store.save().unwrap();
+        assert_eq!(summaries()[0].messages, 1);
+
+        // Changed where only a reading from the start would see it: before
+        // the long message and the bytes checked at its end.
+        let path = dir.join("sessions/1.jsonl");
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, text.replace("\"kept\"", "\"lost\"")).unwrap();
+        store.conversations[0].messages.push(said("user", "more"));
+        store.save().unwrap();
+        let listed = summaries();
+        assert_eq!((listed[0].title.as_str(), listed[0].messages), ("kept", 2));
+
+        std::fs::remove_file(dir.join("sessions/index.json")).unwrap();
+        let listed = summaries();
+        assert_eq!((listed[0].title.as_str(), listed[0].messages), ("lost", 2));
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_session_that_shrank_or_was_replaced_is_read_again_in_full() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("index-shrunk");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let path = dir.join("sessions/3.jsonl");
+        std::fs::create_dir_all(dir.join("sessions")).unwrap();
+
+        std::fs::write(&path, session_text("long", 3)).unwrap();
+        assert_eq!(summaries()[0].messages, 3);
+        // Rewritten shorter, as a compacted session would be.
+        std::fs::write(&path, session_text("short", 1)).unwrap();
+        let listed = summaries();
+        assert_eq!((listed[0].title.as_str(), listed[0].messages), ("short", 1));
+        // Replaced by a longer one, as when a deleted session's id is reused.
+        std::fs::write(&path, session_text("other", 4)).unwrap();
+        let listed = summaries();
+        assert_eq!((listed[0].title.as_str(), listed[0].messages), ("other", 4));
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_line_caught_half_written_is_counted_once_it_is_finished() {
+        use std::io::Write;
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("index-half-line");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let path = dir.join("sessions/3.jsonl");
+        std::fs::create_dir_all(dir.join("sessions")).unwrap();
+        let append = |bytes: &str| {
+            let mut file = std::fs::File::options().append(true).open(&path).unwrap();
+            file.write_all(bytes.as_bytes()).unwrap();
+        };
+
+        std::fs::write(&path, session_text("kept", 1)).unwrap();
+        append("{\"type\":\"message\",\"role\":\"user\",\"content\":\"tw");
+        // Counted by its tag, as a reading of the whole file counts it.
+        assert_eq!(summaries()[0].messages, 2);
+        append("o\"}\n");
+        assert_eq!(summaries()[0].messages, 2);
+        append("{\"type\":\"message\",\"role\":\"user\",\"content\":\"three\"}\n");
+        assert_eq!(summaries()[0].messages, 3);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_broken_or_missing_index_is_rebuilt_from_the_sessions() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("index-broken");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        store.conversations.push(numbered(2));
+        store.conversations.push(Conversation {
+            id: 2,
+            messages: vec![said("user", "hello")],
+            ..Default::default()
+        });
+        store.save().unwrap();
+        assert_eq!(summaries().len(), 2);
+
+        let index = dir.join("sessions/index.json");
+        let counts = || {
+            let mut listed: Vec<(u64, usize)> =
+                summaries().iter().map(|s| (s.id, s.messages)).collect();
+            listed.sort();
+            listed
+        };
+        std::fs::write(&index, "{\"version\":1,\"sessions\":[{\"si").unwrap();
+        assert_eq!(counts(), [(1, 2), (2, 1)]);
+        assert_eq!(super::read_index(&index).len(), 2);
+        // One from a build that meant something else by its entries.
+        let text = std::fs::read_to_string(&index).unwrap();
+        std::fs::write(&index, text.replace("\"version\":1", "\"version\":0")).unwrap();
+        assert!(super::read_index(&index).is_empty());
+        assert_eq!(counts(), [(1, 2), (2, 1)]);
+        std::fs::remove_file(&index).unwrap();
+        assert_eq!(counts(), [(1, 2), (2, 1)]);
+        assert_eq!(super::read_index(&index).len(), 2);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_deleted_session_leaves_the_listing_and_the_index() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("index-deleted");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        store.conversations.push(numbered(2));
+        store.conversations.push(Conversation {
+            id: 2,
+            messages: vec![said("user", "hello")],
+            ..Default::default()
+        });
+        store.save().unwrap();
+        assert_eq!(summaries().len(), 2);
+
+        store.remove(0);
+        let listed: Vec<u64> = summaries().iter().map(|s| s.id).collect();
+        assert_eq!(listed, [2]);
+        let indexed: Vec<u64> = super::read_index(&super::index_path())
+            .into_keys()
+            .collect();
+        assert_eq!(indexed, [2]);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn listings_in_many_threads_at_once_leave_a_whole_index() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("index-threads");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        // Each thread writes its own session and lists them all as it goes,
+        // so every one of them is rewriting the index at the same time.
+        let writers: Vec<_> = (1..=6u64)
+            .map(|id| {
+                std::thread::spawn(move || {
+                    let mut store = Store::default();
+                    store.conversations.push(Conversation {
+                        id,
+                        ..Default::default()
+                    });
+                    for i in 0..10 {
+                        store.conversations[0]
+                            .messages
+                            .push(said("user", &i.to_string()));
+                        store.save().unwrap();
+                        let listed = summaries();
+                        let mine = listed.iter().find(|s| s.id == id).unwrap();
+                        assert_eq!(mine.messages, i + 1);
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+
+        assert!(summaries().iter().all(|s| s.messages == 10));
+        let index = super::index_path();
+        let cached = super::read_index(&index);
+        assert_eq!(cached.len(), 6);
+        std::fs::remove_file(&index).unwrap();
+        summaries();
+        assert!(cached == super::read_index(&index));
+        let temp = std::fs::read_dir(dir.join("sessions"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(!temp);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 }
