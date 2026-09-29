@@ -137,6 +137,7 @@ pub(super) fn telegram_media(body: &Value) -> Vec<Incoming> {
                 false => None,
             },
             needs_session: false,
+            spoken: false,
             press: None,
             remote: crate::chat::Remote {
                 place: match group {
@@ -450,6 +451,7 @@ fn hear_with(
             }
         };
         note(&mut message.text, &line);
+        message.spoken = true;
     }
     message
 }
@@ -862,6 +864,7 @@ mod tests {
             files,
             author: None,
             needs_session: false,
+            spoken: false,
             press: None,
             remote: Default::default(),
         }
@@ -1348,5 +1351,16 @@ mod tests {
                 .text
                 .ends_with("it could not be transcribed: Sign in first.)")
         );
+    }
+
+    #[test]
+    fn only_a_message_that_brought_a_voice_note_is_marked_spoken() {
+        let mut voice = file(Kind::Voice, Origin::Telegram("v".into()), "note.ogg", 4);
+        voice.saved = Some(PathBuf::from("/m/note.ogg"));
+        let heard = super::hear_with(incoming("", vec![voice]), true, |_| Ok("hi".into()));
+        assert!(heard.spoken);
+        let declined = super::hear_with(incoming("", vec![]), false, |_| Ok("hi".into()));
+        assert!(!declined.spoken);
+        assert!(!incoming("typed", vec![]).spoken);
     }
 }

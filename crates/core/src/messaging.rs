@@ -282,6 +282,9 @@ pub struct Incoming {
     /// Heard only if its source is already a session: a reply in a Slack
     /// channel thread that does not mention the app.
     pub needs_session: bool,
+    /// It came with a voice note, since put into words, which is answered
+    /// with one while voice mode is on.
+    pub spoken: bool,
 }
 
 /// A card the app would show -- a question, or a tool waiting to be
@@ -473,6 +476,7 @@ fn parse_updates(body: &serde_json::Value) -> (Vec<Incoming>, Option<u64>) {
             },
             press: None,
             needs_session: false,
+            spoken: false,
         });
     }
     (messages, highest.map(|id| id + 1))
@@ -504,6 +508,7 @@ fn telegram_press(query: &serde_json::Value) -> Option<Incoming> {
         remote: backend::Remote::default(),
         press: Some(Press { allow, call, tap }),
         needs_session: false,
+        spoken: false,
         files: Vec::new(),
     })
 }
@@ -1351,6 +1356,7 @@ fn gateway_message(
         },
         press: None,
         needs_session: false,
+        spoken: false,
     })
 }
 
@@ -1388,6 +1394,7 @@ fn gateway_press(interaction: &serde_json::Value, config: &Discord) -> Option<In
         remote: backend::Remote::default(),
         press: Some(Press { allow, call, tap }),
         needs_session: false,
+        spoken: false,
         files: Vec::new(),
     })
 }
@@ -1987,6 +1994,7 @@ fn slack_event(event: &serde_json::Value, config: &Slack, bot_user: &str) -> Opt
             history: None,
         },
         needs_session,
+        spoken: false,
         press: None,
         files: Vec::new(),
     })

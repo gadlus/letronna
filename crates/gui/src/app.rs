@@ -240,9 +240,6 @@ pub(crate) struct Chat {
         letronna_core::messaging::Source,
         letronna_core::messaging::Incoming,
     >,
-    /// Chats whose message in hand came as a voice note, which is answered
-    /// with one while the Voice setting is on.
-    pub(crate) spoken: std::collections::HashSet<letronna_core::messaging::Source>,
     /// Sessions whose turn in flight answers a voice note.
     pub(crate) speak_back: std::collections::HashSet<u64>,
     /// What reads replies aloud, there only while the Voice setting is on, so
@@ -641,7 +638,6 @@ impl Chat {
             messaging_stop: None,
             slack_listener: None,
             voice_waiting: std::collections::HashMap::new(),
-            spoken: std::collections::HashSet::new(),
             speak_back: std::collections::HashSet::new(),
             voice: None,
             token_input,
@@ -1962,9 +1958,6 @@ impl Chat {
             return self.on_remote_after(move || files::fetch(&config, message, into), cx);
         }
         if files::unheard(&message) {
-            // Heard or not, the note is gone from the message after this, so
-            // the answer's form is decided now.
-            self.spoken.insert(source.clone());
             match files::voice_choice(&self.messaging, &source) {
                 None => return self.ask_voice(message, cx),
                 Some(true) => return self.on_remote_after(move || files::hear(message, true), cx),
@@ -2000,8 +1993,11 @@ impl Chat {
             Source::Slack { .. } => self.messaging.slack.allow_tools,
         };
         self.remote.insert(id, source.clone());
+        // The message itself says it was a voice note: a flag kept per chat
+        // would outlive a message held for its transcript or turned away
+        // while busy, and give a later typed one a paid spoken answer.
         self.speak_back.remove(&id);
-        if self.spoken.remove(&source) {
+        if message.spoken {
             self.speak_back.insert(id);
         }
         // Nobody on the far end can answer an approval card, so unless the
