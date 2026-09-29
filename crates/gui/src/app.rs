@@ -13,7 +13,14 @@ pub(crate) const GREETINGS: &[&str] = &[
 
 actions!(
     letronna,
-    [NewSession, Dismiss, ToggleSidebar, OpenSettings, SendNow]
+    [
+        NewSession,
+        Dismiss,
+        ToggleSidebar,
+        OpenSettings,
+        SendNow,
+        OpenActivity
+    ]
 );
 
 /// How near the bottom still counts as at it: a line or two, so a reply
@@ -44,6 +51,7 @@ pub(crate) enum Page {
     Messaging,
     Artifacts,
     Jobs,
+    Activity,
 }
 impl Page {
     pub(crate) fn title(self) -> &'static str {
@@ -53,6 +61,7 @@ impl Page {
             Page::Messaging => "Messaging",
             Page::Artifacts => "Artifacts",
             Page::Jobs => "Scheduled jobs",
+            Page::Activity => "Activity",
         }
     }
     pub(crate) fn blurb(self) -> &'static str {
@@ -65,6 +74,10 @@ impl Page {
             Page::Artifacts => "Files, images and links produced in sessions will collect here.",
             // Jobs renders its own page; this blurb is only a fallback.
             Page::Jobs => "Prompts that run on a timer.",
+            Page::Activity => {
+                "Helpers your agents handed part of their work to: what each is doing, and a way \
+                 to read, steer or stop it."
+            }
         }
     }
 }
@@ -250,6 +263,18 @@ pub(crate) struct Chat {
     /// Set by Stop for the `finish` it causes, so stopping does not start a
     /// turn for notices in the same moment.
     pub(crate) stopping: bool,
+    /// The helpers as last read, for the Activity page, the status bar's pill
+    /// and the sidebar's dots.
+    pub(crate) helpers: Vec<crate::ui::activity::Helper>,
+    /// Whether the helpers are being read again on a timer.
+    pub(crate) helper_tick: bool,
+    /// The helper whose transcript the Activity page shows.
+    pub(crate) viewing: Option<crate::ui::activity::Viewing>,
+    /// The helper the steer box is open for, and the box.
+    pub(crate) steering: Option<letronna_core::driver::AgentId>,
+    pub(crate) steer: Entity<InputState>,
+    /// The Activity page's, for the keyboard to land on.
+    pub(crate) activity_focus: FocusHandle,
     /// Your message being changed in place, by session id and place.
     pub(crate) editing_message: Option<(u64, usize)>,
     /// The box a message is changed in.
@@ -415,6 +440,8 @@ impl Chat {
                 .multi_line(true)
                 .auto_grow(1, 12)
         });
+        let steer =
+            cx.new(|cx| InputState::new(window, cx).placeholder("What it should know or do now"));
         let subscriptions = vec![
             cx.subscribe_in(&model_search, window, |this, _, event, window, cx| {
                 // Enter takes the first match, so a model can be picked by
@@ -477,6 +504,11 @@ impl Chat {
                     // settings wears the old colours.
                     this.settings_backdrop = None;
                     crate::theme::apply(&this.store.settings.appearance, window, cx);
+                }
+            }),
+            cx.subscribe_in(&steer, window, |this, _, event, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.send_steer(window, cx);
                 }
             }),
         ];
@@ -583,6 +615,12 @@ impl Chat {
             skills_refused: Vec::new(),
             unseen: std::collections::HashSet::new(),
             stopping: false,
+            helpers: Vec::new(),
+            helper_tick: false,
+            viewing: None,
+            steering: None,
+            steer,
+            activity_focus: cx.focus_handle(),
             editing_message: None,
             edit_message,
             thinking_open: std::collections::HashSet::new(),
@@ -1962,6 +2000,12 @@ impl Chat {
             self.model_open = false;
             self.focus_composer(window, cx);
             cx.notify();
+        } else if self.page == Page::Activity && self.steering.is_some() {
+            // Escape in the steer box backs out of it; the reply carries on.
+            self.close_steer(window, cx);
+        } else if self.page == Page::Activity && self.viewing.is_some() {
+            // And out of a helper's transcript, back to the list.
+            self.open_activity(window, cx);
         } else if self.busy_elsewhere().is_none() {
             // Not a reply in another session, which nothing here shows.
             self.stop_turn(cx);
@@ -2186,6 +2230,9 @@ impl Render for Chat {
             })
             .detach();
         }
+        // Helpers work off the UI thread too, and a timer reads them while a
+        // turn runs or one works.
+        self.watch_helpers(cx);
         if let Some(note) = self.note.take() {
             window.push_notification(gpui_component::notification::Notification::info(note), cx);
         }
@@ -2256,6 +2303,8 @@ impl Render for Chat {
             self.skills_page(cx).into_any_element()
         } else if self.page == Page::Messaging {
             self.messaging_page(cx).into_any_element()
+        } else if self.page == Page::Activity {
+            self.activity_page(window, cx)
         } else if self.page != Page::Chat {
             self.page_view(self.page, cx).into_any_element()
         } else if conversation.messages.is_empty()
@@ -2513,6 +2562,9 @@ impl Render for Chat {
                         this.show_tab(crate::ui::panel::PanelTab::Browser, window, cx)
                     }
                 }),
+            )
+            .on_action(
+                cx.listener(|this, _: &OpenActivity, window, cx| this.open_activity(window, cx)),
             )
             .child(
                 div()

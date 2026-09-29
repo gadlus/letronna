@@ -111,6 +111,16 @@ impl Chat {
                         .bg(cx.theme().primary),
                 )
             })
+            // Green, as a running job's chip is: a helper works for it.
+            .when(self.helpers_working_in(c.id), |this| {
+                this.child(
+                    div()
+                        .size(px(6.))
+                        .rounded_full()
+                        .flex_shrink_0()
+                        .bg(cx.theme().green),
+                )
+            })
             // The session a reply is running in says so, on screen or not.
             .child(if self.busy && self.streaming_id == Some(c.id) {
                 // In the age's colour: the primary is lost on the sidebar.
@@ -249,6 +259,19 @@ impl Chat {
                         Some(Page::Artifacts),
                         cx,
                     ))
+                    .child(
+                        self.nav_item(
+                            "activity",
+                            AppIcon::Robot,
+                            "Activity",
+                            Some(Page::Activity),
+                            cx,
+                        )
+                        // To the list, as the pill goes, even from a transcript.
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.open_activity(window, cx)),
+                        ),
+                    )
                     .child(self.nav_item(
                         "jobs",
                         AppIcon::Clock,

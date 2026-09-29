@@ -2394,4 +2394,42 @@ mod tests {
         assert_eq!(sizes, [7_500, 3_000, 1_875, 1_875, 750]);
         assert!(pages.concat() == long, "the pages are not the report");
     }
+
+    #[test]
+    fn the_users_message_reaches_only_a_helper_still_running() {
+        let _running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+        let _bell = crate::inbox::tests::DOORBELL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let slot = reserve(9_601, 9_601, "worker", AT_ONCE, Cancel::default()).unwrap();
+        let id = slot.id;
+        let mut working = known(id, 9_601, 9_601, "worker", "general");
+        working.ended = None;
+        let ended = known(96_012, 9_601, 9_601, "done", "explore");
+        registry().helpers.extend([working, ended]);
+
+        assert!(steer(id, "Look at the tests first."));
+        assert!(!steer(96_012, "Too late."));
+        let heard = inbox::take(id, false);
+        let heard: Vec<&str> = heard.iter().map(|n| n.text.as_str()).collect();
+        assert_eq!(heard, ["message from the user:\nLook at the tests first."]);
+        assert!(inbox::take(96_012, true).is_empty());
+        let seen: Vec<(String, Option<String>)> = (seen().into_iter())
+            .filter(|helper| helper.session == 9_601)
+            .map(|helper| (helper.name, helper.ended))
+            .collect();
+        let finished = Some("finished".to_owned());
+        assert_eq!(seen, [("worker".into(), None), ("done".into(), finished)]);
+
+        // One that ends before its next step passes it on to its owner.
+        assert!(steer(id, "And the docs."));
+        close(slot, &report(Outcome::Done, "Done."), |_| ());
+        let passed: Vec<String> = (inbox::take(9_601, true).into_iter())
+            .map(|notice| notice.text)
+            .collect();
+        let text =
+            "worker ended before it read this, from user:\nmessage from the user:\nAnd the docs.";
+        assert_eq!(passed, [text]);
+        assert!(!steer(id, "Gone."));
+    }
 }
