@@ -89,6 +89,9 @@ impl Tool for WebFetch {
     fn needs_approval(&self) -> bool {
         true
     }
+    fn concurrent(&self) -> bool {
+        true
+    }
     fn preview(&self, args: &Value, _: &ToolContext) -> String {
         format!("GET {}", args["url"].as_str().unwrap_or_default())
     }

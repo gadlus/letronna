@@ -42,6 +42,11 @@ pub const STOPPED_WHILE_RUNNING: &str = "Stopped while it ran; check before retr
 /// The answer a call gets when the turn is stopped before it starts.
 pub const STOPPED_BEFORE_START: &str = "Not run: stopped before it started.";
 
+/// Calls from one reply run at once. Enough for a model reading around a
+/// project in one go, few enough that a reply of dozens never starts dozens
+/// of threads and requests together.
+pub const MAX_BATCH: usize = 8;
+
 /// What the caller should do next.
 #[derive(Debug, PartialEq)]
 pub enum Next {
@@ -88,6 +93,8 @@ pub struct Turn {
     /// when it stopped inside a tool call.
     cut_off: Option<bool>,
     continued: usize,
+    /// The batch's call ids in the order the model made them, which its results keep.
+    order: Vec<String>,
 }
 
 impl Turn {
@@ -102,6 +109,7 @@ impl Turn {
             results: Vec::new(),
             cut_off: None,
             continued: 0,
+            order: Vec::new(),
         }
     }
 
@@ -194,6 +202,7 @@ impl Turn {
             return false;
         }
         self.rounds += 1;
+        self.order = calls.iter().map(|call| call.id.clone()).collect();
         self.queue = calls.into();
         self.results.clear();
         true
@@ -213,6 +222,17 @@ impl Turn {
             Outcome::Ask => Next::AskUser(call.clone()),
             Outcome::Refuse(why) => Next::Refuse(call.clone(), why),
         }
+    }
+
+    /// The calls at the front of the queue that may run at once, at most
+    /// `max`, left queued until `finish_id` records each.
+    pub fn next_batch(&self, gate: impl Fn(&str) -> bool, max: usize) -> Vec<ToolCall> {
+        self.queue
+            .iter()
+            .take_while(|call| tools::concurrent(&call.name) && !gate(&call.name))
+            .take(max)
+            .cloned()
+            .collect()
     }
 
     /// Record the outcome of the call at the front of the queue.
@@ -236,10 +256,27 @@ impl Turn {
         });
     }
 
+    /// Record the outcome of the call with this id, wherever it sits in the queue.
+    pub fn finish_id(&mut self, call_id: &str, outcome: Result<String, String>) {
+        let Some(at) = self.queue.iter().position(|call| call.id == call_id) else {
+            return;
+        };
+        if let Some(call) = self.queue.remove(at) {
+            // At the front, it is recorded exactly as a call run on its own is.
+            self.queue.push_front(call);
+            self.finish_call(outcome);
+        }
+    }
+
     /// The tool results collected for this batch, ready to append before the
     /// next model call.
     pub fn take_results(&mut self) -> Vec<Message> {
-        std::mem::take(&mut self.results)
+        let mut results = std::mem::take(&mut self.results);
+        // Calls that ran together finish in whatever order their threads did;
+        // put back in the order the model made them, the results read the
+        // same however that went.
+        results.sort_by_key(|result| self.order.iter().position(|id| *id == result.tool_call_id));
+        results
     }
 
     /// Record the user's answer to the `exit_plan` call at the front of the
@@ -359,24 +396,23 @@ mod tests {
     #[test]
     fn runs_a_batch_then_asks_the_model_again() {
         let mut turn = turn();
-        let never = |_: &ToolCall| Outcome::Run;
-        assert_eq!(turn.next(never), Next::Done);
+        assert_eq!(turn.next(|_| Outcome::Run), Next::Done);
 
         assert!(turn.begin(vec![call("read_file"), call("list_dir")]));
-        assert_eq!(turn.next(never), Next::Run(call("read_file")));
+        assert_eq!(turn.next(|_| Outcome::Run), Next::Run(call("read_file")));
         turn.finish_call(Ok("contents".into()));
-        assert_eq!(turn.next(never), Next::Run(call("list_dir")));
+        assert_eq!(turn.next(|_| Outcome::Run), Next::Run(call("list_dir")));
         turn.finish_call(Err("no such folder".into()));
 
         // Batch drained: the results go back to the model.
-        assert_eq!(turn.next(never), Next::Ask);
+        assert_eq!(turn.next(|_| Outcome::Run), Next::Ask);
         let results = turn.take_results();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].content, "contents");
         assert!(!results[0].is_error);
         assert!(results[1].is_error);
         // Having handed them over, there is nothing left to send.
-        assert_eq!(turn.next(never), Next::Done);
+        assert_eq!(turn.next(|_| Outcome::Run), Next::Done);
     }
 
     #[test]
@@ -600,5 +636,93 @@ mod tests {
         assert!(kept.iter().all(|m| m.role == "tool"));
         // Nothing is left to run or send.
         assert_eq!(turn.next(|_| Outcome::Run), Next::Done);
+    }
+
+    #[test]
+    fn reads_in_one_batch_run_together_and_come_back_in_order() {
+        let mut turn = turn();
+        let never = |_: &str| false;
+        let names = [
+            "read_file",
+            "list_dir",
+            "search",
+            "web_fetch",
+            "list_sessions",
+            "search_sessions",
+            "read_job",
+        ];
+        let reads = names.map(call);
+        turn.begin([reads.to_vec(), vec![call("write_file")]].concat());
+        assert_eq!(turn.next_batch(never, MAX_BATCH), reads);
+
+        // They finish in whatever order their threads do.
+        for read in reads.iter().rev() {
+            turn.finish_id(&read.id, Ok(read.name.clone()));
+        }
+        // The write was never part of it, and now runs on its own.
+        assert!(turn.next_batch(never, MAX_BATCH).is_empty());
+        assert_eq!(turn.next(|_| Outcome::Run), Next::Run(call("write_file")));
+        turn.finish_call(Ok("write_file".into()));
+        assert_eq!(turn.next(|_| Outcome::Run), Next::Ask);
+        let order: Vec<String> = turn.take_results().into_iter().map(|r| r.content).collect();
+        let mut asked = names.to_vec();
+        asked.push("write_file");
+        assert_eq!(order, asked);
+
+        // A reply of a dozen reads runs eight at a time.
+        turn.begin(vec![call("read_file"); 12]);
+        assert_eq!(turn.next_batch(never, MAX_BATCH).len(), 8);
+    }
+
+    #[test]
+    fn a_call_that_needs_asking_ends_the_batch() {
+        let mut turn = turn();
+        turn.begin(vec![call("read_file"), call("web_fetch"), call("list_dir")]);
+        let asks = |name: &str| name == "web_fetch";
+        assert_eq!(turn.next_batch(asks, MAX_BATCH), [call("read_file")]);
+        turn.finish_id("read_file-1", Ok("contents".into()));
+
+        // Nothing runs past it while it waits for an answer.
+        assert!(turn.next_batch(asks, MAX_BATCH).is_empty());
+        assert_eq!(
+            turn.next(|queued: &ToolCall| if asks(&queued.name) {
+                Outcome::Ask
+            } else {
+                Outcome::Run
+            }),
+            Next::AskUser(call("web_fetch"))
+        );
+        // Once allowed, the same fetch joins the read after it.
+        let allowed = |_: &str| false;
+        assert_eq!(
+            turn.next_batch(allowed, MAX_BATCH),
+            [call("web_fetch"), call("list_dir")]
+        );
+    }
+
+    #[test]
+    fn browse_and_memory_are_never_batched() {
+        let never = |_: &str| false;
+        for alone in [
+            "browse",
+            "use_page",
+            "memory",
+            tools::TODO,
+            tools::ASK_USER,
+            "wait",
+        ] {
+            // A name nothing answers to would pass without proving anything.
+            assert!(tools::find(alone).is_some(), "{alone} is not a tool");
+            let mut turn = turn();
+            turn.begin(vec![call("read_file"), call(alone), call("list_dir")]);
+            assert_eq!(
+                turn.next_batch(never, MAX_BATCH),
+                [call("read_file")],
+                "{alone}"
+            );
+            turn.finish_id("read_file-1", Ok("contents".into()));
+            assert!(turn.next_batch(never, MAX_BATCH).is_empty(), "{alone}");
+            assert_eq!(turn.next(|_| Outcome::Run), Next::Run(call(alone)));
+        }
     }
 }

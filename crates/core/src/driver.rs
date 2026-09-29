@@ -17,7 +17,7 @@
 //! call. A run writes only to its own transcript, never into `sessions/`, so
 //! every file still has one writer.
 
-use crate::agent::{Next, Turn};
+use crate::agent::{MAX_BATCH, Next, Turn};
 use crate::approvals;
 use crate::budget::Budget;
 use crate::cancel::Cancel;
@@ -212,12 +212,29 @@ fn steps(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result<Outcom
     }
 }
 
-/// Works through one reply's calls in order, then hands back their results
-/// and any mail that cannot wait, leaving early at a stop.
+/// Works through one reply's calls, running together the ones that may, then
+/// hands back their results and any mail that cannot wait, leaving early at a stop.
 fn work_through(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result<(), String> {
     loop {
         if spec.cancel.is_set() {
             return Ok(());
+        }
+        // A tool allowed for the whole run would get its yes at once from
+        // `approvals::ask`, so it counts as allowed here and can join a batch.
+        let batchable = |name: &str| {
+            refusal(&spec.allow, name).is_none()
+                && tools::needs_approval(name)
+                && !approvals::granted(spec.run, name)
+        };
+        let batch = turn.next_batch(batchable, MAX_BATCH);
+        if !batch.is_empty() {
+            for (call, outcome) in batch.iter().zip(together(spec, &batch)) {
+                // One a stop kept from starting gets no result, as a lone call does.
+                if let Some(outcome) = outcome {
+                    turn.finish_id(&call.id, outcome);
+                }
+            }
+            continue;
         }
         // A call this helper may not make runs into its refusal in `dispatch`.
         let gate = |call: &ToolCall| {
@@ -277,6 +294,35 @@ fn dispatch(
         }
     }
     Some(outcome)
+}
+
+/// Runs a batch of calls at once, each on a thread of its own, giving their
+/// outcomes in the batch's order and None for one a stop kept from starting.
+fn together(spec: &Spec, batch: &[ToolCall]) -> Vec<Option<Result<String, String>>> {
+    std::thread::scope(|scope| {
+        let running: Vec<_> = batch
+            .iter()
+            .map(|call| {
+                // Only tools that opt in are batched, and neither `todo` nor a
+                // write is one, so nothing here needs `dispatch`'s special cases.
+                let refused = refusal(&spec.allow, &call.name);
+                let ctx = context(spec);
+                scope.spawn(move || match refused {
+                    Some(refused) => Some(Err(refused)),
+                    None => off_thread(call, &ctx),
+                })
+            })
+            .collect();
+        batch
+            .iter()
+            .zip(running)
+            .map(|(call, running)| {
+                running.join().unwrap_or_else(|_| {
+                    Some(Err(format!("`{}` stopped without finishing.", call.name)))
+                })
+            })
+            .collect()
+    })
 }
 
 /// Why this agent may not call `name`, when it may not.
@@ -853,5 +899,106 @@ mod tests {
             .rfind(|record| record["type"] == "meta")
             .unwrap();
         assert_eq!(meta["todos"], items);
+    }
+
+    #[test]
+    fn a_batch_of_reads_answers_in_the_order_asked() {
+        let dir = scratch("batch");
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        std::fs::write(dir.join("docs/more.txt"), "and more").unwrap();
+        let (endpoint, provider) = provider(vec![
+            reply(
+                "",
+                &[
+                    read_notes(),
+                    ("list_dir", json!({"path": "docs"})),
+                    ("search", json!({"query": "hello"})),
+                    ("read_file", json!({"path": "docs/more.txt"})),
+                ],
+            ),
+            reply("Read them all.", &[]),
+        ]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 80);
+        // A call refused inside a batch keeps its place like the rest.
+        spec.allow = Allow::Only(vec!["read_file".into(), "list_dir".into()]);
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        let sent = provider.sent();
+
+        assert_eq!(
+            results(&sent[1]),
+            [
+                "1|hello from the notes",
+                "more.txt",
+                "`search` is not available to this helper.",
+                "1|and more"
+            ]
+        );
+    }
+
+    #[test]
+    fn fetches_allowed_for_the_run_go_out_at_once() {
+        let _serving = crate::approvals::tests::SERVING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("fetches");
+        let id = AGENTS + 90;
+        // What answering a card with "allow for this run" leaves behind.
+        let requests = approvals::serve();
+        let earlier = ToolCall {
+            id: "earlier".into(),
+            name: "web_fetch".into(),
+            arguments: "{}".into(),
+        };
+        let asked = std::thread::spawn(move || {
+            approvals::ask(7, id, "helper", &earlier, &ToolContext::default())
+        });
+        let request = requests.recv_timeout(WAIT).unwrap();
+        request.answer(approvals::Decision::ForRun);
+        assert!(asked.join().unwrap());
+
+        // Both requests are taken before either is answered, so fetches made
+        // one after another fail: the first waits out its timeout unanswered.
+        let pages = TcpListener::bind("127.0.0.1:0").unwrap();
+        let site = format!("http://{}", pages.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let mut asked = Vec::new();
+            for _ in 0..2 {
+                let (mut socket, _) = pages.accept().unwrap();
+                let mut head = Vec::new();
+                let mut block = [0; 4096];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = socket.read(&mut block).unwrap();
+                    assert_ne!(n, 0, "the request ended early");
+                    head.extend_from_slice(&block[..n]);
+                }
+                let head = String::from_utf8_lossy(&head).into_owned();
+                let page = head.split(' ').nth(1).unwrap().trim_start_matches('/');
+                asked.push((socket, page.to_owned()));
+            }
+            for (mut socket, page) in asked {
+                let _ = write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
+                    page.len()
+                );
+            }
+        });
+        let fetch = |page: &str| ("web_fetch", json!({"url": format!("{site}/{page}")}));
+        let (endpoint, provider) = provider(vec![
+            reply("", &[fetch("first"), fetch("second")]),
+            reply("Fetched both.", &[]),
+        ]);
+        let report = finished(spec(endpoint, &dir, id));
+        assert_eq!(report.status, Outcome::Done);
+        let sent = provider.sent();
+
+        assert_eq!(
+            results(&sent[1]),
+            [
+                format!("{site}/first\n\nfirst"),
+                format!("{site}/second\n\nsecond")
+            ]
+        );
     }
 }
