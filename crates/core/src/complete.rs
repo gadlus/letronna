@@ -74,7 +74,7 @@ pub fn typing(text: &str, cursor: usize) -> Option<Typing<'_>> {
     let start = word_start(before);
     let word = &before[start..];
     let trigger = word.chars().next()?;
-    let query = &word[1..];
+    let query = &word[trigger.len_utf8()..];
     let offered = match trigger {
         // `//` sends a line starting with a slash, so it is not a command.
         '/' => before[..start].trim().is_empty() && !query.starts_with('/'),
@@ -344,6 +344,12 @@ mod tests {
         assert_eq!(typing("run /new", 8), None);
         assert_eq!(typing("//tmp", 5), None);
         assert_eq!(typing("/new now", 8), None);
+    }
+
+    #[test]
+    fn a_word_starting_with_a_wide_letter_is_not_completed() {
+        assert_eq!(typing("é", 2), None);
+        assert_eq!(typing("voilà 日本", 13), None);
     }
 
     #[test]
