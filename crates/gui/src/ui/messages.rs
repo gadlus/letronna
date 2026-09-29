@@ -65,13 +65,27 @@ impl Chat {
         // never ends -- confirming a rewind left the reply half selected.
         let selectable = !window.has_active_dialog(cx);
         let body: AnyElement = if editing {
+            // Sending takes back what followed, unless more was asked: that
+            // stays, and the edit goes to a fork, which Send says first.
+            let forks = self.asked_after(index);
             v_flex()
                 .gap_2()
                 .child(Input::new(&self.edit_message).appearance(false))
                 .child(
                     h_flex()
                         .gap_2()
+                        .items_center()
                         .justify_end()
+                        .when(forks, |row| {
+                            row.child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_xs()
+                                    .text_color(cx_muted)
+                                    .child("What you asked after this stays here."),
+                            )
+                        })
                         .child(
                             Button::new("edit-cancel")
                                 .plain(cx)
@@ -85,7 +99,7 @@ impl Chat {
                             Button::new("edit-send")
                                 .primary()
                                 .small()
-                                .label("Send")
+                                .label(if forks { "Send in a fork" } else { "Send" })
                                 .on_click(
                                     cx.listener(|this, _, window, cx| this.send_edit(window, cx)),
                                 ),
