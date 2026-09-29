@@ -145,6 +145,25 @@ impl Chat {
         cx.notify();
     }
 
+    /// Allow the servers of the plugin as the page shows it. The consent is
+    /// taken for what is on disk now, which an update here or in the
+    /// terminal may have changed since the list was read, so a plugin that
+    /// changed is shown again instead.
+    fn allow_plugin(&mut self, shown: &Plugin, cx: &mut Context<Self>) {
+        let name = shown.name.clone();
+        let current = extensions::list().map(|now| unchanged(shown, &now));
+        self.change_plugin(
+            move || match current? {
+                true => extensions::allow(&name),
+                false => Err(format!(
+                    "{name} changed since this page read it; look over its servers again before \
+                     allowing them."
+                )),
+            },
+            cx,
+        );
+    }
+
     fn remove_plugin(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
         let body = format!("{name} will be moved to the plugins archive on this device.");
         let chat = cx.entity();
@@ -232,8 +251,8 @@ impl Chat {
         let (enabled, allowed) = (plugin.enabled, plugin.allowed);
         let busy = self.plugins.busy;
         let named = || plugin.name.clone();
-        let (switch_name, allow_name, update_name, remove_name) =
-            (named(), named(), named(), named());
+        let (switch_name, update_name, remove_name) = (named(), named(), named());
+        let shown = plugin.clone();
         let muted = cx.theme().muted_foreground;
         let small = |text: String, color: Hsla| div().text_xs().text_color(color).child(text);
         let mut brings: Vec<Div> = Vec::new();
@@ -363,10 +382,12 @@ impl Chat {
                                 .xsmall()
                                 .flex_shrink_0()
                                 .label("Allow servers")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    let name = allow_name.clone();
-                                    this.change_plugin(move || extensions::allow(&name), cx)
-                                })),
+                                .disabled(busy)
+                                .on_click(
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.allow_plugin(&shown, cx)
+                                    }),
+                                ),
                         ),
                 )
             })
@@ -596,6 +617,16 @@ impl Chat {
     }
 }
 
+/// Whether the plugin `shown` is in `now` with the version and servers the
+/// page showed, which is what allowing it consents to.
+fn unchanged(shown: &Plugin, now: &[Plugin]) -> bool {
+    now.iter().any(|plugin| {
+        plugin.name == shown.name
+            && plugin.version == shown.version
+            && plugin.servers == shown.servers
+    })
+}
+
 /// The marketplaces saved, each with nothing read from it yet.
 fn unread_markets() -> Vec<Market> {
     extensions::markets()
@@ -606,4 +637,45 @@ fn unread_markets() -> Vec<Market> {
             listings: Ok(Vec::new()),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
+    // would shadow the built-in attribute.
+    use super::unchanged;
+    use letronna_core::plugins::Plugin;
+    use std::path::PathBuf;
+
+    fn plugin(version: &str, servers: &[(&str, &str)]) -> Plugin {
+        Plugin {
+            name: "notes".into(),
+            version: version.into(),
+            description: String::new(),
+            source: "https://example.com/notes.git".into(),
+            folder: PathBuf::from("notes"),
+            enabled: true,
+            allowed: false,
+            skills: Vec::new(),
+            commands: Vec::new(),
+            styles: Vec::new(),
+            servers: servers
+                .iter()
+                .map(|(name, target)| (name.to_string(), target.to_string()))
+                .collect(),
+            clashes: Vec::new(),
+            broken: None,
+        }
+    }
+
+    #[test]
+    fn allowing_waits_for_a_look_at_servers_that_changed_since_shown() {
+        let shown = plugin("1.0", &[("notes:db", "node db.js")]);
+        assert!(unchanged(&shown, std::slice::from_ref(&shown)));
+        let swapped = plugin("1.0", &[("notes:db", "node other.js")]);
+        assert!(!unchanged(&shown, &[swapped]));
+        let bumped = plugin("1.1", &[("notes:db", "node db.js")]);
+        assert!(!unchanged(&shown, &[bumped]));
+        assert!(!unchanged(&shown, &[]));
+    }
 }
