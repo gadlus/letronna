@@ -950,9 +950,10 @@ impl Chat {
             .messages
             .extend(inbox::fold(&inbox::take(conversation.id, true)));
         // Only what the user typed here: a chat app's message is someone
-        // else's, and must not read the user's files by naming them.
+        // else's, and must not read the user's files by naming them, nor
+        // hide its end from the window behind the marker.
         let content = if from_chat_app {
-            prompt
+            letronna_core::references::inert(&prompt)
         } else {
             letronna_core::references::expand(&prompt, conversation.workspace.as_deref())
         };
