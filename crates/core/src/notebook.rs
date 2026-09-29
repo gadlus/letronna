@@ -31,46 +31,65 @@ pub(crate) fn cells(bytes: &[u8]) -> Result<String, String> {
     let Some(cells) = cells else {
         return Err("it has no cells".into());
     };
-    let mut out = Vec::new();
+    // One string, not a string a line: a log of millions of short lines
+    // would otherwise take gigabytes to show twenty of them.
+    let mut out = String::new();
     for (n, cell) in cells.iter().enumerate() {
         if n > 0 {
-            out.push(String::new());
+            out.push_str("\n\n");
         }
         let kind = cell["cell_type"].as_str().unwrap_or("cell");
-        out.push(format!("[{}] {kind}", n + 1));
-        out.extend(text(&cell["source"]).lines().map(str::to_owned));
-        let outputs = cell["outputs"].as_array().into_iter().flatten();
-        let mut shown: Vec<String> = outputs.flat_map(output).collect();
-        if shown.is_empty() {
-            continue;
+        out.push_str(&format!("[{}] {kind}", n + 1));
+        for line in text(&cell["source"]).lines() {
+            push_line(&mut out, line);
         }
-        let more = shown.len().saturating_sub(OUTPUT_LINES);
-        shown.truncate(OUTPUT_LINES);
-        out.push("[output]".into());
-        out.extend(shown);
+        let (mut shown, mut more) = (0, 0);
+        for output in cell["outputs"].as_array().into_iter().flatten() {
+            for line in lines(&output_text(output)) {
+                if shown == OUTPUT_LINES {
+                    more += 1;
+                    continue;
+                }
+                if shown == 0 {
+                    push_line(&mut out, "[output]");
+                }
+                shown += 1;
+                push_line(&mut out, line);
+            }
+        }
         if more > 0 {
-            out.push(format!("[{more} more lines of output cut]"));
+            push_line(&mut out, &format!("[{more} more lines of output cut]"));
         }
     }
-    Ok(out.join("\n"))
+    Ok(out)
 }
 
-/// The lines one output shows: what it printed, its error, or its value as
-/// text, with a line naming each other form of the value.
-fn output(output: &Value) -> Vec<String> {
+/// Adds `line` to `out` on a line of its own.
+fn push_line(out: &mut String, line: &str) {
+    out.push('\n');
+    out.push_str(line);
+}
+
+/// What one output shows: what it printed, its error, or its value as text,
+/// with a line naming each other form of the value.
+fn output_text(output: &Value) -> String {
     match output["output_type"].as_str() {
-        Some("stream") => lines(&text(&output["text"])),
-        Some("error") => lines(&format!(
+        Some("stream") => text(&output["text"]),
+        Some("error") => format!(
             "{}: {}",
             output["ename"].as_str().unwrap_or("Error"),
             output["evalue"].as_str().unwrap_or_default()
-        )),
+        ),
         _ => {
             let data = &output["data"];
-            let mut shown = lines(&text(&data["text/plain"]));
+            let mut shown = text(&data["text/plain"]);
             let kinds = data.as_object().into_iter().flat_map(|data| data.keys());
-            let others = kinds.filter(|kind| *kind != "text/plain");
-            shown.extend(others.map(|kind| format!("[{kind} output]")));
+            for kind in kinds.filter(|kind| *kind != "text/plain") {
+                if !shown.is_empty() && !shown.ends_with('\n') {
+                    shown.push('\n');
+                }
+                shown.push_str(&format!("[{kind} output]"));
+            }
             shown
         }
     }
@@ -79,11 +98,10 @@ fn output(output: &Value) -> Vec<String> {
 /// Output text as lines, each only as last written over: a progress bar
 /// redraws itself after a carriage return, and would otherwise show every
 /// step it took on one line.
-fn lines(text: &str) -> Vec<String> {
+fn lines(text: &str) -> impl Iterator<Item = &str> {
     text.lines()
         .map(|line| line.rsplit('\r').find(|part| !part.is_empty()))
-        .map(|last| last.unwrap_or_default().to_owned())
-        .collect()
+        .map(Option::unwrap_or_default)
 }
 
 /// A multiline field, which nbformat stores as one string or as a list of
@@ -160,6 +178,17 @@ mod tests {
                 steps.join("\n")
             )
         );
+    }
+
+    #[test]
+    fn a_log_of_a_million_lines_is_counted_not_kept() {
+        let log = "ok\n".repeat(1_000_000);
+        let notebook = json!({"cells": [{"cell_type": "code", "source": "x", "outputs": [
+            {"output_type": "stream", "name": "stdout", "text": log}
+        ]}]});
+        let shown = render(notebook);
+        let head = format!("[1] code\nx\n[output]\n{}", ["ok"; 20].join("\n"));
+        assert_eq!(shown, format!("{head}\n[999980 more lines of output cut]"));
     }
 
     #[test]
