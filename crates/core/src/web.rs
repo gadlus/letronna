@@ -577,6 +577,40 @@ mod tests {
     }
 
     #[test]
+    fn a_second_fetch_rides_the_first_ones_connection() {
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.local_addr().unwrap());
+        let connections = Arc::new(Mutex::new(0));
+        let counted = connections.clone();
+        std::thread::spawn(move || {
+            for mut socket in server.incoming().flatten() {
+                *counted.lock().unwrap() += 1;
+                std::thread::spawn(move || {
+                    let _ = socket.set_read_timeout(Some(Duration::from_secs(10)));
+                    let mut block = [0; 4096];
+                    // Every request is answered on the socket it came in on,
+                    // which stays open for the next.
+                    while matches!(socket.read(&mut block), Ok(n) if n > 0) {
+                        let reply = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
+                                     Content-Length: 7\r\n\r\narrived";
+                        if socket.write_all(reply.as_bytes()).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        for _ in 0..2 {
+            let page = fetch(&format!("{base}/"), &[]).unwrap();
+            assert_eq!(page, format!("{base}/\n\narrived"));
+            // Time for the pool to take the connection back once its reply
+            // has been read.
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        assert_eq!(*connections.lock().unwrap(), 1);
+    }
+
+    #[test]
     #[ignore = "Fetches https://example.com: run with --ignored when online"]
     fn fetches_a_real_page() {
         let page = fetch("https://example.com", &[]).unwrap();
