@@ -23,10 +23,12 @@
 //! A server starts the first time a file it serves is written, in the
 //! project folder, as a process tree of its own the way an MCP server run
 //! here does, spoken to over its pipes in JSON-RPC framed by
-//! `Content-Length` headers. One serves a session and its helpers, and is
-//! shut down when the session is deleted or the app quits. A file is opened
-//! as it was before its first edit, so the errors it already had are known
-//! and not blamed on the edit; then each write sends the whole new text.
+//! `Content-Length` headers. One serves every session and helper working
+//! in its project folder, and is shut down after ten minutes with no
+//! write, when the last session that used it is deleted, or when the app
+//! quits; the next write starts it again. A file is opened as it was before
+//! its first edit, so the errors it already had are known and not blamed
+//! on the edit; then each write sends the whole new text.
 //! Only errors count, not warnings, and each is told once: one that goes
 //! away is forgotten, so it is told again if it comes back.
 //!
@@ -63,6 +65,10 @@ const NOTE_WAIT: Duration = Duration::from_secs(5);
 const QUIET: Duration = Duration::from_millis(250);
 /// How long a server gets to shut down before it is ended.
 const STOP_WAIT: Duration = Duration::from_secs(1);
+/// How long a server is kept with no write: past a turn and the reading
+/// between turns, but a project left alone gets back what its index holds,
+/// a gigabyte or more for rust-analyzer on a large one.
+const IDLE: Duration = Duration::from_secs(10 * 60);
 /// Errors told at once; past this the rest are counted.
 const MAX_LINES: usize = 20;
 /// Characters kept of one error's message.
@@ -174,7 +180,6 @@ fn load(file: &Path) -> Option<Config> {
 
 /// A write a language server is to hear of once it has happened.
 pub(crate) struct Planned {
-    owner: u64,
     conversation: u64,
     name: String,
     entry: Entry,
@@ -192,18 +197,11 @@ pub(crate) fn before_write(
 ) -> Option<Planned> {
     let file = config_file()?;
     let root = ctx.workspace.as_deref()?;
-    // A helper's writes go to the server of the session it works for, so a
-    // run of helpers starts one server, not one each.
-    let owner = match ctx.caller.root {
-        0 => ctx.conversation,
-        root => root,
-    };
-    plan(&file, owner, ctx.conversation, root, path, before)
+    plan(&file, ctx.conversation, root, path, before)
 }
 
 fn plan(
     file: &Path,
-    owner: u64,
     conversation: u64,
     root: &Path,
     path: &Path,
@@ -219,7 +217,6 @@ fn plan(
         .into_iter()
         .find(|(_, entry)| entry.serves(path, root))?;
     Some(Planned {
-        owner,
         conversation,
         name,
         entry,
@@ -230,33 +227,41 @@ fn plan(
 }
 
 /// Tell the server `planned` names that its file now holds `after`,
-/// starting the server if this is its first.
+/// starting the server if this is its project's first.
 pub(crate) fn wrote(planned: Option<Planned>, after: &str) {
-    let Some(planned) = planned else {
+    let Some(Planned {
+        conversation,
+        name,
+        entry,
+        root,
+        path,
+        before,
+    }) = planned
+    else {
         return;
     };
-    let server = {
-        let mut servers = lock(servers());
-        let key = (planned.owner, planned.name.clone());
-        servers
-            .entry(key)
-            .or_insert_with(|| {
-                let (config, root) = (planned.entry.server.clone(), planned.root.clone());
-                Server::start(&planned.name, &planned.root, move || launch(&config, &root))
-            })
-            .clone()
-    };
-    let extension = planned.path.extension().and_then(|e| e.to_str());
+    let extension = path.extension().and_then(|e| e.to_str());
     let language =
-        (planned.entry.language.clone()).unwrap_or_else(|| language(extension.unwrap_or_default()));
-    server.queue(Job {
-        conversation: planned.conversation,
-        uri: uri(&planned.path),
-        path: planned.path,
+        (entry.language.clone()).unwrap_or_else(|| language(extension.unwrap_or_default()));
+    let job = Job {
+        conversation,
+        uri: uri(&path),
+        path,
         language,
-        before: planned.before,
+        before,
         after: after.to_owned(),
-    });
+    };
+    let mut servers = lock(servers());
+    // One per project, which every session and helper working there shares.
+    let server = servers
+        .entry((root.clone(), name.clone()))
+        .or_insert_with(|| {
+            let config = entry.server;
+            let start = root.clone();
+            Server::start(&name, &root, IDLE, move || launch(&config, &start))
+        });
+    // Under the lock, so a server going idle cannot miss it.
+    server.queue(job);
 }
 
 /// What the language servers found since `conversation` last asked, as a
@@ -327,20 +332,29 @@ pub fn stop_all() {
     }
 }
 
-/// Shut down the servers of session `owner`, which has ended, without
-/// waiting for them.
-pub(crate) fn stop(owner: u64) {
+/// Forget what session `conversation`, which was deleted, was told, since
+/// a new session can be given its id, and shut down, without waiting, a
+/// server no other conversation used.
+pub(crate) fn forget(conversation: u64) {
     let mut servers = lock(servers());
-    let theirs: Vec<(u64, String)> = servers.keys().filter(|k| k.0 == owner).cloned().collect();
-    for key in theirs {
+    let mut unused = Vec::new();
+    for (key, server) in servers.iter() {
+        let mut known = lock(&server.known);
+        known.told.remove(&conversation);
+        known.seen.retain(|(c, _), _| *c != conversation);
+        if known.users.remove(&conversation) && known.users.is_empty() {
+            unused.push(key.clone());
+        }
+    }
+    for key in unused {
         if let Some(server) = servers.remove(&key) {
             std::thread::spawn(move || server.shut_down());
         }
     }
 }
 
-/// Servers by the session they serve and their name.
-type Servers = HashMap<(u64, String), Arc<Server>>;
+/// Servers by the project folder they serve and their name.
+type Servers = HashMap<(PathBuf, String), Arc<Server>>;
 
 /// The running servers.
 fn servers() -> &'static Mutex<Servers> {
@@ -542,6 +556,8 @@ struct Server {
     process: Mutex<Option<Process>>,
     /// Writes waiting for the worker, which does all the talking.
     jobs: Mutex<Option<mpsc::Sender<Job>>>,
+    /// How long it is kept with no write.
+    idle: Duration,
     known: Mutex<Known>,
     /// Woken whenever `known` changes.
     heard: Condvar,
@@ -554,6 +570,7 @@ impl Server {
     fn start(
         name: &str,
         root: &Path,
+        idle: Duration,
         connect: impl FnOnce() -> Result<Pipes, String> + Send + 'static,
     ) -> Arc<Self> {
         let (jobs, queue) = mpsc::channel();
@@ -563,6 +580,7 @@ impl Server {
             to: Mutex::new(None),
             process: Mutex::new(None),
             jobs: Mutex::new(Some(jobs)),
+            idle,
             known: Mutex::default(),
             heard: Condvar::new(),
             next: AtomicU64::new(1),
@@ -580,14 +598,49 @@ impl Server {
         if let Err(why) = self.connect(connect) {
             self.die(why);
         }
-        // Until the server is shut down, which lets go of the sender.
-        for job in queue {
+        // Until the server is shut down, which lets go of the sender, or is
+        // let go of for having nothing to do.
+        loop {
+            let job = match queue.recv_timeout(self.idle) {
+                Ok(job) => job,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(mpsc::RecvTimeoutError::Timeout) => match self.idle_out(&queue) {
+                    Some(job) => job,
+                    None => return,
+                },
+            };
             if lock(&self.known).dead.is_none() {
                 self.apply(job);
             }
             lock(&self.known).done += 1;
             self.heard.notify_all();
         }
+    }
+
+    /// After `idle` with no write: the write that came meanwhile, or None
+    /// once the server is unlisted and shut down, so that the next write
+    /// starts a new one. One that is dead stays listed, so it is not started
+    /// again, and only its worker ends.
+    fn idle_out(self: &Arc<Self>, queue: &mpsc::Receiver<Job>) -> Option<Job> {
+        let mut servers = lock(servers());
+        // Writes are queued under this lock, so one that came since the wait
+        // ended is here now, and none can come once it is unlisted.
+        if let Ok(job) = queue.try_recv() {
+            return Some(job);
+        }
+        if lock(&self.known).dead.is_some() {
+            return None;
+        }
+        let key = (self.root.clone(), self.name.clone());
+        if servers
+            .get(&key)
+            .is_some_and(|listed| Arc::ptr_eq(listed, self))
+        {
+            servers.remove(&key);
+        }
+        drop(servers);
+        self.shut_down();
+        None
     }
 
     fn connect(
@@ -1140,26 +1193,34 @@ mod tests {
     }
 
     /// A project with a config naming the fake server, which is already
-    /// running for `owner`; the log of what it heard.
-    fn project(name: &str, owner: u64, kind: Fake) -> (PathBuf, PathBuf, mpsc::Receiver<String>) {
+    /// running there; the log of what it heard.
+    fn project(name: &str, kind: Fake) -> (PathBuf, PathBuf, mpsc::Receiver<String>) {
         let dir = scratch(name);
         let file = config(&dir, "fake-language-server");
         let (pipes, log) = fake(kind);
-        let server = Server::start("fake", &dir, move || Ok(pipes));
-        lock(servers()).insert((owner, "fake".into()), server);
+        let server = Server::start("fake", &dir, IDLE, move || Ok(pipes));
+        lock(servers()).insert((dir.clone(), "fake".into()), server);
         (dir, file, log)
     }
 
-    /// Write `after` over `path`, which held `before`, as the file tools do.
-    fn edit(file: &Path, owner: u64, root: &Path, path: &Path, before: Option<&str>, after: &str) {
+    /// Write `after` over `path`, which held `before`, as the file tools do
+    /// for `conversation`.
+    fn edit(
+        file: &Path,
+        conversation: u64,
+        root: &Path,
+        path: &Path,
+        before: Option<&str>,
+        after: &str,
+    ) {
         std::fs::write(path, after).unwrap();
-        wrote(plan(file, owner, owner, root, path, before), after);
+        wrote(plan(file, conversation, root, path, before), after);
     }
 
     #[test]
     fn a_new_error_is_reported_once_and_what_was_there_before_is_not() {
         let owner = session();
-        let (dir, file, _) = project("new-error", owner, Fake::Checks);
+        let (dir, file, _) = project("new-error", Fake::Checks);
         let path = dir.join("main.rs");
         let before = "ERROR: old trouble\nfn main() {}\n";
         std::fs::write(&path, before).unwrap();
@@ -1183,13 +1244,13 @@ mod tests {
         let later = format!("\n{after}");
         edit(&file, owner, &dir, &path, Some(after), &later);
         assert_eq!(note(owner), None);
-        stop(owner);
+        forget(owner);
     }
 
     #[test]
     fn a_fixed_error_is_cleared_and_told_again_if_it_comes_back() {
         let owner = session();
-        let (dir, file, _) = project("fixed", owner, Fake::Checks);
+        let (dir, file, _) = project("fixed", Fake::Checks);
         let path = dir.join("lib.rs");
         let broken = "ERROR: cannot find value `x`\n";
         edit(&file, owner, &dir, &path, None, broken);
@@ -1208,19 +1269,19 @@ mod tests {
                 .unwrap()
                 .contains("lib.rs:1: cannot find value `x`")
         );
-        stop(owner);
+        forget(owner);
     }
 
     #[test]
     fn errors_reach_the_model_fenced_with_keys_hidden() {
         let owner = session();
-        let (dir, file, _) = project("fenced", owner, Fake::Checks);
+        let (dir, file, _) = project("fenced", Fake::Checks);
         let path = dir.join("main.rs");
         let key = "ghp_0123456789abcdefghijABCDEFGHIJ012345";
         let broken = format!("ERROR: expected u32, found \"{key}\"\n");
         edit(&file, owner, &dir, &path, None, &broken);
         let said = note(owner).unwrap();
-        stop(owner);
+        forget(owner);
         assert!(!said.contains(key), "{said}");
         let (head, fenced) = said.split_once("<untrusted-content-").unwrap();
         assert!(head.starts_with("(From Letronna"), "{said}");
@@ -1230,7 +1291,7 @@ mod tests {
     #[test]
     fn a_write_through_the_file_tools_reaches_the_server() {
         let owner = session();
-        let (dir, file, log) = project("tools", owner, Fake::Checks);
+        let (dir, file, log) = project("tools", Fake::Checks);
         CONFIG.with(|config| *config.borrow_mut() = Some(file));
         let ctx = ToolContext {
             workspace: Some(dir.clone()),
@@ -1255,7 +1316,7 @@ mod tests {
                 "textDocument/didSave"
             ]
         );
-        stop(owner);
+        forget(owner);
     }
 
     #[test]
@@ -1264,10 +1325,10 @@ mod tests {
         let dir = scratch("nothing");
         let path = dir.join("main.rs");
         let missing = dir.join("missing").join(FILE);
-        assert!(plan(&missing, owner, owner, &dir, &path, None).is_none());
+        assert!(plan(&missing, owner, &dir, &path, None).is_none());
         // One for other kinds of file is no server for this one.
         let other = config(&dir, "fake-language-server");
-        assert!(plan(&other, owner, owner, &dir, &dir.join("notes.md"), None).is_none());
+        assert!(plan(&other, owner, &dir, &dir.join("notes.md"), None).is_none());
 
         CONFIG.with(|config| *config.borrow_mut() = Some(missing));
         let ctx = ToolContext {
@@ -1279,7 +1340,7 @@ mod tests {
         CONFIG.with(|config| *config.borrow_mut() = None);
         wrote(None, "ERROR: nobody hears this\n");
 
-        assert!(lock(servers()).keys().all(|(o, _)| *o != owner));
+        assert!(lock(servers()).keys().all(|(root, _)| *root != dir));
         assert_eq!(note(owner), None);
     }
 
@@ -1288,20 +1349,20 @@ mod tests {
         let dir = scratch("listed");
         let clone = scratch("listed-clone");
         let listed = config(&dir, "fake-language-server");
-        assert!(plan(&listed, 1, 1, &dir, &dir.join("main.rs"), None).is_some());
+        assert!(plan(&listed, 1, &dir, &dir.join("main.rs"), None).is_some());
         // A folder the user never named, such as one cloned a minute ago.
-        assert!(plan(&listed, 1, 1, &clone, &clone.join("build.rs"), None).is_none());
+        assert!(plan(&listed, 1, &clone, &clone.join("build.rs"), None).is_none());
         let unlisted = clone.join(FILE);
         let text = json!({"servers": {"fake": {"command": "fake-language-server",
             "extensions": ["rs"]}}});
         std::fs::write(&unlisted, text.to_string()).unwrap();
-        assert!(plan(&unlisted, 1, 1, &clone, &clone.join("main.rs"), None).is_none());
+        assert!(plan(&unlisted, 1, &clone, &clone.join("main.rs"), None).is_none());
     }
 
     #[test]
     fn a_server_that_stops_is_told_of_once_and_not_started_again() {
         let owner = session();
-        let (dir, file, log) = project("stops", owner, Fake::HangsUp);
+        let (dir, file, log) = project("stops", Fake::HangsUp);
         let path = dir.join("main.rs");
         edit(&file, owner, &dir, &path, None, "fn main() {}\n");
         let said = note(owner).unwrap();
@@ -1319,7 +1380,7 @@ mod tests {
         );
         assert_eq!(note(owner), None);
         assert_eq!(log.try_iter().collect::<Vec<_>>(), ["initialize"]);
-        stop(owner);
+        forget(owner);
     }
 
     #[test]
@@ -1334,16 +1395,97 @@ mod tests {
         assert!(said.contains("letronna-no-such-language-server"), "{said}");
         assert!(started.elapsed() < NOTE_WAIT);
         assert_eq!(note(owner), None);
-        stop(owner);
+        forget(owner);
+    }
+
+    #[test]
+    fn sessions_in_one_project_share_its_server_and_hear_only_their_own_errors() {
+        let (a, b) = (session(), session());
+        let (dir, file, log) = project("shared", Fake::Checks);
+        edit(&file, a, &dir, &dir.join("a.rs"), None, "ERROR: one\n");
+        edit(&file, b, &dir, &dir.join("b.rs"), None, "ERROR: two\n");
+        let (for_a, for_b) = (note(a).unwrap(), note(b).unwrap());
+        assert!(
+            for_a.contains("a.rs:1: one") && !for_a.contains("two"),
+            "{for_a}"
+        );
+        assert!(
+            for_b.contains("b.rs:1: two") && !for_b.contains("one"),
+            "{for_b}"
+        );
+        let serving = || {
+            lock(servers())
+                .keys()
+                .filter(|(root, _)| *root == dir)
+                .count()
+        };
+        assert_eq!(serving(), 1);
+
+        // Kept for the session still using it, then shut down.
+        forget(a);
+        assert_eq!(serving(), 1);
+        forget(b);
+        assert_eq!(serving(), 0);
+        let heard: Vec<String> = log.iter().collect();
+        assert_eq!(heard.iter().filter(|m| *m == "initialize").count(), 1);
+        assert!(
+            heard.ends_with(&["shutdown".into(), "exit".into()]),
+            "{heard:?}"
+        );
+    }
+
+    #[test]
+    fn a_server_left_alone_is_shut_down_and_the_next_write_starts_another() {
+        let owner = session();
+        let dir = scratch("idle");
+        let file = config(&dir, "letronna-no-such-language-server");
+        let key = (dir.clone(), String::from("fake"));
+        let (pipes, log) = fake(Fake::Checks);
+        let idle = Duration::from_millis(200);
+        let first = Server::start("fake", &dir, idle, move || Ok(pipes));
+        lock(servers()).insert(key.clone(), first.clone());
+        edit(&file, owner, &dir, &dir.join("a.rs"), None, "\n");
+        let _ = note(owner);
+
+        let mut heard = Vec::new();
+        while heard.last().is_none_or(|m| m != "exit") {
+            heard.push(log.recv_timeout(Duration::from_secs(5)).unwrap());
+        }
+        assert!(!lock(servers()).contains_key(&key));
+        edit(&file, owner, &dir, &dir.join("a.rs"), Some("\n"), "\n\n");
+        let next = lock(servers()).get(&key).cloned().unwrap();
+        forget(owner);
+        assert!(!Arc::ptr_eq(&first, &next));
+    }
+
+    #[test]
+    fn a_server_that_stopped_stays_listed_when_left_alone() {
+        let owner = session();
+        let dir = scratch("dead-idle");
+        let file = config(&dir, "fake-language-server");
+        let key = (dir.clone(), String::from("fake"));
+        let (pipes, _) = fake(Fake::HangsUp);
+        let server = Server::start("fake", &dir, Duration::from_millis(100), move || Ok(pipes));
+        lock(servers()).insert(key.clone(), server.clone());
+        edit(&file, owner, &dir, &dir.join("a.rs"), None, "\n");
+        assert!(note(owner).unwrap().contains("is not running"));
+        std::thread::sleep(Duration::from_millis(500));
+        let listed = lock(servers())
+            .get(&key)
+            .is_some_and(|s| Arc::ptr_eq(s, &server));
+        forget(owner);
+        assert!(listed);
     }
 
     #[test]
     fn a_server_is_asked_to_shut_down_and_exit() {
         let owner = session();
-        let (dir, file, log) = project("shut-down", owner, Fake::Checks);
+        let (dir, file, log) = project("shut-down", Fake::Checks);
         edit(&file, owner, &dir, &dir.join("a.rs"), None, "\n");
         let _ = note(owner);
-        let server = lock(servers()).remove(&(owner, "fake".into())).unwrap();
+        let server = lock(servers())
+            .remove(&(dir.clone(), "fake".into()))
+            .unwrap();
         server.shut_down();
         let heard: Vec<String> = log.try_iter().collect();
         assert!(
@@ -1386,7 +1528,7 @@ mod tests {
             "args": ["-c", "printf '%s' \"$0\"; exec sleep 600", answer]}))
         .unwrap();
         let root = dir.clone();
-        let server = Server::start("stuck", &dir, move || launch(&config, &root));
+        let server = Server::start("stuck", &dir, IDLE, move || launch(&config, &root));
         let path = dir.join("a.rs");
         // Far more than a pipe holds, so the worker is left writing it.
         server.queue(Job {

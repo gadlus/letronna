@@ -245,7 +245,7 @@ After Letronna writes or edits a file, a language server can check it, and the e
 
 A server serves only the project folders listed for it. Most run the project's own code as they check it -- rust-analyzer its build scripts and proc macros, a TypeScript server the project's own compiler -- so list only projects you would build yourself: there, an edit Letronna makes, in Accept edits mode too, can run that code on the next check.
 
-A server starts in the project folder the first time a file it serves is written, and is shut down when Letronna quits. Only errors are told, not warnings, and only those that were not there before the edit. A server that cannot start or stops is mentioned once and not started again until the next session. Projects cannot add servers of their own, since a server is a command and whoever wrote a repository may not be whoever runs it.
+A server starts in the project folder the first time a file it serves is written there, serves every session in that project, and is shut down after ten minutes without a write and when Letronna quits. Only errors are told, not warnings, and only those that were not there before the edit. A server that cannot start or stops is mentioned once and not started again until the next session. Projects cannot add servers of their own, since a server is a command and whoever wrote a repository may not be whoever runs it.
 
 ## Build
 
