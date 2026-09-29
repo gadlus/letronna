@@ -1573,4 +1573,28 @@ mod tests {
         ));
         std::fs::remove_dir_all(dir).unwrap();
     }
+
+    #[test]
+    fn bypass_still_holds_back_a_denied_or_risky_call() {
+        use letronna_core::permissions::{Effect, Rule};
+        let dir = std::env::temp_dir().join(format!("letronna-bypass-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rules = Ok(vec![Rule {
+            tool: "run_command".into(),
+            pattern: "git push".into(),
+            effect: Effect::Deny,
+            project: None,
+        }]);
+        let judge = |line: &str| {
+            let call = made("run_command", json!({ "command": line }));
+            let (none, mode) = (Grants::new(), Mode::Bypass);
+            judged(&call, 1, Some(dir.clone()), mode, &none, &rules, false)
+        };
+        assert_eq!(judge("echo hi"), Some(Decision::Once));
+        assert!(
+            matches!(judge("git push origin main"), Some(Decision::Deny(why)) if !why.is_empty())
+        );
+        assert!(matches!(judge("git reset --hard"), Some(Decision::Deny(why)) if !why.is_empty()));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

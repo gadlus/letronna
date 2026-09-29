@@ -443,45 +443,54 @@ fn emit(line: &Value) -> bool {
     writeln!(std::io::stdout().lock(), "{line}").is_ok()
 }
 
-/// Answers the run's calls that need a yes: every one with `--yes`, then
-/// what `mode` and the permission rules settle, by asking when there is a
-/// keyboard to ask at, and otherwise no, saying why.
+/// Answers the run's calls that need a yes: what `mode` and the permission
+/// rules settle, then by asking when there is a keyboard to ask at, and
+/// otherwise no, saying why.
 fn answer_approvals(mode: Mode, keyboard: bool, context: tools::ToolContext, cancel: Cancel) {
     let requests = approvals::serve();
     let rules = permissions::load(&permissions::user_file());
     std::thread::spawn(move || {
         // The run asks for every call that needs a yes, so without the gate
         // here `--mode accept-edits` was never heard and every edit refused.
+        // Bypass goes through it too: it only skips the asking, and `--yes`
+        // is to bar risky calls and honour deny rules as a session does.
         let none = Grants::new();
         for request in requests {
-            let decision = if mode == Mode::Bypass {
-                Decision::Once
-            } else {
-                let workspace = context.workspace.clone();
-                let settled = session::judged(
-                    &request.call,
-                    request.root,
-                    workspace,
-                    mode,
-                    &none,
-                    &rules,
-                    keyboard,
-                );
-                match settled {
-                    Some(Decision::Deny(why)) if !keyboard => {
-                        eprintln!(
-                            "`{}` needs a yes and nobody is here to give it; run with --yes to allow it.",
-                            request.call.name
-                        );
-                        Decision::Deny(why)
+            let workspace = context.workspace.clone();
+            let settled = session::judged(
+                &request.call,
+                request.root,
+                workspace,
+                mode,
+                &none,
+                &rules,
+                keyboard,
+            );
+            let decision = match settled {
+                Some(Decision::Deny(why)) => {
+                    if !keyboard {
+                        say_refused(&request.call.name, &why);
                     }
-                    Some(decision) => decision,
-                    None => consult(&request, &context, &cancel),
+                    Decision::Deny(why)
                 }
+                Some(decision) => decision,
+                None => consult(&request, &context, &cancel),
             };
             request.answer(decision);
         }
     });
+}
+
+/// Says on stderr why a call was refused with nobody to ask: the gate's
+/// reason, or that it needed a yes when it gave none.
+fn say_refused(name: &str, why: &str) {
+    if why.is_empty() {
+        eprintln!(
+            "`{name}` needs a yes and nobody is here to give it; run with --yes to allow it."
+        );
+    } else {
+        eprintln!("`{name}` was refused: {}", tools::one_line(why));
+    }
 }
 
 /// Asks the person at the keyboard about one call, the way the conversation
