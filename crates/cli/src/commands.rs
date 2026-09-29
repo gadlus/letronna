@@ -299,6 +299,13 @@ fn usage(session: u64) {
             ));
         }
     }
+    if !report.misses.is_empty() {
+        render::blank();
+        render::line(&render::dim("cache misses in this session, newest first"));
+        for missed in &report.misses {
+            render::line(&missed.line());
+        }
+    }
     if let Some(legend) = report.legend() {
         render::blank();
         render::line(&render::dim(&legend));

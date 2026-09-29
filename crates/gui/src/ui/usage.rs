@@ -78,11 +78,36 @@ pub(crate) fn usage_page(report: Option<&Report>, cx: &App) -> Div {
         models,
         cx,
     ))
+    .when(!report.misses.is_empty(), |page| {
+        page.child(misses(&report.misses, cx))
+    })
     .children(
         report
             .legend()
             .map(|legend| div().text_xs().text_color(muted).child(legend)),
     )
+}
+
+/// The session's latest cache misses, a line each with why, as `/usage`
+/// lists them.
+fn misses(misses: &[usage::Missed], cx: &App) -> Div {
+    let muted = cx.theme().muted_foreground;
+    v_flex()
+        .gap_1()
+        .child(
+            div()
+                .text_xs()
+                .font_family(HEADING_FONT)
+                .text_color(muted)
+                .child("Cache misses in this session"),
+        )
+        .children(misses.iter().map(|missed| {
+            div()
+                .py_1()
+                .text_sm()
+                .text_color(muted)
+                .child(missed.line())
+        }))
 }
 
 /// A list of totals, a row each with hairlines between, under `title`.

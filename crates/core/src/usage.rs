@@ -12,6 +12,7 @@
 //! Elsewhere the cost is estimated from the price the gateway's model list
 //! gives. With neither it is left unknown rather than shown as nothing.
 
+use crate::cache_miss::Reason;
 use crate::chat::Message;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -44,6 +45,9 @@ pub struct Usage {
     /// The cost comes from the listed price rather than a bill.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub estimated: bool,
+    /// Why the cache served far less of the call than of the one before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub miss: Option<Reason>,
 }
 
 impl Usage {
@@ -57,6 +61,7 @@ impl Usage {
             reasoning: reply.reasoning_tokens,
             cost: reply.cost,
             estimated: reply.cost_estimated,
+            miss: reply.cache_miss,
         }
     }
 
@@ -274,6 +279,37 @@ pub struct Report {
     pub days: Vec<(chrono::NaiveDate, Totals)>,
     /// Each model used, the most tokens first.
     pub models: Vec<(String, Totals)>,
+    /// The session's latest cache misses, newest first.
+    pub misses: Vec<Missed>,
+}
+
+/// A call the prompt cache served far less of than the one before it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Missed {
+    /// Seconds since 1970.
+    pub at: u64,
+    pub model: String,
+    pub reason: Reason,
+}
+
+impl Missed {
+    /// The miss on one line: when, why, and on which model.
+    pub fn line(&self) -> String {
+        let at = i64::try_from(self.at).ok();
+        let local =
+            at.and_then(|at| chrono::TimeZone::timestamp_opt(&chrono::Local, at, 0).single());
+        let when = local.map_or_else(
+            || "some time".to_owned(),
+            |time| format!("{} {}", day_name(time.date_naive()), time.format("%H:%M")),
+        );
+        let model = self.model.trim();
+        let model = if model.is_empty() {
+            "unknown model"
+        } else {
+            model
+        };
+        format!("{when} · {} · {model}", self.reason.text())
+    }
 }
 
 impl Report {
@@ -328,6 +364,13 @@ fn report_in<Tz: chrono::TimeZone>(spent: &[Spent], session: u64, now: u64, zone
     for call in spent {
         if call.session == session {
             report.session.add(&call.usage);
+            if let Some(reason) = call.usage.miss {
+                report.misses.push(Missed {
+                    at: call.at,
+                    model: call.model.clone(),
+                    reason,
+                });
+            }
         }
         if call.copy {
             continue;
@@ -342,6 +385,12 @@ fn report_in<Tz: chrono::TimeZone>(spent: &[Spent], session: u64, now: u64, zone
             models.entry(model).or_default().add(&call.usage);
         }
     }
+    // A helper's transcript is read after its session's, so the file order
+    // is not the order they happened in.
+    report
+        .misses
+        .sort_by_key(|missed| std::cmp::Reverse(missed.at));
+    report.misses.truncate(crate::cache_miss::SHOWN);
     report.days = days.into_iter().rev().collect();
     report.models = models
         .into_iter()
@@ -381,6 +430,7 @@ mod tests {
                 reasoning: 150,
                 cost: Some(0.0123),
                 estimated: false,
+                miss: None,
             }
         );
         // On the user's own key OpenRouter bills its fee, the provider the rest.
@@ -521,6 +571,36 @@ mod tests {
         let a = &report.models[1].1;
         assert_eq!(a.cache_rate(), Some(50));
         assert_eq!(a.cost_text().as_deref(), Some("$0.75"));
+    }
+
+    #[test]
+    fn the_sessions_latest_misses_are_listed_newest_first() {
+        let missed = |session, at, reason| Spent {
+            session,
+            at,
+            model: "m".into(),
+            usage: Usage {
+                miss: Some(reason),
+                ..Default::default()
+            },
+            copy: false,
+        };
+        let mut spent: Vec<Spent> = (0..7)
+            .map(|at| missed(1, 1_000 + at, Reason::Summary))
+            .collect();
+        // A helper's miss read after them, but the newest of all.
+        spent.push(missed(1, 2_000, Reason::Tools));
+        spent.push(missed(2, 3_000, Reason::Memory));
+        let report = report_in(&spent, 1, 3_000, &chrono::Utc);
+        let reasons: Vec<(u64, Reason)> = report
+            .misses
+            .iter()
+            .map(|missed| (missed.at, missed.reason))
+            .collect();
+        assert_eq!(reasons.len(), crate::cache_miss::SHOWN);
+        assert_eq!(reasons[0], (2_000, Reason::Tools));
+        assert_eq!(reasons[1], (1_006, Reason::Summary));
+        assert!(report.misses[0].line().contains("the tools changed · m"));
     }
 
     #[test]

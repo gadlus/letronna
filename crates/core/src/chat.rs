@@ -48,6 +48,10 @@ pub struct Message {
     /// longer held took, a model call of its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary_usage: Option<crate::usage::Usage>,
+    /// For `role: "assistant"`: why the prompt cache served far less of its
+    /// request than of the one before, when it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_miss: Option<crate::cache_miss::Reason>,
     /// For `role: "assistant"`: when the reply finished, in seconds since
     /// 1970, so its usage counts on the right day.
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -257,6 +261,9 @@ pub enum Event {
     /// What summarizing the turns the request no longer holds took, sent
     /// before the reply when a summary had to be asked for.
     SummaryUsage(crate::usage::Usage),
+    /// Sent after `Usage` when the cache served far less of this request
+    /// than of the session's last one, with the likely reason.
+    CacheMiss(crate::cache_miss::Reason),
     /// Sent once, before `Finished`, when the model asked for tools.
     ToolCalls(Vec<ToolCall>),
     /// Sent once, before `Finished`, when a finished reply came with
@@ -633,6 +640,20 @@ fn body_with(
     budget: &Budget,
     extra: &[Value],
 ) -> Value {
+    body_hashed(connection, window, summary, plan, budget, extra, None)
+}
+
+/// `body_with`, keeping the hashes of its cached prefix in `prefix` when
+/// given one: only a request that is sent needs them.
+fn body_hashed(
+    connection: &Connection,
+    window: &[Message],
+    summary: Option<&str>,
+    plan: Option<&str>,
+    budget: &Budget,
+    extra: &[Value],
+    mut prefix: Option<&mut crate::cache_miss::Prefix>,
+) -> Value {
     // The user's SOUL.md, when there is one, says who Letronna is instead.
     let mut system = crate::memory::soul().unwrap_or_else(|| {
         String::from("You are Letronna, a personal assistant. Be clear, concise, and honest.")
@@ -679,8 +700,12 @@ fn body_with(
     // Memory and skills first: they change rarely, so the prompt's start
     // stays cacheable; the summary of dropped turns changes as the
     // conversation grows.
-    system.push_str(&crate::memory::context(connection));
-    system.push_str(&crate::skills::context(connection));
+    let identity = system.len();
+    let memory = crate::memory::context(connection);
+    let skills = crate::skills::context(connection);
+    system.push_str(&memory);
+    system.push_str(&skills);
+    let tail = system.len();
     // Models reckon "today" from their training and guess who they are. The
     // date alone changes once a day, so the prefix above stays cached; the OS
     // says something about this computer, so a shared chat goes without it.
@@ -696,6 +721,16 @@ fn body_with(
             other => other,
         };
         system.push_str(&format!(" This computer runs {os}."));
+    }
+    // Hashed apart from the model line, so that a switch of model is named
+    // as that rather than as the system prompt.
+    if let Some(prefix) = prefix.as_deref_mut() {
+        use crate::cache_miss::Reason;
+        prefix.set(Reason::System, (&system[..identity], &system[tail..]));
+        prefix.set(Reason::Memory, &memory);
+        prefix.set(Reason::Skills, &skills);
+        prefix.set(Reason::Summary, summary);
+        prefix.set(Reason::Model, connection.model.trim());
     }
     system.push_str(&format!(" The model behind you is {}.", connection.model));
     if let Some(summary) = summary {
@@ -861,6 +896,10 @@ fn body_with(
     }
     if crate::usage::asks_cost(&connection.endpoint) {
         body["usage"] = json!({"include": true});
+    }
+    if let Some(prefix) = prefix {
+        let tools = body.get("tools").map(Value::to_string);
+        prefix.set(crate::cache_miss::Reason::Tools, tools);
     }
     body
 }
@@ -1988,14 +2027,17 @@ fn stream(
             let _ = sender.send_blocking(Event::SummaryUsage(usage));
         },
     );
-    let sent = body_with(
+    let mut prefix = crate::cache_miss::Prefix::default();
+    let sent = body_hashed(
         connection,
         window,
         summary.as_deref(),
         checklist(messages).as_deref(),
         budget,
         &extra.tools,
+        Some(&mut prefix),
     );
+    crate::cache_miss::sent(connection.conversation, prefix);
     let mut request = client()
         .map_err(|e| Failure::new(FailureKind::Unknown, e))?
         .post(endpoint)
@@ -2287,6 +2329,20 @@ impl Reply {
                 reasoning: self.reasoning_tokens,
                 cost: self.cost,
             });
+            if let Some(miss) =
+                crate::cache_miss::answered(connection.conversation, self.cached_tokens)
+            {
+                crate::diag::event(
+                    "cache_miss",
+                    &[
+                        ("model", connection.model.as_str().into()),
+                        ("reason", miss.reason.id().into()),
+                        ("before", miss.before.into()),
+                        ("cached", miss.cached.into()),
+                    ],
+                );
+                let _ = sender.send_blocking(Event::CacheMiss(miss.reason));
+            }
         }
         if !done && self.finish.is_none() {
             return Err(Failure::new(
