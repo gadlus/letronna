@@ -222,26 +222,13 @@ impl Chat {
                         Some(Page::Skills),
                         cx,
                     ))
-                    .child(
-                        self.nav_item(
-                            "messaging",
-                            AppIcon::MessageSquare,
-                            "Messaging",
-                            Some(Page::Messaging),
-                            cx,
-                        )
-                        // A chat asking to be allowed waits on that page,
-                        // which nobody has reason to open; this is the knock.
-                        .when(self.pairing.is_some(), |this| {
-                            this.child(div().size(px(6.)).rounded_full().bg(cx.theme().primary))
-                                .tooltip(|window, cx| {
-                                    gpui_component::tooltip::Tooltip::new(
-                                        "A Telegram chat is asking to be allowed",
-                                    )
-                                    .build(window, cx)
-                                })
-                        }),
-                    )
+                    .child(self.nav_item(
+                        "messaging",
+                        AppIcon::MessageSquare,
+                        "Messaging",
+                        Some(Page::Messaging),
+                        cx,
+                    ))
                     .child(self.nav_item(
                         "artifacts",
                         AppIcon::File,

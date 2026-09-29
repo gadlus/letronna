@@ -6,8 +6,8 @@
 //! tray, so this makes it answerable from a phone.
 //!
 //! Two things are deliberately locked down. A bot is public the moment it
-//! exists, so messages are ignored until the user approves one chat, and
-//! nothing else is ever answered. And a remote message cannot see an approval
+//! exists, so messages are ignored until the user pairs one chat, with a
+//! code only they can send from it, and nothing else is ever answered. And a remote message cannot see an approval
 //! card, so remote sessions run in plan mode unless the user explicitly says
 //! otherwise: the failure mode of getting that wrong is someone else running
 //! commands on this machine.
@@ -15,6 +15,8 @@
 use crate::chat::{self as backend};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+pub mod pairing;
 
 const API: &str = "https://api.telegram.org";
 const DISCORD_API: &str = "https://discord.com/api/v10";
@@ -47,6 +49,10 @@ pub struct Telegram {
     /// The one chat allowed to talk to this agent.
     #[serde(default)]
     pub chat: Option<i64>,
+    /// Who paired `chat`, by Telegram user ID: in a group, the one member
+    /// whose answers count.
+    #[serde(default)]
+    pub owner: Option<i64>,
     /// Let remote messages use tools that change things. Off by default: the
     /// approval card has no one to ask on the other end.
     #[serde(default)]
@@ -106,7 +112,7 @@ pub enum Source {
 /// A message that arrived from a chat service.
 pub struct Incoming {
     pub source: Source,
-    /// Who sent it, for the pairing prompt.
+    /// Who sent it, by the name they go by.
     pub from: String,
     /// The prompt: the sender's words, with any forward or replied-to
     /// message quoted in.
@@ -114,6 +120,10 @@ pub struct Incoming {
     /// The sender's own words alone, for commands and card answers, which a
     /// quoted reply would otherwise bury.
     pub said: String,
+    /// The user ID of whoever wrote `said`, as the service vouches for it;
+    /// `None` for a forward, which is someone else's words, and for a post in
+    /// a chat's name, which any of its admins could have sent.
+    pub author: Option<String>,
     /// Where it came from, as the session is told it.
     pub remote: backend::Remote,
 }
@@ -270,6 +280,13 @@ fn parse_updates(body: &serde_json::Value) -> (Vec<Incoming>, Option<u64>) {
             .or_else(|| message["from"]["username"].as_str())
             .unwrap_or("someone")
             .to_owned();
+        // Telegram sets `from` itself, so it cannot be spoofed; but a forward
+        // carries someone else's words, and anonymous admins and channels
+        // all post under one shared `from` with `sender_chat` set.
+        let author = match message["forward_origin"].is_null() && message["sender_chat"].is_null() {
+            true => message["from"]["id"].as_i64().map(|id| id.to_string()),
+            false => None,
+        };
         // Group chats have negative IDs. Everyone in one reads the replies,
         // and the Bot API keeps no history for a bot to read back.
         let group = chat < 0;
@@ -278,6 +295,7 @@ fn parse_updates(body: &serde_json::Value) -> (Vec<Incoming>, Option<u64>) {
             from,
             text: text.to_owned(),
             said: text.to_owned(),
+            author,
             remote: backend::Remote {
                 place: match group {
                     true => "a Telegram group".into(),
@@ -726,6 +744,14 @@ fn gateway_message(
         from: author["username"].as_str().unwrap_or("you").to_owned(),
         text: message_text(&message, bot_id)?,
         said: own_text(&message).unwrap_or_default(),
+        // Only the owner gets this far, but a forward is someone else's words.
+        author: match message["message_snapshots"]
+            .as_array()
+            .is_some_and(|snapshots| !snapshots.is_empty())
+        {
+            true => None,
+            false => author["id"].as_str().map(str::to_owned),
+        },
         remote: backend::Remote {
             // The listener names the channel once it has looked it up.
             place: match server {

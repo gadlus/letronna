@@ -180,8 +180,8 @@ pub(crate) struct Chat {
     pub(crate) job_name: Entity<InputState>,
     pub(crate) job_prompt: Entity<InputState>,
     pub(crate) messaging: letronna_core::messaging::Config,
-    /// A chat that has messaged the bot but has not been allowed yet.
-    pub(crate) pairing: Option<(i64, String)>,
+    /// The code the Messaging page shows for pairing a Telegram chat.
+    pub(crate) pairing: Option<letronna_core::messaging::pairing::Code>,
     /// Sessions a schedule opened, so their result can be reported onward.
     pub(crate) scheduled: std::collections::HashSet<u64>,
     /// Sessions opened for a remote chat, so the reply goes back to it.
@@ -1467,18 +1467,39 @@ impl Chat {
             .detach();
     }
 
-    /// A message arrived from a bot. A Telegram chat the user has not
-    /// approved is held for approval rather than acted on; Discord only ever
-    /// delivers the owner's DMs, so there is nothing to approve.
+    /// A message arrived from a bot. A Telegram chat that is not paired is
+    /// heard only as a try at the pairing code, and gets no reply unless it
+    /// is right; Discord only ever delivers the owner's messages.
     fn on_remote(&mut self, message: letronna_core::messaging::Incoming, cx: &mut Context<Self>) {
         use letronna_core::gate::Mode;
-        use letronna_core::messaging::Source;
-        let source = message.source;
+        use letronna_core::messaging::{Source, pairing};
+        let source = message.source.clone();
         if let Source::Telegram(chat) = source
             && self.messaging.telegram.chat != Some(chat)
         {
-            self.pairing = Some((chat, message.from));
-            cx.notify();
+            let now = std::time::Instant::now();
+            match pairing::pair(
+                &mut self.pairing,
+                &mut self.messaging.telegram,
+                &message,
+                now,
+            ) {
+                Some(pairing::Attempt::Paired) => {
+                    // Saved without restarting the poller: a new one starts
+                    // without the offset and could hear the code again, now
+                    // as the paired chat's first message.
+                    letronna_core::messaging::save(&self.messaging);
+                    self.tell_remote(
+                        &source,
+                        "Paired. Letronna answers this chat now, and only your answers \
+                         count for what it asks here.",
+                        cx,
+                    );
+                    cx.notify();
+                }
+                Some(_) => cx.notify(),
+                None => {}
+            }
             return;
         }
         if message.said.trim() == "/stop" {
@@ -1497,8 +1518,11 @@ impl Chat {
             }
             return;
         }
+        // In a group anyone may write, but only the owner's own words answer;
+        // anyone else's go on as any message would while a turn runs.
         if let Some((waiting, call)) = self.remote_waiting.clone()
             && waiting == source
+            && pairing::may_answer(&self.messaging, &message)
         {
             use letronna_core::messaging::{CardAnswer, card_answer};
             let verdict = match card_answer(&call.name, &call.arguments, &message.said) {
