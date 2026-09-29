@@ -26,6 +26,12 @@
 //! wake-ups run there is no look at all: the agent can only poll them, and
 //! each poll would spend a continuation. Their end wakes the session, and
 //! the turn that follows is looked at instead.
+//!
+//! The goal is kept with the session's other settings, in memory and in
+//! its file's meta record, so like them it is not shared live between a
+//! terminal and a window that have the same session open: each counts its
+//! own continuations, up to twenty each, and a change made in one is
+//! undone by the other's next save of its own copy.
 
 use crate::approvals;
 use crate::cancel::Cancel;
