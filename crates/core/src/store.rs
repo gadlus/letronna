@@ -775,8 +775,9 @@ static RUNNING: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(
 /// if that is set, this has not run in the last day and no other Letronna
 /// is open, then hold the running file for as long as this one runs.
 /// Called at startup, before the sessions are read, so none of them is open
-/// yet but the one the settings say was open last, which is kept.
-pub fn prune_old() {
+/// yet but the one the settings say was open last and those in `keep`, the
+/// ones this start was asked to open, which are kept.
+pub fn prune_old(keep: &[u64]) {
     let mut held = RUNNING
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -800,7 +801,8 @@ pub fn prune_old() {
     // With another Letronna open this waits for a later start, unmarked.
     if settings.keep_days != 0 && !recent && running.try_lock().is_ok() {
         let _ = std::fs::write(&marker, b"");
-        prune(settings.keep_days, backend::now(), &[settings.active_id]);
+        let open = [keep, &[settings.active_id]].concat();
+        prune(settings.keep_days, backend::now(), &open);
         let _ = running.unlock();
     }
     // Waits out another start's prune, so nothing is read half deleted.
@@ -813,17 +815,25 @@ pub fn prune_old() {
 const DAY: u64 = 24 * 60 * 60;
 
 /// Delete every session last touched more than `keep_days` before `now`,
-/// except those in `open`, pinned ones and any another process is writing
-/// to. Gives the ids deleted.
+/// except those in `open`, the newest, pinned ones and any another process
+/// is writing to. Gives the ids deleted.
 fn prune(keep_days: u32, now: u64, open: &[u64]) -> Vec<u64> {
     let before = now.saturating_sub(u64::from(keep_days) * DAY);
+    let sessions = summaries();
+    // What `-c` and a window with no session open go on with, and what is
+    // left after a long break or a clock that jumped ahead.
+    let newest = sessions.first().map(|s| s.updated);
     let mut deleted = Vec::new();
-    for summary in summaries() {
+    for summary in sessions {
         let path = session_path(summary.id);
         // The file's time as well as the meta's: a save that changed no
         // descriptive field still touched the session.
         let written = std::fs::metadata(&path).map_or(0, |stat| modified(&stat) / 1_000_000_000);
-        if summary.pinned || open.contains(&summary.id) || summary.updated.max(written) >= before {
+        if summary.pinned
+            || open.contains(&summary.id)
+            || Some(summary.updated) == newest
+            || summary.updated.max(written) >= before
+        {
             continue;
         }
         // Held means another Letronna is writing it right now, so it is in
@@ -6536,6 +6546,7 @@ pub(crate) mod tests {
 
         let mut store = Store::default();
         saved_days_ago(&mut store, 1, 40, now);
+        saved_days_ago(&mut store, 2, 5, now);
         let path = super::session_path(1);
         let held = Lock::take(&path).unwrap();
         assert!(super::prune(30, now, &[]).is_empty());
@@ -6555,7 +6566,8 @@ pub(crate) mod tests {
 
         let mut store = Store::default();
         saved_days_ago(&mut store, 1, 4000, now);
-        super::prune_old();
+        saved_days_ago(&mut store, 2, 5, now);
+        super::prune_old(&[]);
         assert!(super::session_path(1).exists());
         assert!(!super::pruned_path().exists());
 
@@ -6566,10 +6578,10 @@ pub(crate) mod tests {
         .unwrap();
         // Looked for less than a day ago, so not again yet.
         std::fs::write(super::pruned_path(), "").unwrap();
-        super::prune_old();
+        super::prune_old(&[]);
         assert!(super::session_path(1).exists());
         std::fs::remove_file(super::pruned_path()).unwrap();
-        super::prune_old();
+        super::prune_old(&[]);
         assert!(!super::session_path(1).exists());
         assert!(super::pruned_path().exists());
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
@@ -6738,17 +6750,34 @@ pub(crate) mod tests {
         };
         let other = running();
         other.lock_shared().unwrap();
-        super::prune_old();
+        super::prune_old(&[]);
         assert!(super::session_path(1).exists());
         // Not marked, so the next start looks again.
         assert!(!super::pruned_path().exists());
 
         drop(other);
-        super::prune_old();
+        super::prune_old(&[]);
         assert!(!super::session_path(1).exists());
         assert!(super::session_path(2).exists());
         // And this one now holds it, so no other start prunes meanwhile.
         assert!(running().try_lock().is_err());
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn the_newest_session_and_one_asked_for_are_kept_however_old() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("prune-newest");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let now = crate::chat::now();
+        let mut store = Store::default();
+        saved_days_ago(&mut store, 1, 50, now);
+        saved_days_ago(&mut store, 2, 45, now);
+        saved_days_ago(&mut store, 3, 40, now);
+
+        // 1 is the one `--resume 1` opens, 3 the one `-c` goes on with.
+        assert_eq!(super::prune(30, now, &[1]), [2]);
+        assert!(super::session_path(1).exists() && super::session_path(3).exists());
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 }

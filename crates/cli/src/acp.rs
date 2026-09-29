@@ -87,7 +87,7 @@ pub fn run() -> i32 {
     letronna_core::diag::init("acp");
     // An editor's sessions are written here too, so this start holds the
     // running file as the terminal's does, and prunes as one.
-    store::prune_old();
+    store::prune_old(&[]);
     let store = store::load_listing();
     if store.settings.model.is_empty() {
         eprintln!("Nothing is set up yet. Run `letronna setup` first.");

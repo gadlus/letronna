@@ -153,7 +153,12 @@ fn main() {
     letronna_core::mcp::start();
     letronna_core::diag::mark("mcp");
 
-    store::prune_old();
+    // A session named on the command line is kept for the start opening it.
+    let named = match args.start {
+        Start::Named(id) => Some(id),
+        _ => None,
+    };
+    store::prune_old(named.as_slice());
     let mut runner = Runner {
         store: store::load_listing(),
         allowed: Default::default(),

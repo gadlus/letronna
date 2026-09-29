@@ -454,7 +454,7 @@ impl Chat {
         // session rather than the history. Only listed: each is read in
         // when it is opened, so starting costs the same however much was
         // said before.
-        letronna_core::store::prune_old();
+        letronna_core::store::prune_old(&[]);
         let started = std::time::Instant::now();
         let (mut store, error) = (letronna_core::store::load_listing(), None);
         store.active = store
