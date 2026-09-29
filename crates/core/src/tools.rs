@@ -136,6 +136,13 @@ const MARKER_ROOM: usize = 100;
 /// `read_file`, past anything a model reads through, while a command that
 /// prints without end costs the disk no more than this for the call.
 const SPILL_BYTES: usize = 4 * 1024 * 1024;
+/// A command's output to one pipe is kept this far from its start, and
+/// `KEEP_TAIL` from its end, with only a count of the bytes and lines in
+/// between: a quarter and three quarters of 4 MiB, the split of the cut to
+/// `MAX_OUTPUT`, which then always has whole lines at both ends, while a
+/// command printing gigabytes keeps no more than 8 MiB for its two pipes.
+const KEEP_HEAD: usize = 1024 * 1024;
+const KEEP_TAIL: usize = 3 * 1024 * 1024;
 
 /// Tools contributed by enabled plugins. Kept here rather than read from the
 /// plugin registry because tools run on worker threads with no `App` to hand.
@@ -483,14 +490,24 @@ fn spill(text: &str, ctx: &ToolContext) -> Option<PathBuf> {
 /// whole lines, with a line between them saying how much was left out and
 /// ending in `note`.
 fn keep_ends(text: String, max: usize, note: &str) -> String {
-    if text.len() <= max {
+    keep_ends_around(text, &[], max, note)
+}
+
+/// `keep_ends` for a text with `gaps` in it, in order, where output was
+/// printed but not kept: they fall in the part left out, and its line
+/// counts them too.
+fn keep_ends_around(text: String, gaps: &[Gap], max: usize, note: &str) -> String {
+    if text.len() <= max && gaps.is_empty() {
         return text;
     }
     let room = max.saturating_sub(MARKER_ROOM + note.len());
-    let head = line_end(&text, room / 4);
-    let tail = line_start(&text, text.len() - (room - room / 4));
+    let first = gaps.first().map_or(text.len(), |g| g.at);
+    let last = gaps.last().map_or(0, |g| g.at);
+    let head = line_end(&text, room / 4).min(first);
+    let tail = line_start(&text, text.len().saturating_sub(room - room / 4)).max(last);
     let left = &text[head..tail];
-    let lines = left.lines().count();
+    let lines = left.lines().count() + gaps.iter().map(|g| g.lines).sum::<usize>();
+    let bytes = left.len() + gaps.iter().map(|g| g.bytes).sum::<usize>();
     let unit = if lines == 1 { "line" } else { "lines" };
     let gap = if head == 0 || text[..head].ends_with('\n') {
         ""
@@ -498,9 +515,8 @@ fn keep_ends(text: String, max: usize, note: &str) -> String {
         "\n"
     };
     format!(
-        "{}{gap}… [{lines} {unit} ({} bytes) left out{note}]\n{}",
+        "{}{gap}… [{lines} {unit} ({bytes} bytes) left out{note}]\n{}",
         &text[..head],
-        left.len(),
         &text[tail..]
     )
 }
@@ -779,9 +795,8 @@ fn run_shell(command: &str, cwd: Option<&Path>, cancel: &Cancel) -> Result<Strin
         let _ = child.kill();
         return Err("Cannot read the command's output.".into());
     };
-    let (sender, chunks) = std::sync::mpsc::channel();
-    forward(stdout, false, sender.clone());
-    forward(stderr, true, sender);
+    let (sender, open) = std::sync::mpsc::channel();
+    let kept = [forward(stdout, sender.clone()), forward(stderr, sender)];
     let started = std::time::Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
@@ -801,11 +816,16 @@ fn run_shell(command: &str, cwd: Option<&Path>, cancel: &Cancel) -> Result<Strin
             return Err("Stopped, and the command was ended before it finished.".into());
         }
     };
-    let (out, err, held_open) = collect(&chunks);
-    let mut text = strip_escapes(&String::from_utf8_lossy(&out));
-    let err = strip_escapes(&String::from_utf8_lossy(&err));
+    let held_open = !pipes_closed(&open);
+    let (mut text, gap) = take(&kept[0]).into_text();
+    let mut gaps: Vec<Gap> = gap.into_iter().collect();
+    let (err, gap) = take(&kept[1]).into_text();
     if !err.trim().is_empty() {
         text.push_str("\n[stderr]\n");
+        gaps.extend(gap.map(|g| Gap {
+            at: text.len() + g.at,
+            ..g
+        }));
         text.push_str(&err);
     }
     if !status.success() {
@@ -813,6 +833,7 @@ fn run_shell(command: &str, cwd: Option<&Path>, cancel: &Cancel) -> Result<Strin
     }
     if held_open {
         // First, so the cut `run` makes to a long result cannot drop it.
+        let len = text.len();
         text.insert_str(
             0,
             "[the command started something that is still running and holds \
@@ -820,6 +841,14 @@ fn run_shell(command: &str, cwd: Option<&Path>, cancel: &Cancel) -> Result<Strin
              collected. To follow a process like that, run it with \
              background: true]\n",
         );
+        for gap in &mut gaps {
+            gap.at += text.len() - len;
+        }
+    }
+    if !gaps.is_empty() {
+        // Only this knows where the gaps are, so it makes the cut, and the
+        // one `run` makes then finds the result short enough.
+        text = keep_ends_around(text, &gaps, MAX_OUTPUT, "");
     }
     Ok(text)
 }
@@ -857,27 +886,94 @@ pub(crate) fn strip_escapes(text: &str) -> String {
     out
 }
 
-/// Send what `pipe` yields over `chunks`, marked as stderr or not, until it
-/// closes, dropping everything past `MAX_OUTPUT`.
+/// What a command printed to one pipe: its start, its end and how much
+/// there was in all, so the middle of a chatty command's output costs
+/// nothing to hold.
+#[derive(Default)]
+struct Captured {
+    head: Vec<u8>,
+    tail: std::collections::VecDeque<u8>,
+    bytes: usize,
+    lines: usize,
+}
+
+/// Bytes and line breaks printed but not kept, and where in the text they
+/// would have been.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Gap {
+    at: usize,
+    bytes: usize,
+    lines: usize,
+}
+
+impl Captured {
+    /// Counts `chunk` and keeps it where it falls in the start or the end.
+    fn push(&mut self, chunk: &[u8]) {
+        self.bytes += chunk.len();
+        self.lines += line_breaks(chunk);
+        let room = KEEP_HEAD.saturating_sub(self.head.len()).min(chunk.len());
+        let (head, rest) = chunk.split_at(room);
+        self.head.extend_from_slice(head);
+        self.tail.extend(rest);
+        let over = self.tail.len().saturating_sub(KEEP_TAIL);
+        self.tail.drain(..over);
+    }
+
+    /// What was kept, as text without escape sequences, and the gap in it
+    /// when anything between the start and the end was dropped.
+    fn into_text(mut self) -> (String, Option<Gap>) {
+        let text = |bytes: &[u8]| strip_escapes(&String::from_utf8_lossy(bytes));
+        if self.bytes == self.head.len() + self.tail.len() {
+            self.head.extend(self.tail);
+            return (text(&self.head), None);
+        }
+        // Whole lines on both sides keep the count of lines in the gap
+        // exact; a line longer than what is kept is cut inside instead.
+        if let Some(end) = self.head.iter().rposition(|&b| b == b'\n') {
+            self.head.truncate(end + 1);
+        }
+        let tail = Vec::from(self.tail);
+        let tail = tail
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(&tail[..], |i| &tail[i + 1..]);
+        let mut out = text(&self.head);
+        let gap = Gap {
+            at: out.len(),
+            bytes: self.bytes - self.head.len() - tail.len(),
+            lines: self.lines - line_breaks(&self.head) - line_breaks(tail),
+        };
+        out.push_str(&text(tail));
+        (out, Some(gap))
+    }
+}
+
+fn line_breaks(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|&&b| b == b'\n').count()
+}
+
+/// Keep what `pipe` yields in the returned capture until it closes or the
+/// capture is taken, then drop `open`.
 fn forward(
     mut pipe: impl std::io::Read + Send + 'static,
-    stderr: bool,
-    chunks: std::sync::mpsc::Sender<(bool, Vec<u8>)>,
-) {
+    open: std::sync::mpsc::Sender<()>,
+) -> Arc<Mutex<Option<Captured>>> {
+    let kept = Arc::new(Mutex::new(Some(Captured::default())));
+    let slot = kept.clone();
     std::thread::spawn(move || {
+        let _open = open;
         let mut block = [0u8; 4096];
-        let mut sent = 0;
         loop {
             match pipe.read(&mut block) {
                 Ok(0) => break,
                 Ok(n) => {
-                    // `run` shows no more than `MAX_OUTPUT` and a chatty child
-                    // can print gigabytes, so the rest is dropped; reading on
-                    // anyway keeps a child left behind from blocking on a full
-                    // pipe, or dying of a broken one.
-                    if sent <= MAX_OUTPUT {
-                        sent += n;
-                        let _ = chunks.send((stderr, block[..n].to_vec()));
+                    // Once the capture is taken the rest is dropped; reading
+                    // on anyway keeps a child left behind from blocking on a
+                    // full pipe, or dying of a broken one.
+                    if let Ok(mut slot) = slot.lock()
+                        && let Some(kept) = slot.as_mut()
+                    {
+                        kept.push(&block[..n]);
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -885,25 +981,23 @@ fn forward(
             }
         }
     });
+    kept
 }
 
-/// A finished command's stdout and stderr, and whether a pipe was still open
-/// when `PIPE_GRACE` ran out.
-fn collect(chunks: &std::sync::mpsc::Receiver<(bool, Vec<u8>)>) -> (Vec<u8>, Vec<u8>, bool) {
+/// Whether every reader's pipe closed within `PIPE_GRACE`, which each marks
+/// by dropping its sender of `open`.
+fn pipes_closed(open: &std::sync::mpsc::Receiver<()>) -> bool {
     use std::sync::mpsc::RecvTimeoutError;
-    let (mut out, mut err) = (Vec::new(), Vec::new());
-    let deadline = Instant::now() + PIPE_GRACE;
-    loop {
-        // A chunk already waiting is taken even past the deadline; this still
-        // ends, because `forward` stops sending past `MAX_OUTPUT`.
-        let left = deadline.saturating_duration_since(Instant::now());
-        match chunks.recv_timeout(left) {
-            Ok((true, bytes)) => err.extend(bytes),
-            Ok((false, bytes)) => out.extend(bytes),
-            Err(RecvTimeoutError::Timeout) => return (out, err, true),
-            Err(RecvTimeoutError::Disconnected) => return (out, err, false),
-        }
-    }
+    let closed = open.recv_timeout(PIPE_GRACE);
+    matches!(closed, Err(RecvTimeoutError::Disconnected))
+}
+
+/// What a reader kept so far, which also stops it keeping more.
+fn take(kept: &Mutex<Option<Captured>>) -> Captured {
+    kept.lock()
+        .ok()
+        .and_then(|mut kept| kept.take())
+        .unwrap_or_default()
 }
 
 struct WriteFile;
@@ -1971,13 +2065,10 @@ mod tests {
     fn a_multibyte_character_split_across_reads_survives() {
         // The é (0xC3 0xA9) comes in two reads, as it can from a pipe; the
         // bytes are joined before they are decoded.
-        let (sender, chunks) = std::sync::mpsc::channel();
-        sender.send((false, b"caf\xc3".to_vec())).unwrap();
-        sender.send((false, b"\xa9 done".to_vec())).unwrap();
-        drop(sender);
-        let (out, _, held_open) = collect(&chunks);
-        assert!(!held_open);
-        assert_eq!(String::from_utf8_lossy(&out), "café done");
+        let mut kept = Captured::default();
+        kept.push(b"caf\xc3");
+        kept.push(b"\xa9 done");
+        assert_eq!(kept.into_text(), ("café done".to_owned(), None));
     }
 
     #[test]
@@ -3178,5 +3269,100 @@ mod tests {
         assert_eq!(guards("git commit -m wip"), 0);
         assert_eq!(guards("git status > status.txt"), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The numbers `seq` printed last before the marker in `out` and first
+    /// after it, and the lines and bytes the marker says it left out.
+    #[cfg(unix)]
+    fn around_the_cut(out: &str) -> (usize, usize, usize, usize) {
+        let (head, rest) = out.split_once("… [").unwrap();
+        let (marker, tail) = rest.split_once(" bytes) left out]\n").unwrap();
+        let (lines, bytes) = marker.split_once(" lines (").unwrap();
+        let last = head.lines().last().unwrap().parse().unwrap();
+        let first = tail.lines().next().unwrap().parse().unwrap();
+        (last, first, lines.parse().unwrap(), bytes.parse().unwrap())
+    }
+
+    /// What `seq` prints for the numbers after `last` and before `first`.
+    #[cfg(unix)]
+    fn seq_between(last: usize, first: usize) -> (usize, usize) {
+        let bytes = (last + 1..first).map(|n| n.to_string().len() + 1).sum();
+        (first - last - 1, bytes)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_end_of_a_megabyte_of_output_is_kept_and_counted() {
+        let ctx = ToolContext {
+            workspace: Some(std::env::temp_dir()),
+            ..Default::default()
+        };
+        let command = r#"{"command":"seq 1 150000; exit 3"}"#;
+        let out = run("run_command", command, &ctx).unwrap();
+        assert!(out.len() <= MAX_OUTPUT, "{}", out.len());
+        assert!(out.starts_with("1\n2\n"), "{out}");
+        assert!(out.ends_with("149999\n150000\n\n[exit code 3]"), "{out}");
+        let (last, first, lines, bytes) = around_the_cut(&out);
+        assert_eq!((lines, bytes), seq_between(last, first), "{out}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_past_what_is_kept_still_ends_whole_and_counts_right() {
+        // Some 6.9 MB, so the middle is never held, only counted.
+        let ctx = ToolContext {
+            workspace: Some(std::env::temp_dir()),
+            ..Default::default()
+        };
+        let out = run("run_command", r#"{"command":"seq 1 999999"}"#, &ctx).unwrap();
+        assert!(out.len() <= MAX_OUTPUT, "{}", out.len());
+        assert!(out.starts_with("1\n2\n"), "{out}");
+        assert!(out.ends_with("999998\n999999\n"), "{out}");
+        let (last, first, lines, bytes) = around_the_cut(&out);
+        assert_eq!((lines, bytes), seq_between(last, first), "{out}");
+    }
+
+    #[test]
+    fn a_chatty_command_is_held_in_bounded_memory() {
+        let mut kept = Captured::default();
+        let block = b"y\n".repeat(2048);
+        for _ in 0..16 * 1024 {
+            kept.push(&block);
+        }
+        let all = 64 * 1024 * 1024;
+        assert_eq!((kept.bytes, kept.lines), (all, all / 2));
+        assert_eq!((kept.head.len(), kept.tail.len()), (KEEP_HEAD, KEEP_TAIL));
+        let capacity = kept.tail.capacity();
+        assert!(capacity < 2 * KEEP_TAIL, "{capacity}");
+        // The end starts with a whole line, so the one cut in half goes too.
+        let (text, gap) = kept.into_text();
+        assert_eq!(text.len(), KEEP_HEAD + KEEP_TAIL - 2);
+        let bytes = all - text.len();
+        let gap = gap.unwrap();
+        assert_eq!((gap.at, gap.bytes), (KEEP_HEAD, bytes));
+        assert_eq!(gap.lines, bytes / 2);
+    }
+
+    #[test]
+    fn output_that_fits_what_is_kept_comes_back_whole() {
+        let all = "ab\n".repeat((KEEP_HEAD + KEEP_TAIL) / 3);
+        let mut kept = Captured::default();
+        for chunk in all.as_bytes().chunks(4096) {
+            kept.push(chunk);
+        }
+        assert_eq!(kept.into_text(), (all, None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn random_bytes_past_what_is_kept_are_cut_safely() {
+        let ctx = ToolContext {
+            workspace: Some(std::env::temp_dir()),
+            ..Default::default()
+        };
+        let command = r#"{"command":"head -c 6000000 /dev/urandom"}"#;
+        let out = run("run_command", command, &ctx).unwrap();
+        assert!(out.len() <= MAX_OUTPUT, "{}", out.len());
+        assert!(out.contains(" left out]\n"), "{out}");
     }
 }
