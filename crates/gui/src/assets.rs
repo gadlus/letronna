@@ -22,6 +22,7 @@ impl AssetSource for Assets {
                 "arrow-up",
                 "arrow-down",
                 "copy",
+                "ellipsis",
                 "redo",
                 "undo",
                 "git-branch",

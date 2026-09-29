@@ -1679,6 +1679,13 @@ impl Render for Chat {
             // turn knows its place, which its buttons and menu work from.
             use crate::ui::actions::{Span, shows_bar};
             let messages = &conversation.messages;
+            // A menu a turn opened takes the focus from inside that turn. That
+            // is not the turn being picked out: showing its full row would
+            // take away the button the menu hangs from, and the menu with it.
+            let in_menu = window
+                .context_stack()
+                .iter()
+                .any(|context| context.contains("PopupMenu"));
             let mut turns: Vec<(Vec<AnyElement>, Span, FocusHandle)> = Vec::new();
             let mut assistant_turn = false;
             for (i, m) in messages.iter().enumerate() {
@@ -1713,7 +1720,7 @@ impl Render for Chat {
                 let ends = messages.get(i + 1).is_none_or(|next| next.role == "user")
                     && !(streaming_here && i + 1 == messages.len());
                 let bar = (is_user || ends).then(|| {
-                    let focused = focus.contains_focused(window, cx);
+                    let focused = focus.contains_focused(window, cx) && !in_menu;
                     let shown = shows_bar(*span, messages.len(), streaming_here, focused);
                     self.turn_bar(*span, shown, cx)
                 });

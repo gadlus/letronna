@@ -9,7 +9,7 @@ curl -sL -o "$tmp/p.tgz" https://registry.npmjs.org/@phosphor-icons/core/-/core-
 tar -xzf "$tmp/p.tgz" -C "$tmp"
 src="$tmp/package/assets/light"
 mkdir -p assets/icons
-map="plus:plus close:x window-close:x window-minimize:minus window-maximize:square window-restore:browsers
+map="plus:plus close:x window-close:x window-minimize:minus window-maximize:square window-restore:browsers ellipsis:dots-three
 minus:minus settings:gear arrow-up:arrow-up arrow-down:arrow-down copy:copy panel-left-close:sidebar-simple panel-left-open:sidebar-simple
 chevron-down:caret-down chevron-right:caret-right check:check loader-circle:circle-notch loader:circle-notch bot:robot mic:microphone chevrons-up-down:caret-up-down
 inbox:tray send:paper-plane-tilt sparkles:sparkle message-square:chat-teardrop file:file file-text:file-text clock:clock
