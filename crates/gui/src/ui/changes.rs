@@ -13,11 +13,15 @@ const SHOWN_LINES: usize = 1500;
 #[derive(Default)]
 pub(crate) struct Changes {
     open: Option<Open>,
+    /// Clicks that asked git so far, to tell each answer's click apart.
+    asked: u64,
 }
 
 struct Open {
     session: u64,
     file: PathBuf,
+    /// Which click this is, so an answer to an earlier one is dropped.
+    ask: u64,
     /// `None` while git is still being asked.
     diff: Option<Result<String, String>>,
 }
@@ -45,12 +49,15 @@ impl Chat {
             cx.notify();
             return;
         }
+        self.changes.asked += 1;
+        let ask = self.changes.asked;
         self.changes.open = Some(Open {
             session,
             file: file.clone(),
+            ask,
             diff: None,
         });
-        let only = vec![file.clone()];
+        let only = vec![file];
         cx.spawn(async move |this, cx| {
             let diff = cx
                 .background_executor()
@@ -65,8 +72,9 @@ impl Chat {
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                // Only for the file still open: a later click wins.
-                if let Some(open) = this.changes.open.as_mut().filter(|o| o.file == file) {
+                // Only for this click: a later one, in this session or
+                // another with its own project, wins.
+                if let Some(open) = this.changes.open.as_mut().filter(|o| o.ask == ask) {
                     open.diff = Some(diff);
                 }
                 cx.notify();
