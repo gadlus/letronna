@@ -102,7 +102,7 @@ impl Tool for ApplyPatch {
     fn preview(&self, args: &Value, _: &ToolContext) -> String {
         let patch = patch_arg(args).unwrap_or_default();
         match parse(patch) {
-            Ok(actions) => diff(&actions),
+            Ok(actions) => format!("{}\n{}", listing(&actions), diff(&actions)),
             Err(_) => patch.to_owned(),
         }
     }
@@ -332,6 +332,23 @@ fn hunks(body: &[(usize, &str)], mut i: usize) -> Result<(Vec<Hunk>, usize), Str
         hunks.push(hunk);
     }
     Ok((hunks, i))
+}
+
+/// A line for each file saying what the patch does to it, which the card
+/// shows first: the terminal shows only a card's first lines, and a delete
+/// at the end of a long diff would go by unseen.
+fn listing(actions: &[Action]) -> String {
+    actions
+        .iter()
+        .map(|action| match action {
+            Action::Add { path, .. } => format!("Add {path}\n"),
+            Action::Delete { path } => format!("Delete {path}\n"),
+            Action::Update {
+                path, to: Some(to), ..
+            } => format!("Move {path} to {to}\n"),
+            Action::Update { path, .. } => format!("Update {path}\n"),
+        })
+        .collect()
 }
 
 /// The patch as the card shows it: each file's diff, one after another.
@@ -951,7 +968,7 @@ mod tests {
     }
 
     #[test]
-    fn the_card_shows_every_file_as_one_diff() {
+    fn the_card_names_every_file_and_what_becomes_of_it_before_the_diff() {
         let args = json!({"patch": "*** Begin Patch
 *** Add File: new.txt
 +hi
@@ -964,7 +981,8 @@ mod tests {
 *** End Patch"});
         assert_eq!(
             ApplyPatch.preview(&args, &ToolContext::default()),
-            "--- /dev/null\n+++ new.txt\n+hi\n--- old.txt\n+++ /dev/null\n\
+            "Add new.txt\nDelete old.txt\nMove a.rs to b.rs\n\n\
+             --- /dev/null\n+++ new.txt\n+hi\n--- old.txt\n+++ /dev/null\n\
              --- a.rs\n+++ b.rs\n@@ fn main\n-a\n+b\n"
         );
         assert_eq!(
@@ -972,6 +990,20 @@ mod tests {
             ["new.txt", "old.txt", "a.rs", "b.rs"]
         );
         assert_eq!(paths(&json!({"input": "nonsense"})), None);
+    }
+
+    #[test]
+    fn a_delete_at_the_end_of_a_long_patch_is_among_the_cards_first_lines() {
+        let updates =
+            ["a", "b", "c"].map(|name| format!("*** Update File: {name}.rs\n@@\n-a\n+b\n"));
+        let text = format!(
+            "*** Begin Patch\n{}*** Delete File: important.rs\n*** End Patch",
+            updates.concat()
+        );
+        let card = ApplyPatch.preview(&json!({ "patch": text }), &ToolContext::default());
+        // The terminal shows a card's first 12 lines.
+        let first: Vec<&str> = card.lines().take(12).collect();
+        assert!(first.contains(&"Delete important.rs"), "{first:?}");
     }
 
     #[test]
