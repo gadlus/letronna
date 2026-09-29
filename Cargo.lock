@@ -3686,6 +3686,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "toml 1.1.6+spec-1.1.0",
  "tungstenite",
  "windows-sys 0.59.0",
 ]

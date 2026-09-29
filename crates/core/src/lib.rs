@@ -42,6 +42,7 @@ pub mod tools;
 pub mod update;
 pub mod watch;
 pub mod web;
+mod write;
 
 /// The name the app goes by, used in paths and on screen.
 pub const BRAND: &str = "Letronna";
