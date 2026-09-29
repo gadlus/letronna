@@ -183,7 +183,9 @@ impl Chat {
                 .text_color(cx.theme().muted_foreground)
                 .tooltip("Transcribing…")
                 .disabled(true),
-            None if available() => button
+            // The account the window already holds, not `available()`:
+            // this runs on every frame, and that reads a file each time.
+            None if self.account.is_some() => button
                 .icon(Icon::new(AppIcon::Mic))
                 .tooltip_with_action("Voice input", &ToggleVoice, None)
                 .on_click(cx.listener(|this, _, window, cx| this.toggle_voice(window, cx))),
