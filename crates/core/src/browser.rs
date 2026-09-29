@@ -23,7 +23,8 @@ use crate::cancel::Cancel;
 use crate::cdp::{self, Event, Ignored, Tab};
 use crate::downloads::{self, Keeper};
 use crate::page::{
-    Frame, Line, PAGE_CHARS, Page, Refs, Tree, cut, framed, matching, page, ref_number, window,
+    Frame, Line, OPAQUE, PAGE_CHARS, Page, Refs, Tree, cut, frame_place, framed, matching, page,
+    ref_number, same_origin, window,
 };
 use crate::tools::{Tool, ToolContext};
 use crate::watch::{self, Sight};
@@ -112,6 +113,9 @@ const FRAME_SCROLL: Duration = Duration::from_millis(150);
 /// Groups the page's handles on the nodes an action touched, so they are
 /// let go of together when it is done.
 const HANDLES: &str = "letronna";
+/// The name of the script context of our own a frame is asked about in,
+/// which the browser makes once per frame and hands back after.
+const WORLD: &str = "letronna";
 /// The modifier with which "select all" is pressed. The key differs by
 /// platform; the command sent with it makes it work everywhere.
 const SELECT_ALL: i64 = if cfg!(target_os = "macos") { 4 } else { 2 };
@@ -344,7 +348,7 @@ impl Tool for UsePage {
         "use_page"
     }
     fn description(&self) -> &'static str {
-        "Act on the page open in browse, the way a person would: `click` an element, `type` into a field (it replaces what is there; `submit` presses Enter after), `press` a key such as Enter, Tab, Escape or ArrowDown, `select` a dropdown's option by its text, `upload` files from the project into a file field, `drag` an element onto another (`to`) or to a point, or `eval` a JavaScript expression and get its value back. Elements are named by the refs browse lists, such as e12; one listed under a frame's header marked cross-origin also needs `frame`, that header's origin, and each such action is asked about on its own. `click` also takes a point instead of a ref, and names what was there: `x` and `y` in CSS pixels from the top left of the view, which is as big as the latest screenshot's result says -- not the picture's own pixels, which may have been shrunk on the way to you, and read off a screenshot of the view, not of the whole page. It is refused once the page has changed or scrolled since it was last seen, and inside a frame from another origin than the page's. Returns the page as it is afterwards, and names any file an action downloaded, saved in the project's media/downloads folder (one the page starts a little later is named in the next result). A question the page asks, such as \"Are you sure?\", is answered Cancel unless `confirm` is true."
+        "Act on the page open in browse, the way a person would: `click` an element, `type` into a field (it replaces what is there; `submit` presses Enter after), `press` a key such as Enter, Tab, Escape or ArrowDown, `select` a dropdown's option by its text, `upload` files from the project into a file field, `drag` an element onto another (`to`) or to a point, or `eval` a JavaScript expression and get its value back. Elements are named by the refs browse lists, such as e12; one listed under a frame's header marked cross-origin or opaque origin also needs `frame`, the origin that header names after \"frame\", and each such action is asked about on its own. `click` also takes a point instead of a ref, and names what was there: `x` and `y` in CSS pixels from the top left of the view, which is as big as the latest screenshot's result says -- not the picture's own pixels, which may have been shrunk on the way to you, and read off a screenshot of the view, not of the whole page. It is refused once the page has changed or scrolled since it was last seen, and inside a frame from another origin than the page's. Returns the page as it is afterwards, and names any file an action downloaded, saved in the project's media/downloads folder (one the page starts a little later is named in the next result). A question the page asks, such as \"Are you sure?\", is answered Cancel unless `confirm` is true."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -353,7 +357,7 @@ impl Tool for UsePage {
             "x": {"type": "number", "description": "For click without a ref, or drag without `to`: the point's CSS pixels from the left of the view."},
             "y": {"type": "number", "description": "With x: the point's CSS pixels from the top of the view."},
             "to": {"type": "string", "description": "For drag: the element to drop onto, by its ref."},
-            "frame": {"type": "string", "description": "For an element in a frame from another origin than the page's: that origin, as the frame's header in the listing names it, such as https://pay.example. Left out otherwise."},
+            "frame": {"type": "string", "description": "For an element in a frame from another origin than the page's: that origin, as the frame's header in the listing names it, such as https://pay.example, or opaque:https://pay.example for one whose origin is opaque, as a sandboxed frame's is. Left out otherwise."},
             "text": {"type": "string", "description": "For type: what to type. For select: the option."},
             "submit": {"type": "boolean", "description": "For type: press Enter afterwards."},
             "key": {"type": "string", "description": "For press: Enter, Tab, Escape, Backspace, Delete, an arrow such as ArrowDown, Home, End, PageUp, PageDown, Space, or one character. With a ref, the element is focused first."},
@@ -811,11 +815,13 @@ fn framed_as(number: u32, within: Option<&Frame>, frame: Option<&str>) -> Result
         (None, None) => Ok(()),
         (Some(origin), Some(named)) if origin == named => Ok(()),
         (Some(origin), None) => Err(format!(
-            "e{number} is inside a frame from {origin}, another origin than the page's. Give \
-             `frame`: \"{origin}\" to act there, so the approval names who it is for."
+            "e{number} is inside {}, another origin than the page's. Give `frame`: \"{origin}\" \
+             to act there, so the approval names who it is for.",
+            frame_place(origin)
         )),
         (Some(origin), Some(named)) => Err(format!(
-            "e{number} is inside a frame from {origin}, not from \"{named}\"."
+            "e{number} is inside {}, not \"{named}\".",
+            frame_place(origin)
         )),
         (None, Some(named)) => Err(format!(
             "e{number} is not inside a frame from another origin; leave `frame` (\"{named}\") \
@@ -830,7 +836,8 @@ fn framed_as(number: u32, within: Option<&Frame>, frame: Option<&str>) -> Result
 fn frame_said(args: &Value) -> Option<String> {
     let frame = frame_arg(args)?;
     Some(format!(
-        "Inside a frame from {frame}, another origin than the page it is embedded in"
+        "Inside {}, another origin than the page it is embedded in",
+        frame_place(frame)
     ))
 }
 
@@ -929,21 +936,50 @@ fn pressable(nodes: &[Value], backend: i64) -> (String, String) {
 }
 
 /// The origin a frame's `src` loads from, resolved against the page's
-/// address: "https://pay.example".
+/// address, as `origin_named` names it: "https://pay.example".
 fn origin_of(page: &str, src: &str) -> Option<String> {
     let url = reqwest::Url::parse(page).ok()?.join(src).ok()?;
-    Some(url.origin().ascii_serialization())
+    Some(origin_named(
+        &url.origin().ascii_serialization(),
+        url.as_str(),
+    ))
+}
+
+/// An origin as a listing names it and `frame` gives it back: as the
+/// browser writes it, unless it is opaque -- written "null", or "://" or
+/// nothing in a frame tree -- when it is named by where its frame was
+/// loaded from, `url`.
+fn origin_named(origin: &str, url: &str) -> String {
+    match origin {
+        "" | "://" | "null" => format!("{OPAQUE}{}", loaded_from(url)),
+        origin => origin.to_owned(),
+    }
+}
+
+/// Where the address `url` loads from: its origin, or for one with none of
+/// its own, such as `data:`, its scheme. Never the rest of it, which the
+/// page writes.
+fn loaded_from(url: &str) -> String {
+    let Ok(url) = reqwest::Url::parse(url) else {
+        return "about:blank".into();
+    };
+    match (url.origin(), url.scheme(), url.path()) {
+        (origin, ..) if origin.is_tuple() => origin.ascii_serialization(),
+        (_, "about", path @ ("blank" | "srcdoc")) => format!("about:{path}"),
+        (_, scheme, _) => format!("{scheme}:"),
+    }
 }
 
 /// Refuses a point inside a frame from another origin than the page's,
 /// `frame` being that frame's origin: the approval card and the judge see
 /// only the page's address, and the frame's own gate is its ref's.
 fn in_page(page: &str, frame: Option<&str>) -> Result<(), String> {
-    match frame.filter(|frame| *frame != page) {
+    match frame.filter(|frame| !same_origin(frame, page)) {
         Some(frame) => Err(format!(
-            "That point is inside a frame from {frame}, which a click at a point does not \
-             reach: the approval saw only this page's address. Click what is there by its ref \
-             under the frame's header in the listing, with `frame` naming it."
+            "That point is inside {}, which a click at a point does not reach: the approval saw \
+             only this page's address. Click what is there by its ref under the frame's header \
+             in the listing, with `frame` naming it.",
+            frame_place(frame)
         )),
         None => Ok(()),
     }
@@ -1009,13 +1045,26 @@ fn frame_in<'a>(tree: &'a Value, id: &str) -> Option<&'a Value> {
     children.iter().find_map(|child| frame_in(child, id))
 }
 
+/// How long a call made while listing frames may take: what is left of
+/// `deadline`, at most `FRAME_TIME`.
+fn time_left(deadline: Instant) -> Duration {
+    deadline
+        .saturating_duration_since(Instant::now())
+        .min(FRAME_TIME)
+}
+
 /// A frame as a frame tree gives it.
 #[derive(Clone, Debug, PartialEq)]
 struct Found {
     id: String,
     /// The frame it is in.
     parent: String,
+    /// Its origin as the tree gives it, which the browser counts from its
+    /// address alone: a sandbox is left out, and an `about:blank` frame's
+    /// inherited origin reads opaque.
     origin: String,
+    /// Where it was loaded from.
+    url: String,
     loader: String,
     /// The session its elements are reached through; `None` for the page's.
     session: Option<String>,
@@ -1024,17 +1073,21 @@ struct Found {
 impl Found {
     fn of(frame: &Value, parent: &str, session: Option<&str>) -> Found {
         let text = |key: &str| frame[key].as_str().unwrap_or_default().to_owned();
-        // A sandboxed frame's origin is opaque, which reads as `null`.
-        let origin = match text("securityOrigin") {
-            origin if origin.is_empty() || origin == "://" => "null".into(),
-            origin => origin,
-        };
         Found {
             id: text("id"),
             parent: parent.to_owned(),
-            origin,
+            origin: origin_named(&text("securityOrigin"), &text("url")),
+            url: text("url"),
             loader: text("loaderId"),
             session: session.map(str::to_owned),
+        }
+    }
+
+    /// Its origin as its own document says it, `said`, if it could be asked.
+    fn origin(&self, said: Option<String>) -> String {
+        match said {
+            Some(said) => origin_named(&said, &self.url),
+            None => self.origin.clone(),
         }
     }
 }
@@ -2434,9 +2487,14 @@ impl Session {
             gather(root, Some(&attached.session), &mut found);
         }
         let page = Found::of(&top["frame"], "", None);
+        // Only a page with frames has its own origin to tell theirs from.
+        let said = match found.is_empty() {
+            true => None,
+            false => self.origin_said(None, &page.id, time_left(deadline)),
+        };
         let mut listing = Listing {
             full,
-            origin: page.origin.clone(),
+            origin: page.origin(said),
             found,
             deadline,
             listed: 0,
@@ -2500,13 +2558,15 @@ impl Session {
         };
         let tree: Tree =
             (self.frame_call(session, "Accessibility.getFullAXTree", asked, deadline)).ok()?;
+        let said = self.origin_said(session, &found.id, time_left(deadline));
+        let origin = found.origin(said);
         let mut path = path.to_vec();
         path.push((host, found.id.clone(), found.session.clone()));
         let frame = Arc::new(Frame {
             id: found.id.clone(),
             loader: found.loader.clone(),
-            origin: found.origin.clone(),
-            foreign: found.origin != listing.origin,
+            foreign: !same_origin(&origin, &listing.origin),
+            origin,
             session: found.session.clone(),
             path: path.clone(),
         });
@@ -2524,12 +2584,36 @@ impl Session {
         params: Value,
         deadline: Instant,
     ) -> Result<T, String> {
-        let left = deadline.saturating_duration_since(Instant::now());
+        let left = time_left(deadline);
         if left.is_zero() {
             return Err("No time was left for the page's frames.".into());
         }
         let stop = self.stop.clone();
-        (self.tab).call_in(session, method, params, left.min(FRAME_TIME), Some(&stop))
+        (self.tab).call_in(session, method, params, left, Some(&stop))
+    }
+
+    /// The origin frame `id`'s document has, reached through `session`, as
+    /// it says it in a script context of our own, where the page's scripts
+    /// cannot change what it says; `None` when it cannot be asked within
+    /// `limit`. Its frame tree counts its origin from its address alone.
+    fn origin_said(&mut self, session: Option<&str>, id: &str, limit: Duration) -> Option<String> {
+        let stop = self.stop.clone();
+        let asked = json!({"frameId": id, "worldName": WORLD});
+        let made: Value = (self.tab)
+            .call_in(
+                session,
+                "Page.createIsolatedWorld",
+                asked,
+                limit,
+                Some(&stop),
+            )
+            .ok()?;
+        let context = made["executionContextId"].as_i64()?;
+        let asked = json!({"expression": "origin", "contextId": context, "returnByValue": true});
+        let said: Value = (self.tab)
+            .call_in(session, "Runtime.evaluate", asked, limit, Some(&stop))
+            .ok()?;
+        said["result"]["value"].as_str().map(str::to_owned)
     }
 
     /// The page as a click at a point needs it to be as last seen: the main
@@ -3188,22 +3272,38 @@ impl Session {
         let text = |value: &Value| value.as_str().unwrap_or_default().to_owned();
         let origin = match tag.as_str() {
             // A frame run apart from the page, whose inside the point cannot
-            // see: it is from another site.
+            // see: it is from another site, or sandboxed.
             "iframe" | "frame" if element["contentDocument"].is_null() => {
                 let attributes = element["attributes"]
                     .as_array()
                     .cloned()
                     .unwrap_or_default();
-                let src = attributes.chunks(2).find(|pair| pair[0] == "src");
-                let src = src
-                    .and_then(|pair| pair.get(1))
-                    .map(text)
-                    .unwrap_or_default();
-                Some(origin_of(&text(&page["url"]), &src).unwrap_or_else(|| "another site".into()))
+                let attribute = |name: &str| {
+                    let pair = attributes.chunks(2).find(|pair| pair[0] == name)?;
+                    pair.get(1).map(text)
+                };
+                let src = attribute("src").unwrap_or_default();
+                let origin = origin_of(&text(&page["url"]), &src);
+                let origin = origin.unwrap_or_else(|| "another site".into());
+                match attribute("sandbox") {
+                    Some(_) if !origin.starts_with(OPAQUE) => Some(format!("{OPAQUE}{origin}")),
+                    _ => Some(origin),
+                }
             }
-            _ => frame_in(&frames["frameTree"], &frame).map(|at| text(&at["securityOrigin"])),
+            _ if frame == text(&page["id"]) => None,
+            _ => frame_in(&frames["frameTree"], &frame).cloned().map(|at| {
+                let said = self.origin_said(None, &frame, cdp::CALL_TIME);
+                let tree = origin_named(&text(&at["securityOrigin"]), &text(&at["url"]));
+                said.map_or(tree, |said| origin_named(&said, &text(&at["url"])))
+            }),
         };
-        in_page(&text(&page["securityOrigin"]), origin.as_deref())?;
+        // The page's own origin matters only against a frame's.
+        let top = match origin.is_some() {
+            true => self.origin_said(None, &text(&page["id"]), cdp::CALL_TIME),
+            false => None,
+        };
+        let top = top.unwrap_or_else(|| text(&page["securityOrigin"]));
+        in_page(&origin_named(&top, &text(&page["url"])), origin.as_deref())?;
         let asked = json!({"backendNodeId": node, "fetchRelatives": true});
         let tree: Value = (self.tab)
             .call("Accessibility.getPartialAXTree", asked)
@@ -3961,10 +4061,11 @@ mod tests {
     }
 
     #[test]
-    fn frames_are_found_with_the_session_that_reaches_them_and_an_opaque_origin_reads_null() {
+    fn frames_are_found_with_the_session_that_reaches_them_and_an_opaque_origin_by_its_address() {
         let tree = json!({"frame": {"id": "TOP"}, "childFrames": [
             {"frame": {"id": "A", "securityOrigin": "https://a.example", "loaderId": "LA"},
-             "childFrames": [{"frame": {"id": "B", "securityOrigin": "://"}}]}]});
+             "childFrames": [{"frame": {"id": "B", "securityOrigin": "://",
+                                        "url": "data:text/html,<p>Hi"}}]}]});
         let mut found = Vec::new();
         gather(&tree, Some("S1"), &mut found);
         let seen: Vec<_> = found
@@ -3982,8 +4083,36 @@ mod tests {
             seen,
             [
                 ("A", "TOP", "https://a.example", Some("S1")),
-                ("B", "A", "null", Some("S1"))
+                ("B", "A", "opaque:data:", Some("S1"))
             ]
+        );
+    }
+
+    #[test]
+    fn an_opaque_origin_is_named_by_where_its_frame_was_loaded_from_and_matches_nothing() {
+        let bank = "opaque:https://bank.test:8443";
+        assert_eq!(
+            origin_named("https://pay.test", "https://pay.test/card"),
+            "https://pay.test"
+        );
+        assert_eq!(
+            origin_named("://", "https://bank.test:8443/move?to=x"),
+            bank
+        );
+        assert_eq!(origin_named("null", "data:text/html,<p>Hi"), "opaque:data:");
+        assert_eq!(origin_named("", "about:srcdoc"), "opaque:about:srcdoc");
+        assert_eq!(
+            origin_of("https://shop.test/", "data:text/html,Hi").as_deref(),
+            Some("opaque:data:")
+        );
+        // Two opaque origins loaded from one place are still not one.
+        assert!(in_page(bank, Some(bank)).is_err());
+        let said = frame_said(&json!({"frame": bank})).unwrap();
+        assert!(
+            said.starts_with(
+                "Inside a frame loaded from https://bank.test:8443 with an opaque origin"
+            ),
+            "{said}"
         );
     }
 
@@ -4645,6 +4774,57 @@ mod tests {
     }
 
     #[test]
+    fn a_frame_is_told_apart_by_the_origin_its_document_says_not_by_its_address() {
+        let sandboxed =
+            "frame opaque:https://shop.test (opaque origin, loaded from https://shop.test)";
+        // The page and its frame as their documents say, both served from
+        // shop.test: sandboxed, as by the page's own header and the frame's
+        // attribute; then the frame inheriting the page's, as `about:blank`
+        // does.
+        for (said, header) in [
+            ("null", sandboxed),
+            ("https://shop.test", "frame https://shop.test (same origin)"),
+        ] {
+            let inner = framed_page(Arc::new(Mutex::new("L1")), Arc::default());
+            let page = move |session: Option<&str>, method: &str, params: &Value| {
+                let (events, mut answer) = inner(session, method, params);
+                match method {
+                    // Chrome counts a frame tree's origins from addresses.
+                    "Page.getFrameTree" => {
+                        let frame = &mut answer["frameTree"]["frame"];
+                        frame["securityOrigin"] = json!("https://shop.test");
+                        frame["url"] = json!("https://shop.test/x");
+                    }
+                    "Page.createIsolatedWorld" => answer = json!({"executionContextId": 7}),
+                    "Runtime.evaluate" if params["expression"] == "origin" => {
+                        answer = json!({"result": {"value": said}});
+                    }
+                    _ => {}
+                }
+                (events, answer)
+            };
+            let (mut session, server) = fake_frames_session(page);
+            let listed = session.read(false).unwrap().text();
+            assert!(listed.contains(header), "{listed}");
+            if said == "null" {
+                let refused = session.reach("e1", None).unwrap_err();
+                let named = "`frame`: \"opaque:https://shop.test\"";
+                assert!(refused.contains(named), "{refused}");
+                assert!(session.reach("e1", Some("https://shop.test")).is_err());
+                assert!(
+                    session
+                        .reach("e1", Some("opaque:https://shop.test"))
+                        .is_ok()
+                );
+            } else {
+                assert!(session.reach("e1", None).is_ok());
+            }
+            drop(session);
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
     fn an_element_in_another_sites_frame_is_listed_under_its_origin_and_clicked_through_it() {
         let loader = Arc::new(Mutex::new("L1"));
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -4928,8 +5108,11 @@ mod tests {
                             "<iframe id={id} src=\"{src}\" style=\"display:block;width:300px;height:120px\"></iframe>"
                         )
                     };
+                    // Last, a frame from the page's own site whose origin its
+                    // sandbox makes opaque.
                     framed = format!(
-                        "<!doctype html><title>Frames</title>{}{}{}{}",
+                        "<!doctype html><title>Frames</title>{}{}{}{}\
+                         <iframe sandbox=\"allow-scripts\" src=\"/boxed\"></iframe>",
                         frame("same", "/two"),
                         frame("near", &format!("http://127.0.0.1:{port}/two")),
                         frame("far", &format!("http://localhost:{port}/two")),
@@ -4940,6 +5123,7 @@ mod tests {
                 "/files" => FILES,
                 "/input" => INPUT,
                 "/two" => "<!doctype html><title>Two</title><h1>Page two</h1>",
+                "/boxed" => "<!doctype html><title>Boxed</title><label>Note <input></label>",
                 "/pay" => {
                     "<!doctype html><title>Pay</title><label>Card <input id=card></label>\
                      <button onclick=\"paid.textContent = 'Paid ' + card.value\">Pay</button>\
@@ -5334,6 +5518,19 @@ mod tests {
                 ] {
                     assert!(listed.contains(&header), "{header} in {listed}");
                 }
+                // A sandboxed frame is named by where it was loaded from,
+                // and is not the page's though its address is.
+                let boxed = format!("opaque:{site}");
+                let header = format!("frame {boxed} (opaque origin, loaded from {site})");
+                assert!(listed.contains(&header), "{header} in {listed}");
+                let note = ref_of(&listed, "textbox \"Note\"");
+                let noting = json!({"action": "type", "ref": note, "text": "hi"});
+                let unnamed = act(noting.clone()).unwrap_err();
+                let named = format!("`frame`: \"{boxed}\"");
+                assert!(unnamed.contains(&named), "{unnamed}");
+                let mut named = noting;
+                named["frame"] = json!(boxed);
+                act(named).unwrap();
                 let card = ref_of(&listed, "textbox \"Card\"");
                 let typing = json!({"action": "type", "ref": card, "text": "4242"});
                 let unnamed = act(typing.clone()).unwrap_err();

@@ -223,12 +223,34 @@ impl Frame {
     /// Its header in a listing. Not a line the page could write: those all
     /// start with a dash.
     pub(crate) fn header(&self) -> String {
-        let whose = if self.foreign {
-            "cross-origin"
-        } else {
-            "same origin"
+        let whose = match self.origin.strip_prefix(OPAQUE) {
+            Some(from) => format!("opaque origin, loaded from {from}"),
+            None if self.foreign => "cross-origin".into(),
+            None => "same origin".into(),
         };
         format!("frame {} ({whose})", self.origin)
+    }
+}
+
+/// What starts the name of an opaque origin -- a sandboxed frame's, or a
+/// `data:` page's -- before where its frame was loaded from: the browser
+/// calls every such origin "null", which would tell a bank from an ad.
+pub(crate) const OPAQUE: &str = "opaque:";
+
+/// Whether `origin` is the page's, both as a listing names them. An
+/// opaque origin is the same as no other, not even one named alike.
+pub(crate) fn same_origin(origin: &str, page: &str) -> bool {
+    origin == page && !origin.starts_with(OPAQUE)
+}
+
+/// A frame as a card or a refusal names it, by its origin as a listing
+/// does: "a frame from https://pay.example".
+pub(crate) fn frame_place(origin: &str) -> String {
+    match origin.strip_prefix(OPAQUE) {
+        Some(from) => {
+            format!("a frame loaded from {from} with an opaque origin, as a sandboxed frame has")
+        }
+        None => format!("a frame from {origin}"),
     }
 }
 
@@ -1188,5 +1210,29 @@ mod tests {
         );
         // A point on it still finds its line.
         assert_eq!(listed.line_of(9), Some(1));
+    }
+
+    #[test]
+    fn an_opaque_frame_is_headed_by_where_it_was_loaded_from_and_matches_no_origin() {
+        let opaque = Frame {
+            origin: format!("{OPAQUE}https://bank.example"),
+            foreign: true,
+            ..Frame::default()
+        };
+        assert_eq!(
+            opaque.header(),
+            "frame opaque:https://bank.example (opaque origin, loaded from https://bank.example)"
+        );
+        assert_eq!(
+            frame_place(&opaque.origin),
+            "a frame loaded from https://bank.example with an opaque origin, as a sandboxed frame has"
+        );
+        assert_eq!(
+            frame_place("https://pay.example"),
+            "a frame from https://pay.example"
+        );
+        assert!(same_origin("https://pay.example", "https://pay.example"));
+        assert!(!same_origin("https://pay.example", "https://shop.example"));
+        assert!(!same_origin(&opaque.origin, &opaque.origin));
     }
 }
