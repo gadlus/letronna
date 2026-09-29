@@ -332,6 +332,29 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_grant_does_not_cover_a_later_call_the_floor_asks_about() {
+        let _turn = lock(&SERVING);
+        let requests = serve();
+        let ctx = ToolContext::default();
+        let first = asking(1911, call("a", "run_command"), ctx.clone());
+        let request = requests.recv_timeout(WAIT).unwrap();
+        request.answer(Decision::ForRun);
+        assert_eq!(first.recv_timeout(WAIT), Ok(true));
+
+        // Hard to take back, so a session's own grant would not cover it either.
+        let dangerous = ToolCall {
+            id: "b".into(),
+            name: "run_command".into(),
+            arguments: r#"{"command": "git reset --hard HEAD~1"}"#.into(),
+        };
+        let worse = asking(1911, dangerous, ctx);
+        let request = requests.recv_timeout(WAIT).unwrap();
+        assert_eq!(request.call.id, "b");
+        request.answer(Decision::Deny(String::new()));
+        assert_eq!(worse.recv_timeout(WAIT), Ok(false));
+    }
+
+    #[test]
     fn a_grant_does_not_cover_a_later_call_the_projects_rule_denies() {
         let _turn = lock(&SERVING);
         let requests = serve();
