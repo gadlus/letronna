@@ -1493,8 +1493,8 @@ fn asides_dir() -> PathBuf {
     backend::data_dir().join("asides")
 }
 
-/// Removes the conversations side questions left behind when their process
-/// quit or crashed mid-answer, and only those.
+/// Removes the conversations, and their locks, that side questions left
+/// behind when their process quit or crashed mid-answer, and only those.
 fn sweep_asides() {
     let Ok(entries) = std::fs::read_dir(asides_dir()) else {
         return;
@@ -1506,7 +1506,8 @@ fn sweep_asides() {
             .metadata()
             .and_then(|meta| meta.modified())
             .is_ok_and(|at| at.elapsed().is_ok_and(|age| age > ASIDE_STALE));
-        if name.starts_with(ASIDE) && name.ends_with(".jsonl") && stale {
+        let kind = name.ends_with(".jsonl") || name.ends_with(".lock");
+        if name.starts_with(ASIDE) && kind && stale {
             let _ = std::fs::remove_file(entry.path());
         }
     }
@@ -4044,14 +4045,22 @@ pub(crate) mod tests {
         let running = Transcript::aside(1, None).unwrap().path;
         let other = dir.join("asides").join("notes.jsonl");
         std::fs::write(&other, "").unwrap();
+        // The lock a save of each left behind, and one this feature never made.
+        let [old_lock, running_lock] = [&old, &running].map(|path| {
+            drop(Lock::take(path).unwrap());
+            path.with_extension("lock")
+        });
+        let other_lock = dir.join("asides").join("notes.lock");
+        std::fs::write(&other_lock, "").unwrap();
         let long_ago = std::time::SystemTime::now() - ASIDE_STALE * 2;
-        for path in [&old, &other] {
+        for path in [&old, &other, &old_lock, &other_lock] {
             let file = std::fs::File::options().write(true).open(path).unwrap();
             file.set_modified(long_ago).unwrap();
         }
         load_listing();
-        assert!(!old.exists());
+        assert!(!old.exists() && !old_lock.exists());
         assert!(running.exists() && other.exists());
+        assert!(running_lock.exists() && other_lock.exists());
         assert!(!dir.join("agents").exists());
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }

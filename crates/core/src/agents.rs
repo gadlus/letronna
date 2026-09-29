@@ -1436,12 +1436,8 @@ pub fn btw(
     let from = first.len();
     transcript.conversation.messages = first;
     let model = Some(connection.model.as_str());
-    let mut asking = child(connection, &AgentDef::default(), model, &Limits::read(), id);
-    // One request: a reply that calls a tool ends it, rather than the round
-    // cap's wrap-up asking again.
-    asking.wrap_up = true;
     let report = driver::run(Spec {
-        connection: asking,
+        connection: child(connection, &AgentDef::default(), model, &Limits::read(), id),
         transcript,
         id,
         owner: session,
@@ -3490,7 +3486,10 @@ mod tests {
         let (answer, sent) = ask(reply("", Some(("read_file", read.clone()))));
         assert_eq!(answer, Err("No answer came.".into()));
         assert_eq!(sent.len(), 1);
+        // Offered as the session's are and left to the model, so the request
+        // opens as the session's own and the provider's cache serves it.
         assert!(!sent[0]["tools"].as_array().unwrap().is_empty());
+        assert_eq!(sent[0].get("tool_choice"), None);
         let (answer, sent) = ask(reply("It says hello.", Some(("read_file", read))));
         assert_eq!(answer, Ok("It says hello.".into()));
         assert_eq!(sent.len(), 1);
