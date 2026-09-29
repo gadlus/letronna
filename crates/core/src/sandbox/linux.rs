@@ -67,29 +67,36 @@ fn readable(
 }
 
 /// The folders and files to grant writing beneath so that a command writes
-/// everything under `project` but what an edit asks about, `PROTECTED` and
-/// `SECRETS` taken from `project`, as `children` lists it. A folder on the
-/// way to one of those, `project` itself included, is granted only through
-/// what it holds now, so nothing can be made or removed in it directly.
-fn writable(project: &Path, children: &dyn Fn(&Path) -> Vec<PathBuf>) -> Vec<PathBuf> {
+/// everything under `project` but `hidden` and what an edit asks about,
+/// `PROTECTED` and `SECRETS` taken from `project`, as `children` lists it.
+/// A folder on the way to one of those, `project` itself included, is
+/// granted only through what it holds now, so nothing can be made or
+/// removed in it directly.
+fn writable(
+    project: &Path,
+    hidden: &[PathBuf],
+    children: &dyn Fn(&Path) -> Vec<PathBuf>,
+) -> Vec<PathBuf> {
     fn beneath(
         path: &Path,
         project: &Path,
+        hidden: &[PathBuf],
         children: &dyn Fn(&Path) -> Vec<PathBuf>,
     ) -> Vec<PathBuf> {
         let inside = path.strip_prefix(project).unwrap_or(path);
-        if crate::gate::protected(inside) {
+        if crate::gate::protected(inside) || hidden.iter().any(|hid| hid == path) {
             return Vec::new();
         }
-        if !crate::gate::leads_to_protected(inside) {
+        let holds_hidden = hidden.iter().any(|hid| hid.starts_with(path));
+        if !crate::gate::leads_to_protected(inside) && !holds_hidden {
             return vec![path.to_path_buf()];
         }
         children(path)
             .iter()
-            .flat_map(|child| beneath(child, project, children))
+            .flat_map(|child| beneath(child, project, hidden, children))
             .collect()
     }
-    beneath(project, project, children)
+    beneath(project, project, hidden, children)
 }
 
 /// What `dir` holds, less its links: a rule on a link would grant whatever
@@ -332,7 +339,7 @@ mod kernel {
                 if *dir == policy.temp {
                     vec![dir.clone()]
                 } else {
-                    super::writable(dir, &super::listing)
+                    super::writable(dir, hidden, &super::listing)
                 }
             })
             .chain([PathBuf::from("/dev/null")])
@@ -497,6 +504,38 @@ mod kernel {
             std::fs::remove_dir_all(dir).unwrap();
         }
 
+        /// Letronna's own folder can lie in the project, as when
+        /// `AGENT_DATA_DIR` names one there, and must stay hidden, though
+        /// the project around it is written.
+        #[test]
+        fn a_hidden_folder_inside_the_project_stays_hidden() {
+            if !usable() {
+                return;
+            }
+            let dir = tree("hidden-inside");
+            std::fs::create_dir_all(dir.join("project/src/own")).unwrap();
+            std::fs::create_dir_all(dir.join("project/src/lib")).unwrap();
+            std::fs::write(dir.join("project/src/own/key"), "secret").unwrap();
+            let mut policy = policy(&dir);
+            policy.hidden = vec![dir.join("project/src/own")];
+            let mut command = Command::new("/bin/sh");
+            command
+                .args([
+                    "-c",
+                    "cat src/own/key; echo x > src/own/new; echo x > src/lib/ok",
+                ])
+                .current_dir(dir.join("project"));
+            let ran = confine(&command, &policy, &policy.hidden)
+                .unwrap()
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            assert!(!String::from_utf8_lossy(&ran.stdout).contains("secret"));
+            assert!(!dir.join("project/src/own/new").exists(), "{ran:?}");
+            assert!(dir.join("project/src/lib/ok").exists(), "{ran:?}");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
         #[test]
         fn reading_a_guarded_file_is_refused() {
             if !usable() {
@@ -654,13 +693,14 @@ mod tests {
                     "/p/a.txt",
                 ],
                 Some("/p/.github") => &["/p/.github/workflows", "/p/.github/CODEOWNERS"],
-                Some("/p/src") => &["/p/src/.git"],
+                Some("/p/src") => &["/p/src/.git", "/p/src/own", "/p/src/lib.rs"],
                 _ => &[],
             };
             names.iter().map(PathBuf::from).collect()
         };
-        let writes = writable(Path::new("/p"), &children);
-        let expected = ["/p/.github/CODEOWNERS", "/p/src", "/p/a.txt"].map(PathBuf::from);
+        let hidden = [PathBuf::from("/p/src/own")];
+        let writes = writable(Path::new("/p"), &hidden, &children);
+        let expected = ["/p/.github/CODEOWNERS", "/p/src/lib.rs", "/p/a.txt"].map(PathBuf::from);
         assert_eq!(writes, expected);
     }
 
