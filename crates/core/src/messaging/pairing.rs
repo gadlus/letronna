@@ -1,4 +1,5 @@
-//! Pairing a Telegram chat with this agent, and who in it may answer.
+//! Pairing a Telegram chat or a Slack member with this agent, and who may
+//! answer.
 //!
 //! A bot is public the moment it exists, so a prompt naming whoever last
 //! messaged it could be anyone's: a stranger flooding the bot is who the
@@ -6,8 +7,10 @@
 //! chat that sends it back is paired, with its sender as the owner. In a
 //! group everyone reads the replies and may ask, but a yes to a tool, or
 //! the answer to anything the app asks there, is the owner's alone to give.
+//! A Slack member pairs the same way, by sending the code as a DM; in a
+//! channel or thread only that member is heard or answers.
 
-use super::{Config, Incoming, Source, Telegram};
+use super::{Config, Incoming, Slack, Source, Telegram};
 use std::time::{Duration, Instant};
 
 /// Long enough to pick up a phone and send it, short enough that a guesser
@@ -83,8 +86,37 @@ pub fn pair(
         return None;
     };
     let owner = message.author.as_deref()?.parse::<i64>().ok()?;
-    let tried = message
-        .said
+    let tried = attempt(code, &message.said, now)?;
+    if tried == Attempt::Paired {
+        telegram.chat = Some(chat);
+        telegram.owner = Some(owner);
+    }
+    Some(tried)
+}
+
+/// Take a DM from a Slack member who is not paired as a try at `code`, as
+/// `pair` does a Telegram chat's: the right code makes its sender the one
+/// member the app answers.
+pub fn pair_slack(
+    code: &mut Option<Code>,
+    slack: &mut Slack,
+    message: &Incoming,
+    now: Instant,
+) -> Option<Attempt> {
+    let Source::Slack { .. } = message.source else {
+        return None;
+    };
+    let owner = message.author.clone()?;
+    let tried = attempt(code, &message.said, now)?;
+    if tried == Attempt::Paired {
+        slack.owner = owner;
+    }
+    Some(tried)
+}
+
+/// Whether `said` tries `code`, and what came of it.
+fn attempt(code: &mut Option<Code>, said: &str, now: Instant) -> Option<Attempt> {
+    let tried = said
         .split_whitespace()
         .last()
         .filter(|word| word.len() == 6 && word.bytes().all(|b| b.is_ascii_digit()))?;
@@ -100,15 +132,13 @@ pub fn pair(
         });
     }
     *code = None;
-    telegram.chat = Some(chat);
-    telegram.owner = Some(owner);
     Some(Attempt::Paired)
 }
 
 /// Whether `message` answers what the app asked in its chat: an approval
 /// card, a question, or any yes or no. Only the owner's own words do.
-/// Discord's listener hears nobody else anyway; a Telegram group holds
-/// whoever its members add.
+/// Discord's and Slack's listeners hear nobody else once paired anyway; a
+/// Telegram group holds whoever its members add.
 pub fn may_answer(config: &Config, message: &Incoming) -> bool {
     let Some(author) = message.author.as_deref() else {
         return false;
@@ -119,6 +149,10 @@ pub fn may_answer(config: &Config, message: &Incoming) -> bool {
                 && owner(&config.telegram).is_some_and(|owner| owner.to_string() == author)
         }
         Source::Discord(_) => author == config.discord.owner.trim(),
+        Source::Slack { .. } => {
+            let owner = config.slack.owner.trim();
+            !owner.is_empty() && author == owner
+        }
     }
 }
 
@@ -132,7 +166,7 @@ pub fn owner(telegram: &Telegram) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::super::{Config, Incoming, Source, parse_updates};
-    use super::{Attempt, Code, LIFE, TRIES, may_answer, pair};
+    use super::{Attempt, Code, LIFE, TRIES, may_answer, pair, pair_slack};
     use serde_json::{Value, json};
     use std::time::{Duration, Instant};
 
@@ -296,5 +330,62 @@ mod tests {
         assert_eq!(typed.source, Source::Discord("dm1".into()));
         assert!(may_answer(&config, &typed));
         assert!(!may_answer(&config, &heard(&forward)));
+    }
+
+    /// What the Slack listener hands on for `event`, with `owner` paired.
+    fn slack(owner: &str, event: Value) -> Option<Incoming> {
+        let mut config = Config::default();
+        config.slack.owner = owner.into();
+        super::super::slack_event(&event, &config.slack, "UBOT")
+    }
+
+    fn slack_dm(user: &str, text: &str) -> Value {
+        json!({"type": "message", "channel_type": "im", "channel": "D1", "user": user,
+               "text": text, "ts": "1700000000.000100"})
+    }
+
+    #[test]
+    fn a_slack_member_pairs_by_sending_the_code_in_a_dm() {
+        let now = Instant::now();
+        let mut code = Some(Code::made(424242, now));
+        let mut config = Config::default();
+        let tries: Vec<_> = [
+            ("U9", "please let me in"),
+            ("U9", "111111"),
+            ("U7", "424242"),
+        ]
+        .iter()
+        .map(|(user, text)| {
+            let message = slack("", slack_dm(user, text)).expect("unpaired DMs are handed on");
+            pair_slack(&mut code, &mut config.slack, &message, now)
+        })
+        .collect();
+        assert_eq!(tries, [None, Some(Attempt::Wrong), Some(Attempt::Paired)]);
+        assert_eq!(config.slack.owner, "U7");
+        assert!(code.is_none());
+        // A Telegram chat cannot use a code shown for Slack.
+        let mut code = Some(Code::made(424242, now));
+        let telegram = &updates(vec![said(7, 7, "424242")])[0];
+        assert_eq!(
+            pair_slack(&mut code, &mut config.slack, telegram, now),
+            None
+        );
+        assert!(code.is_some());
+    }
+
+    #[test]
+    fn in_slack_only_the_paired_members_own_words_answer() {
+        let mut config = Config::default();
+        let owners = slack("U7", slack_dm("U7", "yes")).expect("the owner is heard");
+        assert!(!may_answer(&config, &owners));
+        config.slack.owner = "U7".into();
+        assert!(may_answer(&config, &owners));
+        let mention = json!({"type": "app_mention", "channel": "C1", "user": "U7",
+                             "text": "<@UBOT> yes", "ts": "1700000000.000200"});
+        assert!(may_answer(&config, &slack("U7", mention).unwrap()));
+        let mut someone = slack("U8", slack_dm("U8", "yes")).unwrap();
+        assert!(!may_answer(&config, &someone));
+        someone.author = None;
+        assert!(!may_answer(&config, &someone));
     }
 }

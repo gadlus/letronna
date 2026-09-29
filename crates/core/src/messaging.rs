@@ -29,6 +29,33 @@ const INTENTS_WITHOUT_CONTENT: u64 = (1 << 9) | (1 << 12);
 const POLL_SECONDS: u32 = 25;
 /// Telegram rejects anything longer.
 const MAX_REPLY: usize = 4000;
+const SLACK_API: &str = "https://slack.com/api";
+/// Slack asks for message text under 4,000 characters, so a longer reply
+/// goes out in parts of at most that.
+const SLACK_PART: usize = 4000;
+/// Slack cuts a message off past 40,000 characters, and nobody reads more
+/// in a chat: a reply is trimmed to that first, which is ten parts.
+const SLACK_TOTAL: usize = 40_000;
+/// The trim above allows ten parts; line breaks can make them shorter, so
+/// more are dropped rather than posted a second apart.
+const SLACK_PARTS: usize = 10;
+/// How long a read waits for a frame. Slack does not document how often it
+/// pings, so the first quiet spell is answered with a ping of our own and
+/// only a second one in a row means the connection is gone; it is also how
+/// soon the off switch is noticed.
+const SLACK_QUIET: std::time::Duration = std::time::Duration::from_secs(15);
+/// Slack sends an event again when it thinks the ack was lost; this many
+/// recent event IDs cover its three retries with room to spare.
+const SLACK_SEEN: usize = 256;
+/// A rate-limited post waits what Slack asks, but no longer than this, so a
+/// reply is not held back for minutes.
+const SLACK_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+/// The first wait after a failed connection. It doubles with each failure
+/// in a row, up to `SLACK_RETRY_MAX`.
+const SLACK_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+/// Opening a socket is limited to a few calls a minute, so a longer outage
+/// settles at one attempt a minute.
+const SLACK_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -36,6 +63,8 @@ pub struct Config {
     pub telegram: Telegram,
     #[serde(default)]
     pub discord: Discord,
+    #[serde(default)]
+    pub slack: Slack,
 }
 
 /// Two-way: Telegram hands out messages over long polling, so Letronna can
@@ -101,18 +130,56 @@ impl Discord {
     }
 }
 
+/// Two-way over Socket Mode: Slack pushes events down a WebSocket the app
+/// opens, so, as with Telegram, nothing here has to be reachable from the
+/// internet. It hears one member, paired from the window: in a DM with the
+/// app, and where they mention it in a channel it was invited to.
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Slack {
+    #[serde(default)]
+    pub enabled: bool,
+    /// The app-level token (xapp-) that opens the socket.
+    #[serde(default)]
+    pub app_token: String,
+    /// The bot token (xoxb-) that posts the replies.
+    #[serde(default)]
+    pub bot_token: String,
+    /// The one member ID the app answers. Empty until a member sends the
+    /// pairing code.
+    #[serde(default)]
+    pub owner: String,
+    /// As for Telegram: off unless the user says otherwise.
+    #[serde(default)]
+    pub allow_tools: bool,
+}
+
+impl Slack {
+    /// Both tokens are in, so the app can listen and answer.
+    pub fn ready(&self) -> bool {
+        self.enabled && !self.app_token.trim().is_empty() && !self.bot_token.trim().is_empty()
+    }
+}
+
 /// Where a message came from, and so where its answer goes.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Source {
     Telegram(i64),
     /// A channel ID: a DM, or a server channel the bot was mentioned in.
     Discord(String),
+    /// A channel ID, and the thread to answer in: the mention's own, or the
+    /// one it was written in. A DM is answered in place unless it was
+    /// written in a thread.
+    Slack {
+        channel: String,
+        thread: Option<String>,
+    },
 }
 
 /// A message that arrived from a chat service.
 pub struct Incoming {
     pub source: Source,
-    /// Who sent it, by the name they go by.
+    /// Who sent it, by the name they go by; from Slack, the member ID, as
+    /// its events carry no name.
     pub from: String,
     /// The prompt: the sender's words, with any forward or replied-to
     /// message quoted in.
@@ -126,6 +193,9 @@ pub struct Incoming {
     pub author: Option<String>,
     /// Where it came from, as the session is told it.
     pub remote: backend::Remote,
+    /// Heard only if its source is already a session: a reply in a Slack
+    /// channel thread that does not mention the app.
+    pub needs_session: bool,
 }
 
 /// A card the app would show -- a question, or a tool waiting to be
@@ -226,8 +296,9 @@ pub fn save(config: &Config) {
 }
 
 /// Tell every channel that can take it how a scheduled run ended. Nobody asked
-/// for this message, so Telegram gets it only once a chat is paired: that is
-/// the one chat the bot may talk to. Returns what failed to send.
+/// for this message, so Telegram and Slack get it only once a chat or member
+/// is paired: that is the one the bot may talk to. Returns what failed to
+/// send.
 pub fn report(config: &Config, title: &str, body: &str) -> Vec<String> {
     report_via(API, config, title, body)
 }
@@ -245,6 +316,12 @@ fn report_via(api: &str, config: &Config, title: &str, body: &str) -> Vec<String
         let sent = discord_open_dm(&config.discord.bot_token, &config.discord.owner)
             .and_then(|(channel, _)| discord_post(&config.discord.bot_token, &channel, &text));
         if let Err(error) = sent {
+            failed.push(error);
+        }
+    }
+    if config.slack.ready() && !config.slack.owner.trim().is_empty() {
+        let text = format!("*{title}*\n{body}");
+        if let Err(error) = slack_post(&config.slack.bot_token, &config.slack.owner, None, &text) {
             failed.push(error);
         }
     }
@@ -304,6 +381,7 @@ fn parse_updates(body: &serde_json::Value) -> (Vec<Incoming>, Option<u64>) {
                 shared: group,
                 history: None,
             },
+            needs_session: false,
         });
     }
     (messages, highest.map(|id| id + 1))
@@ -766,6 +844,7 @@ fn gateway_message(
                 owner: config.owner.trim().to_owned(),
             }),
         },
+        needs_session: false,
     })
 }
 
@@ -1020,6 +1099,607 @@ fn gateway_session(
             _ => {}
         }
     }
+}
+
+/// Slack's errors that no retry will fix: the token is wrong or gone.
+const SLACK_REFUSED: &[&str] = &[
+    "invalid_auth",
+    "not_authed",
+    "account_inactive",
+    "token_revoked",
+    "token_expired",
+    "not_allowed_token_type",
+];
+
+/// Call a Slack Web API method. Slack answers most failures with 200 and
+/// `"ok": false`, so the error is its own code, `ratelimited` and the
+/// seconds to wait, or `unreachable` or `unreadable` when there was no
+/// answer to read.
+fn slack_call(
+    api: &str,
+    method: &str,
+    token: &str,
+    body: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let client = client().ok_or("unreachable")?;
+    let mut request = client
+        .post(format!("{api}/{method}"))
+        .bearer_auth(token.trim());
+    if let Some(body) = body {
+        request = request.json(body);
+    }
+    let response = request.send().map_err(|_| "unreachable".to_owned())?;
+    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let seconds = response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(1);
+        return Err(format!("ratelimited {seconds}"));
+    }
+    let reply: serde_json::Value = response.json().map_err(|_| "unreadable".to_owned())?;
+    match reply["ok"].as_bool() {
+        Some(true) => Ok(reply),
+        _ => Err(reply["error"].as_str().unwrap_or("unreadable").to_owned()),
+    }
+}
+
+/// How long a rate-limited call asked to wait, capped at `SLACK_WAIT_MAX`.
+fn slack_retry_after(code: &str) -> Option<std::time::Duration> {
+    let seconds = code.strip_prefix("ratelimited ")?.parse().ok()?;
+    Some(std::time::Duration::from_secs(seconds).min(SLACK_WAIT_MAX))
+}
+
+/// A Slack error code as the person setting the app up can act on it.
+fn slack_error(code: &str) -> String {
+    match code {
+        "unreachable" => "Cannot reach Slack.".into(),
+        "unreadable" => "Slack sent an unreadable reply.".into(),
+        "not_allowed_token_type" => "That is the wrong kind of token: the app-level token \
+                                     starts xapp-, the bot token xoxb-."
+            .into(),
+        "missing_scope" => "The Slack app is missing a permission. Give the bot the scopes \
+                            chat:write, im:history, app_mentions:read, channels:history \
+                            and groups:history, then reinstall it."
+            .into(),
+        code if code.starts_with("ratelimited") => {
+            "Slack is limiting how often the app can call it. Try again in a minute.".into()
+        }
+        "not_in_channel" | "channel_not_found" => {
+            "The Slack app is not in that channel. Invite it first.".into()
+        }
+        code if SLACK_REFUSED.contains(&code) => "Slack did not accept that token.".into(),
+        code => format!("Slack refused: {code}."),
+    }
+}
+
+/// Confirm both tokens work before they are kept, and return the bot's
+/// name. Opening a socket is the one way to try the app-level token; the
+/// address it hands back is simply not used.
+pub fn slack_check(app_token: &str, bot_token: &str) -> Result<String, String> {
+    if !app_token.trim().starts_with("xapp-") {
+        return Err(
+            "The app-level token starts with xapp-. Make one under Basic Information, \
+             with the connections:write scope."
+                .into(),
+        );
+    }
+    if !bot_token.trim().starts_with("xoxb-") {
+        return Err(
+            "The bot token starts with xoxb-. It is under OAuth & Permissions once the \
+             app is installed."
+                .into(),
+        );
+    }
+    let (name, _) = slack_auth(SLACK_API, bot_token).map_err(|code| slack_error(&code))?;
+    slack_socket_url(SLACK_API, app_token).map_err(|code| slack_error(&code))?;
+    Ok(name)
+}
+
+/// The bot's name and member ID. The error is Slack's code.
+fn slack_auth(api: &str, bot_token: &str) -> Result<(String, String), String> {
+    let reply = slack_call(api, "auth.test", bot_token, None)?;
+    Ok((
+        reply["user"].as_str().unwrap_or("bot").to_owned(),
+        reply["user_id"].as_str().unwrap_or_default().to_owned(),
+    ))
+}
+
+/// A fresh socket address, good for one connection. The error is Slack's
+/// code, so a refused token can be told from a network blip.
+fn slack_socket_url(api: &str, app_token: &str) -> Result<String, String> {
+    let reply = slack_call(api, "apps.connections.open", app_token, None)?;
+    reply["url"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "unreadable".to_owned())
+}
+
+/// Post a reply where the message came from: the DM, or the thread under a
+/// mention. A long reply goes out in parts rather than being cut off.
+pub fn slack_post(
+    bot_token: &str,
+    channel: &str,
+    thread: Option<&str>,
+    text: &str,
+) -> Result<(), String> {
+    slack_post_via(SLACK_API, bot_token, channel, thread, text)
+}
+
+fn slack_post_via(
+    api: &str,
+    bot_token: &str,
+    channel: &str,
+    thread: Option<&str>,
+    text: &str,
+) -> Result<(), String> {
+    for (index, part) in slack_parts(text).into_iter().enumerate() {
+        // Slack takes about one message a second into a channel.
+        if index > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        // A link the model writes is not fetched by Slack's servers unasked.
+        let mut body = serde_json::json!({
+            "channel": channel,
+            "text": part,
+            "unfurl_links": false,
+            "unfurl_media": false,
+        });
+        if let Some(thread) = thread {
+            body["thread_ts"] = thread.into();
+        }
+        let mut sent = slack_call(api, "chat.postMessage", bot_token, Some(&body));
+        // A burst of parts can be rate limited: wait as asked, once, rather
+        // than lose the rest of the reply.
+        if let Some(wait) = sent.as_ref().err().and_then(|code| slack_retry_after(code)) {
+            std::thread::sleep(wait);
+            sent = slack_call(api, "chat.postMessage", bot_token, Some(&body));
+        }
+        sent.map_err(|code| slack_error(&code))?;
+    }
+    Ok(())
+}
+
+/// `text` as Slack messages: keys hidden, the three characters its markup
+/// reserves escaped, trimmed so the escaped text is what Slack keeps, and
+/// split into at most `SLACK_PARTS` it takes whole, at a line break where
+/// there is one.
+fn slack_parts(text: &str) -> Vec<String> {
+    let text = slack_trimmed(&outgoing(text));
+    let mut parts = Vec::new();
+    let mut rest = text.as_str();
+    while let Some((end, _)) = rest.char_indices().nth(SLACK_PART) {
+        let window = &rest[..end];
+        // Never inside an escape: half of `&lt;` shows as garbage.
+        let whole = match window.rfind('&') {
+            Some(amp) if !window[amp..].contains(';') => amp,
+            _ => end,
+        };
+        let cut = match window[..whole].rfind('\n') {
+            Some(line) if line >= whole / 2 => line + 1,
+            _ => whole,
+        };
+        parts.push(rest[..cut].to_owned());
+        rest = &rest[cut..];
+    }
+    parts.push(rest.to_owned());
+    if parts.len() > SLACK_PARTS {
+        parts.truncate(SLACK_PARTS);
+        parts[SLACK_PARTS - 1].push_str("\n\u{2026} (trimmed)");
+    }
+    parts
+}
+
+/// `text` escaped, cut where its escaped form would pass `SLACK_TOTAL`, so
+/// an entity is never split and a reply full of `&` is not five times over.
+fn slack_trimmed(text: &str) -> String {
+    let mut length = 0;
+    for (at, c) in text.char_indices() {
+        length += match c {
+            '&' => 5,
+            '<' | '>' => 4,
+            _ => 1,
+        };
+        if length > SLACK_TOTAL {
+            return slack_escape(&format!("{}\n\u{2026} (trimmed)", &text[..at]));
+        }
+    }
+    slack_escape(text)
+}
+
+/// Slack reads `&`, `<` and `>` as markup, so they go as entities.
+fn slack_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Slack's markup made readable: a mention as @ and the ID, a channel as #
+/// and its name, a link as its address, the app's own mention dropped, and
+/// the escaped `&`, `<` and `>` put back.
+fn slack_text(raw: &str, bot_user: &str) -> String {
+    let mut out = String::new();
+    let mut rest = raw;
+    while let Some(open) = rest.find('<') {
+        let Some(len) = rest[open..].find('>') else {
+            break;
+        };
+        out.push_str(&rest[..open]);
+        let inner = &rest[open + 1..open + len];
+        let (target, label) = match inner.split_once('|') {
+            Some((target, label)) => (target, Some(label)),
+            None => (inner, None),
+        };
+        if let Some(user) = target.strip_prefix('@') {
+            if user != bot_user {
+                out.push('@');
+                out.push_str(label.unwrap_or(user));
+            }
+        } else if let Some(channel) = target.strip_prefix('#') {
+            out.push('#');
+            out.push_str(label.unwrap_or(channel));
+        } else if let Some(special) = target.strip_prefix('!') {
+            // @here and the like; a date or a user group carries its own text.
+            match label {
+                Some(label) => out.push_str(label),
+                None => {
+                    out.push('@');
+                    out.push_str(special);
+                }
+            }
+        } else {
+            out.push_str(target);
+        }
+        rest = &rest[open + len + 1..];
+    }
+    out.push_str(rest);
+    out.trim()
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// Whether a Socket Mode event is for this agent, and what it says. Anything
+/// from a bot, this app's own replies included, and edits, joins and every
+/// other subtype but a file share and a thread reply also sent to the channel
+/// are dropped, so the app never answers itself. Until a member is paired a
+/// DM from anyone comes through, so it can bring the pairing code; after
+/// that, and in channels always, only the paired member is heard.
+fn slack_event(event: &serde_json::Value, config: &Slack, bot_user: &str) -> Option<Incoming> {
+    let files = match event["subtype"].as_str() {
+        None | Some("thread_broadcast") => false,
+        Some("file_share") => true,
+        Some(_) => return None,
+    };
+    if !event["bot_id"].is_null() {
+        return None;
+    }
+    let user = event["user"].as_str().filter(|user| *user != bot_user)?;
+    let channel = event["channel"].as_str()?;
+    let raw = event["text"].as_str().unwrap_or_default();
+    let thread = event["thread_ts"].as_str();
+    let (dm, needs_session) = match event["type"].as_str()? {
+        "message" if event["channel_type"].as_str() == Some("im") => (true, false),
+        // A mention in a DM arrives as a message too; taking both would
+        // answer it twice.
+        "app_mention" if !channel.starts_with('D') => (false, false),
+        // A thread reply that mentions the app arrives as app_mention too.
+        "message" if thread.is_some() && !raw.contains(&format!("<@{bot_user}")) => (false, true),
+        _ => return None,
+    };
+    let owner = config.owner.trim();
+    if user != owner && (!dm || !owner.is_empty()) {
+        return None;
+    }
+    // Slack takes a leading / as one of its own commands, so these stand in.
+    let said = match slack_text(raw, bot_user) {
+        said if said.eq_ignore_ascii_case("!stop") => "/stop".to_owned(),
+        said if said.eq_ignore_ascii_case("!new") => "/new".to_owned(),
+        said => said,
+    };
+    let text = match files {
+        true => format!("{said}\n\n(attached files are not read)")
+            .trim()
+            .to_owned(),
+        false => said.clone(),
+    };
+    if text.is_empty() {
+        return None;
+    }
+    // A mention is answered in a thread under it, so a channel is not
+    // flooded and the thread becomes the session. A DM is one session, a
+    // reply threaded under a card included.
+    let thread = match dm {
+        true => None,
+        false => thread.or(event["ts"].as_str()),
+    };
+    Some(Incoming {
+        source: Source::Slack {
+            channel: channel.to_owned(),
+            thread: thread.map(str::to_owned),
+        },
+        from: user.to_owned(),
+        said,
+        text,
+        // Slack sets `user` itself, so it cannot be spoofed.
+        author: Some(user.to_owned()),
+        remote: backend::Remote {
+            place: match dm {
+                true => "a Slack DM".into(),
+                false => "a Slack channel".into(),
+            },
+            shared: !dm,
+            history: None,
+        },
+        needs_session,
+    })
+}
+
+/// What the listener does with one Socket Mode frame.
+enum Envelope {
+    /// Send this acknowledgement, then pass on the message it carried for
+    /// the agent, if any.
+    Ack(String, Option<Box<Incoming>>),
+    /// Slack is about to close the connection: open a fresh one.
+    Disconnect,
+    /// Nothing to do: the hello, or something unreadable.
+    Ignore,
+}
+
+/// Read one Socket Mode frame. Every envelope is acknowledged whatever it
+/// holds, or Slack sends it again; only a message event reaches the agent.
+fn slack_envelope(
+    payload: &serde_json::Value,
+    config: &Slack,
+    bot_user: &str,
+    seen: &mut SlackSeen,
+) -> Envelope {
+    if payload["type"].as_str() == Some("disconnect") {
+        return Envelope::Disconnect;
+    }
+    let Some(id) = payload["envelope_id"].as_str() else {
+        return Envelope::Ignore;
+    };
+    let message = match payload["type"].as_str() {
+        // At least once: a repeat is acknowledged again but not acted on.
+        Some("events_api")
+            if payload["payload"]["event_id"]
+                .as_str()
+                .is_none_or(|event| seen.first(event)) =>
+        {
+            slack_event(&payload["payload"]["event"], config, bot_user).map(Box::new)
+        }
+        _ => None,
+    };
+    Envelope::Ack(serde_json::json!({"envelope_id": id}).to_string(), message)
+}
+
+/// The event IDs handed on lately, so one Slack sends again is dropped.
+#[derive(Default)]
+struct SlackSeen(std::collections::VecDeque<String>);
+
+impl SlackSeen {
+    /// Whether `id` is new, remembering it if so.
+    fn first(&mut self, id: &str) -> bool {
+        if self.0.iter().any(|seen| seen == id) {
+            return false;
+        }
+        if self.0.len() == SLACK_SEEN {
+            self.0.pop_front();
+        }
+        self.0.push_back(id.to_owned());
+        true
+    }
+}
+
+/// What the Slack listener is doing, for the settings page.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SlackState {
+    /// Opening a connection, or waiting to try again after one failed.
+    Connecting,
+    Listening,
+    /// Slack refused a token, so the listener has stopped; why, in words.
+    Refused(String),
+}
+
+/// What one listener thread keeps from one connection to the next.
+struct SlackListener {
+    config: Slack,
+    /// The app's own member ID, for dropping its mention from a message.
+    bot_user: String,
+    seen: SlackSeen,
+    quiet: std::time::Duration,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    sender: async_channel::Sender<Incoming>,
+    state: async_channel::Sender<SlackState>,
+}
+
+impl SlackListener {
+    /// Nobody may be watching; the listener carries on either way.
+    fn tell(&self, state: SlackState) {
+        let _ = self.state.try_send(state);
+    }
+}
+
+/// Hold a Socket Mode connection open until `stop` is set, opening a fresh
+/// one when Slack asks or the old one drops. Runs on its own thread; each
+/// message for the agent goes down `sender`, and each change of state down
+/// `state`. While idle the thread wakes once per `SLACK_QUIET`, so `stop` is
+/// noticed within that; a message that arrives after it is left
+/// unacknowledged, and Slack hands it to the connection that replaced this
+/// one. A refused token stops it: retrying cannot help.
+pub fn slack_listen(
+    config: Slack,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    sender: async_channel::Sender<Incoming>,
+    state: async_channel::Sender<SlackState>,
+) {
+    std::thread::spawn(move || {
+        use std::sync::atomic::Ordering;
+        let mut listener = SlackListener {
+            config,
+            bot_user: String::new(),
+            seen: SlackSeen::default(),
+            quiet: SLACK_QUIET,
+            stop,
+            sender,
+            state,
+        };
+        let mut wait = SLACK_RETRY;
+        while !listener.stop.load(Ordering::Relaxed) {
+            listener.tell(SlackState::Connecting);
+            // A refused bot token would otherwise run the agent for every
+            // message and lose every reply.
+            let bot = &listener.config.bot_token;
+            let checked = match listener.bot_user.is_empty() {
+                true => slack_auth(SLACK_API, bot).map(|(_, id)| id),
+                false => Ok(listener.bot_user.clone()),
+            };
+            let began = std::time::Instant::now();
+            let opened = checked
+                .and_then(|id| Ok((id, slack_socket_url(SLACK_API, &listener.config.app_token)?)));
+            let ended = match opened {
+                Err(code) if SLACK_REFUSED.contains(&code.as_str()) => {
+                    return listener.tell(SlackState::Refused(slack_error(&code)));
+                }
+                Err(_) => Ended::Failed,
+                Ok((id, url)) => {
+                    listener.bot_user = id;
+                    slack_session(&url, &mut listener)
+                }
+            };
+            if let Ended::Stopped = ended {
+                return;
+            }
+            let held = began.elapsed() >= SLACK_RETRY_MAX;
+            let (pause, next) = slack_backoff(wait, &ended, held);
+            wait = next;
+            if !pause.is_zero() {
+                listener.tell(SlackState::Connecting);
+                std::thread::sleep(pause);
+            }
+        }
+    });
+}
+
+/// The pause before the next connection and the wait after that one. A
+/// connection that held a while was not what is failing, so the wait starts
+/// over; Slack refreshes one every few hours and says so first, which is
+/// routine, so the next one opens at once.
+fn slack_backoff(
+    wait: std::time::Duration,
+    ended: &Ended,
+    held: bool,
+) -> (std::time::Duration, std::time::Duration) {
+    let wait = if held { SLACK_RETRY } else { wait };
+    match ended {
+        Ended::Closed(None) if held => (std::time::Duration::ZERO, wait),
+        _ => (wait, (wait * 2).min(SLACK_RETRY_MAX)),
+    }
+}
+
+/// One connection, until it ends. A quiet spell is answered with a ping of
+/// our own; a second in a row means the connection is gone even if TCP has
+/// not noticed.
+fn slack_session(url: &str, listener: &mut SlackListener) -> Ended {
+    use std::sync::atomic::Ordering;
+    use tungstenite::Message as Frame;
+    let Some(mut socket) = slack_connect(url, listener.quiet) else {
+        return Ended::Failed;
+    };
+    listener.tell(SlackState::Listening);
+    let mut quiet = false;
+    loop {
+        let read = socket.read();
+        if listener.stop.load(Ordering::Relaxed) {
+            let _ = socket.close(None);
+            return Ended::Stopped;
+        }
+        let frame = match read {
+            Ok(frame) => frame,
+            // tungstenite keeps its place across a timed-out read.
+            Err(tungstenite::Error::Io(error)) if !quiet && slack_quiet(&error) => {
+                quiet = true;
+                if socket.send(Frame::Ping(Default::default())).is_err() {
+                    return Ended::Failed;
+                }
+                continue;
+            }
+            Err(_) => return Ended::Failed,
+        };
+        quiet = false;
+        let payload: serde_json::Value = match frame {
+            Frame::Text(text) => match serde_json::from_str(text.as_str()) {
+                Ok(payload) => payload,
+                Err(_) => continue,
+            },
+            Frame::Close(_) => return Ended::Failed,
+            _ => continue,
+        };
+        let config = &listener.config;
+        match slack_envelope(&payload, config, &listener.bot_user, &mut listener.seen) {
+            Envelope::Ignore => {}
+            Envelope::Disconnect => {
+                let _ = socket.close(None);
+                return Ended::Closed(None);
+            }
+            // Acknowledged before it is acted on, well within Slack's three
+            // seconds; one that cannot be is left for Slack to send again.
+            Envelope::Ack(ack, message) => {
+                if socket.send(Frame::text(ack)).is_err() {
+                    return Ended::Failed;
+                }
+                if let Some(message) = message
+                    && listener.sender.send_blocking(*message).is_err()
+                {
+                    return Ended::Stopped;
+                }
+            }
+        }
+    }
+}
+
+/// Open the socket with a timeout on every step -- the lookup, the connect
+/// and each read, `quiet` -- so neither a stalled resolver nor the handshake
+/// can hang the thread.
+fn slack_connect(
+    url: &str,
+    quiet: std::time::Duration,
+) -> Option<tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>> {
+    use std::net::ToSocketAddrs;
+    let step = std::time::Duration::from_secs(10);
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = (
+        parsed.host_str()?.to_owned(),
+        parsed.port_or_known_default()?,
+    );
+    // The system resolver has no timeout of its own, so it runs aside and a
+    // stalled one is left to finish by itself.
+    let (found, lookup) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = found.send(host.to_socket_addrs().map(Vec::from_iter));
+    });
+    let stream = lookup
+        .recv_timeout(step)
+        .ok()?
+        .ok()?
+        .iter()
+        .find_map(|address| std::net::TcpStream::connect_timeout(address, step).ok())?;
+    stream.set_read_timeout(Some(quiet)).ok()?;
+    stream.set_write_timeout(Some(quiet)).ok()?;
+    tungstenite::client_tls(url, stream)
+        .ok()
+        .map(|(socket, _)| socket)
+}
+
+/// A read that timed out: Unix says it would block, Windows that it timed
+/// out.
+fn slack_quiet(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
 }
 
 pub const READ_CHAT: &str = "read_chat";
@@ -1552,5 +2232,605 @@ mod discord_tests {
     fn read_chat_needs_a_chat() {
         let refused = crate::tools::run("read_chat", "{}", &Default::default()).unwrap_err();
         assert_eq!(refused, "There is no chat to read in this session.");
+    }
+}
+
+#[cfg(test)]
+mod slack_tests {
+    use super::{
+        Ended, Envelope, Incoming, SLACK_PART, SLACK_PARTS, SLACK_QUIET, SLACK_RETRY,
+        SLACK_RETRY_MAX, SLACK_SEEN, SLACK_TOTAL, Slack, SlackListener, SlackSeen, SlackState,
+        Source, slack_backoff, slack_check, slack_envelope, slack_event, slack_parts,
+        slack_post_via, slack_session, slack_text,
+    };
+    use serde_json::{Value, json};
+
+    const BOT: &str = "UBOT";
+
+    fn paired() -> Slack {
+        Slack {
+            enabled: true,
+            app_token: "xapp-1-test".into(),
+            bot_token: "xoxb-test".into(),
+            owner: "U7".into(),
+            ..Default::default()
+        }
+    }
+
+    fn dm(user: &str, text: &str) -> Value {
+        json!({"type": "message", "channel_type": "im", "channel": "D1", "user": user,
+               "text": text, "ts": "1700000000.000100"})
+    }
+
+    fn mention(user: &str, text: &str) -> Value {
+        json!({"type": "app_mention", "channel": "C1", "user": user, "text": text,
+               "ts": "1700000000.000200"})
+    }
+
+    fn envelope(event: Value) -> Value {
+        json!({"envelope_id": "e1", "type": "events_api", "accepts_response_payload": false,
+               "payload": {"type": "event_callback", "event_id": "Ev1", "event": event}})
+    }
+
+    #[test]
+    fn an_event_is_acknowledged_by_its_envelope_id_and_its_message_passed_on() {
+        let Envelope::Ack(ack, Some(message)) = slack_envelope(
+            &envelope(dm("U7", "hello &amp; bye")),
+            &paired(),
+            BOT,
+            &mut SlackSeen::default(),
+        ) else {
+            panic!("expected an acknowledged message");
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&ack).unwrap(),
+            json!({"envelope_id": "e1"})
+        );
+        assert_eq!(
+            message.source,
+            Source::Slack {
+                channel: "D1".into(),
+                thread: None
+            }
+        );
+        assert_eq!(message.text, "hello & bye");
+        assert_eq!(message.said, "hello & bye");
+        assert_eq!(message.from, "U7");
+        assert_eq!(message.remote.place, "a Slack DM");
+        assert!(!message.remote.shared);
+        assert!(message.remote.history.is_none());
+    }
+
+    #[test]
+    fn every_envelope_is_acknowledged_even_with_nothing_for_the_agent() {
+        let command = json!({"envelope_id": "e2", "type": "slash_commands", "payload": {}});
+        let Envelope::Ack(ack, None) =
+            slack_envelope(&command, &paired(), BOT, &mut SlackSeen::default())
+        else {
+            panic!("a slash command is acknowledged and dropped");
+        };
+        assert_eq!(ack, r#"{"envelope_id":"e2"}"#);
+        let stranger = envelope(dm("U8", "hi"));
+        assert!(matches!(
+            slack_envelope(&stranger, &paired(), BOT, &mut SlackSeen::default()),
+            Envelope::Ack(_, None)
+        ));
+        let hello = json!({"type": "hello", "num_connections": 1});
+        assert!(matches!(
+            slack_envelope(&hello, &paired(), BOT, &mut SlackSeen::default()),
+            Envelope::Ignore
+        ));
+        let refresh = json!({"type": "disconnect", "reason": "refresh_requested"});
+        assert!(matches!(
+            slack_envelope(&refresh, &paired(), BOT, &mut SlackSeen::default()),
+            Envelope::Disconnect
+        ));
+    }
+
+    #[test]
+    fn the_apps_own_messages_and_edits_are_never_heard() {
+        let mut own = dm("U7", "an earlier reply");
+        own["bot_id"] = "B1".into();
+        assert!(slack_event(&own, &paired(), BOT).is_none());
+        let mut edit = dm("U7", "fixed a typo");
+        edit["subtype"] = "message_changed".into();
+        assert!(slack_event(&edit, &paired(), BOT).is_none());
+        let mut paired_to_itself = paired();
+        paired_to_itself.owner = BOT.into();
+        assert!(slack_event(&dm(BOT, "hi"), &paired_to_itself, BOT).is_none());
+        assert!(slack_event(&dm("U7", "   "), &paired(), BOT).is_none());
+    }
+
+    #[test]
+    fn a_mention_is_answered_in_its_thread_and_only_from_the_paired_member() {
+        let message = slack_event(&mention("U7", "<@UBOT> what changed?"), &paired(), BOT).unwrap();
+        assert_eq!(message.text, "what changed?");
+        assert_eq!(
+            message.source,
+            Source::Slack {
+                channel: "C1".into(),
+                thread: Some("1700000000.000200".into())
+            }
+        );
+        assert!(message.remote.shared);
+        assert_eq!(message.remote.place, "a Slack channel");
+        let mut in_thread = mention("U7", "<@UBOT> and now?");
+        in_thread["thread_ts"] = "1700000000.000001".into();
+        let message = slack_event(&in_thread, &paired(), BOT).unwrap();
+        assert_eq!(
+            message.source,
+            Source::Slack {
+                channel: "C1".into(),
+                thread: Some("1700000000.000001".into())
+            }
+        );
+        assert!(slack_event(&mention("U8", "<@UBOT> hi"), &paired(), BOT).is_none());
+        // Heard once, as the DM's message, not again as a mention.
+        let mut in_dm = mention("U7", "<@UBOT> hi");
+        in_dm["channel"] = "D1".into();
+        assert!(slack_event(&in_dm, &paired(), BOT).is_none());
+        // A channel's every message, if the app is subscribed to them.
+        let mut chatter = dm("U7", "lunch?");
+        chatter["channel_type"] = "channel".into();
+        assert!(slack_event(&chatter, &paired(), BOT).is_none());
+    }
+
+    #[test]
+    fn before_pairing_a_dm_asks_to_be_allowed_and_a_mention_is_ignored() {
+        let unpaired = Slack {
+            owner: String::new(),
+            ..paired()
+        };
+        let message = slack_event(&dm("U8", "hi"), &unpaired, BOT).unwrap();
+        assert_eq!(message.from, "U8");
+        assert!(slack_event(&mention("U8", "<@UBOT> hi"), &unpaired, BOT).is_none());
+        // Nor does a schedule report to an app nobody paired: this would
+        // otherwise reach out to Slack.
+        let config = super::Config {
+            slack: unpaired,
+            ..Default::default()
+        };
+        assert!(super::report(&config, "Nightly", "ok").is_empty());
+    }
+
+    #[test]
+    fn slack_markup_reads_as_plain_text() {
+        let raw = "<@UBOT> ask <@U9> in <#C2|general> about <https://example.com/a?b=1&amp;c=2|the page>, \
+                   <!here>, 1 &lt; 2 &amp;&amp; 3 &gt; 2, &amp;lt; stays";
+        assert_eq!(
+            slack_text(raw, BOT),
+            "ask @U9 in #general about https://example.com/a?b=1&c=2, @here, 1 < 2 && 3 > 2, \
+             &lt; stays"
+        );
+        assert_eq!(slack_text("a <b", BOT), "a <b");
+    }
+
+    #[test]
+    fn replies_are_escaped_and_split_at_lines_never_inside_an_escape() {
+        assert_eq!(slack_parts("a < b & c > d"), ["a &lt; b &amp; c &gt; d"]);
+        let line = format!("{}\n", "x".repeat(99));
+        let long = line.repeat(SLACK_PART / 100 + 5);
+        let parts = slack_parts(&long);
+        assert_eq!(parts.len(), 2);
+        assert!(parts.iter().all(|part| part.chars().count() <= SLACK_PART));
+        assert!(parts[0].ends_with('\n'));
+        assert_eq!(parts.concat(), long);
+        // No line break to cut at, and an escape straddling the limit.
+        let dense = format!("{}<{}", "y".repeat(SLACK_PART - 2), "z".repeat(10));
+        let parts = slack_parts(&dense);
+        assert_eq!(parts[0], "y".repeat(SLACK_PART - 2));
+        assert!(parts[1].starts_with("&lt;z"));
+        let huge = "w".repeat(SLACK_TOTAL * 2);
+        let parts = slack_parts(&huge);
+        assert_eq!(parts.len(), SLACK_PARTS);
+        assert!(parts.last().unwrap().ends_with("… (trimmed)"));
+        // The escaped text is what is trimmed, and never mid-escape.
+        let amps = slack_parts(&"&".repeat(SLACK_TOTAL)).concat();
+        assert!(amps.chars().count() <= SLACK_TOTAL + 20);
+        assert!(amps.ends_with("&amp;\n… (trimmed)"));
+        // Lines cut at half a part would make twenty; ten are posted.
+        let halves = format!("{}\n", "v".repeat(SLACK_PART / 2)).repeat(19);
+        let parts = slack_parts(&halves);
+        assert_eq!(parts.len(), SLACK_PARTS);
+        assert!(parts.last().unwrap().ends_with("… (trimmed)"));
+    }
+
+    #[test]
+    fn a_token_must_look_right_before_slack_is_asked() {
+        let wrong = slack_check("xoxb-1", "xoxb-2").unwrap_err();
+        assert!(wrong.contains("xapp-"), "{wrong}");
+        let wrong = slack_check("xapp-1", "xoxp-2").unwrap_err();
+        assert!(wrong.contains("xoxb-"), "{wrong}");
+    }
+
+    #[test]
+    fn a_file_share_keeps_its_words_and_a_broadcast_reply_is_a_message() {
+        let mut shared = dm("U7", "see this");
+        shared["subtype"] = "file_share".into();
+        shared["files"] = json!([{"id": "F1"}]);
+        let message = slack_event(&shared, &paired(), BOT).unwrap();
+        assert_eq!(message.text, "see this\n\n(attached files are not read)");
+        assert_eq!(message.said, "see this");
+        shared["text"] = "".into();
+        let message = slack_event(&shared, &paired(), BOT).unwrap();
+        assert_eq!(message.text, "(attached files are not read)");
+        let mut broadcast = mention("U7", "<@UBOT> also here");
+        broadcast["subtype"] = "thread_broadcast".into();
+        broadcast["thread_ts"] = "1700000000.000050".into();
+        let message = slack_event(&broadcast, &paired(), BOT).unwrap();
+        assert_eq!(message.text, "also here");
+    }
+
+    #[test]
+    fn a_thread_reply_without_a_mention_is_heard_only_as_a_follow_up() {
+        let reply = json!({"type": "message", "channel_type": "channel", "channel": "C1",
+                           "user": "U7", "text": "yes", "ts": "1700000000.000300",
+                           "thread_ts": "1700000000.000200"});
+        let message = slack_event(&reply, &paired(), BOT).unwrap();
+        assert!(message.needs_session);
+        assert!(message.remote.shared);
+        let thread = Some("1700000000.000200".to_owned());
+        assert_eq!(
+            message.source,
+            Source::Slack {
+                channel: "C1".into(),
+                thread
+            }
+        );
+        // One that mentions the app arrives as app_mention too.
+        let mut mentioned = reply.clone();
+        mentioned["text"] = "<@UBOT> yes".into();
+        assert!(slack_event(&mentioned, &paired(), BOT).is_none());
+        let mut chatter = reply.clone();
+        chatter.as_object_mut().unwrap().remove("thread_ts");
+        assert!(slack_event(&chatter, &paired(), BOT).is_none());
+        let mut other = reply;
+        other["user"] = "U8".into();
+        assert!(slack_event(&other, &paired(), BOT).is_none());
+        // In a DM a threaded reply, such as a card's answer, is the DM.
+        let mut threaded = dm("U7", "2");
+        threaded["thread_ts"] = "1700000000.000050".into();
+        let message = slack_event(&threaded, &paired(), BOT).unwrap();
+        assert!(!message.needs_session);
+        let dm = Source::Slack {
+            channel: "D1".into(),
+            thread: None,
+        };
+        assert_eq!(message.source, dm);
+    }
+
+    #[test]
+    fn bang_stop_and_bang_new_stand_in_for_the_slash_commands() {
+        let said = |event: Value| slack_event(&event, &paired(), BOT).unwrap().said;
+        assert_eq!(said(dm("U7", " !STOP ")), "/stop");
+        assert_eq!(said(mention("U7", "<@UBOT> !new")), "/new");
+        assert_eq!(said(dm("U7", "!stop that")), "!stop that");
+    }
+
+    #[test]
+    fn a_group_dm_mention_is_shared_and_an_enterprise_member_id_matches_exactly() {
+        let mut group = mention("U7", "<@UBOT> hi");
+        group["channel"] = "G1".into();
+        assert!(slack_event(&group, &paired(), BOT).unwrap().remote.shared);
+        let grid = Slack {
+            owner: "W0123".into(),
+            ..paired()
+        };
+        assert!(slack_event(&dm("W0123", "hi"), &grid, BOT).is_some());
+        assert!(slack_event(&dm("w0123", "hi"), &grid, BOT).is_none());
+        assert!(slack_event(&dm("U0123", "hi"), &grid, BOT).is_none());
+    }
+
+    #[test]
+    fn an_event_slack_sends_again_is_acknowledged_but_not_heard_twice() {
+        let mut seen = SlackSeen::default();
+        let first = envelope(dm("U7", "run it"));
+        assert!(matches!(
+            slack_envelope(&first, &paired(), BOT, &mut seen),
+            Envelope::Ack(_, Some(_))
+        ));
+        let mut again = first.clone();
+        again["envelope_id"] = "e9".into();
+        again["retry_attempt"] = 1.into();
+        let Envelope::Ack(ack, None) = slack_envelope(&again, &paired(), BOT, &mut seen) else {
+            panic!("a repeat is acknowledged and dropped");
+        };
+        assert_eq!(ack, r#"{"envelope_id":"e9"}"#);
+        // Only the latest are kept, so the ring stays small.
+        for n in 0..SLACK_SEEN {
+            assert!(seen.first(&format!("Ev-{n}")));
+        }
+        assert!(seen.first("Ev1"));
+        assert!(!seen.first("Ev1"));
+    }
+
+    #[test]
+    fn a_failing_connection_waits_longer_each_time_up_to_a_minute() {
+        let mut wait = SLACK_RETRY;
+        let mut pauses = Vec::new();
+        for _ in 0..7 {
+            let (pause, next) = slack_backoff(wait, &Ended::Failed, false);
+            pauses.push(pause.as_secs());
+            wait = next;
+        }
+        assert_eq!(pauses, [2, 4, 8, 16, 32, 60, 60]);
+        // One that held a while starts over; Slack's refresh reopens at once,
+        // unless it came right after connecting.
+        let failed = slack_backoff(SLACK_RETRY_MAX, &Ended::Failed, true);
+        assert_eq!(failed, (SLACK_RETRY, SLACK_RETRY * 2));
+        let refresh = slack_backoff(SLACK_RETRY_MAX, &Ended::Closed(None), true);
+        assert_eq!(refresh, (std::time::Duration::ZERO, SLACK_RETRY));
+        let early = slack_backoff(SLACK_RETRY, &Ended::Closed(None), false);
+        assert_eq!(early.0, SLACK_RETRY);
+    }
+
+    /// A Web API call: its path, bearer token and JSON body.
+    type Call = (String, String, Value);
+
+    /// Answer `count` Web API calls with `{"ok": true}`, the first with a
+    /// rate limit instead when `limited`, and hand them back.
+    fn slack_api(count: usize, limited: bool) -> (String, std::thread::JoinHandle<Vec<Call>>) {
+        use std::io::{Read, Write};
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            (0..count)
+                .map(|index| {
+                    let (mut socket, _) = server.accept().unwrap();
+                    let mut bytes = Vec::new();
+                    let mut block = [0; 8192];
+                    let (head, body) = loop {
+                        let n = socket.read(&mut block).unwrap();
+                        assert_ne!(n, 0);
+                        bytes.extend_from_slice(&block[..n]);
+                        let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+                            continue;
+                        };
+                        let head = String::from_utf8_lossy(&bytes[..end]).to_string();
+                        let len: usize = header(&head, "content-length: ").parse().unwrap();
+                        if bytes.len() >= end + 4 + len {
+                            break (head, bytes[end + 4..end + 4 + len].to_vec());
+                        }
+                    };
+                    let (status, ok) = match limited && index == 0 {
+                        true => (
+                            "429 Too Many Requests\r\nRetry-After: 0",
+                            r#"{"ok":false,"error":"ratelimited"}"#,
+                        ),
+                        false => ("200 OK", r#"{"ok":true}"#),
+                    };
+                    write!(
+                        socket,
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{ok}",
+                        ok.len()
+                    )
+                    .unwrap();
+                    let path = head.split_whitespace().nth(1).unwrap().to_owned();
+                    let token = header(&head, "authorization: bearer ");
+                    (path, token, serde_json::from_slice(&body).unwrap())
+                })
+                .collect()
+        });
+        (base, worker)
+    }
+
+    fn header(head: &str, name: &str) -> String {
+        head.lines()
+            .find(|line| line.to_lowercase().starts_with(name))
+            .map(|line| line[name.len()..].trim().to_owned())
+            .unwrap()
+    }
+
+    #[test]
+    fn a_long_reply_goes_to_its_thread_in_parts_with_no_token_in_it() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let data = std::env::temp_dir().join("letronna-slack-scrub");
+        let _ = std::fs::remove_dir_all(&data);
+        std::fs::create_dir_all(&data).unwrap();
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &data) };
+        let config = super::Config {
+            slack: Slack {
+                app_token: "xapp-1-A0SAVED-0123456789".into(),
+                bot_token: "xoxb-0123456789-saved".into(),
+                ..paired()
+            },
+            ..Default::default()
+        };
+        super::save(&config);
+        let marker = crate::redact::MARKER;
+
+        let (api, worker) = slack_api(2, false);
+        let text = format!(
+            "{}\nthe keys are {} and {}",
+            "x".repeat(SLACK_PART - 10),
+            config.slack.app_token,
+            config.slack.bot_token
+        );
+        let sent = slack_post_via(&api, "xoxb-given", "C1", Some("17.01"), &text);
+        let calls = worker.join().unwrap();
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        sent.unwrap();
+        for (path, token, body) in &calls {
+            assert_eq!(path, "/chat.postMessage");
+            assert_eq!(token, "xoxb-given");
+            assert_eq!(body["channel"], "C1");
+            assert_eq!(body["thread_ts"], "17.01");
+            assert_eq!(body["unfurl_links"], false);
+            assert_eq!(body["unfurl_media"], false);
+        }
+        assert_eq!(
+            calls[1].2["text"],
+            format!("the keys are {marker} and {marker}")
+        );
+    }
+
+    #[test]
+    fn a_rate_limited_part_is_sent_again_once_after_the_wait_slack_asks() {
+        let (api, worker) = slack_api(2, true);
+        let sent = slack_post_via(&api, "xoxb-given", "D1", None, "hello");
+        let calls = worker.join().unwrap();
+        sent.unwrap();
+        assert_eq!(calls[0].2, calls[1].2);
+        assert_eq!(calls[1].2["text"], "hello");
+        assert_eq!(
+            super::slack_retry_after("ratelimited 5").unwrap().as_secs(),
+            5
+        );
+        assert_eq!(
+            super::slack_retry_after("ratelimited 900")
+                .unwrap()
+                .as_secs(),
+            30
+        );
+        assert!(super::slack_retry_after("invalid_auth").is_none());
+    }
+
+    type Reply = tungstenite::Result<tungstenite::Message>;
+
+    /// A listener for `paired()` that reads with `quiet`, and the far ends of
+    /// its message and state channels.
+    fn listener(
+        stop: bool,
+        quiet: std::time::Duration,
+    ) -> (
+        SlackListener,
+        async_channel::Receiver<Incoming>,
+        async_channel::Receiver<SlackState>,
+    ) {
+        let (sender, messages) = async_channel::unbounded();
+        let (state, states) = async_channel::unbounded();
+        let listener = SlackListener {
+            config: paired(),
+            bot_user: BOT.into(),
+            seen: SlackSeen::default(),
+            quiet,
+            stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(stop)),
+            sender,
+            state,
+        };
+        (listener, messages, states)
+    }
+
+    /// A local Socket Mode server: say hello, send `frames`, and hand back
+    /// what the client sends in return.
+    fn socket(frames: Vec<Value>) -> (String, std::thread::JoinHandle<Reply>) {
+        use tungstenite::Message as Frame;
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}", server.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let (stream, _) = server.accept().unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            socket
+                .send(Frame::text(r#"{"type":"hello","num_connections":1}"#))
+                .unwrap();
+            // A stopped client may already have gone.
+            for frame in &frames {
+                let _ = socket.send(Frame::text(frame.to_string()));
+            }
+            let reply = socket.read();
+            let refresh = json!({"type": "disconnect", "reason": "refresh_requested"});
+            let _ = socket.send(Frame::text(refresh.to_string()));
+            reply
+        });
+        (url, worker)
+    }
+
+    #[test]
+    fn a_session_acknowledges_hands_on_and_ends_when_slack_asks() {
+        let (url, worker) = socket(vec![envelope(dm("U7", "status?"))]);
+        let (mut listener, receiver, states) = listener(false, SLACK_QUIET);
+        let ended = slack_session(&url, &mut listener);
+        assert!(matches!(ended, Ended::Closed(None)));
+        assert_eq!(states.try_recv().unwrap(), SlackState::Listening);
+        let ack = worker.join().unwrap().unwrap().into_text().unwrap();
+        assert_eq!(ack.as_str(), r#"{"envelope_id":"e1"}"#);
+        assert_eq!(receiver.try_recv().unwrap().text, "status?");
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_stopped_session_leaves_the_next_envelope_for_slack_to_send_again() {
+        let (url, worker) = socket(vec![envelope(dm("U7", "status?"))]);
+        let (mut listener, receiver, _) = listener(true, SLACK_QUIET);
+        let ended = slack_session(&url, &mut listener);
+        assert!(matches!(ended, Ended::Stopped));
+        let reply = worker.join().unwrap();
+        assert!(!matches!(reply, Ok(tungstenite::Message::Text(_))));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    /// A local server that says hello and then nothing: it answers the
+    /// client's pings while `answers`, and stays mute otherwise. It counts the
+    /// pings, and asks for a refresh after three.
+    fn quiet_socket(answers: bool) -> (String, std::thread::JoinHandle<usize>) {
+        use tungstenite::Message as Frame;
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}", server.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let (stream, _) = server.accept().unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            socket
+                .send(Frame::text(r#"{"type":"hello","num_connections":1}"#))
+                .unwrap();
+            if !answers {
+                // Held open, so only the silence can end it.
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                return 0;
+            }
+            let mut pings = 0;
+            // Reading is what sends tungstenite's pong.
+            while let Ok(frame) = socket.read() {
+                if frame.is_ping() {
+                    pings += 1;
+                }
+                if pings == 3 {
+                    let refresh = json!({"type": "disconnect", "reason": "refresh_requested"});
+                    let _ = socket.send(Frame::text(refresh.to_string()));
+                    let _ = socket.read();
+                    break;
+                }
+            }
+            pings
+        });
+        (url, worker)
+    }
+
+    #[test]
+    fn a_quiet_connection_is_pinged_and_kept_while_it_answers() {
+        let quiet = std::time::Duration::from_millis(100);
+        let (url, worker) = quiet_socket(true);
+        let (mut listener, _, _) = listener(false, quiet);
+        let ended = slack_session(&url, &mut listener);
+        assert!(matches!(ended, Ended::Closed(None)));
+        assert_eq!(worker.join().unwrap(), 3);
+    }
+
+    #[test]
+    fn a_connection_silent_twice_in_a_row_is_given_up() {
+        let quiet = std::time::Duration::from_millis(100);
+        let (url, worker) = quiet_socket(false);
+        let (mut listener, _, _) = listener(false, quiet);
+        let began = std::time::Instant::now();
+        let ended = slack_session(&url, &mut listener);
+        assert!(matches!(ended, Ended::Failed));
+        assert!(began.elapsed() < std::time::Duration::from_secs(1));
+        worker.join().unwrap();
+    }
+
+    /// Talks to a real Slack app, and posts one message.
+    #[test]
+    #[ignore = "needs a Slack app with Socket Mode on: LETRONNA_TEST_SLACK_APP=xapp-... \
+                LETRONNA_TEST_SLACK_BOT=xoxb-... LETRONNA_TEST_SLACK_TO=<member or channel \
+                ID> cargo test -p letronna-core -- --ignored live_slack"]
+    fn live_slack_check_and_post() {
+        let env = |name| std::env::var(name).expect(name);
+        let bot = env("LETRONNA_TEST_SLACK_BOT");
+        let name = slack_check(&env("LETRONNA_TEST_SLACK_APP"), &bot).unwrap();
+        println!("connected as {name}");
+        let to = env("LETRONNA_TEST_SLACK_TO");
+        super::slack_post(&bot, &to, None, "Letronna test: 1 < 2 & 3 > 2").unwrap();
     }
 }

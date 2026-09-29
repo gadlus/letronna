@@ -207,6 +207,13 @@ pub(crate) struct Chat {
         letronna_core::chat::ToolCall,
     )>,
     pub(crate) messaging_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// The Slack listener's own off switch and the settings it runs with:
+    /// reopening its socket costs a call Slack limits, so a save that leaves
+    /// Slack alone leaves it running.
+    pub(crate) slack_listener: Option<(
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        letronna_core::messaging::Slack,
+    )>,
     pub(crate) token_input: Entity<InputState>,
     pub(crate) webhook_input: Entity<InputState>,
     pub(crate) discord_token_input: Entity<InputState>,
@@ -561,6 +568,7 @@ impl Chat {
             outstanding: 0,
             remote_waiting: None,
             messaging_stop: None,
+            slack_listener: None,
             token_input,
             webhook_input,
             discord_token_input,
@@ -1413,15 +1421,26 @@ impl Chat {
     }
 
     /// Stop any running poller and start one if messaging is set up. Called
-    /// whenever the settings change, so the worker always matches them.
+    /// whenever the settings change, so the worker always matches them; the
+    /// Slack listener is reopened only when its own settings changed.
     pub(crate) fn restart_messaging(&mut self, cx: &mut Context<Self>) {
         use std::sync::atomic::{AtomicBool, Ordering};
         if let Some(stop) = self.messaging_stop.take() {
             stop.store(true, Ordering::Relaxed);
         }
+        let slack = self.messaging.slack.clone();
+        let unchanged = slack.ready()
+            && self
+                .slack_listener
+                .as_ref()
+                .is_some_and(|(_, running)| *running == slack);
+        if !unchanged && let Some((stop, _)) = self.slack_listener.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        let open_slack = slack.ready() && !unchanged;
         let telegram = &self.messaging.telegram;
         let discord = &self.messaging.discord;
-        if !telegram.ready() && !discord.bot_ready() {
+        if !telegram.ready() && !discord.bot_ready() && !open_slack {
             return;
         }
         let stop = std::sync::Arc::new(AtomicBool::new(false));
@@ -1430,7 +1449,14 @@ impl Chat {
             letronna_core::messaging::poll(telegram.token.clone(), stop.clone(), tx.clone());
         }
         if discord.bot_ready() {
-            letronna_core::messaging::discord_listen(discord.clone(), stop.clone(), tx);
+            letronna_core::messaging::discord_listen(discord.clone(), stop.clone(), tx.clone());
+        }
+        if open_slack {
+            let slack_stop = std::sync::Arc::new(AtomicBool::new(false));
+            // Nothing shows its state yet.
+            let (state, _) = async_channel::unbounded();
+            letronna_core::messaging::slack_listen(slack.clone(), slack_stop.clone(), tx, state);
+            self.slack_listener = Some((slack_stop, slack));
         }
         self.messaging_stop = Some(stop);
         cx.spawn(async move |this, cx| {
@@ -1457,11 +1483,15 @@ impl Chat {
         let text = text.to_owned();
         let telegram = self.messaging.telegram.token.clone();
         let discord = self.messaging.discord.bot_token.clone();
+        let slack = self.messaging.slack.bot_token.clone();
         cx.background_executor()
             .spawn(async move {
                 let _ = match source {
                     Source::Telegram(chat) => messaging::send(&telegram, chat, &text),
                     Source::Discord(channel) => messaging::discord_post(&discord, &channel, &text),
+                    Source::Slack { channel, thread } => {
+                        messaging::slack_post(&slack, &channel, thread.as_deref(), &text)
+                    }
                 };
             })
             .detach();
@@ -1469,7 +1499,9 @@ impl Chat {
 
     /// A message arrived from a bot. A Telegram chat that is not paired is
     /// heard only as a try at the pairing code, and gets no reply unless it
-    /// is right; Discord only ever delivers the owner's messages.
+    /// is right; Discord only ever delivers the owner's messages. Slack hands
+    /// on a DM from anyone until a member is paired, and those are dropped:
+    /// only the paired member is answered.
     fn on_remote(&mut self, message: letronna_core::messaging::Incoming, cx: &mut Context<Self>) {
         use letronna_core::gate::Mode;
         use letronna_core::messaging::{Source, pairing};
@@ -1500,6 +1532,18 @@ impl Chat {
                 Some(_) => cx.notify(),
                 None => {}
             }
+            return;
+        }
+        // Slack hears only its paired member, so who may answer is who is
+        // heard at all.
+        if let Source::Slack { .. } = source
+            && !pairing::may_answer(&self.messaging, &message)
+        {
+            return;
+        }
+        // A thread reply that does not mention the app is a follow-up, or a
+        // card's answer, only where that thread is a session already.
+        if message.needs_session && !self.remote_session.contains_key(&source) {
             return;
         }
         if message.said.trim() == "/stop" {
@@ -1534,12 +1578,16 @@ impl Chat {
             return;
         }
         if self.busy {
-            self.tell_remote(
-                &source,
-                "Still working on something. Send /stop to cancel it, or send this again \
-                 once it is done.",
-                cx,
+            // Slack takes a leading / as one of its own commands.
+            let stop = match source {
+                Source::Slack { .. } => "!stop",
+                _ => "/stop",
+            };
+            let text = format!(
+                "Still working on something. Send {stop} to cancel it, or send this again \
+                 once it is done."
             );
+            self.tell_remote(&source, &text, cx);
             return;
         }
         // Telegram sends /start when a chat first opens the bot.
@@ -1574,6 +1622,7 @@ impl Chat {
         let allow_tools = match source {
             Source::Telegram(_) => self.messaging.telegram.allow_tools,
             Source::Discord(_) => self.messaging.discord.allow_tools,
+            Source::Slack { .. } => self.messaging.slack.allow_tools,
         };
         self.remote.insert(id, source);
         // Nobody on the far end can answer an approval card, so unless the
