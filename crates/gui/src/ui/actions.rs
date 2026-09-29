@@ -55,12 +55,16 @@ impl Chat {
         &self.store.conversations[self.store.active].messages
     }
 
-    /// The text of your message at `at`, if that is what is there.
+    /// The text of your message at `at`, if that is what is there, with
+    /// `/init` as it was typed rather than its prompt.
     fn prompt_text(&self, at: usize) -> Option<String> {
         self.open_messages()
             .get(at)
             .filter(|m| m.role == "user")
-            .map(|m| m.content.clone())
+            .map(|m| {
+                letronna_core::init::typed(&m.content)
+                    .map_or_else(|| m.content.clone(), str::to_owned)
+            })
     }
 
     /// What a turn says, for copying: your message, or the reply's words
@@ -187,7 +191,12 @@ impl Chat {
     fn ask_again(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
         // What had the keys, the edit box or the turn's buttons, is gone.
         self.focus_composer(window, cx);
-        if self.dispatch(text.clone(), None, cx).is_err() {
+        let Some(prompt) = self.prompt_for(text.clone(), cx) else {
+            self.composer
+                .update(cx, |input, cx| input.set_value(text, window, cx));
+            return;
+        };
+        if self.dispatch(prompt, None, cx).is_err() {
             // Not asked, so the text waits in the box rather than being lost.
             self.composer
                 .update(cx, |input, cx| input.set_value(text, window, cx));

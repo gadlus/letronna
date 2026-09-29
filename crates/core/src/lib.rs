@@ -28,6 +28,7 @@ pub mod gateway;
 mod grep;
 pub mod history;
 pub mod inbox;
+pub mod init;
 pub mod jobs;
 pub mod judge;
 pub mod limits;

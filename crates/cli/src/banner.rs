@@ -24,7 +24,10 @@ pub fn replay(runner: &Runner, session: usize) {
     }
     for message in &messages[from..] {
         match message.role.as_str() {
-            "user" => said_over_lines(&render::blue("›"), &message.content, true),
+            "user" => {
+                let text = letronna_core::init::typed(&message.content).unwrap_or(&message.content);
+                said_over_lines(&render::blue("›"), text, true)
+            }
             "assistant" if !message.content.trim().is_empty() => {
                 said_over_lines(&render::blue("●"), &message.content, false);
                 if message.interrupted {

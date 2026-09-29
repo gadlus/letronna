@@ -692,10 +692,31 @@ impl Chat {
             cx.notify();
             return;
         }
+        let Some(prompt) = self.prompt_for(prompt, cx) else {
+            return;
+        };
         self.composer
             .update(cx, |input, cx| input.set_value("", window, cx));
         if self.dispatch(prompt, None, cx).is_err() {
             self.open_settings(window, cx);
+        }
+    }
+
+    /// What sending `text` in the active session asks the model: `/init`
+    /// becomes its prompt, or `None` with the reason shown when there is no
+    /// project folder for it.
+    pub(crate) fn prompt_for(&mut self, text: String, cx: &mut Context<Self>) -> Option<String> {
+        let workspace = self.store.conversations[self.store.active]
+            .workspace
+            .as_deref();
+        match letronna_core::init::command(&text, workspace) {
+            Some(Ok(prompt)) => Some(prompt.to_owned()),
+            Some(Err(why)) => {
+                self.error = Some(why);
+                cx.notify();
+                None
+            }
+            None => Some(text),
         }
     }
 
@@ -749,7 +770,8 @@ impl Chat {
         if conversation.messages.is_empty()
             && (conversation.title.is_empty() || conversation.title == "New session")
         {
-            conversation.title = prompt.chars().take(40).collect();
+            let shown = letronna_core::init::typed(&prompt).unwrap_or(&prompt);
+            conversation.title = shown.chars().take(40).collect();
         }
         conversation.updated = backend::now();
         conversation.messages.push(Message {
@@ -1642,6 +1664,9 @@ impl Chat {
             Some("Another session is working. Send this when it is done, or stop it first.")
         } else if prompt.chars().count() > 12_000 {
             Some("Please keep each message under 12,000 characters.")
+        } else if prompt == letronna_core::init::COMMAND {
+            // Folded into a turn as it runs, it would reach the model as typed.
+            Some("/init starts a turn of its own. Send it when this one is done.")
         } else {
             None
         };

@@ -114,7 +114,10 @@ impl Chat {
                 )
                 .into_any_element()
         } else if is_user {
-            TextView::markdown(md, message.content.clone(), window, cx)
+            // `/init` shows as typed, not as the prompt it sent.
+            let text = letronna_core::init::typed(&message.content)
+                .map_or_else(|| message.content.clone(), str::to_owned);
+            TextView::markdown(md, text, window, cx)
                 .selectable(selectable)
                 .text_size(px(15.))
                 .font_weight(FontWeight::MEDIUM)
