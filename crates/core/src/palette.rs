@@ -93,6 +93,11 @@ pub fn typed_folder(query: &str) -> Option<PathBuf> {
         }
         _ => PathBuf::from(typed),
     };
+    // Looked at on every key, on the window's thread: a share would be
+    // signed in to and a device can hang, for half-typed text too.
+    if crate::paths::unsafe_raw(&path.to_string_lossy(), None).is_some() {
+        return None;
+    }
     (path.is_absolute() && path.is_dir()).then_some(path)
 }
 
@@ -176,5 +181,14 @@ mod tests {
         assert_eq!(typed_folder(&file.display().to_string()), None);
         assert_eq!(typed_folder("crates"), None);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_typed_share_or_device_path_is_not_looked_at_on_windows() {
+        // Canonical on Windows is a `\\?\` device path, here to a real folder.
+        let dir = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let found = typed_folder(&dir.display().to_string());
+        assert_eq!(found, (!cfg!(windows)).then_some(dir));
+        assert_eq!(typed_folder(r"\\host\share"), None);
     }
 }
