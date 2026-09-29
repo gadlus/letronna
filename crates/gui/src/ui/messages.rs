@@ -497,23 +497,24 @@ impl Chat {
                 cx.background_executor()
                     .timer(std::time::Duration::from_secs(1))
                     .await;
-                let due = this.update(cx, |this, cx| {
+                let waiting = this.update(cx, |this, cx| {
                     // A turn since, or the session gone, leaves nothing to
                     // wait for, and the count must not tick on until `at`.
                     if this.waiting_retry.as_ref().is_some_and(same) && !this.ends_failed(session) {
                         this.waiting_retry = None;
                     }
                     let waiting = this.waiting_retry.as_ref().is_some_and(same);
-                    cx.notify();
-                    waiting.then(|| backend::now() >= at)
-                });
-                match due {
-                    Ok(Some(false)) => {}
-                    Ok(Some(true)) => {
-                        let _ = this.update(cx, |this, cx| this.retry_failed(session, cx));
-                        break;
+                    // In the same update as the check, so nothing can take
+                    // the agent in between.
+                    if waiting && retry_due(backend::now(), at, this.busy) {
+                        this.retry_failed(session, cx);
+                        return false;
                     }
-                    _ => break,
+                    cx.notify();
+                    waiting
+                });
+                if !matches!(waiting, Ok(true)) {
+                    break;
                 }
             }
         })
@@ -551,15 +552,17 @@ impl Chat {
             if !newest || running_here {
                 None
             } else if let Some(waiting) = waiting {
-                let left = countdown(waiting.at.saturating_sub(now));
+                let when = if now >= waiting.at {
+                    "Retrying once the reply running now is done".to_owned()
+                } else {
+                    let left = countdown(waiting.at - now);
+                    format!("Retrying at {}, in {left}", failure::clock(waiting.at))
+                };
                 Some(
                     h_flex()
                         .gap_2()
                         .items_center()
-                        .child(div().text_xs().text_color(muted).child(format!(
-                            "Retrying at {}, in {left}",
-                            failure::clock(waiting.at)
-                        )))
+                        .child(div().text_xs().text_color(muted).child(when))
                         .child(
                             Button::new(self.row_id("failure-cancel", index))
                                 .plain(cx)
@@ -1107,6 +1110,12 @@ impl Chat {
     }
 }
 
+/// Whether a retry set for `at` goes at `now`. Another session's reply owns
+/// the agent while `busy`, and the retry waits for it rather than being lost.
+fn retry_due(now: u64, at: u64, busy: bool) -> bool {
+    now >= at && !busy
+}
+
 /// What is left of a wait, as a clock counts it down: 0:45, 3:05, 1:02:03.
 fn countdown(seconds: u64) -> String {
     let (hours, minutes, seconds) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
@@ -1323,8 +1332,16 @@ fn sound_button(index: usize, path: PathBuf, cx: &mut Context<Chat>) -> Button {
 mod tests {
     // Deliberately not `use super::*`: the prelude re-exports gpui, whose own
     // `test` macro would shadow the built-in attribute here.
-    use super::{countdown, usage_line};
+    use super::{countdown, retry_due, usage_line};
     use letronna_core::chat::Message;
+
+    #[test]
+    fn a_retry_that_falls_due_while_busy_waits_rather_than_going() {
+        assert!(!retry_due(999, 1_000, false));
+        assert!(retry_due(1_000, 1_000, false));
+        assert!(!retry_due(1_000, 1_000, true));
+        assert!(retry_due(1_500, 1_000, false));
+    }
 
     #[test]
     fn a_countdown_reads_as_a_clock_does() {
