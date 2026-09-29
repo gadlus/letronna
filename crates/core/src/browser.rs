@@ -2506,11 +2506,13 @@ impl Session {
             };
             let root = &tree["frameTree"];
             found.retain(|known| known.id != attached.frame);
-            found.push(Found::of(
-                &root["frame"],
-                &attached.parent,
-                Some(&attached.session),
-            ));
+            // A browser that leaves out which frame it sits in when telling
+            // of a frame still writes it in the frame's own tree.
+            let parent = match attached.parent.as_str() {
+                "" => root["frame"]["parentId"].as_str().unwrap_or_default(),
+                parent => parent,
+            };
+            found.push(Found::of(&root["frame"], parent, Some(&attached.session)));
             gather(root, Some(&attached.session), &mut found);
         }
         let page = Found::of(&top["frame"], "", None);
@@ -5220,6 +5222,33 @@ mod tests {
         let flipped = json!([310, 300, 10, 300, 10, 200, 310, 200]);
         assert!(drawn_as_laid_out(&flipped, (300., 100.)).is_err());
         assert!(drawn_as_laid_out(&json!([]), (300., 100.)).is_err());
+    }
+
+    #[test]
+    fn a_frame_told_of_without_the_frame_it_sits_in_is_still_listed() {
+        let inner = framed_page(Arc::default(), Arc::default(), [300, 100], u64::MAX);
+        let page = move |session: Option<&str>, method: &str, params: &Value| {
+            let (events, mut answer) = inner(session, method, params);
+            match (session, method) {
+                (None, "Target.setAutoAttach") => {
+                    let info = json!({"targetId": "F1", "type": "iframe"});
+                    let told = json!({"method": "Target.attachedToTarget",
+                                      "params": {"sessionId": "S1", "targetInfo": info}});
+                    (vec![told], answer)
+                }
+                (Some("S1"), "Page.getFrameTree") => {
+                    answer["frameTree"]["frame"]["parentId"] = json!("TOP");
+                    (events, answer)
+                }
+                _ => (events, answer),
+            }
+        };
+        let (mut session, server) = fake_frames_session(page);
+        let listed = session.read(false).unwrap().text();
+        let framed = "frame https://pay.test (cross-origin)\n  - textbox \"Card number\" [e1]";
+        assert!(listed.contains(framed), "{listed}");
+        drop(session);
+        server.join().unwrap();
     }
 
     #[test]
