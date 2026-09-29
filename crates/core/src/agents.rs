@@ -1499,6 +1499,9 @@ pub fn quick(connection: &Connection, question: &str, cancel: Cancel) -> Result<
     // No tool schemas either, which would cost more than the question.
     asking.tools = false;
     asking.wrap_up = true;
+    // A look is one short verdict: thinking at the session's level would cost
+    // hundreds of tokens more for nothing it needs.
+    asking.effort = "low".into();
     let report = driver::run(Spec {
         connection: asking,
         transcript,
@@ -3579,6 +3582,29 @@ mod tests {
         let sent = stub.sent();
         let last = sent[0]["messages"].as_array().unwrap().last().unwrap();
         assert_eq!(last["content"], format!("{ASIDE_HEADER}\nwhat did it say?"));
+    }
+
+    #[test]
+    fn a_quick_look_thinks_little_offers_no_tools_and_is_counted() {
+        let session = Session::new("quick-look");
+        let (endpoint, stub) = Stub::start(vec![reply("It is done.", None)]);
+        let ctx = session.context(endpoint);
+        let mut connection = ctx.caller.connection.as_deref().unwrap().clone();
+        connection.effort = "high".into();
+        let answer = quick(&connection, "is it done?", Cancel::default());
+        assert_eq!(answer, Ok("It is done.".into()));
+        let sent = stub.sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["reasoning_effort"], "low", "{}", sent[0]);
+        assert!(sent[0].get("tools").is_none(), "{}", sent[0]);
+        // What it cost is kept where /usage counts it, and nothing else is.
+        let spent = crate::store::spent(0, connection.conversation);
+        let counted = spent
+            .iter()
+            .filter(|call| call.session == connection.conversation);
+        assert_eq!(counted.count(), 1, "{spent:?}");
+        let asides = session.data.join("asides");
+        assert!(std::fs::read_dir(asides).map_or(true, |dir| dir.count() == 0));
     }
 
     /// A fork call that waits for its report.

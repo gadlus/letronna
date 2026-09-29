@@ -17,9 +17,11 @@
 //! turns of work the user had put aside.
 //!
 //! The look runs on the headless driver with no tools and no history, the
-//! goal, the last reply and the check's output being all it reads, on the
-//! helpers' model when one is set: a small model answers this as well as a
-//! large one, and the price of each look stays flat as the session grows.
+//! goal, the last reply and the check's output being all it reads, thinking
+//! at low effort, on the helpers' model when one is set: that
+//! setting is where to name a cheap model, since a small one answers this
+//! as well as a large one. The price of each look stays flat as the
+//! session grows.
 //! A user who stops or types meanwhile ends it where it is, and nothing it
 //! found is acted on. While the session's jobs, helpers, workflows or
 //! wake-ups run there is no look at all: the agent can only poll them, and
