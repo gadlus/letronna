@@ -6,8 +6,10 @@
 //! `ask_user` is answered by the user, and only runs here when nobody is there
 //! to answer it.
 
+use crate::budget::Budget;
 use crate::cancel::Cancel;
 use crate::chat::{Connection, Remote};
+use crate::driver::AgentId;
 use crate::grep::{SEARCH_FILES, SEARCH_TIME};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read};
@@ -35,6 +37,26 @@ pub struct ToolContext {
     /// The user said yes to this very call on its card, which lets a read
     /// the gate asked about reach a file of keys.
     pub approved: bool,
+    /// Who is calling, for tools that start other agents. Crate-private, so
+    /// a plugin's tool never sees the connection's key.
+    pub(crate) caller: Caller,
+}
+
+/// Who is making a call, as a tool that starts another agent needs to know.
+#[derive(Clone, Default)]
+pub(crate) struct Caller {
+    /// What the calling agent talks to the model on, which a helper's is made from.
+    pub connection: Option<Arc<Connection>>,
+    /// The helper making the call, or None for a session's own agent.
+    pub agent: Option<AgentId>,
+    /// The session the work is for.
+    pub root: u64,
+    /// How many helpers deep the calling agent is: 0 for a session's own.
+    pub depth: u8,
+    /// What the calling helper's tree spends from, or None outside a helper.
+    pub budget: Option<Arc<Budget>>,
+    /// The tree of helpers the call is made in, which an approval for the run covers.
+    pub run: Option<u64>,
 }
 
 impl ToolContext {
@@ -47,6 +69,11 @@ impl ToolContext {
             cancel: Cancel::default(),
             plan: connection.plan,
             approved: false,
+            caller: Caller {
+                connection: Some(Arc::new(connection.clone())),
+                root: connection.conversation,
+                ..Caller::default()
+            },
         }
     }
 
@@ -198,6 +225,7 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(crate::media::MakeVideo),
         Arc::new(crate::browser::Browse),
         Arc::new(crate::browser::UsePage),
+        Arc::new(crate::agents::Agent),
     ];
     // The user's own search service, once one is set up.
     if crate::search::ready() {
@@ -614,6 +642,7 @@ pub fn summary(name: &str, args: &str) -> String {
             .unwrap_or_default()
             .to_owned(),
         "speak" => v["text"].as_str().unwrap_or_default().to_owned(),
+        "agent" => v["description"].as_str().unwrap_or_default().to_owned(),
         crate::browser::BROWSE | "use_page" => crate::browser::summary(&v),
         TODO => {
             let items = v["items"].as_array().map(Vec::len).unwrap_or(0);

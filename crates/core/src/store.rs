@@ -190,6 +190,21 @@ pub struct Settings {
     /// terminal saves over it.
     #[serde(default)]
     pub context_cap: u64,
+    /// The model helpers use when neither the call nor their type names one;
+    /// empty for the model of the agent that starts them.
+    #[serde(default)]
+    pub helper_model: String,
+    /// How many helpers may run at once across Letronna; 0 for the usual 8.
+    #[serde(default)]
+    pub helpers_at_once: usize,
+    /// How deep helpers may nest, a helper's own helper being depth 2; 0 for
+    /// the usual 2.
+    #[serde(default)]
+    pub helper_depth: u8,
+    /// Tokens the helpers one agent call starts may spend between them; 0 for
+    /// the usual 500k.
+    #[serde(default)]
+    pub helper_budget: u64,
 }
 
 // Written out rather than derived so the film grain starts on for a first
@@ -200,6 +215,10 @@ impl Default for Settings {
             endpoint: String::new(),
             model: String::new(),
             context_cap: 0,
+            helper_model: String::new(),
+            helpers_at_once: 0,
+            helper_depth: 0,
+            helper_budget: 0,
             gateway: String::new(),
             custom_endpoint: String::new(),
             presence: String::new(),
@@ -943,6 +962,11 @@ pub fn fill(conversation: &mut Conversation) {
         conversation.flushed = conversation.messages.len();
         conversation.written = Some(conversation.meta());
     }
+}
+
+/// The settings as the file has them now.
+pub(crate) fn current_settings() -> Settings {
+    settings().0
 }
 
 /// The context cap the settings file sets, 0 for the default.

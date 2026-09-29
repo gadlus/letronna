@@ -297,6 +297,7 @@ fn ask_once(runner: &mut Runner, session: usize, prompt: &str, args: &Args) -> b
         root: id,
         run: id,
         label: "Letronna".into(),
+        depth: 0,
         allow: args.tools.clone().map_or(Allow::All, Allow::Only),
         rounds: args.max_rounds.unwrap_or(agent::MAX_ROUNDS),
         cancel: Cancel::default(),

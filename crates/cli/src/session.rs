@@ -320,10 +320,8 @@ impl Runner {
         call: letronna_core::chat::ToolCall,
         approved: bool,
     ) -> bool {
-        let ctx = tools::ToolContext {
-            approved,
-            ..turn.tool_context()
-        };
+        let mut ctx = turn.tool_context();
+        ctx.approved = approved;
         let summary = tools::summary(&call.name, &call.arguments);
         let ran = self.run_off_the_loop(&call, ctx, &summary);
         let stopped = ran.is_none();

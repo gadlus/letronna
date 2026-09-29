@@ -1044,10 +1044,8 @@ impl Chat {
     /// Run one call off the UI thread and continue the queue when it returns;
     /// `approved` when the user said yes to it on its card.
     fn execute_call(&mut self, call: backend::ToolCall, approved: bool, cx: &mut Context<Self>) {
-        let mut ctx = letronna_core::tools::ToolContext {
-            approved,
-            ..self.call_context()
-        };
+        let mut ctx = self.call_context();
+        ctx.approved = approved;
         ctx.cancel = self.turn_stop.clone();
         self.call_running = true;
         let (tx, rx) = async_channel::bounded(1);
