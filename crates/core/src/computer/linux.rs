@@ -1139,14 +1139,13 @@ fn parse_stat(stat: &str) -> Option<Proc> {
 fn hosts_of(own: u32, procs: &[Proc]) -> Vec<u32> {
     let by_pid: HashMap<u32, &Proc> = procs.iter().map(|proc| (proc.pid, proc)).collect();
     let mut hosts = ancestors(own, &by_pid);
-    let multiplexers: Vec<String> = hosts
+    let multiplexers: Vec<&str> = hosts
         .iter()
         .filter_map(|pid| by_pid.get(pid))
-        .map(|proc| proc.name.to_lowercase())
-        .filter(|name| MULTIPLEXERS.contains(&name.as_str()))
+        .filter_map(|proc| multiplexer(&proc.name))
         .collect();
     for proc in procs {
-        let client = multiplexers.contains(&proc.name.to_lowercase());
+        let client = multiplexer(&proc.name).is_some_and(|kind| multiplexers.contains(&kind));
         if !client || proc.pid == own || hosts.contains(&proc.pid) {
             continue;
         }
@@ -1158,6 +1157,17 @@ fn hosts_of(own: u32, procs: &[Proc]) -> Vec<u32> {
         }
     }
     hosts
+}
+
+/// Which of `MULTIPLEXERS` a process called `name` is, if one: tmux names
+/// its processes `tmux: server` and `tmux: client`.
+fn multiplexer(name: &str) -> Option<&'static str> {
+    let name = name.to_lowercase();
+    let program = name.split(':').next().unwrap_or_default().trim();
+    MULTIPLEXERS
+        .iter()
+        .find(|&&known| known == program)
+        .copied()
 }
 
 /// `pid`'s parents, nearest first, up to but leaving out init.
@@ -1545,18 +1555,32 @@ mod tests {
             proc(1, 0, "systemd"),
             proc(100, 1, "gnome-terminal-"),
             proc(101, 100, "bash"),
-            proc(102, 101, "tmux"),
-            proc(200, 1, "tmux"),
+            proc(102, 101, "tmux: client"),
+            proc(200, 1, "tmux: server"),
             proc(201, 200, "bash"),
             proc(202, 201, "letronna"),
             proc(300, 1, "kitty"),
             proc(301, 300, "zsh"),
-            proc(302, 301, "tmux"),
+            proc(302, 301, "tmux: client"),
             proc(400, 1, "firefox"),
+            proc(500, 1, "screen"),
+            proc(501, 500, "bash"),
         ];
         let mut hosts = hosts_of(202, &table);
         hosts.sort_unstable();
         assert_eq!(hosts, [100, 101, 102, 200, 201, 300, 301, 302]);
+        // Older tmux and the other multiplexers keep the program's name.
+        let old = [
+            proc(10, 1, "xterm"),
+            proc(11, 10, "tmux"),
+            proc(20, 1, "tmux"),
+            proc(21, 20, "letronna"),
+        ];
+        let mut hosts = hosts_of(21, &old);
+        hosts.sort_unstable();
+        assert_eq!(hosts, [10, 11, 20]);
+        assert_eq!(multiplexer("SCREEN"), Some("screen"));
+        assert_eq!(multiplexer("tmuxinator"), None);
         // Without a multiplexer, only its own terminal.
         let plain = [
             proc(1, 0, "systemd"),
