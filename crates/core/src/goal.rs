@@ -59,6 +59,9 @@ const CHECK_CHARS: usize = 4_000;
 const REPLY_CHARS: usize = 6_000;
 /// How long a reason may be when it is shown and sent back.
 const REASON_CHARS: usize = 300;
+/// The longest goal, in characters: it goes into every look and every
+/// continuation, up to twenty-one copies a run.
+const MAX_GOAL_CHARS: usize = 4_000;
 
 /// Opens every continuation, saying in plain words whose it is, since it
 /// goes to the model as the user's turn.
@@ -198,6 +201,13 @@ pub fn apply_command(goal: &mut Option<Goal>, command: Command) -> Result<String
             None => "No goal is set. /goal <what to reach> sets one.".to_owned(),
         }),
         Command::Set(text) => {
+            let length = text.trim().chars().count();
+            if length > MAX_GOAL_CHARS {
+                return Err(format!(
+                    "A goal can be at most {MAX_GOAL_CHARS} characters, and this one has \
+                     {length}. Say it shorter, or put the details in a file and name it."
+                ));
+            }
             let check = goal.take().and_then(|old| old.check);
             let set = Goal::new(&text, check);
             let said = format!(
@@ -913,6 +923,16 @@ mod tests {
         );
         let shown = apply_command(&mut kept, Command::Show).unwrap();
         assert_eq!(shown, "Goal: ship it twice\nChecked with: cargo test");
+        // Too long a goal is refused, and the one there is kept.
+        let long = "a".repeat(MAX_GOAL_CHARS + 1);
+        let refused = apply_command(&mut kept, Command::Set(long)).unwrap_err();
+        assert!(refused.contains("at most 4000 characters"), "{refused}");
+        assert_eq!(
+            kept.as_ref().map(|g| g.text.as_str()),
+            Some("ship it twice")
+        );
+        let longest = "a".repeat(MAX_GOAL_CHARS);
+        assert!(apply_command(&mut Some(goal(None)), Command::Set(longest)).is_ok());
         assert_eq!(
             apply_command(&mut kept, Command::Clear).unwrap(),
             "Goal cleared."
