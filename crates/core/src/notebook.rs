@@ -45,7 +45,10 @@ pub(crate) fn cells(bytes: &[u8]) -> Result<String, String> {
         }
         let (mut shown, mut more) = (0, 0);
         for output in cell["outputs"].as_array().into_iter().flatten() {
-            for line in lines(&output_text(output)) {
+            // Loggers and progress bars colour what they print, and a
+            // colour code is only noise in the view.
+            let text = crate::tools::strip_escapes(&output_text(output));
+            for line in lines(&text) {
                 if shown == OUTPUT_LINES {
                     more += 1;
                     continue;
@@ -193,7 +196,7 @@ mod tests {
 
     #[test]
     fn a_progress_bar_shows_where_it_ended() {
-        let bar = "\r 10%|#         |\r 50%|#####     |\r100%|##########|\r\n";
+        let bar = "\r 10%|#         |\r 50%|#####     |\r\u{1b}[32m100%|##########|\u{1b}[0m\r\n";
         let notebook = json!({"cells": [{"cell_type": "code", "source": "fit()", "outputs": [
             {"output_type": "stream", "name": "stderr", "text": bar}
         ]}]});
