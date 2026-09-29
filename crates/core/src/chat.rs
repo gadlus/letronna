@@ -28,6 +28,30 @@ pub struct Message {
     pub prompt_tokens: u64,
     #[serde(default)]
     pub cached_tokens: u64,
+    /// The most tokens a request to the reply's model could hold, from the
+    /// model facts when the reply came; 0 when they did not say.
+    #[serde(default)]
+    pub window: u64,
+    /// Of the input, how much the provider wrote to its prompt cache.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_write_tokens: u64,
+    /// Of `tokens`, how many the model spent thinking.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reasoning_tokens: u64,
+    /// What the reply cost in US dollars, when that is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<f64>,
+    /// `cost` is estimated from the model's listed price, not billed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cost_estimated: bool,
+    /// For `role: "assistant"`: what summarizing the turns its request no
+    /// longer held took, a model call of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_usage: Option<crate::usage::Usage>,
+    /// For `role: "assistant"`: when the reply finished, in seconds since
+    /// 1970, so its usage counts on the right day.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub at: u64,
     /// Calls the assistant asked for in this turn.
     #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
@@ -66,17 +90,52 @@ pub struct Message {
     pub replay: Option<Box<Replay>>,
 }
 
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
 impl Message {
-    /// All the input a reply was given. OpenAI counts cache hits inside
-    /// `prompt_tokens`, but some gateways count them beside it, which shows
-    /// as more cached than sent -- and as a cache rate over a hundred percent.
+    /// All the input a reply was given. OpenAI counts cache hits and writes
+    /// inside `prompt_tokens`, but some gateways count them beside it, which
+    /// shows as more cached than sent -- and as a cache rate over a hundred
+    /// percent.
     pub fn input_tokens(&self) -> u64 {
-        if self.cached_tokens > self.prompt_tokens {
-            self.prompt_tokens + self.cached_tokens
+        let cache = self.cached_tokens.saturating_add(self.cache_write_tokens);
+        if cache > self.prompt_tokens {
+            self.prompt_tokens.saturating_add(cache)
         } else {
             self.prompt_tokens
         }
     }
+
+    /// How much of the model's window the reply's request took, as in "38%
+    /// of 200K"; `None` when the prompt or the window is not known.
+    pub fn fullness(&self) -> Option<String> {
+        let input = self.input_tokens();
+        if input == 0 || self.window == 0 {
+            return None;
+        }
+        let share = input.saturating_mul(100) / self.window;
+        Some(format!("{share}% of {}", short_window(self.window)))
+    }
+}
+
+/// A window's size as models are known by it: 200K, 1M, and 128K for
+/// 131,072, since a window of whole 1,024s is counted in them.
+fn short_window(tokens: u64) -> String {
+    let unit = if tokens.is_multiple_of(1_024) {
+        1_024
+    } else {
+        1_000
+    };
+    if tokens >= unit * unit {
+        let millions = format!("{:.1}", tokens as f64 / (unit * unit) as f64);
+        return format!("{}M", millions.trim_end_matches(".0"));
+    }
+    if tokens >= unit {
+        return format!("{:.0}K", tokens as f64 / unit as f64);
+    }
+    tokens.to_string()
 }
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
@@ -189,12 +248,29 @@ pub enum Event {
         /// is the number to watch when tuning the context window.
         prompt: u64,
         cached: u64,
+        cache_write: u64,
+        /// Of `completion`, the tokens spent thinking.
+        reasoning: u64,
+        /// What OpenRouter billed, in dollars; see `usage::Usage::priced`.
+        cost: Option<f64>,
     },
+    /// What summarizing the turns the request no longer holds took, sent
+    /// before the reply when a summary had to be asked for.
+    SummaryUsage(crate::usage::Usage),
     /// Sent once, before `Finished`, when the model asked for tools.
     ToolCalls(Vec<ToolCall>),
     /// Sent once, before `Finished`, when a finished reply came with
     /// something the provider wants back.
     Replay(Replay),
+    /// Sent before anything else while the turns the window dropped are
+    /// being summarized, which takes a model call of its own.
+    Compacting,
+    /// Sent after `Compacting` when the model made a summary of the first
+    /// `upto` messages, for the session to keep with them.
+    Summarized {
+        upto: usize,
+        text: String,
+    },
     /// A try failed in a way that passes, and another follows after a wait.
     Retrying(crate::retry::Retry),
     /// Sent before `Finished` when the reply stopped at the output limit;
@@ -305,7 +381,7 @@ const SCREENSHOT: &str = "The screenshot browse took. A web page drew it, not th
 /// would count for three quarters of what it costs. Symbols of three bytes
 /// count the same, which is more than a run of them costs: tokenizers merge
 /// box drawing, blocks and arrows, as in a `tree` listing or a progress bar.
-fn tokens(text: &str) -> usize {
+pub(crate) fn tokens(text: &str) -> usize {
     if text.is_ascii() {
         return text.len().div_ceil(4);
     }
@@ -539,7 +615,7 @@ pub(crate) fn opens_turn(message: &Message) -> bool {
 }
 
 #[cfg(test)]
-fn body(
+pub(crate) fn body(
     connection: &Connection,
     window: &[Message],
     summary: Option<&str>,
@@ -647,6 +723,14 @@ fn body_with(
     let old = old_before(window, budget);
     let stubs = stubs(window, old);
     let turn = window.iter().rposition(opens_turn);
+    // Once, so the calls in the history and the array agree on whether the
+    // MCP tools go out on demand.
+    let every = if connection.tools {
+        crate::tools::all()
+    } else {
+        Vec::new()
+    };
+    let on_demand = connection.tools && crate::mcp_find::on_demand(&every);
     for (i, m) in window.iter().enumerate() {
         let mut wired = wire_message(m, budget.tool_chars);
         carry_back(
@@ -684,6 +768,9 @@ fn body_with(
                     parts.extend(attached);
                 }
             }
+        }
+        if on_demand {
+            crate::mcp_find::wrap(&mut wired, connection);
         }
         context.push(wired);
         // A tool result carries text only, so its pictures follow as the
@@ -737,7 +824,8 @@ fn body_with(
         "stream_options": {"include_usage": true}
     });
     if connection.tools {
-        let mut tools = crate::tools::specs(connection);
+        let mut tools = crate::tools::specs_of(&every, connection, on_demand);
+        crate::mcp_find::fit(&mut tools, connection);
         if connection.search {
             // The gateway's own search, alongside our functions rather than
             // instead of them: the model picks whichever it needs, and the
@@ -770,6 +858,9 @@ fn body_with(
     // says nothing about what is in the session.
     if host(&connection.endpoint).as_deref() == Some("api.openai.com") {
         body["prompt_cache_key"] = format!("letronna-{}", connection.conversation).into();
+    }
+    if crate::usage::asks_cost(&connection.endpoint) {
+        body["usage"] = json!({"include": true});
     }
     body
 }
@@ -1089,7 +1180,7 @@ fn learn(connection: &Connection, sent: &Value, error: &str) -> bool {
 }
 
 /// The host a URL names, if it is one.
-fn host(url: &str) -> Option<String> {
+pub(crate) fn host(url: &str) -> Option<String> {
     reqwest::Url::parse(url.trim())
         .ok()?
         .host_str()
@@ -1437,6 +1528,9 @@ struct Chunk {
     /// stream assembles them.
     tool_calls: Vec<(Option<usize>, String, String, String, Value)>,
     reasoning_details: Vec<Value>,
+    cache_write_tokens: Option<u64>,
+    reasoning_tokens: Option<u64>,
+    cost: Option<f64>,
     finish: Option<FinishReason>,
 }
 
@@ -1521,6 +1615,18 @@ fn name_unnamed(calls: &mut [ToolCall]) {
     }
 }
 
+/// Gives each of `calls` an id and the name of the tool it calls, before
+/// anything decides about them.
+fn name_calls(calls: &mut [ToolCall], extra: &[Value]) {
+    name_unnamed(calls);
+    name_as_offered(calls, extra);
+    // So that no gate or rule sees the stand-in but always the MCP tool it
+    // calls, named as offered too: the model wrote that name as well.
+    if crate::mcp_find::resolve(calls) {
+        name_as_offered(calls, extra);
+    }
+}
+
 /// Call each tool by the name it was offered under.
 ///
 /// Some gateways hand the name back in a case of their own -- `ListDir` for
@@ -1574,14 +1680,11 @@ fn parse_chunk(value: &Value) -> Result<Chunk, Failure> {
     let prompt_tokens = inner
         .pointer("/usage/prompt_tokens")
         .and_then(Value::as_u64);
-    // OpenAI reports cache hits under prompt_tokens_details; DeepSeek and
-    // Anthropic use fields of their own. Gateways pass through whichever the
-    // upstream provider sent.
-    let cached_tokens = inner
-        .pointer("/usage/prompt_tokens_details/cached_tokens")
-        .or_else(|| inner.pointer("/usage/prompt_cache_hit_tokens"))
-        .or_else(|| inner.pointer("/usage/cache_read_input_tokens"))
-        .and_then(Value::as_u64);
+    let usage = inner.get("usage").filter(|usage| usage.is_object());
+    let cached_tokens = usage.and_then(crate::usage::cached);
+    let cache_write_tokens = usage.and_then(crate::usage::cache_write);
+    let reasoning_tokens = usage.and_then(crate::usage::reasoning);
+    let cost = usage.and_then(crate::usage::billed);
     let tool_calls = delta
         .and_then(|d| d["tool_calls"].as_array())
         .map(|calls| {
@@ -1622,6 +1725,9 @@ fn parse_chunk(value: &Value) -> Result<Chunk, Failure> {
         completion_tokens,
         prompt_tokens,
         cached_tokens,
+        cache_write_tokens,
+        reasoning_tokens,
+        cost,
         tool_calls,
         reasoning_details,
         finish,
@@ -1865,7 +1971,23 @@ fn stream(
     // What the window no longer holds goes in as a summary rather than not at
     // all. It is made here, on the worker, so the wait is part of the reply's.
     let (dropped, window) = messages.split_at(start);
-    let summary = crate::compact::summary(connection, dropped, budget.step);
+    let summary = crate::compact::summary(
+        connection,
+        dropped,
+        budget.tokens,
+        || {
+            let _ = sender.send_blocking(Event::Compacting);
+        },
+        |text| {
+            let _ = sender.send_blocking(Event::Summarized {
+                upto: dropped.len(),
+                text: text.to_owned(),
+            });
+        },
+        |usage| {
+            let _ = sender.send_blocking(Event::SummaryUsage(usage));
+        },
+    );
     let sent = body_with(
         connection,
         window,
@@ -2084,6 +2206,9 @@ struct Reply {
     completion_tokens: u64,
     prompt_tokens: u64,
     cached_tokens: u64,
+    cache_write_tokens: u64,
+    reasoning_tokens: u64,
+    cost: Option<f64>,
     assembler: Assembler,
     reasoning_details: Vec<Value>,
     finish: Option<FinishReason>,
@@ -2105,6 +2230,15 @@ impl Reply {
         }
         if let Some(n) = chunk.cached_tokens {
             self.cached_tokens = n;
+        }
+        if let Some(n) = chunk.cache_write_tokens {
+            self.cache_write_tokens = n;
+        }
+        if let Some(n) = chunk.reasoning_tokens {
+            self.reasoning_tokens = n;
+        }
+        if chunk.cost.is_some() {
+            self.cost = chunk.cost;
         }
         if chunk.finish.is_some() {
             self.finish = chunk.finish;
@@ -2149,6 +2283,9 @@ impl Reply {
                 per_second: self.completion_tokens as f32 / secs,
                 prompt: self.prompt_tokens,
                 cached: self.cached_tokens,
+                cache_write: self.cache_write_tokens,
+                reasoning: self.reasoning_tokens,
+                cost: self.cost,
             });
         }
         if !done && self.finish.is_none() {
@@ -2172,8 +2309,7 @@ impl Reply {
         if in_call {
             calls.clear();
         }
-        name_unnamed(&mut calls);
-        name_as_offered(&mut calls, extra_tools);
+        name_calls(&mut calls, extra_tools);
         let (endpoint, model) = route(connection);
         let replay = Replay {
             endpoint,
@@ -3423,6 +3559,28 @@ mod tests {
     }
 
     #[test]
+    fn fullness_is_the_prompt_against_the_window_and_nothing_when_either_is_unknown() {
+        let fullness = |prompt_tokens, cached_tokens, window| {
+            let reply = Message {
+                prompt_tokens,
+                cached_tokens,
+                window,
+                ..Default::default()
+            };
+            reply.fullness().unwrap_or_default()
+        };
+        assert_eq!(fullness(76_000, 0, 200_000), "38% of 200K");
+        // Cache hits counted beside the prompt fill the window all the same.
+        assert_eq!(fullness(100, 1_000_000, 1_048_576), "95% of 1M");
+        assert_eq!(fullness(3_291, 0, 131_072), "2% of 128K");
+        assert_eq!(fullness(900, 0, 1_047_576), "0% of 1M");
+        assert_eq!(fullness(900, 0, 1_500_000), "0% of 1.5M");
+        assert_eq!(fullness(900, 0, 16_385), "5% of 16K");
+        assert_eq!(fullness(900, 0, 0), "");
+        assert_eq!(fullness(0, 0, 200_000), "");
+    }
+
+    #[test]
     fn an_error_partway_through_a_stream_is_classified_like_one_before_it() {
         // OpenRouter's event for a provider that failed after the stream began.
         let data = r#"{"id":"gen-1759000000-abc","object":"chat.completion.chunk","model":"anthropic/claude-sonnet-4","provider":"Anthropic","error":{"code":"server_error","message":"Provider disconnected unexpectedly"},"choices":[{"index":0,"delta":{"content":""},"finish_reason":"error"}]}"#;
@@ -3571,7 +3729,7 @@ mod tests {
             let replies = [
                 (
                     "application/json",
-                    r#"{"choices":[{"message":{"content":"A big file was written."}}]}"#,
+                    r#"{"choices":[{"message":{"content":"A big file was written."}}],"usage":{"prompt_tokens":800,"completion_tokens":40}}"#,
                 ),
                 (
                     "text/event-stream",
@@ -3591,6 +3749,18 @@ mod tests {
             ..connection()
         };
         let rx = start(c, a_big_write());
+        // The wait for the summary is said to be one, what asking took is
+        // told, and the summary is handed over for the session to keep, with
+        // what it covers.
+        assert!(matches!(rx.recv_blocking().unwrap(), Event::Compacting));
+        assert!(matches!(
+            rx.recv_blocking().unwrap(),
+            Event::SummaryUsage(usage) if (usage.input, usage.output) == (800, 40)
+        ));
+        assert!(matches!(
+            rx.recv_blocking().unwrap(),
+            Event::Summarized { upto: 4, text } if text == "A big file was written."
+        ));
         assert!(matches!(rx.recv_blocking().unwrap(), Event::Delta(s) if s == "Welcome"));
         assert!(matches!(
             rx.recv_blocking().unwrap(),
@@ -3603,6 +3773,56 @@ mod tests {
         assert!(!bodies[1].contains("write the big file"));
         assert!(bodies[1].contains("A big file was written."));
         assert!(bodies[1].contains("thanks"));
+    }
+
+    #[test]
+    fn a_summary_the_model_could_not_make_is_not_handed_over() {
+        use std::io::Write;
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1", server.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            // An empty summary, then the reply.
+            let replies = [
+                (
+                    "application/json",
+                    r#"{"choices":[{"message":{"content":"  "}}]}"#,
+                ),
+                (
+                    "text/event-stream",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Welcome\"}}]}\n\ndata: [DONE]\n\n",
+                ),
+            ];
+            let mut bodies = Vec::new();
+            for (kind, reply) in replies {
+                let (mut socket, _) = server.accept().unwrap();
+                bodies.push(request_body(&mut socket));
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+            }
+            bodies
+        });
+        let c = Connection {
+            endpoint,
+            ..connection()
+        };
+        // Said apart from the other test's, which the summaries remembered
+        // in this process would otherwise answer.
+        let mut messages = a_big_write();
+        messages[0].content = "write the other big file".into();
+        let rx = start(c, messages);
+        assert!(matches!(rx.recv_blocking().unwrap(), Event::Compacting));
+        // What asking took is told, as it was paid for, but the digest
+        // standing in is not for the session to keep.
+        let mut next = rx.recv_blocking().unwrap();
+        if matches!(next, Event::SummaryUsage(_)) {
+            next = rx.recv_blocking().unwrap();
+        }
+        assert!(matches!(next, Event::Delta(s) if s == "Welcome"));
+        assert!(matches!(
+            rx.recv_blocking().unwrap(),
+            Event::Finished(Ok(()))
+        ));
+        let bodies = worker.join().unwrap();
+        assert!(bodies[1].contains("No summary could be made"));
     }
 
     #[test]
@@ -4615,6 +4835,79 @@ mod tests {
         assert!(matches!(events[2], Event::Finished(Ok(()))));
     }
 
+    #[test]
+    fn a_call_through_call_mcp_tool_meets_the_gate_as_the_tool_it_names() {
+        use crate::agent::{Next, Turn};
+        use crate::gate::{Gate, Grants, Mode};
+        use crate::permissions::{Effect, Rule};
+        use crate::tools::ToolContext;
+        let events = reply_of(
+            "application/json",
+            r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"call_mcp_tool","arguments":"{\"name\":\"mcp__files__delete\",\"arguments\":{\"path\":\"a.rs\"}}"}}]},"finish_reason":"tool_calls"}]}"#,
+        );
+        let Event::ToolCalls(calls) = &events[0] else {
+            panic!("no calls");
+        };
+        assert_eq!(calls[0].name, "mcp__files__delete");
+        assert_eq!(calls[0].arguments, r#"{"path":"a.rs"}"#);
+        // The gate finds the server's tool by that name, as a turn runs it.
+        crate::mcp::serve(vec![crate::mcp_find::tests::fake(
+            "mcp__files__delete",
+            "Delete a file.",
+            true,
+        )]);
+        let mut turn = Turn::new(connection());
+        assert!(turn.begin(calls.clone()));
+        let rule = |effect| {
+            Ok(vec![Rule {
+                tool: "mcp__files__delete".into(),
+                pattern: String::new(),
+                effect,
+                project: None,
+            }])
+        };
+        let none = Grants::new();
+        let next = |rules: &Result<Vec<Rule>, String>, mode, plan| {
+            let ctx = ToolContext {
+                plan,
+                ..Default::default()
+            };
+            turn.next(|call| {
+                crate::gate::decide(call, &Gate::for_window(&ctx, &none, rules, mode, None))
+            })
+        };
+        assert!(matches!(
+            next(&Ok(Vec::new()), Mode::Bypass, false),
+            Next::Run(_)
+        ));
+        assert!(matches!(
+            next(&rule(Effect::Deny), Mode::Bypass, false),
+            Next::Refuse(..)
+        ));
+        assert!(matches!(
+            next(&rule(Effect::Ask), Mode::Bypass, false),
+            Next::AskUser(_)
+        ));
+        assert!(matches!(
+            next(&Ok(Vec::new()), Mode::Bypass, true),
+            Next::Refuse(..)
+        ));
+    }
+
+    #[test]
+    fn a_name_inside_call_mcp_tool_is_forgiven_its_case_as_a_direct_one_is() {
+        crate::mcp::serve(vec![crate::mcp_find::tests::fake(
+            "mcp__GitHub__create_issue",
+            "Create an issue.",
+            true,
+        )]);
+        let mut calls = vec![crate::mcp_find::tests::wrapped(
+            r#"{"name": "mcp__github__createIssue", "arguments": {}}"#,
+        )];
+        name_calls(&mut calls, &[]);
+        assert_eq!(calls[0].name, "mcp__GitHub__create_issue");
+    }
+
     /// A plain exchange of about 300 tokens, numbered so no two are alike.
     fn exchange(i: usize) -> [Message; 2] {
         [
@@ -5368,6 +5661,45 @@ mod tests {
         let anthropic = r#"{"prompt_tokens":20,"cache_read_input_tokens":4100,"cache_creation_input_tokens":300}"#;
         assert_eq!(cached(anthropic), Some(4100));
         assert_eq!(cached(r#"{"prompt_tokens":20}"#), None);
+    }
+
+    #[test]
+    fn a_reply_brings_its_cache_writes_thinking_and_bill() {
+        let events = reply_of(
+            "text/event-stream",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":\"stop\"}]}\n\n\
+             data: {\"choices\":[],\"usage\":{\"prompt_tokens\":900,\"completion_tokens\":40,\
+             \"prompt_tokens_details\":{\"cached_tokens\":500,\"cache_write_tokens\":300},\
+             \"completion_tokens_details\":{\"reasoning_tokens\":25},\"cost\":0.0042}}\n\n\
+             data: [DONE]\n\n",
+        );
+        let usage = events.iter().find_map(|event| match event {
+            Event::Usage {
+                cache_write,
+                reasoning,
+                cost,
+                ..
+            } => Some((*cache_write, *reasoning, *cost)),
+            _ => None,
+        });
+        assert_eq!(usage, Some((300, 25, Some(0.0042))));
+    }
+
+    #[test]
+    fn only_openrouter_is_asked_what_a_reply_cost() {
+        let turn = tool_turn();
+        for (endpoint, asked) in [
+            ("https://openrouter.ai/api/v1", true),
+            ("https://api.openai.com/v1", false),
+            ("http://localhost:11434/v1", false),
+        ] {
+            let c = Connection {
+                endpoint: endpoint.into(),
+                ..connection()
+            };
+            let payload = body(&c, &turn, None, None);
+            assert_eq!(payload["usage"]["include"] == true, asked, "{endpoint}");
+        }
     }
 
     #[test]

@@ -55,12 +55,16 @@ impl Chat {
         &self.store.conversations[self.store.active].messages
     }
 
-    /// The text of your message at `at`, if that is what is there.
+    /// The text of your message at `at`, if that is what is there, with
+    /// `/init` as it was typed rather than its prompt.
     fn prompt_text(&self, at: usize) -> Option<String> {
         self.open_messages()
             .get(at)
             .filter(|m| m.role == "user" && !m.notice)
-            .map(|m| m.content.clone())
+            .map(|m| {
+                letronna_core::init::typed(&m.content)
+                    .map_or_else(|| m.content.clone(), str::to_owned)
+            })
     }
 
     /// The pictures your message at `at` carried, to go with it again.
@@ -203,7 +207,12 @@ impl Chat {
     ) {
         // What had the keys, the edit box or the turn's buttons, is gone.
         self.focus_composer(window, cx);
-        if self.dispatch(text.clone(), images, None, cx).is_err() {
+        let Some(prompt) = self.prompt_for(text.clone(), cx) else {
+            self.composer
+                .update(cx, |input, cx| input.set_value(text, window, cx));
+            return;
+        };
+        if self.dispatch(prompt, images, None, cx).is_err() {
             // Not asked, so the text waits in the box rather than being lost.
             self.composer
                 .update(cx, |input, cx| input.set_value(text, window, cx));
@@ -402,6 +411,10 @@ impl Chat {
             updated: backend::now(),
             workspace: source.workspace.clone(),
             todos: todos_in(&messages),
+            model: source.model.clone(),
+            gateway: source.gateway.clone(),
+            effort: source.effort.clone(),
+            summary: source.summary_within(messages.len()),
             messages,
             ..Default::default()
         };

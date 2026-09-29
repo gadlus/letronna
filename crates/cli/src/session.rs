@@ -5,6 +5,7 @@
 //! frame, and asking the user by reading a line rather than drawing a card.
 
 use letronna_core::agent::{Next, Turn};
+use letronna_core::agents;
 use letronna_core::approvals::{self, Decision, Request};
 use letronna_core::cancel::Cancel;
 use letronna_core::chat::{self, Connection, Event, Message, ToolCall};
@@ -45,29 +46,30 @@ pub struct Runner {
 }
 
 impl Runner {
-    /// Where requests go and the key or sign-in token they carry.
-    pub fn route(&self) -> (String, String) {
-        let settings = &self.store.settings;
+    /// Where a session's requests go and the key or sign-in token they carry.
+    pub fn route(&self, session: usize) -> (String, String) {
+        let (gateway, _) = self.store.model(session);
         let saved = letronna_core::store::load_keys()
-            .get(letronna_core::gateway::key_slot(&settings.gateway))
+            .get(letronna_core::gateway::key_slot(gateway))
             .cloned()
             .unwrap_or_default();
-        letronna_core::gateway::resolve(&settings.gateway, &settings.custom_endpoint, &saved)
+        let custom = &self.store.settings.custom_endpoint;
+        letronna_core::gateway::resolve(gateway, custom, &saved)
     }
 
     pub fn connection(&self, session: usize) -> Connection {
         let workspace = self.store.conversations[session].workspace.clone();
         let settings = &self.store.settings;
-        let (endpoint, key) = self.route();
+        let (endpoint, key) = self.route(session);
         Connection {
             endpoint,
-            model: settings.model.clone(),
+            model: self.store.model(session).1.to_owned(),
             key,
             tools: true,
             workspace,
             plan: self.mode == Mode::Plan,
             remote: None,
-            effort: settings.effort.clone(),
+            effort: self.store.effort(session).to_owned(),
             search: settings.search,
             conversation: self.store.conversations[session].id,
             unattended: false,
@@ -80,11 +82,13 @@ impl Runner {
     pub fn ask(&mut self, session: usize, prompt: &str) -> Result<String, String> {
         let connection = self.connection(session);
         chat::validate(&connection)?;
+        self.store.pin(session);
 
         {
             let conversation = &mut self.store.conversations[session];
             if conversation.messages.is_empty() && conversation.title.is_empty() {
-                conversation.title = prompt.chars().take(40).collect();
+                let shown = letronna_core::init::typed(prompt).unwrap_or(prompt);
+                conversation.title = shown.chars().take(40).collect();
             }
             conversation.updated = chat::now();
         }
@@ -119,9 +123,44 @@ impl Runner {
         self.run(connection, session)
     }
 
+    /// Ask a side question about the session on a fork of it, with no tools
+    /// and one request, waiting where escape can stop it. Nothing of it is kept.
+    pub fn btw(&mut self, session: usize, question: &str) -> Result<Message, String> {
+        let connection = self.connection(session);
+        chat::validate(&connection)?;
+        let messages = self.store.conversations[session].messages.clone();
+        let cancel = Cancel::default();
+        let (stop, question) = (cancel.clone(), question.to_owned());
+        let (sender, receiver) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let _ = sender.send_blocking(agents::btw(&connection, messages, &question, stop));
+        });
+        self.bar.working(true);
+        self.bar.wait_line_about("btw");
+        let answer = loop {
+            self.bar.pump();
+            if self.bar.interrupted() {
+                cancel.set();
+                break Err("Stopped.".to_owned());
+            }
+            match receiver.try_recv() {
+                Ok(answer) => break answer,
+                Err(async_channel::TryRecvError::Empty) => continue,
+                Err(async_channel::TryRecvError::Closed) => {
+                    break Err("The side question stopped without an answer.".to_owned());
+                }
+            }
+        };
+        self.bar.wait_line(false);
+        self.bar.working(false);
+        answer
+    }
+
     /// Run the agent to completion on the conversation as it stands.
     fn run(&mut self, connection: Connection, session: usize) -> Result<String, String> {
         self.bar.show_helpers_of(connection.conversation);
+        // What the session's kept helpers wake on from now on.
+        agents::connected(&connection);
         let mut turn = Turn::new(connection);
         self.stopped = false;
         self.bar.working(true);
@@ -248,7 +287,7 @@ impl Runner {
         let mut out = Stream::opening_with(render::bullet());
         let mut opened = false;
         let mut thought = false;
-        let mut retrying = false;
+        let mut explained = false;
         self.bar.wait_line(true);
         loop {
             // Keys first, then whatever the model has sent.
@@ -274,14 +313,20 @@ impl Runner {
                 }
             };
             // The waiting line says why while a failed try waits to be made
-            // again, and goes back to waiting once the new try answers,
-            // which may be with thinking that is not shown.
-            if let Event::Retrying(retry) = &event {
-                self.bar.wait_line_about(&retry.to_string());
-                retrying = true;
-            } else if retrying {
+            // again or earlier turns are summarized, and goes back to
+            // waiting once the reply answers, which may be with thinking
+            // that is not shown.
+            let why = match &event {
+                Event::Retrying(retry) => Some(retry.to_string()),
+                Event::Compacting => Some("Compacting…".to_owned()),
+                _ => None,
+            };
+            if let Some(why) = why {
+                self.bar.wait_line_about(&why);
+                explained = true;
+            } else if explained {
                 self.bar.wait_line(true);
-                retrying = false;
+                explained = false;
             }
             if let Event::Reasoning(text) = &event
                 && self.store.settings.thinking
@@ -311,6 +356,10 @@ impl Runner {
                 }
                 out.push(text);
             }
+            // Kept with the session, so a restart need not ask for it again.
+            if let Event::Summarized { upto, text } = &event {
+                self.store.conversations[session].summarized(*upto, text.clone());
+            }
             turn.absorb(&event);
             if let Event::Finished(result) = event {
                 self.bar.wait_line(false);
@@ -321,7 +370,7 @@ impl Runner {
                 break;
             }
         }
-        let model = self.store.settings.model.clone();
+        let model = turn.connection.model.clone();
         let reply = turn.take_reply(&model);
         // A reply that only asked for a tool has nothing to caption; the tool
         // line below speaks for it.
@@ -390,7 +439,8 @@ impl Runner {
     /// Save what a stopped turn got to, so the model hears next time what ran
     /// and what did not.
     fn keep_stopped(&mut self, turn: &mut Turn, session: usize) {
-        let kept = turn.stop(&self.store.settings.model);
+        let model = turn.connection.model.clone();
+        let kept = turn.stop(&model);
         if kept.is_empty() {
             return;
         }
@@ -806,6 +856,9 @@ impl Runner {
             letronna_core::store::fill(conversation);
             self.bar.set_plan(&conversation.todos);
         }
+        // Each session has its own model, and the footer names it.
+        let note = crate::banner::footer(self);
+        self.bar.set_footer(note);
     }
 
     /// A session of its own.
@@ -820,6 +873,8 @@ impl Runner {
         let index = self.store.conversations.len() - 1;
         self.store.active = index;
         self.bar.set_plan(&[]);
+        let note = crate::banner::footer(self);
+        self.bar.set_footer(note);
         index
     }
 }
@@ -1130,7 +1185,7 @@ fn declined(request: &Request, why: &str) {
     render::tool(&call.name, &summary, &why, true);
 }
 
-fn usage(reply: &Message) -> String {
+pub(crate) fn usage(reply: &Message) -> String {
     let mut parts = vec![format!("{} out", reply.tokens)];
     if reply.per_second > 0. {
         parts.push(format!("{:.1} tok/s", reply.per_second));
@@ -1138,6 +1193,7 @@ fn usage(reply: &Message) -> String {
     let input = reply.input_tokens();
     if input > 0 {
         parts.push(format!("{input} in"));
+        parts.extend(reply.fullness());
         if reply.cached_tokens > 0 {
             parts.push(format!("{}% cached", 100 * reply.cached_tokens / input));
         }

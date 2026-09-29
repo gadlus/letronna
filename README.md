@@ -140,7 +140,7 @@ The window shows the browser beside the chat, live, while the agent uses it or o
 - `media/` images, speech and video made with no project attached, and browser screenshots
 - `browser/` the browser's own profile: delete it to sign out of everything there
 
-With a project folder attached, its `AGENTS.md` (or `CLAUDE.md`) is read as the project's instructions.
+With a project folder attached, its `AGENTS.md` (or `CLAUDE.md`) is read as the project's instructions, and so is the one in each folder above it up to the repository's root.
 
 Chat text is sent to the gateway you selected and nowhere else.
 
@@ -177,6 +177,27 @@ A server that runs elsewhere -- a hosted one, or one on another machine -- is gi
 ```
 
 It is spoken to over HTTP as the protocol now has it (streamable HTTP: an address that usually ends in `/mcp`). The older way, an address ending in `/sse`, is not supported.
+
+A server's `command`, `args`, `cwd`, `url`, `env` and `headers` may name `${VAR}` or `${VAR:-default}`, filled in from Letronna's environment when the server starts, so a key need not be written into the file; a variable that is not set and has no default keeps that server from starting. A server also takes:
+
+- `timeout_ms`: how long one call may take (2 minutes unless set), and `startup_timeout_ms`: how long it may take to start and list its tools (1 minute unless set); a day at most.
+- `includeTools` and `excludeTools`: tool names, where `*` matches any run of characters, to offer the model only some of a server's tools; an excluded tool is never offered.
+- `"autoApprove": "readOnly"`: every tool the server marks read-only, not destructive and closed to the world runs without asking. A server run here is taken at its word on that already; this takes a server elsewhere at its word too.
+- `cwd`: the folder a server run here starts in, from the data folder when relative.
+- `"env_scrub": true`: start it with only `PATH`, `HOME`, the language, the temp folder and, on Windows, the system folders, plus its own `env`, rather than all of Letronna's environment.
+
+```json
+{
+  "mcpServers": {
+    "hosted": {
+      "url": "https://example.com/mcp",
+      "headers": { "Authorization": "Bearer ${HOSTED_KEY}" },
+      "excludeTools": ["delete_*"],
+      "autoApprove": "readOnly"
+    }
+  }
+}
+```
 
 ### A lighter browser
 

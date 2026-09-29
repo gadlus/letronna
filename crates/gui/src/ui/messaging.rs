@@ -501,7 +501,7 @@ fn badge(channel: &Channel) -> impl IntoElement {
         )
 }
 
-fn pill(text: &'static str, colour: Hsla, cx: &App) -> impl IntoElement {
+pub(crate) fn pill(text: &'static str, colour: Hsla, cx: &App) -> impl IntoElement {
     h_flex()
         .gap_1p5()
         .items_center()
