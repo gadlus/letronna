@@ -57,6 +57,15 @@ pub struct Conversation {
     /// `flush` should touch it; it is visible for the same reason as `flushed`.
     #[serde(skip)]
     pub gone: bool,
+    /// The newest summary the model made of the session's first messages:
+    /// how many of them it covers, and the summary. Kept in the file, so a
+    /// restart does not ask for it again.
+    #[serde(skip)]
+    pub summary: Option<(usize, String)>,
+    /// Whether `summary` is in the file yet. Only the store should touch it;
+    /// it is visible for the same reason as `flushed`.
+    #[serde(skip)]
+    pub summary_saved: bool,
 }
 
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -131,6 +140,13 @@ enum Record {
     /// back is appended like everything else rather than cutting the file.
     Rewind {
         to: usize,
+    },
+    /// A summary the model made of the first `upto` messages, which stands
+    /// in for them once the context window no longer holds them. The newest
+    /// one a later rewind has not cut into is used.
+    Summary {
+        upto: usize,
+        text: String,
     },
 }
 
@@ -267,6 +283,29 @@ impl Conversation {
             self.flushed = len;
             self.rewound = Some(len);
         }
+        // A summary of messages taken back no longer sums up the session.
+        // The one in the file is dropped by the rewind record written after it.
+        if self.summary.as_ref().is_some_and(|(upto, _)| *upto > len) {
+            self.summary = None;
+        }
+    }
+
+    /// Keep the summary the model made of the first `upto` messages, which
+    /// the next save writes down. One covering more messages than the
+    /// session now has was made for a history since taken back.
+    pub fn summarized(&mut self, upto: usize, text: String) {
+        let kept = Some((upto, text));
+        if upto > self.messages.len() || self.summary == kept {
+            return;
+        }
+        self.summary = kept;
+        self.summary_saved = false;
+    }
+
+    /// The summary a copy of the first `len` messages starts with: this
+    /// session's, when the copy holds everything it covers.
+    pub fn summary_within(&self, len: usize) -> Option<(usize, String)> {
+        self.summary.clone().filter(|(upto, _)| *upto <= len)
     }
 }
 
@@ -411,6 +450,7 @@ impl Conversation {
     fn flush_to(&mut self, path: &std::path::Path) -> std::io::Result<()> {
         let meta = self.meta();
         let meta_changed = self.written.as_ref() != Some(&meta);
+        let summary_new = self.summary.is_some() && !self.summary_saved;
         // Every session is flushed on every save, and most have nothing new.
         // Those are known without the file system: taking the lock and
         // checking the file first made each save touch every session on disk.
@@ -418,6 +458,7 @@ impl Conversation {
             && self.flushed == self.messages.len()
             && self.rewound.is_none()
             && !meta_changed
+            && !summary_new
         {
             return Ok(());
         }
@@ -433,7 +474,11 @@ impl Conversation {
             self.gone = true;
             return Ok(());
         }
-        if !fresh && self.flushed == self.messages.len() && self.rewound.is_none() && !meta_changed
+        if !fresh
+            && self.flushed == self.messages.len()
+            && self.rewound.is_none()
+            && !meta_changed
+            && !summary_new
         {
             return Ok(());
         }
@@ -468,10 +513,22 @@ impl Conversation {
         for message in &self.messages[self.flushed.min(self.messages.len())..] {
             push(&mut out, &Record::Message(message.clone()));
         }
+        // After the rewind and the messages, which it may have been made
+        // from: before them, the rewind would take it back on replay.
+        if summary_new && let Some((upto, text)) = &self.summary {
+            push(
+                &mut out,
+                &Record::Summary {
+                    upto: *upto,
+                    text: text.clone(),
+                },
+            );
+        }
         file.write_all(out.as_bytes())?;
         self.flushed = self.messages.len();
         self.written = Some(meta);
         self.rewound = None;
+        self.summary_saved = true;
         Ok(())
     }
 }
@@ -504,6 +561,9 @@ fn replay(path: &std::path::Path) -> Option<Conversation> {
     let bytes = std::fs::read(path).ok()?;
     let text = String::from_utf8_lossy(&bytes);
     let mut conversation = Conversation::default();
+    // Every summary still within the history so far: a rewind can take the
+    // newest back and leave an earlier one standing.
+    let mut summaries = Vec::new();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         match serde_json::from_str::<Record>(line) {
             Ok(Record::Head { id, created }) => {
@@ -518,7 +578,15 @@ fn replay(path: &std::path::Path) -> Option<Conversation> {
                 conversation.todos = meta.todos;
             }
             Ok(Record::Message(message)) => conversation.messages.push(message),
-            Ok(Record::Rewind { to }) => conversation.messages.truncate(to),
+            Ok(Record::Rewind { to }) => {
+                conversation.messages.truncate(to);
+                summaries.retain(|(upto, _)| *upto <= to);
+            }
+            Ok(Record::Summary { upto, text }) => {
+                if upto <= conversation.messages.len() {
+                    summaries.push((upto, text));
+                }
+            }
             Err(_) => continue,
         }
     }
@@ -532,6 +600,14 @@ fn replay(path: &std::path::Path) -> Option<Conversation> {
     }
     conversation.flushed = conversation.messages.len();
     conversation.written = Some(conversation.meta());
+    conversation.summary = summaries.pop();
+    conversation.summary_saved = true;
+    // The model is not asked again for what the file already has.
+    if let Some((upto, text)) = &conversation.summary
+        && let Some(covered) = conversation.messages.get(..*upto)
+    {
+        crate::compact::remember(covered, text);
+    }
     Some(conversation)
 }
 
@@ -662,7 +738,7 @@ pub fn summaries() -> Vec<Summary> {
                     }
                     Ok(Record::Message(_)) => summary.messages += 1,
                     Ok(Record::Rewind { to }) => summary.messages = summary.messages.min(to),
-                    Err(_) => {}
+                    Ok(Record::Summary { .. }) | Err(_) => {}
                 }
             }
             Some(summary)
@@ -938,10 +1014,12 @@ pub fn fill(conversation: &mut Conversation) {
     }
     if let Some(full) = replay(&session_path(conversation.id)) {
         conversation.messages = full.messages;
+        conversation.summary = full.summary;
         // What has been written is what was just read, so a flush appends
         // only what is said from here on rather than the whole history again.
         conversation.flushed = conversation.messages.len();
         conversation.written = Some(conversation.meta());
+        conversation.summary_saved = true;
     }
 }
 
@@ -2370,5 +2448,172 @@ pub(crate) mod tests {
         let first = load().settings;
         assert_eq!((first.appearance.as_str(), first.grain), ("", true));
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    /// Session 1, holding `n` messages that each say `tag` and their place,
+    /// so a summary of them is remembered apart from any other test's.
+    fn tagged(n: usize, tag: &str) -> Conversation {
+        Conversation {
+            id: 1,
+            messages: (0..n)
+                .map(|i| said("user", &format!("{tag} {i}")))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_summary_is_appended_once_and_read_back_with_what_it_covers() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("summary");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        store.conversations.push(tagged(6, "round trip"));
+        store.save().unwrap();
+        let path = dir.join("sessions/1.jsonl");
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        // One of more messages than the session has is not for this history.
+        store.conversations[0].summarized(7, "too far".into());
+        assert_eq!(store.conversations[0].summary, None);
+        store.conversations[0].summarized(4, "The first four.".into());
+        store.save().unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            after,
+            format!("{before}{{\"type\":\"summary\",\"upto\":4,\"text\":\"The first four.\"}}\n")
+        );
+        // Written once, and the same summary handed over again is no news.
+        store.conversations[0].summarized(4, "The first four.".into());
+        store.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), after);
+
+        let back = replay(&path).unwrap();
+        assert_eq!(back.summary, Some((4, "The first four.".into())));
+        assert_eq!(back.messages.len(), 6);
+        // The listing counts messages, not the summary line.
+        assert_eq!(summaries()[0].messages, 6);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_restart_uses_the_kept_summary_rather_than_asking_again() {
+        let dir = scratch("summary-restart");
+        let path = dir.join("1.jsonl");
+        let mut conversation = tagged(6, "restart");
+        conversation.summarized(4, "Kept across the restart.".into());
+        conversation.flush_to(&path).unwrap();
+
+        // Read back as a new process would, nothing in memory but the file.
+        let back = replay(&path).unwrap();
+        let nowhere = crate::chat::Connection {
+            endpoint: "http://127.0.0.1:9/v1".into(),
+            ..Default::default()
+        };
+        let summary = crate::compact::summary(
+            &nowhere,
+            &back.messages[..4],
+            0,
+            || panic!("the model was asked for the summary again"),
+            |_| panic!("the kept summary was handed over as new"),
+        );
+        assert_eq!(summary.as_deref(), Some("Kept across the restart."));
+    }
+
+    #[test]
+    fn a_rewind_into_a_summary_drops_it_and_leaves_an_earlier_one() {
+        let dir = scratch("summary-rewind");
+        let path = dir.join("1.jsonl");
+        let mut conversation = tagged(6, "rewind into");
+        conversation.summarized(2, "The first two.".into());
+        conversation.flush_to(&path).unwrap();
+        conversation.summarized(4, "The first four.".into());
+        conversation.flush_to(&path).unwrap();
+
+        conversation.rewind(3);
+        assert_eq!(conversation.summary, None);
+        conversation.flush_to(&path).unwrap();
+        // The file still has the one the rewind left whole.
+        let back = replay(&path).unwrap();
+        assert_eq!(back.messages.len(), 3);
+        assert_eq!(back.summary, Some((2, "The first two.".into())));
+
+        // Past both, neither stands.
+        conversation.rewind(1);
+        conversation.flush_to(&path).unwrap();
+        assert_eq!(replay(&path).unwrap().summary, None);
+    }
+
+    #[test]
+    fn a_rewind_that_leaves_what_a_summary_covers_keeps_it() {
+        let dir = scratch("summary-rewind-after");
+        let path = dir.join("1.jsonl");
+        let mut conversation = tagged(6, "rewind after");
+        conversation.summarized(4, "The first four.".into());
+        conversation.flush_to(&path).unwrap();
+
+        conversation.rewind(4);
+        conversation.messages.push(said("user", "again"));
+        conversation.flush_to(&path).unwrap();
+        assert_eq!(conversation.summary, Some((4, "The first four.".into())));
+        let back = replay(&path).unwrap();
+        assert_eq!(back.messages.len(), 5);
+        assert_eq!(back.summary, Some((4, "The first four.".into())));
+    }
+
+    #[test]
+    fn a_session_file_from_before_summaries_reads_back_without_one() {
+        let dir = scratch("summary-old");
+        let path = dir.join("1.jsonl");
+        // As a build from before summaries were kept wrote it.
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"head\",\"id\":1,\"created\":5}\n",
+                "{\"type\":\"message\",\"role\":\"user\",\"content\":\"hello\"}\n",
+                "{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"hi\"}\n",
+            ),
+        )
+        .unwrap();
+        let mut back = replay(&path).unwrap();
+        assert_eq!(back.messages.len(), 2);
+        assert_eq!(back.summary, None);
+        // Saving it again adds nothing for a summary it never had.
+        let before = std::fs::read_to_string(&path).unwrap();
+        back.flush_to(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        // A summary line claiming more than the file holds is not used.
+        std::fs::write(
+            &path,
+            format!("{before}{{\"type\":\"summary\",\"upto\":3,\"text\":\"x\"}}\n"),
+        )
+        .unwrap();
+        assert_eq!(replay(&path).unwrap().summary, None);
+    }
+
+    #[test]
+    fn a_copy_keeps_the_summary_only_when_it_holds_what_it_covers() {
+        let dir = scratch("summary-fork");
+        let mut source = tagged(6, "fork");
+        source.summarized(4, "The first four.".into());
+        assert_eq!(source.summary_within(6), source.summary);
+        assert_eq!(source.summary_within(4), source.summary);
+        assert_eq!(source.summary_within(3), None);
+
+        // A copy writes the summary it started with into its own file.
+        let path = dir.join("2.jsonl");
+        let mut copy = Conversation {
+            id: 2,
+            messages: source.messages[..5].to_vec(),
+            summary: source.summary_within(5),
+            ..Default::default()
+        };
+        copy.flush_to(&path).unwrap();
+        assert_eq!(
+            replay(&path).unwrap().summary,
+            Some((4, "The first four.".into()))
+        );
     }
 }

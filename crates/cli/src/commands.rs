@@ -961,6 +961,7 @@ fn branch(runner: &mut Runner, session: &mut usize, name: &str) {
         updated: letronna_core::chat::now(),
         workspace: from.workspace.clone(),
         todos: from.todos.clone(),
+        summary: from.summary.clone(),
         ..Default::default()
     };
     history::share(from.id, copy.id);

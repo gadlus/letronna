@@ -386,6 +386,7 @@ impl Chat {
             updated: backend::now(),
             workspace: source.workspace.clone(),
             todos: todos_in(&messages),
+            summary: source.summary_within(messages.len()),
             messages,
             ..Default::default()
         };

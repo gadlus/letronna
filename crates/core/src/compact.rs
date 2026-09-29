@@ -11,16 +11,19 @@
 //! prompt cache. Each step folds what it newly dropped into the summary made
 //! for the step before, so a summary is never rebuilt from the whole history.
 //!
-//! Summaries are kept in memory, keyed by what they cover, and never written
-//! down: nothing about a conversation outlives its own file when it is
-//! deleted. The price is summarizing a long session once more after a
-//! restart, from as much of its most recent part as the window holds.
+//! Summaries are kept in memory, keyed by what they cover, and each one the
+//! model makes is also written into the session's own file, with how many
+//! messages it covers, so a restart reads it back rather than asking again.
+//! Nothing about a conversation outlives that file: deleting the session
+//! deletes its summaries with it, and a rewind to before a summary's end
+//! drops that summary, since what it summed up is no longer the history.
 //!
 //! A summary the model could not make is asked for again after a while
 //! rather than never, and until then a digest read straight from the dropped
 //! messages -- the user's latest requests word for word, the files, the
 //! background jobs, the checklist -- stands in for it. It is made once per
-//! failure, so the requests in between still share their prefix.
+//! failure, so the requests in between still share their prefix. A digest
+//! is never written down: after a restart the model is asked again anyway.
 
 use crate::chat::{Connection, Message};
 use serde_json::{Value, json};
@@ -77,32 +80,62 @@ enum Entry {
 /// A summary per stretch of dropped messages, by `key`.
 type Cache = Mutex<HashMap<u64, Entry>>;
 
+/// Every summary made or read back in this process.
+fn cache() -> &'static Cache {
+    static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
 /// The summary of `dropped`, the messages a window of `window` tokens no
 /// longer holds, or a digest of them while the model cannot make one.
-/// `compacting` is called just before the model is asked.
+/// `compacting` is called just before the model is asked, and `made` with
+/// the summary when it made one.
 pub fn summary(
     connection: &Connection,
     dropped: &[Message],
     window: usize,
     compacting: impl FnOnce(),
+    made: impl FnOnce(&str),
 ) -> Option<String> {
-    static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
-    let cache = CACHE.get_or_init(Default::default);
     // A fresh summary, the first of a long session after a restart or of a
     // big window's step, reads as much of what was dropped as the window
     // holds, which a request to this model carries anyway; less would leave
     // out how the session started, its goal.
     let input = INPUT_TOKENS.max(window);
-    summary_in(
-        cache,
+    let mut answered = false;
+    let text = summary_in(
+        cache(),
         dropped,
         input,
         Instant::now(),
         |earlier, transcript| {
             compacting();
-            ask(connection, earlier, transcript)
+            let reply = ask(connection, earlier, transcript);
+            // What `summary_in` takes for a summary rather than a failure.
+            answered = reply.as_ref().is_ok_and(|text| !text.trim().is_empty());
+            reply
         },
-    )
+    );
+    // Only what the model just made goes to the session: one from the cache
+    // is there already, and a digest is not worth keeping.
+    if answered && let Some(text) = &text {
+        made(text);
+    }
+    text
+}
+
+/// Take `text` as the summary of `covered`, as the session's file has it,
+/// so the model is not asked for it again.
+pub(crate) fn remember(covered: &[Message], text: &str) {
+    remember_in(cache(), covered, text);
+}
+
+/// `remember`, into `cache`.
+fn remember_in(cache: &Cache, covered: &[Message], text: &str) {
+    let key = keys(covered)[covered.len()];
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(key, Entry::Made(text.to_owned()));
+    }
 }
 
 /// `summary`, with the cache, the most tokens read, the time and the model
@@ -537,6 +570,38 @@ mod tests {
         assert_eq!(asked[1].0.as_deref(), Some("summary of two turns"));
         assert!(!asked[1].1.contains("question 1"), "{}", asked[1].1);
         assert!(asked[1].1.starts_with("User: question 2"), "{}", asked[1].1);
+    }
+
+    #[test]
+    fn a_summary_read_back_from_the_session_is_used_and_extended() {
+        let cache = Cache::default();
+        let messages = turns(4);
+        remember_in(&cache, &messages[..4], "kept summary of two turns");
+
+        let same = summary_in(
+            &cache,
+            &messages[..4],
+            INPUT_TOKENS,
+            Instant::now(),
+            |_, _| panic!("asked for what the session kept"),
+        );
+        assert_eq!(same.as_deref(), Some("kept summary of two turns"));
+
+        // A later step folds only what is new into it, as into one made here.
+        let mut asked = None;
+        summary_in(
+            &cache,
+            &messages[..8],
+            INPUT_TOKENS,
+            Instant::now(),
+            |earlier, transcript| {
+                asked = Some((earlier.map(str::to_owned), transcript.to_owned()));
+                Ok("summary of four turns".into())
+            },
+        );
+        let (earlier, transcript) = asked.unwrap();
+        assert_eq!(earlier.as_deref(), Some("kept summary of two turns"));
+        assert!(transcript.starts_with("User: question 2"), "{transcript}");
     }
 
     #[test]
