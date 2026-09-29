@@ -152,9 +152,9 @@ impl Chat {
         change: impl FnOnce() -> Result<(), String>,
         cx: &mut Context<Self>,
     ) {
-        if let Err(why) = change() {
-            self.plugins.note = Some(Err(why));
-        }
+        // A note from before, such as that the servers still wait, would
+        // now be out of date.
+        self.plugins.note = change().err().map(Err);
         self.reload_plugins();
         self.reload_skills();
         cx.notify();
