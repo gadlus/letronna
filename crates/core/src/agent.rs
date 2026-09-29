@@ -15,7 +15,7 @@
 use crate::chat::{Connection, Event, Message, Replay, ToolCall};
 use crate::gate::Outcome;
 use crate::tools;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 /// Tool rounds per user message. Enough for a real investigation, small
@@ -153,6 +153,9 @@ pub struct Turn {
     /// How often each call, by tool, arguments and result, has come back
     /// the same this turn.
     repeats: HashMap<(String, u64, u64), usize>,
+    /// Each change made this turn, by tool and arguments, so only a new one
+    /// starts the counts again.
+    changes: HashSet<(String, u64)>,
     /// Nobody is watching, so a call repeated without end stops the turn.
     unattended: bool,
     /// Why an unattended turn stopped going round in circles.
@@ -176,6 +179,7 @@ impl Turn {
             asked_again: false,
             pushed_on: false,
             repeats: HashMap::new(),
+            changes: HashSet::new(),
             looped: None,
         }
     }
@@ -458,6 +462,14 @@ impl Turn {
             hash(&arguments),
             hash(&(content, is_error)),
         );
+        // A change not made before this turn is progress, so the same answer
+        // to a call made before it, such as a `git add` saying nothing, is no
+        // sign of a loop.
+        if tools::find(&call.name).is_some_and(|tool| tool.mutates())
+            && self.changes.insert((key.0.clone(), key.1))
+        {
+            self.repeats.clear();
+        }
         let times = self.repeats.entry(key).or_default();
         *times += 1;
         *times
@@ -1282,6 +1294,27 @@ mod tests {
         let mut scheduled = Turn::new(connection);
         repeat(&mut scheduled, &call("read_file"), "same", 5);
         assert!(scheduled.looping().is_some());
+    }
+
+    #[test]
+    fn a_new_change_between_repeats_starts_the_count_again() {
+        let mut turn = turn().unattended();
+        let mut stage = call("run_command");
+        stage.arguments = r#"{"command": "git add -A"}"#.into();
+        let mut edit = call("edit_file");
+        for step in 0..6 {
+            edit.arguments = format!(r#"{{"path": "a.rs", "old": "{step}", "new": "x"}}"#);
+            repeat(&mut turn, &edit, "Edited a.rs.", 1);
+            // `git add` says nothing when it works, so it answers the same every time.
+            assert_eq!(repeat(&mut turn, &stage, "", 1), [""]);
+        }
+        assert_eq!(turn.looping(), None);
+        // Making the same change again is no news, so it is still counted.
+        for _ in 0..4 {
+            repeat(&mut turn, &edit, "Edited a.rs.", 1);
+            repeat(&mut turn, &stage, "", 1);
+        }
+        assert!(turn.looping().is_some());
     }
 
     #[test]
