@@ -73,6 +73,10 @@ pub(crate) struct Chat {
     pub(crate) store: Store,
     pub(crate) composer: Entity<InputState>,
     pub(crate) search: Entity<InputState>,
+    /// What the sidebar's search found in what was said.
+    pub(crate) found: Vec<crate::ui::search::Found>,
+    /// The search waiting for typing to pause, or running.
+    pub(crate) finding: Option<Task<()>>,
     pub(crate) endpoint: Entity<InputState>,
     pub(crate) model: Entity<InputState>,
     pub(crate) key: Entity<InputState>,
@@ -275,6 +279,11 @@ pub(crate) struct Chat {
     /// Where the chat was scrolled to at the last draw, to tell which way
     /// it has moved since.
     pub(crate) followed_offset: Pixels,
+    /// The session and message a search hit opened, which the chat is held
+    /// at until it is scrolled by hand or another session is shown.
+    pub(crate) reveal: Option<(u64, usize)>,
+    /// Where holding it last put the chat, to tell a scroll by hand from it.
+    pub(crate) revealed: Option<Pixels>,
     /// The list of modes, while the mode chip has it open.
     pub(crate) mode_menu: Option<Entity<gpui_component::menu::PopupMenu>>,
     pub(crate) _subscriptions: Vec<Subscription>,
@@ -432,7 +441,12 @@ impl Chat {
                     _ => {}
                 }
             }),
-            cx.subscribe_in(&search, window, |_, _, _: &InputEvent, _, cx| cx.notify()),
+            cx.subscribe_in(&search, window, |this, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.find_in_messages(cx);
+                }
+                cx.notify();
+            }),
             cx.subscribe_in(&edit_message, window, |this, _, event, window, cx| {
                 if matches!(event, InputEvent::PressEnter { secondary: false }) {
                     this.send_edit(window, cx);
@@ -489,6 +503,8 @@ impl Chat {
             store,
             composer,
             search,
+            found: Vec::new(),
+            finding: None,
             endpoint,
             model,
             key,
@@ -580,6 +596,8 @@ impl Chat {
             scroll: ScrollHandle::new(),
             following: true,
             followed_offset: px(0.),
+            reveal: None,
+            revealed: None,
             mode_menu: None,
             _subscriptions: subscriptions,
         };
@@ -1783,6 +1801,8 @@ impl Chat {
     /// Go to the newest message and stay with it as more arrives.
     pub(crate) fn follow(&mut self) {
         self.following = true;
+        self.reveal = None;
+        self.revealed = None;
         self.scroll.scroll_to_bottom();
     }
 
@@ -1794,6 +1814,12 @@ impl Chat {
     /// moves it up, but pinned to the bottom, and that must not count.
     fn keep_following(&mut self) {
         let offset = self.scroll.offset().y;
+        // Held at a search hit, the chat stays put. Where it is still counts,
+        // so a scroll by hand after it lets go is told the right way round.
+        if self.holding_hit() {
+            self.followed_offset = offset;
+            return;
+        }
         let near_bottom = self.distance_from_bottom() <= FOLLOW_SLACK;
         // The offset grows towards zero going up.
         if offset > self.followed_offset && !near_bottom {
@@ -2225,7 +2251,11 @@ impl Render for Chat {
                 .any(|context| context.contains("PopupMenu"));
             let mut turns: Vec<(Vec<AnyElement>, Span, FocusHandle)> = Vec::new();
             let mut assistant_turn = false;
+            // The message a search hit opened, marked on the first row drawn
+            // from it on: a reply that only called tools has none of its own.
+            let mut marking = false;
             for (i, m) in messages.iter().enumerate() {
+                marking |= self.reveal == Some((conversation.id, i));
                 let is_user = m.role == "user";
                 if is_user || !assistant_turn {
                     // A notice stands apart as your message does, but it is
@@ -2263,7 +2293,12 @@ impl Render for Chat {
                     let shown = shows_bar(*span, messages.len(), streaming_here, focused);
                     self.turn_bar(*span, shown, cx)
                 });
-                rows.push(self.message_row(i, m, labeled, false, bar, window, cx));
+                let row = self.message_row(i, m, labeled, false, bar, window, cx);
+                rows.push(if std::mem::take(&mut marking) {
+                    self.mark_hit(row, cx)
+                } else {
+                    row
+                });
             }
             // The turn a reply is still coming in to has no buttons or menu:
             // it is not finished, and it owns the session until it is.

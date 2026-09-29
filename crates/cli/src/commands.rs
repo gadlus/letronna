@@ -173,7 +173,7 @@ pub fn command(
             Flow::Handled
         }
         "/resume" => {
-            resume(runner, session, workspace);
+            resume(runner, session, workspace, rest);
             Flow::Handled
         }
         "/undo" => {
@@ -924,16 +924,32 @@ fn add_skills(runner: &mut Runner, source: &str) {
 const SESSION_CHOICES: usize = 9;
 
 /// Pick up a session from before. The same files the window uses, so a
-/// conversation started there can be carried on here.
-pub fn resume(runner: &mut Runner, session: &mut usize, workspace: Option<&std::path::Path>) {
+/// conversation started there can be carried on here. With a `term`, only
+/// sessions whose title holds it are offered, or failing that, those where
+/// it was said.
+pub fn resume(
+    runner: &mut Runner,
+    session: &mut usize,
+    workspace: Option<&std::path::Path>,
+    term: &str,
+) {
     // Newest first, skipping the one already open and any that never got a
     // word said in them.
+    let lower = term.to_lowercase();
     let mut recent: Vec<usize> = (0..runner.store.conversations.len())
         .filter(|i| *i != *session && runner.store.conversations[*i].length() > 0)
+        .filter(|i| {
+            let title = &runner.store.conversations[*i].title;
+            title.to_lowercase().contains(&lower)
+        })
         .collect();
     recent.sort_by_key(|i| std::cmp::Reverse(runner.store.conversations[*i].updated));
     recent.truncate(SESSION_CHOICES);
 
+    if recent.is_empty() && !term.is_empty() {
+        resume_said(runner, session, workspace, term);
+        return;
+    }
     if recent.is_empty() {
         render::blank();
         render::line(&render::dim("No earlier sessions to pick up."));
@@ -972,7 +988,131 @@ pub fn resume(runner: &mut Runner, session: &mut usize, workspace: Option<&std::
         render::line(&render::dim("Stayed put."));
         return;
     };
+    pick_up(runner, session, workspace, index);
+}
 
+/// Sessions where `term` was said, for `/resume <term>` when no title holds
+/// it: one line each, with a little of what was said, the best match first.
+fn resume_said(
+    runner: &mut Runner,
+    session: &mut usize,
+    workspace: Option<&std::path::Path>,
+    term: &str,
+) {
+    let within = store::Within {
+        exclude: runner.store.conversations[*session].id,
+        ..Default::default()
+    };
+    // A session gives up to three hits; picking one opens the session, so
+    // it is listed once, by its best.
+    let mut hits = store::search(term, &within, SESSION_CHOICES * 3);
+    let mut listed: Vec<u64> = Vec::new();
+    hits.retain(|hit| {
+        let first = !listed.contains(&hit.id);
+        listed.push(hit.id);
+        first
+    });
+    hits.truncate(SESSION_CHOICES);
+    if hits.is_empty() {
+        render::blank();
+        render::line(&render::dim(&format!(
+            "No earlier session has \"{term}\" in its title or what was said."
+        )));
+        return;
+    }
+
+    let room = render::width().saturating_sub(PICKER_EDGES);
+    let labels: Vec<String> = hits
+        .iter()
+        .map(|hit| {
+            let title = match hit.title.trim() {
+                "" => "untitled",
+                title => title,
+            };
+            // A match in the title has only the title to show.
+            let label = match hit.ordinal {
+                Some(_) => format!("{title}  ·  {}", from_match(&hit.snippet, term)),
+                None => title.to_owned(),
+            };
+            // What was said can hold an escape a tool read from the web,
+            // which printed raw would restyle or move about the terminal.
+            render::fit(&label, room)
+                .chars()
+                .filter(|c| !c.is_control())
+                .collect()
+        })
+        .collect();
+
+    render::blank();
+    render::said(
+        &render::blue("●"),
+        &render::bold("Said in earlier sessions"),
+    );
+    let mut options: Vec<&str> = labels.iter().map(String::as_str).collect();
+    options.push("Stay where I am");
+    let Some(picked) = runner.bar.choose("Which one?", Vec::new(), &options) else {
+        return;
+    };
+    let Some(hit) = hits.get(picked) else {
+        render::line(&render::dim("Stayed put."));
+        return;
+    };
+    // One begun in the window since this terminal started is not listed
+    // here yet, so it is read from its file.
+    let index = match runner
+        .store
+        .conversations
+        .iter()
+        .position(|c| c.id == hit.id)
+    {
+        Some(index) => index,
+        None => {
+            let Some(conversation) = store::saved(hit.id) else {
+                render::line(&render::red("That session is no longer on disk."));
+                return;
+            };
+            runner.store.conversations.push(conversation);
+            runner.store.conversations.len() - 1
+        }
+    };
+    pick_up(runner, session, workspace, index);
+}
+
+/// Columns a picker line loses to the box around it and its number: two
+/// margins, two borders with their spaces, and "› 10 ".
+const PICKER_EDGES: usize = 13;
+/// Characters of a snippet kept before its first match, so the match is on
+/// screen after the session's title.
+const SNIPPET_LEAD: usize = 20;
+
+/// `snippet` from a little before the first of `query`'s words it holds,
+/// ignoring case, so the match is not cut off the end of a picker line.
+fn from_match(snippet: &str, query: &str) -> String {
+    let lower = snippet.to_lowercase();
+    let first = query
+        .split(|c: char| c.is_whitespace() || c == '"')
+        .map(|word| word.trim_matches(|c: char| c.is_ascii_punctuation()))
+        .filter(|word| !word.is_empty())
+        .filter_map(|word| lower.find(&word.to_lowercase()))
+        .min();
+    // Counted in characters, as core cuts its snippets.
+    let skip = first.map_or(0, |at| {
+        lower[..at].chars().count().saturating_sub(SNIPPET_LEAD)
+    });
+    if skip == 0 {
+        return snippet.to_owned();
+    }
+    let rest: String = snippet.chars().skip(skip).collect();
+    format!("…{}", rest.trim_start())
+}
+
+/// Make session `index` the open one and show what was said in it.
+fn pick_up(
+    runner: &mut Runner,
+    session: &mut usize,
+    workspace: Option<&std::path::Path>,
+    index: usize,
+) {
     *session = index;
     runner.enter(index);
     // A session carries its own project folder; one that never had a folder
@@ -1492,7 +1632,7 @@ pub fn gateways(runner: &mut Runner) {
 
 #[cfg(test)]
 mod tests {
-    use super::{agent_rows, last_prompt, with_files};
+    use super::{agent_rows, from_match, last_prompt, with_files};
     use letronna_core::agents::Seen;
     use letronna_core::chat::Message;
     use letronna_core::driver::Status;
@@ -1612,5 +1752,23 @@ mod tests {
         assert_eq!(at(&wide[0], "task"), at(&wide[1], "Find"));
         assert_eq!(at(&wide[0], "task"), at(&wide[2], "Run every"));
         assert_eq!(at(&wide[0], "state"), at(&wide[2], "stopped"));
+    }
+
+    #[test]
+    fn a_hit_is_shown_from_just_before_its_match() {
+        let snippet = format!("…{} the Signing key was rotated", "x".repeat(90));
+        let shown = from_match(&snippet, "signing KEY");
+        assert!(shown.starts_with('…'));
+        assert!(shown.contains("the Signing key"));
+        assert_eq!(
+            shown.chars().count(),
+            1 + 20 + "Signing key was rotated".len()
+        );
+        // Near the start already, or holding none of the words: as it is.
+        assert_eq!(from_match("the signing key", "signing"), "the signing key");
+        assert_eq!(
+            from_match("nothing here", "\"signing key\""),
+            "nothing here"
+        );
     }
 }

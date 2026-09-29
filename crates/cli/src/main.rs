@@ -205,7 +205,7 @@ fn main() {
         });
     }
     if args.start == Start::Choose {
-        resume(&mut runner, &mut session, workspace.as_deref());
+        resume(&mut runner, &mut session, workspace.as_deref(), "");
     } else if runner.store.conversations[session].length() > 0 {
         replay(&runner, session);
     }
