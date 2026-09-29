@@ -78,7 +78,7 @@ impl Tool for MakeImage {
         let mut body = json!({"prompt": prompt, "n": 1});
         pass(args, &mut body, &["size"], "image");
         let reply: Value = send(
-            client(MAKE_TIME)?
+            client()?
                 .post(endpoint("/images/generations"))
                 .bearer_auth(&token)
                 .json(&body),
@@ -140,7 +140,7 @@ impl Tool for Speak {
         let mut body = json!({"input": text});
         pass(args, &mut body, &["voice"], "speech");
         let reply = send(
-            client(MAKE_TIME)?
+            client()?
                 .post(endpoint("/audio/speech"))
                 .bearer_auth(&token)
                 .json(&body),
@@ -230,7 +230,7 @@ fn transcribe(path: &Path, args: &Value) -> Result<String, String> {
     let fields: Vec<(&str, &str)> = model.iter().map(|m| ("model", m.as_str())).collect();
     let (boundary, form) = form(&fields, "file", path, &audio);
     let reply: Value = send(
-        client(MAKE_TIME)?
+        client()?
             .post(endpoint("/audio/transcriptions"))
             .bearer_auth(&token)
             .header(
@@ -291,7 +291,7 @@ impl Tool for MakeVideo {
                 let mut body = json!({"prompt": required(args, "prompt")?});
                 pass(args, &mut body, &["seconds"], "video");
                 let job: Value = send(
-                    client(MAKE_TIME)?
+                    client()?
                         .post(endpoint("/videos"))
                         .bearer_auth(&token)
                         .json(&body),
@@ -304,12 +304,13 @@ impl Tool for MakeVideo {
                     .to_owned()
             }
         };
-        let look = client(Duration::from_secs(30))?;
+        let look = client()?;
         let started = Instant::now();
         let seconds = loop {
             let job: Value = send(
                 look.get(endpoint(&format!("/videos/{id}")))
-                    .bearer_auth(&token),
+                    .bearer_auth(&token)
+                    .timeout(Duration::from_secs(30)),
             )?
             .json()
             .map_err(|_| "The video's progress could not be read.".to_owned())?;
@@ -329,7 +330,7 @@ impl Tool for MakeVideo {
             std::thread::sleep(VIDEO_POLL);
         };
         let bytes = send(
-            client(MAKE_TIME)?
+            client()?
                 .get(endpoint(&format!("/videos/{id}/content")))
                 .bearer_auth(&token),
         )?
@@ -429,8 +430,9 @@ fn dollars(usd: f64) -> String {
 /// Every hosted model that makes images, speech, transcripts or video, with
 /// what it costs, cheapest first. The list is public: no sign-in needed.
 pub fn catalogue() -> Result<Vec<Offer>, String> {
-    let list: Vec<Value> = client(Duration::from_secs(20))?
+    let list: Vec<Value> = client()?
         .get(crate::auth::api("/models?kind=all"))
+        .timeout(Duration::from_secs(20))
         .send()
         .and_then(|r| r.error_for_status())
         .map_err(|_| "Could not load the hosted models.".to_owned())?
@@ -497,11 +499,21 @@ fn endpoint(path: &str) -> String {
     format!("{}{path}", crate::auth::hosted_base())
 }
 
-fn client(timeout: Duration) -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
-        .timeout(timeout)
-        .build()
-        .map_err(|e| e.to_string())
+/// The one HTTP client every hosted-media call goes through, kept open
+/// between calls. It allows `MAKE_TIME`, and a call that must answer sooner
+/// sets its own timeout.
+fn client() -> Result<&'static reqwest::blocking::Client, String> {
+    static CLIENT: std::sync::OnceLock<Result<reqwest::blocking::Client, String>> =
+        std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .timeout(MAKE_TIME)
+                .build()
+                .map_err(|e| e.to_string())
+        })
+        .as_ref()
+        .map_err(Clone::clone)
 }
 
 /// Send a request, and hand back the reply or the API's own reason for
@@ -826,6 +838,13 @@ fn to_base64(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_media_call_shares_one_client() {
+        let first = client().expect("the client builds");
+        let second = client().expect("the client builds");
+        assert!(std::ptr::eq(first, second));
+    }
 
     #[test]
     fn base64_decodes_what_the_api_sends() {
