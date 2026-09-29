@@ -15,7 +15,7 @@ use crate::tools::keep_ends;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::io::Read as _;
+use std::io::{BufRead as _, Read as _};
 use std::path::{Path, PathBuf};
 
 /// Enough of a file to find its title without reading the whole thing: a
@@ -223,15 +223,14 @@ fn import_claude_code(path: &Path) -> Result<Imported, String> {
         .filter(|s| !s.is_empty())
         .ok_or_else(|| format!("{} has no session id in its name.", path.display()))?
         .to_owned();
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("Could not read {}: {e}", path.display()))?;
+    let lines = read_lines(path)?;
 
     let mut messages = Vec::new();
     let mut tool_names: HashMap<String, String> = HashMap::new();
     let mut workspace = None;
     let mut skipped = 0usize;
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        let Ok(record) = serde_json::from_str::<Value>(line) else {
+    for line in lines {
+        let Ok(record) = serde_json::from_str::<Value>(&line) else {
             skipped += 1;
             continue;
         };
@@ -516,16 +515,15 @@ fn codex_head(path: &Path) -> (String, String, Option<PathBuf>) {
 }
 
 fn import_codex(path: &Path) -> Result<Imported, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("Could not read {}: {e}", path.display()))?;
+    let lines = read_lines(path)?;
 
     let mut session_id = String::new();
     let mut workspace = None;
     let mut messages = Vec::new();
     let mut call_names: HashMap<String, String> = HashMap::new();
     let mut skipped = 0usize;
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        let Ok(record) = serde_json::from_str::<Value>(line) else {
+    for line in lines {
+        let Ok(record) = serde_json::from_str::<Value>(&line) else {
             skipped += 1;
             continue;
         };
@@ -736,6 +734,30 @@ fn codex_output_text(output: &Value) -> String {
 }
 
 // -- Shared ----------------------------------------------------------------
+
+/// The non-empty lines of `path`, read one at a time so a transcript that has
+/// grown to gigabytes is never held whole; bytes that are not UTF-8 are
+/// replaced rather than ending the read, and a read that fails ends it.
+fn read_lines(path: &Path) -> Result<impl Iterator<Item = String>, String> {
+    let file =
+        std::fs::File::open(path).map_err(|e| format!("Could not read {}: {e}", path.display()))?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut buf = Vec::new();
+    Ok(std::iter::from_fn(move || {
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf) {
+                Ok(0) | Err(_) => return None,
+                Ok(_) => {
+                    let line = String::from_utf8_lossy(&buf);
+                    if !line.trim().is_empty() {
+                        return Some(line.trim_end().to_owned());
+                    }
+                }
+            }
+        }
+    }))
+}
 
 /// Assistant messages that follow one another folded into one. Claude Code
 /// writes a record per content block and Codex an item per call, so one
@@ -1021,6 +1043,28 @@ mod tests {
     }
 
     #[test]
+    fn parallel_calls_stay_in_front_of_their_results() {
+        let dir = scratch("parallel");
+        let text = concat!(
+            r#"{"type":"user","message":{"content":"go"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"a","name":"read_file","input":{}}]}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"b","name":"read_file","input":{}}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"a","content":"x"}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"b","content":"y"}]}}"#,
+            "\n",
+        );
+        let path = write(&dir, "par.jsonl", text);
+        let messages = import_claude_code(&path).unwrap().messages;
+        let roles: Vec<&str> = messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["user", "assistant", "tool", "tool"]);
+        assert_eq!(messages[1].tool_calls.len(), 2);
+    }
+
+    #[test]
     fn a_folder_that_is_not_here_is_not_kept() {
         let imported = |workspace| Imported {
             source: Source {
@@ -1050,24 +1094,13 @@ mod tests {
     }
 
     #[test]
-    fn parallel_calls_stay_in_front_of_their_results() {
-        let dir = scratch("parallel");
-        let text = concat!(
-            r#"{"type":"user","message":{"content":"go"}}"#,
-            "\n",
-            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"a","name":"read_file","input":{}}]}}"#,
-            "\n",
-            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"b","name":"read_file","input":{}}]}}"#,
-            "\n",
-            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"a","content":"x"}]}}"#,
-            "\n",
-            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"b","content":"y"}]}}"#,
-            "\n",
-        );
-        let path = write(&dir, "par.jsonl", text);
-        let messages = import_claude_code(&path).unwrap().messages;
-        let roles: Vec<&str> = messages.iter().map(|m| m.role.as_str()).collect();
-        assert_eq!(roles, ["user", "assistant", "tool", "tool"]);
-        assert_eq!(messages[1].tool_calls.len(), 2);
+    fn a_file_that_is_not_utf8_still_imports() {
+        let dir = scratch("lossy");
+        let mut bytes = br#"{"type":"user","message":{"content":"caf"#.to_vec();
+        bytes.push(0xff);
+        bytes.extend_from_slice(b"\"}}\n");
+        let path = dir.join("bad.jsonl");
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(import_claude_code(&path).unwrap().messages.len(), 1);
     }
 }
