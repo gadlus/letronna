@@ -23,6 +23,9 @@ image = "0.25"
 # Plays speech a tool made, in the chat: playback and the formats voices come
 # back in, and no recording.
 rodio = { version = "0.22", default-features = false, features = ["playback", "mp3", "wav", "flac", "vorbis"] }
+# Already in the tree via rodio, but not exposed by it: rodio only plays
+# sound, so the mic button opens an input stream with cpal directly.
+cpal = "0.17"
 
 [target.'cfg(windows)'.dependencies]
 tray-icon = "0.25"

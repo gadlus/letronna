@@ -68,6 +68,11 @@ fn main() {
             // tried first and can hand the key back when there is nothing
             // to send now.
             KeyBinding::new("secondary-enter", SendNow, Some("Composer > Input")),
+            KeyBinding::new(
+                "secondary-shift-v",
+                ui::voice::ToggleVoice,
+                Some("Composer > Input"),
+            ),
             // On the browser's page, Tab moves through the page, not the
             // window.
             KeyBinding::new("tab", ui::browser::PageTab, Some("Browser")),

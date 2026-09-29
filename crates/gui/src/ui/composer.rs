@@ -616,6 +616,11 @@ impl Chat {
                 this.send(window, cx);
                 this.send_now(cx);
             }))
+            .on_action(
+                cx.listener(|this, _: &crate::ui::voice::ToggleVoice, window, cx| {
+                    this.toggle_voice(window, cx);
+                }),
+            )
             .child(Input::new(&self.composer).w_full().appearance(false));
         let controls = h_flex()
             .items_center()
@@ -655,14 +660,7 @@ impl Chat {
                     })),
             )
             .child(self.model_picker(cx))
-            .child(
-                Button::new("mic")
-                    .plain(cx)
-                    .xsmall()
-                    .icon(Icon::new(AppIcon::Mic))
-                    .disabled(true)
-                    .tooltip("Voice input, coming soon"),
-            )
+            .child(self.mic_button(cx))
             // Stop only where the reply is: in another session it would end
             // a reply that is not on screen.
             .when(self.busy && self.busy_elsewhere().is_none(), |row| {

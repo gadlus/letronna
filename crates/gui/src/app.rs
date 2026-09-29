@@ -350,6 +350,9 @@ pub(crate) struct Chat {
     pub(crate) revealed: Option<Pixels>,
     /// The list of modes, while the mode chip has it open.
     pub(crate) mode_menu: Option<Entity<gpui_component::menu::PopupMenu>>,
+    /// The mic button's own state: recording, or sending what it heard off
+    /// to be transcribed. `None` the rest of the time; nothing runs then.
+    pub(crate) voice: Option<crate::ui::voice::Voice>,
     pub(crate) _subscriptions: Vec<Subscription>,
 }
 
@@ -684,6 +687,7 @@ impl Chat {
             reveal: None,
             revealed: None,
             mode_menu: None,
+            voice: None,
             _subscriptions: subscriptions,
         };
         let widen = this.follow_browser_layout(window, cx);

@@ -11,6 +11,7 @@
 pub(crate) mod audio;
 pub(crate) mod backdrop;
 pub(crate) mod install;
+pub(crate) mod mic;
 pub(crate) mod poster;
 pub(crate) mod tray;
 pub(crate) mod video;
