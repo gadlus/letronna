@@ -262,6 +262,7 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(crate::browser::UsePage),
         Arc::new(crate::agents::Agent),
         Arc::new(crate::agents::Agents),
+        Arc::new(crate::tasklist::Board),
     ];
     // In place of the MCP tools when those are too many to send; see
     // `specs`. Here, so that no plugin can take their names.
@@ -768,6 +769,14 @@ pub fn summary(name: &str, args: &str) -> String {
             v["action"].as_str().unwrap_or_default(),
             v["to"].as_str().unwrap_or_default()
         ),
+        "board" => match v["id"].as_u64() {
+            Some(id) => format!("{} #{id}", v["action"].as_str().unwrap_or_default()),
+            None => format!(
+                "{} {}",
+                v["action"].as_str().unwrap_or_default(),
+                v["title"].as_str().unwrap_or_default()
+            ),
+        },
         crate::browser::BROWSE | "use_page" => crate::browser::summary(&v),
         TODO => {
             let items = v["items"].as_array().map(Vec::len).unwrap_or(0);
