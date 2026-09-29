@@ -35,6 +35,8 @@ pub struct Sentences {
     fenced: bool,
     /// `pending` starts partway through a line, where no fence can open.
     mid_line: bool,
+    /// The line under way is a table row, which is not read aloud either.
+    row: bool,
 }
 
 impl Sentences {
@@ -74,12 +76,16 @@ impl Sentences {
                 if line_end.is_none() && !done && could_be_fence(start) {
                     break;
                 }
+                // Decided at the row's start, since a stop inside a cell
+                // would otherwise let the rest of the row be said.
+                self.row = !self.fenced && start.starts_with('|');
             }
-            if self.fenced {
+            if self.fenced || self.row {
                 match line_end {
                     Some(end) => {
                         self.pending.drain(..=end);
                         self.mid_line = false;
+                        self.row = false;
                     }
                     None => {
                         self.pending.clear();
@@ -595,6 +601,15 @@ mod tests {
             words("# Result\nIt worked.\n```\nrm -rf x\n```\n| a | b |\nBye."),
             "Result It worked. Bye."
         );
+    }
+
+    #[test]
+    fn a_table_row_is_passed_over_even_with_a_stop_inside_it() {
+        let reply = "| Step | Run it. Then check it |\n|---|---|\nDone.";
+        let pieces: Vec<String> = reply.chars().map(String::from).collect();
+        let pieces: Vec<&str> = pieces.iter().map(String::as_str).collect();
+        assert_eq!(all(&[reply]), ["Done."]);
+        assert_eq!(all(&pieces), ["Done."]);
     }
 
     #[cfg(unix)]
