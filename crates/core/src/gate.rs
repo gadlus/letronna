@@ -2301,6 +2301,34 @@ mod tests {
     }
 
     #[test]
+    fn a_batch_whose_steps_come_as_text_is_decided_on_the_steps_it_runs() {
+        let ctx = ToolContext::default();
+        let granted = Grants::from([(0, HashSet::from(["use_page".to_owned()]))]);
+        let gate = Gate {
+            ctx: &ctx,
+            mode: Mode::Default,
+            grants: &granted,
+            rules: &[],
+            broken: None,
+            human: true,
+        };
+        // Some models send an array inside a call as its JSON text, which
+        // the tool reads as the array before it runs.
+        let batch = |steps: serde_json::Value| {
+            call(
+                "use_page",
+                serde_json::json!({ "action": "batch", "steps": steps.to_string() }),
+            )
+        };
+        let click = serde_json::json!({ "action": "click", "ref": "e1" });
+        let upload = serde_json::json!({ "action": "upload", "ref": "e3", "files": ["cv.pdf"] });
+        let plain = batch(serde_json::json!([click]));
+        assert_eq!(decide(&plain, &gate), Outcome::Run);
+        let sends = batch(serde_json::json!([click, upload]));
+        assert_eq!(decide(&sends, &gate), Outcome::Ask);
+    }
+
+    #[test]
     fn a_call_carrying_the_secret_marker_is_refused_before_any_card() {
         let ctx = ToolContext::default();
         let none = Grants::new();

@@ -645,8 +645,13 @@ fn steps(args: &Value) -> Result<Vec<(&'static str, &Value)>, String> {
 /// decide as it would decide each alone; why the batch cannot run instead,
 /// and `None` for any other call.
 pub(crate) fn batch_calls(call: &ToolCall) -> Option<Result<Vec<ToolCall>, String>> {
-    let args = crate::tools::parse_args(&call.arguments).ok()?;
-    if call.name != "use_page" || args["action"] != "batch" {
+    if call.name != "use_page" {
+        return None;
+    }
+    // Read as the tool reads them when it runs, `steps` sent as its JSON
+    // text included, so what is decided is what runs.
+    let args = crate::tools::parse_args_for(&call.name, &call.arguments).ok()?;
+    if args["action"] != "batch" {
         return None;
     }
     let steps = match steps(&args) {
