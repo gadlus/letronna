@@ -1899,9 +1899,14 @@ mod tests {
         // Don't ask, Bypass. A line that only reads runs in every mode; one
         // that only Accept edits would ask about runs sandboxed there
         // instead, on a system that can confine it.
+        let confined = if crate::sandbox::available() {
+            "ASXXR"
+        } else {
+            "AAXXR"
+        };
         let table = [
             (command("ls"), "RRRRR"),
-            (command("cargo test"), "ASXXR"),
+            (command("cargo test"), confined),
             (edit("src/new.rs"), "ARXXR"),
             (call("edit_file", changed), "ARXXR"),
             (edit(".git/hooks/pre-commit"), "AAXXR"),
@@ -1918,6 +1923,61 @@ mod tests {
                 .collect();
             assert_eq!(got, expected, "{}", queued.arguments);
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Given a system that confines commands, whichever this one is: in
+    /// Accept edits and auto mode a command that would ask runs sandboxed,
+    /// an allow rule leaves it there, and Git or a run asked for outside
+    /// still asks; Default mode asks as before.
+    #[test]
+    fn a_command_that_would_ask_runs_sandboxed_where_commands_can_be() {
+        let dir = project_dir("sandboxed");
+        let ctx = ToolContext {
+            workspace: Some(dir.join("project")),
+            ..Default::default()
+        };
+        let none = Grants::new();
+        let allowed = [Rule {
+            tool: "run_command".into(),
+            pattern: "cargo test".into(),
+            effect: permissions::Effect::Allow,
+            project: None,
+        }];
+        let outside = call(
+            "run_command",
+            serde_json::json!({ "command": "cargo test", "unsandboxed": true }),
+        );
+        for (mode, rules) in [
+            (Mode::AcceptEdits, &[][..]),
+            (Mode::AcceptEdits, &allowed[..]),
+            (Mode::Auto, &[][..]),
+        ] {
+            let gate = Gate {
+                ctx: &ctx,
+                mode,
+                grants: &none,
+                rules,
+                broken: None,
+                human: true,
+            };
+            let decided = |call: &ToolCall| decide_with(call, &gate, None, true);
+            assert_eq!(decided(&command("cargo test")), Outcome::Sandboxed);
+            assert_eq!(decided(&command("git commit -m x")), Outcome::Ask);
+            assert_eq!(decided(&outside), Outcome::Ask);
+        }
+        let gate = Gate {
+            ctx: &ctx,
+            mode: Mode::Default,
+            grants: &none,
+            rules: &[],
+            broken: None,
+            human: true,
+        };
+        assert_eq!(
+            decide_with(&command("cargo test"), &gate, None, true),
+            Outcome::Ask
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
