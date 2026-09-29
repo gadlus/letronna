@@ -24,7 +24,7 @@ pub struct ToolContext {
     /// and whether other people can see the replies.
     pub remote: Option<Remote>,
     /// The conversation the call is made in, which keeps a browser of its
-    /// own; 0 for none in particular.
+    /// own and hears when its jobs exit; 0 for none in particular.
     pub conversation: u64,
     /// Where the file tools note what they write, for a rewind to put back.
     pub files: crate::history::Log,
@@ -1156,7 +1156,7 @@ impl Tool for RunCommand {
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
             "command": {"type": "string"},
-            "background": {"type": "boolean", "description": "Leave the command running and return a job number straight away. Read its output later with read_job, and end it with stop_job."}
+            "background": {"type": "boolean", "description": "Leave the command running and return a job number straight away. A notice comes when it exits; read its output meanwhile with read_job, and end it with stop_job."}
         }, "required": ["command"]})
     }
     fn needs_approval(&self) -> bool {
@@ -1195,7 +1195,7 @@ impl Tool for RunCommand {
                 Err(e) => Err(note + &e),
             };
         }
-        let id = crate::jobs::start(command, cwd)?;
+        let id = crate::jobs::start_for(command, cwd, ctx.conversation)?;
         // Give it a moment to fail or announce a port, so the first reply says
         // something more useful than "started". A stop cuts the moment short,
         // but the job runs on either way, so it is still reported.
@@ -1336,11 +1336,13 @@ impl Tool for ReadJob {
         "read_job"
     }
     fn description(&self) -> &'static str {
-        "Read what a background job has printed so far, and whether it is still running."
+        "Read what a background job has printed so far, and whether it is still running. Pass offset and limit to read a long log a page of lines at a time."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
-            "id": {"type": "integer"}
+            "id": {"type": "integer"},
+            "offset": {"type": "integer", "description": "How many lines to skip, counting from the oldest line still kept."},
+            "limit": {"type": "integer", "description": "How many lines to read from there."}
         }, "required": ["id"]})
     }
     fn run(&self, args: &Value, _: &ToolContext) -> Result<String, String> {
@@ -1354,6 +1356,26 @@ impl Tool for ReadJob {
                 None => "stopped".to_owned(),
             }
         };
+        let (offset, limit) = (args["offset"].as_u64(), args["limit"].as_u64());
+        if offset.is_some() || limit.is_some() {
+            let lines: Vec<&str> = log.trim_end().lines().collect();
+            let total = lines.len();
+            let start = (offset.unwrap_or(0) as usize).min(total);
+            let end = limit.map_or(total, |limit| {
+                start.saturating_add(limit as usize).min(total)
+            });
+            if start == end {
+                return Ok(format!(
+                    "Job #{id} is {state}. No lines from line {}; the log has {total}.",
+                    offset.unwrap_or(0).saturating_add(1)
+                ));
+            }
+            return Ok(format!(
+                "Job #{id} is {state}. Lines {} to {end} of {total}:\n{}",
+                start + 1,
+                lines[start..end].join("\n")
+            ));
+        }
         Ok(format!(
             "Job #{id} is {state}.\n{}",
             if log.trim().is_empty() {
@@ -2736,6 +2758,37 @@ mod tests {
         crate::jobs::stop(id).unwrap();
         let out = out.unwrap_err();
         assert!(out.contains("still running"), "{out}");
+    }
+
+    #[test]
+    fn read_job_pages_through_a_long_log() {
+        let count = if cfg!(windows) {
+            "1..300 | ForEach-Object { \"line $_\" }"
+        } else {
+            "i=1; while [ $i -le 300 ]; do echo line $i; i=$((i+1)); done"
+        };
+        let id = crate::jobs::start(count, &std::env::temp_dir()).unwrap();
+        // Read once it has all been printed, so no page moves while it is read.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !crate::jobs::log(id).unwrap().contains("line 300") && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let read = |args: Value| ReadJob.run(&args, &ToolContext::default()).unwrap();
+        let page = read(json!({"id": id, "offset": 100, "limit": 3}));
+        assert!(
+            page.ends_with(" Lines 101 to 103 of 300:\nline 101\nline 102\nline 103"),
+            "{page}"
+        );
+        let end = read(json!({"id": id, "offset": 298}));
+        assert!(
+            end.ends_with(" Lines 299 to 300 of 300:\nline 299\nline 300"),
+            "{end}"
+        );
+        let past = read(json!({"id": id, "offset": 400, "limit": 10}));
+        assert!(
+            past.ends_with(" No lines from line 401; the log has 300."),
+            "{past}"
+        );
     }
 
     #[test]
