@@ -665,6 +665,10 @@ impl BrowserView {
             "=" | "+" if shortcut => self.set_zoom(zoom_step(self.zoom, true), window, cx),
             "-" if shortcut => self.set_zoom(zoom_step(self.zoom, false), window, cx),
             "0" if shortcut => self.set_zoom(1., window, cx),
+            "p" if shortcut => self.toggle_point(cx),
+            // Clicks are held back while pointing, so keys are too: Enter on
+            // a focused page button would click it all the same.
+            _ if self.pointing.is_some() => {}
             "c" if shortcut => watch::control(Control::Copy),
             "x" if shortcut => {
                 watch::control(Control::Copy);
@@ -675,7 +679,6 @@ impl BrowserView {
                     watch::control(Control::Paste(text));
                 }
             }
-            "p" if shortcut => self.toggle_point(cx),
             name => press(name, stroke.key_char.clone(), held(stroke.modifiers)),
         }
         cx.stop_propagation();
