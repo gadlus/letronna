@@ -64,14 +64,24 @@ pub(crate) fn record(
         }
     }
     drop(stream);
-    let samples = Arc::try_unwrap(samples)
-        .map(|m| m.into_inner().unwrap_or_default())
-        .unwrap_or_default();
+    // Taken rather than unwrapped: a backend that keeps its callback alive
+    // past the stream would otherwise hand back an empty recording.
+    let mut samples = std::mem::take(&mut *samples.lock().unwrap_or_else(|e| e.into_inner()));
+    fit(&mut samples, channels, max_bytes);
     Ok(Captured {
         samples,
         sample_rate,
         channels,
     })
+}
+
+/// Cut `samples` to the whole frames that fit in `max_bytes`: the stream
+/// keeps sending between the last check and closing, and a file over the cap
+/// is refused outright.
+fn fit(samples: &mut Vec<i16>, channels: u16, max_bytes: u64) {
+    let frame = usize::from(channels.max(1));
+    let most = usize::try_from(max_bytes / 2).unwrap_or(usize::MAX) / frame * frame;
+    samples.truncate(most);
 }
 
 /// A stream that appends what the microphone sends to `samples`, in the
@@ -125,4 +135,22 @@ fn build_stream(
         other => return Err(format!("Letronna cannot record in {other:?}.")),
     };
     built.map_err(|e| format!("Could not start recording: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit;
+
+    #[test]
+    fn a_recording_past_the_cap_is_cut_to_whole_frames_within_it() {
+        let mut samples = vec![0i16; 100];
+        fit(&mut samples, 2, 101);
+        assert_eq!(samples.len(), 50);
+        let mut samples = vec![0i16; 100];
+        fit(&mut samples, 3, 100);
+        assert_eq!(samples.len(), 48);
+        let mut samples = vec![0i16; 10];
+        fit(&mut samples, 1, 1_000);
+        assert_eq!(samples.len(), 10);
+    }
 }

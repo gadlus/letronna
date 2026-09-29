@@ -17,9 +17,12 @@ actions!(voice, [ToggleVoice]);
 
 /// A recording longer than this is cut off and sent as it is.
 const MAX_DURATION: Duration = Duration::from_secs(120);
-/// The upload cap the transcription API takes; recording stops at it too,
-/// rather than filling the cap and having the upload refused anyway.
-const MAX_BYTES: u64 = letronna_core::media::UPLOAD_BYTES;
+/// The upload cap the transcription API takes, less the WAV header that goes
+/// in front of the samples; recording stops at it too, rather than filling
+/// the cap and having the upload refused anyway.
+const MAX_BYTES: u64 = letronna_core::media::UPLOAD_BYTES - WAV_HEADER as u64;
+/// The bytes `encode_wav` writes ahead of the samples.
+const WAV_HEADER: usize = 44;
 
 /// Where the mic button stands: silent until pressed, recording until
 /// pressed again or a cap is hit, then away being transcribed.
@@ -223,7 +226,7 @@ fn encode_wav(audio: &Captured) -> Vec<u8> {
     let data_len = (audio.samples.len() * 2) as u32;
     let byte_rate = audio.sample_rate * u32::from(audio.channels) * 2;
     let block_align = audio.channels * 2;
-    let mut wav = Vec::with_capacity(44 + data_len as usize);
+    let mut wav = Vec::with_capacity(WAV_HEADER + data_len as usize);
     wav.extend_from_slice(b"RIFF");
     wav.extend_from_slice(&(36 + data_len).to_le_bytes());
     wav.extend_from_slice(b"WAVE");
@@ -282,7 +285,19 @@ mod tests {
     #[test]
     fn the_caps_match_what_a_recording_may_spend() {
         assert_eq!(super::MAX_DURATION, std::time::Duration::from_secs(120));
-        assert_eq!(super::MAX_BYTES, 25 * 1024 * 1024);
+        assert_eq!(super::MAX_BYTES, 25 * 1024 * 1024 - 44);
+    }
+
+    #[test]
+    fn a_recording_filled_to_the_cap_is_still_small_enough_to_send() {
+        let audio = Captured {
+            samples: vec![0; super::MAX_BYTES as usize / 2],
+            sample_rate: 96_000,
+            channels: 2,
+        };
+        let wav = encode_wav(&audio);
+        assert_eq!(&wav[super::WAV_HEADER - 8..super::WAV_HEADER - 4], b"data");
+        assert!(wav.len() as u64 <= letronna_core::media::UPLOAD_BYTES);
     }
 
     #[test]
