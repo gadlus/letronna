@@ -3681,6 +3681,7 @@ dependencies = [
  "async-channel 2.5.0",
  "chrono",
  "ignore",
+ "image",
  "libc",
  "regex",
  "reqwest",
@@ -3691,6 +3692,8 @@ dependencies = [
  "toml 1.1.6+spec-1.1.0",
  "tungstenite",
  "windows-sys 0.59.0",
+ "x11rb",
+ "zbus",
 ]
 
 [[package]]

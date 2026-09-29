@@ -36,6 +36,16 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Securit
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Computer use on Linux: X11 through x11rb, which the window already uses,
+# with XTest for input and X-Resource for which process owns a window;
+# AT-SPI's element tree over zbus, already here under the tray; and image,
+# already here under the window, for the PNG, or the JPEG where that is
+# too large to send.
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.13", features = ["xtest", "res"] }
+zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
 [features]
 default = ["workflows"]
 # Orchestration scripts that run many agents at once. On by default, so CI

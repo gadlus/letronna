@@ -27,6 +27,9 @@
 //! as the browser's refs hold for a page, and are never given to another
 //! element, so a stale id is refused rather than landing somewhere else.
 
+#[cfg(target_os = "linux")]
+mod linux;
+
 use crate::chat::{Connection, ToolCall};
 use crate::tools::{Tool, ToolContext};
 use serde_json::{Value, json};
@@ -314,7 +317,11 @@ fn backend() -> Option<Arc<dyn Backend>> {
     {
         tests::fake()
     }
-    #[cfg(not(test))]
+    #[cfg(all(not(test), target_os = "linux"))]
+    {
+        linux::backend()
+    }
+    #[cfg(all(not(test), not(target_os = "linux")))]
     {
         None
     }
