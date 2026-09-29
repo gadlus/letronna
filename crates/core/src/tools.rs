@@ -389,7 +389,7 @@ impl Tool for WriteFile {
         "write_file"
     }
     fn description(&self) -> &'static str {
-        "Create or overwrite a text file in the project folder. Parent folders are created."
+        "Create or overwrite a text file in the project folder. Parent folders are created. A file that exists keeps its line endings and byte order mark."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -406,11 +406,18 @@ impl Tool for WriteFile {
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         let path = resolve_write(path_arg(args), ctx)?;
         let content = args["content"].as_str().ok_or("`content` is required.")?;
+        // Only a regular file is read: opening a pipe would wait for a writer.
+        let before = std::fs::metadata(&path)
+            .ok()
+            .filter(std::fs::Metadata::is_file)
+            .and_then(|_| std::fs::read(&path).ok());
+        let text = crate::write::keep_format(before.as_deref().unwrap_or_default(), content);
+        crate::write::check_syntax(&path, before.as_deref(), &text)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        std::fs::write(&path, content).map_err(|e| e.to_string())?;
-        Ok(format!("Wrote {} bytes.", content.len()))
+        crate::write::atomic(&path, text.as_bytes())?;
+        Ok(format!("Wrote {} bytes.", text.len()))
     }
 }
 
@@ -467,7 +474,8 @@ impl Tool for EditFile {
         if done.replaced == 0 {
             return Ok("Already applied; nothing changed.".into());
         }
-        std::fs::write(&path, done.text).map_err(|e| e.to_string())?;
+        crate::write::check_syntax(&path, Some(text.as_bytes()), &done.text)?;
+        crate::write::atomic(&path, done.text.as_bytes())?;
         Ok(match (done.replaced, done.already) {
             (1, 0) => "Edited.".into(),
             (n, 0) => format!("Edited {n} places."),
@@ -1287,6 +1295,40 @@ World"
             "\u{FEFF}fn b(x) {\r\n    two(x);\r\n}\r\n"
         );
         assert!(edit(json!({"path": "a.rs"})).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn write_file_keeps_the_files_format_and_neither_tool_breaks_a_manifest() {
+        let dir = std::env::temp_dir().join(format!("letronna-write-tool-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.cs"), "\u{FEFF}class A {}\r\n").unwrap();
+        std::fs::write(dir.join("package.json"), "{\"a\": 1}\n").unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"a\"\n").unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let write = |args: Value| WriteFile.run(&args, &ctx);
+        write(json!({"path": "a.cs", "content": "class B {\n}\n"})).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.cs")).unwrap(),
+            "\u{FEFF}class B {\r\n}\r\n"
+        );
+
+        let err = write(json!({"path": "package.json", "content": "{\"a\": 1,}"})).unwrap_err();
+        assert!(err.contains("nothing was written"), "{err}");
+        assert!(write(json!({"path": "new/tsconfig.json", "content": "{\n// ok\n}"})).is_ok());
+        let edit = json!({"path": "Cargo.toml", "old": "name = \"a\"", "new": "name = a"});
+        assert!(EditFile.run(&edit, &ctx).is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("package.json")).unwrap(),
+            "{\"a\": 1}\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("Cargo.toml")).unwrap(),
+            "[package]\nname = \"a\"\n"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
