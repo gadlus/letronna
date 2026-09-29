@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// How long a look or a stage may take: these touch only the index.
@@ -745,8 +746,8 @@ fn run_both(
         let _ = child.kill();
         return Err("git gave no output to read.".into());
     };
-    let out = std::thread::spawn(move || drain(stdout));
-    let errors = std::thread::spawn(move || drain(stderr));
+    let out = reader(stdout);
+    let errors = reader(stderr);
     if let (Some(text), Some(mut stdin)) = (input, child.stdin.take()) {
         // One that exits without reading it all says why on stderr.
         let _ = stdin.write_all(text.as_bytes());
@@ -768,9 +769,21 @@ fn run_both(
             Err(e) => return Err(format!("git did not finish: {e}")),
         }
     };
-    let out = out.join().unwrap_or_default();
-    let errors = errors.join().unwrap_or_default();
+    // Git has written all it will by now; a process a hook left running in
+    // the background may hold the pipes open for good, and is not waited on.
+    let out = out.recv_timeout(AFTER_EXIT).unwrap_or_default();
+    let errors = errors.recv_timeout(AFTER_EXIT).unwrap_or_default();
     Ok((status.code().unwrap_or(-1), out, errors))
+}
+
+/// How long what git printed is waited for once git itself has exited.
+const AFTER_EXIT: Duration = Duration::from_secs(2);
+
+/// `stream` read to its end on a thread of its own, sent back when done.
+fn reader(stream: impl Read + Send + 'static) -> mpsc::Receiver<String> {
+    let (send, receive) = mpsc::channel();
+    std::thread::spawn(move || send.send(drain(stream)));
+    receive
 }
 
 /// All of `stream` read to its end, keeping the first [`OUTPUT_CAP`] bytes;
@@ -1010,6 +1023,26 @@ mod tests {
         assert!(why.contains("Nothing is staged"), "{why}");
         let why = commit(&folder, "  \n").unwrap_err();
         assert!(why.contains("message"), "{why}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_that_leaves_a_process_running_does_not_hold_the_commit() {
+        use std::os::unix::fs::PermissionsExt;
+        let folder = repo("hook-left");
+        let hook = folder.join(".git/hooks/post-commit");
+        std::fs::write(&hook, "#!/bin/sh\nsleep 30 &\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(folder.join("a.txt"), "changed\n").unwrap();
+        setup(&folder, &["add", "a.txt"]);
+        let started = Instant::now();
+        let said = commit(&folder, "Change the file").unwrap();
+        assert!(said.contains("Change the file"), "{said}");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
