@@ -38,6 +38,19 @@ const START_TIME: Duration = Duration::from_secs(60);
 const CALL_TIME: Duration = Duration::from_secs(120);
 /// The protocol revision asked for; a server answers with one it speaks.
 const PROTOCOL: &str = "2025-06-18";
+/// The words in an `env` or `headers` name that say its value is a secret.
+/// Other values -- paths, addresses, flags -- would hide ordinary text
+/// wherever they turned up.
+const SECRET_NAMES: &[&str] = &[
+    "key",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "credential",
+    "authorization",
+    "cookie",
+];
 
 /// `mcp.json`, as Claude Desktop writes it.
 #[derive(Deserialize, Default)]
@@ -88,12 +101,7 @@ pub fn start() {
     }
     static STARTED: Once = Once::new();
     STARTED.call_once(|| {
-        let path = crate::chat::data_dir().join("mcp.json");
-        let config: Config = std::fs::read(path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default();
-        for (name, server) in config.servers {
+        for (name, server) in config().servers {
             if server.disabled || (server.command.trim().is_empty() && server.url.trim().is_empty())
             {
                 continue;
@@ -109,6 +117,50 @@ pub fn start() {
             });
         }
     });
+}
+
+/// `mcp.json` as saved, or no servers when it is missing or unreadable.
+fn config() -> Config {
+    let path = crate::chat::data_dir().join("mcp.json");
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// The values in `mcp.json` whose names say they are secret, for hiding
+/// wherever they turn up.
+pub(crate) fn secrets() -> Vec<String> {
+    secret_values(&config())
+}
+
+/// Each server's `env` and `headers` values named for a key, a token or a
+/// password; of `Bearer <token>`, the token.
+fn secret_values(config: &Config) -> Vec<String> {
+    let secret = |name: &String| {
+        let name = name.to_lowercase();
+        SECRET_NAMES.iter().any(|word| name.contains(word))
+    };
+    config
+        .servers
+        .values()
+        .flat_map(|server| server.env.iter().chain(&server.headers))
+        .filter(|(name, _)| secret(name))
+        .filter_map(|(_, value)| value.split_whitespace().last().map(str::to_owned))
+        // A path named for a key, as SSH_KEY_PATH is, is no secret, and hiding
+        // it would hide the file wherever it is named.
+        .filter(|value| !path_like(value))
+        .collect()
+}
+
+/// Whether `value` reads as a path to a file, on any system.
+fn path_like(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let drive = bytes.first().is_some_and(u8::is_ascii_alphabetic)
+        && bytes.get(1) == Some(&b':')
+        && matches!(bytes.get(2), Some(b'\\' | b'/'));
+    // `.` starts `./` and `../`, and `\\` a Windows network path.
+    drive || value.starts_with(['/', '\\', '~', '.'])
 }
 
 /// Wait until every server has answered or given up, for at most `limit`:
@@ -559,6 +611,9 @@ struct McpTool {
 }
 
 impl Tool for McpTool {
+    fn hides_key_shapes(&self) -> bool {
+        true
+    }
     fn name(&self) -> &'static str {
         self.name
     }
@@ -1004,5 +1059,33 @@ mod tests {
             .run(&json!({"message": "hello"}), &ToolContext::default())
             .unwrap();
         assert!(said.contains("hello"), "{said}");
+    }
+
+    #[test]
+    fn only_values_named_as_secrets_are_hidden() {
+        let config: Config = serde_json::from_value(json!({"mcpServers": {
+            "files": {"command": "files-server", "env": {
+                "ROOT_FOLDER": "/home/someone/projects",
+                "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_0123456789abcdefghij",
+                "Db_Password": "a-long-database-password",
+                "SSH_KEY_PATH": "/home/someone/.ssh/id_ed25519",
+                "GOOGLE_APPLICATION_CREDENTIALS": "C:\\keys\\service-account.json"
+            }},
+            "remote": {"url": "https://mcp.example.com", "headers": {
+                "Authorization": "Bearer remote-0123456789abcdef",
+                "Accept": "application/json-seq"
+            }}
+        }}))
+        .unwrap();
+        let mut found = secret_values(&config);
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                "a-long-database-password",
+                "ghp_0123456789abcdefghij",
+                "remote-0123456789abcdef"
+            ]
+        );
     }
 }

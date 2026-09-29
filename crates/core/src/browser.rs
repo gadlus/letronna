@@ -50,9 +50,6 @@ const SHOT_TIME: Duration = Duration::from_secs(10);
 const SHOT_WIDTH: f64 = 1280.;
 /// Console lines shown, newest last.
 const CONSOLE_LINES: usize = 30;
-/// A secret shorter than this is not looked for in addresses: it would
-/// match by chance.
-const SECRET_CHARS: usize = 16;
 /// Groups the page's handles on the nodes an action touched, so they are
 /// let go of together when it is done.
 const HANDLES: &str = "letronna";
@@ -114,6 +111,9 @@ const CHOOSE: &str = "function(choice) {
 pub struct Browse;
 
 impl Tool for Browse {
+    fn hides_key_shapes(&self) -> bool {
+        true
+    }
     fn name(&self) -> &'static str {
         BROWSE
     }
@@ -153,7 +153,10 @@ impl Tool for Browse {
         };
         match args["action"].as_str().unwrap_or("look") {
             "open" => {
-                let url = address(args["url"].as_str().unwrap_or_default(), &secrets())?;
+                let url = address(
+                    args["url"].as_str().unwrap_or_default(),
+                    &crate::redact::secrets(),
+                )?;
                 with_session(ctx.conversation, |session| session.open(&url))
             }
             // Finding looks through the words too: those are what is
@@ -185,6 +188,9 @@ impl Tool for Browse {
 pub struct UsePage;
 
 impl Tool for UsePage {
+    fn hides_key_shapes(&self) -> bool {
+        true
+    }
     fn name(&self) -> &'static str {
         "use_page"
     }
@@ -418,22 +424,6 @@ fn percent_decoded(text: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
-}
-
-/// The user's own keys and tokens: what no address may carry out.
-pub(crate) fn secrets() -> Vec<String> {
-    let mut all: Vec<String> = crate::store::load_keys().into_values().collect();
-    all.extend(crate::auth::account().map(|account| account.token));
-    let chats = crate::messaging::load();
-    all.extend([
-        chats.telegram.token,
-        chats.discord.bot_token,
-        chats.discord.webhook,
-    ]);
-    all.into_iter()
-        .map(|secret| secret.trim().to_owned())
-        .filter(|secret| secret.chars().count() >= SECRET_CHARS)
-        .collect()
 }
 
 /// A key, as the model named it.

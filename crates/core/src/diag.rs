@@ -45,26 +45,6 @@ const FLUSH_WAIT: Duration = Duration::from_secs(1);
 const REACH_WAIT: Duration = Duration::from_secs(5);
 /// What a masked secret is replaced with.
 const HIDDEN: &str = "***";
-/// The starts of the key formats in common use, masked wherever they appear
-/// even when the key is not one saved here.
-const KEY_PREFIXES: &[&str] = &[
-    "sk-",
-    "sk_",
-    "gsk_",
-    "ghp_",
-    "gho_",
-    "github_pat_",
-    "xoxb-",
-    "xoxp-",
-    "hf_",
-    "AIza",
-    "eyJ",
-];
-/// A key-shaped word at least this long is masked: shorter ones are words.
-const KEY_CHARS: usize = 16;
-/// A word of letters and digits at least this long is masked even with no
-/// known prefix: nothing else the app logs is that long without a break.
-const TOKEN_CHARS: usize = 40;
 
 /// The log of this process, once `init` has run.
 struct Log {
@@ -257,7 +237,7 @@ fn now() -> String {
 /// swallowed -- a full disk loses the log, not the app.
 fn write(entries: Receiver<Entry>, logs: &Path, frontend: &'static str) {
     // Read once: a key saved later is still caught by its shape.
-    let secrets = crate::browser::secrets();
+    let secrets = crate::redact::secrets();
     let pid = std::process::id();
     while let Ok(entry) = entries.recv() {
         let (time, kind, fields) = match entry {
@@ -321,45 +301,7 @@ fn clip(text: &str) -> String {
 
 /// `text` with every known secret, bearer token and key-shaped word masked.
 pub fn mask(text: &str, secrets: &[String]) -> String {
-    let mut text = text.to_owned();
-    for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
-        text = text.replace(secret.as_str(), HIDDEN);
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut after_bearer = false;
-    let mut rest = text.as_str();
-    while let Some(first) = rest.chars().next() {
-        let end = if after_bearer && !first.is_whitespace() {
-            // A bearer token is masked whole, dots and all.
-            after_bearer = false;
-            out.push_str(HIDDEN);
-            rest.find(char::is_whitespace).unwrap_or(rest.len())
-        } else if !word_char(first) {
-            out.push(first);
-            first.len_utf8()
-        } else {
-            let end = rest.find(|c: char| !word_char(c)).unwrap_or(rest.len());
-            let word = &rest[..end];
-            out.push_str(if key_shaped(word) { HIDDEN } else { word });
-            after_bearer = word.eq_ignore_ascii_case("bearer");
-            end
-        };
-        rest = &rest[end..];
-    }
-    out
-}
-
-fn word_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '-' || c == '_'
-}
-
-fn key_shaped(word: &str) -> bool {
-    let long =
-        word.len() >= KEY_CHARS && KEY_PREFIXES.iter().any(|prefix| word.starts_with(prefix));
-    let mixed = word.len() >= TOKEN_CHARS
-        && word.chars().any(|c| c.is_ascii_digit())
-        && word.chars().any(|c| c.is_ascii_alphabetic());
-    long || mixed
+    crate::redact::hide(text, secrets, crate::redact::Shapes::Any, HIDDEN)
 }
 
 /// Append `line` to the frontend's log in `logs`, rotating the log first
@@ -403,7 +345,7 @@ fn catch_panics() {
         let frontend = LOG.get().map_or("letronna", |log| log.frontend);
         let backtrace = std::backtrace::Backtrace::force_capture().to_string();
         // Read now rather than at start, so a key saved since is masked too.
-        let secrets = crate::browser::secrets();
+        let secrets = crate::redact::secrets();
         let dir = crate::chat::data_dir();
         let _ = crash(&dir, frontend, &message, &location, &backtrace, &secrets);
         event("panic", &[("at", location.into())]);

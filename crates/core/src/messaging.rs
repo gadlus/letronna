@@ -290,7 +290,7 @@ pub fn send(token: &str, chat: i64, text: &str) -> Result<(), String> {
 
 fn send_via(api: &str, token: &str, chat: i64, text: &str) -> Result<(), String> {
     let client = client().ok_or("Cannot initialize connection.")?;
-    let text = trim_reply(text);
+    let text = trim_reply(&outgoing(text));
     client
         .post(format!("{api}/bot{}/sendMessage", token.trim()))
         .json(&serde_json::json!({"chat_id": chat, "text": text}))
@@ -464,6 +464,34 @@ mod tests {
     }
 
     #[test]
+    fn a_saved_key_never_reaches_a_chat_app() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let data = std::env::temp_dir().join("letronna-messaging-scrub");
+        let _ = std::fs::remove_dir_all(&data);
+        std::fs::create_dir_all(&data).unwrap();
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &data) };
+        let key = "a-saved-key-of-no-known-shape";
+        std::fs::write(data.join("keys.json"), format!(r#"{{"OpenAI":"{key}"}}"#)).unwrap();
+        let marker = crate::redact::MARKER;
+
+        let (api, worker) = one_request("200 OK");
+        report_via(&api, &paired(), "Nightly", &format!("used {key}"));
+        let (_, body) = worker.join().unwrap();
+        assert_eq!(body["text"], format!("Nightly\nused {marker}"));
+        // A question's card is built from the call's own arguments.
+        let args = json!({ "question": format!("Use {key}?") }).to_string();
+        let card = super::card_text(crate::tools::ASK_USER, &args, "");
+        let (base, worker) = one_request("204 No Content");
+        discord_send(&format!("{base}/api/webhooks/1/t"), &card).unwrap();
+        let (_, body) = worker.join().unwrap();
+        let sent = body["content"].as_str().unwrap_or_default();
+        assert!(sent.starts_with(&format!("Use {marker}?")), "{sent}");
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
     fn discord_gets_the_content_field() {
         let (base, worker) = one_request("204 No Content");
         discord_send(&format!("{base}/api/webhooks/1/t"), "**Nightly**\nok").unwrap();
@@ -544,11 +572,18 @@ mod tests {
     }
 }
 
+/// `text` as it may leave for a chat app: other people read it there, so a
+/// key or token Letronna holds is hidden, whether it came in a card, a
+/// question's arguments or the model's reply.
+fn outgoing(text: &str) -> String {
+    crate::redact::scrub(text, false)
+}
+
 /// Post to a Discord channel. Send-only by nature: nothing comes back.
 pub fn discord_send(webhook: &str, text: &str) -> Result<(), String> {
     let client = client().ok_or("Cannot initialize connection.")?;
     // Discord's own limit is 2000 characters.
-    let text = trim_to(text, 1900);
+    let text = trim_to(&outgoing(text), 1900);
     client
         .post(webhook.trim())
         .json(&serde_json::json!({"content": text}))
@@ -630,7 +665,7 @@ pub fn discord_post(token: &str, channel: &str, text: &str) -> Result<(), String
         token,
         &format!("/channels/{channel}/messages"),
     )?
-    .json(&serde_json::json!({"content": trim_to(text, 1900)}))
+    .json(&serde_json::json!({"content": trim_to(&outgoing(text), 1900)}))
     .send()
     .map_err(|_| "Cannot reach Discord.".to_owned())?
     .error_for_status()

@@ -2250,6 +2250,114 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn saved_keys_are_hidden_from_tool_results_and_cards() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let data = scratch("scrub-data");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &data) };
+        let keys = r#"{"OpenAI":"a-saved-key-of-no-known-shape","Custom":"sk-1"}"#;
+        std::fs::write(data.join("keys.json"), keys).unwrap();
+        let mcp =
+            r#"{"mcpServers":{"db":{"command":"db","env":{"DB_TOKEN":"an-mcp-token-0123"}}}}"#;
+        std::fs::write(data.join("mcp.json"), mcp).unwrap();
+        let work = scratch("scrub-work");
+        let notes = "saved a-saved-key-of-no-known-shape\nmcp an-mcp-token-0123\n\
+                     shaped sk-proj-0123456789abcdef\nshort sk-1\n";
+        std::fs::write(work.join("notes.txt"), notes).unwrap();
+        let ctx = crate::tools::ToolContext {
+            workspace: Some(work),
+            ..Default::default()
+        };
+        let marker = crate::redact::MARKER;
+
+        let read = crate::tools::run("read_file", r#"{"path":"notes.txt"}"#, &ctx).unwrap();
+        assert!(read.contains(&format!("saved {marker}")), "{read}");
+        assert!(read.contains(&format!("mcp {marker}")), "{read}");
+        // A file's own key-shaped words are left for the model to edit.
+        assert!(read.contains("shaped sk-proj-0123456789abcdef"), "{read}");
+        assert!(read.contains("short sk-1"), "{read}");
+        let ran = crate::tools::run("run_command", r#"{"command":"cat notes.txt"}"#, &ctx).unwrap();
+        assert!(ran.contains(&format!("shaped {marker}")), "{ran}");
+        assert!(
+            !ran.contains("a-saved-key") && !ran.contains("an-mcp-token"),
+            "{ran}"
+        );
+        let missing = r#"{"path":"a-saved-key-of-no-known-shape.txt"}"#;
+        let error = crate::tools::run("read_file", missing, &ctx).unwrap_err();
+        assert!(!error.contains("a-saved-key"), "{error}");
+        let write = r#"{"path":"x.txt","content":"key a-saved-key-of-no-known-shape"}"#;
+        let card = crate::tools::preview("write_file", write, &ctx);
+        assert_eq!(card, format!("key {marker}"));
+        // A file holding a hidden key and the marker's own text takes no
+        // marker back, since which one it stands for cannot be told.
+        let both = format!("{marker}\nkey a-saved-key-of-no-known-shape\n");
+        let workspace = ctx.workspace.clone().unwrap();
+        std::fs::write(workspace.join("both.txt"), &both).unwrap();
+        let write = serde_json::json!({"path": "both.txt", "content": format!("key {marker}\n")});
+        let refused = crate::tools::run("write_file", &write.to_string(), &ctx).unwrap_err();
+        assert!(refused.starts_with("Refused"), "{refused}");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("both.txt")).unwrap(),
+            both
+        );
+        // No other tool takes the marker at all.
+        let fetch = serde_json::json!({ "url": format!("https://x.test/{marker}") }).to_string();
+        let refused = crate::tools::run("web_fetch", &fetch, &ctx).unwrap_err();
+        assert!(refused.contains("arguments of `web_fetch`"), "{refused}");
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_key_cut_in_two_shows_none_of_itself() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let data = scratch("cut-data");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &data) };
+        let key = "QWERTYUIOPasdfghjklZXCVBNM0123456789qwerty";
+        std::fs::write(data.join("keys.json"), format!(r#"{{"OpenAI":"{key}"}}"#)).unwrap();
+        let work = scratch("cut-work");
+        // Each puts the key across a cut: the end of what a command's output
+        // is read to, the 1,000 characters a line shows, the bytes a line is
+        // read to, the 300 a search shows around a match, and the oldest bytes
+        // a job's log drops.
+        std::fs::write(work.join("long.txt"), "a".repeat(8180) + key).unwrap();
+        std::fs::write(work.join("wide.txt"), "b".repeat(980) + key + "\n").unwrap();
+        std::fs::write(work.join("wider.txt"), "\u{1F600}".repeat(991) + key).unwrap();
+        std::fs::write(work.join("job.txt"), key.to_owned() + &"c".repeat(63_990)).unwrap();
+        let found = format!("needle{}{key}\n", "d".repeat(284));
+        std::fs::write(work.join("found.txt"), found).unwrap();
+        let ctx = crate::tools::ToolContext {
+            workspace: Some(work),
+            ..Default::default()
+        };
+        let shows_part = |text: &str| (0..=key.len() - 6).any(|at| text.contains(&key[at..at + 6]));
+
+        let ran = crate::tools::run("run_command", r#"{"command":"cat long.txt"}"#, &ctx).unwrap();
+        assert!(!shows_part(&ran), "{}", &ran[ran.len() - 80..]);
+        for file in ["wide.txt", "wider.txt"] {
+            let args = serde_json::json!({ "path": file }).to_string();
+            let read = crate::tools::run("read_file", &args, &ctx).unwrap();
+            assert!(read.contains("[line cut]") && !shows_part(&read), "{read}");
+        }
+        let search = r#"{"pattern":"needle","path":"found.txt"}"#;
+        let search = crate::tools::run("search", search, &ctx).unwrap();
+        assert!(
+            search.contains("needle") && !shows_part(&search),
+            "{search}"
+        );
+        let started = r#"{"command":"cat job.txt","background":true}"#;
+        let started = crate::tools::run("run_command", started, &ctx).unwrap();
+        assert!(!shows_part(&started), "{}", &started[..200]);
+        let id: u64 = started["Started as job #".len()..]
+            .split(' ')
+            .next()
+            .and_then(|id| id.parse().ok())
+            .unwrap();
+        let args = serde_json::json!({ "job": id, "seconds": 10 }).to_string();
+        let waited = crate::tools::run("wait", &args, &ctx).unwrap();
+        assert!(!shows_part(&waited), "{}", &waited[..200]);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
     fn removing_a_session_removes_its_helpers() {
         let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
         let dir = scratch("transcript-remove");

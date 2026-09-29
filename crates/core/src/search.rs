@@ -251,6 +251,9 @@ fn web_address(pasted: &str, self_hosted: bool) -> String {
 pub struct SearchWeb;
 
 impl Tool for SearchWeb {
+    fn hides_key_shapes(&self) -> bool {
+        true
+    }
     fn name(&self) -> &'static str {
         "search_web"
     }
