@@ -7,6 +7,9 @@
 //! `memory` tool. When a project folder is attached, the `AGENTS.md` (or
 //! `CLAUDE.md`) in it and in each folder above it up to the repository's root
 //! join them, so a subfolder of a repository keeps the repository's rules.
+//! An `@path` in one of them pulls that file in where it stands, as Claude
+//! Code's CLAUDE.md files expect, but only from inside the repository, or a
+//! Markdown file from the home folder when written `~/`.
 //!
 //! USER.md and MEMORY.md go into every request, so each has a small budget --
 //! Hermes Agent's, which has run this way for a long time -- and a full one
@@ -20,7 +23,9 @@
 use crate::chat::Connection;
 use crate::tools::{Tool, ToolContext};
 use serde_json::{Value, json};
-use std::path::Path;
+use std::collections::HashSet;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
 
 /// The line between entries, as Hermes Agent writes it.
 const SEPARATOR: &str = "\n§\n";
@@ -35,6 +40,9 @@ const FILE_LIMIT: usize = 20_000;
 /// a project folder deep in a repository costs at most half as much again as
 /// one at its root. A file past it is only named, in one line.
 const INSTRUCTIONS_LIMIT: usize = 30_000;
+/// How many imports deep an instruction file pulls files in: Claude Code's
+/// five, since the files that use imports are written for it.
+const IMPORT_DEPTH: usize = 5;
 
 /// How the model is told to use its memory, when it has the tool to.
 const GUIDANCE: &str = " You have a memory that outlasts this session: what you know about the user (USER.md) and your own notes (MEMORY.md), shown below when there is anything in them, and kept with the memory tool. Save what will still matter in a later session -- the user's name and preferences, their setup, corrections they gave you -- and not the progress of the task at hand. Write facts, not instructions to yourself.";
@@ -75,7 +83,7 @@ fn context_in(dir: &Path, connection: &Connection) -> String {
     let project = connection
         .workspace
         .as_deref()
-        .map(instructions)
+        .map(|workspace| instructions(workspace, dir, crate::tools::home().as_deref()))
         .unwrap_or_default();
     match project.as_slice() {
         [] => {}
@@ -99,20 +107,32 @@ fn context_in(dir: &Path, connection: &Connection) -> String {
 
 /// The project's instructions, each labelled with its path from `workspace`:
 /// the AGENTS.md, else CLAUDE.md, of each folder from the repository's root
-/// down to `workspace`, the root's first. The nearest are read first, so when
-/// they are too long together it is the root's that are cut.
-fn instructions(workspace: &Path) -> Vec<(String, String)> {
+/// down to `workspace`, the root's first, with their imports pulled in. The
+/// nearest are read first, so when they are too long together it is the
+/// root's that are cut. `data` is Letronna's own folder, which no import
+/// reaches, and `home` the one a `~/` import is read from.
+fn instructions(workspace: &Path, data: &Path, home: Option<&Path>) -> Vec<(String, String)> {
     // A `.git` file rather than a folder marks the top of a worktree or a
     // submodule, which is as far as its own rules go.
     let dirs = folders(workspace, |dir| dir.join(".git").symlink_metadata().is_ok());
+    let mut reach = Reach {
+        root: dirs.last().copied().unwrap_or(workspace),
+        data,
+        home,
+        seen: HashSet::new(),
+    };
     let mut left = INSTRUCTIONS_LIMIT;
     let mut found = Vec::new();
-    for (up, dir) in dirs.into_iter().enumerate() {
+    for (up, dir) in dirs.iter().enumerate() {
+        let max = left.min(FILE_LIMIT);
         let file = ["AGENTS.md", "CLAUDE.md"].into_iter().find_map(|name| {
             let label = format!("{}{name}", "../".repeat(up));
-            read_ends(&dir.join(name), &label, left.min(FILE_LIMIT)).map(|text| (label, text))
+            let path = dir.join(name);
+            read_ends(&path, &label, max).map(|text| (label, path, text))
         });
-        if let Some((label, text)) = file {
+        if let Some((label, path, text)) = file {
+            reach.seen.extend(std::fs::canonicalize(&path));
+            let text = expand(text, &path, &label, max, 0, &mut reach);
             left = left.saturating_sub(text.chars().count());
             found.push((label, text));
         }
@@ -138,6 +158,226 @@ fn folders(workspace: &Path, is_root: impl Fn(&Path) -> bool) -> Vec<&Path> {
         }
     }
     vec![workspace]
+}
+
+/// Where imports may lead, and the files already in the prompt.
+struct Reach<'a> {
+    /// The repository's root, or the project folder outside one, which a
+    /// plain path never leaves.
+    root: &'a Path,
+    /// Letronna's own folder, with the keys and sign-in.
+    data: &'a Path,
+    home: Option<&'a Path>,
+    /// Each file tried once: that ends a cycle, and a repository naming one
+    /// huge file many times has it read once.
+    seen: HashSet<PathBuf>,
+}
+
+impl Reach<'_> {
+    /// The file an import of `raw` from the file at `from` names, when it may
+    /// be read: a `~/` path must be a Markdown file in the home folder, and
+    /// any other must stay in the root, even from a file in the home folder.
+    /// Links are followed, and no file with secrets in it or in Letronna's
+    /// own folder is ever taken. A cloned repository writes these files, so
+    /// without this its AGENTS.md could put the keys in every prompt; and it
+    /// is why only notes come from the home folder, not a shell history or a
+    /// tool's settings, which the secret list does not name.
+    fn target(&self, raw: &str, from: &Path) -> Option<PathBuf> {
+        // Judged as text first: on Windows, opening a share signs in to it.
+        if crate::paths::unsafe_raw(raw, Some(self.root)).is_some() {
+            return None;
+        }
+        let (path, within, notes) = match raw.strip_prefix("~/") {
+            Some(rest) => (self.home?.join(rest), self.home?, true),
+            None => (from.parent()?.join(raw), self.root, false),
+        };
+        let path = std::fs::canonicalize(path).ok()?;
+        let inside = std::fs::canonicalize(within).is_ok_and(|within| path.starts_with(within));
+        let markdown = path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
+        let refused = crate::tools::private(&path, self.data)
+            || crate::tools::secret(&path)
+            || (notes && !markdown);
+        (inside && !refused).then_some(path)
+    }
+}
+
+/// `text`, read from `path` and labelled `label`, with each import in it
+/// replaced by the imported file's text, itself `depth` imports deep. The
+/// file's own text comes first: an import is pulled in only when it fits in
+/// what `max` leaves, cut to fit if it must, and is otherwise left as
+/// written, as one that is missing or refused is.
+fn expand(
+    text: String,
+    path: &Path,
+    label: &str,
+    max: usize,
+    depth: usize,
+    reach: &mut Reach,
+) -> String {
+    if depth >= IMPORT_DEPTH {
+        return text;
+    }
+    let found = imports(&text);
+    if found.is_empty() {
+        return text;
+    }
+    let mut out = String::new();
+    let mut last = 0;
+    // How long the text would be if nothing more were pulled in.
+    let mut total = text.chars().count();
+    for (token, raw) in found {
+        out.push_str(&text[last..token.start]);
+        last = token.start;
+        let written = text[token.clone()].chars().count();
+        let room = max.saturating_sub(total - written);
+        if room == 0 {
+            continue;
+        }
+        let Some(target) = reach.target(&raw, path) else {
+            continue;
+        };
+        if !reach.seen.insert(target.clone()) {
+            continue;
+        }
+        let name = import_label(label, &raw, reach.home);
+        let Some(pulled) = read_ends(&target, &name, room) else {
+            continue;
+        };
+        let pulled = expand(pulled, &target, &name, room, depth + 1, reach);
+        let len = pulled.chars().count();
+        // Only the line naming a file too long for a small room is longer.
+        if len > room {
+            continue;
+        }
+        out.push_str(&pulled);
+        total = total - written + len;
+        last = token.end;
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
+/// The path read_file takes to what `raw` names, imported from the file
+/// labelled `from`, for the line a cut leaves.
+fn import_label(from: &str, raw: &str, home: Option<&Path>) -> String {
+    if let (Some(rest), Some(home)) = (raw.strip_prefix("~/"), home) {
+        return format!("{}/{rest}", home.display());
+    }
+    if raw.starts_with('/') {
+        return raw.to_owned();
+    }
+    let folder = from.rfind('/').map_or("", |at| &from[..=at]);
+    format!("{folder}{}", raw.trim_start_matches("./"))
+}
+
+/// The imports in `text`, each as where it is written and the path it names:
+/// an `@` at the start of a line or after a space, outside fenced code blocks
+/// and code spans, as Claude Code reads them. A span is looked for on its own
+/// line only, and an indented code block is not told from a list item.
+fn imports(text: &str) -> Vec<(Range<usize>, String)> {
+    let mut found = Vec::new();
+    let mut fence: Option<(char, usize)> = None;
+    let mut at = 0;
+    for line in text.split_inclusive('\n') {
+        let start = at;
+        at += line.len();
+        let body = line.trim_start_matches(' ');
+        let mark = body.chars().next().filter(|c| matches!(c, '`' | '~'));
+        let run = mark.map_or(0, |mark| body.len() - body.trim_start_matches(mark).len());
+        if let Some(mark) = mark
+            && run >= 3
+            && line.len() - body.len() <= 3
+        {
+            match fence {
+                None => {
+                    fence = Some((mark, run));
+                    continue;
+                }
+                Some((open, len))
+                    if open == mark && run >= len && body[run..].trim().is_empty() =>
+                {
+                    fence = None;
+                    continue;
+                }
+                Some(_) => {}
+            }
+        }
+        if fence.is_none() {
+            line_imports(line, start, &mut found);
+        }
+    }
+    found
+}
+
+/// The imports on one line outside a code block, `start` bytes into the text.
+fn line_imports(line: &str, start: usize, found: &mut Vec<(Range<usize>, String)>) {
+    let mut i = 0;
+    while i < line.len() {
+        let rest = &line[i..];
+        if rest.starts_with('`') {
+            let run = rest.len() - rest.trim_start_matches('`').len();
+            i += run + span_end(&rest[run..], run).unwrap_or(0);
+            continue;
+        }
+        let after_space = line[..i]
+            .chars()
+            .next_back()
+            .is_none_or(char::is_whitespace);
+        if after_space
+            && let Some(written) = rest.strip_prefix('@')
+            && let Some((len, path)) = import_path(written)
+        {
+            found.push((start + i..start + i + 1 + len, path));
+            i += 1 + len;
+            continue;
+        }
+        i += rest.chars().next().map_or(1, char::len_utf8);
+    }
+}
+
+/// How far into `after` a code span opened by `run` backticks ends, past the
+/// next run of just as many; None when it has none, and the backticks are
+/// plain text.
+fn span_end(after: &str, run: usize) -> Option<usize> {
+    let mut i = 0;
+    while let Some(found) = after[i..].find('`') {
+        let from = i + found;
+        let len = after[from..].len() - after[from..].trim_start_matches('`').len();
+        if len == run {
+            return Some(from + len);
+        }
+        i = from + len;
+    }
+    None
+}
+
+/// The path written at the start of `text`, just after an `@`, and how many
+/// bytes it takes: up to a space or a backtick, `\ ` read as a space and a
+/// `#heading` left off. None for what is no path, such as `@@` or `@#`.
+fn import_path(text: &str) -> Option<(usize, String)> {
+    let mut path = String::new();
+    let mut len = 0;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && chars.peek() == Some(&' ') {
+            chars.next();
+            path.push(' ');
+            len += 2;
+            continue;
+        }
+        if c.is_whitespace() || matches!(c, '\\' | '`') {
+            break;
+        }
+        path.push(c);
+        len += c.len_utf8();
+    }
+    let path = path.split('#').next().unwrap_or_default();
+    let named = path.starts_with("~/")
+        || (path.starts_with('/') && path != "/")
+        || path.starts_with(|c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    named.then(|| (len, path.to_owned()))
 }
 
 /// A file people write, trimmed and kept under `max` characters: past that,
@@ -616,7 +856,7 @@ mod tests {
             std::os::unix::fs::symlink("/dev/zero", dir.join("CLAUDE.md")).unwrap();
             assert!(read_capped(&dir.join("CLAUDE.md")).is_none());
         }
-        assert!(instructions(&dir).is_empty());
+        assert!(instructions(&dir, &dir.join("data"), None).is_empty());
     }
 
     #[test]
@@ -728,7 +968,7 @@ mod tests {
         for (folder, letter) in [(&dir, "r"), (&dir.join("a"), "a"), (&project, "b")] {
             std::fs::write(folder.join("AGENTS.md"), letter.repeat(FILE_LIMIT + 10)).unwrap();
         }
-        let found = instructions(&project);
+        let found = instructions(&project, &dir.join("data"), None);
         let labels: Vec<_> = found.iter().map(|(label, _)| label.as_str()).collect();
         assert_eq!(labels, ["../../AGENTS.md", "../AGENTS.md", "AGENTS.md"]);
         let sizes: Vec<_> = found.iter().map(|(_, text)| text.chars().count()).collect();
@@ -743,11 +983,191 @@ mod tests {
         std::fs::write(project.join("AGENTS.md"), "b".repeat(FILE_LIMIT)).unwrap();
         let rest = "a".repeat(INSTRUCTIONS_LIMIT - FILE_LIMIT);
         std::fs::write(dir.join("a").join("AGENTS.md"), rest).unwrap();
-        let found = instructions(&project);
+        let found = instructions(&project, &dir.join("data"), None);
         assert_eq!(
             found[0].1,
             "… [cut here to fit; read_file `../../AGENTS.md` has the whole file]"
         );
+    }
+
+    /// A scratch repository, by its root.
+    fn repo(name: &str) -> PathBuf {
+        let root = scratch(name);
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        root
+    }
+
+    /// The instructions of a project at `root`, imports pulled in, as one text.
+    fn read_in(root: &Path, home: Option<&Path>) -> String {
+        let found = instructions(root, &root.join("data"), home);
+        let texts: Vec<_> = found.into_iter().map(|(_, text)| text).collect();
+        texts.join("\n\n")
+    }
+
+    #[test]
+    fn an_import_pulls_the_file_in_where_it_is_named() {
+        let root = repo("import");
+        let docs = root.join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(
+            root.join("AGENTS.md"),
+            "Start. See @docs/style.md#tabs then @./docs/my\\ notes.md and mail user_a@example.com.",
+        )
+        .unwrap();
+        // Taken from the importing file's own folder.
+        std::fs::write(docs.join("style.md"), "Tabs. @rules.md\n").unwrap();
+        std::fs::write(docs.join("rules.md"), "Rules.").unwrap();
+        std::fs::write(docs.join("my notes.md"), "Notes.").unwrap();
+        assert_eq!(
+            read_in(&root, None),
+            "Start. See Tabs. Rules. then Notes. and mail user_a@example.com."
+        );
+    }
+
+    #[test]
+    fn an_at_is_an_import_only_after_a_space_and_outside_code() {
+        let text = "@a.md first\n```\n@b.md\n```\n~~~~ md\n@c.md\n~~~\n~~~~\n `@d.md` and ``x ` @e.md`` but ` @f.md\nx@g.md @@h @#i @/ @~j\r\n   ```\n@k.md\n    ```\n@l.md\n";
+        let found = imports(text);
+        let paths: Vec<_> = found.iter().map(|(_, path)| path.as_str()).collect();
+        assert_eq!(paths, ["a.md", "f.md"]);
+        assert_eq!(found[0].0, 0..5);
+        assert_eq!(&text[found[1].0.clone()], "@f.md");
+    }
+
+    #[test]
+    fn imports_nest_five_deep_and_a_cycle_is_skipped() {
+        let root = repo("depth");
+        std::fs::write(root.join("AGENTS.md"), "0 @1.md").unwrap();
+        for n in 1..=6 {
+            std::fs::write(root.join(format!("{n}.md")), format!("{n} @{}.md", n + 1)).unwrap();
+        }
+        assert_eq!(read_in(&root, None), "0 1 2 3 4 5 @6.md");
+        // Each file is pulled in once.
+        std::fs::write(root.join("2.md"), "2 @1.md @AGENTS.md").unwrap();
+        assert_eq!(read_in(&root, None), "0 1 2 @1.md @AGENTS.md");
+    }
+
+    #[test]
+    fn a_missing_file_or_anything_but_a_plain_file_is_left_as_written() {
+        let root = repo("missing");
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("empty.md"), " \n").unwrap();
+        std::fs::write(root.join("AGENTS.md"), "@gone.md @docs @empty.md @pipe").unwrap();
+        // A named pipe never ends when read, as #154's /dev/zero does not.
+        #[cfg(unix)]
+        {
+            let made = std::process::Command::new("mkfifo")
+                .arg(root.join("pipe"))
+                .status();
+            assert!(made.unwrap().success());
+        }
+        assert_eq!(read_in(&root, None), "@gone.md @docs @empty.md @pipe");
+    }
+
+    #[test]
+    fn imports_never_leave_the_repository_but_for_home_paths() {
+        let dir = scratch("reach");
+        let root = dir.join("repo");
+        let home = dir.join("home");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(dir.join("outside.md"), "Outside.").unwrap();
+        // Only notes come from the home folder, and a note's own plain
+        // imports stay in the repository.
+        std::fs::write(home.join("notes.md"), "Home. @outside.md @~/more.md").unwrap();
+        std::fs::write(home.join("more.md"), "More.").unwrap();
+        std::fs::write(home.join("outside.md"), "Beside.").unwrap();
+        std::fs::write(home.join(".zsh_history"), "export TOKEN=1").unwrap();
+        let text = "@../outside.md @~/notes.md @~/../outside.md @~/.zsh_history";
+        std::fs::write(root.join("AGENTS.md"), text).unwrap();
+        assert_eq!(
+            read_in(&root, Some(&home)),
+            "@../outside.md Home. @outside.md More. @~/../outside.md @~/.zsh_history"
+        );
+        assert_eq!(read_in(&root, None), text);
+        // An absolute path counts where it leads, and so does a link.
+        #[cfg(unix)]
+        {
+            let outside = dir.join("outside.md");
+            let inside = root.join("inside.md");
+            std::fs::write(&inside, "Inside.").unwrap();
+            std::fs::write(root.join("linked.md"), "Linked.").unwrap();
+            std::os::unix::fs::symlink(&outside, root.join("out.md")).unwrap();
+            std::os::unix::fs::symlink("linked.md", root.join("in.md")).unwrap();
+            let (outside, inside) = (outside.display(), inside.display());
+            let text = format!("@{outside} @{inside} @out.md @in.md");
+            std::fs::write(root.join("AGENTS.md"), text).unwrap();
+            assert_eq!(
+                read_in(&root, None),
+                format!("@{outside} Inside. @out.md Linked.")
+            );
+        }
+    }
+
+    #[test]
+    fn secret_files_and_letronnas_own_folder_are_never_imported() {
+        let dir = scratch("import-secrets");
+        let root = dir.join("repo");
+        let home = dir.join("home");
+        let data = home.join(".letronna");
+        for folder in [root.join(".git"), home.join(".ssh"), data.clone()] {
+            std::fs::create_dir_all(folder).unwrap();
+        }
+        std::fs::write(home.join(".ssh").join("id_ed25519"), "Private key.").unwrap();
+        std::fs::write(data.join("keys.json"), "{}").unwrap();
+        std::fs::write(root.join(".env"), "TOKEN=1").unwrap();
+        std::fs::write(root.join(".env.example"), "TOKEN=").unwrap();
+        let text = "@.env @.env.example @~/.ssh/id_ed25519 @~/.letronna/keys.json";
+        std::fs::write(root.join("AGENTS.md"), text).unwrap();
+        let read = |root: &Path| {
+            let found = instructions(root, &data, Some(&home));
+            found.into_iter().map(|(_, text)| text).collect::<String>()
+        };
+        assert_eq!(
+            read(&root),
+            "@.env TOKEN= @~/.ssh/id_ed25519 @~/.letronna/keys.json"
+        );
+        // Nor by a link with another name.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(".env", root.join("settings.md")).unwrap();
+            std::fs::write(root.join("AGENTS.md"), "@settings.md").unwrap();
+            assert_eq!(read(&root), "@settings.md");
+        }
+    }
+
+    #[test]
+    fn imported_text_counts_against_the_budgets() {
+        let dir = repo("import-budget");
+        let project = dir.join("sub");
+        std::fs::create_dir_all(&project).unwrap();
+        let long = |name: &str| format!("{name} start.{}{name} end.", "x".repeat(FILE_LIMIT * 2));
+        std::fs::write(dir.join("big.md"), long("Big")).unwrap();
+        std::fs::write(dir.join("other.md"), long("Other")).unwrap();
+        std::fs::write(project.join("AGENTS.md"), "Own start. @../big.md Own end.").unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "Root. @other.md").unwrap();
+        let found = instructions(&project, &dir.join("data"), None);
+        // The import is cut to fit the file's own budget, and says where the
+        // whole of it is.
+        let near = &found[1].1;
+        assert!(
+            near.starts_with("Own start. Big start.") && near.ends_with("Big end. Own end."),
+            "{near}"
+        );
+        assert!(near.contains("read_file `../big.md` has the whole file"));
+        assert!(near.chars().count() <= FILE_LIMIT);
+        // The root's gets what is left of the total.
+        let root = &found[0].1;
+        assert!(root.starts_with("Root. Other start.") && root.ends_with("Other end."));
+        assert!(root.contains("read_file `../other.md` has the whole file"));
+        let sizes: usize = found.iter().map(|(_, text)| text.chars().count()).sum();
+        assert!(sizes <= INSTRUCTIONS_LIMIT, "{sizes}");
+
+        // The file's own text comes first: an import with no room is left.
+        let own = format!("@../other.md {}", "y".repeat(FILE_LIMIT - 20));
+        std::fs::write(project.join("AGENTS.md"), &own).unwrap();
+        let found = instructions(&project, &dir.join("data"), None);
+        assert_eq!(found[1].1, own);
     }
 
     fn backups(dir: &Path) -> Vec<String> {
