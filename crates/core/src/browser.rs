@@ -3053,7 +3053,7 @@ impl Session {
             "Page.getFrameTree",
             json!({}),
             cdp::CALL_TIME,
-            None,
+            Some(&self.stop),
         );
         let now = tree.ok().and_then(|tree| {
             let frame = frame_in(&tree["frameTree"], &within.id)?;
@@ -3085,7 +3085,7 @@ impl Session {
                 "DOM.getFrameOwner",
                 asked,
                 cdp::CALL_TIME,
-                None,
+                Some(&self.stop),
             )?;
             let node = owner["backendNodeId"]
                 .as_i64()
@@ -3097,7 +3097,7 @@ impl Session {
                     "DOM.getBoxModel",
                     asked,
                     cdp::CALL_TIME,
-                    None,
+                    Some(&self.stop),
                 )
                 .map_err(|_| "The frame is not on screen now. Look again.")?;
             // A frame in the same process has its points counted as the
@@ -3131,7 +3131,13 @@ impl Session {
             .inside
             .as_ref()
             .and_then(|inside| inside.session.clone());
-        (self.tab).call_in(session.as_deref(), method, params, cdp::CALL_TIME, None)
+        (self.tab).call_in(
+            session.as_deref(),
+            method,
+            params,
+            cdp::CALL_TIME,
+            Some(&self.stop),
+        )
     }
 
     fn focus(&mut self, node: i64) -> Result<(), String> {
@@ -3525,7 +3531,7 @@ impl Session {
             "Runtime.callFunctionOn",
             asked,
             cdp::CALL_TIME,
-            None,
+            Some(&self.stop),
         )?;
         let cover = answer["result"]["value"].as_str().unwrap_or_default();
         Ok((!cover.is_empty()).then(|| cover.to_owned()))
@@ -3542,8 +3548,13 @@ impl Session {
 
     fn object_in(&mut self, session: Option<&str>, node: i64) -> Result<String, String> {
         let asked = json!({"backendNodeId": node, "objectGroup": HANDLES});
-        let resolved: Value =
-            (self.tab).call_in(session, "DOM.resolveNode", asked, cdp::CALL_TIME, None)?;
+        let resolved: Value = (self.tab).call_in(
+            session,
+            "DOM.resolveNode",
+            asked,
+            cdp::CALL_TIME,
+            Some(&self.stop),
+        )?;
         resolved["object"]["objectId"]
             .as_str()
             .map(str::to_owned)
