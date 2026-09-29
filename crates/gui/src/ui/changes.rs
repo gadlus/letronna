@@ -651,6 +651,7 @@ fn file_row(file: &ChangedFile, selected: bool, cx: &App) -> Div {
         ]
     };
     h_flex()
+        .w_full()
         .h(ROW)
         .px_2()
         .gap_2()
