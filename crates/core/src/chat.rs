@@ -487,14 +487,15 @@ impl Budget {
 
 /// The budget for the next request over `connection`: its model's window as
 /// far as it is known, the user's cap of `cap` tokens (0 for the default),
-/// and what the system prompt and the tools take.
+/// and what the system prompt, the tools and subfolders' instructions take.
 fn budget(connection: &Connection, cap: u64) -> Budget {
     let facts = crate::models::facts(&connection.endpoint, connection.model.trim());
     let cap = match cap {
         0 => CAP_TOKENS,
         cap => cap as usize,
     };
-    let fixed = fixed_tokens(connection);
+    // The instructions ride on results the window counts without them.
+    let fixed = fixed_tokens(connection) + crate::subfolders::reserve(connection);
     sized(facts.context, facts.max_output, cap, fixed)
 }
 
@@ -722,6 +723,7 @@ fn body_with(
     // is shortened.
     let old = old_before(window, budget);
     let stubs = stubs(window, old);
+    let hints = crate::subfolders::hints(window, connection);
     let turn = window.iter().rposition(opens_turn);
     // Once, so the calls in the history and the array agree on whether the
     // MCP tools go out on demand.
@@ -741,6 +743,15 @@ fn body_with(
         );
         if let Some(stub) = &stubs[i] {
             wired["content"] = stub.as_str().into();
+        }
+        // After the stub, which would otherwise clear it with the result,
+        // and after the result's own text is kept from forging one.
+        if m.role == "tool"
+            && let Some(text) = wired["content"].as_str()
+        {
+            let text = crate::subfolders::defang(text);
+            let hint = hints[i].as_deref().unwrap_or_default();
+            wired["content"] = format!("{text}{hint}").into();
         }
         if i < old {
             for (at, call) in m.tool_calls.iter().enumerate() {
