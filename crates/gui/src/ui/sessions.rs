@@ -1,3 +1,4 @@
+use crate::app::card_is_up;
 use crate::prelude::*;
 use gpui_component::{Selectable, menu::PopupMenu};
 
@@ -315,12 +316,10 @@ impl Chat {
     pub(crate) fn needs_you(&self, id: u64) -> bool {
         self.agent_asks.iter().any(|request| request.root == id)
             || (self.streaming_id == Some(id)
-                && self.turn.as_ref().is_some_and(|turn| {
-                    matches!(
-                        turn.next(|_| letronna_core::gate::Outcome::Ask),
-                        letronna_core::agent::Next::AskUser(_)
-                    )
-                }))
+                && self
+                    .turn
+                    .as_ref()
+                    .is_some_and(|turn| card_is_up(turn, self.asking.as_deref())))
     }
 
     /// The state the sidebar's filters see the session at `index` in.

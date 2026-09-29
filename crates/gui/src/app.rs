@@ -3082,6 +3082,12 @@ pub(crate) fn front_call(
     }
 }
 
+/// Whether the approval card is up for the call at the front of the queue,
+/// as opposed to that call running or about to.
+pub(crate) fn card_is_up(turn: &agent::Turn, asking: Option<&str>) -> bool {
+    front_call(turn, asking).is_some_and(|(_, waiting)| waiting)
+}
+
 /// The session to wake, of those with notices waiting that `wakes` allows:
 /// the one on screen, else the one waiting longest.
 fn woken(on_screen: u64, pending: &[u64], wakes: impl Fn(u64) -> bool) -> Option<u64> {
@@ -3161,8 +3167,8 @@ mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
     use super::{
-        cuts_in, escape_closes_aside, front_call, run_ended, running_calls, side_question,
-        until_repeated_id,
+        card_is_up, cuts_in, escape_closes_aside, front_call, run_ended, running_calls,
+        side_question, until_repeated_id,
     };
     use letronna_core::agent::{MAX_BATCH, Next, Turn};
     use letronna_core::chat::{Connection, ToolCall};
@@ -3197,6 +3203,18 @@ mod tests {
         // Stopped on an earlier call, which has left the queue since.
         assert!(front_call(&turn, Some("call-0")).is_some_and(|(_, waiting)| !waiting));
         assert!(front_call(&Turn::new(Connection::default()), Some("call-1")).is_none());
+    }
+
+    #[test]
+    fn a_queued_call_needs_you_only_while_its_card_is_up() {
+        let turn = writing();
+        // Queued, but running or about to, so nothing waits on the user.
+        assert!(!card_is_up(&turn, None));
+        assert!(card_is_up(&turn, Some("call-1")));
+        assert!(!card_is_up(
+            &Turn::new(Connection::default()),
+            Some("call-1")
+        ));
     }
 
     #[test]
