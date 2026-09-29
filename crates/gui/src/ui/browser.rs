@@ -659,6 +659,13 @@ impl BrowserView {
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // The comment box sits inside the page: held here, what is typed
+        // into it would never reach it.
+        if let Some(Pointing::Chosen { comment, .. }) = &self.pointing
+            && comment.focus_handle(cx).is_focused(window)
+        {
+            return;
+        }
         let stroke = &event.keystroke;
         let shortcut = stroke.modifiers.secondary();
         match stroke.key.as_str() {
@@ -1136,6 +1143,16 @@ impl BrowserView {
         {
             return None;
         }
+        // At the top the card would cover what it is about when that sits
+        // in the page's upper half, as headings and menus do.
+        let low = self
+            .point_area()
+            .is_some_and(|[_, y, _, h]| y + h / 2. < self.size.1 / 2.);
+        let (above, below) = if low {
+            (None, commenting)
+        } else {
+            (commenting, None)
+        };
         Some(
             v_flex()
                 .absolute()
@@ -1147,8 +1164,9 @@ impl BrowserView {
                         .gap_2()
                         .children(asked)
                         .children(note)
-                        .children(commenting),
+                        .children(above),
                 )
+                .children(below.map(|card| div().p_2().child(card)))
                 .children(doing)
                 .children(hint),
         )
