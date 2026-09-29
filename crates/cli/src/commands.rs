@@ -230,6 +230,10 @@ pub fn command(
             attach(runner, rest, workspace);
             Flow::Handled
         }
+        "/preview" => {
+            preview(rest, workspace);
+            Flow::Handled
+        }
         "/where" => {
             render::blank();
             render::line(&format!(
@@ -1458,6 +1462,35 @@ fn attach(runner: &mut Runner, raw: &str, workspace: Option<&std::path::Path>) {
                 "Attached {}; it goes with your next message.",
                 path.display()
             )));
+        }
+        Err(error) => render::line(&render::red(&error)),
+    }
+}
+
+/// Serve the HTML or SVG file `raw` names to the browser on this computer
+/// and print where; `--open` first also opens it there.
+fn preview(raw: &str, workspace: Option<&std::path::Path>) {
+    render::blank();
+    let (open, raw) = match raw.strip_prefix("--open") {
+        Some(rest) if rest.is_empty() || rest.starts_with(' ') => (true, rest.trim()),
+        _ => (false, raw),
+    };
+    if raw.is_empty() {
+        render::line(&render::dim(
+            "/preview <path> serves an HTML or SVG file to your browser; --open opens it too.",
+        ));
+        return;
+    }
+    match letronna_core::preview::start(&typed_path(raw, workspace)) {
+        Ok(url) => {
+            render::line(&url);
+            render::line(&render::dim(&format!(
+                "Only this computer can reach it, and it closes after {} minutes without a visit.",
+                letronna_core::preview::IDLE.as_secs() / 60
+            )));
+            if open {
+                open_in_browser(&url);
+            }
         }
         Err(error) => render::line(&render::red(&error)),
     }
