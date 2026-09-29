@@ -864,16 +864,14 @@ mod tests {
         File, GIVE_UP, Manifest, Part, Pending, State, allowed, beside, download_to, fetch, hex,
         newer, offer, platform, started, swap, verify,
     };
+    use crate::store::tests::Scratch;
     use ring::signature::{Ed25519KeyPair, KeyPair};
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("letronna-update-{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(name: &str) -> Scratch {
+        Scratch::new(&format!("update-{name}"))
     }
 
     fn signer() -> (Ed25519KeyPair, [u8; 32]) {

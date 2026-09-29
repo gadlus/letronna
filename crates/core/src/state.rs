@@ -160,18 +160,15 @@ fn temp_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{merge, read, temp_path, update};
+    use crate::store::tests::Scratch;
     use serde_json::{Value, json};
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
 
     type Keys = HashMap<String, String>;
 
-    fn scratch(name: &str) -> PathBuf {
-        // One folder per test, reused and emptied each run.
-        let dir = std::env::temp_dir().join(format!("letronna-state-{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(name: &str) -> Scratch {
+        Scratch::new(&format!("state-{name}"))
     }
 
     /// Where `path` was moved aside to, if it was.

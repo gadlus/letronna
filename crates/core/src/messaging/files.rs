@@ -774,6 +774,7 @@ impl Tool for SendFile {
 #[cfg(test)]
 mod tests {
     use super::{Incoming, Kind, Origin, Received, Source, To};
+    use crate::store::tests::Scratch;
     use crate::tools::ToolContext;
     use serde_json::json;
     use std::path::{Path, PathBuf};
@@ -842,11 +843,8 @@ mod tests {
         }
     }
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("letronna-chat-files-{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(name: &str) -> Scratch {
+        Scratch::new(&format!("chat-files-{name}"))
     }
 
     fn incoming(text: &str, files: Vec<Received>) -> Incoming {

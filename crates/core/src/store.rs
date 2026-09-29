@@ -1936,13 +1936,53 @@ pub(crate) mod tests {
     /// variable for the whole process, and tests run side by side.
     pub(crate) static DATA_DIR: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn scratch(name: &str) -> std::path::PathBuf {
-        // One folder per test, reused and emptied each run. Naming it after
-        // the process as well left a new one behind on every run.
-        let dir = std::env::temp_dir().join(format!("letronna-store-{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A test's own empty folder, removed when dropped.
+    pub(crate) struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        /// A new folder `letronna-{name}` in the temporary folder, with this
+        /// process's id and a number counted within it after the name, so
+        /// neither another test nor another test run on the machine shares it.
+        pub(crate) fn new(name: &str) -> Self {
+            static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let made = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir =
+                std::env::temp_dir().join(format!("letronna-{name}-{}-{made}", std::process::id()));
+            // Left by a killed run that had this process's id.
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl std::ops::Deref for Scratch {
+        type Target = std::path::PathBuf;
+
+        fn deref(&self) -> &std::path::PathBuf {
+            &self.0
+        }
+    }
+
+    impl AsRef<std::path::Path> for Scratch {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<std::ffi::OsStr> for Scratch {
+        fn as_ref(&self) -> &std::ffi::OsStr {
+            self.0.as_os_str()
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scratch(name: &str) -> Scratch {
+        Scratch::new(&format!("store-{name}"))
     }
 
     #[cfg(unix)]
@@ -3237,7 +3277,7 @@ pub(crate) mod tests {
                      shaped sk-proj-0123456789abcdef\nshort sk-1\n";
         std::fs::write(work.join("notes.txt"), notes).unwrap();
         let ctx = crate::tools::ToolContext {
-            workspace: Some(work),
+            workspace: Some(work.to_path_buf()),
             ..Default::default()
         };
         let marker = crate::redact::MARKER;
@@ -3298,7 +3338,7 @@ pub(crate) mod tests {
         let found = format!("needle{}{key}\n", "d".repeat(284));
         std::fs::write(work.join("found.txt"), found).unwrap();
         let ctx = crate::tools::ToolContext {
-            workspace: Some(work),
+            workspace: Some(work.to_path_buf()),
             ..Default::default()
         };
         let shows_part = |text: &str| (0..=key.len() - 6).any(|at| text.contains(&key[at..at + 6]));

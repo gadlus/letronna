@@ -828,6 +828,7 @@ fn task(def: &AgentDef, tools: &[String], prompt: &str) -> Message {
 mod tests {
     use super::journal::{canonical, key};
     use super::*;
+    use crate::store::tests::Scratch;
     use serde_json::json;
     use std::io::Read;
     use std::net::TcpListener;
@@ -841,9 +842,9 @@ mod tests {
     const SESSION: u64 = 4_343;
 
     /// Letronna's data and a project folder, both the test's own, kept from
-    /// other tests until dropped.
+    /// other tests and removed when dropped.
     struct Data {
-        dir: PathBuf,
+        dir: Scratch,
         _locks: [MutexGuard<'static, ()>; 2],
     }
 
@@ -860,8 +861,7 @@ mod tests {
             ];
             // Left by another test's pause, a notice would run into this one's.
             inbox::take(SESSION, true);
-            let dir = std::env::temp_dir().join(format!("letronna-workflow-{name}"));
-            let _ = std::fs::remove_dir_all(&dir);
+            let dir = Scratch::new(&format!("workflow-{name}"));
             std::fs::create_dir_all(dir.join("data")).unwrap();
             std::fs::create_dir_all(dir.join("work")).unwrap();
             unsafe { std::env::set_var("AGENT_DATA_DIR", dir.join("data")) };

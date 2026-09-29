@@ -2331,6 +2331,7 @@ fn keep(text: String) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::tests::Scratch;
 
     /// A server that answers the handshake, lists its tools over two pages,
     /// pings the client once, and echoes calls back.
@@ -3782,17 +3783,14 @@ mod tests {
         assert!(bad.error.unwrap().contains("will not read"));
     }
 
-    fn scratch(name: &str) -> std::path::PathBuf {
-        // One folder per test, reused and emptied each run.
-        let dir = std::env::temp_dir().join(format!("letronna-mcp-{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(name: &str) -> Scratch {
+        Scratch::new(&format!("mcp-{name}"))
     }
 
     #[test]
     fn adding_and_removing_servers_keeps_what_else_the_file_holds() {
-        let path = scratch("edits").join("mcp.json");
+        let dir = scratch("edits");
+        let path = dir.join("mcp.json");
         std::fs::write(
             &path,
             r#"{"theme": "dark", "mcpServers": {"z": {"command": "x", "cursorOnly": 1},
@@ -4231,7 +4229,8 @@ mod tests {
 
     #[test]
     fn a_file_that_will_not_parse_reloads_nothing_and_says_why() {
-        let path = scratch("reload").join("mcp.json");
+        let dir = scratch("reload");
+        let path = dir.join("mcp.json");
         std::fs::write(&path, "{\"mcpServers\": {").unwrap();
         let run = connected("t-unparsed", shell("serve"), 0, Duration::ZERO);
         let error = reload_from(&path).unwrap_err();

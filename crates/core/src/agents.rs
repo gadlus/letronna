@@ -2185,6 +2185,7 @@ fn user_stopped(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::chat::{Remote, ToolCall};
+    use crate::store::tests::Scratch;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::path::PathBuf;
@@ -2223,10 +2224,11 @@ mod tests {
     }
 
     /// A session's folder holding `notes.txt`, with Letronna's data in a
-    /// folder beside it, kept from other tests until dropped.
+    /// folder beside it, kept from other tests and removed when dropped.
     struct Session {
         work: PathBuf,
         data: PathBuf,
+        _dir: Scratch,
         _locks: [MutexGuard<'static, ()>; 3],
     }
 
@@ -2242,8 +2244,7 @@ mod tests {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()),
             ];
-            let dir = std::env::temp_dir().join(format!("letronna-agents-{name}"));
-            let _ = std::fs::remove_dir_all(&dir);
+            let dir = Scratch::new(&format!("agents-{name}"));
             let (work, data) = (dir.join("work"), dir.join("data"));
             std::fs::create_dir_all(&work).unwrap();
             std::fs::create_dir_all(&data).unwrap();
@@ -2252,6 +2253,7 @@ mod tests {
             Self {
                 work,
                 data,
+                _dir: dir,
                 _locks: locks,
             }
         }

@@ -869,12 +869,10 @@ impl Tool for Remember {
 mod tests {
     use super::*;
     use crate::chat::Remote;
+    use crate::store::tests::Scratch;
 
-    fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("letronna-memory-{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(name: &str) -> Scratch {
+        Scratch::new(&format!("memory-{name}"))
     }
 
     #[test]
@@ -1231,7 +1229,7 @@ mod tests {
         let project = dir.join("a").join("b");
         std::fs::create_dir_all(&project).unwrap();
         std::fs::create_dir_all(dir.join(".git")).unwrap();
-        for (folder, letter) in [(&dir, "r"), (&dir.join("a"), "a"), (&project, "b")] {
+        for (folder, letter) in [(&*dir, "r"), (&dir.join("a"), "a"), (&project, "b")] {
             std::fs::write(folder.join("AGENTS.md"), letter.repeat(FILE_LIMIT + 10)).unwrap();
         }
         let found = instructions(&project, &dir.join("data"), None);
@@ -1405,7 +1403,7 @@ mod tests {
     }
 
     /// A scratch repository, by its root.
-    fn repo(name: &str) -> PathBuf {
+    fn repo(name: &str) -> Scratch {
         let root = scratch(name);
         std::fs::create_dir_all(root.join(".git")).unwrap();
         root

@@ -2438,6 +2438,7 @@ impl Tool for Search {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::tests::Scratch;
 
     #[test]
     fn a_session_search_date_is_a_day_here_or_days_ago() {
@@ -2455,8 +2456,7 @@ mod tests {
 
     #[test]
     fn reads_lists_searches_within_workspace() {
-        let dir = std::env::temp_dir().join("letronna-tools");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = Scratch::new("tools");
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("src/a.txt"), "hello\nWorld").unwrap();
         let ctx = ToolContext {
@@ -3744,12 +3744,11 @@ mod tests {
 
     /// A data folder of its own, set as `AGENT_DATA_DIR` while the guard is
     /// held, with a project folder inside it.
-    fn data_folder(name: &str) -> (std::sync::MutexGuard<'static, ()>, PathBuf) {
+    fn data_folder(name: &str) -> (std::sync::MutexGuard<'static, ()>, Scratch) {
         let turn = crate::store::tests::DATA_DIR
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("letronna-spill-{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = Scratch::new(&format!("spill-{name}"));
         std::fs::create_dir_all(dir.join("project")).unwrap();
         unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
         (turn, dir)
