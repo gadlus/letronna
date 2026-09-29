@@ -31,8 +31,15 @@ fn main() {
             .spawn();
         return;
     }
+    letronna_core::diag::init("gui");
     Application::new().with_assets(Assets).run(|cx| {
         gpui_component::init(cx);
+        // Before the theme, which checks each face resolves and names
+        // today's platform face in place of any that does not.
+        let fonts = FONTS.iter().map(|&font| Cow::Borrowed(font)).collect();
+        if let Err(e) = cx.text_system().add_fonts(fonts) {
+            eprintln!("The brand fonts did not load: {e}");
+        }
         theme::apply(cx);
         plugins::init(
             cx,
@@ -77,6 +84,7 @@ fn main() {
         cx.on_app_quit(|_| {
             letronna_core::jobs::stop_all();
             letronna_core::browser::close_hidden();
+            letronna_core::diag::stop();
             async {}
         })
         .detach();

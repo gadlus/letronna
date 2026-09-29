@@ -3,10 +3,13 @@
 //!
 //! Read-only tools run without asking. Tools that change the workspace or
 //! run a command return `needs_approval`, and the chat shows a card first.
-//! `ask_user` is answered by the user, never run here.
+//! `ask_user` is answered by the user, and only runs here when nobody is there
+//! to answer it.
 
+use crate::cancel::Cancel;
 use crate::chat::{Connection, Remote};
 use serde_json::{Value, json};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -22,6 +25,10 @@ pub struct ToolContext {
     /// The conversation the call is made in, which keeps a browser of its
     /// own; 0 for none in particular.
     pub conversation: u64,
+    /// Stops this call and anything it started.
+    pub cancel: Cancel,
+    /// Plan mode, in which a tool that changes things is refused when named.
+    pub plan: bool,
 }
 
 impl ToolContext {
@@ -30,6 +37,8 @@ impl ToolContext {
             workspace: connection.workspace.clone(),
             remote: connection.remote.clone(),
             conversation: connection.conversation,
+            cancel: Cancel::default(),
+            plan: connection.plan,
         }
     }
 
@@ -74,21 +83,45 @@ pub trait Tool: Send + Sync {
 
 pub const ASK_USER: &str = "ask_user";
 pub const TODO: &str = "todo";
+pub const EXIT_PLAN: &str = "exit_plan";
 /// The tool result the model gets when the user denies a call.
 pub const DECLINED: &str = "The user declined this action. Ask before trying a different approach.";
+/// The tool result the model gets when the user approves its plan.
+pub const PLAN_APPROVED: &str = "The user approved this plan. Plan mode is off; carry it out now.";
+/// The tool result the model gets when the user wants the plan changed.
+pub const KEEP_PLANNING: &str =
+    "Keep planning: the user wants changes. Ask what to change, or refine the plan.";
 const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 /// A search stops after this long or this many files, and says so, rather
 /// than walking a whole home folder while the session waits on it.
 const SEARCH_TIME: Duration = Duration::from_secs(15);
 const SEARCH_FILES: usize = 20_000;
-/// Bigger files are skipped by search and cut short by read_file: neither
-/// can show more than `MAX_OUTPUT`, and reading gigabytes to find that out
-/// is how a tool hangs.
+/// Bigger files are skipped by search: it cannot show more than
+/// `MAX_OUTPUT`, and reading gigabytes to find that out is how a tool hangs.
 const SEARCH_FILE_BYTES: u64 = 1_000_000;
-const READ_BYTES: u64 = 256 * 1024;
+/// How much of a file one read shows, in bytes, which is never more
+/// characters: under the chat's cap on a tool result with room for the
+/// footer, so a page reaches the model whole instead of losing its middle.
+const PAGE_BYTES: usize = crate::chat::MAX_TOOL_CHARS - 1_000;
+/// A line of a file longer than this, in characters, is cut, so a minified
+/// file on one line still leaves room in a page for the lines around it.
+const LINE_CHARS: usize = 1_000;
+/// The footer counts the lines after a page only this far: at disk speed that
+/// is well under a second, where counting a log of many gigabytes would hold
+/// the session up.
+const COUNT_BYTES: u64 = 64 * 1024 * 1024;
+/// A UTF-16 file is decoded whole, its line breaks being two bytes wide, so
+/// only this much of one is read. Such files are exports and redirected shell
+/// output, far smaller than this.
+const UTF16_BYTES: u64 = 16 * 1024 * 1024;
 /// How long a background command gets to print something before the tool
 /// replies, so the first message can carry a port or an early crash.
 const SETTLE: std::time::Duration = std::time::Duration::from_millis(1200);
+/// How long a command's output pipes get to close after its shell exits. A
+/// child it left running, like `sleep 100 &` or a daemon, holds them open
+/// for as long as it lives; 300 ms is plenty for output still in flight and
+/// too short to feel.
+const PIPE_GRACE: Duration = Duration::from_millis(300);
 
 const MAX_OUTPUT: usize = 24_000;
 const SKIP_DIRS: &[&str] = &[".git", "node_modules", "target", ".next", "dist", "build"];
@@ -120,6 +153,7 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(StopJob),
         Arc::new(Wait),
         Arc::new(AskUser),
+        Arc::new(ExitPlan),
         Arc::new(Todo),
         Arc::new(crate::messaging::ReadChat),
         Arc::new(Sessions),
@@ -171,21 +205,161 @@ pub fn parse_args(args: &str) -> Result<Value, String> {
     })
 }
 
+/// The file tools, which other agents' models all call with a file path.
+const FILE_TOOLS: &[&str] = &["read_file", "write_file", "edit_file"];
+
+/// Parameter names other agents use, as (theirs, ours, the tools it applies
+/// to), since a model used to one of them reaches for its names first.
+const ALIASES: &[(&str, &str, &[&str])] = &[
+    ("file_path", "path", FILE_TOOLS),
+    ("filepath", "path", FILE_TOOLS),
+    ("absolute_path", "path", FILE_TOOLS),
+    ("file", "path", FILE_TOOLS),
+    ("file_text", "content", &["write_file"]),
+    ("file_content", "content", &["write_file"]),
+    ("contents", "content", &["write_file"]),
+    ("old_string", "old", &["edit_file"]),
+    ("old_str", "old", &["edit_file"]),
+    ("new_string", "new", &["edit_file"]),
+    ("new_str", "new", &["edit_file"]),
+    ("dir_path", "path", &["list_dir", "search"]),
+    ("directory", "path", &["list_dir", "search"]),
+    ("cmd", "command", &["run_command"]),
+    ("run_in_background", "background", &["run_command"]),
+    ("is_background", "background", &["run_command"]),
+    ("job_id", "id", &["read_job", "stop_job"]),
+    ("bash_id", "id", &["read_job"]),
+    ("shell_id", "id", &["stop_job"]),
+    ("job_id", "job", &["wait"]),
+];
+
+/// Renames another agent's name for a parameter of tool `name` to Letronna's,
+/// unless the call already has Letronna's; returns what was renamed.
+pub fn rename_aliases(name: &str, args: &mut Value) -> Vec<String> {
+    let mut changed = Vec::new();
+    let Some(object) = args.as_object_mut() else {
+        return changed;
+    };
+    for (theirs, ours, tools) in ALIASES {
+        // A key already there, the call's own or an earlier row's, stands.
+        if !tools.contains(&name) || object.contains_key(*ours) {
+            continue;
+        }
+        let Some(value) = object.remove(*theirs) else {
+            continue;
+        };
+        object.insert((*ours).to_owned(), value);
+        changed.push(format!("`{theirs}` as `{ours}`"));
+    }
+    changed
+}
+
+/// Parses a top-level string the schema wants as another type, such as
+/// `"true"` for a boolean or `"[1, 2]"` for an array, and returns what it
+/// changed.
+fn coerce(schema: &Value, args: &mut Value) -> Vec<String> {
+    let mut changed = Vec::new();
+    let (Some(properties), Some(object)) = (schema["properties"].as_object(), args.as_object_mut())
+    else {
+        return changed;
+    };
+    for (key, value) in object.iter_mut() {
+        let Some(kind) = properties.get(key).and_then(|p| p["type"].as_str()) else {
+            continue;
+        };
+        let Value::String(text) = value else {
+            continue;
+        };
+        let Ok(parsed) = serde_json::from_str::<Value>(text.trim()) else {
+            continue;
+        };
+        let fits = match kind {
+            "boolean" => parsed.is_boolean(),
+            "integer" => parsed.is_i64() || parsed.is_u64(),
+            "number" => parsed.is_number(),
+            "array" => parsed.is_array(),
+            "object" => parsed.is_object(),
+            _ => false,
+        };
+        if fits {
+            *value = parsed;
+            let article = if matches!(kind, "integer" | "array" | "object") {
+                "an"
+            } else {
+                "a"
+            };
+            changed.push(format!("`{key}` as {article} {kind}"));
+        }
+    }
+    changed
+}
+
+/// Renames aliases, then coerces values to the tool's schema, and returns
+/// what was reinterpreted.
+fn repair(tool: &dyn Tool, args: &mut Value) -> Vec<String> {
+    let mut changed = rename_aliases(tool.name(), args);
+    changed.extend(coerce(&tool.parameters(), args));
+    changed
+}
+
+/// Parses a call's arguments as tool `name` runs them, renamed and coerced,
+/// for a frontend that reads them itself, such as the todo checklist.
+pub fn parse_args_for(name: &str, args: &str) -> Result<Value, String> {
+    let mut args = parse_args(args)?;
+    if let Some(tool) = find(name) {
+        repair(&*tool, &mut args);
+    }
+    Ok(args)
+}
+
+/// The note that ends a result whose arguments were reinterpreted, so the
+/// model uses the right ones next time; empty when none were.
+fn reinterpreted(changed: &[String]) -> String {
+    if changed.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\n[Read {}. Use the tool's own parameter names and types.]",
+        changed.join(", ")
+    )
+}
+
 pub fn needs_approval(name: &str) -> bool {
     find(name).is_some_and(|t| t.needs_approval())
 }
 
 pub fn preview(name: &str, args: &str, ctx: &ToolContext) -> String {
     match (find(name), parse_args(args)) {
-        (Some(t), Ok(v)) => t.preview(&v, ctx),
+        (Some(t), Ok(mut v)) => {
+            // The card shows what will run, under the names the tool reads.
+            repair(&*t, &mut v);
+            t.preview(&v, ctx)
+        }
         _ => args.to_owned(),
     }
+}
+
+/// The plan an `exit_plan` call puts to the user, or why the call cannot be
+/// put to them: arguments that were cut off or carry no plan.
+pub fn plan_of(args: &str) -> Result<String, String> {
+    let args = parse_args(args)?;
+    match args["plan"].as_str() {
+        Some(plan) if !plan.trim().is_empty() => Ok(plan.to_owned()),
+        _ => Err("No plan came with the call: put the whole plan, in markdown, in `plan`.".into()),
+    }
+}
+
+/// Whether `exit_plan` is offered: in plan mode, and only at the terminal or
+/// the window, since a chat app's plan mode is its owner's to lift.
+pub fn offers_plan(connection: &Connection) -> bool {
+    connection.plan && connection.remote.is_none()
 }
 
 /// The `tools` array for a chat completion request. In plan mode the tools
 /// that change things are left out entirely, so the model cannot try them;
 /// where other people read the replies, so is everything that touches this
-/// computer; and `read_chat` exists only where there is a chat to read.
+/// computer; `read_chat` exists only where there is a chat to read, and
+/// `exit_plan` only where there is a plan to hand over and someone to take it.
 pub fn specs(connection: &Connection) -> Vec<Value> {
     let shared = connection.remote.as_ref().is_some_and(|r| r.shared);
     let history = connection
@@ -195,6 +369,7 @@ pub fn specs(connection: &Connection) -> Vec<Value> {
     all()
         .iter()
         .filter(|t| !connection.plan || !t.mutates())
+        .filter(|t| t.name() != EXIT_PLAN || offers_plan(connection))
         .filter(|t| !shared || !t.machine())
         .filter(|t| history || !t.needs_history())
         .map(|t| {
@@ -209,6 +384,21 @@ pub fn specs(connection: &Connection) -> Vec<Value> {
 
 pub fn run(name: &str, args: &str, ctx: &ToolContext) -> Result<String, String> {
     let tool = find(name).ok_or_else(|| format!("Unknown tool `{name}`."))?;
+    let started = Instant::now();
+    let result = run_found(tool.as_ref(), name, args, ctx);
+    crate::diag::event(
+        "tool",
+        &[
+            ("name", name.into()),
+            ("outcome", crate::diag::outcome(&result).into()),
+            ("ms", crate::diag::millis(started)),
+            ("bytes", result.as_ref().map_or(0, String::len).into()),
+        ],
+    );
+    result
+}
+
+fn run_found(tool: &dyn Tool, name: &str, args: &str, ctx: &ToolContext) -> Result<String, String> {
     // Only fitting tools are offered, but the model can name any of them;
     // refuse here too rather than trust the offer.
     if ctx.shared() && tool.machine() {
@@ -217,13 +407,36 @@ pub fn run(name: &str, args: &str, ctx: &ToolContext) -> Result<String, String> 
              nothing on this computer is in reach."
         ));
     }
-    let args = parse_args(args)?;
-    let mut out = tool.run(&args, ctx)?;
+    if ctx.plan && tool.mutates() {
+        return Err(format!(
+            "`{name}` is not available in plan mode: it changes things, and plan \
+             mode can only look and propose. Describe the change instead."
+        ));
+    }
+    let mut args = parse_args(args)?;
+    let note = reinterpreted(&repair(tool, &mut args));
+    // Refused however the call was approved: with approvals skipped, --yes
+    // or an unattended schedule there was no card to stop it.
+    if name == "run_command" {
+        let line = args["command"].as_str().unwrap_or_default();
+        let dialect = crate::command::Dialect::here();
+        let judged = crate::command::assess(line, dialect, ctx.workspace.as_deref());
+        if let crate::command::Risk::Hardline(why) = judged.risk {
+            return Err(format!(
+                "Refused: this command {why}. Letronna never runs that, whatever the \
+                 approval setting; if it is really meant, the user can run it \
+                 themselves, outside Letronna."
+            ));
+        }
+    }
+    let mut out = tool.run(&args, ctx).map_err(|e| e + &note)?;
     if out.len() > MAX_OUTPUT {
         let cut = out.floor_char_boundary(MAX_OUTPUT);
         out.truncate(cut);
         out.push_str("\n… [truncated]");
     }
+    // After the cut, so the note is never the part that gets lost.
+    out.push_str(&note);
     Ok(out)
 }
 
@@ -241,7 +454,8 @@ pub fn clamp_lines(text: &str, max: usize) -> String {
 
 /// The argument the UI shows next to a tool name.
 pub fn summary(name: &str, args: &str) -> String {
-    let v: Value = serde_json::from_str(args).unwrap_or(Value::Null);
+    let mut v: Value = serde_json::from_str(args).unwrap_or(Value::Null);
+    rename_aliases(name, &mut v);
     let text = match name {
         "search" | "search_sessions" => v["query"]
             .as_str()
@@ -256,6 +470,13 @@ pub fn summary(name: &str, args: &str) -> String {
             _ => format!("{}s", v["seconds"].as_f64().unwrap_or(10.)),
         },
         ASK_USER => v["question"].as_str().unwrap_or_default().to_owned(),
+        // The whole plan is too long for a row; its first line names it.
+        EXIT_PLAN => v["plan"]
+            .as_str()
+            .and_then(|plan| plan.lines().find(|line| !line.trim().is_empty()))
+            .unwrap_or_default()
+            .trim_start_matches(['#', ' '])
+            .to_owned(),
         "make_image" => v["prompt"].as_str().unwrap_or_default().to_owned(),
         "make_video" => v["prompt"]
             .as_str()
@@ -284,24 +505,99 @@ pub fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Where a write may land: inside the workspace only. The file need not
-/// exist yet, so the check is on the nearest existing ancestor.
+/// Where a write may land: inside the workspace only, and never in
+/// Letronna's own folder or on the program that is running.
 fn resolve_write(raw: &str, ctx: &ToolContext) -> Result<PathBuf, String> {
+    let me = std::env::current_exe().ok();
+    resolve_write_in(raw, ctx, &crate::chat::data_dir(), me.as_deref())
+}
+
+/// `resolve_write` with Letronna's folder at `data` and its program at `me`,
+/// checked on the nearest existing ancestor since the file need not exist yet.
+fn resolve_write_in(
+    raw: &str,
+    ctx: &ToolContext,
+    data: &Path,
+    me: Option<&Path>,
+) -> Result<PathBuf, String> {
     let workspace = ctx
         .workspace
         .as_ref()
         .ok_or("No project folder is attached. Ask the user to attach one first.")?;
     let root = std::fs::canonicalize(workspace).map_err(|_| "The project folder is missing.")?;
+    // Refused, not folded: on Linux and macOS a missing folder hid the `..`
+    // after it from the check below, so `new/../../x` was written beside the
+    // project. Folding by hand would judge `link/..` unlike the system, which
+    // follows the link first.
+    if Path::new(raw)
+        .components()
+        .any(|part| part == std::path::Component::ParentDir)
+    {
+        return Err(format!(
+            "`{raw}` climbs up with `..`; give the path from the project folder without it."
+        ));
+    }
     let target = workspace.join(raw);
     let mut probe = target.clone();
-    while !probe.exists() {
+    // Not `exists`, which follows links: a link to a missing file was passed
+    // over, and the write then went through it to wherever it pointed.
+    while probe.symlink_metadata().is_err() {
         probe = probe.parent().map(Path::to_path_buf).ok_or("Bad path.")?;
     }
-    let existing = std::fs::canonicalize(&probe).map_err(|e| e.to_string())?;
+    let existing = std::fs::canonicalize(&probe).map_err(|_| {
+        format!(
+            "`{raw}` goes through a link that leads nowhere, so where it lands cannot be checked."
+        )
+    })?;
     if !existing.starts_with(&root) {
         return Err(format!("`{raw}` is outside the project folder."));
     }
+    if private(&existing, data) {
+        return Err(format!(
+            "`{raw}` is in Letronna's own folder, with its keys and settings; it stays out of reach."
+        ));
+    }
+    let Ok(rest) = target.strip_prefix(&probe) else {
+        return Err("Bad path.".into());
+    };
+    if me.is_some_and(|me| own_program(&existing.join(rest), me)) {
+        return Err(format!(
+            "`{raw}` is Letronna's own program or an update to it; it stays out of reach."
+        ));
+    }
     Ok(target)
+}
+
+/// Variables every command and every job starts with.
+const SHELL_ENV: [(&str, &str); 5] = [
+    ("PAGER", "cat"),
+    ("GIT_PAGER", "cat"),
+    ("GIT_EDITOR", "true"),
+    ("NO_COLOR", "1"),
+    ("TERM", "dumb"),
+];
+/// Whether `path` is the program `me`, or the `.new` or `.old` copy of it
+/// that an update later moves into its place.
+fn own_program(path: &Path, me: &Path) -> bool {
+    let Ok(me) = std::fs::canonicalize(me) else {
+        return false;
+    };
+    // The folder is canonical on both sides; the name is compared without
+    // case, because Windows and macOS open `LETRONNA.NEW.EXE` as
+    // `Letronna.new.exe`.
+    [
+        crate::update::beside(&me, "new"),
+        crate::update::beside(&me, "old"),
+        me,
+    ]
+    .iter()
+    .any(|own| {
+        own.parent() == path.parent()
+            && own
+                .file_name()
+                .zip(path.file_name())
+                .is_some_and(|(own, name)| own.eq_ignore_ascii_case(name))
+    })
 }
 
 /// The platform shell, configured the way every caller needs it.
@@ -309,16 +605,28 @@ pub fn shell(command: &str, cwd: Option<&Path>) -> std::process::Command {
     use std::process::Command;
     let mut cmd = if cfg!(windows) {
         let mut c = Command::new("powershell");
-        c.args(["-NoProfile", "-NonInteractive", "-Command", command]);
+        c.args(["-NoProfile", "-NonInteractive", "-Command"])
+            .arg(with_utf8_output(command));
         c
     } else {
         let mut c = Command::new("sh");
         c.args(["-c", command]);
         c
     };
+    // Output is read back as UTF-8, and Python writes to a pipe in the
+    // locale's encoding, which on Windows is not. An encoding on its own
+    // would make Python strict, and a file name holding bytes that are not
+    // UTF-8 would then raise instead of printing.
+    cmd.env("PYTHONIOENCODING", "utf-8:surrogateescape");
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
+    // No one reads a command's output as a terminal, so a pager or an editor
+    // would wait for keys that never come until the timeout killed it, and
+    // colour would reach the model as escape codes. Git takes a pager of `cat`
+    // to mean none, and an editor of `true` keeps the message it was given,
+    // so a commit without -m fails at once instead of hanging.
+    cmd.envs(SHELL_ENV);
     // Letronna is a GUI-subsystem app, so it owns no console. Without this,
     // Windows hands the shell a brand new console window on every call and it
     // flashes up over the chat.
@@ -331,8 +639,34 @@ pub fn shell(command: &str, cwd: Option<&Path>) -> std::process::Command {
     cmd
 }
 
-fn run_shell(command: &str, cwd: Option<&Path>) -> Result<String, String> {
-    use std::io::Read;
+/// Switches Windows PowerShell's output to UTF-8 where the session allows it.
+const UTF8_PRELUDE: &str = "if ($ExecutionContext.SessionState.LanguageMode -eq 'FullLanguage') { \
+     try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); \
+     $OutputEncoding = [Console]::OutputEncoding } catch {} }\n";
+
+/// The command behind a prelude that makes Windows PowerShell print UTF-8.
+fn with_utf8_output(command: &str) -> String {
+    // Windows PowerShell writes to a pipe in the console's code page, so an
+    // accented letter arrives as a byte that is not UTF-8. ConstrainedLanguage
+    // mode refuses the switch, hence the check in the prelude, and its
+    // encoding writes no BOM, which would otherwise start the output. The
+    // command starts a line of its own, so an error in it points at its own
+    // columns. A script that opens with param( or using must keep it first,
+    // so it runs as it is.
+    let head = command.trim_start().to_ascii_lowercase();
+    let must_lead = head
+        .strip_prefix("param")
+        .is_some_and(|rest| rest.trim_start().starts_with('('))
+        || head
+            .strip_prefix("using")
+            .is_some_and(|rest| rest.starts_with(char::is_whitespace));
+    if must_lead {
+        return command.to_owned();
+    }
+    format!("{UTF8_PRELUDE}{command}")
+}
+
+fn run_shell(command: &str, cwd: Option<&Path>, cancel: &Cancel) -> Result<String, String> {
     use std::process::Stdio;
     let mut child = shell(command, cwd)
         .stdin(Stdio::null())
@@ -340,18 +674,13 @@ fn run_shell(command: &str, cwd: Option<&Path>) -> Result<String, String> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Cannot start the shell: {e}"))?;
-    let mut stdout = child.stdout.take().unwrap();
-    let mut stderr = child.stderr.take().unwrap();
-    let out = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = stdout.read_to_string(&mut s);
-        s
-    });
-    let err = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = stderr.read_to_string(&mut s);
-        s
-    });
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        let _ = child.kill();
+        return Err("Cannot read the command's output.".into());
+    };
+    let (sender, chunks) = std::sync::mpsc::channel();
+    forward(stdout, false, sender.clone());
+    forward(stderr, true, sender);
     let started = std::time::Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
@@ -366,10 +695,14 @@ fn run_shell(command: &str, cwd: Option<&Path>) -> Result<String, String> {
                 COMMAND_TIMEOUT.as_secs()
             ));
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        if !cancel.sleep(std::time::Duration::from_millis(50)) {
+            let _ = child.kill();
+            return Err("Stopped, and the command was ended before it finished.".into());
+        }
     };
-    let mut text = out.join().unwrap_or_default();
-    let err = err.join().unwrap_or_default();
+    let (out, err, held_open) = collect(&chunks);
+    let mut text = strip_escapes(&String::from_utf8_lossy(&out));
+    let err = strip_escapes(&String::from_utf8_lossy(&err));
     if !err.trim().is_empty() {
         text.push_str("\n[stderr]\n");
         text.push_str(&err);
@@ -377,7 +710,99 @@ fn run_shell(command: &str, cwd: Option<&Path>) -> Result<String, String> {
     if !status.success() {
         text.push_str(&format!("\n[exit code {}]", status.code().unwrap_or(-1)));
     }
+    if held_open {
+        // First, so the cut `run` makes to a long result cannot drop it.
+        text.insert_str(
+            0,
+            "[the command started something that is still running and holds \
+             its output open; output after the command exited was not \
+             collected. To follow a process like that, run it with \
+             background: true]\n",
+        );
+    }
     Ok(text)
+}
+
+/// Removes CSI and OSC escape sequences, keeping the text between them.
+pub(crate) fn strip_escapes(text: &str) -> String {
+    // NO_COLOR and TERM=dumb stop most of these, but not every program checks,
+    // and a colour code or a window title is only noise to the model.
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        if chars.next_if_eq(&'[').is_some() {
+            while chars.next_if(|c| ('\x20'..='\x3f').contains(c)).is_some() {}
+            chars.next_if(|c| ('\x40'..='\x7e').contains(c));
+        } else if chars.next_if_eq(&']').is_some() {
+            // A terminal ends an OSC at BEL or at ST (ESC \) and reads any
+            // other escape as the start of the next sequence, so this does too.
+            // No title or link holds a newline, so one ends there too, and an
+            // OSC left open hides the rest of its line, not the whole output.
+            while chars.next_if(|c| !"\x07\x1b\n".contains(*c)).is_some() {}
+            if chars.next_if_eq(&'\x07').is_none() {
+                let mut ahead = chars.clone();
+                if ahead.next() == Some('\x1b') && ahead.next() == Some('\\') {
+                    chars = ahead;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Send what `pipe` yields over `chunks`, marked as stderr or not, until it
+/// closes, dropping everything past `MAX_OUTPUT`.
+fn forward(
+    mut pipe: impl std::io::Read + Send + 'static,
+    stderr: bool,
+    chunks: std::sync::mpsc::Sender<(bool, Vec<u8>)>,
+) {
+    std::thread::spawn(move || {
+        let mut block = [0u8; 4096];
+        let mut sent = 0;
+        loop {
+            match pipe.read(&mut block) {
+                Ok(0) => break,
+                Ok(n) => {
+                    // `run` shows no more than `MAX_OUTPUT` and a chatty child
+                    // can print gigabytes, so the rest is dropped; reading on
+                    // anyway keeps a child left behind from blocking on a full
+                    // pipe, or dying of a broken one.
+                    if sent <= MAX_OUTPUT {
+                        sent += n;
+                        let _ = chunks.send((stderr, block[..n].to_vec()));
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+/// A finished command's stdout and stderr, and whether a pipe was still open
+/// when `PIPE_GRACE` ran out.
+fn collect(chunks: &std::sync::mpsc::Receiver<(bool, Vec<u8>)>) -> (Vec<u8>, Vec<u8>, bool) {
+    use std::sync::mpsc::RecvTimeoutError;
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let deadline = Instant::now() + PIPE_GRACE;
+    loop {
+        // A chunk already waiting is taken even past the deadline; this still
+        // ends, because `forward` stops sending past `MAX_OUTPUT`.
+        let left = deadline.saturating_duration_since(Instant::now());
+        match chunks.recv_timeout(left) {
+            Ok((true, bytes)) => err.extend(bytes),
+            Ok((false, bytes)) => out.extend(bytes),
+            Err(RecvTimeoutError::Timeout) => return (out, err, true),
+            Err(RecvTimeoutError::Disconnected) => return (out, err, false),
+        }
+    }
 }
 
 struct WriteFile;
@@ -516,7 +941,7 @@ impl Tool for RunCommand {
     }
     fn description(&self) -> &'static str {
         if cfg!(windows) {
-            "Run a PowerShell command in the project folder. Waits for it to finish and returns its output, with a 2 minute limit. For anything meant to keep running, such as a dev server or a watcher, pass background: true instead."
+            "Run a Windows PowerShell 5.1 command in the project folder. `&&` and `||` are syntax errors in 5.1: separate commands with `;`, or write `first; if ($?) { second }` to run the second only when the first succeeded. Waits for it to finish and returns its output, with a 2 minute limit. For anything meant to keep running, such as a dev server or a watcher, pass background: true instead."
         } else {
             "Run a shell (sh) command in the project folder. Waits for it to finish and returns its output, with a 2 minute limit. For anything meant to keep running, such as a dev server or a watcher, pass background: true instead."
         }
@@ -540,12 +965,13 @@ impl Tool for RunCommand {
             .as_deref()
             .ok_or("No project folder is attached. Ask the user to attach one first.")?;
         if !args["background"].as_bool().unwrap_or(false) {
-            return run_shell(command, Some(cwd));
+            return run_shell(command, Some(cwd), &ctx.cancel);
         }
         let id = crate::jobs::start(command, cwd)?;
         // Give it a moment to fail or announce a port, so the first reply says
-        // something more useful than "started".
-        std::thread::sleep(SETTLE);
+        // something more useful than "started". A stop cuts the moment short,
+        // but the job runs on either way, so it is still reported.
+        ctx.cancel.sleep(SETTLE);
         let log = crate::jobs::log(id).unwrap_or_default();
         let state = if crate::jobs::running(id).unwrap_or(false) {
             "running"
@@ -749,11 +1175,13 @@ impl Tool for Wait {
             "until": {"type": "string", "description": "Text to watch for in the job's output, such as `ready` or `listening`."}
         }})
     }
-    fn run(&self, args: &Value, _: &ToolContext) -> Result<String, String> {
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         let seconds = args["seconds"].as_f64().unwrap_or(10.).clamp(0., 120.);
         let limit = std::time::Duration::from_secs_f64(seconds);
         let Some(id) = args["job"].as_u64() else {
-            std::thread::sleep(limit);
+            if !ctx.cancel.sleep(limit) {
+                return Err("Stopped before the wait was over.".into());
+            }
             return Ok(format!("Waited {seconds:.0}s."));
         };
         let until = args["until"].as_str().unwrap_or_default();
@@ -783,7 +1211,9 @@ impl Tool for Wait {
                     log.trim_end()
                 ));
             }
-            std::thread::sleep(std::time::Duration::from_millis(250));
+            if !ctx.cancel.sleep(std::time::Duration::from_millis(250)) {
+                return Err(format!("Stopped waiting. Job #{id} is still running."));
+            }
         }
     }
 }
@@ -794,7 +1224,7 @@ fn job_id(args: &Value) -> Result<u64, String> {
         .ok_or_else(|| "`id` is required and must be a job number.".to_owned())
 }
 
-/// Answered in the chat, not here.
+/// Answered in the chat, and run only in an unattended session to say nobody will.
 struct AskUser;
 impl Tool for AskUser {
     fn name(&self) -> &'static str {
@@ -816,12 +1246,51 @@ impl Tool for AskUser {
         false
     }
     fn run(&self, _: &Value, _: &ToolContext) -> Result<String, String> {
-        Err("ask_user is answered by the user.".into())
+        Ok("Nobody is available to answer; decide for yourself and say what you assumed.".into())
     }
 }
 
-/// A checklist the model keeps for itself. The app stores the items on the
-/// conversation and draws them above the composer; see `Chat::apply_todo`.
+/// The plan made in plan mode, put to the user. Like `ask_user` it is
+/// answered by the user (see `Turn::answer_plan`), so it only runs when
+/// nobody could be asked, and then it refuses.
+struct ExitPlan;
+impl Tool for ExitPlan {
+    fn name(&self) -> &'static str {
+        EXIT_PLAN
+    }
+    fn description(&self) -> &'static str {
+        "Put your finished plan to the user for approval, written in markdown. If they approve, plan mode turns off and you carry the plan out straight away; if not, keep planning. Use it once the plan is ready, instead of asking whether to go ahead."
+    }
+    fn parameters(&self) -> Value {
+        json!({"type": "object", "properties": {
+            "plan": {"type": "string", "description": "The plan in markdown: what will change, where, and how it will be checked."}
+        }, "required": ["plan"]})
+    }
+    fn needs_approval(&self) -> bool {
+        true
+    }
+    fn preview(&self, args: &Value, _: &ToolContext) -> String {
+        args["plan"].as_str().unwrap_or_default().to_owned()
+    }
+    fn run(&self, _: &Value, ctx: &ToolContext) -> Result<String, String> {
+        // A chat app is in plan mode because its owner left it there, which
+        // nobody on the far end may undo.
+        let advice = if ctx.remote.is_some() {
+            "A plan cannot be approved from a chat app, so plan mode stays on. \
+             Give the plan as your answer; to carry it out from here, the owner \
+             can switch on \"Let messages use tools\" on Letronna's Messaging page."
+        } else {
+            "Nobody is here to approve a plan, so plan mode stays on. Give the \
+             plan as your answer and stop there, so the user can read it and \
+             decide."
+        };
+        Err(advice.into())
+    }
+}
+
+/// A checklist the model keeps for itself. The window and the terminal store
+/// the items on the conversation and draw them above where you type; see
+/// `store::apply_todo`.
 struct Todo;
 impl Tool for Todo {
     fn name(&self) -> &'static str {
@@ -847,7 +1316,7 @@ impl Tool for Todo {
     }
 }
 
-fn home() -> Option<PathBuf> {
+pub(crate) fn home() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
@@ -872,6 +1341,13 @@ pub(crate) fn resolve(raw: &str, ctx: &ToolContext) -> Result<PathBuf, String> {
             "`{raw}` is in Letronna's own folder, with the keys and sign-in; it stays out of reach."
         ));
     }
+    // Refused rather than asked about: the approval gate sees a tool's name,
+    // not the path it was given, so it cannot tell this read from any other.
+    if secret(&path) {
+        return Err(format!(
+            "`{raw}` holds keys, passwords or tokens, so it stays out of reach. Ask the user to paste what you need from it."
+        ));
+    }
     Ok(path)
 }
 
@@ -881,6 +1357,43 @@ pub(crate) fn resolve(raw: &str, ctx: &ToolContext) -> Result<PathBuf, String> {
 /// model into it would have had them read out.
 fn private(path: &Path, data: &Path) -> bool {
     std::fs::canonicalize(data).is_ok_and(|data| path.starts_with(data))
+}
+
+/// Folders and files that hold keys, passwords or other agents' sign-in
+/// tokens, matched as a run of names anywhere in a path so that a folder
+/// covers everything in it; `_netrc` is what curl and Git read on Windows.
+const SECRETS: &[&str] = &[
+    ".ssh",
+    ".aws",
+    ".netrc",
+    "_netrc",
+    ".git-credentials",
+    ".claude/.credentials.json",
+    ".codex/auth.json",
+];
+
+/// Whether `path` is or lies in one of `SECRETS`, or is a `.env` file other
+/// than the example and sample ones that projects commit.
+fn secret(path: &Path) -> bool {
+    // Without case, because Windows and macOS open `.SSH` as `.ssh`.
+    let names: Vec<&std::ffi::OsStr> = path.iter().collect();
+    let listed = SECRETS.iter().any(|entry| {
+        let len = entry.split('/').count();
+        names.windows(len).any(|run| {
+            run.iter()
+                .zip(entry.split('/'))
+                .all(|(name, part)| name.eq_ignore_ascii_case(part))
+        })
+    });
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    listed
+        || name == ".env"
+        || name
+            .strip_prefix(".env.")
+            .is_some_and(|rest| !matches!(rest, "example" | "sample"))
 }
 
 fn path_arg(args: &Value) -> &str {
@@ -893,34 +1406,216 @@ impl Tool for ReadFile {
         "read_file"
     }
     fn description(&self) -> &'static str {
-        "Read a text file. Paths are relative to the workspace."
+        "Read a text file. Paths are relative to the workspace. Each line is shown as `N|text`, N being its line number; the `N|` is not part of the file. A long file comes a page at a time, and the page ends with the offset to continue from."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
-            "path": {"type": "string"}
+            "path": {"type": "string"},
+            "offset": {"type": "integer", "description": "The line to start at, counting from 1."},
+            "limit": {"type": "integer", "description": "How many lines to show at most."}
         }, "required": ["path"]})
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
-        use std::io::Read;
-        let path = resolve(path_arg(args), ctx)?;
-        let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
-        let mut bytes = Vec::new();
-        file.take(READ_BYTES)
-            .read_to_end(&mut bytes)
-            .map_err(|e| e.to_string())?;
-        let cut = bytes.len() as u64 == READ_BYTES;
-        match String::from_utf8(bytes) {
-            Ok(text) => Ok(text),
-            // A cut can split the last character; anything else is binary.
-            Err(e) if cut && e.utf8_error().error_len().is_none() => {
-                let valid = e.utf8_error().valid_up_to();
-                let mut bytes = e.into_bytes();
-                bytes.truncate(valid);
-                String::from_utf8(bytes).map_err(|_| "Not a text file.".into())
-            }
-            Err(_) => Err("Not a text file.".into()),
+        let raw = path_arg(args);
+        let path = resolve(raw, ctx).map_err(|e| e + &similar(raw, ctx))?;
+        let offset = args["offset"].as_u64().unwrap_or(1).max(1) as usize;
+        let limit = args["limit"].as_u64().unwrap_or(u64::MAX).max(1) as usize;
+        let (mut text, cut) = open_text(&path)?;
+        page(&mut text, offset, limit, cut)
+    }
+}
+
+/// A file's text as UTF-8, without a byte order mark and with UTF-16 decoded,
+/// and whether it stops at `UTF16_BYTES`; a NUL byte near the start marks a
+/// binary file, which is refused.
+fn open_text(path: &Path) -> Result<(Box<dyn BufRead>, bool), String> {
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(file);
+    let start = reader.fill_buf().map_err(|e| e.to_string())?;
+    let unit: fn([u8; 2]) -> u16 = match start {
+        [0xFF, 0xFE, ..] => u16::from_le_bytes,
+        [0xFE, 0xFF, ..] => u16::from_be_bytes,
+        [0xEF, 0xBB, 0xBF, ..] => {
+            reader.consume(3);
+            return Ok((Box::new(reader), false));
+        }
+        _ if start.contains(&0) => return Err("Not a text file.".into()),
+        _ => return Ok((Box::new(reader), false)),
+    };
+    reader.consume(2);
+    let mut bytes = Vec::new();
+    // One byte past the cap tells a file cut there from one that fits it.
+    reader
+        .take(UTF16_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    let cut = bytes.len() as u64 > UTF16_BYTES;
+    bytes.truncate(UTF16_BYTES as usize);
+    let units = bytes.as_chunks::<2>().0.iter().map(|&pair| unit(pair));
+    let text: String = char::decode_utf16(units)
+        .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect();
+    Ok((Box::new(std::io::Cursor::new(text.into_bytes())), cut))
+}
+
+/// Lines from `offset` on, numbered, until `limit` of them or `PAGE_BYTES`,
+/// with a footer saying where the rest starts and a note on every page of a
+/// `cut` file.
+fn page(
+    reader: &mut impl BufRead,
+    offset: usize,
+    limit: usize,
+    cut: bool,
+) -> Result<String, String> {
+    let mut out = String::new();
+    let mut line = Vec::new();
+    let (mut n, mut lossy, mut more) = (0, false, false);
+    while next_line(reader, &mut line)? {
+        n += 1;
+        if n < offset {
+            continue;
+        }
+        if n - offset == limit {
+            more = true;
+            break;
+        }
+        let text = String::from_utf8_lossy(&line);
+        let shown = match text.char_indices().nth(LINE_CHARS) {
+            Some((at, _)) => format!("{n}|{} … [line cut]\n", &text[..at]),
+            None => format!("{n}|{text}\n"),
+        };
+        if !out.is_empty() && out.len() + shown.len() > PAGE_BYTES {
+            more = true;
+            break;
+        }
+        // A bad byte shows only before the cut, as the character after the
+        // valid ones; one past it, or a character split where `next_line`
+        // stopped, is never seen.
+        lossy |= std::str::from_utf8(&line)
+            .is_err_and(|e| text[..e.valid_up_to()].chars().count() < LINE_CHARS);
+        out.push_str(&shown);
+    }
+    if n == 0 {
+        return Ok("The file is empty.".into());
+    }
+    let mb = UTF16_BYTES / (1024 * 1024);
+    if out.is_empty() {
+        let file = if cut {
+            format!("The first {mb} MB of this UTF-16 file, which is all that is read,")
+        } else {
+            "The file".into()
+        };
+        return Err(format!(
+            "{file} has {n} lines, so offset {offset} is past its end."
+        ));
+    }
+    out.pop();
+    if lossy {
+        out.push_str("\n\n[Some bytes are not UTF-8 and show as \u{FFFD}.]");
+    }
+    // Without this a cut file's last page would read as the end of the file.
+    if cut {
+        out.push_str(&format!(
+            "\n\n[Only the first {mb} MB of this UTF-16 file is read.]"
+        ));
+    }
+    // Line `n` was read to find there is more, and is where the next page
+    // starts. Past a cut there are lines that cannot be counted.
+    if more {
+        let rest = if cut { None } else { lines_left(reader) };
+        let of = rest
+            .map(|rest| format!(" of {}", n + rest))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "\n\nLines {offset}-{}{of}. Continue with offset={n}.",
+            n - 1
+        ));
+    }
+    Ok(out)
+}
+
+/// Reads the next line into `line`, without its line break and only as much
+/// of it as a page could show; false at the end of the file.
+fn next_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> Result<bool, String> {
+    // One character more than a line shows, at up to four bytes each, so a
+    // line stopped short here still reads as too long and is marked cut.
+    let keep = 4 * (LINE_CHARS as u64 + 1);
+    line.clear();
+    let read = reader
+        .by_ref()
+        .take(keep)
+        .read_until(b'\n', line)
+        .map_err(|e| e.to_string())?;
+    if line.last() == Some(&b'\n') {
+        line.pop();
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+    } else if read as u64 == keep {
+        reader.skip_until(b'\n').map_err(|e| e.to_string())?;
+    }
+    Ok(read > 0)
+}
+
+/// How many lines are left in `reader`, or `None` once it runs past
+/// `COUNT_BYTES`.
+fn lines_left(reader: &mut impl BufRead) -> Option<usize> {
+    let (mut lines, mut read, mut last) = (0, 0, b'\n');
+    loop {
+        let buf = reader.fill_buf().ok()?;
+        let Some(&end) = buf.last() else {
+            return Some(lines + usize::from(last != b'\n'));
+        };
+        lines += buf.iter().filter(|&&b| b == b'\n').count();
+        last = end;
+        let len = buf.len();
+        reader.consume(len);
+        read += len as u64;
+        if read > COUNT_BYTES {
+            return None;
         }
     }
+}
+
+/// Up to five names beside a missing `raw` that start like it, as a sentence
+/// to add to the error, or nothing.
+fn similar(raw: &str, ctx: &ToolContext) -> String {
+    let wanted = Path::new(raw);
+    let Some(file_name) = wanted.file_name() else {
+        return String::new();
+    };
+    // Through `resolve`, so no name is given from a folder that may not be
+    // read, and none for a path that is there but refused.
+    let parent = wanted.parent().and_then(Path::to_str);
+    let Ok(dir) = resolve(parent.filter(|p| !p.is_empty()).unwrap_or("."), ctx) else {
+        return String::new();
+    };
+    if dir.join(file_name).exists() {
+        return String::new();
+    }
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return String::new();
+    };
+    let name = file_name.to_string_lossy().to_lowercase();
+    let stem = match name.rsplit_once('.') {
+        Some((stem, _)) if !stem.is_empty() => stem,
+        _ => name.as_str(),
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.to_lowercase().starts_with(stem))
+        .collect();
+    if names.is_empty() {
+        return String::new();
+    }
+    names.sort();
+    let names: Vec<String> = names
+        .iter()
+        .take(5)
+        .map(|n| format!("`{}`", wanted.with_file_name(n).display()))
+        .collect();
+    format!(" Did you mean {}?", names.join(", "))
 }
 
 struct ListDir;
@@ -981,7 +1676,8 @@ fn search(root: &Path, query: &str, time: Duration, files: usize) -> String {
     let mut scanned = 0;
     let mut stopped = false;
     let mut hits = Vec::new();
-    walk(root, &mut |path, is_dir| {
+    let mut skipped = 0;
+    walk(root, &mut skipped, &mut |path, is_dir| {
         // Checked on folders too, or a deep tree of them runs unbounded.
         if scanned >= files || started.elapsed() >= time {
             stopped = true;
@@ -1021,6 +1717,12 @@ fn search(root: &Path, query: &str, time: Duration, files: usize) -> String {
              complete results."
         ));
     }
+    if skipped > 0 {
+        out.push_str(&format!(
+            "\n… Secret files and folders left out: {skipped}. Ask the user to paste \
+             what you need from them."
+        ));
+    }
     out
 }
 
@@ -1037,11 +1739,11 @@ fn searchable(path: &Path) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-/// Depth-first walk skipping build, VCS and hidden folders. A symlink is
-/// never followed, so a link back up the tree cannot loop it. The callback
-/// sees each folder before it is entered and each file, and returns false to
-/// stop.
-fn walk(dir: &Path, f: &mut dyn FnMut(&Path, bool) -> bool) -> bool {
+/// Depth-first walk skipping build, VCS and hidden folders, and secrets,
+/// which it counts in `skipped`. A symlink is never followed, so a link back
+/// up the tree cannot loop it. The callback sees each folder before it is
+/// entered and each file, and returns false to stop.
+fn walk(dir: &Path, skipped: &mut usize, f: &mut dyn FnMut(&Path, bool) -> bool) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return true;
     };
@@ -1053,6 +1755,10 @@ fn walk(dir: &Path, f: &mut dyn FnMut(&Path, bool) -> bool) -> bool {
             continue;
         }
         let path = entry.path();
+        if secret(&path) {
+            *skipped += 1;
+            continue;
+        }
         if kind.is_dir() {
             let name = entry.file_name();
             let hidden = name.to_string_lossy().starts_with('.');
@@ -1062,7 +1768,7 @@ fn walk(dir: &Path, f: &mut dyn FnMut(&Path, bool) -> bool) -> bool {
             {
                 continue;
             }
-            if !f(&path, true) || !walk(&path, f) {
+            if !f(&path, true) || !walk(&path, skipped, f) {
                 return false;
             }
         } else if !f(&path, false) {
@@ -1087,7 +1793,7 @@ mod tests {
         };
         assert_eq!(
             run("read_file", r#"{"path":"src/a.txt"}"#, &ctx).unwrap(),
-            "hello\nWorld"
+            "1|hello\n2|World"
         );
         assert_eq!(run("list_dir", "{}", &ctx).unwrap(), "src/");
         assert_eq!(
@@ -1169,8 +1875,7 @@ mod tests {
         assert_eq!(run("extra", "{}", &ctx).unwrap(), "from a plugin");
         assert_eq!(
             run("read_file", r#"{"path":"src/a.txt"}"#, &ctx).unwrap(),
-            "hello
-World"
+            "1|hello\n2|World"
         );
         set_plugin_tools(Vec::new());
         assert!(run("extra", "{}", &ctx).is_err());
@@ -1225,6 +1930,61 @@ World"
     }
 
     #[test]
+    fn a_multibyte_character_split_across_reads_survives() {
+        // The é (0xC3 0xA9) comes in two reads, as it can from a pipe; the
+        // bytes are joined before they are decoded.
+        let (sender, chunks) = std::sync::mpsc::channel();
+        sender.send((false, b"caf\xc3".to_vec())).unwrap();
+        sender.send((false, b"\xa9 done".to_vec())).unwrap();
+        drop(sender);
+        let (out, _, held_open) = collect(&chunks);
+        assert!(!held_open);
+        assert_eq!(String::from_utf8_lossy(&out), "café done");
+    }
+
+    #[test]
+    fn invalid_bytes_become_replacement_characters_not_an_error() {
+        // 0xE9 is é in Latin-1 and Windows-1252; alone it is not UTF-8.
+        let print = if cfg!(windows) {
+            "[Console]::OpenStandardOutput().Write([byte[]](0x63,0x61,0x66,0xE9,0x0A), 0, 5); \
+             [Console]::OpenStandardError().Write([byte[]](0x62,0x61,0x64,0xE9,0x0A), 0, 5)"
+        } else {
+            r"printf 'caf\351\n'; printf 'bad\351\n' >&2"
+        };
+        let out = run_shell(print, None, &Cancel::default()).unwrap();
+        assert_eq!(out, "caf\u{FFFD}\n\n[stderr]\nbad\u{FFFD}\n");
+    }
+
+    #[test]
+    fn commands_are_asked_for_utf8_output() {
+        let print = if cfg!(windows) {
+            r#"Write-Output "café $env:PYTHONIOENCODING""#
+        } else {
+            r#"printf 'café %s\n' "$PYTHONIOENCODING""#
+        };
+        let out = run_shell(print, None, &Cancel::default()).unwrap();
+        assert_eq!(out.trim_end(), "café utf-8:surrogateescape");
+    }
+
+    #[test]
+    fn a_script_that_must_open_with_param_or_using_runs_as_it_is() {
+        for kept in [
+            "param($name) Write-Output $name",
+            "  PARAM ($name) $name",
+            "using namespace System.Text\n[StringBuilder]::new()",
+        ] {
+            assert_eq!(with_utf8_output(kept), kept);
+        }
+        for led in ["Get-ChildItem", "parameters.ps1", "usingcmd"] {
+            let script = with_utf8_output(led);
+            assert!(
+                script.starts_with(UTF8_PRELUDE) && script.ends_with(led),
+                "{script}"
+            );
+        }
+    }
+
+    #[test]
     fn letronnas_own_folder_is_out_of_reach() {
         let dir = std::env::temp_dir().join(format!("letronna-private-{}", std::process::id()));
         let data = dir.join("Letronna");
@@ -1240,18 +2000,168 @@ World"
     }
 
     #[test]
-    fn read_file_stops_at_its_limit() {
+    fn read_file_pages_through_a_long_file_by_line() {
         let dir = std::env::temp_dir().join(format!("letronna-read-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        // A two-byte character straddles the cut, which must not read as binary.
-        let text = format!("{}é{}", "a".repeat(READ_BYTES as usize - 1), "b".repeat(10));
-        std::fs::write(dir.join("long.txt"), text).unwrap();
+        let lines: Vec<String> = (1..=3000).map(|n| format!("line {n}")).collect();
+        std::fs::write(dir.join("long.txt"), lines.join("\r\n") + "\r\n").unwrap();
         let ctx = ToolContext {
             workspace: Some(dir.clone()),
             ..Default::default()
         };
-        let out = ReadFile.run(&json!({"path": "long.txt"}), &ctx).unwrap();
-        assert_eq!(out.len(), READ_BYTES as usize - 1);
+        let read = |args: Value| ReadFile.run(&args, &ctx);
+
+        // A page stops under the wire's cap and says where the rest starts.
+        let first = read(json!({"path": "long.txt"})).unwrap();
+        assert!(first.starts_with("1|line 1\n2|line 2\n"), "{first}");
+        assert!(first.len() < crate::chat::MAX_TOOL_CHARS, "{}", first.len());
+        let (body, footer) = first.rsplit_once("\n\n").unwrap();
+        let last = body.lines().count();
+        assert_eq!(
+            footer,
+            format!("Lines 1-{last} of 3000. Continue with offset={}.", last + 1)
+        );
+        let next = read(json!({"path": "long.txt", "offset": last + 1})).unwrap();
+        assert!(
+            next.starts_with(&format!("{0}|line {0}\n", last + 1)),
+            "{next}"
+        );
+
+        assert_eq!(
+            read(json!({"path": "long.txt", "offset": 10, "limit": 2})).unwrap(),
+            "10|line 10\n11|line 11\n\nLines 10-11 of 3000. Continue with offset=12."
+        );
+        // The last page needs no footer, and past it there is nothing to read.
+        assert_eq!(
+            read(json!({"path": "long.txt", "offset": 2999})).unwrap(),
+            "2999|line 2999\n3000|line 3000"
+        );
+        let past = read(json!({"path": "long.txt", "offset": 3001})).unwrap_err();
+        assert!(past.contains("3000 lines"), "{past}");
+
+        // A line too long to show whole is cut on a character, and says so.
+        let wide = format!("{}\nend", "é".repeat(5 * LINE_CHARS));
+        std::fs::write(dir.join("wide.txt"), wide).unwrap();
+        assert_eq!(
+            read(json!({"path": "wide.txt"})).unwrap(),
+            format!("1|{} … [line cut]\n2|end", "é".repeat(LINE_CHARS))
+        );
+        // A character split where the read stopped, or a bad byte past the
+        // cut, is never shown, so it gets no note.
+        let split = format!("{}\nend", "中".repeat(3 * LINE_CHARS));
+        std::fs::write(dir.join("split.txt"), split).unwrap();
+        assert_eq!(
+            read(json!({"path": "split.txt"})).unwrap(),
+            format!("1|{} … [line cut]\n2|end", "中".repeat(LINE_CHARS))
+        );
+        let bad = [&b"a".repeat(2 * LINE_CHARS)[..], b"\xFF\nend"].concat();
+        std::fs::write(dir.join("bad.txt"), bad).unwrap();
+        assert_eq!(
+            read(json!({"path": "bad.txt"})).unwrap(),
+            format!("1|{} … [line cut]\n2|end", "a".repeat(LINE_CHARS))
+        );
+        std::fs::write(dir.join("empty.txt"), "").unwrap();
+        assert_eq!(
+            read(json!({"path": "empty.txt"})).unwrap(),
+            "The file is empty."
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn read_file_drops_a_byte_order_mark_and_decodes_utf16() {
+        let dir = std::env::temp_dir().join(format!("letronna-read-bom-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let read = |path: &str| ReadFile.run(&json!({"path": path}), &ctx);
+        let text = "\u{FEFF}é\r\nz";
+        let utf16 =
+            |unit: fn(u16) -> [u8; 2]| -> Vec<u8> { text.encode_utf16().flat_map(unit).collect() };
+        std::fs::write(dir.join("bom.txt"), text).unwrap();
+        std::fs::write(dir.join("le.txt"), utf16(u16::to_le_bytes)).unwrap();
+        std::fs::write(dir.join("be.txt"), utf16(u16::to_be_bytes)).unwrap();
+        for path in ["bom.txt", "le.txt", "be.txt"] {
+            assert_eq!(read(path).unwrap(), "1|é\n2|z", "{path}");
+        }
+
+        // Text that is not UTF-8 still reads, with a note; a NUL means binary.
+        std::fs::write(dir.join("latin1.txt"), b"caf\xE9").unwrap();
+        let latin1 = read("latin1.txt").unwrap();
+        assert!(latin1.starts_with("1|caf\u{FFFD}\n\n["), "{latin1}");
+        std::fs::write(dir.join("bin.dat"), b"a\0b").unwrap();
+        assert_eq!(read("bin.dat").unwrap_err(), "Not a text file.");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn read_file_says_it_reads_only_the_start_of_a_large_utf16_file() {
+        let dir = std::env::temp_dir().join(format!("letronna-read-cut-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let read = |args: Value| ReadFile.run(&args, &ctx);
+        // Each line is 16 bytes in UTF-16, so the cap falls on a line's end.
+        let kept = UTF16_BYTES as usize / 16;
+        let write = |lines: usize| {
+            let text = format!("\u{FEFF}{}", "line 01\n".repeat(lines));
+            let bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            std::fs::write(dir.join("big.txt"), bytes).unwrap();
+        };
+
+        // Every page of a cut file says so, and none counts its lines.
+        write(kept + 100);
+        let note = "[Only the first 16 MB of this UTF-16 file is read.]";
+        assert_eq!(
+            read(json!({"path": "big.txt", "limit": 2})).unwrap(),
+            format!("1|line 01\n2|line 01\n\n{note}\n\nLines 1-2. Continue with offset=3.")
+        );
+        assert_eq!(
+            read(json!({"path": "big.txt", "offset": kept})).unwrap(),
+            format!("{kept}|line 01\n\n{note}")
+        );
+        let past = read(json!({"path": "big.txt", "offset": kept + 1})).unwrap_err();
+        assert!(past.starts_with("The first 16 MB"), "{past}");
+
+        // A file that fills the cap exactly is read whole.
+        write(kept);
+        assert_eq!(
+            read(json!({"path": "big.txt", "offset": kept})).unwrap(),
+            format!("{kept}|line 01")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn read_file_suggests_names_like_a_missing_one() {
+        let dir = std::env::temp_dir().join(format!("letronna-read-near-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        for name in ["tools.rs", "toolbox.rs", "other.rs"] {
+            std::fs::write(dir.join("src").join(name), "").unwrap();
+        }
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let missing = |path: &str| ReadFile.run(&json!({"path": path}), &ctx).unwrap_err();
+        assert_eq!(
+            missing("src/tool.rs"),
+            "`src/tool.rs` does not exist. Did you mean `src\\toolbox.rs`, `src\\tools.rs`?"
+                .replace("src\\", &format!("src{}", std::path::MAIN_SEPARATOR))
+        );
+        assert_eq!(missing("src/zzz.rs"), "`src/zzz.rs` does not exist.");
+        assert_eq!(
+            missing("nowhere/tool.rs"),
+            "`nowhere/tool.rs` does not exist."
+        );
+        // A folder outside the workspace and home is never listed, though
+        // its root has a name that starts this way.
+        let outside = if cfg!(windows) { "/Windo" } else { "/us" };
+        assert_eq!(missing(outside), format!("`{outside}` does not exist."));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1393,5 +2303,564 @@ World"
         };
         let refused = run("read_file", r#"{"path": "x"}"#, &shared).unwrap_err();
         assert!(refused.contains("not available here"), "{refused}");
+    }
+
+    #[test]
+    fn commands_start_with_no_pager_no_editor_and_no_colour() {
+        let print = if cfg!(windows) {
+            r#"Write-Output "$env:PAGER $env:GIT_PAGER $env:GIT_EDITOR $env:NO_COLOR $env:TERM""#
+        } else {
+            r#"echo "$PAGER $GIT_PAGER $GIT_EDITOR $NO_COLOR $TERM""#
+        };
+        let out = shell(print, None).output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "cat cat true 1 dumb"
+        );
+    }
+
+    #[test]
+    fn escape_sequences_go_and_the_text_between_them_stays() {
+        for (raw, plain) in [
+            ("\x1b[1;31merror\x1b[0m: bad", "error: bad"),
+            ("\x1b[2K\x1b[?25lnext", "next"),
+            ("\x1b]0;a title\x07after", "after"),
+            (
+                "\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\ done",
+                "link done",
+            ),
+            ("\x1b]0;cut short\x1b[32mgreen", "green"),
+            ("ok\n\x1b]0;no end\nline2\nline3\n", "ok\n\nline2\nline3\n"),
+            ("héllo — ✓", "héllo — ✓"),
+            // An escape that starts neither kind is left for the reader to see.
+            ("a\x1bb", "a\x1bb"),
+            // A killed process can stop halfway through one.
+            ("text\x1b[3", "text"),
+        ] {
+            assert_eq!(strip_escapes(raw), plain, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn a_commands_colour_and_title_are_stripped_from_what_the_model_reads() {
+        let print = if cfg!(windows) {
+            r#"$e = [char]27; Write-Output "$e]0;title$([char]7)$e[31mred$e[0m plain""#
+        } else {
+            r#"printf '\033]0;title\007\033[31mred\033[0m plain\n'"#
+        };
+        let out = run_shell(print, None, &Cancel::default()).unwrap();
+        assert_eq!(out.trim_end(), "red plain");
+    }
+
+    #[test]
+    fn a_catastrophic_command_is_refused_however_it_was_approved() {
+        // No project folder either, so were the refusal missing it still
+        // could not start.
+        let args = r#"{"command": "Remove-Item -Recurse -Force ~"}"#;
+        let refused = run("run_command", args, &ToolContext::default()).unwrap_err();
+        assert!(refused.contains("deletes the home folder"), "{refused}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_background_child_holding_the_pipe_does_not_hang_the_command() {
+        let started = Instant::now();
+        let out = run_shell("echo before; sleep 30 & echo $!", None, &Cancel::default()).unwrap();
+        let took = started.elapsed();
+        let lines: Vec<&str> = out.lines().collect();
+        if let Some(pid) = lines.get(2) {
+            let _ = std::process::Command::new("kill").arg(pid).status();
+        }
+        // Waiting on the pipe would take the whole 30 s the child sleeps.
+        assert!(took < Duration::from_secs(10), "took {took:?}");
+        let note = lines.first().copied().unwrap_or_default();
+        assert!(note.contains("was not collected"), "{out}");
+        assert_eq!(lines.get(1), Some(&"before"), "{out}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_written_before_exit_is_kept() {
+        // Several chunks' worth, then stderr, right as the shell ends, with a
+        // child still holding both pipes so only the grace can end the wait.
+        let out = run_shell(
+            "sleep 2 & head -c 20000 /dev/zero | tr '\\0' a; echo; echo warned >&2; exit 3",
+            None,
+            &Cancel::default(),
+        )
+        .unwrap();
+        let (note, rest) = out.split_once('\n').unwrap();
+        assert!(note.contains("was not collected"), "{out}");
+        let (body, rest) = rest.split_once('\n').unwrap();
+        assert_eq!(body, "a".repeat(20_000));
+        assert_eq!(rest, "\n[stderr]\nwarned\n\n[exit code 3]");
+    }
+
+    /// A workspace of its own for a test, holding `a.txt` with `text` in it.
+    fn workspace_with(label: &str, text: &str) -> (PathBuf, ToolContext) {
+        let dir = std::env::temp_dir().join(format!("letronna-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), text).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        (dir, ctx)
+    }
+
+    #[test]
+    fn a_claude_style_file_path_reaches_path() {
+        let (dir, ctx) = workspace_with("aliases", "");
+        run(
+            "write_file",
+            r#"{"file_path":"a.txt","file_text":"one two"}"#,
+            &ctx,
+        )
+        .unwrap();
+        let edit = r#"{"file_path":"a.txt","old_string":"two","new_string":"three"}"#;
+        // The approval shows the same call the tool will run.
+        assert_eq!(summary("edit_file", edit), "a.txt");
+        assert_eq!(preview("edit_file", edit, &ctx), "- two\n+ three\n");
+        run("edit_file", edit, &ctx).unwrap();
+        let read = run("read_file", r#"{"file_path":"a.txt"}"#, &ctx).unwrap();
+        assert!(read.starts_with("1|one three\n\n"), "{read}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn string_numbers_and_booleans_are_coerced_by_the_schema() {
+        let schema = json!({"type": "object", "properties": {
+            "background": {"type": "boolean"},
+            "id": {"type": "integer"},
+            "seconds": {"type": "number"},
+            "options": {"type": "array"},
+            "command": {"type": "string"}
+        }});
+        let mut args = json!({"background": "true", "id": " 3 ", "seconds": "2.5",
+            "options": "[\"a\", \"b\"]", "command": "42", "other": "1"});
+        assert_eq!(coerce(&schema, &mut args).len(), 4);
+        assert_eq!(
+            args,
+            json!({"background": true, "id": 3, "seconds": 2.5,
+                "options": ["a", "b"], "command": "42", "other": "1"})
+        );
+        // What does not read as the type is left for the tool to refuse.
+        let mut wrong = json!({"background": "yes", "id": "2.5", "options": "a"});
+        assert!(coerce(&schema, &mut wrong).is_empty());
+        assert_eq!(wrong["id"], "2.5");
+        // And through a real tool: a string of seconds is waited, not 10s.
+        let out = run("wait", r#"{"seconds": "0"}"#, &ToolContext::default()).unwrap();
+        assert!(out.starts_with("Waited 0s."), "{out}");
+    }
+
+    #[test]
+    fn a_present_key_is_never_overwritten_by_an_alias() {
+        let mut args = json!({"path": "a.txt", "file_path": "b.txt", "old_string": "x"});
+        let changed = rename_aliases("edit_file", &mut args);
+        assert_eq!(changed, ["`old_string` as `old`"]);
+        assert_eq!(
+            args,
+            json!({"path": "a.txt", "file_path": "b.txt", "old": "x"})
+        );
+        let (dir, ctx) = workspace_with("present", "kept");
+        let both = r#"{"path":"a.txt","file_path":"missing.txt"}"#;
+        assert_eq!(run("read_file", both, &ctx).unwrap(), "1|kept");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_result_says_what_was_reinterpreted() {
+        let (dir, ctx) = workspace_with("note", "hello");
+        assert_eq!(
+            run("read_file", r#"{"file_path":"a.txt"}"#, &ctx).unwrap(),
+            "1|hello\n\n[Read `file_path` as `path`. Use the tool's own parameter names and types.]"
+        );
+        let out = run("wait", r#"{"seconds": "0"}"#, &ctx).unwrap();
+        assert!(
+            out.ends_with(
+                "[Read `seconds` as a number. Use the tool's own parameter names and types.]"
+            ),
+            "{out}"
+        );
+        // A failure carries the note too, since the model reads that as well.
+        let missing = r#"{"file_path":"a.txt","old_string":"zzz","new_string":""}"#;
+        let err = run("edit_file", missing, &ctx).unwrap_err();
+        assert!(
+            err.contains("`file_path` as `path`, `old_string` as `old`, `new_string` as `new`"),
+            "{err}"
+        );
+        // A call in the tool's own terms gets no note.
+        assert_eq!(
+            run("read_file", r#"{"path":"a.txt"}"#, &ctx).unwrap(),
+            "1|hello"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn every_alias_leads_from_a_name_its_tool_lacks_to_one_it_has() {
+        for (theirs, ours, names) in ALIASES {
+            for name in *names {
+                let tool = find(name).unwrap_or_else(|| panic!("{name} missing"));
+                let properties = &tool.parameters()["properties"];
+                assert!(properties.get(*ours).is_some(), "{name} has no `{ours}`");
+                assert!(properties.get(*theirs).is_none(), "{name} has `{theirs}`");
+            }
+        }
+    }
+
+    #[test]
+    fn a_frontend_reads_the_arguments_the_tool_runs_with() {
+        let todo = r#"{"items": "[{\"text\": \"a\", \"status\": \"doing\"}]"}"#;
+        let args = parse_args_for(TODO, todo).unwrap();
+        assert_eq!(args["items"][0]["status"], "doing");
+        let ask = r#"{"question": "Which?", "options": "[\"a\", \"b\"]"}"#;
+        assert_eq!(
+            parse_args_for(ASK_USER, ask).unwrap()["options"],
+            json!(["a", "b"])
+        );
+        // A tool it does not know is parsed as sent.
+        let unknown = parse_args_for("nope", r#"{"id": "3"}"#).unwrap();
+        assert_eq!(unknown, json!({"id": "3"}));
+    }
+
+    #[test]
+    fn a_stopped_wait_returns_at_once() {
+        let ctx = ToolContext::default();
+        let stop = ctx.cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            stop.set();
+        });
+        let started = Instant::now();
+        let out = Wait.run(&json!({"seconds": 60}), &ctx).unwrap_err();
+        assert!(out.contains("Stopped"), "{out}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "waited {:?}",
+            started.elapsed()
+        );
+
+        // Waiting on a job hears it too, and says the job is still running.
+        let sleeper = if cfg!(windows) {
+            "Start-Sleep 30"
+        } else {
+            "sleep 30"
+        };
+        let id = crate::jobs::start(sleeper, &std::env::temp_dir()).unwrap();
+        let out = Wait.run(&json!({"job": id, "seconds": 60, "until": "ready"}), &ctx);
+        crate::jobs::stop(id).unwrap();
+        let out = out.unwrap_err();
+        assert!(out.contains("still running"), "{out}");
+    }
+
+    #[test]
+    fn a_stopped_command_is_killed_and_says_so() {
+        let dir = std::env::temp_dir().join(format!("letronna-stop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Only the first mark may appear: the second would mean it ran on.
+        let command = if cfg!(windows) {
+            "Set-Content started x; Start-Sleep 1; Set-Content finished x"
+        } else {
+            "echo x > started; sleep 1; echo x > finished"
+        };
+        let cancel = Cancel::default();
+        let stop = cancel.clone();
+        let mark = dir.join("started");
+        std::thread::spawn(move || {
+            // A cold PowerShell start can take seconds, and a stop before the
+            // command runs would prove nothing.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !mark.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            stop.set();
+        });
+        let out = run_shell(command, Some(&dir), &cancel).unwrap_err();
+        assert!(out.contains("Stopped"), "{out}");
+        assert!(dir.join("started").exists(), "stopped before it ran");
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(!dir.join("finished").exists(), "it ran on after the stop");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn plan_mode_refuses_a_tool_that_changes_things_even_when_named() {
+        let dir = std::env::temp_dir().join(format!("letronna-plan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "hello").unwrap();
+        let ctx = ToolContext::of(&Connection {
+            workspace: Some(dir.clone()),
+            plan: true,
+            ..Default::default()
+        });
+        for (name, args) in [
+            ("write_file", r#"{"path":"b.txt","content":"x"}"#),
+            ("edit_file", r#"{"path":"a.txt","old":"hello","new":"bye"}"#),
+            ("run_command", r#"{"command":"echo hi > c.txt"}"#),
+        ] {
+            let refused = run(name, args, &ctx).unwrap_err();
+            assert!(refused.contains("plan mode"), "{name}: {refused}");
+        }
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "hello");
+        assert!(!dir.join("b.txt").exists() && !dir.join("c.txt").exists());
+        // Looking is still allowed.
+        assert_eq!(
+            run("read_file", r#"{"path":"a.txt"}"#, &ctx).unwrap(),
+            "1|hello"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn search_leaves_out_secret_files_and_says_how_many() {
+        let dir = std::env::temp_dir().join(format!("letronna-unsearched-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("app/.ssh")).unwrap();
+        std::fs::write(dir.join("app/.ssh/id_rsa"), "TOKEN=1").unwrap();
+        std::fs::write(dir.join("app/.env.local"), "TOKEN=2").unwrap();
+        std::fs::write(dir.join(".env"), "TOKEN=3").unwrap();
+        std::fs::write(dir.join(".git-credentials"), "https://me:TOKEN@host").unwrap();
+        std::fs::write(dir.join(".env.example"), "TOKEN=").unwrap();
+        // The folder counts once; nothing inside it is looked at.
+        assert_eq!(
+            search(&dir, "token", SEARCH_TIME, SEARCH_FILES),
+            ".env.example:1: TOKEN=\n… Secret files and folders left out: 4. Ask the user \
+             to paste what you need from them."
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn secret_files_are_refused_but_env_examples_are_not() {
+        let dir = std::env::temp_dir().join(format!("letronna-secrets-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for folder in [".ssh", ".aws", ".claude", ".codex"] {
+            std::fs::create_dir_all(dir.join(folder)).unwrap();
+        }
+        let secrets = [
+            ".ssh",
+            ".ssh/id_ed25519",
+            ".aws/credentials",
+            ".netrc",
+            ".git-credentials",
+            ".claude/.credentials.json",
+            ".codex/auth.json",
+            ".env",
+            ".env.local",
+            ".ENV.production",
+        ];
+        let open = [".env.example", ".env.sample", ".claude/settings.json"];
+        for name in secrets.iter().skip(1).chain(&open) {
+            std::fs::write(dir.join(name), "KEY=value").unwrap();
+        }
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        for name in secrets {
+            let refused = resolve(name, &ctx).unwrap_err();
+            assert!(refused.contains("out of reach"), "{name}: {refused}");
+        }
+        for name in open {
+            let text = ReadFile.run(&json!({"path": name}), &ctx).unwrap();
+            assert_eq!(text, "1|KEY=value", "{name}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_write_that_climbs_with_dots_is_refused_on_every_system() {
+        let dir = std::env::temp_dir().join(format!("letronna-climb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(project.clone()),
+            ..Default::default()
+        };
+        for path in [
+            "nonexistent/../../x.txt",
+            "nonexistent/../x.txt",
+            "../x.txt",
+        ] {
+            let args = json!({"path": path, "content": "escaped"});
+            let refused = WriteFile.run(&args, &ctx).unwrap_err();
+            assert!(refused.contains("`..`"), "{path}: {refused}");
+        }
+        assert!(!dir.join("x.txt").exists());
+        assert!(!project.join("x.txt").exists());
+        assert!(!project.join("nonexistent").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_write_that_lands_outside_the_project_is_refused_and_creates_nothing() {
+        let dir = std::env::temp_dir().join(format!("letronna-outside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(project.clone()),
+            ..Default::default()
+        };
+        let refuses = |path: &str| {
+            let args = json!({"path": path, "content": "escaped"});
+            let refused = WriteFile.run(&args, &ctx).unwrap_err();
+            assert!(
+                refused.contains("outside the project folder"),
+                "{path}: {refused}"
+            );
+        };
+        refuses(&dir.join("x.txt").display().to_string());
+        // A link inside the project is judged by the folder it leads to.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&dir, project.join("up")).unwrap();
+            refuses("up/x.txt");
+        }
+        assert!(!dir.join("x.txt").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn writes_stay_out_of_letronnas_folder_and_off_its_program() {
+        let dir = std::env::temp_dir().join(format!("letronna-guarded-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let data = dir.join("Letronna");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(data.join("settings.json"), "{}").unwrap();
+        let me = dir.join("bin/letronna.exe");
+        std::fs::write(&me, "program").unwrap();
+        // The home folder attached as the project holds both.
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let write = |path: &str| resolve_write_in(path, &ctx, &data, Some(&me));
+        for path in [
+            "Letronna/settings.json",
+            "Letronna/mcp.json",
+            "Letronna/new/SOUL.md",
+        ] {
+            let refused = write(path).unwrap_err();
+            assert!(refused.contains("own folder"), "{path}: {refused}");
+        }
+        for path in [
+            "bin/letronna.exe",
+            "bin/letronna.new.exe",
+            "bin/letronna.old.exe",
+            "bin/Letronna.NEW.exe",
+        ] {
+            let refused = write(path).unwrap_err();
+            assert!(refused.contains("own program"), "{path}: {refused}");
+        }
+        for path in [
+            "Letronna.md",
+            "bin/other.exe",
+            "bin/letronna.exe.txt",
+            "notes/a.md",
+        ] {
+            assert_eq!(write(path).unwrap(), dir.join(path), "{path}");
+        }
+
+        // And the real thing refuses the program these tests run as.
+        let running = std::env::current_exe().unwrap();
+        let ctx = ToolContext {
+            workspace: running.parent().map(Path::to_path_buf),
+            ..Default::default()
+        };
+        let name = running.file_name().unwrap().to_string_lossy();
+        let refused = resolve_write(&name, &ctx).unwrap_err();
+        assert!(refused.contains("own program"), "{refused}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_write_through_a_link_that_leads_nowhere_is_refused_and_creates_nothing() {
+        let dir = std::env::temp_dir().join(format!("letronna-dangling-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let data = dir.join("Letronna");
+        std::fs::create_dir_all(&data).unwrap();
+        // A cloned repo can carry this link; writing through it would create
+        // the file it names, in Letronna's folder or anywhere else.
+        std::os::unix::fs::symlink(data.join("mcp.json"), dir.join("notes.md")).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let refused = resolve_write_in("notes.md", &ctx, &data, None).unwrap_err();
+        assert!(refused.contains("leads nowhere"), "{refused}");
+        let args = json!({"path": "notes.md", "content": "{}"});
+        let refused = WriteFile.run(&args, &ctx).unwrap_err();
+        assert!(refused.contains("leads nowhere"), "{refused}");
+        assert!(!data.join("mcp.json").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_plan_is_offered_only_in_plan_mode_and_refused_when_nobody_can_answer() {
+        let offered = |plan: bool, remote: Option<Remote>| {
+            specs(&Connection {
+                tools: true,
+                plan,
+                remote,
+                ..Default::default()
+            })
+            .iter()
+            .any(|t| t["function"]["name"] == EXIT_PLAN)
+        };
+        assert!(offered(true, None));
+        assert!(!offered(false, None));
+        // A chat app's DMs stay in plan mode by default, and nobody there can
+        // approve a plan.
+        assert!(!offered(true, Some(Remote::default())));
+        assert!(needs_approval(EXIT_PLAN));
+
+        // Reaching `run` means nobody was asked: it refuses, and says what to do.
+        let args = r#"{"plan":"Rename the thing"}"#;
+        let unattended = ToolContext {
+            plan: true,
+            ..Default::default()
+        };
+        let refused = run(EXIT_PLAN, args, &unattended).unwrap_err();
+        assert!(refused.contains("Nobody is here"), "{refused}");
+        assert!(refused.contains("Give the plan"), "{refused}");
+        let chat_app = ToolContext {
+            remote: Some(Remote::default()),
+            ..unattended.clone()
+        };
+        let refused = run(EXIT_PLAN, args, &chat_app).unwrap_err();
+        assert!(refused.contains("chat app"), "{refused}");
+        assert!(refused.contains("Let messages use tools"), "{refused}");
+
+        // The card and the row show the plan, not its JSON.
+        let plan = json!({"plan": "## Rename the thing\n\n1. Edit a.rs"}).to_string();
+        assert_eq!(
+            preview(EXIT_PLAN, &plan, &unattended),
+            "## Rename the thing\n\n1. Edit a.rs"
+        );
+        assert_eq!(summary(EXIT_PLAN, &plan), "Rename the thing");
+    }
+
+    #[test]
+    fn a_plan_that_is_cut_off_or_missing_goes_back_to_the_model() {
+        let plan = json!({"plan": "## Rename the thing\n\n1. Edit a.rs"}).to_string();
+        assert_eq!(
+            plan_of(&plan).unwrap(),
+            "## Rename the thing\n\n1. Edit a.rs"
+        );
+        // A long plan can run into the output limit mid-string.
+        let cut = plan_of(r#"{"plan":"Rename the thing\n\n1. Ed"#).unwrap_err();
+        assert!(cut.contains("cut off"), "{cut}");
+        for empty in ["{}", "", r#"{"plan":"  \n"}"#, r#"{"plan":3}"#] {
+            let missing = plan_of(empty).unwrap_err();
+            assert!(missing.contains("No plan came"), "{empty}: {missing}");
+        }
     }
 }

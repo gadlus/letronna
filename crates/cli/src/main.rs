@@ -9,6 +9,7 @@ mod banner;
 mod bar;
 mod commands;
 mod diff;
+mod doctor;
 mod edit;
 mod input;
 mod install;
@@ -59,6 +60,10 @@ fn main() {
         update_now();
         return;
     }
+    if args.doctor {
+        std::process::exit(doctor::run(args.offline));
+    }
+    letronna_core::diag::init("cli");
     // MCP servers can take seconds to start; started now, their tools are
     // there by the first question.
     letronna_core::mcp::start();
@@ -116,13 +121,17 @@ fn main() {
         let asked = runner.ask(session, &prompt);
         // A browser with no window would outlive this run unseen.
         letronna_core::browser::close_hidden();
+        // So would a job left running in the background, a dev server say.
+        letronna_core::jobs::stop_all();
         match asked {
             Ok(_) => runner.persist(),
             Err(error) => {
                 render::line(&render::red(&error));
+                letronna_core::diag::stop();
                 std::process::exit(1);
             }
         }
+        letronna_core::diag::stop();
         return;
     }
 
@@ -189,9 +198,13 @@ fn main() {
         }
     }
     runner.bar.uninstall();
+    // A job's process is not ended with ours, so a dev server left running
+    // would carry on with nobody left to stop it.
+    letronna_core::jobs::stop_all();
     letronna_core::browser::close_hidden();
     render::title("");
     render::blank();
+    letronna_core::diag::stop();
 }
 
 /// Hand the terminal back if we panic. Without this a crash leaves the

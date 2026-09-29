@@ -40,7 +40,8 @@ pub fn soul() -> Option<String> {
 }
 
 /// What follows the built-in lines of the prompt: memory, the project's own
-/// instructions, and how to use them. Nothing where others read the replies.
+/// instructions, the helper types files define, and how to use them. Nothing
+/// where others read the replies.
 pub fn context(connection: &Connection) -> String {
     context_in(&crate::chat::data_dir(), connection)
 }
@@ -76,13 +77,44 @@ fn context_in(dir: &Path, connection: &Connection) -> String {
             "\n\nThe project's instructions, from {name}:\n{text}"
         ));
     }
+    if connection.tools
+        && let Some(types) = crate::agent_defs::advert_in(dir, connection.workspace.as_deref())
+    {
+        out.push_str(&format!("\n\n{types}"));
+    }
     out
 }
 
 /// A file people write, trimmed and kept under `FILE_LIMIT`. None when it is
-/// missing or empty.
+/// missing or empty, or not a plain file: an AGENTS.md in a cloned repository
+/// that links to /dev/zero would otherwise be read until memory ran out, and
+/// on every request.
 fn read_capped(path: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
+    use std::io::Read;
+    if !std::fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
+    // Enough for `FILE_LIMIT` characters of any width and one more, so a cut
+    // is still seen as one.
+    let most = (FILE_LIMIT as u64 + 1) * 4;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(most)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        // Stopping short can split the last character; anything else is not
+        // text.
+        Err(e) if e.utf8_error().error_len().is_none() => {
+            let valid = e.utf8_error().valid_up_to();
+            let mut bytes = e.into_bytes();
+            bytes.truncate(valid);
+            String::from_utf8(bytes).ok()?
+        }
+        Err(_) => return None,
+    };
     let text = text.trim();
     if text.is_empty() {
         return None;
@@ -131,12 +163,25 @@ impl Target {
     }
 }
 
-/// The entries in a store, oldest first. A file edited on Windows has CRLF
-/// line ends, which would hide the separator.
+/// The entries in a store, oldest first, or none when it cannot be read.
 fn entries(path: &Path) -> Vec<String> {
-    std::fs::read_to_string(path)
-        .unwrap_or_default()
-        .replace("\r\n", "\n")
+    split(&read_store(path).unwrap_or_default())
+}
+
+/// A store's text with any BOM taken off, and empty when there is no file.
+fn read_store(path: &Path) -> std::io::Result<String> {
+    match std::fs::read_to_string(path) {
+        // A BOM is not whitespace to trim, so it would stick to the first entry.
+        Ok(text) => Ok(text.strip_prefix('\u{feff}').unwrap_or(&text).to_owned()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(e),
+    }
+}
+
+/// A store's text as its entries, oldest first. A file edited on Windows has
+/// CRLF line ends, which would hide the separator.
+fn split(text: &str) -> Vec<String> {
+    text.replace("\r\n", "\n")
         .split(SEPARATOR)
         .map(str::trim)
         .filter(|entry| !entry.is_empty())
@@ -147,6 +192,13 @@ fn entries(path: &Path) -> Vec<String> {
 /// How much of the budget the entries use, separators included.
 fn size(entries: &[String]) -> usize {
     entries.join(SEPARATOR).chars().count()
+}
+
+/// Whether a person wrote the store: it does not read back the way Letronna
+/// writes it, or it holds more than the budget Letronna keeps to.
+fn hand_written(text: &str, entries: &[String], limit: usize) -> bool {
+    let text = text.replace("\r\n", "\n");
+    size(entries) > limit || text.strip_suffix('\n').unwrap_or(&text) != entries.join(SEPARATOR)
 }
 
 /// What a store holds, as the tool reports it.
@@ -193,7 +245,23 @@ fn apply(
     old_text: &str,
 ) -> Result<String, String> {
     let path = dir.join(target.file());
-    let before = entries(&path);
+    // The window and the terminal both save here, so the store is read again
+    // under the lock and neither writes over what the other just kept.
+    let _lock = crate::store::Lock::take(&path).map_err(|e| {
+        format!(
+            "{} is being written by another Letronna, so nothing was changed: {e}",
+            target.file()
+        )
+    })?;
+    // Taken as empty, a file that is there but cannot be read would be
+    // replaced by the one new entry.
+    let raw = read_store(&path).map_err(|e| {
+        format!(
+            "{} could not be read, so nothing was changed: {e}",
+            target.file()
+        )
+    })?;
+    let before = split(&raw);
     let mut after = before.clone();
     let content = content.trim();
     match action {
@@ -225,13 +293,38 @@ fn apply(
     } else {
         format!("{}\n", after.join(SEPARATOR))
     };
-    // Written beside and moved over, so a crash cannot leave half a file.
-    let temp = path.with_extension("tmp");
+    // Notes a person wrote without separators are one entry of several lines,
+    // and read back unchanged, so the layout cannot tell them from Letronna's.
+    // A replace or remove drops that entry whole, so the file is copied first.
+    let drops_lines = before
+        .iter()
+        .any(|entry| entry.contains('\n') && !after.contains(entry));
+    let backed_up = if drops_lines || hand_written(&raw, &before, target.limit()) {
+        let backup = format!("{}.bak.{}", target.file(), crate::chat::now());
+        std::fs::copy(&path, dir.join(&backup)).map_err(|e| {
+            format!(
+                "Could not back up {}, so nothing was changed: {e}",
+                target.file()
+            )
+        })?;
+        format!(
+            "{} may have held notes written by hand, so that version was copied to {backup} first.\n\n",
+            target.file()
+        )
+    } else {
+        String::new()
+    };
+    // Written beside and moved over, so a crash cannot leave half a file. The
+    // name is per process because a lock that waited too long is taken anyway.
+    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
     std::fs::create_dir_all(dir)
         .and_then(|_| std::fs::write(&temp, text))
         .and_then(|_| std::fs::rename(&temp, &path))
-        .map_err(|e| format!("Could not save {}: {e}", target.file()))?;
-    Ok(listing(target, &after))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&temp);
+            format!("Could not save {}: {e}", target.file())
+        })?;
+    Ok(format!("{backed_up}{}", listing(target, &after)))
 }
 
 /// The model's hand on USER.md and MEMORY.md.
@@ -342,6 +435,13 @@ mod tests {
             "Works late.\r\n§\r\nLikes tables.\r\n",
         )
         .unwrap();
+        let agents = project.join(".letronna").join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("docs.md"),
+            "---\ndescription: Writes docs.\n---\n",
+        )
+        .unwrap();
         let connection = Connection {
             tools: true,
             workspace: Some(project),
@@ -357,6 +457,10 @@ mod tests {
         );
         assert!(!text.contains("USER.md,"), "an empty store is left out");
         assert!(text.contains("from AGENTS.md:\nRun cargo test before committing."));
+        assert!(
+            text.ends_with("agent tool's type: docs (Writes docs)."),
+            "{text}"
+        );
 
         let shared = Connection {
             remote: Some(Remote {
@@ -375,5 +479,142 @@ mod tests {
         let soul = read_capped(&dir.join("SOUL.md")).unwrap();
         assert!(soul.ends_with(&format!("[cut at {FILE_LIMIT} characters]")));
         assert!(read_capped(&dir.join("missing.md")).is_none());
+        // Read only as far as the cut, even in characters four bytes wide.
+        std::fs::write(dir.join("AGENTS.md"), "\u{1f600}".repeat(FILE_LIMIT * 3)).unwrap();
+        let wide = read_capped(&dir.join("AGENTS.md")).unwrap();
+        assert!(wide.ends_with(&format!("[cut at {FILE_LIMIT} characters]")));
+        assert!(wide.starts_with("\u{1f600}"));
+    }
+
+    #[test]
+    fn instructions_that_are_not_a_plain_file_are_passed_over() {
+        let dir = scratch("not-a-file");
+        std::fs::create_dir_all(dir.join("AGENTS.md")).unwrap();
+        assert!(read_capped(&dir.join("AGENTS.md")).is_none());
+        // What a cloned repository can hold on macOS and Linux, and which
+        // never ends when read.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/dev/zero", dir.join("CLAUDE.md")).unwrap();
+            assert!(read_capped(&dir.join("CLAUDE.md")).is_none());
+        }
+    }
+
+    fn backups(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|entry| entry.unwrap().file_name().into_string().ok())
+            .filter(|name| name.contains(".bak."))
+            .collect()
+    }
+
+    #[test]
+    fn a_store_that_cannot_be_read_is_not_overwritten() {
+        let dir = scratch("unreadable");
+        // What Windows PowerShell's `>` writes: UTF-16 with a BOM.
+        let utf16: Vec<u8> = [0xFF, 0xFE]
+            .into_iter()
+            .chain("Name is Hugo.".encode_utf16().flat_map(u16::to_le_bytes))
+            .collect();
+        std::fs::write(dir.join("USER.md"), &utf16).unwrap();
+        let refused = apply(&dir, Target::User, "add", "Prefers short answers.", "").unwrap_err();
+        assert!(
+            refused.contains("USER.md could not be read, so nothing was changed"),
+            "{refused}"
+        );
+        assert_eq!(std::fs::read(dir.join("USER.md")).unwrap(), utf16);
+    }
+
+    #[test]
+    fn a_bom_is_left_off_the_first_entry() {
+        let dir = scratch("bom");
+        let path = dir.join("MEMORY.md");
+        std::fs::write(&path, "\u{feff}Uses PowerShell.\r\n§\r\nUses Rust.\r\n").unwrap();
+        assert_eq!(entries(&path), ["Uses PowerShell.", "Uses Rust."]);
+        apply(
+            &dir,
+            Target::Memory,
+            "replace",
+            "Uses PowerShell 7.",
+            "PowerShell",
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "Uses PowerShell 7.\n§\nUses Rust.\n"
+        );
+        assert!(
+            backups(&dir).is_empty(),
+            "a file saved by a Windows editor is not taken for one written by hand"
+        );
+    }
+
+    #[test]
+    fn two_writers_keep_both_entries() {
+        let dir = scratch("writers");
+        let path = dir.join("USER.md");
+        // Holding the lock stands in for another process part way through a save.
+        let lock = crate::store::Lock::take(&path);
+        let writer = {
+            let dir = dir.clone();
+            std::thread::spawn(move || {
+                apply(&dir, Target::User, "add", "Prefers short answers.", "")
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::fs::write(&path, "Name is Hugo.\n").unwrap();
+        drop(lock);
+        writer.join().unwrap().unwrap();
+        assert_eq!(entries(&path), ["Name is Hugo.", "Prefers short answers."]);
+    }
+
+    #[test]
+    fn a_save_leaves_another_process_temp_file_alone() {
+        let dir = scratch("temp");
+        // An older build running beside this one still saves through USER.tmp.
+        std::fs::write(dir.join("USER.tmp"), "half of another save").unwrap();
+        apply(&dir, Target::User, "add", "Name is Hugo.", "").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("USER.tmp")).unwrap(),
+            "half of another save"
+        );
+        assert_eq!(entries(&dir.join("USER.md")), ["Name is Hugo."]);
+    }
+
+    #[test]
+    fn a_hand_written_file_is_backed_up_before_it_is_replaced() {
+        let dir = scratch("backup");
+        // Notes as an editor saves them read back unchanged, as one entry.
+        let notes = "Name: Hugo\nLives in Malaysia\nPrefers short answers\n";
+        std::fs::write(dir.join("USER.md"), notes).unwrap();
+        let out = apply(
+            &dir,
+            Target::User,
+            "replace",
+            "Lives in Singapore.",
+            "Malaysia",
+        )
+        .unwrap();
+        let saved = backups(&dir);
+        assert_eq!(saved.len(), 1);
+        assert!(out.contains(&saved[0]), "{out}");
+        assert_eq!(std::fs::read_to_string(dir.join(&saved[0])).unwrap(), notes);
+        assert_eq!(entries(&dir.join("USER.md")), ["Lives in Singapore."]);
+
+        // Letronna never saves more than the budget, even laid out its way.
+        let long = format!("{}\n", "x".repeat(MEMORY_LIMIT + 1));
+        std::fs::write(dir.join("MEMORY.md"), &long).unwrap();
+        apply(&dir, Target::Memory, "remove", "", "x").unwrap();
+        assert_eq!(backups(&dir).len(), 2);
+
+        // A file Letronna wrote itself is not copied again.
+        apply(&dir, Target::User, "add", "Name is Hugo.", "").unwrap();
+        assert_eq!(backups(&dir).len(), 2);
+
+        // A file laid out some other way is copied even before an add.
+        let other = scratch("layout");
+        std::fs::write(other.join("USER.md"), "Likes tea.\n\n\n").unwrap();
+        apply(&other, Target::User, "add", "Works late.", "").unwrap();
+        assert_eq!(backups(&other).len(), 1);
     }
 }

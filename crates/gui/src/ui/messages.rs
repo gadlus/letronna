@@ -107,7 +107,13 @@ impl Chat {
                         .xsmall()
                         .color(cx.theme().primary),
                 )
-                .child("Thinking…")
+                .child(
+                    self.turn
+                        .as_ref()
+                        .and_then(|turn| turn.live.retrying)
+                        .filter(|_| streaming)
+                        .map_or_else(|| "Thinking…".to_owned(), |retry| retry.to_string()),
+                )
                 .into_any_element()
         } else {
             TextView::markdown(md, message.content.clone(), window, cx)
@@ -144,28 +150,26 @@ impl Chat {
                     h_flex()
                         .items_center()
                         .gap_2()
-                        .text_xs()
-                        .font_family(HEADING_FONT)
-                        .child(
-                            div()
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(cx.theme().primary)
-                                .child(label),
-                        )
+                        .child(crate::ui::micro(&label, cx))
+                        // The site's star, a quarter turn a beat on its
+                        // expo-out: quick to move, long to settle, and whole
+                        // again after each turn. Signal, as the brand's blue
+                        // is too dark on night for a mark this small.
                         .when(streaming, |this| {
                             this.child(
-                                div()
-                                    .size(px(6.))
-                                    .rounded_full()
-                                    .bg(cx.theme().primary)
+                                svg()
+                                    .path("icons/brand-star.svg")
+                                    .size(px(10.))
+                                    .text_color(cx.theme().link)
                                     .with_animation(
-                                        "pulse",
-                                        Animation::new(std::time::Duration::from_millis(1000))
+                                        "star",
+                                        Animation::new(std::time::Duration::from_millis(1200))
                                             .repeat()
-                                            .with_easing(ease_in_out),
-                                        |dot, delta| {
-                                            let wave = 1.0 - (delta * 2.0 - 1.0).abs();
-                                            dot.opacity(0.25 + 0.75 * wave)
+                                            .with_easing(expo_out),
+                                        |star, turn| {
+                                            star.with_transformation(Transformation::rotate(
+                                                percentage(turn / 4.),
+                                            ))
                                         },
                                     ),
                             )
@@ -228,9 +232,61 @@ impl Chat {
             .children(under)
             .with_animation(
                 self.row_id("appear", index),
-                Animation::new(std::time::Duration::from_millis(260))
-                    .with_easing(gpui::ease_out_quint()),
+                Animation::new(std::time::Duration::from_millis(260)).with_easing(expo_out),
                 |el, delta| el.opacity(delta).mt(px(10. * (1. - delta))),
+            )
+            .into_any_element()
+    }
+
+    /// A message sent while the reply runs, waiting for the reply's next
+    /// step: your card, faded, with a way to take it back first.
+    pub(crate) fn queued_row(&self, n: usize, text: &str, cx: &mut Context<Self>) -> AnyElement {
+        v_flex()
+            .w_full()
+            .gap_1()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .text_xs()
+                    .font_family(BODY_FONT)
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Queued · goes in after this step")
+                    .child(
+                        h_flex()
+                            .gap_0p5()
+                            .child(
+                                Button::new(("queued-back", n))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(Icon::new(AppIcon::Pencil))
+                                    .tooltip("Back to the box")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.unqueue(n, true, window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new(("queued-drop", n))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(Icon::new(IconName::Close))
+                                    .tooltip("Don't send")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.unqueue(n, false, window, cx)
+                                    })),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .px_4()
+                    .py_3()
+                    .rounded(cx.theme().radius_lg)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .text_color(cx.theme().muted_foreground)
+                    .child(text.to_owned()),
             )
             .into_any_element()
     }
@@ -293,7 +349,6 @@ impl Chat {
                     .rounded(cx.theme().radius)
                     .cursor_pointer()
                     .text_xs()
-                    .font_family(HEADING_FONT)
                     .text_color(cx.theme().muted_foreground)
                     .hover(|s| s.bg(cx.theme().secondary.opacity(0.5)))
                     .child(
@@ -374,7 +429,6 @@ impl Chat {
                     .rounded(cx.theme().radius)
                     .cursor_pointer()
                     .text_xs()
-                    .font_family(HEADING_FONT)
                     .text_color(cx.theme().muted_foreground)
                     .hover(|s| s.bg(cx.theme().secondary.opacity(0.5)))
                     .child(
@@ -426,19 +480,11 @@ impl Chat {
             .items_center()
             .justify_center()
             .gap_2()
+            .child(crate::ui::wordmark(px(32.), cx))
             .child(
-                div()
-                    .font_family(WORDMARK_FONT)
-                    .italic()
-                    .text_size(px(72.))
-                    .line_height(px(80.))
-                    .child(BRAND),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(self.greeting),
+                crate::ui::display(self.greeting, px(56.), cx)
+                    .mt_6()
+                    .text_center(),
             )
             .when(no_project, |this| {
                 this.child(
@@ -454,11 +500,11 @@ impl Chat {
                 )
             })
             .child(
-                div()
-                    .mt_4()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground.opacity(0.7))
-                    .child("Enter to send  ·  Shift+Enter for a new line  ·  Esc to stop"),
+                crate::ui::micro(
+                    "Enter to send  ·  Shift+Enter for a new line  ·  Esc to stop",
+                    cx,
+                )
+                .mt_4(),
             )
     }
 
@@ -467,20 +513,7 @@ impl Chat {
             .flex_1()
             .px_8()
             .py_6()
-            .gap_2()
-            .child(
-                div()
-                    .text_xl()
-                    .font_family(HEADING_FONT)
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(page.title()),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(page.blurb()),
-            )
+            .child(crate::ui::page_header(page.title(), page.blurb(), cx))
     }
 
     /// Play a video a tool made, in the chat; where it cannot play here, in

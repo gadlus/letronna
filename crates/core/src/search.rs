@@ -21,7 +21,9 @@ use crate::tools::{Tool, ToolContext};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
-use std::time::Duration;
+use std::path::Path;
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime};
 
 /// How long a search service gets to answer.
 const SEARCH_TIME: Duration = Duration::from_secs(20);
@@ -130,7 +132,47 @@ fn choice_path() -> std::path::PathBuf {
 
 /// Whether a search service is set up, so the tool is offered.
 pub fn ready() -> bool {
-    usable(&choice(), &crate::store::load_keys()).is_ok()
+    // Asked on every tool lookup -- several for each call, and one each
+    // frame the window's approval card is up -- so the files are only read
+    // again once one has changed: the terminal and the window each save
+    // them, and each has to see the other's change.
+    static SEEN: Mutex<Option<([Stamp; 2], bool)>> = Mutex::new(None);
+    remembered(&SEEN, [&choice_path(), &crate::store::keys_path()], || {
+        usable(&choice(), &crate::store::load_keys()).is_ok()
+    })
+}
+
+/// When a file last changed and how long it was then, or `None` while it is
+/// missing.
+// The length catches a second save within the clock's tick.
+type Stamp = Option<(SystemTime, u64)>;
+
+fn stamp(path: &Path) -> Stamp {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+/// The answer kept in `seen` while both files are as they were when it was
+/// read, or a fresh one from `read` once either has changed.
+fn remembered(
+    seen: &Mutex<Option<([Stamp; 2], bool)>>,
+    files: [&Path; 2],
+    read: impl FnOnce() -> bool,
+) -> bool {
+    // Stamped before reading, so a save that lands during the read leaves
+    // a stamp that no longer matches, and the next call reads again.
+    let stamps = files.map(stamp);
+    let Ok(mut seen) = seen.lock() else {
+        return read();
+    };
+    if let Some((was, ready)) = *seen
+        && was == stamps
+    {
+        return ready;
+    }
+    let ready = read();
+    *seen = Some((stamps, ready));
+    ready
 }
 
 /// Where a service stands: a short status, whether it works, and whether it
@@ -568,6 +610,54 @@ mod tests {
             ("Saved, not in use", false, true)
         );
         assert!(usable(&Choice::default(), &keys).is_err(), "nothing chosen");
+    }
+
+    #[test]
+    fn ready_is_read_from_disk_only_when_a_file_changed() {
+        let dir = std::env::temp_dir().join(format!("letronna-ready-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (search, keys) = (dir.join("search.json"), dir.join("keys.json"));
+        // Each save at a second of its own: two within one tick of a coarse
+        // clock would carry the same time.
+        let save = |path: &Path, text: &str, second: u64| {
+            std::fs::write(path, text).unwrap();
+            let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000 + second);
+            let file = std::fs::File::options().write(true).open(path).unwrap();
+            file.set_modified(at).unwrap();
+        };
+        let seen = Mutex::new(None);
+        let reads = std::cell::Cell::new(0);
+        let ready = || {
+            remembered(&seen, [&search, &keys], || {
+                reads.set(reads.get() + 1);
+                std::fs::read_to_string(&keys).is_ok()
+            })
+        };
+
+        save(&search, r#"{"service": "Brave"}"#, 0);
+        assert!(!ready());
+        assert!(!ready());
+        assert_eq!(reads.get(), 1, "nothing changed in between");
+        // The other process saves the key.
+        save(&keys, r#"{"Brave": "key-1"}"#, 1);
+        assert!(ready());
+        assert!(ready());
+        assert_eq!(reads.get(), 2);
+        // Saved again at the same length, its time still tells.
+        save(&keys, r#"{"Brave": "key-2"}"#, 2);
+        assert!(ready());
+        assert_eq!(reads.get(), 3);
+        // Saved within the same second, its length tells.
+        save(&keys, r#"{"Brave": "a-longer-key"}"#, 2);
+        assert!(ready());
+        assert_eq!(reads.get(), 4);
+        // And a file taken away is a change too.
+        std::fs::remove_file(&search).unwrap();
+        assert!(ready());
+        assert!(ready());
+        assert_eq!(reads.get(), 5);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
