@@ -4149,9 +4149,20 @@ mod tests {
         );
 
         // An MCP server's tool goes by its full name, and only that one.
-        let refused = run_found(&Named("mcp__demo__echo"), "{}", &ctx).unwrap_err();
+        let refused = run_found(
+            &Named("mcp__demo__echo"),
+            "{}",
+            &ctx,
+            &Ok(Default::default()),
+        )
+        .unwrap_err();
         assert!(refused.contains("switched off"), "{refused}");
-        let other = run_found(&Named("mcp__demo__other"), "{}", &ctx);
+        let other = run_found(
+            &Named("mcp__demo__other"),
+            "{}",
+            &ctx,
+            &Ok(Default::default()),
+        );
         assert_eq!(other.as_deref(), Ok("ran"));
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
