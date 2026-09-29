@@ -11,7 +11,7 @@ use std::time::Instant;
 use crate::banner::{banner, folder_name, footer, replay};
 use crate::bar;
 use crate::render;
-use crate::session::Runner;
+use crate::session::{Runner, usage as reply_usage};
 
 pub enum Flow {
     Handled,
@@ -221,6 +221,10 @@ pub fn command(
                 }
             }
         }
+        "/btw" => {
+            aside(runner, *session, rest);
+            Flow::Handled
+        }
         "/where" => {
             render::blank();
             render::line(&format!(
@@ -293,6 +297,24 @@ fn usage(session: u64) {
     if let Some(legend) = report.legend() {
         render::blank();
         render::line(&render::dim(&legend));
+    }
+}
+
+/// A side question, answered dim under it from what the session holds so far
+/// and kept out of the session.
+fn aside(runner: &mut Runner, session: usize, question: &str) {
+    match runner.btw(session, question) {
+        Ok(answer) => {
+            let mut lines = answer.content.lines();
+            let first = lines.next().unwrap_or_default();
+            render::said(&render::dim("◇"), &render::dim(first));
+            for line in lines {
+                render::line(&render::dim(line));
+            }
+            // What it cost, as under a reply, since the session keeps no trace of it.
+            render::line(&render::dim(&reply_usage(&answer)));
+        }
+        Err(error) => render::line(&render::red(&error)),
     }
 }
 

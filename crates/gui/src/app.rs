@@ -30,7 +30,7 @@ const FOLLOW_SLACK: Pixels = px(48.);
 /// The chat column's widest, gutters included: about 90 characters of
 /// text, which reads as one measure. A wider window gets wider margins
 /// rather than longer lines.
-const COLUMN: Pixels = px(816.);
+pub(crate) const COLUMN: Pixels = px(816.);
 
 pub(crate) enum Verdict {
     Allow {
@@ -42,6 +42,19 @@ pub(crate) enum Verdict {
     Deny(String),
     /// The reply to an `ask_user` question.
     Answer(String),
+}
+
+/// A side question asked with /btw, answered on a fork of its session and
+/// shown under the conversation rather than in it.
+pub(crate) struct Aside {
+    /// The session it was asked about, the only one it shows under.
+    pub(crate) session: u64,
+    pub(crate) question: String,
+    /// None while the fork works on it; the reply carries what it cost.
+    pub(crate) answer: Option<Result<Message, String>>,
+    pub(crate) cancel: letronna_core::cancel::Cancel,
+    /// When it was asked, which tells its answer from an earlier one's.
+    asked: std::time::Instant,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -257,6 +270,8 @@ pub(crate) struct Chat {
     pub(crate) skills_note: Option<Result<String, String>>,
     /// The skills the last add left out, each with why.
     pub(crate) skills_refused: Vec<String>,
+    /// The side question on show, if one is.
+    pub(crate) aside: Option<Aside>,
     /// Sessions a notice woke, marked in the sidebar until they are next on
     /// screen.
     pub(crate) unseen: std::collections::HashSet<u64>,
@@ -613,6 +628,7 @@ impl Chat {
             adding_skills: false,
             skills_note: None,
             skills_refused: Vec::new(),
+            aside: None,
             unseen: std::collections::HashSet::new(),
             stopping: false,
             helpers: Vec::new(),
@@ -768,6 +784,13 @@ impl Chat {
 
     pub(crate) fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let prompt = self.composer.read(cx).value().trim().to_owned();
+        // Asked beside the session, so it waits for no reply to end.
+        if let Some(question) = side_question(&prompt) {
+            let question = question.to_owned();
+            self.composer
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            return self.ask_aside(question, cx);
+        }
         if self.busy && !prompt.is_empty() {
             return self.queue_follow_up(prompt, window, cx);
         }
@@ -810,6 +833,53 @@ impl Chat {
             }
             None => Some(text),
         }
+    }
+
+    /// Asks `question` about the active session on a fork of it, whose answer
+    /// shows under the conversation and never goes into it.
+    fn ask_aside(&mut self, question: String, cx: &mut Context<Self>) {
+        let ix = self.store.active;
+        let mut connection = match self.connection_for(ix, None) {
+            Ok(connection) => connection,
+            Err(error) => {
+                self.error = Some(error);
+                cx.notify();
+                return;
+            }
+        };
+        connection.workspace = self.store.conversations[ix].workspace.clone();
+        let messages = self.store.conversations[ix].messages.clone();
+        if let Some(earlier) = self.aside.take() {
+            earlier.cancel.set();
+        }
+        let cancel = letronna_core::cancel::Cancel::default();
+        let asked = std::time::Instant::now();
+        self.aside = Some(Aside {
+            session: connection.conversation,
+            question: question.clone(),
+            answer: None,
+            cancel: cancel.clone(),
+            asked,
+        });
+        let (sender, receiver) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let answer = letronna_core::agents::btw(&connection, messages, &question, cancel);
+            let _ = sender.send_blocking(answer);
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(answer) = receiver.recv().await {
+                let _ = this.update(cx, |this, cx| {
+                    // One closed or asked again since has no place for it.
+                    if let Some(aside) = this.aside.as_mut().filter(|a| a.asked == asked) {
+                        aside.answer = Some(answer);
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
+        self.follow();
+        cx.notify();
     }
 
     /// Send a prompt in the active session. Split out of `send` so a schedule
@@ -2000,6 +2070,9 @@ impl Chat {
             self.model_open = false;
             self.focus_composer(window, cx);
             cx.notify();
+        } else if let Some(aside) = self.aside_to_close() {
+            aside.cancel.set();
+            cx.notify();
         } else if self.page == Page::Activity && self.steering.is_some() {
             // Escape in the steer box backs out of it; the reply carries on.
             self.close_steer(window, cx);
@@ -2010,6 +2083,14 @@ impl Chat {
             // Not a reply in another session, which nothing here shows.
             self.stop_turn(cx);
         }
+    }
+
+    /// Takes the aside escape closes rather than stopping a reply, if any.
+    fn aside_to_close(&mut self) -> Option<Aside> {
+        let here = self.store.conversations[self.store.active].id;
+        let replying = self.streaming_id.filter(|_| self.busy);
+        self.aside
+            .take_if(|aside| escape_closes_aside(aside.session, here, replying))
     }
 
     fn finish(&mut self, cx: &mut Context<Self>) {
@@ -2312,7 +2393,7 @@ impl Render for Chat {
             // A helper's card needs the chat body even with nothing said.
             && !self.agent_asks.iter().any(|ask| ask.root == conversation.id)
         {
-            self.empty_state(cx).into_any_element()
+            self.empty_state(window, cx).into_any_element()
         } else {
             // One turn per prompt, like Claude Code: the user's message, then
             // everything the model did in reply under a single label. Each
@@ -2468,6 +2549,7 @@ impl Render for Chat {
                 .collect();
             // Last, where the eye is: a helper does not wait on a turn.
             rows.extend(self.helper_card(conversation.id, window, cx));
+            rows.extend(self.aside_row(conversation.id, window, cx));
             // The scrollbar must sit outside the scrolling element, or it
             // scrolls away with the content. The scrolling box spans the
             // pane, so the bar is at its edge and the wheel works over the
@@ -2663,13 +2745,30 @@ pub(crate) fn running_calls(turn: &agent::Turn, outstanding: usize) -> Vec<backe
         .collect()
 }
 
+/// Whether escape closes an aside asked in session `asked` rather than
+/// stopping a reply: only with that session on screen as `here`, and only
+/// once `replying`, the session a reply runs in, is not that one.
+fn escape_closes_aside(asked: u64, here: u64, replying: Option<u64>) -> bool {
+    asked == here && replying != Some(here)
+}
+
+/// The question a /btw line asks, empty when it names none, or None for any
+/// other line.
+fn side_question(prompt: &str) -> Option<&str> {
+    let rest = prompt.strip_prefix("/btw")?;
+    (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim())
+}
+
 #[cfg(test)]
 mod tests {
     use super::woken;
     use letronna_core::gate::Mode;
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
-    use super::{cuts_in, front_call, run_ended, running_calls, until_repeated_id};
+    use super::{
+        cuts_in, escape_closes_aside, front_call, run_ended, running_calls, side_question,
+        until_repeated_id,
+    };
     use letronna_core::agent::{MAX_BATCH, Next, Turn};
     use letronna_core::chat::{Connection, ToolCall};
     use letronna_core::gate::{Gate, Grants, decide};
@@ -2860,5 +2959,26 @@ mod tests {
         assert!(run_ended(root, run));
         // A run with nothing listed, as one a turn waits on, never looks ended.
         assert!(!run_ended(root, run + 1));
+    }
+
+    #[test]
+    fn escape_stops_the_reply_on_screen_before_it_closes_that_sessions_aside() {
+        assert!(escape_closes_aside(1, 1, None));
+        assert!(!escape_closes_aside(1, 1, Some(1)));
+        // A reply running elsewhere is not the one on screen.
+        assert!(escape_closes_aside(1, 1, Some(2)));
+        // An aside of another session is hidden, so escape is not for it.
+        assert!(!escape_closes_aside(1, 2, None));
+    }
+
+    #[test]
+    fn only_a_btw_line_asks_a_side_question() {
+        assert_eq!(
+            side_question("/btw what did we decide?"),
+            Some("what did we decide?")
+        );
+        assert_eq!(side_question("/btw"), Some(""));
+        assert_eq!(side_question("/btwx"), None);
+        assert_eq!(side_question("tell me /btw"), None);
     }
 }

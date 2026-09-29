@@ -5,6 +5,7 @@
 //! frame, and asking the user by reading a line rather than drawing a card.
 
 use letronna_core::agent::{Next, Turn};
+use letronna_core::agents;
 use letronna_core::approvals::{self, Decision, Request};
 use letronna_core::cancel::Cancel;
 use letronna_core::chat::{self, Connection, Event, Message, ToolCall};
@@ -117,6 +118,39 @@ impl Runner {
         chat::validate(&connection)?;
         self.take_notices(session, true);
         self.run(connection, session)
+    }
+
+    /// Ask a side question about the session on a fork of it, with no tools
+    /// and one request, waiting where escape can stop it. Nothing of it is kept.
+    pub fn btw(&mut self, session: usize, question: &str) -> Result<Message, String> {
+        let connection = self.connection(session);
+        chat::validate(&connection)?;
+        let messages = self.store.conversations[session].messages.clone();
+        let cancel = Cancel::default();
+        let (stop, question) = (cancel.clone(), question.to_owned());
+        let (sender, receiver) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let _ = sender.send_blocking(agents::btw(&connection, messages, &question, stop));
+        });
+        self.bar.working(true);
+        self.bar.wait_line_about("btw");
+        let answer = loop {
+            self.bar.pump();
+            if self.bar.interrupted() {
+                cancel.set();
+                break Err("Stopped.".to_owned());
+            }
+            match receiver.try_recv() {
+                Ok(answer) => break answer,
+                Err(async_channel::TryRecvError::Empty) => continue,
+                Err(async_channel::TryRecvError::Closed) => {
+                    break Err("The side question stopped without an answer.".to_owned());
+                }
+            }
+        };
+        self.bar.wait_line(false);
+        self.bar.working(false);
+        answer
     }
 
     /// Run the agent to completion on the conversation as it stands.
@@ -1146,7 +1180,7 @@ fn declined(request: &Request, why: &str) {
     render::tool(&call.name, &summary, &why, true);
 }
 
-fn usage(reply: &Message) -> String {
+pub(crate) fn usage(reply: &Message) -> String {
     let mut parts = vec![format!("{} out", reply.tokens)];
     if reply.per_second > 0. {
         parts.push(format!("{:.1} tok/s", reply.per_second));

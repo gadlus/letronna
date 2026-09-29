@@ -9,7 +9,7 @@
 use crate::budget::Budget;
 use crate::cancel::Cancel;
 use crate::chat::{Connection, Remote};
-use crate::driver::AgentId;
+use crate::driver::{AgentId, Allow};
 use crate::grep::{SEARCH_FILES, SEARCH_TIME};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read};
@@ -60,6 +60,10 @@ pub(crate) struct Caller {
     /// The tools the calling helper may use, or None when it may use all;
     /// `find_tools` finds it no others.
     pub allowed: Option<Arc<[String]>>,
+    /// Whether the calling agent is a fork, which may start no agent of its own.
+    pub fork: bool,
+    /// What the calling agent may call, which a fork of it is held to.
+    pub allow: Allow,
 }
 
 impl ToolContext {

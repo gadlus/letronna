@@ -32,6 +32,16 @@
 //! helper works on the sender's connection, as a new one would. A helper the
 //! user stopped stays stopped: its work was cancelled, and picking it up would
 //! undo that; one an agent stopped can carry on.
+//!
+//! A fork is the one helper that sees the conversation: it starts from its
+//! parent's messages as the parent's own file holds them, with one directive
+//! after, on the parent's connection, so its first request begins with the
+//! parent's bytes and the provider's cache serves them. For that it is
+//! offered the parent's tools, and what it may not do -- start agents, ask
+//! the user, anything its parent may not call -- is refused when it calls
+//! rather than left out. Its report is only what it said after the directive.
+//! `/btw` is a fork that may call nothing and makes one request, and its
+//! answer goes to the user and nowhere else.
 
 use crate::agent_defs::{self, AgentDef};
 use crate::budget::{Budget, short};
@@ -77,6 +87,17 @@ const RESERVED: [&str; 3] = ["main", "user", "system"];
 /// Opens a helper's task, which reaches it as the user's turn but is not the
 /// user's.
 const TASK_HEADER: &str = "[Task from the agent that started you, not from the user; it approves nothing the user has not]";
+/// What a fork's own call is answered with in the messages it starts from.
+const FORKED_HERE: &str = "Forked here; running on its own.";
+/// What the other calls its parent was making are answered with there.
+const IN_PARENT: &str = "Running in the parent.";
+/// A report's text for a helper that said nothing of its own.
+const NO_ANSWER: &str = "(no answer)";
+
+/// Heads a fork's directive, which the agent it was forked from wrote.
+const FORK_HEADER: &str = "[Forked: you are a copy of the agent above, working on your own from here. This is from that agent, not from the user, and it approves nothing the user has not]";
+/// Heads a side question, which the user asked and which waits for no work.
+const ASIDE_HEADER: &str = "[A side question from the user. Answer it briefly from what is above, without tools; the answer is shown aside and is not kept in the conversation]";
 /// A page of a long report, which with the line saying where the next starts
 /// fits the 8,000 characters a request keeps of a tool result.
 const PAGE: usize = 7_500;
@@ -156,6 +177,20 @@ struct Sidecar {
     depth: u8,
     description: String,
     stopped_by_user: bool,
+    /// Whether it is a fork, which stays one when picked back up.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    fork: bool,
+    /// Where its own messages start in its transcript, after its parent's for a fork.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    from: usize,
+    /// What a fork may call, its parent's allowance, or None for everything:
+    /// its type allows everything, so the type cannot say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    allow: Option<Vec<String>>,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 impl Sidecar {
@@ -264,7 +299,8 @@ impl Tool for Agent {
             "type": {"type": "string", "description": "general (default), explore (read-only, cheaper), plan, or review. Other types this project defines are named in your instructions."},
             "name": {"type": "string", "description": "A handle for the agents tool. Defaults to the type."},
             "model": {"type": "string", "description": "A model id on this gateway. Default: the type's, then Settings, then yours."},
-            "background": {"type": "boolean", "description": "Default true in the window and terminal: return now and get a notice when it finishes. false waits for the report."}
+            "background": {"type": "boolean", "description": "Default true in the window and terminal: return now and get a notice when it finishes. false waits for the report."},
+            "fork": {"type": "boolean", "description": "Start it from a copy of this conversation rather than from nothing: it has seen everything so far, so the prompt only says what to do. It keeps your model and tools, whatever type and model say."}
         }, "required": ["description", "prompt"]})
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
@@ -328,24 +364,49 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
                 .into(),
         );
     };
-    let kind = text(args, "type").unwrap_or("general");
-    let wanted = text(args, "name").unwrap_or(kind);
+    let forking = args["fork"].as_bool() == Some(true);
+    // A fork keeps its parent's model and tools whatever the call asks,
+    // since changing either would change the prefix the two share.
+    let kind = if forking {
+        "general"
+    } else {
+        text(args, "type").unwrap_or("general")
+    };
+    let wanted = text(args, "name").unwrap_or(if forking { "fork" } else { kind });
     check_name(wanted)?;
     let def = agent_defs::find(kind, parent.workspace.as_deref())?;
+    // Read before a place is taken, so a fork with nothing to start from takes none.
+    let history = if forking {
+        Some(parent_messages(caller)?)
+    } else {
+        None
+    };
     let owner = caller.agent.unwrap_or(caller.root);
     let background = in_background(args, inbox::listened(), caller.depth, parent);
     // No call waits for a helper in the background, so it shares no call's allowance.
     let waiting = if background { 0 } else { owner };
     let cancel = cancel_for(background, ctx);
     let slot = reserve(caller.root, waiting, wanted, limits.at_once, cancel.clone())?;
-    let connection = child(parent, &def, text(args, "model"), limits, slot.id);
-    let tools = usable(&connection, &def);
+    let (connection, first, allow) = match history {
+        Some(messages) => (
+            // Narrowed as any helper's is, but on its parent's model.
+            child(parent, &def, Some(&parent.model), limits, slot.id),
+            forked(messages, Some(args), directive(prompt)),
+            // Never more than its parent may call, whatever its type allows.
+            caller.allow.clone(),
+        ),
+        None => {
+            let connection = child(parent, &def, text(args, "model"), limits, slot.id);
+            let tools = usable(&connection, &def);
+            let first = vec![task(&def, &tools, prompt)];
+            (connection, first, allow(&def, tools))
+        }
+    };
     let (n, mut transcript) =
         Transcript::create(caller.root, &slot.name, parent.workspace.clone())?;
-    transcript
-        .conversation
-        .messages
-        .push(task(&def, &tools, prompt));
+    let from = if forking { first.len() } else { 0 };
+    transcript.conversation.messages = first;
+    let label = if forking { "fork" } else { def.name.as_str() };
     let sidecar = transcript.path.with_extension("json");
     Sidecar {
         name: slot.name.clone(),
@@ -358,6 +419,12 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
         depth: caller.depth + 1,
         description: text(args, "description").unwrap_or_default().to_owned(),
         stopped_by_user: false,
+        fork: forking,
+        from,
+        allow: match &allow {
+            Allow::Only(names) if forking => Some(names.clone()),
+            _ => None,
+        },
     }
     .write(&sidecar)?;
     let run = Run::new(owner, background);
@@ -369,18 +436,20 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
         root: caller.root,
         run: caller.run.unwrap_or(slot.id),
         label: slot.name.clone(),
-        allow: allow(&def, tools),
+        allow,
         rounds: def.rounds.unwrap_or(ROUNDS),
         cancel,
         budget: Some(Arc::new(Budget::new(limits.budget, caller.budget.clone()))),
         status: run.status.clone(),
         depth: caller.depth + 1,
+        fork: forking,
+        from,
     };
     registry().helpers.push(Helper {
         id: slot.id,
         root: caller.root,
         name: slot.name.clone(),
-        kind: def.name.clone(),
+        kind: label.to_owned(),
         description: text(args, "description").unwrap_or_default().to_owned(),
         n,
         sidecar,
@@ -392,9 +461,9 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
     let started = format!(
         "Started {} ({}) in the background. A notice comes when it finishes; do not poll or \
          wait for it. Carry on, or end your turn.",
-        slot.name, def.name
+        slot.name, label
     );
-    launch(spec, slot, background, &def.name, started)
+    launch(spec, slot, background, label, started)
 }
 
 /// Sets a helper to work in the place `slot` holds: in the background, where
@@ -534,9 +603,12 @@ fn how(outcome: &Outcome, by_user: bool) -> &'static str {
     }
 }
 
-/// Refuses a helper its caller may not start: one too deep, one from an agent
-/// being stopped, or one its tree has no budget left for.
+/// Refuses a helper its caller may not start: any from a fork, one too deep,
+/// one from an agent being stopped, or one its tree has no budget left for.
 fn check(caller: &Caller, cancel: &Cancel, limits: &Limits) -> Result<(), String> {
+    if caller.fork {
+        return Err("A fork cannot start another fork. Do the work yourself.".into());
+    }
     if caller.depth >= limits.depth {
         return Err(format!(
             "Helper nesting limit reached (depth {} of {}). Do this task yourself with your \
@@ -756,23 +828,180 @@ fn task(def: &AgentDef, tools: &[String], prompt: &str) -> Message {
     } else {
         tools.join(", ")
     };
-    let prompt: Vec<String> = prompt
-        .replace("\r\n", "\n")
-        .split(LINE_BREAKS)
-        .map(|line| format!("    {line}"))
-        .collect();
     let content = format!(
         "{TASK_HEADER}\n{}\nTools you may use: {tools}.\nWhen done, answer with a report: what you \
          did, what you found, files you changed, open questions.\nThat answer is all the agent \
          that started you will see.\nTask:\n{}",
         about.trim_end(),
-        prompt.join("\n")
+        indented(prompt)
     );
     Message {
         role: "user".into(),
         content,
         notice: true,
         ..Default::default()
+    }
+}
+
+/// `text` with each line indented, so no line of it reads as the start of
+/// something the user said.
+fn indented(text: &str) -> String {
+    let lines: Vec<String> = text
+        .replace("\r\n", "\n")
+        .split(LINE_BREAKS)
+        .map(|line| format!("    {line}"))
+        .collect();
+    lines.join("\n")
+}
+
+/// The messages the calling agent has so far, as its own file holds them: a
+/// session's, which both front ends save before running tools, or a helper's
+/// transcript, which the driver saves before each round.
+fn parent_messages(caller: &Caller) -> Result<Vec<Message>, String> {
+    let conversation = match caller.agent {
+        None => crate::store::session(caller.root),
+        Some(id) => {
+            let n = registry().helpers.iter().find(|h| h.id == id).map(|h| h.n);
+            n.and_then(|n| Transcript::open(caller.root, n))
+                .map(|transcript| transcript.conversation)
+        }
+    };
+    conversation
+        .map(|conversation| conversation.messages)
+        .filter(|messages| !messages.is_empty())
+        .ok_or_else(|| {
+            "This conversation could not be read, so it cannot be forked. Start a helper with \
+             the whole task instead."
+                .into()
+        })
+}
+
+/// A fork's first messages: its parent's as they are, a result for each call
+/// the parent's last reply is still making, where `own`, the arguments of the
+/// fork's own call, marks the one running here, and then `directive`.
+///
+/// Nothing before the directive is rewritten, so the request starts with the
+/// same bytes as the parent's last one and the provider's cache serves them,
+/// unless what is added moves the window's start on a step.
+fn forked(mut messages: Vec<Message>, own: Option<&Value>, directive: Message) -> Vec<Message> {
+    let mut own = own;
+    let pending: Vec<Message> = match messages.iter().rposition(|m| m.role == "assistant") {
+        Some(at) => messages[at]
+            .tool_calls
+            .iter()
+            .filter(|call| {
+                !messages[at + 1..]
+                    .iter()
+                    .any(|m| m.role == "tool" && m.tool_call_id == call.id)
+            })
+            .map(|call| {
+                let mine = own.is_some_and(|args| {
+                    call.name == "agent"
+                        && tools::parse_args(&call.arguments).is_ok_and(|called| &called == args)
+                });
+                // Two identical calls are two forks; each claims one.
+                if mine {
+                    own = None;
+                }
+                Message {
+                    role: "tool".into(),
+                    content: if mine { FORKED_HERE } else { IN_PARENT }.into(),
+                    tool_call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    args: call.arguments.clone(),
+                    ..Default::default()
+                }
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    messages.extend(pending);
+    messages.push(directive);
+    messages
+}
+
+/// What a fork is told after its parent's messages: that it is a copy, then
+/// its task.
+fn directive(prompt: &str) -> Message {
+    Message {
+        role: "user".into(),
+        content: format!(
+            "{FORK_HEADER}\nDo only this, then answer with a report: what you did, what you \
+             found, files you changed. That answer is all the agent that forked you will \
+             see.\nTask:\n{}",
+            indented(prompt)
+        ),
+        notice: true,
+        ..Default::default()
+    }
+}
+
+/// Answers `question` about a conversation from its `messages`, on a fork of
+/// `connection` that may call no tool and makes one request, until `cancel`
+/// stops it, giving back the reply with what it cost. Nothing it says is
+/// added to the conversation.
+pub fn btw(
+    connection: &Connection,
+    messages: Vec<Message>,
+    question: &str,
+    cancel: Cancel,
+) -> Result<Message, String> {
+    let question = question.trim();
+    if question.is_empty() {
+        return Err("Ask something after /btw, such as: /btw what did we decide?".into());
+    }
+    let session = connection.conversation;
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let mut transcript = Transcript::aside(session, connection.workspace.clone())?;
+    let path = transcript.path.clone();
+    let aside = Message {
+        role: "user".into(),
+        content: format!("{ASIDE_HEADER}\n{question}"),
+        ..Default::default()
+    };
+    let first = forked(messages, None, aside);
+    let from = first.len();
+    transcript.conversation.messages = first;
+    let model = Some(connection.model.as_str());
+    let mut asking = child(connection, &AgentDef::default(), model, &Limits::read(), id);
+    // One request: a reply that calls a tool ends it, rather than the round
+    // cap's wrap-up asking again.
+    asking.wrap_up = true;
+    let report = driver::run(Spec {
+        connection: asking,
+        transcript,
+        id,
+        owner: session,
+        root: session,
+        run: id,
+        label: "btw".into(),
+        // Still offered, so the prefix is the session's, but none of them runs.
+        allow: Allow::Only(Vec::new()),
+        // No tool round, so a reply that calls one ends it.
+        rounds: 0,
+        cancel,
+        budget: None,
+        status: Arc::default(),
+        depth: 1,
+        fork: true,
+        from,
+    });
+    // An aside is kept nowhere, its own transcript and its lock included.
+    let _ = std::fs::remove_file(path.with_extension("lock"));
+    let _ = std::fs::remove_file(path);
+    match report.status {
+        Outcome::Stopped => Err("Stopped.".into()),
+        Outcome::Failed(error) => Err(error),
+        _ if report.text.trim().is_empty() => Err("No answer came.".into()),
+        _ => Ok(Message {
+            role: "assistant".into(),
+            content: report.text,
+            model: connection.model.clone(),
+            tokens: report.output,
+            prompt_tokens: report.input,
+            cached_tokens: report.cached,
+            ..Default::default()
+        }),
     }
 }
 
@@ -800,8 +1029,10 @@ fn answer(name: &str, report: &Report, rounds: usize, share: usize) -> Result<St
         out.push('\n');
         out.push_str(&jobs);
     }
-    if !report.text.is_empty() {
-        out.push('\n');
+    out.push('\n');
+    if report.text.is_empty() {
+        out.push_str(NO_ANSWER);
+    } else {
         out.push_str(&trim(&report.text, share));
     }
     match report.status {
@@ -867,10 +1098,12 @@ fn ended(
         text.push('\n');
         text.push_str(&jobs);
     }
-    if !report.text.is_empty() {
-        text.push('\n');
-        text.push_str(&report.text);
-    }
+    text.push('\n');
+    text.push_str(if report.text.is_empty() {
+        NO_ANSWER
+    } else {
+        &report.text
+    });
     // Last, where it survives the fold's trim, which keeps a notice's two ends.
     let whole = json!({"action": "report", "to": name});
     text.push_str(&format!("\nWhole report: agents {whole}"));
@@ -1159,7 +1392,11 @@ fn resume(
         conversation: slot.id,
         ..sender.clone()
     };
-    let tools = usable(&connection, &def);
+    let allow = match what.allow {
+        Some(names) => Allow::Only(names),
+        None if what.fork => Allow::All,
+        None => allow(&def, usable(&connection, &def)),
+    };
     let spec = Spec {
         connection,
         transcript,
@@ -1168,18 +1405,21 @@ fn resume(
         root: caller.root,
         run: caller.run.unwrap_or(slot.id),
         label: slot.name.clone(),
-        allow: allow(&def, tools),
+        allow,
         rounds: def.rounds.unwrap_or(ROUNDS),
         cancel,
         budget: Some(Arc::new(Budget::new(limits.budget, caller.budget.clone()))),
         status,
         depth: caller.depth + 1,
+        fork: what.fork,
+        from: what.from,
     };
     let started = format!(
         "{name} had finished; it is carrying on from where it stopped, with your message. A \
          notice comes when it is done."
     );
-    launch(spec, slot, background, &def.name, started)
+    let label = if what.fork { "fork" } else { def.name.as_str() };
+    launch(spec, slot, background, label, started)
 }
 
 /// Takes a place for helper `name` of session `root` to carry on in as `run`
@@ -1255,15 +1495,17 @@ fn stop_by_name(caller: &Caller, to: &str) -> Result<String, String> {
 /// A page of the last thing helper `to` of the caller's said, from character
 /// `offset` on.
 fn report(caller: &Caller, to: &str, offset: usize) -> Result<String, String> {
-    let (name, n) = {
+    let (name, n, sidecar) = {
         let registry = registry();
         let helper = mine(&registry.helpers, caller, to)?;
-        (helper.name.clone(), helper.n)
+        (helper.name.clone(), helper.n, helper.sidecar.clone())
     };
     let Some(transcript) = Transcript::open(caller.root, n) else {
         return Err(format!("{name}'s conversation could not be read."));
     };
-    let said = driver::last_said(&transcript.conversation.messages);
+    let from = Sidecar::read(&sidecar).map_or(0, |what| what.from);
+    let messages = &transcript.conversation.messages;
+    let said = driver::last_said(messages.get(from..).unwrap_or_default());
     let total = said.chars().count();
     if total == 0 {
         return Ok(format!("{name} has said nothing yet."));
@@ -1332,7 +1574,7 @@ fn user_stopped(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chat::Remote;
+    use crate::chat::{Remote, ToolCall};
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::path::PathBuf;
@@ -2175,7 +2417,7 @@ mod tests {
 
         assert_eq!(
             out,
-            Err("halted was stopped; its partial report is below.".into())
+            Err("halted was stopped; its partial report is below.\n(no answer)".into())
         );
         assert_eq!(sidecar(&session, 1)["stopped_by_user"], true);
         // The session's next turn cannot pick it back up, and never reaches a model trying.
@@ -2431,5 +2673,291 @@ mod tests {
             "worker ended before it read this, from user:\nmessage from the user:\nAnd the docs.";
         assert_eq!(passed, [text]);
         assert!(!steer(id, "Gone."));
+    }
+
+    #[test]
+    fn a_fork_answers_the_calls_its_parent_is_still_making() {
+        let own = fork_args();
+        let messages = vec![
+            said("user", "Go."),
+            Message {
+                role: "assistant".into(),
+                tool_calls: vec![
+                    tool_call("a", "read_file", &json!({"path": "notes.txt"})),
+                    tool_call("b", "agent", &own),
+                    tool_call("c", "run_command", &json!({"command": "ls"})),
+                ],
+                ..Default::default()
+            },
+            Message {
+                role: "tool".into(),
+                tool_call_id: "a".into(),
+                content: "hello from the notes".into(),
+                ..Default::default()
+            },
+        ];
+        let out = forked(messages, Some(&own), directive("Read it."));
+        let added: Vec<(&str, &str)> = out[3..out.len() - 1]
+            .iter()
+            .map(|m| (m.tool_call_id.as_str(), m.content.as_str()))
+            .collect();
+        assert_eq!(added, [("b", FORKED_HERE), ("c", IN_PARENT)]);
+        assert_eq!(out.len(), 6);
+    }
+
+    #[test]
+    fn a_fork_cannot_fork() {
+        let session = Session::new("fork-in-fork");
+        let args = fork_args();
+        saved_session(&forking(&args));
+        let again = json!({"description": "go deeper", "prompt": "Carry on.", "fork": true});
+        let (endpoint, stub) = Stub::start(vec![
+            reply("", Some(("agent", again))),
+            reply("Did it myself.", None),
+        ]);
+        let answer = call(session.context(endpoint), args).unwrap();
+        assert!(answer.contains("Did it myself."), "{answer}");
+        let sent = stub.sent();
+        assert_eq!(
+            results(&sent[1]).last(),
+            Some(&"A fork cannot start another fork. Do the work yourself.")
+        );
+    }
+
+    #[test]
+    fn a_fork_is_refused_the_deny_set_at_dispatch_though_it_is_offered() {
+        let session = Session::new("fork-deny");
+        let args = fork_args();
+        saved_session(&forking(&args));
+        let keep = json!({"action": "add", "target": "memory", "content": "Forks remember."});
+        let (endpoint, stub) = Stub::start(vec![
+            reply("", Some(("memory", keep))),
+            reply("Left it.", None),
+        ]);
+        call(session.context(endpoint), args).unwrap();
+        let sent = stub.sent();
+        let offered: Vec<&str> = sent[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect();
+        assert!(offered.contains(&"memory"), "{offered:?}");
+        assert_eq!(
+            results(&sent[1]).last(),
+            Some(&"`memory` is not available to this helper.")
+        );
+        assert!(!session.data.join("MEMORY.md").exists());
+    }
+
+    #[test]
+    fn a_fork_of_a_restricted_helper_is_refused_what_it_was_even_picked_back_up() {
+        let session = Session::new("fork-blind");
+        let types = session.work.join(".letronna").join("agents");
+        std::fs::create_dir_all(&types).unwrap();
+        let blind = "---\nname: blind\ndisallowed: read_file\n---\nLook without reading.\n";
+        std::fs::write(types.join("blind.md"), blind).unwrap();
+        let read = json!({"path": "notes.txt"});
+        let refused = "`read_file` is not available to this helper.";
+        let (endpoint, stub) = Stub::start(vec![
+            reply("", Some(("agent", fork_args()))),
+            reply("", Some(("read_file", read.clone()))),
+            reply("Could not read it.", None),
+            reply("The fork could not read it.", None),
+        ]);
+        let args = json!({"description": "look", "type": "blind", "prompt": "Look at notes.txt.",
+            "background": false});
+        let answer = call(session.context(endpoint), args).unwrap();
+        assert!(answer.contains("The fork could not read it."), "{answer}");
+        assert_eq!(results(&stub.sent()[2]).last(), Some(&refused));
+        let kept = sidecar(&session, 2);
+        assert_eq!(kept["fork"], true);
+        let allowed = kept["allow"].as_array().unwrap();
+        assert!(!allowed.is_empty() && !allowed.contains(&json!("read_file")));
+        // Picked back up, it is still a fork held to what its parent could call.
+        let (endpoint, stub) = Stub::start(vec![
+            reply("", Some(("read_file", read))),
+            reply("Still could not.", None),
+        ]);
+        let message = json!({"action": "send", "to": kept["name"], "message": "Try again.",
+            "background": false});
+        let out = talk(session.context(endpoint), message).unwrap();
+        assert!(out.contains("Still could not."), "{out}");
+        assert_eq!(results(&stub.sent()[1]).last(), Some(&refused));
+    }
+
+    #[test]
+    fn a_fork_sends_its_parents_bytes_before_its_directive() {
+        let session = Session::new("fork-prefix");
+        let (endpoint, stub) = Stub::start(vec![reply("", None), reply("Forked and done.", None)]);
+        let ctx = session.context(endpoint);
+        let parent = ctx.caller.connection.as_deref().unwrap().clone();
+        let mut messages = vec![said("user", "What does notes.txt say? Check it two ways.")];
+        // The parent's own request, which the reply that forks answered.
+        let events = crate::chat::start(parent, messages.clone());
+        while let Ok(event) = events.recv_blocking() {
+            if matches!(event, crate::chat::Event::Finished(_)) {
+                break;
+            }
+        }
+        let args = fork_args();
+        let read = json!({"path": "notes.txt"});
+        messages.push(Message {
+            role: "assistant".into(),
+            tool_calls: vec![
+                tool_call("call-fork", "agent", &args),
+                tool_call("call-read", "read_file", &read),
+            ],
+            ..Default::default()
+        });
+        saved_session(&messages);
+        let answer = call(ctx, args).unwrap();
+        assert!(answer.contains("Forked and done."), "{answer}");
+        let sent = stub.sent();
+        let (parent, fork) = (&sent[0], &sent[1]);
+        assert_eq!(fork["model"], parent["model"]);
+        assert_eq!(fork["tools"], parent["tools"]);
+        let before = parent["messages"].as_array().unwrap();
+        let after = fork["messages"].as_array().unwrap();
+        // Serialized as the request is, so equal text is equal bytes.
+        assert_eq!(
+            serde_json::to_string(&after[..before.len()]).unwrap(),
+            serde_json::to_string(before).unwrap()
+        );
+        assert_eq!(results(fork), [FORKED_HERE, IN_PARENT]);
+        let directive = after.last().unwrap();
+        assert_eq!(directive["role"], "user");
+        let directive = directive["content"].as_str().unwrap();
+        assert!(directive.starts_with(FORK_HEADER), "{directive}");
+        assert!(directive.ends_with("    Read notes.txt and say what it says."));
+    }
+
+    #[test]
+    fn a_fork_that_says_nothing_reports_no_answer_and_not_its_parents_words() {
+        let session = Session::new("fork-silent");
+        let args = fork_args();
+        let mut messages = vec![said("user", "Hi."), said("assistant", "PARENT-ONLY TEXT")];
+        messages.extend(forking(&args));
+        saved_session(&messages);
+        let (endpoint, stub) = Stub::start(vec![reply("", None)]);
+        let ctx = session.context(endpoint);
+        // Asked again once, as an empty reply is, it ends with nothing said.
+        let answer = match call(ctx.clone(), args) {
+            Ok(answer) | Err(answer) => answer,
+        };
+        stub.sent();
+        // Named `fork`, or `fork-<n>` where the session has one already.
+        let (name, _) = answer.split_once(' ').unwrap();
+        assert!(answer.ends_with("\n(no answer)"), "{answer}");
+        let page = talk(ctx, json!({"action": "report", "to": name}));
+        assert_eq!(page, Ok(format!("{name} has said nothing yet.")));
+    }
+
+    #[test]
+    fn btw_makes_one_request_and_answers_only_from_it() {
+        let session = Session::new("btw-round");
+        let messages = vec![
+            said("user", "Look at notes.txt later."),
+            said("assistant", "PARENT-ONLY TEXT"),
+        ];
+        let read = json!({"path": "notes.txt"});
+        let ask = |given: String| {
+            let (endpoint, stub) = Stub::start(vec![given]);
+            let ctx = session.context(endpoint);
+            let connection = ctx.caller.connection.as_deref().unwrap();
+            // A second request would find the provider gone and fail the answer.
+            let answer = btw(
+                connection,
+                messages.clone(),
+                "what is in it?",
+                Cancel::default(),
+            );
+            (answer.map(|reply| reply.content), stub.sent())
+        };
+        let (answer, sent) = ask(reply("", Some(("read_file", read.clone()))));
+        assert_eq!(answer, Err("No answer came.".into()));
+        assert_eq!(sent.len(), 1);
+        assert!(!sent[0]["tools"].as_array().unwrap().is_empty());
+        let (answer, sent) = ask(reply("It says hello.", Some(("read_file", read))));
+        assert_eq!(answer, Ok("It says hello.".into()));
+        assert_eq!(sent.len(), 1);
+    }
+
+    #[test]
+    fn btw_never_touches_the_session() {
+        let session = Session::new("btw-session");
+        let messages = vec![
+            said("user", "What does notes.txt say?"),
+            said("assistant", "It says hello from the notes."),
+        ];
+        saved_session(&messages);
+        let file = crate::store::sessions_dir().join("4242.jsonl");
+        let before = std::fs::read(&file).unwrap();
+        let (endpoint, stub) = Stub::start(vec![reply("Hello, from the notes.", None)]);
+        let ctx = session.context(endpoint);
+        let connection = ctx.caller.connection.as_deref().unwrap();
+        let answer = btw(connection, messages, "what did it say?", Cancel::default()).unwrap();
+        assert_eq!(answer.content, "Hello, from the notes.");
+        // What it cost, for the front end to show as it does a reply's.
+        assert_eq!((answer.tokens, answer.prompt_tokens), (50, 1_000));
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+        // Nor does it leave a transcript of its own, or a helpers' folder.
+        let asides = session.data.join("asides");
+        assert!(std::fs::read_dir(asides).map_or(true, |dir| dir.count() == 0));
+        assert!(!session.data.join("agents").join("4242").exists());
+        let sent = stub.sent();
+        let last = sent[0]["messages"].as_array().unwrap().last().unwrap();
+        assert_eq!(last["content"], format!("{ASIDE_HEADER}\nwhat did it say?"));
+    }
+
+    /// A fork call that waits for its report.
+    fn fork_args() -> Value {
+        json!({"description": "read the notes", "prompt": "Read notes.txt and say what it \
+            says.", "fork": true, "background": false})
+    }
+
+    /// A question, then a reply making the fork call `args` and nothing else.
+    fn forking(args: &Value) -> Vec<Message> {
+        vec![
+            said("user", "Look into the notes."),
+            Message {
+                role: "assistant".into(),
+                tool_calls: vec![tool_call("call-fork", "agent", args)],
+                ..Default::default()
+            },
+        ]
+    }
+
+    fn said(role: &str, content: &str) -> Message {
+        Message {
+            role: role.into(),
+            content: content.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Session 4242 as a front end leaves it before running tools: `messages`,
+    /// saved.
+    fn saved_session(messages: &[Message]) {
+        std::fs::create_dir_all(crate::store::sessions_dir()).unwrap();
+        Transcript {
+            path: crate::store::sessions_dir().join("4242.jsonl"),
+            conversation: crate::store::Conversation {
+                id: 4242,
+                title: "parent".into(),
+                messages: messages.to_vec(),
+                ..Default::default()
+            },
+        }
+        .save()
+        .unwrap();
+    }
+
+    fn tool_call(id: &str, name: &str, args: &Value) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: args.to_string(),
+        }
     }
 }

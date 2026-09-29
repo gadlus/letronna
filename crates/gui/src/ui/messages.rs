@@ -352,6 +352,80 @@ impl Chat {
             .into_any_element()
     }
 
+    /// The side question on show for `session`, under the conversation and
+    /// in no turn of it, since the session does not keep it.
+    pub(crate) fn aside_row(
+        &self,
+        session: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let aside = self
+            .aside
+            .as_ref()
+            .filter(|aside| aside.session == session)?;
+        let muted = cx.theme().muted_foreground;
+        // Rendered and selectable as a reply is, since it is the only copy.
+        let answer = match &aside.answer {
+            None => div()
+                .text_color(muted)
+                .child("Thinking…")
+                .into_any_element(),
+            Some(Ok(reply)) => v_flex()
+                .gap_1()
+                .text_color(muted)
+                .child(
+                    TextView::markdown(self.row_id("aside", 0), reply.content.clone(), window, cx)
+                        .selectable(!window.has_active_dialog(cx))
+                        .line_height(px(26.)),
+                )
+                .child(div().text_xs().child(usage_line(reply)))
+                .into_any_element(),
+            Some(Err(error)) => div()
+                .text_color(cx.theme().danger)
+                .child(error.clone())
+                .into_any_element(),
+        };
+        let row = v_flex()
+            .w_full()
+            .gap_1()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .text_xs()
+                    .font_family(HEADING_FONT)
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Aside · not kept in the session")
+                    .child(
+                        Button::new("aside-close")
+                            .ghost()
+                            .xsmall()
+                            .icon(Icon::new(IconName::Close))
+                            .tooltip_with_action("Close", &Dismiss, None)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(aside) = this.aside.take() {
+                                    aside.cancel.set();
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .w_full()
+                    .gap_2()
+                    .px_4()
+                    .py_3()
+                    .rounded(cx.theme().radius_lg)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .child(aside.question.clone())
+                    .child(answer),
+            );
+        Some(row.into_any_element())
+    }
+
     /// Something that happened meanwhile, such as a job exiting: one quiet
     /// line rather than a card, since nobody here said it; click to read it.
     fn notice_row(
@@ -632,7 +706,11 @@ impl Chat {
             })
     }
 
-    pub(crate) fn empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn empty_state(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         // Without a project folder the tools have nowhere to read or write,
         // and the only other place that says so is a chip in the status bar.
         let no_project = self.store.conversations[self.store.active]
@@ -679,6 +757,11 @@ impl Chat {
                     .child("Enter to send  ·  Shift+Enter for a new line  ·  Esc to stop"),
             )
             .children(self.grain(&self.grains.empty_chat))
+            // A side question asked before anything else still needs somewhere to show.
+            .children(
+                self.aside_row(self.store.conversations[self.store.active].id, window, cx)
+                    .map(|row| div().w_full().max_w(COLUMN).px_6().mt_6().child(row)),
+            )
     }
 
     pub(crate) fn page_view(&self, page: Page, cx: &mut Context<Self>) -> impl IntoElement {
