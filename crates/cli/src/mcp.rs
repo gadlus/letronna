@@ -76,6 +76,19 @@ pub fn health(server: &ServerStatus) -> String {
             render::dim(&format!("· {} tools", server.tools))
         ),
         State::Starting => render::dim("… still starting"),
+        State::Retrying => {
+            let why = server.error.as_deref().unwrap_or("stopped");
+            let next = server.retry.map_or_else(String::new, |retry| {
+                format!(
+                    " in {} s ({} of {})",
+                    retry.wait.as_secs_f64().ceil(),
+                    retry.attempt,
+                    retry.attempts
+                )
+            });
+            let why = why.lines().next().unwrap_or(why);
+            render::amber(&format!("↻ retrying{next}: {why}"))
+        }
         State::Disabled => render::dim("switched off"),
         State::Failed => {
             let why = server.error.as_deref().unwrap_or("failed");
