@@ -12,6 +12,7 @@ const PAGES: &[(&str, AppIcon)] = &[
     ("Appearance", AppIcon::Palette),
     ("Thinking", AppIcon::Sparkles),
     ("Privacy", AppIcon::Shield),
+    ("MCP", AppIcon::PlugsConnected),
     ("Plugins", AppIcon::Puzzle),
     ("About", AppIcon::Info),
 ];
@@ -414,6 +415,7 @@ impl Chat {
             "Usage" => super::usage::usage_page(self.usage_report.as_ref(), cx).into_any_element(),
             "Thinking" => thinking_page(&chat, &self.store, cx).into_any_element(),
             "Plugins" => plugins_page(&chat, cx).into_any_element(),
+            "MCP" => super::mcp::mcp_page(&chat, window, cx).into_any_element(),
             "About" => about_page(&chat, self, cx).into_any_element(),
             "Search" => search_page(self.search_rows(), &pick, &endpoint, &key, &chat, cx)
                 .into_any_element(),

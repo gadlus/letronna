@@ -14,6 +14,7 @@ Letronna — a small agent in your terminal
   letronna setup           name, sign in, provider, model, install
   letronna update          install the newest version
   letronna doctor          check the setup, the disk and the gateway
+  letronna mcp             add, list, get or remove MCP servers
   letronna --uninstall     take it off again
 
 Options
@@ -85,6 +86,8 @@ pub struct Args {
     pub max_rounds: Option<usize>,
     pub tools: Option<Vec<String>>,
     pub budget: Option<u64>,
+    /// The words after `letronna mcp`, which manage MCP servers.
+    pub mcp: Option<Vec<String>>,
 }
 
 pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -110,7 +113,13 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
         max_rounds: None,
         tools: None,
         budget: None,
+        mcp: None,
     };
+    // Only as the first word, so `-p mcp` still asks about it.
+    if raw.next_if(|first| first == "mcp").is_some() {
+        args.mcp = Some(raw.collect());
+        return Ok(args);
+    }
     while let Some(arg) = raw.next() {
         match arg.as_str() {
             "gui" => args.gui = true,
@@ -285,6 +294,13 @@ mod tests {
         assert!(args(&["--mode"]).mode.is_err());
         assert!(args(&["-h"]).help);
         assert!(args(&["--version"]).version && args(&["-V"]).version);
+        // `mcp` first hands every word after it on, flags and all.
+        let mcp = args(&["mcp", "add", "fs", "-e", "K=V", "--", "npx", "-y"]);
+        assert_eq!(
+            mcp.mcp.unwrap(),
+            ["add", "fs", "-e", "K=V", "--", "npx", "-y"]
+        );
+        assert_eq!(args(&["-p", "mcp"]).prompt.as_deref(), Some("mcp"));
     }
 
     #[test]

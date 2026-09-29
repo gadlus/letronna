@@ -37,11 +37,20 @@
 //! that a tool only looks, as a server run here is taken at its word
 //! already. A child inherits Letronna's environment, as Claude Code's do,
 //! unless `env_scrub` gives it only where things are and its own `env`.
+//!
+//! What became of each server is kept for the user in its slot: whether it
+//! answered, how many tools it gave, why it failed, and the last 64 KB it
+//! printed on stderr. `/mcp` in the terminal and Settings › MCP in the
+//! window read it through `status()`. A server can print anything there,
+//! keys included, so the tail is scrubbed as a job's log is and goes only
+//! to the user's screen, never to the model. `mcp.json` is changed as plain
+//! JSON rather than through the structs below, so keys another app or a
+//! newer Letronna wrote are kept.
 
 use crate::tools::{Tool, ToolContext};
 use serde::Deserialize;
-use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use serde_json::{Map, Value, json};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -107,13 +116,7 @@ const KEPT_ENV: &[&str] = &[
     "PROGRAMFILES",
 ];
 
-/// `mcp.json`, as Claude Desktop writes it.
-#[derive(Deserialize, Default)]
-struct Config {
-    #[serde(default, rename = "mcpServers")]
-    servers: BTreeMap<String, ServerConfig>,
-}
-
+/// One entry under `mcpServers` in `mcp.json`, as Claude Desktop writes it.
 #[derive(Deserialize, Clone, Default)]
 struct ServerConfig {
     /// Empty for a server reached by URL.
@@ -287,12 +290,83 @@ fn matches_glob(glob: &str, name: &str) -> bool {
     left.ends_with(last)
 }
 
+/// What a configured server is doing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum State {
+    /// Started, and not yet answered with its tools.
+    #[default]
+    Starting,
+    /// Answered, and its tools are offered.
+    Connected,
+    /// Could not start, stopped, or its entry will not parse; the error says
+    /// which.
+    Failed,
+    /// Switched off in `mcp.json`.
+    Disabled,
+}
+
+/// One server as the user sees it, in `/mcp` and in the window's settings.
+#[derive(Clone, Debug)]
+pub struct ServerStatus {
+    pub name: String,
+    /// "stdio" for a server run here, "http" for one reached by URL.
+    pub transport: &'static str,
+    /// The command and its arguments, or the URL.
+    pub target: String,
+    pub state: State,
+    pub tools: usize,
+    /// Why it failed, word for word but for keys.
+    pub error: Option<String>,
+    /// The names of the environment variables it is given, without values.
+    pub env: Vec<String>,
+    /// The names of the headers sent to it, without values.
+    pub headers: Vec<String>,
+    /// The newest of what it printed on stderr, without escape sequences and
+    /// with keys hidden. For the user's eyes only: nothing hands it to the
+    /// model.
+    pub log: String,
+}
+
+/// One configured server and what became of it: the one record that
+/// `status`, `reconnect` and `set_enabled` read and change.
+#[derive(Default)]
+struct Slot {
+    config: ServerConfig,
+    state: State,
+    tools: Vec<Arc<dyn Tool>>,
+    error: Option<String>,
+    /// Its stderr, the newest 64 KB, kept across restarts.
+    log: Arc<Mutex<VecDeque<u8>>>,
+    /// The process of a server run here, held so a restart can stop it.
+    child: Option<std::process::Child>,
+    /// Counts the starts, so one that ends after a later start began is
+    /// dropped rather than taken for the current one.
+    run: u64,
+}
+
+impl Slot {
+    /// Stop its process, if it runs here, and drop its tools.
+    fn stop(&mut self) {
+        self.tools.clear();
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 /// The tools of every server that has answered so far.
 pub fn tools() -> Vec<Arc<dyn Tool>> {
     start();
-    registry()
+    slots()
         .lock()
-        .map(|known| known.clone())
+        .map(|slots| {
+            slots
+                .values()
+                .filter(|slot| slot.state == State::Connected)
+                .flat_map(|slot| slot.tools.iter().cloned())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -307,50 +381,35 @@ pub fn start() {
     }
     static STARTED: Once = Once::new();
     STARTED.call_once(|| {
-        for (name, server) in config().servers {
-            if server.disabled || (server.command.trim().is_empty() && server.url.trim().is_empty())
-            {
-                continue;
-            }
-            begin_start();
-            std::thread::spawn(move || {
-                if let Ok(tools) = launch(&name, &server)
-                    && let Ok(mut known) = registry().lock()
-                {
-                    known.extend(tools);
-                }
-                end_start();
-            });
+        // One that will not read starts nothing; `unreadable` says why.
+        for (name, server) in configured().unwrap_or_default() {
+            open(&name, server);
         }
     });
-}
-
-/// `mcp.json` as saved, or no servers when it is missing or unreadable.
-fn config() -> Config {
-    let path = crate::chat::data_dir().join("mcp.json");
-    std::fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
 }
 
 /// The values in `mcp.json` whose names say they are secret, for hiding
 /// wherever they turn up.
 pub(crate) fn secrets() -> Vec<String> {
-    secret_values(&config(), &|name| std::env::var(name).ok())
+    secret_values(&configured().unwrap_or_default(), &|name| {
+        std::env::var(name).ok()
+    })
 }
 
 /// Each server's `env` and `headers` values named for a key, a token or a
 /// password, with their variables filled in from `var`; of
 /// `Bearer <token>`, the token.
-fn secret_values(config: &Config, var: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
+fn secret_values(
+    servers: &BTreeMap<String, Result<ServerConfig, String>>,
+    var: &dyn Fn(&str) -> Option<String>,
+) -> Vec<String> {
     let secret = |name: &String| {
         let name = name.to_lowercase();
         SECRET_NAMES.iter().any(|word| name.contains(word))
     };
-    config
-        .servers
+    servers
         .values()
+        .flatten()
         .flat_map(|server| server.env.iter().chain(&server.headers))
         .filter(|(name, _)| secret(name))
         // A server with a variable unset never starts, so none of it goes out.
@@ -380,6 +439,334 @@ pub fn ready(limit: Duration) {
     wait_started(limit);
 }
 
+/// Every configured server, in name order.
+pub fn status() -> Vec<ServerStatus> {
+    start();
+    let Ok(slots) = slots().lock() else {
+        return Vec::new();
+    };
+    let mut all: Vec<ServerStatus> = slots
+        .iter()
+        .map(|(name, slot)| {
+            let config = &slot.config;
+            let by_url = !config.url.trim().is_empty();
+            let target = match by_url {
+                true => config.url.trim().to_owned(),
+                false => std::iter::once(config.command.trim())
+                    .chain(config.args.iter().map(String::as_str))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            };
+            let mut env: Vec<String> = config.env.keys().cloned().collect();
+            env.sort();
+            let mut headers: Vec<String> = config.headers.keys().cloned().collect();
+            headers.sort();
+            ServerStatus {
+                name: name.clone(),
+                transport: if by_url { "http" } else { "stdio" },
+                target,
+                state: slot.state,
+                tools: slot.tools.len(),
+                error: slot.error.clone(),
+                env,
+                headers,
+                log: slot
+                    .log
+                    .lock()
+                    .map(|mut log| crate::tools::strip_escapes(&crate::jobs::text(&mut log)))
+                    .unwrap_or_default(),
+            }
+        })
+        .collect();
+    // Scrubbed with the lock let go, since finding the saved keys reads files.
+    drop(slots);
+    for server in &mut all {
+        if !server.log.is_empty() {
+            server.log = crate::redact::scrub_cut(&server.log, true);
+        }
+        if let Some(error) = &mut server.error {
+            *error = crate::redact::scrub(error, true);
+        }
+    }
+    all
+}
+
+/// Why `mcp.json` itself will not read, if it will not; then no server
+/// starts from it.
+pub fn unreadable() -> Option<String> {
+    read_config(&config_path()).err()
+}
+
+/// Stop a server and start it again from what `mcp.json` says of it now, so
+/// a fixed typo takes without a restart. Returns once it is starting.
+pub fn reconnect(name: &str) -> Result<(), String> {
+    start();
+    let server = entry(name)?;
+    if server.as_ref().is_ok_and(|server| server.disabled) {
+        return Err(format!("{name} is switched off; enable it first."));
+    }
+    open(name, server);
+    Ok(())
+}
+
+/// Switch a server on or off in `mcp.json`, and start or stop it to match.
+pub fn set_enabled(name: &str, on: bool) -> Result<(), String> {
+    start();
+    edit(&config_path(), |servers| switch(servers, name, on))?;
+    open(name, entry(name)?);
+    Ok(())
+}
+
+/// Add a server to `mcp.json` under a name not yet taken, as the JSON its
+/// entry should hold.
+pub fn add_server(name: &str, server: Value) -> Result<(), String> {
+    edit(&config_path(), |servers| add(servers, name, server))
+}
+
+/// Take a server out of `mcp.json`, leaving the others as they are.
+pub fn remove_server(name: &str) -> Result<(), String> {
+    edit(&config_path(), |servers| remove(servers, name))
+}
+
+/// Where the servers are listed.
+pub fn config_path() -> std::path::PathBuf {
+    crate::chat::data_dir().join("mcp.json")
+}
+
+fn switch(servers: &mut Map<String, Value>, name: &str, on: bool) -> Result<(), String> {
+    let Some(Value::Object(server)) = servers.get_mut(name) else {
+        return Err(missing(name));
+    };
+    match on {
+        true => server.remove("disabled"),
+        false => server.insert("disabled".into(), Value::Bool(true)),
+    };
+    Ok(())
+}
+
+fn add(servers: &mut Map<String, Value>, name: &str, server: Value) -> Result<(), String> {
+    ServerConfig::deserialize(&server).map_err(|e| format!("That server will not read: {e}"))?;
+    if servers.contains_key(name) {
+        return Err(format!(
+            "{name} is already in mcp.json; `letronna mcp remove {name}` first."
+        ));
+    }
+    servers.insert(name.to_owned(), server);
+    Ok(())
+}
+
+fn remove(servers: &mut Map<String, Value>, name: &str) -> Result<(), String> {
+    if !servers.contains_key(name) {
+        return Err(missing(name));
+    }
+    // Rebuilt rather than removed from: where the map keeps the file's
+    // order, `remove` would move the last server into the gap.
+    *servers = std::mem::take(servers)
+        .into_iter()
+        .filter(|(key, _)| key != name)
+        .collect();
+    Ok(())
+}
+
+fn missing(name: &str) -> String {
+    format!("There is no {name} in mcp.json.")
+}
+
+fn slots() -> &'static Mutex<BTreeMap<String, Slot>> {
+    static SLOTS: OnceLock<Mutex<BTreeMap<String, Slot>>> = OnceLock::new();
+    SLOTS.get_or_init(Default::default)
+}
+
+/// The file as JSON: nothing when there is none, and an error a person can
+/// act on when it will not parse or is not an object.
+fn read_config(path: &std::path::Path) -> Result<Value, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(json!({})),
+        Err(e) => return Err(format!("Cannot read {}: {e}", path.display())),
+    };
+    let config: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("{} will not parse: {e}", path.display()))?;
+    match &config["mcpServers"] {
+        _ if !config.is_object() => Err(format!("{} is not a JSON object.", path.display())),
+        Value::Object(_) | Value::Null => Ok(config),
+        _ => Err(format!(
+            "mcpServers in {} is not an object.",
+            path.display()
+        )),
+    }
+}
+
+/// The servers `mcp.json` lists, each read on its own so one bad entry
+/// shows as failed rather than hiding the rest.
+fn configured() -> Result<BTreeMap<String, Result<ServerConfig, String>>, String> {
+    Ok(entries(&read_config(&config_path())?))
+}
+
+fn entries(config: &Value) -> BTreeMap<String, Result<ServerConfig, String>> {
+    config["mcpServers"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(name, server)| {
+            let read = ServerConfig::deserialize(server)
+                .map_err(|e| format!("Its entry in mcp.json will not read: {e}"));
+            (name.clone(), read)
+        })
+        .collect()
+}
+
+/// One server's entry as `mcp.json` has it now.
+fn entry(name: &str) -> Result<Result<ServerConfig, String>, String> {
+    configured()?.remove(name).ok_or_else(|| missing(name))
+}
+
+/// Change the servers in `mcp.json` under its lock, as JSON, writing nothing
+/// when `change` refuses.
+fn edit(
+    path: &std::path::Path,
+    change: impl FnOnce(&mut Map<String, Value>) -> Result<(), String>,
+) -> Result<(), String> {
+    // Checked first: one that will not parse is the user's to fix, not to
+    // be moved aside and started over.
+    read_config(path)?;
+    if let Some(folder) = path.parent() {
+        std::fs::create_dir_all(folder).map_err(|e| format!("{}: {e}", folder.display()))?;
+    }
+    // Written where a link points, so a link to another app's config stays
+    // one rather than being replaced by a copy.
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    let mut outcome = Ok(());
+    crate::state::update::<Value>(&target, |config| {
+        let not_object = || Err(format!("{} is not a JSON object.", path.display()));
+        let mut file = match config {
+            Value::Null => Map::new(),
+            Value::Object(file) => file.clone(),
+            _ => {
+                outcome = not_object();
+                return;
+            }
+        };
+        let mut servers = match file.get("mcpServers") {
+            None | Some(Value::Null) => Map::new(),
+            Some(Value::Object(servers)) => servers.clone(),
+            Some(_) => {
+                outcome = not_object();
+                return;
+            }
+        };
+        outcome = change(&mut servers);
+        if outcome.is_ok() {
+            file.insert("mcpServers".into(), Value::Object(servers));
+            *config = Value::Object(file);
+        }
+    })?;
+    outcome
+}
+
+/// Put a server in its slot, stopping whatever ran there before, and start
+/// it on a thread of its own unless it is switched off or will not read.
+fn open(name: &str, server: Result<ServerConfig, String>) {
+    let Ok(mut slots) = slots().lock() else {
+        return;
+    };
+    let slot = slots.entry(name.to_owned()).or_default();
+    slot.stop();
+    slot.run += 1;
+    slot.error = None;
+    let config = match server {
+        Ok(config) => config,
+        Err(error) => {
+            // Not the last good one's command, shown as if it were this.
+            slot.config = ServerConfig::default();
+            slot.state = State::Failed;
+            slot.error = Some(error);
+            return;
+        }
+    };
+    slot.config = config.clone();
+    if config.disabled {
+        slot.state = State::Disabled;
+        return;
+    }
+    if config.command.trim().is_empty() && config.url.trim().is_empty() {
+        slot.state = State::Failed;
+        slot.error = Some("Its entry has neither a command nor a url.".into());
+        return;
+    }
+    slot.state = State::Starting;
+    // What the last run printed stays, marked off from what this one does.
+    if let Ok(mut log) = slot.log.lock()
+        && !log.is_empty()
+    {
+        crate::jobs::append(&mut log, b"\n--- started again ---\n");
+    }
+    let run = slot.run;
+    drop(slots);
+    begin_start();
+    let name = name.to_owned();
+    std::thread::spawn(move || {
+        let outcome = launch(&name, &config, run);
+        settle(&name, run, outcome);
+        end_start();
+    });
+}
+
+/// Change the slot for this start of a server, unless it has been started
+/// again or switched off since; None when it has.
+fn with_run<T>(name: &str, run: u64, change: impl FnOnce(&mut Slot) -> T) -> Option<T> {
+    let mut slots = slots().lock().ok()?;
+    slots
+        .get_mut(name)
+        .filter(|slot| slot.run == run)
+        .map(change)
+}
+
+/// Record how a start went.
+fn settle(name: &str, run: u64, outcome: Result<Vec<Arc<dyn Tool>>, String>) {
+    with_run(name, run, |slot| match outcome {
+        Ok(tools) => {
+            slot.state = State::Connected;
+            slot.tools = tools;
+        }
+        Err(error) => {
+            // One that never answered may still be running.
+            slot.stop();
+            slot.state = State::Failed;
+            slot.error = Some(error);
+        }
+    });
+}
+
+/// Mark a server run here as stopped once its stderr closes, which it does
+/// as the process ends. One still starting hears of it from `connect`.
+fn gone(name: &str, run: u64) {
+    with_run(name, run, |slot| {
+        if slot.state == State::Connected {
+            slot.stop();
+            slot.state = State::Failed;
+            slot.error = Some(format!("{name} stopped."));
+        }
+    });
+}
+
+/// Keep what a server prints on stderr until it closes.
+fn keep_log(mut from: impl Read, log: &Mutex<VecDeque<u8>>) {
+    let mut chunk = [0; 4096];
+    loop {
+        match from.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+                if let Ok(mut log) = log.lock() {
+                    crate::jobs::append(&mut log, &chunk[..read]);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+}
+
 /// How many servers are still starting, and a signal as each is done.
 fn starting() -> &'static (Mutex<usize>, Condvar) {
     static STARTING: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new();
@@ -407,13 +794,8 @@ fn wait_started(limit: Duration) {
     }
 }
 
-fn registry() -> &'static Mutex<Vec<Arc<dyn Tool>>> {
-    static KNOWN: OnceLock<Mutex<Vec<Arc<dyn Tool>>>> = OnceLock::new();
-    KNOWN.get_or_init(Default::default)
-}
-
 /// Start one server and list its tools.
-fn launch(name: &str, config: &ServerConfig) -> Result<Vec<Arc<dyn Tool>>, String> {
+fn launch(name: &str, config: &ServerConfig, run: u64) -> Result<Vec<Arc<dyn Tool>>, String> {
     let config = &config
         .expanded(&|var| std::env::var(var).ok())
         .map_err(|e| format!("{name}: {e}"))?;
@@ -421,13 +803,31 @@ fn launch(name: &str, config: &ServerConfig) -> Result<Vec<Arc<dyn Tool>>, Strin
         return reach(name, config);
     }
     let mut child = spawn(config, &crate::chat::data_dir())?;
-    let (Some(stdin), Some(stdout), Some(mut stderr)) =
+    let (Some(stdin), Some(stdout), Some(stderr)) =
         (child.stdin.take(), child.stdout.take(), child.stderr.take())
     else {
         return Err(format!("{name} has no pipes to talk over."));
     };
+    // Held in its slot at once, so a restart while it is still starting
+    // stops this one rather than leaving it to run.
+    let mut child = Some(child);
+    let log = with_run(name, run, |slot| {
+        slot.child = child.take();
+        slot.log.clone()
+    });
+    let Some(log) = log else {
+        if let Some(mut child) = child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        return Err(format!("{name} was started again."));
+    };
     // A server that fills its stderr pipe stops until someone reads it.
-    std::thread::spawn(move || std::io::copy(&mut stderr, &mut std::io::sink()));
+    let who = name.to_owned();
+    std::thread::spawn(move || {
+        keep_log(stderr, &log);
+        gone(&who, run);
+    });
     connect(name, config, stdout, stdin)
 }
 
@@ -1360,7 +1760,7 @@ mod tests {
             headers: HashMap::from([("Authorization".into(), "Bearer key-1".into())]),
             ..ServerConfig::default()
         };
-        let tools = launch("far", &config).unwrap();
+        let tools = launch("far", &config, 0).unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name(), "mcp__far__echo");
         let said = tools[0]
@@ -1414,7 +1814,7 @@ mod tests {
             url,
             ..ServerConfig::default()
         };
-        let refused = launch("locked", &config).err().unwrap();
+        let refused = launch("locked", &config, 0).err().unwrap();
         assert!(
             refused.contains("HTTP 401") && refused.contains("headers"),
             "{refused}"
@@ -1552,7 +1952,7 @@ mod tests {
             url,
             ..ServerConfig::default()
         };
-        let tools = launch("streams", &config).unwrap();
+        let tools = launch("streams", &config, 0).unwrap();
         let said = tools[0].run(&json!({}), &ToolContext::default());
         assert_eq!(said.unwrap(), "answered");
     }
@@ -1604,7 +2004,7 @@ mod tests {
             url: restarting(state.clone()),
             ..ServerConfig::default()
         };
-        let tools = launch("restarts", &config).unwrap();
+        let tools = launch("restarts", &config, 0).unwrap();
         *state.live.lock().unwrap() = None;
         let said = tools[0].run(&json!({}), &ToolContext::default());
         assert_eq!(said.unwrap(), "called in s-2");
@@ -1622,7 +2022,7 @@ mod tests {
             url: restarting(state.clone()),
             ..ServerConfig::default()
         };
-        let tools = launch("forgets", &config).unwrap();
+        let tools = launch("forgets", &config, 0).unwrap();
         state.forgets.store(true, Ordering::SeqCst);
         *state.live.lock().unwrap() = None;
         let failed = tools[0]
@@ -1651,7 +2051,7 @@ mod tests {
             headers: HashMap::from([("X-Api-Key".into(), "key-3".into())]),
             ..ServerConfig::default()
         };
-        let refused = launch("moved", &config).err().unwrap();
+        let refused = launch("moved", &config, 0).err().unwrap();
         assert!(
             refused.contains("HTTP 307") && refused.contains("not followed"),
             "{refused}"
@@ -1673,7 +2073,7 @@ mod tests {
             headers: HashMap::from([("X-Api-Key".into(), "key-2".into())]),
             ..ServerConfig::default()
         };
-        launch("ends", &config).unwrap();
+        launch("ends", &config, 0).unwrap();
         stop_all();
         let deleted = std::iter::from_fn(|| asked.recv_timeout(Duration::from_secs(5)).ok())
             .find(|head| head.starts_with("delete "))
@@ -1700,7 +2100,7 @@ mod tests {
             timeout_ms: Some(2_000),
             ..ServerConfig::default()
         };
-        let tools = launch("slow", &config).unwrap();
+        let tools = launch("slow", &config, 0).unwrap();
         let said = tools[0].run(&json!({"ms": 1_000}), &ToolContext::default());
         assert_eq!(said.unwrap(), "done");
         let asked = std::time::Instant::now();
@@ -1719,7 +2119,7 @@ mod tests {
             url: "https://mcp.deepwiki.com/mcp".into(),
             ..ServerConfig::default()
         };
-        let tools = launch("deepwiki", &config).unwrap();
+        let tools = launch("deepwiki", &config, 0).unwrap();
         assert!(
             tools
                 .iter()
@@ -1888,18 +2288,15 @@ mod tests {
             "mcp__git_hub__list_repos"
         );
         assert_eq!(tool_name("s", &"x".repeat(100)).len(), 64);
-        let config: Config = serde_json::from_str(
-            r#"{"mcpServers": {"fs": {"command": "npx", "args": ["-y", "pkg"], "autoApprove": ["read"]},
-                               "web": {"url": "https://example.com/mcp"}}}"#,
-        )
-        .unwrap();
-        assert_eq!(config.servers["fs"].args, ["-y", "pkg"]);
-        assert_eq!(
-            config.servers["fs"].auto_approve,
-            AutoApprove::Names(vec!["read".into()])
-        );
+        let servers = entries(&json!({"mcpServers": {
+            "fs": {"command": "npx", "args": ["-y", "pkg"], "autoApprove": ["read"]},
+            "web": {"url": "https://example.com/mcp"},
+        }}));
+        let fs = servers["fs"].as_ref().unwrap();
+        assert_eq!(fs.args, ["-y", "pkg"]);
+        assert_eq!(fs.auto_approve, AutoApprove::Names(vec!["read".into()]));
         // A server reached by URL has no command, and is passed over.
-        assert!(config.servers["web"].command.is_empty());
+        assert!(servers["web"].as_ref().unwrap().command.is_empty());
     }
 
     #[test]
@@ -1913,9 +2310,10 @@ mod tests {
             ],
             ..Default::default()
         };
-        let tools = launch("everything", &config).unwrap();
-        let echo = tools
-            .iter()
+        open("everything", Ok(config));
+        ready(START_TIME);
+        let echo = tools()
+            .into_iter()
             .find(|t| t.name() == "mcp__everything__echo")
             .expect("the everything server has an echo tool");
         let said = echo
@@ -1926,7 +2324,7 @@ mod tests {
 
     #[test]
     fn only_values_named_as_secrets_are_hidden() {
-        let config: Config = serde_json::from_value(json!({"mcpServers": {
+        let config = entries(&json!({"mcpServers": {
             "files": {"command": "files-server", "env": {
                 "ROOT_FOLDER": "/home/someone/projects",
                 "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_0123456789abcdefghij",
@@ -1938,8 +2336,7 @@ mod tests {
                 "Authorization": "Bearer remote-0123456789abcdef",
                 "Accept": "application/json-seq"
             }}
-        }}))
-        .unwrap();
+        }}));
         let mut found = secret_values(&config, &|_| None);
         found.sort();
         assert_eq!(
@@ -1959,6 +2356,32 @@ mod tests {
             "EMPTY" => Some(String::new()),
             "HOME" => Some("/home/someone".into()),
             _ => None,
+        }
+    }
+
+    /// A server that is only a script in the platform's shell.
+    fn shell(script: &str) -> ServerConfig {
+        let (command, flag) = if cfg!(windows) {
+            ("cmd", "/C")
+        } else {
+            ("sh", "-c")
+        };
+        ServerConfig {
+            command: command.into(),
+            args: vec![flag.into(), script.into()],
+            ..Default::default()
+        }
+    }
+
+    /// One server's status once `done` holds, or after five seconds.
+    fn settled(name: &str, done: impl Fn(&ServerStatus) -> bool) -> ServerStatus {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let now = status().into_iter().find(|s| s.name == name).unwrap();
+            if done(&now) || std::time::Instant::now() > deadline {
+                return now;
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 
@@ -1986,7 +2409,7 @@ mod tests {
             env: HashMap::from([("KEY".into(), "${LETRONNA_TEST_NEVER_SET}".into())]),
             ..Default::default()
         };
-        let Err(error) = launch("files", &config) else {
+        let Err(error) = launch("files", &config, 0) else {
             panic!("a server started without its variable");
         };
         assert!(
@@ -2018,15 +2441,14 @@ mod tests {
 
     #[test]
     fn a_secret_given_as_a_variable_is_hidden_as_its_value() {
-        let config: Config = serde_json::from_value(json!({"mcpServers": {
+        let config = entries(&json!({"mcpServers": {
             "remote": {"url": "https://mcp.example.com",
                 "headers": {"Authorization": "Bearer ${TOKEN}"}},
             "files": {"command": "files-server", "env": {
                 "API_KEY": "${UNSET_KEY:-default-key-0123456789}",
                 "OTHER_TOKEN": "${UNSET_TOKEN}"
             }}
-        }}))
-        .unwrap();
+        }}));
         let mut found = secret_values(&config, &var);
         found.sort();
         assert_eq!(found, ["default-key-0123456789", "tok-0123456789abcdef"]);
@@ -2199,5 +2621,152 @@ mod tests {
         let error = spawn(&gone, &base).unwrap_err();
         assert!(error.contains("no such folder"), "{error}");
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_links_to_another_apps_config_stays_a_link() {
+        let dir = scratch("linked");
+        let theirs = dir.join("claude_desktop_config.json");
+        std::fs::write(&theirs, r#"{"mcpServers": {}, "theirs": true}"#).unwrap();
+        let path = dir.join("mcp.json");
+        std::os::unix::fs::symlink(&theirs, &path).unwrap();
+        edit(&path, |s| add(s, "a", json!({"command": "x"}))).unwrap();
+        assert!(path.symlink_metadata().unwrap().file_type().is_symlink());
+        let file = read_config(&theirs).unwrap();
+        assert_eq!(file["theirs"], true);
+        assert_eq!(file["mcpServers"]["a"]["command"], "x");
+    }
+
+    #[test]
+    fn a_file_that_will_not_parse_is_left_for_the_user_to_fix() {
+        let dir = scratch("broken");
+        let path = dir.join("mcp.json");
+        std::fs::write(&path, "{\"mcpServers\": {,}").unwrap();
+        let refused = edit(&path, |s| add(s, "a", json!({"command": "x"}))).unwrap_err();
+        assert!(refused.contains("will not parse"), "{refused}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"mcpServers\": {,}"
+        );
+        // No file at all is no servers, and the first one added makes it.
+        let fresh = dir.join("new").join("mcp.json");
+        edit(&fresh, |s| add(s, "a", json!({"command": "x"}))).unwrap();
+        assert_eq!(
+            read_config(&fresh).unwrap()["mcpServers"]["a"]["command"],
+            "x"
+        );
+    }
+
+    #[test]
+    fn a_server_that_cannot_start_keeps_why_and_what_it_printed() {
+        let script = if cfg!(windows) {
+            "echo no key given, not sk-0123456789abcdefghijklmnop 1>&2 & exit 3"
+        } else {
+            "echo no key given, not sk-0123456789abcdefghijklmnop >&2; exit 3"
+        };
+        open("t-crash", Ok(shell(script)));
+        let crashed = settled("t-crash", |s| {
+            s.state == State::Failed && s.log.contains("no key given")
+        });
+        assert_eq!(crashed.state, State::Failed);
+        let error = crashed.error.unwrap_or_default();
+        assert!(error.contains("stopped"), "{error}");
+        assert!(crashed.log.contains("no key given"), "{}", crashed.log);
+        // Scrubbed as a job's log is, for a screen others may see.
+        assert!(!crashed.log.contains("sk-0123"), "{}", crashed.log);
+        assert!(crashed.log.contains(crate::redact::MARKER));
+        assert_eq!((crashed.transport, crashed.tools), ("stdio", 0));
+    }
+
+    #[test]
+    fn adding_and_removing_servers_keeps_what_else_the_file_holds() {
+        let path = scratch("edits").join("mcp.json");
+        std::fs::write(
+            &path,
+            r#"{"theme": "dark", "mcpServers": {"z": {"command": "x", "cursorOnly": 1},
+                "a": {"url": "https://a"}, "m": {"command": "m"}}}"#,
+        )
+        .unwrap();
+        edit(&path, |s| {
+            add(s, "new", json!({"command": "y", "args": ["1"]}))
+        })
+        .unwrap();
+        edit(&path, |s| switch(s, "z", false)).unwrap();
+        edit(&path, |s| remove(s, "a")).unwrap();
+        let file = read_config(&path).unwrap();
+        assert_eq!(file["theme"], "dark");
+        assert_eq!(
+            file["mcpServers"]["z"],
+            json!({"command": "x", "cursorOnly": 1, "disabled": true})
+        );
+        let mut names: Vec<&String> = file["mcpServers"].as_object().unwrap().keys().collect();
+        names.sort();
+        assert_eq!(names, ["m", "new", "z"]);
+        edit(&path, |s| switch(s, "z", true)).unwrap();
+        assert!(
+            read_config(&path).unwrap()["mcpServers"]["z"]
+                .get("disabled")
+                .is_none()
+        );
+
+        // A name taken, one not there, or an entry that will not read is
+        // refused, and the file is left as it was.
+        let before = std::fs::read(&path).unwrap();
+        let taken = edit(&path, |s| add(s, "m", json!({"command": "z"}))).unwrap_err();
+        assert!(taken.contains("already"), "{taken}");
+        let gone = edit(&path, |s| remove(s, "nope")).unwrap_err();
+        assert!(gone.contains("no nope"), "{gone}");
+        let unread = edit(&path, |s| add(s, "b", json!({"args": "x"}))).unwrap_err();
+        assert!(unread.contains("will not read"), "{unread}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn one_entry_that_will_not_read_does_not_hide_the_rest() {
+        let servers = entries(&json!({"mcpServers": {
+            "bad": {"command": "x", "args": "one string"},
+            "good": {"command": "x"},
+        }}));
+        assert!(servers["good"].is_ok());
+        open("t-bad", servers["bad"].clone());
+        let bad = settled("t-bad", |_| true);
+        assert_eq!(bad.state, State::Failed);
+        assert!(bad.error.unwrap().contains("will not read"));
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        // One folder per test, reused and emptied each run.
+        let dir = std::env::temp_dir().join(format!("letronna-mcp-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    // Unix only: cmd cannot hand itself over to its child as `exec` does,
+    // and a child left behind would hold the pipes open.
+    #[cfg(unix)]
+    #[test]
+    fn starting_a_server_again_stops_the_one_still_starting() {
+        let began = std::time::Instant::now();
+        let hangs = shell("echo waiting >&2; exec sleep 30");
+        open("t-hang", Ok(hangs.clone()));
+        settled("t-hang", |s| s.log.contains("waiting"));
+        open("t-hang", Ok(hangs.clone()));
+        let again = settled("t-hang", |s| s.log.matches("waiting").count() == 2);
+        assert!(again.log.contains("--- started again ---"), "{}", again.log);
+        assert_eq!(again.state, State::Starting);
+        open(
+            "t-hang",
+            Ok(ServerConfig {
+                disabled: true,
+                ..hangs
+            }),
+        );
+        // Both runs were stopped, so neither waits out its minute to start.
+        ready(Duration::from_secs(20));
+        assert!(began.elapsed() < Duration::from_secs(15));
+        let off = settled("t-hang", |_| true);
+        assert_eq!((off.state, off.error), (State::Disabled, None));
     }
 }

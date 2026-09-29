@@ -174,6 +174,10 @@ pub fn command(
             skills(runner, rest, workspace);
             Flow::Handled
         }
+        "/mcp" => {
+            mcp_servers(rest);
+            Flow::Handled
+        }
         "/resume" => {
             resume(runner, session, workspace, rest);
             Flow::Handled
@@ -795,6 +799,81 @@ fn send_to_helper(helpers: &[Seen], rest: &str) {
         render::line(&render::dim(&format!(
             "{name} has ended, so it cannot read this. Ask Letronna to pick it back up."
         )));
+    }
+}
+
+/// The MCP servers and how each is doing, or reconnect, enable, disable or
+/// read the log of one.
+fn mcp_servers(rest: &str) {
+    use letronna_core::mcp;
+    let (verb, name) = rest.split_once(' ').unwrap_or((rest, ""));
+    let name = name.trim();
+    render::blank();
+    if !verb.is_empty() && name.is_empty() {
+        let which = format!("Which server? /mcp {verb} <name>");
+        render::said(&render::blue("●"), &render::bold(&which));
+        return;
+    }
+    let done = match verb {
+        "" => Ok(()),
+        "log" => return mcp_log(name),
+        "reconnect" => mcp::reconnect(name),
+        "enable" => mcp::set_enabled(name, true),
+        "disable" => mcp::set_enabled(name, false),
+        _ => Err(format!(
+            "/mcp {verb} is not one of reconnect, enable, disable or log."
+        )),
+    };
+    if let Err(error) = done {
+        render::line(&render::red(&error));
+        return;
+    }
+    // One just started gets as long to answer as a question asked once waits.
+    if verb == "reconnect" || verb == "enable" {
+        mcp::ready(crate::MCP_WAIT);
+    }
+    if let Some(error) = mcp::unreadable() {
+        render::line(&render::red(&error));
+    }
+    let servers = mcp::status();
+    if servers.is_empty() {
+        render::said(&render::blue("●"), &render::bold("No MCP servers"));
+        render::line(&render::dim("Add one with `letronna mcp add` in a shell."));
+        return;
+    }
+    render::said(&render::blue("●"), &render::bold("MCP servers"));
+    for server in servers.iter().filter(|s| name.is_empty() || s.name == name) {
+        render::line(&format!(
+            "{}  {}  {}",
+            render::bold(&server.name),
+            render::dim(server.transport),
+            crate::mcp::health(server)
+        ));
+    }
+    render::line(&render::dim("/mcp reconnect|enable|disable|log <name>"));
+}
+
+/// The newest of what one server printed on stderr.
+fn mcp_log(name: &str) {
+    let found = letronna_core::mcp::status()
+        .into_iter()
+        .find(|server| server.name == name);
+    let Some(server) = found else {
+        render::line(&render::red(&format!("There is no {name} in mcp.json.")));
+        return;
+    };
+    if server.log.trim().is_empty() {
+        let none = match server.transport {
+            "http" => format!("{name} runs elsewhere, so it has no log here"),
+            _ => format!("{name} has printed nothing"),
+        };
+        render::said(&render::blue("●"), &render::bold(&none));
+        return;
+    }
+    let what = format!("What {name} printed, newest last");
+    render::said(&render::blue("●"), &render::bold(&what));
+    for line in server.log.lines() {
+        render::line(&render::dim(line));
     }
 }
 
