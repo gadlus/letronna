@@ -130,8 +130,13 @@ const PIPE_GRACE: Duration = Duration::from_millis(300);
 /// an install ends with its errors, its summary and the exit code.
 const MAX_OUTPUT: usize = crate::chat::MAX_TOOL_CHARS;
 /// Bytes kept free for the line that says what was left out, which with the
-/// largest counts a `usize` can hold is still shorter than this.
+/// largest counts a `usize` can hold is still shorter than this, apart from
+/// the name of the file the whole output was saved to.
 const MARKER_ROOM: usize = 100;
+/// A saved output keeps its first this many bytes: some 600 pages of
+/// `read_file`, past anything a model reads through, while a command that
+/// prints without end costs the disk no more than this for the call.
+const SPILL_BYTES: usize = 4 * 1024 * 1024;
 const SKIP_DIRS: &[&str] = &[".git", "node_modules", "target", ".next", "dist", "build"];
 
 /// Tools contributed by enabled plugins. Kept here rather than read from the
@@ -438,19 +443,72 @@ fn run_found(tool: &dyn Tool, name: &str, args: &str, ctx: &ToolContext) -> Resu
             ));
         }
     }
-    let mut out = keep_ends(tool.run(&args, ctx).map_err(|e| e + &note)?, MAX_OUTPUT);
+    let mut out = fit(tool.run(&args, ctx).map_err(|e| e + &note)?, ctx);
     // After the cut, so the note is never the part that gets lost.
     out.push_str(&note);
     Ok(out)
 }
 
+/// `out` as it is when it fits; otherwise cut, with the whole of it saved
+/// where the model can page through it and the cut saying where.
+fn fit(out: String, ctx: &ToolContext) -> String {
+    if out.len() <= MAX_OUTPUT {
+        return out;
+    }
+    let note = match spill(&out, ctx) {
+        Some(path) if out.len() > SPILL_BYTES => format!(
+            "; its first {SPILL_BYTES} bytes are in {}, which read_file pages through",
+            path.display()
+        ),
+        Some(path) => format!(
+            "; all of it is in {}, which read_file pages through",
+            path.display()
+        ),
+        None => String::new(),
+    };
+    keep_ends(out, MAX_OUTPUT, &note)
+}
+
+/// Where the outputs cut in `conversation` are saved whole: readable from
+/// its own calls only, and removed with its session.
+pub(crate) fn results_dir(conversation: u64) -> PathBuf {
+    crate::chat::data_dir()
+        .join("results")
+        .join(conversation.to_string())
+}
+
+/// Save up to `SPILL_BYTES` of `text` for the model to read. Nothing is saved
+/// outside a session, where nothing would ever remove it, or in a shared
+/// chat, where `read_file` is out of reach.
+fn spill(text: &str, ctx: &ToolContext) -> Option<PathBuf> {
+    static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if ctx.conversation == 0 || ctx.shared() {
+        return None;
+    }
+    let dir = results_dir(ctx.conversation);
+    std::fs::create_dir_all(&dir).ok()?;
+    // Not the model's call id: some servers repeat theirs every turn, and it
+    // is no safe file name. Calls at the same moment differ in the count, and
+    // the window and the terminal in the process.
+    let millis = std::time::UNIX_EPOCH.elapsed().ok()?.as_millis();
+    let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = dir.join(format!("{millis}-{}-{call}.txt", std::process::id()));
+    let kept = &text[..text.floor_char_boundary(SPILL_BYTES)];
+    if crate::store::write_private(&path, kept.as_bytes()).is_err() {
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
+    Some(path)
+}
+
 /// `text` as it is when it fits in `max` bytes; otherwise its first and last
-/// whole lines, with a line between them saying how much was left out.
-fn keep_ends(text: String, max: usize) -> String {
+/// whole lines, with a line between them saying how much was left out and
+/// ending in `note`.
+fn keep_ends(text: String, max: usize, note: &str) -> String {
     if text.len() <= max {
         return text;
     }
-    let room = max.saturating_sub(MARKER_ROOM);
+    let room = max.saturating_sub(MARKER_ROOM + note.len());
     let head = line_end(&text, room / 4);
     let tail = line_start(&text, text.len() - (room - room / 4));
     let left = &text[head..tail];
@@ -462,7 +520,7 @@ fn keep_ends(text: String, max: usize) -> String {
         "\n"
     };
     format!(
-        "{}{gap}… [{lines} {unit} ({} bytes) left out]\n{}",
+        "{}{gap}… [{lines} {unit} ({} bytes) left out{note}]\n{}",
         &text[..head],
         left.len(),
         &text[tail..]
@@ -1390,6 +1448,11 @@ pub(crate) fn resolve(raw: &str, ctx: &ToolContext) -> Result<PathBuf, String> {
     let base = ctx.workspace.clone().or_else(home).unwrap_or_default();
     let joined = base.join(raw);
     let path = std::fs::canonicalize(&joined).map_err(|_| format!("`{raw}` does not exist."))?;
+    // Checked first: the saved outputs sit in Letronna's own folder, which
+    // need not be under home either. Writing goes through `resolve_write`.
+    if own_result(&path, ctx) {
+        return Ok(path);
+    }
     let allowed = [ctx.workspace.clone(), home()]
         .into_iter()
         .flatten()
@@ -1411,6 +1474,14 @@ pub(crate) fn resolve(raw: &str, ctx: &ToolContext) -> Result<PathBuf, String> {
         ));
     }
     Ok(path)
+}
+
+/// Whether `path` is an output saved whole when it was cut in this same
+/// conversation. Another conversation's stay private like the rest.
+fn own_result(path: &Path, ctx: &ToolContext) -> bool {
+    ctx.conversation != 0
+        && std::fs::canonicalize(results_dir(ctx.conversation))
+            .is_ok_and(|dir| path.starts_with(dir))
 }
 
 /// Whether `path` lies in Letronna's own folder, `data`, which holds the API
@@ -2977,7 +3048,7 @@ mod tests {
             .map(|n| format!("row {n} {}", "=".repeat(n % 40)))
             .collect();
         let text = lines.join("\n");
-        let out = keep_ends(text, 2_000);
+        let out = keep_ends(text, 2_000, "");
         let kept: Vec<&str> = out.lines().filter(|l| !l.starts_with("… [")).collect();
         assert!(kept.len() > 10, "{out}");
         for line in kept {
@@ -2989,7 +3060,7 @@ mod tests {
     fn long_output_keeps_more_of_its_end_and_says_what_was_left_out() {
         let lines: Vec<String> = (1..=5000).map(|n| format!("line {n}")).collect();
         let text = lines.join("\n") + "\n[exit code 3]";
-        let out = keep_ends(text.clone(), MAX_OUTPUT);
+        let out = keep_ends(text.clone(), MAX_OUTPUT, "");
         assert!(out.len() <= MAX_OUTPUT, "{}", out.len());
         assert!(out.starts_with("line 1\nline 2\n"), "{out}");
         assert!(out.ends_with("line 5000\n[exit code 3]"), "{out}");
@@ -3000,5 +3071,143 @@ mod tests {
         let left = text.len() - head.len() - tail.len();
         let missing = text.lines().count() - head.lines().count() - tail.lines().count();
         assert_eq!(marker, format!("{missing} lines ({left} bytes) left out"));
+    }
+
+    #[test]
+    fn short_output_comes_back_as_it_was() {
+        assert_eq!(keep_ends("a\nb\n".into(), 100, ""), "a\nb\n");
+        let full = "x".repeat(100);
+        assert_eq!(keep_ends(full.clone(), 100, ""), full);
+    }
+
+    #[test]
+    fn one_huge_line_is_cut_inside_rather_than_dropped() {
+        let out = keep_ends("x".repeat(1_000_000), MAX_OUTPUT, "");
+        assert!(out.len() <= MAX_OUTPUT, "{}", out.len());
+        let (head, rest) = out.split_once("\n… [1 line (").unwrap();
+        let (_, tail) = rest.split_once("]\n").unwrap();
+        assert!(head.len() > 1_000 && tail.len() > 3 * 1_000, "{out}");
+    }
+
+    #[test]
+    fn a_cut_never_splits_a_character() {
+        // Lossily decoded bytes and wide characters, cut at every offset.
+        let bad = String::from_utf8_lossy(&[b'a', 0xff, 0xfe, b'\n']).into_owned();
+        let text = format!("{}{}", bad.repeat(50), "é日🙂".repeat(200));
+        for max in 150..400 {
+            let out = keep_ends(text.clone(), max, "");
+            assert!(out.len() <= max && out.contains(" left out]\n"), "{max}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_command_with_a_long_output_keeps_its_exit_code() {
+        let ctx = ToolContext {
+            workspace: Some(std::env::temp_dir()),
+            ..Default::default()
+        };
+        let out = run(
+            "run_command",
+            r#"{"command":"seq 1 20000; echo failed >&2; exit 3"}"#,
+            &ctx,
+        )
+        .unwrap();
+        assert!(out.len() <= MAX_OUTPUT, "{}", out.len());
+        assert!(out.starts_with("1\n2\n"), "{out}");
+        assert!(
+            out.ends_with("20000\n\n[stderr]\nfailed\n\n[exit code 3]"),
+            "{out}"
+        );
+    }
+
+    /// A data folder of its own, set as `AGENT_DATA_DIR` while the guard is
+    /// held, with a project folder inside it.
+    fn data_folder(name: &str) -> (std::sync::MutexGuard<'static, ()>, PathBuf) {
+        let turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("letronna-spill-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("project")).unwrap();
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        (turn, dir)
+    }
+
+    fn in_conversation(conversation: u64, dir: &Path) -> ToolContext {
+        ToolContext {
+            workspace: Some(dir.join("project")),
+            conversation,
+            ..Default::default()
+        }
+    }
+
+    fn long_text() -> String {
+        (1..=5000).map(|n| format!("line {n}\n")).collect()
+    }
+
+    /// The file a cut output names as holding all of it.
+    fn saved_in(out: &str) -> PathBuf {
+        let (_, rest) = out.split_once("; all of it is in ").unwrap();
+        PathBuf::from(rest.split_once(", which read_file").unwrap().0)
+    }
+
+    #[test]
+    fn a_cut_output_is_saved_whole_and_read_file_pages_through_it() {
+        let (_turn, dir) = data_folder("saved");
+        let ctx = in_conversation(7, &dir);
+        assert_eq!(fit("short\n".into(), &ctx), "short\n");
+        assert!(!results_dir(7).exists(), "saved an output that was not cut");
+
+        let out = fit(long_text(), &ctx);
+        assert!(out.len() <= MAX_OUTPUT, "{}", out.len());
+        let path = saved_in(&out);
+        assert!(path.starts_with(dir.join("results").join("7")), "{path:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), long_text());
+        let raw = path.to_str().unwrap();
+        let page = run(
+            "read_file",
+            &json!({"path": raw, "offset": 2500, "limit": 2}).to_string(),
+            &ctx,
+        )
+        .unwrap();
+        assert!(
+            page.starts_with("2500|line 2500\n2501|line 2501\n"),
+            "{page}"
+        );
+
+        // Outside a session nothing would remove it, so nothing is saved.
+        let out = fit(long_text(), &ToolContext::default());
+        assert!(out.contains(" left out]\n") && !out.contains("all of it"));
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_saved_output_is_never_written_or_read_from_another_conversation() {
+        let (_turn, dir) = data_folder("private");
+        let path = saved_in(&fit(long_text(), &in_conversation(7, &dir)));
+        let raw = path.to_str().unwrap();
+        let write = json!({"path": raw, "content": "changed"}).to_string();
+        let read = json!({"path": raw}).to_string();
+
+        // A project folder holding Letronna's own reaches everything but
+        // what is private, so it shows the carve-out is for reading only, and
+        // for the conversation that saved the output only.
+        let holding = |conversation| ToolContext {
+            workspace: Some(dir.clone()),
+            conversation,
+            ..Default::default()
+        };
+        let refused = run("write_file", &write, &in_conversation(7, &dir)).unwrap_err();
+        assert!(refused.contains("outside the project"), "{refused}");
+        let refused = run("write_file", &write, &holding(7)).unwrap_err();
+        assert!(refused.contains("own folder"), "{refused}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), long_text());
+        assert!(run("read_file", &read, &holding(7)).is_ok());
+        for other in [8, 0] {
+            let refused = run("read_file", &read, &holding(other)).unwrap_err();
+            assert!(refused.contains("own folder"), "{refused}");
+        }
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 }
