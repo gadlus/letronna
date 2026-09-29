@@ -78,7 +78,13 @@ impl AgentDef {
     /// names it, and otherwise when there is no `tools` list, the list names
     /// it, or it is an MCP server's that need not be named.
     pub fn allows(&self, tool: &str) -> bool {
-        if self.disallowed.iter().any(|name| name == tool) {
+        // A patch writes and edits files, so a type kept from either is kept
+        // from it.
+        let patch = tool == crate::patch::APPLY_PATCH;
+        let kept = |name: &String| {
+            name == tool || (patch && matches!(name.as_str(), "write_file" | "edit_file"))
+        };
+        if self.disallowed.iter().any(kept) {
             return false;
         }
         (tool.starts_with("mcp__") && !self.mcp_by_name)
@@ -508,6 +514,20 @@ mod tests {
         let ours = parse(text, "checker", false).unwrap();
         assert!(!ours.allows("read_file"));
         assert!(ours.allows("mcp__docs__look_up"));
+    }
+
+    #[test]
+    fn a_type_kept_from_writing_or_editing_is_kept_from_patching() {
+        let def = |disallowed: &str| {
+            let text = format!("---\nname: looker\ndisallowedTools: {disallowed}\n---\nLook.");
+            parse(&text, "looker", true).unwrap()
+        };
+        assert!(!def("Write").allows("apply_patch"));
+        assert!(!def("Edit").allows("apply_patch"));
+        assert!(def("Bash").allows("apply_patch"));
+        // A type with a list of its own gets a patch only when it names one.
+        let listed = parse("---\ntools: Read, Edit\n---\n", "listed", true).unwrap();
+        assert!(!listed.allows("apply_patch"));
     }
 
     #[test]

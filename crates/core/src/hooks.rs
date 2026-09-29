@@ -231,6 +231,11 @@ impl Matcher {
 
     /// Whether the group runs for `name`, or for Claude Code's name for it.
     fn fits(&self, name: &str) -> bool {
+        // A patch writes and edits files, so what guards those guards it.
+        let patch = name == crate::patch::APPLY_PATCH;
+        if patch && (self.fits("write_file") || self.fits("edit_file")) {
+            return true;
+        }
         let fits = |name: &str| match self {
             Self::All => true,
             Self::Names(names) => names.iter().any(|n| n == name),
@@ -1228,13 +1233,15 @@ mod tests {
     }
 
     #[test]
-    fn a_matcher_is_a_name_a_list_or_a_regular_expression() {
+    fn a_matcher_is_a_name_a_list_or_a_regular_expression_and_a_patch_is_an_edit() {
         let fits = |matcher: &str, name: &str| Matcher::of(matcher).unwrap().fits(name);
         assert!(fits("", "read_file") && fits("*", "run_command"));
         assert!(fits("run_command", "run_command") && !fits("run", "run_command"));
         assert!(fits("Bash", "run_command") && !fits("Bash", "read_file"));
         assert!(fits("Edit|Write", "edit_file") && fits("Edit|Write", "write_file"));
         assert!(!fits("Edit|Write", "read_file"));
+        assert!(fits("Edit", "apply_patch") && fits("write_file", "apply_patch"));
+        assert!(!fits("Bash", "apply_patch"));
         assert!(fits("^web_", "web_fetch") && fits("Web.*", "web_fetch"));
         assert!(!fits("mcp__.*", "run_command"));
         assert!(Matcher::of("(").is_err());

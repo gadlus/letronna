@@ -427,6 +427,7 @@ fn apply(actions: &[Action], ctx: &ToolContext) -> Result<String, String> {
             }
             Action::Delete { path: raw } => {
                 let path = target(raw, ctx, &mut claimed)?;
+                writable(&path, raw)?;
                 let (before, mark) = batch.open(&path, raw).map_err(|e| missing(&path, raw, e))?;
                 steps.push(Step::Remove {
                     path,
@@ -442,6 +443,7 @@ fn apply(actions: &[Action], ctx: &ToolContext) -> Result<String, String> {
                 hunks,
             } => {
                 let path = target(raw, ctx, &mut claimed)?;
+                writable(&path, raw)?;
                 let (before, mark) = batch.open(&path, raw).map_err(|e| missing(&path, raw, e))?;
                 let after = patched(&before, hunks, raw)?;
                 let Some(to) = to else {
@@ -523,6 +525,18 @@ fn target(raw: &str, ctx: &ToolContext, claimed: &mut Vec<PathBuf>) -> Result<Pa
     }
     claimed.push(same);
     Ok(path)
+}
+
+/// Refuses a read-only file, which write_file and edit_file leave alone too,
+/// before anything is written: deleting one only needs its folder writable.
+fn writable(path: &Path, raw: &str) -> Result<(), String> {
+    if std::fs::metadata(path).is_ok_and(|meta| meta.permissions().readonly()) {
+        return Err(format!(
+            "`{raw}` is read-only, so the patch cannot change, move or delete it. \
+             Nothing was changed."
+        ));
+    }
+    Ok(())
 }
 
 /// Says a file the patch updates or deletes is not there, before the error
@@ -824,6 +838,34 @@ mod tests {
             run("edit_file", &edit.to_string(), &ctx).unwrap();
         }
         crate::filestate::forget(ctx.conversation);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_read_only_file_is_neither_deleted_nor_moved() {
+        let (dir, ctx) = project("read-only");
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+        std::fs::write(dir.join("locked.txt"), "keep\n").unwrap();
+        let locked = dir.join("locked.txt");
+        let mut perms = std::fs::metadata(&locked).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&locked, perms.clone()).unwrap();
+        for body in [
+            "*** Delete File: locked.txt",
+            "*** Update File: locked.txt\n*** Move to: free.txt",
+            "*** Update File: locked.txt\n@@\n-keep\n+changed",
+        ] {
+            let text = format!(
+                "*** Begin Patch\n*** Update File: a.txt\n@@\n-a\n+b\n{body}\n*** End Patch"
+            );
+            let err = patch(&ctx, &text).unwrap_err();
+            assert!(err.contains("`locked.txt` is read-only"), "{err}");
+            assert_eq!(read(&dir, "locked.txt"), "keep\n");
+            assert_eq!(read(&dir, "a.txt"), "a\n");
+        }
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&locked, perms).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 
