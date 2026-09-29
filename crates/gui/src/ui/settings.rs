@@ -413,7 +413,7 @@ impl Chat {
             .into_any_element(),
             "Account" => super::account::account_page(&chat, self, cx).into_any_element(),
             "Usage" => super::usage::usage_page(self.usage_report.as_ref(), cx).into_any_element(),
-            "Thinking" => thinking_page(&chat, &self.store, cx).into_any_element(),
+            "Thinking" => thinking_page(&chat, &self.store, window, cx).into_any_element(),
             "Plugins" => plugins_page(&chat, cx).into_any_element(),
             "MCP" => super::mcp::mcp_page(&chat, window, cx).into_any_element(),
             "About" => about_page(&chat, self, cx).into_any_element(),
@@ -1154,7 +1154,7 @@ fn model_page(model: &Entity<InputState>, chat: &Entity<Chat>, cx: &App) -> Div 
 /// gateway's model list, or low, medium and high when the list does not say.
 /// The one marked is what the next request sends, which for a level picked on
 /// another model is the nearest this one offers.
-fn thinking_page(chat: &Entity<Chat>, store: &Store, cx: &App) -> Div {
+fn thinking_page(chat: &Entity<Chat>, store: &Store, window: &mut Window, cx: &mut App) -> Div {
     let settings = &store.settings;
     let (gateway, model) = store.model(store.active);
     let endpoint = base_url(gateway, &settings.custom_endpoint);
@@ -1193,13 +1193,20 @@ fn thinking_page(chat: &Entity<Chat>, store: &Store, cx: &App) -> Div {
         );
     }
 
-    // A saved name whose file has gone reads as default, so it is marked so.
-    let current = letronna_core::styles::find(&settings.style).map(|s| s.name);
+    // Read as the page opens, not on every frame: the window draws again for
+    // each piece of a streamed reply, and this is a folder of files. The mark
+    // is the settings file's, as requests read it; a saved name whose file
+    // has gone reads as default, so it is marked so.
+    let shown = window.use_keyed_state("styles", cx, |_, _| {
+        let current = letronna_core::styles::current().map(|s| s.name);
+        (letronna_core::styles::all(), current.unwrap_or_default())
+    });
+    let (all, current) = shown.read(cx).clone();
     let default = (
         String::new(),
         "Default — as Letronna usually writes".to_owned(),
     );
-    let own = letronna_core::styles::all().into_iter().map(|style| {
+    let own = all.into_iter().map(|style| {
         let mut text = style.name.clone();
         if !style.about.is_empty() {
             text.push_str(&format!(" — {}", style.about));
@@ -1214,8 +1221,8 @@ fn thinking_page(chat: &Entity<Chat>, store: &Store, cx: &App) -> Div {
     });
     let mut styles = v_flex().gap_2();
     for (at, (value, text)) in std::iter::once(default).chain(own).enumerate() {
-        let active = current.as_deref().unwrap_or_default() == value;
-        let chat = chat.clone();
+        let active = current == value;
+        let (chat, shown) = (chat.clone(), shown.clone());
         styles = styles.child(
             h_flex()
                 .id(("style", at))
@@ -1236,7 +1243,8 @@ fn thinking_page(chat: &Entity<Chat>, store: &Store, cx: &App) -> Div {
                         this.store.choose_style(&value);
                         this.save();
                         cx.notify();
-                    })
+                    });
+                    shown.update(cx, |(_, current), _| current.clone_from(&value));
                 }),
         );
     }
