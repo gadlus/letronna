@@ -90,7 +90,9 @@ fn commands() -> Vec<(&'static str, Rc<dyn Action>)> {
         ("Open usage", Rc::new(super::usage::OpenUsage)),
         ("Open activity", Rc::new(OpenActivity)),
         ("Send now, into the reply", Rc::new(SendNow)),
-        ("Stop the reply", Rc::new(Dismiss)),
+        // Escape's action: it stops the reply only once nothing else is
+        // open to back out of, such as Settings or an edit.
+        ("Back out, or stop the reply", Rc::new(Dismiss)),
     ]
 }
 
