@@ -1,5 +1,5 @@
 use crate::prelude::*;
-use gpui_component::Selectable;
+use gpui_component::{Selectable, menu::PopupMenu, popover::Popover};
 use letronna_core::gate::Mode;
 
 actions!(composer, [LeaveComposer]);
@@ -381,7 +381,8 @@ impl Chat {
         )
     }
 
-    /// The session's mode, which opens the list of modes to pick from.
+    /// The session's mode, which opens the list of modes to pick from on a
+    /// click, or on Enter or Space while it has the focus.
     fn mode_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (chat, mode) = (cx.entity(), self.active_mode());
         let icon = if mode == Mode::Plan {
@@ -389,7 +390,7 @@ impl Chat {
         } else {
             AppIcon::Shield
         };
-        Button::new("mode")
+        let chip = Button::new("mode")
             .ghost()
             .xsmall()
             .tooltip(format!(
@@ -409,18 +410,59 @@ impl Chat {
                     .child(Icon::new(icon).size_3())
                     .child(mode.label()),
             )
-            .dropdown_menu(move |menu, _, _| {
-                Mode::OFFERED.into_iter().fold(menu, |menu, choice| {
-                    let chat = chat.clone();
-                    menu.item(
-                        PopupMenuItem::new(choice.label())
-                            .checked(choice == mode)
-                            .on_click(move |_, _, cx| {
-                                chat.update(cx, |this, cx| this.set_mode(choice, cx))
-                            }),
-                    )
+            // The popover opens on a mouse press only, so a key opens it here.
+            .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
+                if event.is_keyboard() {
+                    this.open_mode_menu(window, cx);
+                }
+            }));
+        Popover::new("mode-menu")
+            .appearance(false)
+            .overlay_closable(false)
+            .open(self.mode_menu.is_some())
+            .on_open_change(move |open, window, cx| {
+                chat.update(cx, |this, cx| {
+                    if *open {
+                        this.open_mode_menu(window, cx);
+                    } else {
+                        this.mode_menu = None;
+                        cx.notify();
+                    }
                 })
             })
+            .trigger(chip)
+            .when_some(self.mode_menu.clone(), |popover, menu| {
+                popover.content(move |_, _, _| menu.clone())
+            })
+    }
+
+    /// Open the list of modes with the keys in it, as the chip's popover
+    /// shows it.
+    fn open_mode_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mode_menu.is_some() {
+            return;
+        }
+        let (chat, mode) = (cx.entity(), self.active_mode());
+        let menu = PopupMenu::build(window, cx, move |menu, _, _| {
+            Mode::OFFERED.into_iter().fold(menu, |menu, choice| {
+                let chat = chat.clone();
+                menu.item(
+                    PopupMenuItem::new(choice.label())
+                        .checked(choice == mode)
+                        .on_click(move |_, _, cx| {
+                            chat.update(cx, |this, cx| this.set_mode(choice, cx))
+                        }),
+                )
+            })
+        });
+        menu.focus_handle(cx).focus(window);
+        cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| {
+            this.mode_menu = None;
+            cx.notify();
+        })
+        .detach();
+        self.mode_menu = Some(menu);
+        cx.notify();
     }
 
     pub(crate) fn composer(&self, cx: &mut Context<Self>) -> impl IntoElement {

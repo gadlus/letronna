@@ -217,6 +217,8 @@ pub(crate) struct Chat {
     /// Where the chat was scrolled to at the last draw, to tell which way
     /// it has moved since.
     pub(crate) followed_offset: Pixels,
+    /// The list of modes, while the mode chip has it open.
+    pub(crate) mode_menu: Option<Entity<gpui_component::menu::PopupMenu>>,
     pub(crate) _subscriptions: Vec<Subscription>,
 }
 
@@ -453,6 +455,7 @@ impl Chat {
             scroll: ScrollHandle::new(),
             following: true,
             followed_offset: px(0.),
+            mode_menu: None,
             _subscriptions: subscriptions,
         };
         this.load_models(window, cx);
