@@ -114,8 +114,20 @@ pub(crate) fn granted(run: u64, name: &str) -> bool {
 
 /// What a yes for the whole run on `call`'s card covers: every call of its
 /// tool, but for an upload only other uploads, as a yes to using pages is
-/// not one to send this computer's files to them.
+/// not one to send this computer's files to them. For a batch of browser
+/// steps, only batches of the same kinds of step: its card was not a yes to
+/// each step's tool, and a yes to its tool is not one to its steps.
 fn grant_name(call: &ToolCall) -> String {
+    match crate::browser::batch_calls(call) {
+        Some(Ok(steps)) => {
+            let mut kinds: Vec<String> = steps.iter().map(grant_name).collect();
+            kinds.sort();
+            kinds.dedup();
+            return format!("{} batch of {}", call.name, kinds.join(", "));
+        }
+        Some(Err(_)) => return format!("{} batch", call.name),
+        None => {}
+    }
     let upload = tools::parse_args(&call.arguments)
         .is_ok_and(|args| crate::gate::uploads(&call.name, &args));
     match upload {
@@ -361,6 +373,27 @@ pub(crate) mod tests {
         assert_eq!(grant_name(&page("click")), "use_page");
         assert_eq!(grant_name(&page("upload")), "use_page upload");
         assert_eq!(grant_name(&call("a", "write_file")), "write_file");
+    }
+
+    #[test]
+    fn a_yes_for_the_run_to_a_batch_covers_only_batches_of_the_same_steps() {
+        let batch = |steps: &str| ToolCall {
+            id: "b".into(),
+            name: "use_page".into(),
+            arguments: format!(r#"{{"action": "batch", "steps": {steps}}}"#),
+        };
+        let hovers =
+            batch(r#"[{"action": "hover", "ref": "e1"}, {"action": "click", "ref": "e2"}]"#);
+        assert_eq!(grant_name(&hovers), "use_page batch of browse, use_page");
+        // Neither a yes to use_page nor one to browse is a yes to it, nor it
+        // to them, and one with an upload among its steps is apart again.
+        let sends =
+            batch(r#"[{"action": "click", "ref": "e2"}, {"action": "upload", "ref": "e3"}]"#);
+        assert_eq!(
+            grant_name(&sends),
+            "use_page batch of use_page, use_page upload"
+        );
+        assert_eq!(grant_name(&batch("[]")), "use_page batch");
     }
 
     #[test]

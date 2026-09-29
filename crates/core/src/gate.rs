@@ -289,13 +289,64 @@ pub fn settle(call: &ToolCall, gate: &Gate, connection: &Connection, typed: &[St
     if gate.ctx.shared() {
         return decide(call, gate);
     }
-    let judge = |why: &str| judge::judge(call, why, typed, connection, gate.ctx);
+    let judge = |call: &ToolCall, why: &str| judge::judge(call, why, typed, connection, gate.ctx);
     decide_with(call, gate, Some(&judge))
 }
 
+/// The judge for a call no earlier layer settles, told why.
+type Judge<'a> = &'a dyn Fn(&ToolCall, &str) -> Verdict;
+
 /// `decide`, with the judge for what no earlier layer settles, if there is one.
-fn decide_with(call: &ToolCall, gate: &Gate, judge: Option<&dyn Fn(&str) -> Verdict>) -> Outcome {
-    let outcome = ladder(call, gate, judge);
+fn decide_with(call: &ToolCall, gate: &Gate, judge: Option<Judge>) -> Outcome {
+    match crate::browser::batch_calls(call) {
+        Some(steps) => batched(call, steps, gate, judge),
+        None => decide_one(call, gate, judge),
+    }
+}
+
+/// A batch of browser steps runs only where it would run as a call of its
+/// own and each step would run alone: the strictest of those stands. So no
+/// step gets past a refusal or a card it would have met by itself -- an
+/// upload, an action in another site's frame, a tool not allowed -- and a
+/// card, asked for any step, shows them all.
+fn batched(
+    call: &ToolCall,
+    steps: Result<Vec<ToolCall>, String>,
+    gate: &Gate,
+    judge: Option<Judge>,
+) -> Outcome {
+    let steps = match steps {
+        Ok(steps) => steps,
+        Err(why) => return Outcome::Refuse(why),
+    };
+    let mut outcome = decide_one(call, gate, judge);
+    if let Outcome::Refuse(_) = outcome {
+        return outcome;
+    }
+    for (at, step) in steps.iter().enumerate() {
+        match decide_one(step, gate, judge) {
+            Outcome::Refuse(why) => {
+                let what = tools::summary(&step.name, &step.arguments);
+                return Outcome::Refuse(format!(
+                    "Step {} of the batch ({what}) would be refused on its own, so none of it \
+                     ran: {why}",
+                    at + 1
+                ));
+            }
+            Outcome::Ask => outcome = Outcome::Ask,
+            Outcome::Run => {}
+        }
+    }
+    outcome
+}
+
+/// `decide_with` for a call that is not a batch.
+fn decide_one(call: &ToolCall, gate: &Gate, judge: Option<Judge>) -> Outcome {
+    let judged = judge.map(|judge| move |why: &str| judge(call, why));
+    let judged = judged
+        .as_ref()
+        .map(|judged| judged as &dyn Fn(&str) -> Verdict);
+    let outcome = ladder(call, gate, judged);
     // Layer 3's Don't ask turns every card into a refusal, the floor's too.
     // A question, or a plan put for approval, is not an approval to give
     // unasked, so those still ask.
@@ -442,9 +493,12 @@ pub(crate) fn in_frame(name: &str, args: &Value) -> bool {
 
 /// Whether a yes on the card for a call to `name` with `args` may be kept
 /// for the rest of the session: an upload, or an action in another site's
-/// frame, is asked about each time, so its card offers no such choice.
+/// frame, is asked about each time, so its card offers no such choice. Nor
+/// does a batch's: a yes kept would be one to its tool alone, not to the
+/// steps its card showed, which are each decided as they would be alone.
 pub fn grants_for_session(name: &str, args: &Value) -> bool {
-    !uploads(name, args) && !in_frame(name, args)
+    let batch = name == "use_page" && args["action"] == "batch";
+    !uploads(name, args) && !in_frame(name, args) && !batch
 }
 
 /// Whether the tool named `name` spends the user's credit, which is theirs
@@ -1234,11 +1288,11 @@ mod tests {
     fn auto_mode_puts_what_would_ask_to_the_judge() {
         let ctx = ToolContext::default();
         let none = Grants::new();
-        let allow = |_: &str| Verdict::Allow;
-        let deny = |_: &str| Verdict::Block(Category::BeyondRequest);
-        let unsure = |_: &str| Verdict::Unsure("no answer".into());
-        let unasked = |_: &str| -> Verdict { panic!("the judge was asked") };
-        let opaque = |why: &str| {
+        let allow = |_: &ToolCall, _: &str| Verdict::Allow;
+        let deny = |_: &ToolCall, _: &str| Verdict::Block(Category::BeyondRequest);
+        let unsure = |_: &ToolCall, _: &str| Verdict::Unsure("no answer".into());
+        let unasked = |_: &ToolCall, _: &str| -> Verdict { panic!("the judge was asked") };
+        let opaque = |_: &ToolCall, why: &str| {
             assert!(why.contains("hides what it runs"), "{why}");
             Verdict::Allow
         };
@@ -2149,6 +2203,101 @@ mod tests {
             crate::browser::BROWSE,
             &args(&browse("hover"))
         ));
+    }
+
+    #[test]
+    fn a_batch_of_browser_steps_is_decided_as_each_step_would_be_alone() {
+        let ctx = ToolContext::default();
+        let granted = Grants::from([(0, HashSet::from(["use_page".to_owned()]))]);
+        let gate = |mode: Mode| Gate {
+            ctx: &ctx,
+            mode,
+            grants: &granted,
+            rules: &[],
+            broken: None,
+            human: true,
+        };
+        let batch = |steps: serde_json::Value| {
+            call(
+                "use_page",
+                serde_json::json!({ "action": "batch", "steps": steps }),
+            )
+        };
+        let click = serde_json::json!({ "action": "click", "ref": "e1" });
+        let typing = serde_json::json!({ "action": "type", "ref": "e2", "text": "Ada" });
+        let upload = serde_json::json!({ "action": "upload", "ref": "e3", "files": ["cv.pdf"] });
+        let paying = serde_json::json!({ "action": "type", "ref": "e4", "text": "4242",
+                                         "frame": "https://pay.example" });
+        let hover = serde_json::json!({ "action": "hover", "ref": "e5" });
+        // Steps each allowed alone run together unasked.
+        let plain = batch(serde_json::json!([click, typing]));
+        assert_eq!(decide(&plain, &gate(Mode::Default)), Outcome::Run);
+        // A step that would be asked about alone is asked about in a batch:
+        // an upload, an action in another site's frame, and a hover, which
+        // is browse's, not the use_page allowed here.
+        for asks in [&upload, &paying, &hover] {
+            let mixed = batch(serde_json::json!([click, asks]));
+            assert_eq!(decide(&mixed, &gate(Mode::Default)), Outcome::Ask);
+            // Refused where it would be refused alone, naming the step.
+            let Outcome::Refuse(why) = decide(&mixed, &gate(Mode::DontAsk)) else {
+                panic!("{asks} got through Don't ask in a batch");
+            };
+            assert!(why.starts_with("Step 2 of the batch"), "{why}");
+        }
+        // Its card never offers to stop asking, which would be a yes to
+        // use_page alone.
+        let args = |call: &ToolCall| serde_json::from_str::<Value>(&call.arguments).unwrap();
+        assert!(!grants_for_session("use_page", &args(&plain)));
+        // A deny rule on a step's tool, plan mode, and a batch that cannot
+        // run are refused before any card.
+        let no_browse = [Rule {
+            tool: crate::browser::BROWSE.into(),
+            pattern: String::new(),
+            effect: permissions::Effect::Deny,
+            project: None,
+        }];
+        let denied = Gate {
+            rules: &no_browse,
+            ..gate(Mode::Default)
+        };
+        let waits = batch(serde_json::json!([click, { "action": "wait", "text": "Done" }]));
+        let refused = decide(&waits, &denied);
+        assert!(matches!(refused, Outcome::Refuse(ref why) if why.contains("Step 2")));
+        assert!(matches!(
+            decide(&plain, &gate(Mode::Plan)),
+            Outcome::Refuse(_)
+        ));
+        let many = batch(serde_json::Value::Array(vec![click.clone(); 21]));
+        let Outcome::Refuse(why) = decide(&many, &gate(Mode::Bypass)) else {
+            panic!("21 steps ran");
+        };
+        assert!(why.contains("at most 20"), "{why}");
+        let script = batch(serde_json::json!([{ "action": "eval", "script": "1" }]));
+        assert!(matches!(
+            decide(&script, &gate(Mode::Bypass)),
+            Outcome::Refuse(_)
+        ));
+        // The judge is shown the batch and each step as it would be alone,
+        // and one step it blocks refuses the whole.
+        let judged = std::cell::RefCell::new(Vec::new());
+        let judge = |call: &ToolCall, _: &str| {
+            judged.borrow_mut().push(call.name.clone());
+            match call.arguments.contains("upload") && call.name == "use_page" {
+                true if !call.arguments.contains("batch") => {
+                    Verdict::Block(Category::BeyondRequest)
+                }
+                _ => Verdict::Allow,
+            }
+        };
+        let none = Grants::new();
+        let auto = Gate {
+            grants: &none,
+            ..gate(Mode::Auto)
+        };
+        let sends = batch(serde_json::json!([hover, upload]));
+        let outcome = decide_with(&sends, &auto, Some(&judge));
+        assert!(matches!(outcome, Outcome::Refuse(ref why) if why.contains("Step 2")));
+        assert_eq!(*judged.borrow(), ["use_page", "browse", "use_page"]);
     }
 
     #[test]
