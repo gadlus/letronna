@@ -176,13 +176,21 @@ impl ListDelegate for Palette {
     fn perform_search(
         &mut self,
         query: &str,
-        _: &mut Window,
-        _: &mut Context<ListState<Self>>,
+        window: &mut Window,
+        cx: &mut Context<ListState<Self>>,
     ) -> Task<()> {
         // In memory and at once, so the rows change in the frame the key
         // was typed in.
         self.shown = sift(&self.groups, query);
-        Task::ready(())
+        // The list then selects by the rows it last drew, so after a search
+        // that found none it would select nothing and Enter would do
+        // nothing; this runs after it and selects by the rows found now.
+        let first = (!self.shown.is_empty()).then(IndexPath::default);
+        cx.spawn_in(window, async move |list, cx| {
+            let _ = list.update_in(cx, |list, window, cx| {
+                list.set_selected_index(first, window, cx)
+            });
+        })
     }
 
     fn sections_count(&self, _: &App) -> usize {
