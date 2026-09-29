@@ -932,18 +932,22 @@ fn confinable(args: &Value, ctx: &ToolContext) -> bool {
     let Some(workspace) = &ctx.workspace else {
         return false;
     };
-    let Ok(root) = std::fs::canonicalize(workspace) else {
-        return false;
-    };
-    let home = tools::home().and_then(|home| std::fs::canonicalize(home).ok());
-    if touches_home(&root, &root, home.as_deref())
-        || tools::private(&root, &crate::chat::data_dir())
-    {
+    if !holdable(workspace) {
         return false;
     }
     let line = args["command"].as_str().unwrap_or_default();
     let assessed = command::assess(line, Dialect::here(), Some(workspace));
     !assessed.commands.iter().any(guarded)
+}
+
+/// Whether the OS sandbox may make `project` writable: it is neither the
+/// home folder, a folder above it, among its settings nor in Letronna's own.
+pub(crate) fn holdable(project: &Path) -> bool {
+    let Ok(root) = std::fs::canonicalize(project) else {
+        return false;
+    };
+    let home = tools::home().and_then(|home| std::fs::canonicalize(home).ok());
+    !touches_home(&root, &root, home.as_deref()) && !tools::private(&root, &crate::chat::data_dir())
 }
 
 /// Whether `command`, or one it hands to another shell, is Git or names a

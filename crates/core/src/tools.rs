@@ -1850,6 +1850,19 @@ impl Tool for RunCommand {
                             in the foreground returns all of its output anyway."
                     .into());
             }
+            // The gate looked at the folder of the session that answered,
+            // which for a helper answered in the terminal is where Letronna
+            // started, not always the helper's own; whichever it was, the
+            // home folder never becomes writable.
+            if ctx.sandboxed && !crate::gate::holdable(cwd) {
+                return Err(
+                    "This project folder cannot be sandboxed: it is the home folder, \
+                     above it, among its settings or in Letronna's own folder. Call \
+                     run_command again with unsandboxed: true, which needs the \
+                     user's approval."
+                        .into(),
+                );
+            }
             let before = crate::filestate::before(ctx.conversation);
             let save = spill_path(ctx).map(|path| SaveTo {
                 path,
@@ -3126,6 +3139,21 @@ mod tests {
         set_plugin_tools(Vec::new());
         assert!(run("extra", "{}", &ctx).is_err());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A sandboxed run in a folder the sandbox would open too wide, such as
+    /// the root that holds the home folder, is refused before it starts.
+    #[test]
+    fn a_sandboxed_command_is_refused_where_home_would_become_writable() {
+        let ctx = ToolContext {
+            workspace: Some(PathBuf::from("/")),
+            sandboxed: true,
+            ..Default::default()
+        };
+        let Err(why) = run("run_command", r#"{"command":"echo hi"}"#, &ctx) else {
+            panic!("a sandboxed command ran with the root folder writable");
+        };
+        assert!(why.contains("project folder cannot be sandboxed"), "{why}");
     }
 
     /// `ctx.sandboxed`, which only the gate sets, runs `run_command` through
