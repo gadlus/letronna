@@ -309,7 +309,13 @@ impl Tool for SearchWeb {
     }
     fn preview(&self, args: &Value, _: &ToolContext) -> String {
         let query = args["query"].as_str().unwrap_or_default();
-        match usable(&choice(), &crate::store::load_keys()) {
+        // Tavily and Exa are sent the sites too, so the card and the judge
+        // see every word that leaves, not just the query. Filters that do
+        // not parse stop the call before anything is sent.
+        let filters = options(args)
+            .map(|options| filters(&options))
+            .unwrap_or_default();
+        let search = match usable(&choice(), &crate::store::load_keys()) {
             Ok(reach) if reach.address == reach.service.official => {
                 format!("Search {} for \"{query}\"", reach.service.name)
             }
@@ -318,8 +324,25 @@ impl Tool for SearchWeb {
                 reach.service.name, reach.address
             ),
             Err(_) => format!("Search for \"{query}\""),
-        }
+        };
+        format!("{search}{filters}")
     }
+}
+
+/// The filters as the approval card lists them, each on a line of its own,
+/// or nothing when there are none.
+fn filters(options: &Options) -> String {
+    let mut shown = String::new();
+    if !options.allowed.is_empty() {
+        shown.push_str(&format!("\nonly from {}", options.allowed.join(", ")));
+    }
+    if !options.blocked.is_empty() {
+        shown.push_str(&format!("\nnot from {}", options.blocked.join(", ")));
+    }
+    if let Some(freshness) = options.freshness {
+        shown.push_str(&format!("\nfrom the last {}", freshness.word()));
+    }
+    shown
 }
 
 /// One result, as every service's answer comes down to.
@@ -1085,6 +1108,27 @@ mod tests {
             payload("Tavily", "rust", 5, &Options::default(), today),
             json!({"query": "rust", "max_results": 5})
         );
+    }
+
+    #[test]
+    fn the_card_and_the_judge_see_the_sites_that_are_sent() {
+        let call = json!({
+            "query": "rust",
+            "allowed_domains": ["docs.rs", "secret-word.example.org"],
+            "blocked_domains": ["spam.example"],
+            "freshness": "week"
+        });
+        let ctx = ToolContext::default();
+        let card = SearchWeb.preview(&call, &ctx);
+        assert!(
+            card.ends_with(
+                "for \"rust\"\nonly from docs.rs, secret-word.example.org\nnot from spam.example\nfrom the last week"
+            ),
+            "{card}"
+        );
+        assert_eq!(SearchWeb.judge_input(&call, &ctx), card);
+        let plain = SearchWeb.preview(&json!({"query": "rust"}), &ctx);
+        assert!(plain.ends_with("for \"rust\""), "{plain}");
     }
 
     #[test]
