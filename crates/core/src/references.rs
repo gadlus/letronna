@@ -182,8 +182,12 @@ fn diff(ctx: &ToolContext) -> Result<String, String> {
         );
     }
     let names = git(folder, &["diff", "--name-only", "-z", "--relative", "HEAD"])?;
+    // A list cut short ends part way through a name, and a pathspec of part
+    // of one can be the folder holding a file of keys, so only the names git
+    // ended are taken.
+    let ended = names.rfind('\0').map_or("", |at| &names[..at]);
     let data = crate::chat::data_dir();
-    let (shown, kept): (Vec<&str>, Vec<&str>) = names
+    let (shown, kept): (Vec<&str>, Vec<&str>) = ended
         .split('\0')
         .filter(|name| !name.is_empty())
         // Joined, not resolved: a deleted file is a change too.
@@ -558,6 +562,49 @@ mod tests {
             sent.contains("[Left out, as files holding keys: .env.]"),
             "{sent}"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_cut_list_of_changes_does_not_take_in_the_folder_of_a_part_name() {
+        let dir = project("diff-cut");
+        let git = |args: &[&str]| {
+            let done = Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(done.status.success(), "{done:?}");
+        };
+        // Files of keys, left out of the diff, whose names with their NULs
+        // fill all but two bytes of what is read, so the list is cut just
+        // after the `zz` of `zz/.env`.
+        std::fs::create_dir_all(dir.join(".aws")).unwrap();
+        std::fs::create_dir_all(dir.join("zz")).unwrap();
+        let mut filled = 0;
+        let mut n = 0;
+        while filled < ATTACHED_CHARS - 2 {
+            let len = (ATTACHED_CHARS - 2 - filled).min(80) - 1;
+            let name = format!(".aws/{n:04}{}", "x".repeat(len - 9));
+            std::fs::write(dir.join(&name), "old\n").unwrap();
+            filled += len + 1;
+            n += 1;
+        }
+        std::fs::write(dir.join("zz/.env"), "TOKEN=old\n").unwrap();
+        git(&["init", "-q"]);
+        git(&["add", "-f", "."]);
+        git(&["commit", "-q", "-m", "start"]);
+        for entry in std::fs::read_dir(dir.join(".aws")).unwrap() {
+            std::fs::write(entry.unwrap().path(), "new\n").unwrap();
+        }
+        std::fs::write(dir.join("zz/.env"), "TOKEN=sk-cut-secret\n").unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..ToolContext::default()
+        };
+        let shown = diff(&ctx).unwrap();
+        assert!(!shown.contains("sk-cut-secret"), "{shown}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
