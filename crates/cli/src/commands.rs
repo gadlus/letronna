@@ -167,8 +167,11 @@ pub fn command(
             runner.store.settings.verify_edits = !runner.store.settings.verify_edits;
             runner.persist();
             render::blank();
-            render::line(&render::dim(if runner.store.settings.verify_edits {
+            let settings = &runner.store.settings;
+            render::line(&render::dim(if settings.verifies_edits() {
                 "After changing files, the model is asked once to build or test before it finishes."
+            } else if settings.verify_edits {
+                "On, but run_command is switched off, so nothing is asked until it is back on."
             } else {
                 "The model may finish after changing files without being asked to check them."
             }));
