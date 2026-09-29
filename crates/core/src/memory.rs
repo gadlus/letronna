@@ -80,9 +80,35 @@ fn context_in(dir: &Path, connection: &Connection) -> String {
 }
 
 /// A file people write, trimmed and kept under `FILE_LIMIT`. None when it is
-/// missing or empty.
+/// missing or empty, or not a plain file: an AGENTS.md in a cloned repository
+/// that links to /dev/zero would otherwise be read until memory ran out, and
+/// on every request.
 fn read_capped(path: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
+    use std::io::Read;
+    if !std::fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
+    // Enough for `FILE_LIMIT` characters of any width and one more, so a cut
+    // is still seen as one.
+    let most = (FILE_LIMIT as u64 + 1) * 4;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(most)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        // Stopping short can split the last character; anything else is not
+        // text.
+        Err(e) if e.utf8_error().error_len().is_none() => {
+            let valid = e.utf8_error().valid_up_to();
+            let mut bytes = e.into_bytes();
+            bytes.truncate(valid);
+            String::from_utf8(bytes).ok()?
+        }
+        Err(_) => return None,
+    };
     let text = text.trim();
     if text.is_empty() {
         return None;
@@ -431,6 +457,25 @@ mod tests {
         let soul = read_capped(&dir.join("SOUL.md")).unwrap();
         assert!(soul.ends_with(&format!("[cut at {FILE_LIMIT} characters]")));
         assert!(read_capped(&dir.join("missing.md")).is_none());
+        // Read only as far as the cut, even in characters four bytes wide.
+        std::fs::write(dir.join("AGENTS.md"), "\u{1f600}".repeat(FILE_LIMIT * 3)).unwrap();
+        let wide = read_capped(&dir.join("AGENTS.md")).unwrap();
+        assert!(wide.ends_with(&format!("[cut at {FILE_LIMIT} characters]")));
+        assert!(wide.starts_with("\u{1f600}"));
+    }
+
+    #[test]
+    fn instructions_that_are_not_a_plain_file_are_passed_over() {
+        let dir = scratch("not-a-file");
+        std::fs::create_dir_all(dir.join("AGENTS.md")).unwrap();
+        assert!(read_capped(&dir.join("AGENTS.md")).is_none());
+        // What a cloned repository can hold on macOS and Linux, and which
+        // never ends when read.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/dev/zero", dir.join("CLAUDE.md")).unwrap();
+            assert!(read_capped(&dir.join("CLAUDE.md")).is_none());
+        }
     }
 
     fn backups(dir: &Path) -> Vec<String> {
