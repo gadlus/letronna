@@ -19,6 +19,7 @@
 //! on that socket, and a `Link` thread reads it, handing each answer to
 //! whoever asked and each event to the session it is about.
 
+use crate::cancel::Cancel;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -44,6 +45,11 @@ const REMOTE_TIME: Duration = Duration::from_secs(15);
 /// How often the one socket to a browser elsewhere stops reading to send
 /// what its tabs have asked: the most a request waits to go.
 const LINK_POLL: Duration = Duration::from_millis(10);
+/// How often a call that may be stopped looks for the stop while it waits:
+/// soon enough to feel at once, and only while such a call runs.
+const STOP_LOOK: Duration = Duration::from_millis(100);
+/// What a call given up on for a stop says.
+pub(crate) const STOPPED: &str = "Stopped before the browser had finished.";
 /// The largest message taken from the browser. A long page's accessibility
 /// tree runs to megabytes -- Wikipedia's article on Rust is 8.5 MB -- and one
 /// past this is refused rather than held in memory.
@@ -839,6 +845,9 @@ pub struct Tab {
     /// Leave a dialog the page opens for someone to answer, and keep it
     /// with the other events, rather than answer it at once.
     pub leaves_dialogs: bool,
+    /// Calls given up on for a stop or their time, whose answers may still
+    /// come: one that hands over a stream has it closed then.
+    let_go: Vec<u64>,
 }
 
 /// How a tab is talked to.
@@ -887,6 +896,7 @@ impl Tab {
             dialogs: Vec::new(),
             open_dialog: None,
             leaves_dialogs: false,
+            let_go: Vec::new(),
         }
     }
 
@@ -924,15 +934,54 @@ impl Tab {
         params: Value,
         limit: Duration,
     ) -> Result<T, String> {
+        self.answer(method, params, limit, None)
+    }
+
+    /// `call_within`, given up on once `cancel` is set, for what can take
+    /// the browser many seconds; an answer that comes after is let go of.
+    pub fn call_unless_stopped<T: DeserializeOwned>(
+        &mut self,
+        method: &str,
+        params: Value,
+        limit: Duration,
+        cancel: &Cancel,
+    ) -> Result<T, String> {
+        self.answer(method, params, limit, Some(cancel))
+    }
+
+    fn answer<T: DeserializeOwned>(
+        &mut self,
+        method: &str,
+        params: Value,
+        limit: Duration,
+        cancel: Option<&Cancel>,
+    ) -> Result<T, String> {
         let id = self.send(method, params)?;
         let deadline = Instant::now() + limit;
         loop {
-            let Some(text) = self.read(deadline)? else {
+            // Looked for before every read, not only when one times out: a
+            // busy page's events would otherwise keep a stop waiting.
+            if cancel.is_some_and(Cancel::is_set) {
+                self.let_go.push(id);
+                return Err(STOPPED.into());
+            }
+            let until = match cancel {
+                Some(_) => deadline.min(Instant::now() + STOP_LOOK),
+                None => deadline,
+            };
+            let Some(text) = self.read(until)? else {
+                if Instant::now() < deadline {
+                    continue;
+                }
+                if cancel.is_some() {
+                    self.let_go.push(id);
+                }
                 return Err(format!("The browser did not answer in time ({method})."));
             };
             let envelope: Envelope = serde_json::from_str(&text)
                 .map_err(|_| "The browser sent something unreadable.".to_owned())?;
             if envelope.id != Some(id) {
+                self.close_late_stream(envelope.id, &text);
                 self.heard(envelope);
                 continue;
             }
@@ -971,6 +1020,7 @@ impl Tab {
             let Ok(envelope) = serde_json::from_str::<Envelope>(&text) else {
                 continue;
             };
+            self.close_late_stream(envelope.id, &text);
             let seen = self.heard(envelope);
             if seen.is_some_and(|at| self.events.get(at).is_some_and(&until)) {
                 return Ok(true);
@@ -1011,6 +1061,20 @@ impl Tab {
             self.broken = true;
             GONE.to_owned()
         })
+    }
+
+    /// Close the stream in the late answer `text` to a call given up on --
+    /// a PDF printed after its stop -- which the browser would otherwise
+    /// hold, all of it, until the tab closes. Not waited for.
+    fn close_late_stream(&mut self, id: Option<u64>, text: &str) {
+        let Some(at) = self.let_go.iter().position(|&late| Some(late) == id) else {
+            return;
+        };
+        self.let_go.swap_remove(at);
+        let late: Value = serde_json::from_str(text).unwrap_or_default();
+        if let Some(stream) = late["result"]["stream"].as_str() {
+            let _ = self.send("IO.close", json!({"handle": stream}));
+        }
     }
 
     /// The next frame's text, or `None` once `deadline` has passed.
@@ -1355,7 +1419,7 @@ fn note(kind: &str, message: &str, agreed: bool) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::net::TcpListener;
 
@@ -1418,7 +1482,7 @@ mod tests {
 
     /// A stand-in for a browser's debugging socket: answers each request
     /// with `reply(method, params)`, after sending the events it returns.
-    fn fake_browser(
+    pub(crate) fn fake_browser(
         reply: impl Fn(&str, &Value) -> (Vec<Value>, Value) + Send + 'static,
     ) -> (String, std::thread::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1556,5 +1620,41 @@ mod tests {
         // still gets its own.
         assert!(!tab.broken);
         tab.call::<Ignored>("Page.reload", json!({})).unwrap();
+    }
+
+    #[test]
+    fn a_long_call_is_given_up_on_at_a_stop_and_the_stream_it_hands_over_late_is_closed() {
+        let (address, server) = fake_browser(|method, _| match method {
+            "Page.printToPDF" => {
+                std::thread::sleep(Duration::from_millis(600));
+                (Vec::new(), json!({"stream": "S1"}))
+            }
+            _ => (Vec::new(), json!({})),
+        });
+        let mut tab = Tab::connect(&address, "T1").unwrap();
+        let cancel = Cancel::default();
+        let stopper = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            stopper.set();
+        });
+        let started = Instant::now();
+        let limit = Duration::from_secs(20);
+        let error = tab
+            .call_unless_stopped::<Ignored>("Page.printToPDF", json!({}), limit, &cancel)
+            .unwrap_err();
+        assert_eq!(error, STOPPED);
+        // Well short of the 20 s limit, with room for a loaded machine.
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(!tab.broken);
+        // The late answer is read on the way to the next one's.
+        tab.call::<Ignored>("Page.reload", json!({})).unwrap();
+        tab.call::<Ignored>("Page.enable", json!({})).unwrap();
+        drop(tab);
+        let heard = server.join().unwrap();
+        assert_eq!(
+            heard,
+            ["Page.printToPDF", "Page.reload", "IO.close", "Page.enable"]
+        );
     }
 }

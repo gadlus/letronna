@@ -269,6 +269,9 @@ struct Watch {
     running: bool,
     /// The room the window last said it has.
     room: Option<Room>,
+    /// Set when the page is to be laid out in the room again although the
+    /// room has not changed: something else changed the page's size.
+    relayout: bool,
     /// The scale of the window's screen, which a browser started from now on
     /// draws at.
     scale: Option<f64>,
@@ -310,6 +313,14 @@ pub fn fit(room: Room) {
     if let Ok(mut watch) = state().0.lock() {
         watch.room = Some(room);
         watch.scale = Some(room.scale);
+    }
+}
+
+/// Have the page laid out in the room again, as a picture of the whole page
+/// may have put the browser's own layout back in its place.
+pub(crate) fn relayout() {
+    if let Ok(mut watch) = state().0.lock() {
+        watch.relayout = true;
     }
 }
 
@@ -701,16 +712,20 @@ impl Stream {
             .tell("Page.screencastFrameAck", json!({"sessionId": named}))
     }
 
-    /// Lay the page out in the room the window now has, if that changed.
-    /// Whether there is a room to lay it out in.
+    /// Lay the page out in the room the window now has, if that changed or
+    /// `relayout` asked. Whether there is a room to lay it out in.
     fn refit(&mut self) -> Result<bool, String> {
-        let room = state().0.lock().ok().and_then(|watch| watch.room);
+        let (room, again) =
+            (state().0.lock().ok()).map_or((None, false), |watch| (watch.room, watch.relayout));
         let Some(room) = room.filter(|room| room.width >= LEAST_ROOM && room.height >= LEAST_ROOM)
         else {
             return Ok(false);
         };
-        if self.room == Some(room) || self.fitted.elapsed() < FIT_GAP {
+        if (self.room == Some(room) && !again) || self.fitted.elapsed() < FIT_GAP {
             return Ok(true);
+        }
+        if again && let Ok(mut watch) = state().0.lock() {
+            watch.relayout = false;
         }
         self.room = Some(room);
         self.fitted = Instant::now();

@@ -15,6 +15,8 @@
 //! A kept file lands in the project, where a test runner or a shell could
 //! pick it up, so only names of inert kinds are kept as they are; anything
 //! else gets ".download" after it, and the folder ignores itself for git.
+//! A PDF the agent prints of a page goes into the same folder by the same
+//! rules, named from the page's title.
 
 use crate::cancel::Cancel;
 use crate::cdp::{self, Event, Ignored, Reach, Rule, Tab};
@@ -50,12 +52,14 @@ const INERT: &[&str] = &[
 
 /// Whether a character is kept in a name: not a control character, nor one
 /// of the invisible ones that turn text around or hide in it, with which
-/// "invoice\u{202E}fdp.exe" shows as "invoiceexe.pdf".
+/// "invoice\u{202E}fdp.exe" shows as "invoiceexe.pdf", nor a line or
+/// paragraph break, nor a tag character, which carries hidden text.
 fn shown_as_is(c: char) -> bool {
     !c.is_control()
         && !matches!(c,
             '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}'
-            | '\u{FEFF}' | '\u{AD}' | '\u{61C}')
+            | '\u{FEFF}' | '\u{AD}' | '\u{61C}' | '\u{2028}' | '\u{2029}'
+            | '\u{E0000}'..='\u{E007F}')
 }
 
 /// Whether a name ends in an extension kept as it is.
@@ -222,6 +226,67 @@ pub(crate) fn keep(
         kind_of(&head),
         path.display()
     ))
+}
+
+/// A name for a PDF of a page from the page's title, which the page chose:
+/// a slash in it made "_" rather than a folder, "page" for no title, then
+/// kept safe as a download's name is, and always ending in ".pdf".
+pub(crate) fn pdf_name(title: &str) -> String {
+    let title: String = title
+        .chars()
+        .filter(|&c| shown_as_is(c))
+        .map(|c| if matches!(c, '/' | '\\') { '_' } else { c })
+        .collect();
+    let title = title.trim();
+    let stem = title
+        .get(title.len().saturating_sub(4)..)
+        .filter(|end| end.eq_ignore_ascii_case(".pdf"))
+        .map_or(title, |end| &title[..title.len() - end.len()]);
+    match stem.trim() {
+        "" => saved_name("page.pdf"),
+        stem => saved_name(&format!("{stem}.pdf")),
+    }
+}
+
+/// How many pages a PDF has, counted by its page objects, which a browser
+/// writes uncompressed; `None` when it has none that can be seen.
+pub(crate) fn pdf_pages(pdf: &[u8]) -> Option<usize> {
+    let mut pages = 0;
+    let mut rest = pdf;
+    while let Some(at) = rest.windows(5).position(|five| five == b"/Type") {
+        rest = &rest[at + 5..];
+        let kind = rest.trim_ascii_start();
+        if kind.starts_with(b"/Page") && !kind.get(5).is_some_and(u8::is_ascii_alphanumeric) {
+            pages += 1;
+        }
+    }
+    (pages > 0).then_some(pages)
+}
+
+/// Save a PDF the browser made of a page into the conversation's downloads
+/// folder under `root`, named from the page's title, beside and never over
+/// what is there: written whole in `staging` first, then placed as a
+/// download is, so no half-written PDF ever shows under its name. Where it
+/// went.
+pub(crate) fn keep_pdf(
+    pdf: &[u8],
+    title: &str,
+    root: &Path,
+    conversation: u64,
+    staging: &Path,
+) -> Result<PathBuf, String> {
+    static PRINTS: AtomicU64 = AtomicU64::new(0);
+    let folder = made_folder(root, conversation)?;
+    std::fs::create_dir_all(staging)
+        .map_err(|e| format!("Cannot make {}: {e}", staging.display()))?;
+    // The window and the terminal may share the data folder.
+    let print = PRINTS.fetch_add(1, Ordering::Relaxed);
+    let staged = staging.join(format!("pdf-{}-{print}", std::process::id()));
+    let placed = std::fs::write(&staged, pdf)
+        .map_err(|e| format!("Cannot save the PDF in {}: {e}", staging.display()))
+        .and_then(|()| place(&staged, &folder, &pdf_name(title)));
+    let _ = std::fs::remove_file(&staged);
+    placed
 }
 
 /// `name` in `folder`, or with -2, -3 and so on before its extension when
@@ -974,6 +1039,9 @@ mod tests {
     #[test]
     fn the_name_the_model_is_told_is_on_one_line_with_nothing_hidden() {
         assert_eq!(told("a\nb\u{202E}c.pdf"), "abc.pdf");
+        assert_eq!(told("a\u{2028}b\u{2029}c.pdf"), "abc.pdf");
+        assert_eq!(told("ok\u{E0069}\u{E0067}\u{E007F}.pdf"), "ok.pdf");
+        assert_eq!(pdf_name("Bill\u{2028}\u{E0041}"), "Bill.pdf");
         assert!(told(&"x".repeat(400)).len() == NAME_BYTES);
     }
 
@@ -1203,6 +1271,59 @@ mod tests {
         let told = format!("Downloaded a.csv: 1 KB, text. Saved to {}", saved.display());
         assert_eq!(inner.told(), [told]);
         assert!(inner.unclaimed.is_empty() && !staging.join("g1").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_pdf_is_named_from_the_page_title_and_always_ends_in_pdf() {
+        assert_eq!(pdf_name("Quarterly report"), "Quarterly report.pdf");
+        assert_eq!(pdf_name("Invoice.PDF"), "Invoice.pdf");
+        assert_eq!(pdf_name("A/B tests \\ results"), "A_B tests _ results.pdf");
+        assert_eq!(pdf_name("  "), "page.pdf");
+        assert_eq!(pdf_name("\u{200B}.pdf"), "page.pdf");
+        assert_eq!(pdf_name(".bashrc"), "_bashrc.pdf");
+        assert_eq!(pdf_name("invoice\u{202E}fdp.exe"), "invoicefdp.exe.pdf");
+        assert_eq!(pdf_name("CON"), "_CON.pdf");
+        let long = pdf_name(&"é".repeat(200));
+        assert!(long.ends_with(".pdf") && long.len() <= NAME_BYTES, "{long}");
+    }
+
+    #[test]
+    fn a_pdfs_pages_are_counted_by_its_page_objects_not_its_page_tree() {
+        let pdf = b"%PDF-1.4\n1 0 obj <</Type /Pages /Count 2>>\n2 0 obj <</Type /Page>>\n\
+                    3 0 obj <</Type/Page /Parent 1 0 R>>\n4 0 obj <</Type /PageLabel>>";
+        assert_eq!(pdf_pages(pdf), Some(2));
+        assert_eq!(pdf_pages(b"%PDF-1.7 nothing to see"), None);
+    }
+
+    #[test]
+    fn a_pdf_is_staged_then_kept_beside_one_of_the_same_name_in_the_session_folder() {
+        let (dir, staging, project) = scratch("keep-pdf");
+        let first = keep_pdf(b"%PDF-1 one", "Report", &project, 4, &staging).unwrap();
+        let second = keep_pdf(b"%PDF-1 two", "Report", &project, 4, &staging).unwrap();
+        let folder = project.join("media/downloads/4");
+        assert_eq!(first, folder.join("Report.pdf"));
+        assert_eq!(second, folder.join("Report-2.pdf"));
+        assert_eq!(std::fs::read(&second).unwrap(), b"%PDF-1 two");
+        assert_eq!(
+            std::fs::read_to_string(project.join("media/downloads/.gitignore")).unwrap(),
+            "*\n"
+        );
+        assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pdf_is_never_written_through_a_link_to_a_file_elsewhere() {
+        let (dir, staging, project) = scratch("pdf-link");
+        let folder = project.join("media/downloads/5");
+        std::fs::create_dir_all(&folder).unwrap();
+        let elsewhere = dir.join("elsewhere.pdf");
+        std::os::unix::fs::symlink(&elsewhere, folder.join("Page.pdf")).unwrap();
+        let path = keep_pdf(b"%PDF-1", "Page", &project, 5, &staging).unwrap();
+        assert_eq!(path, folder.join("Page-2.pdf"));
+        assert!(!elsewhere.exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
