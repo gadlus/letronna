@@ -12,7 +12,7 @@ use letronna_core::chat::{self, Connection, Event, Message, ToolCall};
 use letronna_core::gate::{self, Gate, Grants, Mode};
 use letronna_core::inbox;
 use letronna_core::store::{Conversation, Store};
-use letronna_core::{permissions, tools};
+use letronna_core::{hooks, permissions, tools};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -158,6 +158,7 @@ impl Runner {
         self.bar.show_helpers_of(connection.conversation);
         // What the session's kept helpers wake on from now on.
         agents::connected(&connection);
+        hooks::new_turn(connection.conversation);
         let mut turn = Turn::new(connection);
         self.stopped = false;
         self.bar.working(true);
@@ -179,6 +180,7 @@ impl Runner {
         // A reply cut off at the output limit goes on in the next one, and
         // the answer is both.
         let mut answer = String::new();
+        let mut sent_back = 0;
         loop {
             let Some(mut reply) = self.stream_once(turn, session)? else {
                 self.keep_stopped(turn, session);
@@ -230,11 +232,33 @@ impl Runner {
             self.persist();
 
             if !hurried && !turn.begin(calls) {
+                // Past the limit on rounds the turn ends as it always did; a
+                // Stop hook sending the model back would undo the limit.
                 if let Some(note) = turn.capped() {
                     render::blank();
                     render::said(&render::dim("●"), &render::dim(&note));
+                    return Ok(answer);
                 }
-                return Ok(answer);
+                if sent_back >= hooks::STOP_BLOCKS {
+                    render::blank();
+                    render::said(&render::dim("●"), &render::dim(hooks::STOP_CAPPED));
+                    return Ok(answer);
+                }
+                let Some(feedback) = self.stop_hooks(turn, &answer, sent_back > 0) else {
+                    return Ok(answer);
+                };
+                sent_back += 1;
+                render::blank();
+                render::said(&render::dim("●"), &render::dim(&tools::one_line(&feedback)));
+                self.store.conversations[session].messages.push(Message {
+                    role: "user".into(),
+                    content: feedback,
+                    folded: true,
+                    ..Default::default()
+                });
+                self.persist();
+                answer.clear();
+                continue;
             }
             if !hurried && !self.work_through(turn, session)? {
                 self.stopped = true;
@@ -408,7 +432,8 @@ impl Runner {
                     let results = turn.take_results();
                     self.store.conversations[session].messages.extend(results);
                     self.persist();
-                    return Ok(true);
+                    // A hook's `continue: false`, shown with the results.
+                    return Ok(!hooks::halted(turn.connection.conversation));
                 }
                 Next::Run(call) if call.name == tools::TODO => self.apply_todo(turn, session, call),
                 Next::Run(call) => {
@@ -424,7 +449,14 @@ impl Runner {
                     turn.finish_call(Err(why));
                 }
                 Next::AskUser(call) => {
-                    if !self.consult(turn, call)? {
+                    // What holds every call for a yes, beside each card.
+                    if let Some(error) = hooks::trouble() {
+                        render::line(&render::red(&error));
+                    }
+                    hooks::card(ctx, &call.name);
+                    let consulted = self.consult(turn, call)?;
+                    show_hook_problems();
+                    if !consulted {
                         self.keep_stopped(turn, session);
                         return Ok(false);
                     }
@@ -463,8 +495,37 @@ impl Runner {
         let outcome =
             ran.unwrap_or_else(|| Err(letronna_core::agent::STOPPED_WHILE_RUNNING.into()));
         print_call(&call.name, &summary, &outcome);
+        show_hook_problems();
         turn.finish_call(outcome);
         !stopped
+    }
+
+    /// Let the Stop hooks look at the finished turn, whose reply was `last`,
+    /// off the loop so escape still works: what one says is left to do, if
+    /// anything. `again` when one already sent the model back this turn.
+    fn stop_hooks(&mut self, turn: &Turn, last: &str, again: bool) -> Option<String> {
+        if !hooks::wanted(hooks::Event::Stop) {
+            return None;
+        }
+        let ctx = turn.tool_context();
+        let stop = ctx.cancel.clone();
+        let last = last.to_owned();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = sender.send(hooks::stop(&ctx, &last, again));
+        });
+        self.bar.wait_line_about("Stop hooks");
+        let feedback = match self.wait_on(&receiver) {
+            Ok(feedback) => feedback,
+            Err(Unheard::Stopped) => {
+                stop.set();
+                None
+            }
+            Err(Unheard::Gone) => None,
+        };
+        self.bar.wait_line(false);
+        show_hook_problems();
+        feedback
     }
 
     /// Keep the model's checklist on the session, as the window does, and
@@ -507,6 +568,7 @@ impl Runner {
                     &tools::summary(&call.name, &call.arguments),
                     &outcome,
                 );
+                show_hook_problems();
                 turn.finish_id(&call.id, outcome);
             }
             // The line names the first call still running, which changes as
@@ -1089,6 +1151,13 @@ fn stopped(name: &str) -> String {
     format!("The user stopped `{name}` while it was running. Ask before starting it again.")
 }
 
+/// Shows the hook failures since the last look, each once.
+fn show_hook_problems() {
+    for problem in hooks::problems() {
+        render::line(&render::red(&problem));
+    }
+}
+
 /// What the line above a diff says is about to happen.
 fn verb(name: &str) -> &'static str {
     match name {
@@ -1136,6 +1205,9 @@ fn settled(
 /// line when not.
 fn ask_about(bar: &mut Bar, request: &Request) -> Decision {
     let call = &request.call;
+    let mut ctx = tools::ToolContext::default();
+    ctx.conversation = request.root;
+    hooks::card(ctx, &call.name);
     let summary = tools::summary(&call.name, &call.arguments);
     let question = format!(
         "Helper {} wants to {}",

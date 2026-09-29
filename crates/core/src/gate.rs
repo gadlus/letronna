@@ -338,6 +338,12 @@ fn ladder(call: &ToolCall, gate: &Gate, judge: Option<&dyn Fn(&str) -> Verdict>)
     if let Some(rule) = &ruling.deny {
         return Outcome::Refuse(denied(rule));
     }
+    // A hooks.json that cannot be used may hold what guards this call, so
+    // every call but a question waits for a person until it is fixed.
+    let question = [tools::ASK_USER, tools::EXIT_PLAN].contains(&tool.name());
+    if let Some(why) = crate::hooks::trouble().filter(|_| !question) {
+        return held(&why, tool.name(), gate);
+    }
     // A line the floor cannot read, such as `git $(echo push)`, could be
     // what a deny rule names, so a person looks at it as at a risky one.
     if let (Some(Risk::Opaque), Some(rule)) = (risk, &ruling.denies) {

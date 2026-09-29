@@ -365,12 +365,12 @@ pub(crate) fn text(log: &mut VecDeque<u8>) -> String {
 /// A job's shell and everything it starts, held as one Job Object so that
 /// stopping reaches a server the shell launched and not just the shell.
 #[cfg(windows)]
-struct Tree(std::os::windows::io::OwnedHandle);
+pub(crate) struct Tree(std::os::windows::io::OwnedHandle);
 
 #[cfg(windows)]
 impl Tree {
     /// Put a just-started shell in a new Job Object that ends its processes when closed.
-    fn of(child: &Child) -> Result<Tree, String> {
+    pub(crate) fn of(child: &Child) -> Result<Tree, String> {
         use std::os::windows::io::{AsRawHandle, HandleOrNull, OwnedHandle};
         use windows_sys::Win32::System::JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -418,7 +418,7 @@ impl Tree {
     }
 
     /// End every process in the tree, with the exit code a killed child gets.
-    fn kill(&self) {
+    pub(crate) fn kill(&self) {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::System::JobObjects::TerminateJobObject;
         // SAFETY: the handle is open for as long as the tree is.
@@ -429,17 +429,17 @@ impl Tree {
 /// A job's shell and everything it starts, as the process group the shell
 /// leads.
 #[cfg(unix)]
-struct Tree(libc::pid_t);
+pub(crate) struct Tree(libc::pid_t);
 
 #[cfg(unix)]
 impl Tree {
     /// The group a shell started with `process_group(0)` leads.
-    fn of(child: &Child) -> Result<Tree, String> {
+    pub(crate) fn of(child: &Child) -> Result<Tree, String> {
         Ok(Tree(child.id() as libc::pid_t))
     }
 
     /// End every process in the tree, with the signal a killed child gets.
-    fn kill(&self) {
+    pub(crate) fn kill(&self) {
         // SAFETY: this only sends a signal.
         unsafe { libc::kill(-self.0, libc::SIGKILL) };
     }

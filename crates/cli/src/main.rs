@@ -35,7 +35,7 @@ use letronna_core::cancel::Cancel;
 use letronna_core::chat::{self, Message};
 use letronna_core::driver::{self, Allow, Outcome, Report, Spec, Status};
 use letronna_core::store::Transcript;
-use letronna_core::{agent, store, tools, update};
+use letronna_core::{agent, hooks, store, tools, update};
 use serde_json::{Value, json};
 use session::Runner;
 use std::io::IsTerminal;
@@ -365,6 +365,10 @@ fn ask_once(runner: &mut Runner, session: usize, prompt: &str, args: &Args) -> b
     let progress =
         (args.output == Output::StreamJson).then(|| show_progress(spec.status.clone(), ended));
     let mut report = driver::run(spec);
+    // On stderr, apart from the answer: what a hook said or could not do.
+    for problem in hooks::problems() {
+        eprintln!("{problem}");
+    }
     drop(running);
     if let Some(progress) = progress {
         let _ = progress.join();
@@ -466,6 +470,7 @@ fn answer_approvals(yes: bool, keyboard: bool, context: tools::ToolContext, canc
 /// does, stopping the run when they say stop or leave the question.
 fn consult(request: &Request, context: &tools::ToolContext, cancel: &Cancel) -> Decision {
     let call = &request.call;
+    hooks::card(context.clone(), &call.name);
     let summary = tools::summary(&call.name, &call.arguments);
     // A change to a file is shown as a diff, anything else as its preview.
     match crate::diff::of(&call.name, &call.arguments, context) {

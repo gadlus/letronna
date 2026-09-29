@@ -356,6 +356,22 @@ pub fn rename_aliases(name: &str, args: &mut Value) -> Vec<String> {
     changed
 }
 
+/// Copies the parameters of tool `name` under those of other agents' names
+/// for them that are in `wanted`, for a script written for that agent.
+pub(crate) fn add_aliases(name: &str, args: &mut Value, wanted: &[&str]) {
+    let Some(object) = args.as_object_mut() else {
+        return;
+    };
+    for (theirs, ours, tools) in ALIASES {
+        if !wanted.contains(theirs) || !tools.contains(&name) || object.contains_key(*theirs) {
+            continue;
+        }
+        if let Some(value) = object.get(*ours).cloned() {
+            object.insert((*theirs).to_owned(), value);
+        }
+    }
+}
+
 /// Parses a top-level string the schema wants as another type, such as
 /// `"true"` for a boolean or `"[1, 2]"` for an array, and returns what it
 /// changed.
@@ -513,7 +529,8 @@ pub(crate) fn spec(tool: &dyn Tool) -> Value {
 pub fn run(name: &str, args: &str, ctx: &ToolContext) -> Result<String, String> {
     let tool = find(name).ok_or_else(|| format!("Unknown tool `{name}`."))?;
     let started = Instant::now();
-    let result = run_found(tool.as_ref(), args, ctx);
+    let hooks = crate::hooks::current();
+    let result = run_found(tool.as_ref(), args, ctx, &hooks);
     crate::diag::event(
         "tool",
         &[
@@ -527,7 +544,12 @@ pub fn run(name: &str, args: &str, ctx: &ToolContext) -> Result<String, String> 
 }
 
 /// `run` for a tool already found: what every call goes through.
-pub(crate) fn run_found(tool: &dyn Tool, args: &str, ctx: &ToolContext) -> Result<String, String> {
+pub(crate) fn run_found(
+    tool: &dyn Tool,
+    args: &str,
+    ctx: &ToolContext,
+    hooks: &Result<crate::hooks::Hooks, String>,
+) -> Result<String, String> {
     // Only fitting tools are offered, but the model can name any of them;
     // refuse here too rather than trust the offer.
     let connection = Connection {
@@ -550,12 +572,19 @@ pub(crate) fn run_found(tool: &dyn Tool, args: &str, ctx: &ToolContext) -> Resul
     if let Some(why) = crate::gate::refusal(tool, &args, ctx) {
         return Err(why);
     }
+    // After the gate, so a hook sees only a call that would run, and can
+    // only add a block to what the rules, the mode and the card allowed.
+    let heard = crate::hooks::before(hooks, tool.name(), &args, ctx).map_err(|e| e + &note)?;
+    // A stop while a hook ran came after the card: the call must not run.
+    if ctx.cancel.is_set() {
+        return Err(crate::agent::STOPPED_BEFORE_START.into());
+    }
     // Hidden before the cut, which could split a key and leave half of it
     // showing, and before anything is wrapped around the result.
     let shapes = tool.hides_key_shapes();
     let ran = tool
         .run(&args, ctx)
-        .map_err(|e| crate::redact::scrub(&e, shapes) + &note)?;
+        .map_err(|e| crate::redact::scrub(&e, shapes) + &note + &heard)?;
     let ran = crate::redact::scrub(&ran, shapes);
     // The note goes after the cut and outside any fence: it is Letronna's,
     // and never the part that gets lost. An untrusted tool's result is never
@@ -566,6 +595,9 @@ pub(crate) fn run_found(tool: &dyn Tool, args: &str, ctx: &ToolContext) -> Resul
         fit(ran, ctx)
     };
     out.push_str(&note);
+    out.push_str(&heard);
+    let said = crate::hooks::after(hooks, tool.name(), &args, &out, ctx);
+    out.push_str(&said);
     Ok(out)
 }
 
@@ -1080,7 +1112,7 @@ pub(crate) fn strip_escapes(text: &str) -> String {
 /// there was in all, so the middle of a chatty command's output costs
 /// nothing to hold.
 #[derive(Default)]
-struct Captured {
+pub(crate) struct Captured {
     head: Vec<u8>,
     tail: std::collections::VecDeque<u8>,
     bytes: usize,
@@ -1090,7 +1122,7 @@ struct Captured {
 /// Bytes and line breaks printed but not kept, and where in the text they
 /// would have been.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Gap {
+pub(crate) struct Gap {
     at: usize,
     bytes: usize,
     lines: usize,
@@ -1111,7 +1143,7 @@ impl Captured {
 
     /// What was kept, as text without escape sequences, and the gap in it
     /// when anything between the start and the end was dropped.
-    fn into_text(mut self) -> (String, Option<Gap>) {
+    pub(crate) fn into_text(mut self) -> (String, Option<Gap>) {
         // A pipe cut short, by the kill or by what is kept, can end partway
         // through a key, and what is left of it can be told only while the
         // cut is still the end.
@@ -1149,7 +1181,7 @@ fn line_breaks(bytes: &[u8]) -> usize {
 
 /// Keep what `pipe` yields in the returned capture until it closes or the
 /// capture is taken, then drop `open`.
-fn forward(
+pub(crate) fn forward(
     mut pipe: impl std::io::Read + Send + 'static,
     open: std::sync::mpsc::Sender<()>,
 ) -> Arc<Mutex<Option<Captured>>> {
@@ -1181,14 +1213,14 @@ fn forward(
 
 /// Whether every reader's pipe closed within `PIPE_GRACE`, which each marks
 /// by dropping its sender of `open`.
-fn pipes_closed(open: &std::sync::mpsc::Receiver<()>) -> bool {
+pub(crate) fn pipes_closed(open: &std::sync::mpsc::Receiver<()>) -> bool {
     use std::sync::mpsc::RecvTimeoutError;
     let closed = open.recv_timeout(PIPE_GRACE);
     matches!(closed, Err(RecvTimeoutError::Disconnected))
 }
 
 /// What a reader kept so far, which also stops it keeping more.
-fn take(kept: &Mutex<Option<Captured>>) -> Captured {
+pub(crate) fn take(kept: &Mutex<Option<Captured>>) -> Captured {
     kept.lock()
         .ok()
         .and_then(|mut kept| kept.take())
