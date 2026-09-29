@@ -163,6 +163,17 @@ pub fn command(
             }));
             Flow::Handled
         }
+        "/verify" => {
+            runner.store.settings.verify_edits = !runner.store.settings.verify_edits;
+            runner.persist();
+            render::blank();
+            render::line(&render::dim(if runner.store.settings.verify_edits {
+                "After changing files, the model is asked once to build or test before it finishes."
+            } else {
+                "The model may finish after changing files without being asked to check them."
+            }));
+            Flow::Handled
+        }
         "/jobs" => {
             jobs(rest);
             Flow::Handled

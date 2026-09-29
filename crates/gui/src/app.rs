@@ -964,7 +964,8 @@ impl Chat {
         // asks for its first call.
         let conversation = connection.conversation;
         std::thread::spawn(move || letronna_core::hooks::new_turn(conversation));
-        self.turn = Some(agent::Turn::new(connection));
+        self.turn =
+            Some(agent::Turn::new(connection).verifying(self.store.settings.verifies_edits()));
         // A browser closed during the last turn shows again in this one.
         self.browser.update(cx, |view, _| view.dismissed = false);
         self.page = Page::Chat;
@@ -2546,7 +2547,8 @@ impl Chat {
         agents::connected(&connection);
         let conversation = connection.conversation;
         std::thread::spawn(move || letronna_core::hooks::new_turn(conversation));
-        self.turn = Some(agent::Turn::new(connection));
+        self.turn =
+            Some(agent::Turn::new(connection).verifying(self.store.settings.verifies_edits()));
         self.error = None;
         self.run_turn(cx);
     }

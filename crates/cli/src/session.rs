@@ -162,7 +162,7 @@ impl Runner {
         // What the session's kept helpers wake on from now on.
         agents::connected(&connection);
         hooks::new_turn(connection.conversation);
-        let mut turn = Turn::new(connection);
+        let mut turn = Turn::new(connection).verifying(self.store.settings.verifies_edits());
         self.stopped = false;
         self.bar.working(true);
         // The tab says so too, for whoever has switched away to something

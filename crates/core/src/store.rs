@@ -256,6 +256,10 @@ pub struct Settings {
     /// its full `mcp__server__tool` name; a name no tool has is passed over.
     #[serde(default, deserialize_with = "tool_names")]
     pub disabled_tools: Vec<String>,
+    /// Send a turn that changed files back once to build or test them, when
+    /// it is about to finish with no command run since.
+    #[serde(default = "yes")]
+    pub verify_edits: bool,
 }
 
 // Written out rather than derived so the film grain starts on for a first
@@ -284,7 +288,16 @@ impl Default for Settings {
             browse_unseen: false,
             appearance: String::new(),
             grain: true,
+            verify_edits: true,
         }
+    }
+}
+
+impl Settings {
+    /// Whether turns check their edits: switched on, and with `run_command`
+    /// left on, since the check is asked for with it.
+    pub fn verifies_edits(&self) -> bool {
+        self.verify_edits && !crate::tools::switched_off("run_command", &self.disabled_tools)
     }
 }
 
@@ -3453,6 +3466,19 @@ pub(crate) mod tests {
         let first = load().settings;
         assert_eq!((first.appearance.as_str(), first.grain), ("", true));
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn edits_are_checked_unless_switched_off_or_run_command_is() {
+        let read = |extra: &str| {
+            let text = format!(r#"{{"endpoint": "", "model": "m"{extra}}}"#);
+            super::read_settings(text.as_bytes()).unwrap()
+        };
+        // A file from before the setting starts it on, as a first run does.
+        assert!(read("").verify_edits && super::Settings::default().verify_edits);
+        assert!(read("").verifies_edits());
+        assert!(!read(r#", "verify_edits": false"#).verifies_edits());
+        assert!(!read(r#", "disabled_tools": ["run_command"]"#).verifies_edits());
     }
 
     #[test]

@@ -43,6 +43,14 @@ const SPEAK_UP: &str = "Your previous response had no visible output. Please con
 /// The notice after a short answer that stops at what it is about to do.
 const CONTINUE_NOW: &str = "Continue now.";
 
+/// The notice when a turn that changed files is about to end without
+/// running anything since.
+const VERIFY: &str = "You changed files and have not run anything since. Before saying the \
+    work is done, check it: run the project's build or tests, or say why that cannot be done here.";
+
+/// Tools whose successful calls change files in the project.
+const EDITS: [&str; 2] = ["write_file", "edit_file"];
+
 /// The longest answer read as only announcing its next step: room for a
 /// sentence or two before "Now let me...", too little for a finished answer
 /// that happens to end on a plan.
@@ -137,6 +145,12 @@ pub struct Turn {
     asked_again: bool,
     /// An answer that stopped at its next step was sent back this turn.
     pushed_on: bool,
+    /// Whether an answer after unchecked edits is sent back to check them.
+    verify: bool,
+    /// A file was changed since the last command ran.
+    edited: bool,
+    /// Unchecked edits were sent back this turn.
+    asked_to_verify: bool,
 }
 
 impl Turn {
@@ -154,7 +168,16 @@ impl Turn {
             order: Vec::new(),
             asked_again: false,
             pushed_on: false,
+            verify: false,
+            edited: false,
+            asked_to_verify: false,
         }
+    }
+
+    /// This turn, sending back once an answer that follows file edits with
+    /// no command run since, when `on`.
+    pub fn verifying(self, on: bool) -> Self {
+        Self { verify: on, ..self }
     }
 
     /// A turn that may run `rounds` tool rounds instead of `MAX_ROUNDS`.
@@ -246,7 +269,8 @@ impl Turn {
 
     /// The notice sending the model back to work after the reply just
     /// finished, if it needs one: a reply cut off at the output limit, one
-    /// with nothing in it, or a short answer that stops at "Now let me...".
+    /// with nothing in it, a short answer that stops at "Now let me...", or,
+    /// when verifying, an answer that follows edits no command has checked.
     /// A second empty reply takes its thinking as the answer, and calls made
     /// in the wrap-up at the round cap are dropped unrun. An error when a
     /// reply is still cut off after `MAX_CONTINUATIONS` notices, or still
@@ -296,7 +320,25 @@ impl Turn {
                 "It stopped at its next step; asking it to go on.",
             )));
         }
+        if self.verify && self.edited && !self.asked_to_verify && !wrap_up && self.runs_commands() {
+            self.asked_to_verify = true;
+            return Ok(Some(nudge(
+                VERIFY,
+                "Files changed with nothing run since; asking it to check them.",
+            )));
+        }
         Ok(None)
+    }
+
+    /// Whether this turn can run a command to check its edits: not in plan
+    /// mode, in a project folder, and never from a chat app, whose shared
+    /// chats cannot reach this computer at all.
+    fn runs_commands(&self) -> bool {
+        let connection = &self.connection;
+        connection.tools
+            && !connection.plan
+            && connection.workspace.is_some()
+            && connection.remote.is_none()
     }
 
     /// Queue the calls the model asked for. False when the turn should stop
@@ -379,6 +421,13 @@ impl Turn {
             Ok(out) => (out, false),
             Err(error) => (error, true),
         };
+        // Any command tried, even one that failed or was declined, leaves
+        // the check to the model; a failed edit changed nothing.
+        if call.name == "run_command" {
+            self.edited = false;
+        } else if !is_error && EDITS.contains(&call.name.as_str()) {
+            self.edited = true;
+        }
         self.results.push(Message {
             role: "tool".into(),
             content,
@@ -1104,5 +1153,93 @@ mod tests {
         ] {
             assert!(!announces(said), "{said}");
         }
+    }
+
+    /// A turn in a project folder that checks its edits, having run each of
+    /// `calls` in a round of its own and succeeded.
+    fn verifying_after(calls: &[&str]) -> Turn {
+        let mut turn = turn().verifying(true);
+        turn.connection.workspace = Some("project".into());
+        for name in calls {
+            turn.begin(vec![call(name)]);
+            turn.finish_call(Ok("done".into()));
+            turn.take_results();
+        }
+        turn
+    }
+
+    #[test]
+    fn an_edit_with_no_command_after_it_is_sent_back_to_check_once() {
+        let mut turn = verifying_after(&["read_file", "edit_file"]);
+        let mut done = answer(&mut turn, "Fixed the off-by-one.");
+        let nudge = turn.continuation(&mut done).unwrap().expect("a nudge");
+        assert_eq!(nudge.notice.content, VERIFY);
+        assert!(nudge.notice.notice && nudge.notice.role == "user");
+        assert_eq!(done.content, "Fixed the off-by-one.");
+        // It answers again without running anything: once is enough.
+        let mut again = answer(&mut turn, "It is fixed.");
+        assert!(matches!(turn.continuation(&mut again), Ok(None)));
+        // Nor does another edit earn a second one.
+        turn.begin(vec![call("write_file")]);
+        turn.finish_call(Ok("written".into()));
+        turn.take_results();
+        let mut again = answer(&mut turn, "Also wrote the notes.");
+        assert!(matches!(turn.continuation(&mut again), Ok(None)));
+    }
+
+    #[test]
+    fn an_edit_checked_by_a_command_is_not_sent_back() {
+        let mut turn = verifying_after(&["write_file", "run_command"]);
+        let mut done = answer(&mut turn, "Written, and the tests pass.");
+        assert!(matches!(turn.continuation(&mut done), Ok(None)));
+        let mut turn = verifying_after(&["run_command", "edit_file"]);
+        let mut done = answer(&mut turn, "Tests ran, then I tidied a comment.");
+        assert!(
+            turn.continuation(&mut done).unwrap().is_some(),
+            "the edit came last"
+        );
+    }
+
+    #[test]
+    fn a_failed_edit_or_a_turn_without_edits_is_not_sent_back() {
+        let mut turn = verifying_after(&["read_file"]);
+        let mut done = answer(&mut turn, "The file says hello.");
+        assert!(matches!(turn.continuation(&mut done), Ok(None)));
+        let mut turn = verifying_after(&[]);
+        turn.begin(vec![call("edit_file")]);
+        turn.finish_call(Err("old_string not found".into()));
+        turn.take_results();
+        let mut done = answer(&mut turn, "The text was not there.");
+        assert!(matches!(turn.continuation(&mut done), Ok(None)));
+    }
+
+    #[test]
+    fn edits_are_not_sent_back_where_no_command_can_run() {
+        let unchecked = |mut turn: Turn| {
+            let mut done = answer(&mut turn, "Done.");
+            matches!(turn.continuation(&mut done), Ok(None))
+        };
+        let mut plan = verifying_after(&["edit_file"]);
+        plan.connection.plan = true;
+        assert!(unchecked(plan), "plan mode");
+        let mut no_folder = verifying_after(&["edit_file"]);
+        no_folder.connection.workspace = None;
+        assert!(unchecked(no_folder), "no project folder");
+        let mut chat_app = verifying_after(&["edit_file"]);
+        chat_app.connection.remote = Some(crate::chat::Remote::default());
+        assert!(unchecked(chat_app), "a chat app");
+        let mut shared = verifying_after(&["edit_file"]);
+        shared.connection.remote = Some(crate::chat::Remote {
+            shared: true,
+            ..Default::default()
+        });
+        assert!(unchecked(shared), "a shared chat");
+    }
+
+    #[test]
+    fn edits_are_not_sent_back_with_the_setting_off() {
+        let mut turn = verifying_after(&["edit_file"]).verifying(false);
+        let mut done = answer(&mut turn, "Done.");
+        assert!(matches!(turn.continuation(&mut done), Ok(None)));
     }
 }
