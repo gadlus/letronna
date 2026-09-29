@@ -15,7 +15,8 @@
 use crate::chat::{Connection, Event, Message, Replay, ToolCall};
 use crate::gate::Outcome;
 use crate::tools;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::hash::{DefaultHasher, Hash, Hasher};
 
 /// Tool rounds per user message. Enough for a real investigation, small
 /// enough that a looping model stops on its own.
@@ -60,6 +61,18 @@ pub const STOPPED_WHILE_RUNNING: &str = "Stopped while it ran; check before retr
 
 /// The answer a call gets when the turn is stopped before it starts.
 pub const STOPPED_BEFORE_START: &str = "Not run: stopped before it started.";
+
+/// Times the same call gets the same result before the model is told to
+/// change approach: twice can be a check that something held.
+const REPEATS_NOTED: usize = 3;
+
+/// Times the same call gets the same result before an unattended turn ends,
+/// since nobody is there to notice it going round in circles.
+const REPEATS_STOPPED: usize = 5;
+
+/// Tools made to be called again for news, where the same answer means only
+/// that nothing has happened yet.
+const POLLING: [&str; 4] = ["wait", "read_job", crate::messaging::READ_CHAT, "agents"];
 
 /// Calls from one reply run at once. Enough for a model reading around a
 /// project in one go, few enough that a reply of dozens never starts dozens
@@ -137,12 +150,20 @@ pub struct Turn {
     asked_again: bool,
     /// An answer that stopped at its next step was sent back this turn.
     pushed_on: bool,
+    /// How often each call, by tool, arguments and result, has come back
+    /// the same this turn.
+    repeats: HashMap<(String, u64, u64), usize>,
+    /// Nobody is watching, so a call repeated without end stops the turn.
+    unattended: bool,
+    /// Why an unattended turn stopped going round in circles.
+    looped: Option<String>,
 }
 
 impl Turn {
     pub fn new(connection: Connection) -> Self {
         Self {
             files: crate::history::Log::new(connection.conversation),
+            unattended: connection.unattended,
             connection,
             live: Live::default(),
             rounds: 0,
@@ -154,7 +175,24 @@ impl Turn {
             order: Vec::new(),
             asked_again: false,
             pushed_on: false,
+            repeats: HashMap::new(),
+            looped: None,
         }
+    }
+
+    /// The same turn, ended by a call it keeps repeating whatever its
+    /// connection says, for a run nobody watches.
+    pub fn unattended(self) -> Self {
+        Self {
+            unattended: true,
+            ..self
+        }
+    }
+
+    /// Why an unattended turn must end: it made the same call with the same
+    /// result `REPEATS_STOPPED` times.
+    pub fn looping(&self) -> Option<&str> {
+        self.looped.as_deref()
     }
 
     /// A turn that may run `rounds` tool rounds instead of `MAX_ROUNDS`.
@@ -375,10 +413,24 @@ impl Turn {
         let Some(call) = self.queue.pop_front() else {
             return;
         };
-        let (content, is_error) = match outcome {
+        let (mut content, is_error) = match outcome {
             Ok(out) => (out, false),
             Err(error) => (error, true),
         };
+        let times = self.repeated(&call, &content, is_error);
+        if times >= REPEATS_NOTED {
+            content.push_str(&format!(
+                "\n\n[You have made this exact call {times} times this turn and got the same \
+                 result each time. Change your approach instead of repeating it.]"
+            ));
+        }
+        if times >= REPEATS_STOPPED && self.unattended && self.looped.is_none() {
+            self.looped = Some(format!(
+                "Stopped going round in circles: it called `{}` {times} times with the same \
+                 arguments and got the same result each time.",
+                call.name
+            ));
+        }
         self.results.push(Message {
             role: "tool".into(),
             content,
@@ -389,6 +441,26 @@ impl Turn {
             files: self.files.take(),
             ..Default::default()
         });
+    }
+
+    /// How many times this turn the call has now come back with this result;
+    /// 0 for a tool made to be polled.
+    fn repeated(&mut self, call: &ToolCall, content: &str, is_error: bool) -> usize {
+        if POLLING.contains(&call.name.as_str()) {
+            return 0;
+        }
+        // Parsed first, so spacing or key order does not make a call new.
+        let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments)
+            .map(|args| args.to_string())
+            .unwrap_or_else(|_| call.arguments.clone());
+        let key = (
+            call.name.clone(),
+            hash(&arguments),
+            hash(&(content, is_error)),
+        );
+        let times = self.repeats.entry(key).or_default();
+        *times += 1;
+        *times
     }
 
     /// Record the outcome of the call with this id, wherever it sits in the queue.
@@ -455,6 +527,13 @@ impl Turn {
         kept.append(&mut self.results);
         kept
     }
+}
+
+/// A digest of `value`, for counting repeats without keeping whole results.
+fn hash(value: &impl Hash) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// A notice for the model, with the line that tells the user why.
@@ -1103,6 +1182,87 @@ mod tests {
             &format!("{} Let me run the tests.", "Done. ".repeat(80)),
         ] {
             assert!(!announces(said), "{said}");
+        }
+    }
+
+    /// Makes `call` in a round of its own, `times` times, each coming back
+    /// `result`, and gives what the model was sent back each time.
+    fn repeat(turn: &mut Turn, call: &ToolCall, result: &str, times: usize) -> Vec<String> {
+        (0..times)
+            .map(|_| {
+                turn.begin(vec![call.clone()]);
+                turn.finish_call(Ok(result.into()));
+                turn.take_results().remove(0).content
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_third_identical_result_tells_the_model_to_change_approach() {
+        let mut turn = turn();
+        let sent = repeat(&mut turn, &call("read_file"), "same", 4);
+        assert_eq!(sent[..2], ["same", "same"]);
+        assert_eq!(
+            sent[2],
+            "same\n\n[You have made this exact call 3 times this turn and got the same \
+             result each time. Change your approach instead of repeating it.]"
+        );
+        assert!(sent[3].contains("made this exact call 4 times"));
+        // Someone is watching, so it is told but never stopped.
+        repeat(&mut turn, &call("read_file"), "same", 4);
+        assert_eq!(turn.looping(), None);
+        // The counts are the turn's own: the next starts from nothing.
+        assert_eq!(
+            repeat(&mut self::turn(), &call("read_file"), "same", 1),
+            ["same"]
+        );
+    }
+
+    #[test]
+    fn a_changed_argument_or_result_starts_the_count_again() {
+        let mut turn = turn();
+        let mut other = call("read_file");
+        other.arguments = r#"{"path": "b.rs"}"#.into();
+        repeat(&mut turn, &call("read_file"), "same", 2);
+        assert_eq!(repeat(&mut turn, &other, "same", 2), ["same", "same"]);
+        assert_eq!(
+            repeat(&mut turn, &call("read_file"), "changed", 1),
+            ["changed"]
+        );
+        // Only spacing differs, so it is the same call and its third time.
+        other.arguments = r#"{ "path":"b.rs" }"#.into();
+        assert!(repeat(&mut turn, &other, "same", 1)[0].contains("3 times"));
+    }
+
+    #[test]
+    fn an_unattended_turn_stops_at_the_fifth_repeat() {
+        let mut turn = turn().unattended();
+        repeat(&mut turn, &call("read_file"), "same", 4);
+        assert_eq!(turn.looping(), None);
+        repeat(&mut turn, &call("read_file"), "same", 1);
+        assert_eq!(
+            turn.looping(),
+            Some(
+                "Stopped going round in circles: it called `read_file` 5 times with the same \
+                 arguments and got the same result each time."
+            )
+        );
+        // A schedule's connection says so itself.
+        let mut connection = self::turn().connection;
+        connection.unattended = true;
+        let mut scheduled = Turn::new(connection);
+        repeat(&mut scheduled, &call("read_file"), "same", 5);
+        assert!(scheduled.looping().is_some());
+    }
+
+    #[test]
+    fn polling_tools_are_never_counted_as_repeats() {
+        for polled in POLLING {
+            assert!(tools::find(polled).is_some(), "{polled} is not a tool");
+            let mut turn = turn().unattended();
+            let sent = repeat(&mut turn, &call(polled), "still running", 8);
+            assert!(sent.iter().all(|s| s == "still running"), "{polled}");
+            assert_eq!(turn.looping(), None, "{polled}");
         }
     }
 }

@@ -172,7 +172,7 @@ pub type Handle = std::thread::JoinHandle<Report>;
 pub fn run(mut spec: Spec) -> Report {
     let started = Instant::now();
     crate::hooks::new_turn(spec.connection.conversation);
-    let mut turn = Turn::with_limit(spec.connection.clone(), spec.rounds);
+    let mut turn = Turn::with_limit(spec.connection.clone(), spec.rounds).unattended();
     let mut report = Report {
         status: Outcome::Done,
         text: String::new(),
@@ -329,6 +329,9 @@ fn steps(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result<Outcom
         report.rounds += 1;
         spec.status.rounds.store(report.rounds, Ordering::Relaxed);
         work_through(spec, turn, report)?;
+        if let Some(why) = turn.looping() {
+            return Ok(Outcome::Failed(why.to_owned()));
+        }
         // A hook's `continue: false`, whose results are kept.
         if crate::hooks::halted(spec.connection.conversation) {
             return Ok(Outcome::Stopped);
@@ -382,7 +385,7 @@ fn work_through(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result
                 // After the results, which have to follow the calls they
                 // answer, and only if the run goes on: mail a run ending here
                 // would never read is left for its owner.
-                if settled(spec, report).is_none() {
+                if settled(spec, report).is_none() && turn.looping().is_none() {
                     let mail = inbox::fold(&inbox::take(spec.id, false));
                     spec.transcript.conversation.messages.extend(mail);
                 }
@@ -2044,5 +2047,28 @@ mod tests {
             texts,
             ["helper ended before it read this, from main:\nalso check the tests"]
         );
+    }
+
+    #[test]
+    fn a_run_that_repeats_one_call_stops_at_the_fifth_saying_why() {
+        let dir = scratch("loops");
+        std::fs::create_dir(dir.join("empty")).unwrap();
+        let look = ("list_dir", json!({"path": "empty"}));
+        let (endpoint, provider) = provider(vec![reply("", &[look]); 5]);
+        let report = finished(spec(endpoint, &dir, AGENTS + 90));
+        let sent = provider.sent();
+        assert_eq!(
+            report.status,
+            Outcome::Failed(
+                "Stopped going round in circles: it called `list_dir` 5 times with the same \
+                 arguments and got the same result each time."
+                    .into()
+            )
+        );
+        assert_eq!(report.rounds, 5);
+        // The model was told before it was stopped.
+        let told = results(&sent[3]);
+        assert!(!told[1].contains("Change your approach"));
+        assert!(told[2].contains("made this exact call 3 times"));
     }
 }

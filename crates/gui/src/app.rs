@@ -1520,8 +1520,14 @@ impl Chat {
                 if let Some(ix) = self.streaming_id.and_then(|id| self.store.index_of(id)) {
                     let conversation = &mut self.store.conversations[ix];
                     conversation.messages.extend(results);
+                    let looped = self.turn.as_ref().and_then(agent::Turn::looping);
+                    if let Some(why) = looped.map(str::to_owned) {
+                        // An error, so a schedule's or chat's report says why.
+                        self.error = Some(why);
+                        self.save();
+                        self.finish(cx);
                     // A hook's `continue: false`, shown with the results.
-                    if letronna_core::hooks::halted(conversation.id) {
+                    } else if letronna_core::hooks::halted(conversation.id) {
                         self.save();
                         self.finish(cx);
                     } else {
