@@ -155,9 +155,9 @@ impl Runner {
                 .unwrap_or_default();
             let cancel = Cancel::default();
             let (sender, receiver) = mpsc::sync_channel(1);
-            let (asking, stop) = (connection.clone(), cancel.clone());
+            let (asking, stop, judged) = (connection.clone(), cancel.clone(), standing.clone());
             std::thread::spawn(move || {
-                let _ = sender.send(goal::review(&standing, &asking, &reply, &stop));
+                let _ = sender.send(goal::review(&judged, &asking, &reply, &stop));
             });
             self.bar.working(true);
             self.bar.wait_line_about("goal check");
@@ -183,7 +183,9 @@ impl Runner {
             };
             cancel.set();
             let conversation = &mut self.store.conversations[session];
-            goal::settle(&mut conversation.goal, &step);
+            if !goal::settle(&mut conversation.goal, &standing, &step) {
+                return answer;
+            }
             let (notice, message) = match step {
                 goal::Step::Continue { notice, message } => (notice, Some(message)),
                 goal::Step::Done(notice)

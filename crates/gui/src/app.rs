@@ -826,6 +826,13 @@ impl Chat {
         if let Some(args) = goal_command(&prompt) {
             let command = goal::parse(args);
             let ix = self.store.active;
+            // A look at the goal being changed would act on the old one.
+            let here = self.store.conversations[ix].id;
+            if command != goal::Command::Show
+                && let Some((_, check)) = self.goal_check.take_if(|(id, _)| *id == here)
+            {
+                check.set();
+            }
             match goal::apply_command(&mut self.store.conversations[ix].goal, command) {
                 Ok(said) => self.note = Some(said),
                 Err(error) => self.error = Some(error),
@@ -2568,25 +2575,28 @@ impl Chat {
             earlier.set();
         }
         let (sender, receiver) = async_channel::bounded(1);
-        let stop = cancel.clone();
+        let (stop, judged) = (cancel.clone(), standing.clone());
         std::thread::spawn(move || {
-            let _ = sender.send_blocking(goal::review(&standing, &connection, &reply, &stop));
+            let _ = sender.send_blocking(goal::review(&judged, &connection, &reply, &stop));
         });
         cx.spawn(async move |this, cx| {
             if let Ok(step) = receiver.recv().await {
-                let _ = this.update(cx, |this, cx| this.after_goal_review(id, &cancel, step, cx));
+                let _ = this.update(cx, |this, cx| {
+                    this.after_goal_review(id, &cancel, &standing, step, cx)
+                });
             }
         })
         .detach();
         true
     }
 
-    /// Acts on what the look at session `id`'s goal came to, unless the
-    /// user stopped or sent something meanwhile.
+    /// Acts on what the look at session `id`'s goal, `judged`, came to,
+    /// unless the user stopped, sent something or changed the goal meanwhile.
     fn after_goal_review(
         &mut self,
         id: u64,
         cancel: &letronna_core::cancel::Cancel,
+        judged: &goal::Goal,
         step: goal::Step,
         cx: &mut Context<Self>,
     ) {
@@ -2597,7 +2607,9 @@ impl Chat {
         let Some(ix) = self.store.index_of(id).filter(|_| !self.busy) else {
             return cx.notify();
         };
-        goal::settle(&mut self.store.conversations[ix].goal, &step);
+        if !goal::settle(&mut self.store.conversations[ix].goal, judged, &step) {
+            return self.wake_idle(cx);
+        }
         self.save();
         match step {
             goal::Step::Continue { notice, message } => {

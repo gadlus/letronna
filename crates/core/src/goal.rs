@@ -251,23 +251,22 @@ pub fn interrupted(goal: &mut Option<Goal>) {
     }
 }
 
-/// Puts `step` into the session's goal: one more continuation counted, a
-/// goal that is done dropped, or one that paused marked so.
-pub fn settle(goal: &mut Option<Goal>, step: &Step) {
+/// Puts `step`, what the look at `judged` came to, into the session's goal
+/// as it is now: one more continuation counted, a goal that is done
+/// dropped, or one that paused marked so. False, with nothing changed, when
+/// the goal was cleared or changed while the look ran, since the step was
+/// about a goal that is gone and must not be acted on.
+pub fn settle(goal: &mut Option<Goal>, judged: &Goal, step: &Step) -> bool {
+    let Some(current) = goal.as_mut().filter(|goal| *goal == judged) else {
+        return false;
+    };
     match step {
-        Step::Continue { .. } => {
-            if let Some(goal) = goal {
-                goal.continuations += 1;
-            }
-        }
+        Step::Continue { .. } => current.continuations += 1,
         Step::Done(_) => *goal = None,
-        Step::Pause { why, .. } => {
-            if let Some(goal) = goal {
-                goal.paused = Some(why.clone());
-            }
-        }
+        Step::Pause { why, .. } => current.paused = Some(why.clone()),
         Step::Deferred(_) | Step::Cleared => {}
     }
+    true
 }
 
 /// Looks at the turn that ended with `reply` and says what follows. It waits
@@ -598,7 +597,7 @@ mod tests {
                 |_| String::new(),
                 |prompt| model.ask(prompt),
             );
-            settle(&mut kept, &step);
+            assert!(settle(&mut kept, &goal, &step));
             let more = matches!(step, Step::Continue { .. });
             steps.push(step);
             if !more {
@@ -728,11 +727,12 @@ mod tests {
             },
         );
         assert_eq!(step, Step::Cleared);
-        let mut kept = Some(Goal {
+        let judged = Goal {
             continuations: 7,
             ..goal(None)
-        });
-        settle(&mut kept, &step);
+        };
+        let mut kept = Some(judged.clone());
+        assert!(settle(&mut kept, &judged, &step));
         interrupted(&mut kept);
         assert_eq!(kept.as_ref().map(|g| g.continuations), Some(0));
         // Stopped before the look began, nothing runs and nothing is asked.
@@ -884,7 +884,7 @@ mod tests {
             "{step:?}"
         );
         let mut kept = Some(goal(None));
-        settle(&mut kept, &step);
+        assert!(settle(&mut kept, &goal(None), &step));
         assert_eq!(kept, Some(goal(None)));
         assert!(!working(session));
     }
@@ -945,5 +945,26 @@ mod tests {
         let out = run_check("sleep 30", &std::env::temp_dir(), CHECK_TIME, &cancel);
         assert!(started.elapsed() < Duration::from_secs(10), "{out}");
         assert!(out.ends_with("[stopped]"), "{out}");
+    }
+
+    #[test]
+    fn a_goal_cleared_or_changed_during_a_look_drops_its_step() {
+        let judged = goal(None);
+        let step = Step::Continue {
+            notice: "Goal: carrying on".into(),
+            message: "carry on".into(),
+        };
+        let mut cleared = None;
+        assert!(!settle(&mut cleared, &judged, &step));
+        assert_eq!(cleared, None);
+        let mut replaced = Some(Goal::new("another goal", None));
+        assert!(!settle(&mut replaced, &judged, &Step::Done("met".into())));
+        assert_eq!(replaced, Some(Goal::new("another goal", None)));
+        let mut rechecked = Some(goal(Some("cargo test")));
+        assert!(!settle(&mut rechecked, &judged, &step));
+        assert_eq!(rechecked.unwrap().continuations, 0);
+        let mut same = Some(judged.clone());
+        assert!(settle(&mut same, &judged, &step));
+        assert_eq!(same.unwrap().continuations, 1);
     }
 }
