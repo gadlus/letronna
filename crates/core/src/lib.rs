@@ -62,6 +62,8 @@ pub mod usage;
 pub mod wake;
 pub mod watch;
 pub mod web;
+#[cfg(feature = "workflows")]
+pub mod workflow;
 mod write;
 
 /// The name the app goes by, used in paths and on screen.

@@ -1687,7 +1687,7 @@ fn read_settings_file() -> Settings {
 
 /// The settings, and as JSON what the file said before a retired gateway is
 /// moved, so the move is saved like any other change.
-fn settings() -> (Settings, serde_json::Value) {
+pub(crate) fn settings() -> (Settings, serde_json::Value) {
     let mut s = read_settings_file();
     let read = serde_json::to_value(&s).unwrap_or_default();
     retire_gateway(&mut s);
