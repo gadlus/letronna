@@ -135,20 +135,18 @@ pub(crate) fn ask(
         SETTLED.notify_all();
     });
     let key = (run, call.name.clone());
+    // The grant answers for this tool from whichever call first asked about
+    // it, so it covers this one only if this one clears on its own. Worked
+    // out before the lock, since letting go of it between the check and the
+    // wait below would let a stop's wake land in the gap and be missed.
+    let clears = crate::gate::cleared(call, ctx);
     let mut asks = lock(&ASKS);
     loop {
         if ctx.cancel.is_set() {
             return Err(String::new());
         }
-        if asks.granted.contains(&key) {
-            drop(asks);
-            // The grant answers for this tool from whichever call first
-            // asked about it, so it covers this one too only once this
-            // one clears the floor and any rule on its own.
-            if crate::gate::cleared(call, ctx) {
-                return Ok(());
-            }
-            asks = lock(&ASKS);
+        if clears && asks.granted.contains(&key) {
+            return Ok(());
         }
         if asks.asking.insert(key.clone()) {
             break;
@@ -438,6 +436,37 @@ pub(crate) mod tests {
         assert_eq!(in_line.recv_timeout(WAIT), Ok(false));
         request.answer(Decision::Once);
         assert_eq!(first.recv_timeout(WAIT), Ok(true));
+    }
+
+    #[test]
+    fn a_stop_reaches_a_call_its_runs_grant_does_not_cover() {
+        let _turn = lock(&SERVING);
+        let requests = serve();
+        let ctx = ToolContext::default();
+        let first = asking(1912, call("a", "run_command"), ctx.clone());
+        let request = requests.recv_timeout(WAIT).unwrap();
+        request.answer(Decision::ForRun);
+        assert_eq!(first.recv_timeout(WAIT), Ok(true));
+        let dangerous = |id: &str| ToolCall {
+            id: id.into(),
+            name: "run_command".into(),
+            arguments: r#"{"command": "git reset --hard HEAD~1"}"#.into(),
+        };
+        let out = asking(1912, dangerous("b"), ctx);
+        let request = requests.recv_timeout(WAIT).unwrap();
+
+        // Stopped at every point on the way to its wait behind that
+        // request, including while its own call is being checked, each one
+        // still stops waiting rather than holding out for that answer.
+        for pause in 0..200 {
+            let behind = ToolContext::default();
+            let in_line = asking(1912, dangerous("c"), behind.clone());
+            std::thread::sleep(Duration::from_micros(pause * 5));
+            behind.cancel.set();
+            assert_eq!(in_line.recv_timeout(WAIT), Ok(false), "after {pause}");
+        }
+        request.answer(Decision::Deny(String::new()));
+        assert_eq!(out.recv_timeout(WAIT), Ok(false));
     }
 
     #[test]
