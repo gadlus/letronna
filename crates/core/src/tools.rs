@@ -123,7 +123,15 @@ const SETTLE: std::time::Duration = std::time::Duration::from_millis(1200);
 /// too short to feel.
 const PIPE_GRACE: Duration = Duration::from_millis(300);
 
-const MAX_OUTPUT: usize = 24_000;
+/// A tool's reply is cut to this many bytes, so no more characters: the cap
+/// the chat puts on a tool result in a request, which then carries the cut
+/// whole instead of trimming its middle again, marker line and all. A quarter
+/// goes to the start and the rest to the end, because a build, a test run or
+/// an install ends with its errors, its summary and the exit code.
+const MAX_OUTPUT: usize = crate::chat::MAX_TOOL_CHARS;
+/// Bytes kept free for the line that says what was left out, which with the
+/// largest counts a `usize` can hold is still shorter than this.
+const MARKER_ROOM: usize = 100;
 const SKIP_DIRS: &[&str] = &[".git", "node_modules", "target", ".next", "dist", "build"];
 
 /// Tools contributed by enabled plugins. Kept here rather than read from the
@@ -430,15 +438,55 @@ fn run_found(tool: &dyn Tool, name: &str, args: &str, ctx: &ToolContext) -> Resu
             ));
         }
     }
-    let mut out = tool.run(&args, ctx).map_err(|e| e + &note)?;
-    if out.len() > MAX_OUTPUT {
-        let cut = out.floor_char_boundary(MAX_OUTPUT);
-        out.truncate(cut);
-        out.push_str("\n… [truncated]");
-    }
+    let mut out = keep_ends(tool.run(&args, ctx).map_err(|e| e + &note)?, MAX_OUTPUT);
     // After the cut, so the note is never the part that gets lost.
     out.push_str(&note);
     Ok(out)
+}
+
+/// `text` as it is when it fits in `max` bytes; otherwise its first and last
+/// whole lines, with a line between them saying how much was left out.
+fn keep_ends(text: String, max: usize) -> String {
+    if text.len() <= max {
+        return text;
+    }
+    let room = max.saturating_sub(MARKER_ROOM);
+    let head = line_end(&text, room / 4);
+    let tail = line_start(&text, text.len() - (room - room / 4));
+    let left = &text[head..tail];
+    let lines = left.lines().count();
+    let unit = if lines == 1 { "line" } else { "lines" };
+    let gap = if head == 0 || text[..head].ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    format!(
+        "{}{gap}… [{lines} {unit} ({} bytes) left out]\n{}",
+        &text[..head],
+        left.len(),
+        &text[tail..]
+    )
+}
+
+/// Where the last line that ends by `at` ends, or `at` itself on a line
+/// longer than that, so one huge line is cut rather than dropped.
+fn line_end(text: &str, at: usize) -> usize {
+    let at = text.floor_char_boundary(at);
+    text[..at].rfind('\n').map_or(at, |i| i + 1)
+}
+
+/// Where the first line that starts at or after `at` starts, or `at` itself
+/// when no other line follows, so one huge line is cut rather than dropped.
+fn line_start(text: &str, at: usize) -> usize {
+    let at = text.ceil_char_boundary(at);
+    if at == 0 || text.as_bytes()[at - 1] == b'\n' {
+        return at;
+    }
+    match text[at..].find('\n') {
+        Some(i) if at + i + 1 < text.len() => at + i + 1,
+        _ => at,
+    }
 }
 
 /// The first `max` lines, with a note about the rest. Keeps cards and rows
@@ -2879,5 +2927,36 @@ mod tests {
             assert!(refused.contains(reason), "{path}: {refused}");
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_long_output_is_cut_between_whole_lines() {
+        let lines: Vec<String> = (1..=3000)
+            .map(|n| format!("row {n} {}", "=".repeat(n % 40)))
+            .collect();
+        let text = lines.join("\n");
+        let out = keep_ends(text, 2_000);
+        let kept: Vec<&str> = out.lines().filter(|l| !l.starts_with("… [")).collect();
+        assert!(kept.len() > 10, "{out}");
+        for line in kept {
+            assert!(lines.iter().any(|l| l == line), "cut line {line:?}");
+        }
+    }
+
+    #[test]
+    fn long_output_keeps_more_of_its_end_and_says_what_was_left_out() {
+        let lines: Vec<String> = (1..=5000).map(|n| format!("line {n}")).collect();
+        let text = lines.join("\n") + "\n[exit code 3]";
+        let out = keep_ends(text.clone(), MAX_OUTPUT);
+        assert!(out.len() <= MAX_OUTPUT, "{}", out.len());
+        assert!(out.starts_with("line 1\nline 2\n"), "{out}");
+        assert!(out.ends_with("line 5000\n[exit code 3]"), "{out}");
+        let (head, rest) = out.split_once("… [").unwrap();
+        let (marker, tail) = rest.split_once("]\n").unwrap();
+        assert!(tail.len() > 2 * head.len(), "{} {}", head.len(), tail.len());
+        // The counts add up to exactly what is missing.
+        let left = text.len() - head.len() - tail.len();
+        let missing = text.lines().count() - head.lines().count() - tail.lines().count();
+        assert_eq!(marker, format!("{missing} lines ({left} bytes) left out"));
     }
 }
