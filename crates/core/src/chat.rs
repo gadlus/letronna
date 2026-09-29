@@ -4067,6 +4067,16 @@ mod tests {
             dropped
         );
         first_words(&c, quiet);
+        // Asked for once that reply is over, before the one that needs it is
+        // sent: one asked for on the spot would pass the checks below too.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while asked.load(Ordering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no summary was made ahead"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let rx = start(c, crossing);
         let mut kept = None;
         loop {
