@@ -82,17 +82,8 @@ impl Capabilities {
                 .auto_grow(1, 6)
                 .placeholder("Paste a server's JSON from its README, or the line that starts it")
         });
-        let server_name = cx.new(|cx| InputState::new(window, cx).placeholder("github"));
-        let server_target = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("npx -y @modelcontextprotocol/server-github, or https://…")
-        });
-        let server_extras = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
-                .auto_grow(1, 4)
-                .placeholder("API_KEY=… for a command, or Authorization: Bearer … for an address")
-        });
+        let [server_name, server_target, server_extras] =
+            server_fields(&Draft::default(), window, cx);
         let filled = cx.subscribe_in(&paste, window, |this, _, event, window, cx| {
             if matches!(event, InputEvent::Change) {
                 this.fill_server(window, cx);
@@ -233,7 +224,15 @@ impl Chat {
     fn fill_server(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let pasted = self.capabilities.paste.read(cx).value().to_string();
         if pasted.trim().is_empty() {
-            self.capabilities.server_note = None;
+            // Add empties the box too, and what it came to stays.
+            if self
+                .capabilities
+                .server_note
+                .as_ref()
+                .is_some_and(Result::is_err)
+            {
+                self.capabilities.server_note = None;
+            }
             cx.notify();
             return;
         }
@@ -245,14 +244,7 @@ impl Chat {
                 return;
             }
         };
-        let fields = [
-            (&self.capabilities.server_name, draft.name),
-            (&self.capabilities.server_target, draft.target),
-            (&self.capabilities.server_extras, draft.extras),
-        ];
-        for (input, value) in fields {
-            input.update(cx, |input, cx| input.set_value(value, window, cx));
-        }
+        self.set_server_fields(&draft, window, cx);
         self.capabilities.server_note = None;
         cx.notify();
     }
@@ -267,19 +259,25 @@ impl Chat {
         };
         let added = mcp_paste::add(&draft);
         if added.is_ok() {
-            let inputs = [
-                &self.capabilities.paste,
-                &self.capabilities.server_name,
-                &self.capabilities.server_target,
-                &self.capabilities.server_extras,
-            ];
-            for input in inputs {
-                input.update(cx, |input, cx| input.set_value("", window, cx));
-            }
+            self.set_server_fields(&Draft::default(), window, cx);
+            // Left with the focus, the box's cursor stops blinking once it
+            // is left, as a set box without the focus never would.
+            self.capabilities.paste.update(cx, |input, cx| {
+                input.set_value("", window, cx);
+                input.focus(window, cx);
+            });
         }
         self.capabilities.server_note =
             Some(added.map(|name| format!("Added {name}; it is starting below.")));
         cx.notify();
+    }
+
+    /// Put `draft` in the add form's fields.
+    fn set_server_fields(&mut self, draft: &Draft, window: &mut Window, cx: &mut Context<Self>) {
+        let [name, target, extras] = server_fields(draft, window, cx);
+        self.capabilities.server_name = name;
+        self.capabilities.server_target = target;
+        self.capabilities.server_extras = extras;
     }
 
     pub(crate) fn capabilities_page(
@@ -513,6 +511,35 @@ impl Chat {
                     .children(note),
             )
     }
+}
+
+/// The add form's name, command and variables fields, holding `draft`.
+/// They are built afresh rather than set: setting the text of a box without
+/// the focus starts its cursor blinking, redrawing the window twice a second
+/// until the box has been focused and left.
+fn server_fields(
+    draft: &Draft,
+    window: &mut Window,
+    cx: &mut Context<Chat>,
+) -> [Entity<InputState>; 3] {
+    let name = cx.new(|cx| {
+        InputState::new(window, cx)
+            .placeholder("github")
+            .default_value(draft.name.clone())
+    });
+    let target = cx.new(|cx| {
+        InputState::new(window, cx)
+            .placeholder("npx -y @modelcontextprotocol/server-github, or https://…")
+            .default_value(draft.target.clone())
+    });
+    let extras = cx.new(|cx| {
+        InputState::new(window, cx)
+            .multi_line(true)
+            .auto_grow(1, 4)
+            .placeholder("API_KEY=… for a command, or Authorization: Bearer … for an address")
+            .default_value(draft.extras.clone())
+    });
+    [name, target, extras]
 }
 
 /// A switch that Tab reaches and Enter or Space flips, as a click does:
