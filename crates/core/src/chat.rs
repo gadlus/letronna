@@ -674,6 +674,7 @@ fn body_with(
     // stays cacheable; the summary of dropped turns changes as the
     // conversation grows.
     system.push_str(&crate::memory::context(connection));
+    system.push_str(&crate::mcp::context(connection));
     system.push_str(&crate::skills::context(connection));
     // Models reckon "today" from their training and guess who they are. The
     // date alone changes once a day, so the prefix above stays cached; the OS

@@ -5,7 +5,11 @@
 //! Servers listed in `mcp.json` in the data folder -- the shape Claude Desktop
 //! and Cursor read, so a config can be copied across -- run as child
 //! processes, spoken to over their stdin and stdout one JSON-RPC message per
-//! line. Their tools join Letronna's own as `mcp__<server>__<tool>`.
+//! line. Their tools join Letronna's own as `mcp__<server>__<tool>`, with a
+//! hash on the end of any two that would share a name, as the providers
+//! refuse, and their schemas are reshaped into what every provider takes.
+//! What a server tells the model as it starts goes into the system prompt,
+//! after memory, marked as the server's.
 //!
 //! Starting a server can take a while (npx may be downloading it first), so
 //! the servers start on threads of their own the first time the tools are
@@ -66,6 +70,7 @@
 //! and `cmd /C` whatever it started, where killing the server alone would
 //! end neither.
 
+use crate::chat::Connection;
 use crate::tools::{Tool, ToolContext};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -430,7 +435,7 @@ impl std::fmt::Display for Reloaded {
 struct Slot {
     config: ServerConfig,
     state: State,
-    tools: Vec<Arc<dyn Tool>>,
+    tools: Vec<Arc<McpTool>>,
     error: Option<String>,
     /// Its stderr, the newest 64 KB, kept across restarts.
     log: Arc<Mutex<VecDeque<u8>>>,
@@ -502,19 +507,50 @@ fn retry_wait(attempt: u32, attempts: u32) -> Option<Duration> {
     })
 }
 
-/// The tools of every server that has answered so far.
+/// The tools of every server that has answered so far, each under a name
+/// none of the others has.
 pub fn tools() -> Vec<Arc<dyn Tool>> {
     start();
-    slots()
-        .lock()
-        .map(|slots| {
-            slots
-                .values()
-                .filter(|slot| slot.state == State::Connected)
-                .flat_map(|slot| slot.tools.iter().cloned())
-                .collect()
+    let Ok(slots) = slots().lock() else {
+        return Vec::new();
+    };
+    let tools: Vec<&Arc<McpTool>> = (slots.values())
+        .filter(|slot| slot.state == State::Connected)
+        .flat_map(|slot| &slot.tools)
+        .collect();
+    let owners: Vec<(&str, &str)> = (tools.iter())
+        .map(|tool| (tool.server.name.as_str(), tool.own.as_str()))
+        .collect();
+    // A renamed one is a copy under its new name, and still calls its own
+    // tool on its own server.
+    (tools.into_iter().zip(unique_names(&owners)))
+        .map(|(tool, name)| -> Arc<dyn Tool> {
+            match tool.name == name {
+                true => tool.clone(),
+                false => Arc::new(McpTool {
+                    name: keep(name),
+                    ..McpTool::clone(tool)
+                }),
+            }
         })
-        .unwrap_or_default()
+        .collect()
+}
+
+/// What the servers whose tools are offered said to the model as they
+/// started, each headed by its server's name. Nothing for a session without
+/// tools, or where other people read the replies, which is offered none.
+pub fn context(connection: &Connection) -> String {
+    if !connection.tools || connection.remote.as_ref().is_some_and(|r| r.shared) {
+        return String::new();
+    }
+    let Ok(slots) = slots().lock() else {
+        return String::new();
+    };
+    (slots.values())
+        .filter(|slot| slot.state == State::Connected && !slot.tools.is_empty())
+        .filter_map(|slot| slot.server.as_ref()?.instructions.get())
+        .map(|said| format!("\n\n{said}"))
+        .collect()
 }
 
 #[cfg(test)]
@@ -996,7 +1032,7 @@ fn with_run<T>(name: &str, run: u64, change: impl FnOnce(&mut Slot) -> T) -> Opt
 }
 
 /// Record how a start went.
-fn settle(name: &str, run: u64, outcome: Result<Vec<Arc<dyn Tool>>, String>) {
+fn settle(name: &str, run: u64, outcome: Result<Vec<Arc<McpTool>>, String>) {
     with_run(name, run, |slot| match outcome {
         Ok(tools) => {
             slot.state = State::Connected;
@@ -1118,7 +1154,7 @@ fn wait_started(limit: Duration) {
 }
 
 /// Start one server and list its tools.
-fn launch(name: &str, config: &ServerConfig, run: u64) -> Result<Vec<Arc<dyn Tool>>, String> {
+fn launch(name: &str, config: &ServerConfig, run: u64) -> Result<Vec<Arc<McpTool>>, String> {
     // An unset variable fails the start here, so its slot says which.
     let config = &config
         .expanded(&|var| std::env::var(var).ok())
@@ -1229,7 +1265,7 @@ fn spawn(config: &ServerConfig, base: &Path) -> Result<std::process::Child, Stri
 }
 
 /// Greet a server reached by URL and wrap each tool it lists.
-fn reach(name: &str, config: &ServerConfig, run: u64) -> Result<Vec<Arc<dyn Tool>>, String> {
+fn reach(name: &str, config: &ServerConfig, run: u64) -> Result<Vec<Arc<McpTool>>, String> {
     let (from, replies) = std::io::pipe().map_err(|e| format!("{name}: {e}"))?;
     // Each request carries its own deadline, from the server's call time,
     // rather than the client cutting every call off at one length.
@@ -1588,7 +1624,7 @@ fn connect(
     config: &ServerConfig,
     from: impl Read + Send + 'static,
     to: impl Write + Send + 'static,
-) -> Result<Vec<Arc<dyn Tool>>, String> {
+) -> Result<Vec<Arc<McpTool>>, String> {
     let server = Arc::new(Server {
         name: name.to_owned(),
         run,
@@ -1597,13 +1633,14 @@ fn connect(
         waiting: Mutex::default(),
         next: AtomicU64::new(1),
         relisting: Mutex::default(),
+        instructions: OnceLock::new(),
     });
     // Held weakly, so a server let go of is dropped, closing what it
     // speaks over, rather than kept by the thread reading its replies.
     let reader = Arc::downgrade(&server);
     std::thread::spawn(move || Server::listen(&reader, from));
     with_run(name, run, |slot| slot.server = Some(server.clone()));
-    server.request(
+    let greeting = server.request(
         "initialize",
         json!({
             "protocolVersion": PROTOCOL,
@@ -1612,6 +1649,11 @@ fn connect(
         }),
         config.start_time(),
     )?;
+    if let Some(said) = greeting["instructions"].as_str()
+        && !said.trim().is_empty()
+    {
+        let _ = server.instructions.set(instructions(name, said));
+    }
     server.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))?;
     server.list()
 }
@@ -1636,6 +1678,8 @@ struct Server {
     waiting: Mutex<HashMap<u64, mpsc::Sender<Result<Value, String>>>>,
     next: AtomicU64,
     relisting: Mutex<Relisting>,
+    /// What it told the model as it started, as the system prompt carries it.
+    instructions: OnceLock<String>,
 }
 
 /// Where asking a server for its tools again stands, so a burst of notices
@@ -1652,9 +1696,9 @@ enum Relisting {
 impl Server {
     /// Its tools, wrapped under Letronna's names for them; those its config
     /// does not offer are left out.
-    fn list(self: &Arc<Self>) -> Result<Vec<Arc<dyn Tool>>, String> {
+    fn list(self: &Arc<Self>) -> Result<Vec<Arc<McpTool>>, String> {
         let (name, config) = (&self.name, &self.config);
-        let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
+        let mut tools = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
             let params = match &cursor {
@@ -1666,13 +1710,15 @@ impl Server {
                 let Some(own) = tool["name"].as_str().filter(|own| config.offers(own)) else {
                     continue;
                 };
-                let (description, schema) = vetted(name, own, tool);
+                let (schema, nulls) = normalised(&tool["inputSchema"]);
+                let (description, schema) = vetted(name, own, tool, schema);
                 tools.push(Arc::new(McpTool {
                     server: self.clone(),
                     own: own.to_owned(),
                     name: keep(tool_name(name, own)),
                     description: keep(description),
                     schema,
+                    nulls,
                     // A server elsewhere is only its word, and a tool that
                     // reaches other machines can send what it is given there.
                     ask: !config.auto_approve.approves(own, &tool["annotations"])
@@ -1819,6 +1865,7 @@ impl Server {
 }
 
 /// One of a server's tools, offered to the model under Letronna's name for it.
+#[derive(Clone)]
 struct McpTool {
     server: Arc<Server>,
     /// The tool's name on its server.
@@ -1826,6 +1873,9 @@ struct McpTool {
     name: &'static str,
     description: &'static str,
     schema: Value,
+    /// Arguments its schema required and allowed to be null, which the
+    /// schema offered no longer requires: one left out is sent as null.
+    nulls: Vec<String>,
     ask: bool,
     read_only: bool,
     /// How long a call may take.
@@ -1846,6 +1896,12 @@ impl Tool for McpTool {
         self.schema.clone()
     }
     fn run(&self, args: &Value, _: &ToolContext) -> Result<String, String> {
+        let mut args = args.clone();
+        if let Some(given) = args.as_object_mut() {
+            for name in &self.nulls {
+                given.entry(name).or_insert(Value::Null);
+            }
+        }
         let reply = self.server.reply(
             "tools/call",
             json!({"name": self.own, "arguments": args}),
@@ -1929,15 +1985,15 @@ fn said(error: &Value) -> String {
 /// about a thousand, and every one goes into every request.
 const DESCRIPTION_CHARS: usize = 2_000;
 
-/// A tool's description and input schema as the model is shown them: every
-/// string without hidden characters and capped, and the description headed
-/// by a note when any of them hid characters or fetches or sends a key, as a
-/// project's instruction file would be. `server` is the server's name.
-fn vetted(server: &str, own: &str, tool: &Value) -> (String, Value) {
+/// A tool's description and its normalised input schema as the model is
+/// shown them: every string without hidden characters and capped, and the
+/// description headed by a note when any of them hid characters or fetches
+/// or sends a key, as a project's instruction file would be. `server` is the
+/// server's name.
+fn vetted(server: &str, own: &str, tool: &Value, mut schema: Value) -> (String, Value) {
     let (description, mut hid) =
         crate::untrusted::cleaned(tool["description"].as_str().unwrap_or(own));
     let description = capped(description);
-    let mut schema = schema(&tool["inputSchema"]);
     let mut strings = vec![description.clone()];
     clean_strings(&mut schema, &mut hid, &mut strings);
     let description = format!("{description} (from the {server} MCP server)");
@@ -1975,6 +2031,19 @@ fn clean_strings(value: &mut Value, hid: &mut usize, strings: &mut Vec<String>) 
     }
 }
 
+/// A server's instructions as the system prompt carries them: cleaned and
+/// capped as a tool's description is, headed by whose they are, and by a
+/// note when they hid characters or fetch or send a key.
+fn instructions(server: &str, said: &str) -> String {
+    let (said, hid) = crate::untrusted::cleaned(said);
+    let said = capped(said.trim().to_owned());
+    let head = format!("Instructions from the {server} MCP server, for its tools:");
+    match crate::untrusted::note("the text below", hid, &said) {
+        Some(note) => format!("{head}\n{note}\n{said}"),
+        None => format!("{head}\n{said}"),
+    }
+}
+
 /// `text` cut to `DESCRIPTION_CHARS`, marked where it was cut.
 fn capped(text: String) -> String {
     if text.chars().count() <= DESCRIPTION_CHARS {
@@ -1985,20 +2054,203 @@ fn capped(text: String) -> String {
     kept
 }
 
-/// A tool's input schema as providers take it: an object, and without the
-/// `$schema` key some of them refuse.
-fn schema(input: &Value) -> Value {
-    let mut schema = match input {
-        Value::Object(_) => input.clone(),
-        _ => json!({}),
+/// How deep in a schema a `$ref` is still inlined, each one inlined counting
+/// as a level of its own: the types a tool takes nest a handful deep, every
+/// level inlined goes into every request, and the walk that inlines them
+/// must not run out of stack on a chain of them.
+const SCHEMA_DEPTH: usize = 16;
+
+/// The most nodes a schema may have for another `$ref` to be inlined in it:
+/// a type used in many places is copied to each, every copy goes into every
+/// request, and types that use each other twice over double at each level.
+const SCHEMA_NODES: usize = 1_000;
+
+/// Keys whose value is one schema, or a list of them.
+const SUBSCHEMAS: [&str; 14] = [
+    "items",
+    "prefixItems",
+    "additionalItems",
+    "additionalProperties",
+    "unevaluatedProperties",
+    "propertyNames",
+    "contains",
+    "not",
+    "if",
+    "then",
+    "else",
+    "anyOf",
+    "oneOf",
+    "allOf",
+];
+
+/// Keys whose value maps names to schemas.
+const SCHEMA_MAPS: [&str; 3] = ["properties", "patternProperties", "dependentSchemas"];
+
+/// A tool's input schema as every provider takes it: an object, without the
+/// `$schema` key some refuse, its `$ref`s inlined and its definitions gone,
+/// which some do not follow; a nullable `anyOf` or list of types made the
+/// type itself, which some refuse; and `required` naming only properties
+/// there are, which some check. Also what its `required` lost for being
+/// nullable, for calls to fill in.
+fn normalised(input: &Value) -> (Value, Vec<String>) {
+    let mut normaliser = Normaliser {
+        root: input,
+        refs: Vec::new(),
+        nodes: 0,
+    };
+    let (mut schema, _, nulls) = match input {
+        Value::Object(_) => normaliser.shape(input.clone(), 0),
+        _ => (json!({}), false, Vec::new()),
     };
     if let Value::Object(map) = &mut schema {
         map.remove("$schema");
         map.entry("type").or_insert_with(|| json!("object"));
         map.entry("properties").or_insert_with(|| json!({}));
     }
-    schema
+    (schema, nulls)
 }
+
+/// One walk through a schema, from its `root`.
+struct Normaliser<'a> {
+    root: &'a Value,
+    /// The `$ref`s being inlined, outermost first.
+    refs: Vec<String>,
+    /// Nodes walked so far.
+    nodes: usize,
+}
+
+impl Normaliser<'_> {
+    /// `node`, `depth` levels into the schema, normalised; whether it allowed
+    /// null; and the properties it required that allowed null, which it no
+    /// longer requires.
+    fn shape(&mut self, node: Value, depth: usize) -> (Value, bool, Vec<String>) {
+        self.nodes += 1;
+        let Value::Object(mut map) = node else {
+            return (node, false, Vec::new());
+        };
+        // A null branch goes, and a lone branch left is the node itself; its
+        // own keys, a description or a default, say more about this use.
+        let mut nullable = false;
+        for key in ["anyOf", "oneOf"] {
+            let Some(Value::Array(branches)) = map.get_mut(key) else {
+                continue;
+            };
+            let null = |branch: &Value| branch["type"] == "null";
+            if !branches.iter().any(null) || branches.iter().all(null) {
+                continue;
+            }
+            branches.retain(|branch| !null(branch));
+            nullable = true;
+            if let [Value::Object(only)] = branches.as_mut_slice() {
+                let only = std::mem::take(only);
+                map.remove(key);
+                for (name, value) in only {
+                    map.entry(name).or_insert(value);
+                }
+            }
+        }
+        // A `$ref` becomes what it names, under the keys beside it; of one
+        // that cannot be inlined, the keys beside it are all that is left.
+        if let Some(Value::String(target)) = map.remove("$ref")
+            && let Some(mut found) = self.inlined(&target, depth)
+        {
+            found.extend(map);
+            self.refs.push(target);
+            let (schema, null, nulls) = self.shape(Value::Object(found), depth + 1);
+            self.refs.pop();
+            return (schema, nullable || null, nulls);
+        }
+        // Inlined where they are used, the definitions have no use left.
+        map.remove("$defs");
+        map.remove("definitions");
+        if let Some(Value::Array(types)) = map.get_mut("type")
+            && types.len() > 1
+            && types.iter().any(|kind| kind == "null")
+        {
+            types.retain(|kind| kind != "null");
+            nullable = true;
+            if let [only] = types.as_mut_slice() {
+                let only = std::mem::take(only);
+                map.insert("type".into(), only);
+            }
+        }
+        for key in SUBSCHEMAS {
+            match map.get_mut(key) {
+                Some(Value::Array(items)) => {
+                    for item in items {
+                        *item = self.shape(std::mem::take(item), depth + 1).0;
+                    }
+                }
+                Some(item @ Value::Object(_)) => {
+                    *item = self.shape(std::mem::take(item), depth + 1).0;
+                }
+                _ => {}
+            }
+        }
+        let mut nullables = Vec::new();
+        for key in SCHEMA_MAPS {
+            let Some(Value::Object(schemas)) = map.get_mut(key) else {
+                continue;
+            };
+            for (name, schema) in schemas.iter_mut() {
+                let (shaped, null, _) = self.shape(std::mem::take(schema), depth + 1);
+                *schema = shaped;
+                if null && key == "properties" {
+                    nullables.push(name.clone());
+                }
+            }
+        }
+        let nulls = required(&mut map, &nullables);
+        (Value::Object(map), nullable, nulls)
+    }
+
+    /// The object `target` points to in this schema, unless it is being
+    /// inlined already, or is `SCHEMA_DEPTH` deep, or the schema has grown to
+    /// `SCHEMA_NODES`.
+    fn inlined(&self, target: &str, depth: usize) -> Option<Map<String, Value>> {
+        if depth >= SCHEMA_DEPTH
+            || self.nodes >= SCHEMA_NODES
+            || self.refs.iter().any(|inlining| inlining == target)
+        {
+            return None;
+        }
+        match self.root.pointer(target.strip_prefix('#')?)? {
+            Value::Object(found) => Some(found.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// Take out of `map`'s `required` the names its properties lack, and those
+/// in `nullables`, which the model may now leave out; returns those.
+fn required(map: &mut Map<String, Value>, nullables: &[String]) -> Vec<String> {
+    let Some(required) = map.remove("required") else {
+        return Vec::new();
+    };
+    let properties = map.get("properties").and_then(Value::as_object);
+    let (mut kept, mut nulls) = (Vec::new(), Vec::new());
+    let names = required.as_array().into_iter().flatten();
+    for name in names.filter_map(Value::as_str) {
+        if !properties.is_some_and(|properties| properties.contains_key(name)) {
+            continue;
+        }
+        match nullables.iter().any(|nullable| nullable == name) {
+            true => nulls.push(name.to_owned()),
+            false => kept.push(json!(name)),
+        }
+    }
+    if !kept.is_empty() {
+        map.insert("required".into(), kept.into());
+    }
+    nulls
+}
+
+/// The longest tool name providers accept.
+const NAME_CHARS: usize = 64;
+
+/// Hex digits of the hash that sets apart tools whose names would be alike:
+/// eight make two of them alike again once in four billion.
+const HASH_HEX: usize = 8;
 
 /// `mcp__<server>__<tool>`, in the letters providers accept in a tool name
 /// and no longer than the 64 they allow.
@@ -2012,8 +2264,56 @@ fn tool_name(server: &str, tool: &str) -> String {
                 '_'
             }
         })
-        .take(64)
+        .take(NAME_CHARS)
         .collect()
+}
+
+/// A name for each of `tools`, (server, tool) pairs, that none of the others
+/// has: its `tool_name`, unless another's is alike -- two servers' tools
+/// alike once cleaned, two long names alike in their first 64 letters, or
+/// two alike but for case and underscores, which a call is matched by --
+/// when each of those is cut to make room for `_` and a hash of its server
+/// and tool, so it keeps its name from run to run.
+fn unique_names(tools: &[(&str, &str)]) -> Vec<String> {
+    let plain: Vec<String> = (tools.iter())
+        .map(|(server, tool)| tool_name(server, tool))
+        .collect();
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for name in &plain {
+        *counts.entry(loose(name)).or_default() += 1;
+    }
+    let mut taken = HashSet::new();
+    (plain.iter().zip(tools))
+        .map(|(name, (server, tool))| {
+            let mut salt = 0;
+            let mut unique = match counts[&loose(name)] {
+                1 => name.clone(),
+                _ => hashed(name, server, tool, salt),
+            };
+            // Only a server listing one tool twice, or a hash alike by chance.
+            while !taken.insert(loose(&unique)) {
+                salt += 1;
+                unique = hashed(name, server, tool, salt);
+            }
+            unique
+        })
+        .collect()
+}
+
+/// `name` as a call's name is matched to it, when a gateway hands it back
+/// in a case of its own (see `chat::name_as_offered`).
+fn loose(name: &str) -> String {
+    name.replace('_', "").to_lowercase()
+}
+
+/// `name` cut to make room for `_` and `HASH_HEX` hex digits of a SHA-256 of
+/// `server`, `tool` and `salt`.
+fn hashed(name: &str, server: &str, tool: &str, salt: u32) -> String {
+    let said = format!("{server}\0{tool}\0{salt}");
+    let digest = ring::digest::digest(&ring::digest::SHA256, said.as_bytes());
+    let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+    let kept: String = name.chars().take(NAME_CHARS - 1 - HASH_HEX).collect();
+    format!("{kept}_{}", &hex[..HASH_HEX])
 }
 
 /// A string kept for the rest of the run. Tool names and descriptions must
@@ -2732,6 +3032,305 @@ mod tests {
         assert_eq!(fs.auto_approve, AutoApprove::Names(vec!["read".into()]));
         // A server reached by URL has no command, and is passed over.
         assert!(servers["web"].as_ref().unwrap().command.is_empty());
+    }
+
+    #[test]
+    fn names_alike_get_a_hash_that_stays_the_same_from_run_to_run() {
+        let long = |end: &str| format!("{}{end}", "x".repeat(100));
+        let (first, second) = (long("1"), long("2"));
+        let tools = [
+            ("a__b", "c"),
+            ("a", "b__c"),
+            ("s", first.as_str()),
+            ("s", second.as_str()),
+            ("s", "plain"),
+            ("t", "twice"),
+            ("t", "twice"),
+            ("u", "list_items"),
+            ("u", "listItems"),
+        ];
+        let names = unique_names(&tools);
+        assert!(names[0].starts_with("mcp__a__b__c_") && names[1].starts_with("mcp__a__b__c_"));
+        assert!(names[2].starts_with("mcp__s__xxx") && names[2].len() == 64);
+        assert_eq!(names[4], "mcp__s__plain");
+        assert!(names[7].starts_with("mcp__u__list_items_"));
+        assert!(names[8].starts_with("mcp__u__listItems_"));
+        let distinct: HashSet<String> = names.iter().map(|name| loose(name)).collect();
+        assert_eq!(distinct.len(), names.len(), "{names:?}");
+        assert!(names.iter().all(|name| name.len() <= NAME_CHARS));
+
+        // The same whichever order the servers are read in, and a long name
+        // alike with no other is only cut.
+        let mut reversed = tools;
+        reversed.reverse();
+        let mut again = unique_names(&reversed);
+        again.reverse();
+        assert_eq!(again[..5], names[..5]);
+        assert_eq!(unique_names(&[("s", &first)]), [tool_name("s", &first)]);
+    }
+
+    #[test]
+    fn tools_renamed_apart_still_call_their_own_server() {
+        let servers = ["t-dot.name", "t-dot_name"];
+        for name in servers {
+            let run = connected(name, ServerConfig::default(), 0, Duration::ZERO);
+            let (from_client, to_server) = std::io::pipe().unwrap();
+            let (from_server, to_client) = std::io::pipe().unwrap();
+            scripted_server(from_client, to_client);
+            let listed = connect(name, run, &ServerConfig::default(), from_server, to_server);
+            with_run(name, run, |slot| slot.tools = listed.unwrap());
+        }
+        let echoes: Vec<_> = (tools().into_iter())
+            .filter(|tool| tool.name().starts_with("mcp__t-dot_name__echo"))
+            .collect();
+        let ctx = ToolContext::default();
+        let found: Vec<_> = (echoes.iter())
+            .map(|echo| {
+                let found = crate::tools::find(echo.name()).unwrap();
+                let said = found.run(&json!({"text": "hi"}), &ctx);
+                (echo.name(), found.preview(&json!({}), &ctx), said)
+            })
+            .collect();
+        remove_slots(|name| name.starts_with("t-dot"));
+
+        assert_eq!(found.len(), 2);
+        assert_ne!(found[0].0, found[1].0);
+        for ((name, preview, said), server) in found.into_iter().zip(servers) {
+            assert_eq!(name.len(), "mcp__t-dot_name__echo".len() + 1 + HASH_HEX);
+            assert_eq!(preview, format!("echo on the {server} MCP server\n{{}}"));
+            assert_eq!(said.unwrap(), "echo: hi\n[image/png, 3 bytes]");
+        }
+    }
+
+    #[test]
+    fn a_schemas_refs_are_inlined_and_its_definitions_dropped() {
+        let (schema, _) = normalised(&json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "at": {"$ref": "#/$defs/Point", "description": "Where."},
+                "old": {"$ref": "#/definitions/Old"},
+                "far": {"$ref": "https://example.com/far.json", "description": "Elsewhere."},
+                "tree": {"$ref": "#/$defs/Node"},
+                "definitions": {"type": "string"},
+            },
+            "$defs": {
+                "Point": {"type": "object", "title": "Point", "description": "A point.",
+                    "properties": {"x": {"type": "number"}}, "required": ["x"]},
+                "Node": {"type": "object", "properties": {
+                    "children": {"type": "array", "items": {"$ref": "#/$defs/Node"}}}},
+            },
+            "definitions": {"Old": {"type": "string"}},
+        }));
+        assert_eq!(
+            schema,
+            json!({
+                "type": "object",
+                "properties": {
+                    "at": {"type": "object", "title": "Point", "description": "Where.",
+                        "properties": {"x": {"type": "number"}}, "required": ["x"]},
+                    "old": {"type": "string"},
+                    "far": {"description": "Elsewhere."},
+                    // Inlined once; inside itself it is left open.
+                    "tree": {"type": "object", "properties": {
+                        "children": {"type": "array", "items": {}}}},
+                    "definitions": {"type": "string"},
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn a_schema_is_inlined_only_so_deep_and_so_large() {
+        // A chain of twenty types, each holding the next.
+        let chain: Map<String, Value> = (0..20)
+            .map(|n| {
+                let next = json!({"$ref": format!("#/$defs/T{}", n + 1)});
+                (
+                    format!("T{n}"),
+                    json!({"type": "object", "properties": {"next": next}}),
+                )
+            })
+            .collect();
+        let (schema, _) = normalised(&json!({"$ref": "#/$defs/T0", "$defs": chain}));
+        // Each type is two levels: the type inlined, and its property.
+        let depth = schema.to_string().matches("\"next\"").count();
+        assert_eq!(depth, SCHEMA_DEPTH / 2);
+
+        // Six levels of types each using the next four times over.
+        let wide: Map<String, Value> = (0..6)
+            .map(|n| {
+                let next = json!({"$ref": format!("#/$defs/W{}", n + 1)});
+                let uses: Map<String, Value> =
+                    (0..4).map(|u| (format!("u{u}"), next.clone())).collect();
+                (
+                    format!("W{n}"),
+                    json!({"type": "object", "properties": uses}),
+                )
+            })
+            .collect();
+        let (schema, _) = normalised(&json!({"$ref": "#/$defs/W0", "$defs": wide}));
+        let nodes = schema.to_string().matches('{').count();
+        assert!(nodes < 2 * SCHEMA_NODES, "{nodes}");
+
+        // Thousands of names for one another, which add no level but by
+        // being inlined, end in an open schema rather than a deep walk.
+        let aliases: Map<String, Value> = (0..5_000)
+            .map(|n| {
+                let next = format!("#/$defs/A{}", n + 1);
+                (format!("A{n}"), json!({ "$ref": next }))
+            })
+            .collect();
+        let at = json!({"properties": {"a": {"$ref": "#/$defs/A0"}}, "$defs": aliases});
+        assert_eq!(normalised(&at).0["properties"]["a"], json!({}));
+    }
+
+    #[test]
+    fn a_nullable_type_becomes_the_type_and_required_names_only_properties_there_are() {
+        let (schema, nulls) = normalised(&json!({
+            "type": "object",
+            "properties": {
+                "name": {"anyOf": [{"type": "string"}, {"type": "null"}], "description": "Who."},
+                "limit": {"type": ["integer", "null"]},
+                "kind": {"oneOf": [{"type": "string"}, {"type": "integer"}, {"type": "null"}]},
+                "at": {"anyOf": [{"$ref": "#/$defs/Point"}, {"type": "null"}], "default": null},
+                "path": {"type": "string"},
+                "inner": {"type": "object", "required": ["a", "b"], "properties": {
+                    "a": {"type": ["string", "null"]}, "c": {"type": "string"}}},
+                "loose": {"type": "object", "required": ["x"]},
+            },
+            "required": ["name", "path", "limit", "kind", "gone", "inner", 7],
+            "$defs": {"Point": {"type": "object", "properties": {"x": {"type": "number"}}}},
+        }));
+        assert_eq!(
+            schema["properties"],
+            json!({
+                "name": {"type": "string", "description": "Who."},
+                "limit": {"type": "integer"},
+                "kind": {"oneOf": [{"type": "string"}, {"type": "integer"}]},
+                "at": {"type": "object", "properties": {"x": {"type": "number"}}, "default": null},
+                "path": {"type": "string"},
+                "inner": {"type": "object", "properties": {
+                    "a": {"type": "string"}, "c": {"type": "string"}}},
+                "loose": {"type": "object"},
+            })
+        );
+        assert_eq!(schema["required"], json!(["path", "inner"]));
+        // Only the top level is filled in; below it the server says what it
+        // lacks, and the model can send null itself.
+        assert_eq!(nulls, ["name", "limit", "kind"]);
+
+        // Nothing but null, or no null at all, is left as it was.
+        let (only_null, _) = normalised(&json!({"properties": {
+            "n": {"anyOf": [{"type": "null"}]}, "t": {"type": ["null"]},
+            "u": {"anyOf": [{"type": "string"}, {"type": "integer"}]}}}));
+        assert_eq!(
+            only_null["properties"],
+            json!({"n": {"anyOf": [{"type": "null"}]}, "t": {"type": ["null"]},
+                "u": {"anyOf": [{"type": "string"}, {"type": "integer"}]}})
+        );
+        assert_eq!(
+            normalised(&json!("not a schema")).0,
+            json!({"type": "object", "properties": {}})
+        );
+    }
+
+    /// A server that greets with `instructions`, lists one tool taking
+    /// `schema`, and answers a call with the arguments it was given.
+    fn told_server(instructions: &str, schema: Value) -> Vec<Arc<McpTool>> {
+        let (from_client, to_server) = std::io::pipe().unwrap();
+        let (from_server, mut to_client) = std::io::pipe().unwrap();
+        let instructions = instructions.to_owned();
+        std::thread::spawn(move || {
+            for line in BufReader::new(from_client).lines() {
+                let message: Value = serde_json::from_str(&line.unwrap()).unwrap();
+                let id = message["id"].clone();
+                let result = match message["method"].as_str() {
+                    Some("initialize") => json!({"protocolVersion": PROTOCOL,
+                        "capabilities": {"tools": {}}, "instructions": instructions}),
+                    Some("tools/list") => json!({"tools": [
+                        {"name": "find", "description": "Finds.", "inputSchema": schema}]}),
+                    Some("tools/call") => json!({"content": [
+                        {"type": "text", "text": message["params"]["arguments"].to_string()}]}),
+                    _ => continue,
+                };
+                writeln!(
+                    to_client,
+                    "{}",
+                    json!({"jsonrpc": "2.0", "id": id, "result": result})
+                )
+                .unwrap();
+            }
+        });
+        let config = ServerConfig::default();
+        connect("t-told", 0, &config, from_server, to_server).unwrap()
+    }
+
+    #[test]
+    fn a_nullable_argument_the_model_leaves_out_is_sent_as_null() {
+        let tools = told_server(
+            "",
+            json!({"type": "object", "properties": {
+            "q": {"type": "string"},
+            "page": {"anyOf": [{"type": "integer"}, {"type": "null"}]}},
+            "required": ["q", "page"]}),
+        );
+        let find = &tools[0];
+        assert_eq!(find.parameters()["required"], json!(["q"]));
+        let ctx = ToolContext::default();
+        let sent = |args: Value| -> Value {
+            serde_json::from_str(&find.run(&args, &ctx).unwrap()).unwrap()
+        };
+        assert_eq!(sent(json!({"q": "x"})), json!({"q": "x", "page": null}));
+        assert_eq!(
+            sent(json!({"q": "x", "page": 2})),
+            json!({"q": "x", "page": 2})
+        );
+    }
+
+    #[test]
+    fn a_servers_instructions_reach_the_prompt_cleaned_capped_and_marked_as_its_own() {
+        let said = format!("Search before you fetch.\u{E0041}\n{}", "x".repeat(3_000));
+        let tools = told_server(&said, json!({}));
+        let shown = tools[0].server.instructions.get().unwrap().clone();
+        assert!(
+            shown.starts_with(
+                "Instructions from the t-told MCP server, for its tools:\n[Letronna's note: the \
+                 text below holds 1 character nobody reading it can see (taken out here),"
+            ),
+            "{shown}"
+        );
+        let body = shown.split_once("]\n").unwrap().1;
+        assert!(body.starts_with("Search before you fetch.\nxxx") && body.ends_with("x …"));
+        assert_eq!(body.chars().count(), DESCRIPTION_CHARS + 2);
+
+        // Offered with the server's tools, and only where they are.
+        let run = connected("t-told", ServerConfig::default(), 0, Duration::ZERO);
+        with_run("t-told", run, |slot| {
+            slot.server = Some(tools[0].server.clone());
+            slot.tools = tools.clone();
+        });
+        let with_tools = Connection {
+            tools: true,
+            ..Default::default()
+        };
+        let shared = Connection {
+            remote: Some(crate::chat::Remote {
+                shared: true,
+                ..Default::default()
+            }),
+            ..with_tools.clone()
+        };
+        let (offered, in_shared, toolless) = (
+            context(&with_tools),
+            context(&shared),
+            context(&Connection::default()),
+        );
+        remove_slots(|name| name == "t-told");
+        assert!(offered.contains(&format!("\n\n{shown}")), "{offered}");
+        assert_eq!((in_shared, toolless), (String::new(), String::new()));
+        let blank = told_server("  ", json!({}));
+        assert!(blank[0].server.instructions.get().is_none());
     }
 
     #[test]
