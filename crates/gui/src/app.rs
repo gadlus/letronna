@@ -118,6 +118,9 @@ pub(crate) struct Chat {
     pub(crate) turn: Option<agent::Turn>,
     /// The session id currently receiving a streamed reply, if any.
     pub(crate) streaming_id: Option<u64>,
+    /// The id of the queued call the approval card is up for, decided once
+    /// when the queue stopped on it.
+    pub(crate) asking: Option<String>,
     /// Tools the user allowed for the rest of this run of the app, by the
     /// session they were allowed in. Keyed like `unattended`: "stop asking"
     /// about a tool in one chat is not a yes to it in every other chat.
@@ -395,6 +398,7 @@ impl Chat {
             busy: false,
             turn: None,
             streaming_id: None,
+            asking: None,
             session_allow: std::collections::HashMap::new(),
             unattended: std::collections::HashSet::new(),
             answer,
@@ -806,6 +810,10 @@ impl Chat {
         };
         let gate = |name: &str| self.needs_user(name);
         let next = turn.next(gate);
+        self.asking = match &next {
+            agent::Next::AskUser(call) => Some(call.id.clone()),
+            _ => None,
+        };
         if let agent::Next::AskUser(call) | agent::Next::Run(call) = &next {
             self.show_browser(&call.name, cx);
         }
@@ -1147,6 +1155,9 @@ impl Chat {
         else {
             return;
         };
+        // Answered: until the queue moves on, the card shows the call running.
+        self.asking = None;
+        cx.notify();
         match verdict {
             Verdict::Answer(text) => self.record_result(Ok(text), cx),
             Verdict::Deny => self.record_result(Err(letronna_core::tools::DECLINED.into()), cx),
@@ -1617,5 +1628,52 @@ mod tests {
         assert!(allowed(Some(1)));
         assert!(!allowed(Some(2)));
         assert!(!allowed(None));
+    }
+}
+
+/// The call at the front of the queue, and whether the approval card is up
+/// for it rather than it running.
+pub(crate) fn front_call(
+    turn: &agent::Turn,
+    asking: Option<&str>,
+) -> Option<(backend::ToolCall, bool)> {
+    // `true` shows whatever is at the front, running or not. Which of the two
+    // it is was decided when the queue stopped on it; the card shows that
+    // rather than deciding again on every frame, which looked the tool up in
+    // a freshly built tool list each time.
+    match turn.next(|_| true) {
+        agent::Next::AskUser(call) => {
+            let waiting = asking == Some(call.id.as_str());
+            Some((call, waiting))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
+    // would shadow the built-in attribute.
+    use super::front_call;
+    use letronna_core::agent::Turn;
+    use letronna_core::chat::{Connection, ToolCall};
+
+    #[test]
+    fn the_card_is_up_only_for_the_call_the_queue_stopped_on() {
+        let mut turn = Turn::new(Connection::default());
+        turn.begin(vec![ToolCall {
+            id: "call-1".into(),
+            name: "write_file".into(),
+            arguments: "{}".into(),
+        }]);
+        assert!(
+            front_call(&turn, Some("call-1"))
+                .is_some_and(|(call, waiting)| call.id == "call-1" && waiting)
+        );
+        // Answered, or let run when the queue reached it.
+        assert!(front_call(&turn, None).is_some_and(|(_, waiting)| !waiting));
+        // Stopped on an earlier call, which has left the queue since.
+        assert!(front_call(&turn, Some("call-0")).is_some_and(|(_, waiting)| !waiting));
+        assert!(front_call(&Turn::new(Connection::default()), Some("call-1")).is_none());
     }
 }
