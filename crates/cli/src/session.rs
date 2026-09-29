@@ -63,6 +63,7 @@ impl Runner {
             search: settings.search,
             conversation: self.store.conversations[session].id,
             unattended: false,
+            wrap_up: false,
         }
     }
 
@@ -102,7 +103,7 @@ impl Runner {
         // the answer is both.
         let mut answer = String::new();
         loop {
-            let Some(reply) = self.stream_once(turn, session)? else {
+            let Some(mut reply) = self.stream_once(turn, session)? else {
                 self.keep_stopped(turn, session);
                 // Ctrl-C stops the turn and leaves; escape only stops the
                 // turn, so say so in the one case where you stay.
@@ -112,23 +113,30 @@ impl Runner {
                 }
                 return Ok(String::new());
             };
+            let empty = reply.content.is_empty();
+            let continuation = turn.continuation(&mut reply);
+            if empty && !reply.content.is_empty() {
+                // Taken from its thinking, which was never shown as the answer.
+                render::blank();
+                let mut out = Stream::opening_with(render::bullet());
+                out.push(&reply.content);
+                out.end();
+            }
             answer.push_str(&reply.content);
             let calls = reply.tool_calls.clone();
-            let continuation = turn.continuation();
             self.store.conversations[session].updated = chat::now();
-            // A reply cut off inside a tool call, with no text before it,
-            // leaves nothing to keep.
+            // A reply with nothing in it -- empty, or cut off inside a tool
+            // call with no text before it -- leaves nothing to keep.
             if !reply.content.is_empty() || !calls.is_empty() {
                 self.store.conversations[session].messages.push(reply);
             }
             match continuation {
-                Ok(Some(notice)) => {
+                Ok(Some(nudge)) => {
                     render::blank();
-                    render::said(
-                        &render::dim("●"),
-                        &render::dim("Cut off at the output limit; continuing."),
-                    );
-                    self.store.conversations[session].messages.push(notice);
+                    render::said(&render::dim("●"), &render::dim(nudge.why));
+                    self.store.conversations[session]
+                        .messages
+                        .push(nudge.notice);
                     self.persist();
                     continue;
                 }
@@ -141,6 +149,10 @@ impl Runner {
             self.persist();
 
             if !turn.begin(calls) {
+                if let Some(note) = turn.capped() {
+                    render::blank();
+                    render::said(&render::dim("●"), &render::dim(&note));
+                }
                 return Ok(answer);
             }
             if !self.work_through(turn, session)? {

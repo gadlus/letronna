@@ -124,6 +124,9 @@ pub struct Connection {
     /// Nobody may be watching, as in a schedule or a chat app, so a failed
     /// call is tried more times and may wait longer.
     pub unattended: bool,
+    /// The turn reached its round cap: the tools are still offered, so the
+    /// cached prefix holds, but the reply is asked to use none of them.
+    pub wrap_up: bool,
 }
 
 /// Where a remote conversation is happening, and what that allows.
@@ -685,6 +688,9 @@ fn body_with(
         // without them, and a provider's cached prefix holds up to here.
         tools.extend_from_slice(extra);
         body["tools"] = Value::Array(tools);
+        if connection.wrap_up {
+            body["tool_choice"] = "none".into();
+        }
     }
     // Measured on a model that can be told how hard to think: sixty-four
     // reasoning tokens at low against seven hundred at high. A level saved on
@@ -792,17 +798,21 @@ enum Quirk {
     StreamOptions,
     WebSearch,
     CacheControl,
+    /// The wrap-up's `tool_choice`; without it a model may still call a
+    /// tool, which is then not run.
+    ToolChoice,
 }
 
 /// Each quirk by what a refusal says when its field is the one at fault: the
 /// field's name, or for the cap the name it asks for instead, since a server
 /// out of room names both caps and a new name would not give it more.
-const QUIRKS: [(Quirk, &str); 5] = [
+const QUIRKS: [(Quirk, &str); 6] = [
     (Quirk::CompletionTokens, "'max_completion_tokens' instead"),
     (Quirk::Effort, "reasoning_effort"),
     (Quirk::StreamOptions, "stream_options"),
     (Quirk::WebSearch, "web_search"),
     (Quirk::CacheControl, "cache_control"),
+    (Quirk::ToolChoice, "tool_choice"),
 ];
 
 /// The cap sent as `max_completion_tokens`, which counts a model's thinking
@@ -878,6 +888,7 @@ fn apply_quirk(body: &mut Value, quirk: Quirk) -> bool {
         }
         // Markers ride on message parts, not at the top.
         Quirk::CacheControl => remove_everywhere(body, "cache_control"),
+        Quirk::ToolChoice => fields.remove("tool_choice").is_some(),
     }
 }
 
@@ -1958,18 +1969,19 @@ impl Reply {
                 .map_err(|_| Failure::new(FailureKind::Stopped, "Chat closed."))?;
         }
         if !received && !in_call {
-            return Err(Failure::new(
-                FailureKind::BadReply,
-                match self.finish {
-                    Some(FinishReason::Length) => {
-                        "The model reached its output limit before writing anything. A lower                          effort leaves it more room."
-                    }
-                    Some(FinishReason::ContentFilter) => {
-                        "The provider's content filter stopped the reply."
-                    }
-                    _ => "The model returned no text. Check model compatibility.",
-                },
-            ));
+            let why = match self.finish {
+                Some(FinishReason::Length) => {
+                    "The model reached its output limit before writing anything. A lower \
+                     effort leaves it more room."
+                }
+                Some(FinishReason::ContentFilter) => {
+                    "The provider's content filter stopped the reply."
+                }
+                // Nothing at all, or only thinking: the turn asks once more,
+                // then takes the thinking as the answer.
+                _ => return Ok(()),
+            };
+            return Err(Failure::new(FailureKind::BadReply, why));
         }
         if cut_off {
             sender
@@ -1996,6 +2008,7 @@ mod tests {
             search: false,
             conversation: 0,
             unattended: false,
+            wrap_up: false,
         }
     }
     #[test]
@@ -2059,6 +2072,7 @@ mod tests {
             search: false,
             conversation: 0,
             unattended: false,
+            wrap_up: false,
         };
         let ctx = crate::tools::ToolContext::of(&connection);
         let mut messages = vec![Message {
@@ -3403,7 +3417,8 @@ mod tests {
             "max_tokens": 8192,
             "stream_options": {"include_usage": true},
             "reasoning_effort": "high",
-            "tools": [{"type": "function"}, {"type": "web_search"}]
+            "tools": [{"type": "function"}, {"type": "web_search"}],
+            "tool_choice": "none"
         });
         for (quirk, _) in QUIRKS {
             assert!(apply_quirk(&mut body, quirk));
@@ -3492,6 +3507,30 @@ mod tests {
         assert!(learn(&c, &sent, refusal));
         // Sent without it, the same refusal is no reason to go again.
         assert!(!learn(&c, &body(&c, &hello(), None, None), refusal));
+    }
+
+    #[test]
+    fn the_wrap_up_offers_the_same_tools_and_allows_none() {
+        let c = Connection {
+            model: "wraps-up".into(),
+            tools: true,
+            ..connection()
+        };
+        let working = body(&c, &hello(), None, None);
+        let wrap_up = Connection { wrap_up: true, ..c };
+        let sent = body(&wrap_up, &hello(), None, None);
+        // The same tools, so the prefix a provider cached still holds.
+        assert_eq!(sent["tools"], working["tools"]);
+        assert_eq!(sent["tool_choice"], "none");
+        assert!(working.get("tool_choice").is_none());
+        // A server that turns the field down gets the wrap-up without it.
+        let refusal = r#"{"error":{"message":"Unsupported parameter: tool_choice"}}"#;
+        assert!(learn(&wrap_up, &sent, refusal));
+        assert!(
+            body(&wrap_up, &hello(), None, None)
+                .get("tool_choice")
+                .is_none()
+        );
     }
 
     #[test]
@@ -4187,6 +4226,20 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
         );
         assert!(matches!(events.last(), Some(Event::Finished(Err(_)))));
+    }
+
+    #[test]
+    fn a_reply_of_only_thinking_is_left_to_the_turn() {
+        let events = reply_of(
+            "text/event-stream",
+            "data: {\"choices\":[{\"delta\":{\"reasoning\":\"Hmm.\"},\"finish_reason\":\"stop\"}]}\n\n\
+             data: [DONE]\n\n",
+        );
+        assert!(matches!(&events[0], Event::Reasoning(s) if s == "Hmm."));
+        assert!(matches!(events[1], Event::Finished(Ok(()))));
+        // So is one with nothing in it at all.
+        let events = reply_of("text/event-stream", "data: [DONE]\n\n");
+        assert!(matches!(events[..], [Event::Finished(Ok(()))]));
     }
 
     #[test]
