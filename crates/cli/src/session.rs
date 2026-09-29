@@ -99,6 +99,7 @@ impl Runner {
         let mut answer = String::new();
         loop {
             let Some(reply) = self.stream_once(turn, session)? else {
+                self.keep_stopped(turn, session);
                 // Ctrl-C stops the turn and leaves; escape only stops the
                 // turn, so say so in the one case where you stay.
                 if !self.bar.finished() {
@@ -249,7 +250,7 @@ impl Runner {
     }
 
     /// Run the queued calls, asking first where the rules say to. False when
-    /// the user stopped the turn.
+    /// the user stopped the turn, whose finished results are kept.
     fn work_through(&mut self, turn: &mut Turn, session: usize) -> Result<bool, String> {
         loop {
             let gate = |name: &str| agent::needs_user(name, self.yes, &self.allowed, false);
@@ -262,9 +263,15 @@ impl Runner {
                     return Ok(true);
                 }
                 Next::Run(call) if call.name == tools::TODO => self.apply_todo(turn, session, call),
-                Next::Run(call) => self.run_call(turn, call),
+                Next::Run(call) => {
+                    if !self.run_call(turn, call) {
+                        self.keep_stopped(turn, session);
+                        return Ok(false);
+                    }
+                }
                 Next::AskUser(call) => {
                     if !self.consult(turn, call)? {
+                        self.keep_stopped(turn, session);
                         return Ok(false);
                     }
                 }
@@ -272,10 +279,27 @@ impl Runner {
         }
     }
 
-    fn run_call(&mut self, turn: &mut Turn, call: letronna_core::chat::ToolCall) {
+    /// Save what a stopped turn got to, so the model hears next time what ran
+    /// and what did not.
+    fn keep_stopped(&mut self, turn: &mut Turn, session: usize) {
+        let kept = turn.stop(&self.store.settings.model);
+        if kept.is_empty() {
+            return;
+        }
+        let conversation = &mut self.store.conversations[session];
+        conversation.updated = chat::now();
+        conversation.messages.extend(kept);
+        self.persist();
+    }
+
+    /// Runs `call` and shows what came of it. False when the user stopped it,
+    /// which ends the turn.
+    fn run_call(&mut self, turn: &mut Turn, call: letronna_core::chat::ToolCall) -> bool {
         let ctx = tools::ToolContext::of(&turn.connection);
         let summary = tools::summary(&call.name, &call.arguments);
-        let outcome = self.run_off_the_loop(&call, ctx, &summary);
+        let ran = self.run_off_the_loop(&call, ctx, &summary);
+        let stopped = ran.is_none();
+        let outcome = ran.unwrap_or_else(|| Err(agent::STOPPED_WHILE_RUNNING.into()));
         // Every turn of the conversation opens with a blank line, whoever is
         // speaking; a tool result that butts up against the question it came
         // from reads as part of it.
@@ -296,6 +320,7 @@ impl Runner {
             Err(error) => render::tool(&call.name, &summary, &tools::one_line(error), true),
         }
         turn.finish_call(outcome);
+        !stopped
     }
 
     /// Keep the model's checklist on the session, as the window does, and
@@ -326,13 +351,13 @@ impl Runner {
     /// at once. Anything else is left to finish into a channel nobody is
     /// reading; what it was doing to the disk it will still do, and a
     /// background command it started keeps running under `list_jobs` where it
-    /// can be stopped by name.
+    /// can be stopped by name. `None` when the user stopped it.
     fn run_off_the_loop(
         &mut self,
         call: &letronna_core::chat::ToolCall,
         ctx: tools::ToolContext,
         summary: &str,
-    ) -> Result<String, String> {
+    ) -> Option<Result<String, String>> {
         let (name, arguments) = (call.name.clone(), call.arguments.clone());
         let stop = ctx.cancel.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
@@ -343,15 +368,12 @@ impl Runner {
         self.bar
             .wait_line_about(&format!("{}({summary})", call.name));
         let outcome = match self.wait_on(&receiver) {
-            Ok(outcome) => outcome,
+            Ok(outcome) => Some(outcome),
             Err(Unheard::Stopped) => {
                 stop.set();
-                Err(format!(
-                    "The user stopped `{}` while it was running. Ask before starting it again.",
-                    call.name
-                ))
+                None
             }
-            Err(Unheard::Gone) => Err(format!("`{}` stopped without finishing.", call.name)),
+            Err(Unheard::Gone) => Some(Err(format!("`{}` stopped without finishing.", call.name))),
         };
         self.bar.wait_line(false);
         outcome
@@ -452,14 +474,10 @@ impl Runner {
         );
 
         match picked {
-            Some(0) => {
-                self.run_call(turn, call);
-                Ok(true)
-            }
+            Some(0) => Ok(self.run_call(turn, call)),
             Some(1) => {
                 self.allowed.insert(call.name.clone());
-                self.run_call(turn, call);
-                Ok(true)
+                Ok(self.run_call(turn, call))
             }
             Some(3) | None => Ok(false),
             _ => {

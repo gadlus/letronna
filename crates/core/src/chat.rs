@@ -49,6 +49,9 @@ pub struct Message {
     /// user's turn.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub notice: bool,
+    /// For `role: "assistant"`: the user stopped this reply part way.
+    #[serde(default)]
+    pub interrupted: bool,
 }
 
 impl Message {

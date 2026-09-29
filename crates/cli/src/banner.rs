@@ -24,7 +24,10 @@ pub fn replay(runner: &Runner, session: usize) {
         match message.role.as_str() {
             "user" => said_over_lines(&render::blue("›"), &message.content, true),
             "assistant" if !message.content.trim().is_empty() => {
-                said_over_lines(&render::blue("●"), &message.content, false)
+                said_over_lines(&render::blue("●"), &message.content, false);
+                if message.interrupted {
+                    render::line(&render::dim("(stopped)"));
+                }
             }
             // A tool's own output is not worth replaying, but that it ran is.
             "tool" => render::tool(

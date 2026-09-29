@@ -221,6 +221,7 @@ impl Chat {
                             )
                         })
                         .when(message.tokens > 0, |row| row.child(usage_line(message)))
+                        .when(message.interrupted, |row| row.child("(stopped)"))
                         .children(in_usage),
                 )
             })
