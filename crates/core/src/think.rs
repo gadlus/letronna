@@ -37,6 +37,9 @@ pub(crate) struct Scrubber {
     /// Whether a block has just closed and the answer shown nothing since,
     /// so the blank lines a model leaves after one are dropped.
     after_block: bool,
+    /// The indent of the line under way after a block, once a newline has
+    /// come, held until that line shows whether it has text to indent.
+    indent: Option<String>,
 }
 
 impl Scrubber {
@@ -58,6 +61,7 @@ impl Scrubber {
                 self.closing = None;
                 self.mid_line = false;
                 self.after_block = true;
+                self.indent = None;
                 continue;
             }
             let mut stop = None;
@@ -105,15 +109,28 @@ impl Scrubber {
     }
 
     fn answer(&mut self, pieces: &mut Vec<Piece>, text: String) {
-        let text = if self.after_block {
-            text.trim_start().to_owned()
-        } else {
-            text
-        };
-        if !text.is_empty() {
-            self.after_block = false;
+        if !self.after_block {
+            push(pieces, Piece::Answer(text));
+            return;
         }
-        push(pieces, Piece::Answer(text));
+        let rest = text.trim_start();
+        let blank = &text[..text.len() - rest.len()];
+        // Only the blank lines go: the indent of the line after them is the
+        // answer's own, and may make it code or a nested list.
+        match blank.rfind('\n') {
+            Some(at) => self.indent = Some(blank[at + 1..].to_owned()),
+            None => {
+                if let Some(indent) = &mut self.indent {
+                    indent.push_str(blank);
+                }
+            }
+        }
+        if rest.is_empty() {
+            return;
+        }
+        self.after_block = false;
+        let indent = self.indent.take().unwrap_or_default();
+        push(pieces, Piece::Answer(indent + rest));
     }
 }
 
@@ -221,5 +238,15 @@ mod tests {
         );
         assert_eq!(scrubber.feed("\n<thi"), vec![Piece::Answer("\n".into())]);
         assert_eq!(scrubber.feed("s"), vec![Piece::Answer("<this".into())]);
+    }
+
+    #[test]
+    fn the_first_line_after_a_block_keeps_its_indent() {
+        every_size(
+            "<think>Plan.</think>\n\n    let x = 1;\n",
+            "    let x = 1;\n",
+            "Plan.",
+        );
+        every_size("<think>Plan.</think>  Hello", "Hello", "Plan.");
     }
 }
