@@ -1,5 +1,5 @@
 use crate::prelude::*;
-use letronna_core::{agent, inbox};
+use letronna_core::{agent, approvals, inbox};
 
 pub(crate) const BRAND: &str = "Letronna";
 
@@ -154,6 +154,9 @@ pub(crate) struct Chat {
     /// user's own chats: a job saying "do not ask me at 9am" is not
     /// permission to stop asking everywhere else.
     pub(crate) unattended: std::collections::HashMap<u64, letronna_core::gate::Mode>,
+    /// Helpers' calls waiting on the user, oldest first, each shown as a card
+    /// in its own session. One dropped unanswered is declined.
+    pub(crate) agent_asks: std::collections::VecDeque<approvals::Request>,
     /// Text field on the `ask_user` card.
     pub(crate) answer: Entity<InputState>,
     /// Text field on a tool's card for why it was denied.
@@ -519,6 +522,7 @@ impl Chat {
             rules: Ok(Vec::new()),
             rules_read: None,
             unattended: std::collections::HashMap::new(),
+            agent_asks: std::collections::VecDeque::new(),
             answer,
             deny_reason,
             job_tick: false,
@@ -589,6 +593,7 @@ impl Chat {
         Self::watch_schedules(cx);
         Self::watch_updates(cx);
         Self::watch_inbox(cx);
+        Self::serve_approvals(cx);
         this.restart_messaging(cx);
         if this.store.settings.presence == "off" {
             plugins::set_enabled(cx, plugins::DISCORD, false);
@@ -846,12 +851,145 @@ impl Chat {
         let doorbell = inbox::listen();
         cx.spawn(async move |this, cx| {
             while doorbell.recv().await.is_ok() {
-                if this.update(cx, |this, cx| this.wake_idle(cx)).is_err() {
+                // A helper that ended rings too, and its card goes with it.
+                let rang = this.update(cx, |this, cx| {
+                    this.drop_ended_asks(cx);
+                    this.wake_idle(cx)
+                });
+                if rang.is_err() {
                     break;
                 }
             }
         })
         .detach();
+    }
+
+    /// Take helpers' approval requests for as long as the window is open.
+    fn serve_approvals(cx: &mut Context<Self>) {
+        let served = approvals::serve();
+        let (tx, rx) = async_channel::unbounded();
+        // `serve` hands back a blocking receiver, so a thread of its own
+        // carries each request over rather than one of the executor's.
+        std::thread::spawn(move || {
+            while let Ok(request) = served.recv() {
+                if tx.send_blocking(request).is_err() {
+                    break;
+                }
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            while let Ok(request) = rx.recv().await {
+                if this
+                    .update(cx, |this, cx| this.on_agent_ask(request, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// A helper's call waiting on a yes: answered at once where its session's
+    /// rules already decide it, otherwise put up as a card in that session.
+    fn on_agent_ask(&mut self, request: approvals::Request, cx: &mut Context<Self>) {
+        // Core has one request out per run and tool at a time, so a card
+        // still up for the same was given up on: its helper stopped waiting.
+        self.agent_asks
+            .retain(|queued| queued.run != request.run || queued.call.name != request.call.name);
+        cx.notify();
+        // With its session gone no card could show; dropped, it is declined.
+        let Some(ix) = self.store.index_of(request.root) else {
+            return;
+        };
+        // Its run may have ended before it got here, since the doorbell that
+        // says so comes by another way.
+        if run_ended(request.root, request.run) {
+            return;
+        }
+        if let Some(decision) = self.decided(&request.call, request.root) {
+            request.answer(decision);
+            return;
+        }
+        // Nobody in a chat app sees a helper's card, and one waiting here
+        // would hold up the chat's answer until someone came to the window.
+        if self.remote_session.values().any(|&id| id == request.root) {
+            return;
+        }
+        if !(self.page == Page::Chat && self.store.active == ix) {
+            let title = &self.store.conversations[ix].title;
+            self.error = Some(format!(
+                "Helper {} in \"{title}\" is waiting for your answer.",
+                request.label
+            ));
+        }
+        self.agent_asks.push_back(request);
+    }
+
+    /// What session `root`'s own rules make of a helper's `call`, or None
+    /// when only the user can say: the gate the session itself goes through,
+    /// in its mode and with what was allowed there.
+    fn decided(&self, call: &backend::ToolCall, root: u64) -> Option<approvals::Decision> {
+        let mut ctx = letronna_core::tools::ToolContext::default();
+        ctx.conversation = root;
+        ctx.workspace = self
+            .store
+            .index_of(root)
+            .and_then(|ix| self.store.conversations[ix].workspace.clone());
+        let gate = letronna_core::gate::Gate::for_window(
+            &ctx,
+            &self.session_allow,
+            &self.rules,
+            self.mode(root),
+            self.unattended.get(&root).copied(),
+        );
+        match letronna_core::gate::decide(call, &gate) {
+            letronna_core::gate::Outcome::Run => Some(approvals::Decision::Once),
+            letronna_core::gate::Outcome::Refuse(why) => Some(approvals::Decision::Deny(why)),
+            letronna_core::gate::Outcome::Ask => None,
+        }
+    }
+
+    /// Answer the helpers' cards their sessions' rules now decide, after a
+    /// rule changed under them.
+    fn decide_agent_asks(&mut self, cx: &mut Context<Self>) {
+        for request in std::mem::take(&mut self.agent_asks) {
+            match self.decided(&request.call, request.root) {
+                Some(decision) => request.answer(decision),
+                None => self.agent_asks.push_back(request),
+            }
+        }
+        cx.notify();
+    }
+
+    /// Take down the cards of helpers that have ended, since nothing waits
+    /// for their answers any more.
+    fn drop_ended_asks(&mut self, cx: &mut Context<Self>) {
+        let before = self.agent_asks.len();
+        self.agent_asks
+            .retain(|request| !run_ended(request.root, request.run));
+        if self.agent_asks.len() != before {
+            cx.notify();
+        }
+    }
+
+    /// The user answered helper `label`'s card for call `call_id` in session
+    /// `root`, if it is still up.
+    pub(crate) fn answer_agent(
+        &mut self,
+        root: u64,
+        label: &str,
+        call_id: &str,
+        decision: approvals::Decision,
+        cx: &mut Context<Self>,
+    ) {
+        let at = self.agent_asks.iter().position(|request| {
+            request.root == root && request.label == label && request.call.id == call_id
+        });
+        if let Some(request) = at.and_then(|at| self.agent_asks.remove(at)) {
+            request.answer(decision);
+        }
+        cx.notify();
     }
 
     fn run_due(&mut self, cx: &mut Context<Self>) {
@@ -1570,6 +1708,8 @@ impl Chat {
                         .entry(id)
                         .or_default()
                         .insert(call.name.clone());
+                    // Its helpers waiting on the same tool are allowed too.
+                    self.decide_agent_asks(cx);
                 }
                 self.execute_call(call, true, cx);
             }
@@ -1614,6 +1754,7 @@ impl Chat {
     /// Decide the call the card is up for again after an approval setting
     /// changed, so it runs at once if it no longer needs the user.
     pub(crate) fn approvals_changed(&mut self, cx: &mut Context<Self>) {
+        self.decide_agent_asks(cx);
         let waiting = self
             .turn
             .as_ref()
@@ -2059,7 +2200,11 @@ impl Render for Chat {
             self.messaging_page(cx).into_any_element()
         } else if self.page != Page::Chat {
             self.page_view(self.page, cx).into_any_element()
-        } else if conversation.messages.is_empty() && !streaming_here {
+        } else if conversation.messages.is_empty()
+            && !streaming_here
+            // A helper's card needs the chat body even with nothing said.
+            && !self.agent_asks.iter().any(|ask| ask.root == conversation.id)
+        {
             self.empty_state(cx).into_any_element()
         } else {
             // One turn per prompt, like Claude Code: the user's message, then
@@ -2171,7 +2316,7 @@ impl Render for Chat {
                     rows_here.push(self.queued_row(n, text, cx));
                 }
             }
-            let rows: Vec<AnyElement> = turns
+            let mut rows: Vec<AnyElement> = turns
                 .into_iter()
                 .enumerate()
                 // No min_w_0 or clipping here: both break list layout in the
@@ -2204,6 +2349,8 @@ impl Render for Chat {
                         .into_any_element()
                 })
                 .collect();
+            // Last, where the eye is: a helper does not wait on a turn.
+            rows.extend(self.helper_card(conversation.id, window, cx));
             // The scrollbar must sit outside the scrolling element, or it
             // scrolls away with the content. The scrolling box spans the
             // pane, so the bar is at its edge and the wheel works over the
@@ -2352,6 +2499,16 @@ pub(crate) fn cuts_in(turn: &agent::Turn) -> bool {
     )
 }
 
+/// Whether the helper heading run `run` in session `root` has ended, which
+/// stops every helper under it. Only helpers in the background are listed,
+/// so the card of one a turn waits on stays until it is answered.
+fn run_ended(root: u64, run: u64) -> bool {
+    use letronna_core::tasks::{self, Key, State};
+    tasks::list(root).iter().any(|task| {
+        task.key == Key::Agent(run) && !matches!(task.state, State::Running | State::Idle)
+    })
+}
+
 /// The calls of `batch` before the first whose id an earlier one shares.
 fn until_repeated_id(mut batch: Vec<backend::ToolCall>) -> Vec<backend::ToolCall> {
     // Results come back by id, and nothing makes a reply's ids unique, so
@@ -2387,7 +2544,7 @@ mod tests {
     use letronna_core::gate::Mode;
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
-    use super::{cuts_in, front_call, running_calls, until_repeated_id};
+    use super::{cuts_in, front_call, run_ended, running_calls, until_repeated_id};
     use letronna_core::agent::{MAX_BATCH, Next, Turn};
     use letronna_core::chat::{Connection, ToolCall};
     use letronna_core::gate::{Gate, Grants, decide};
@@ -2565,5 +2722,18 @@ mod tests {
                 ("{}".to_owned(), "listed".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn a_card_goes_when_the_helper_heading_its_run_ends() {
+        use letronna_core::tasks::{self, Key, State, Task};
+        // Far from any session or helper id another test uses.
+        let (root, run) = (9_101, (1 << 40) + 9_101);
+        tasks::register(Task::new(Key::Agent(run), root, None, "helper"));
+        assert!(!run_ended(root, run));
+        tasks::finish(&Key::Agent(run), State::Stopped, None);
+        assert!(run_ended(root, run));
+        // A run with nothing listed, as one a turn waits on, never looks ended.
+        assert!(!run_ended(root, run + 1));
     }
 }
