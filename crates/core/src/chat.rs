@@ -639,7 +639,16 @@ pub fn list_models(base: &str, key: &str) -> Result<Vec<String>, String> {
 pub fn start(connection: Connection, messages: Vec<Message>) -> async_channel::Receiver<Event> {
     let (sender, receiver) = async_channel::bounded(64);
     std::thread::spawn(move || {
+        let started = std::time::Instant::now();
         let result = stream(&connection, &messages, &sender);
+        crate::diag::event(
+            "model_request",
+            &[
+                ("model", connection.model.as_str().into()),
+                ("outcome", crate::diag::outcome(&result).into()),
+                ("ms", crate::diag::millis(started)),
+            ],
+        );
         let _ = sender.send_blocking(Event::Finished(result));
     });
     receiver

@@ -209,6 +209,21 @@ pub fn specs(connection: &Connection) -> Vec<Value> {
 
 pub fn run(name: &str, args: &str, ctx: &ToolContext) -> Result<String, String> {
     let tool = find(name).ok_or_else(|| format!("Unknown tool `{name}`."))?;
+    let started = Instant::now();
+    let result = run_found(tool.as_ref(), name, args, ctx);
+    crate::diag::event(
+        "tool",
+        &[
+            ("name", name.into()),
+            ("outcome", crate::diag::outcome(&result).into()),
+            ("ms", crate::diag::millis(started)),
+            ("bytes", result.as_ref().map_or(0, String::len).into()),
+        ],
+    );
+    result
+}
+
+fn run_found(tool: &dyn Tool, name: &str, args: &str, ctx: &ToolContext) -> Result<String, String> {
     // Only fitting tools are offered, but the model can name any of them;
     // refuse here too rather than trust the offer.
     if ctx.shared() && tool.machine() {

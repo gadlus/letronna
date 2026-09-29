@@ -388,7 +388,11 @@ impl Runner {
     }
 
     pub fn persist(&mut self) {
-        if self.store.save().is_err() {
+        if let Err(error) = self.store.save() {
+            letronna_core::diag::event(
+                "save_failed",
+                &[("error", error.kind().to_string().into())],
+            );
             render::line(&render::red("Could not write the session to disk."));
         }
     }

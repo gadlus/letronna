@@ -421,7 +421,7 @@ fn percent_decoded(text: &str) -> String {
 }
 
 /// The user's own keys and tokens: what no address may carry out.
-fn secrets() -> Vec<String> {
+pub(crate) fn secrets() -> Vec<String> {
     let mut all: Vec<String> = crate::store::load_keys().into_values().collect();
     all.extend(crate::auth::account().map(|account| account.token));
     let chats = crate::messaging::load();

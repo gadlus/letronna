@@ -520,7 +520,11 @@ impl Chat {
     }
 
     pub(crate) fn save(&mut self) {
-        if self.store.save().is_err() {
+        if let Err(error) = self.store.save() {
+            letronna_core::diag::event(
+                "save_failed",
+                &[("error", error.kind().to_string().into())],
+            );
             self.error =
                 Some("Could not save chat history. Your current chat remains in memory.".into());
         }
