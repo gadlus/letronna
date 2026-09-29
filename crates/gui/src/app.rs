@@ -2292,6 +2292,7 @@ impl Render for Chat {
                     per_second: turn.live.per_second,
                     prompt_tokens: turn.live.prompt_tokens,
                     cached_tokens: turn.live.cached_tokens,
+                    window: turn.live.window,
                     ..Default::default()
                 }) {
                     // Keyed by the place the reply will have once it is

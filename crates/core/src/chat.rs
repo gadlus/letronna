@@ -28,6 +28,10 @@ pub struct Message {
     pub prompt_tokens: u64,
     #[serde(default)]
     pub cached_tokens: u64,
+    /// The most tokens a request to the reply's model could hold, from the
+    /// model facts when the reply came; 0 when they did not say.
+    #[serde(default)]
+    pub window: u64,
     /// Calls the assistant asked for in this turn.
     #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
@@ -74,6 +78,35 @@ impl Message {
             self.prompt_tokens
         }
     }
+
+    /// How much of the model's window the reply's request took, as in "38%
+    /// of 200K"; `None` when the prompt or the window is not known.
+    pub fn fullness(&self) -> Option<String> {
+        let input = self.input_tokens();
+        if input == 0 || self.window == 0 {
+            return None;
+        }
+        let share = input.saturating_mul(100) / self.window;
+        Some(format!("{share}% of {}", short_window(self.window)))
+    }
+}
+
+/// A window's size as models are known by it: 200K, 1M, and 128K for
+/// 131,072, since a window of whole 1,024s is counted in them.
+fn short_window(tokens: u64) -> String {
+    let unit = if tokens.is_multiple_of(1_024) {
+        1_024
+    } else {
+        1_000
+    };
+    if tokens >= unit * unit {
+        let millions = format!("{:.1}", tokens as f64 / (unit * unit) as f64);
+        return format!("{}M", millions.trim_end_matches(".0"));
+    }
+    if tokens >= unit {
+        return format!("{:.0}K", tokens as f64 / unit as f64);
+    }
+    tokens.to_string()
 }
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
@@ -3218,6 +3251,28 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(beside.input_tokens(), 1933);
+    }
+
+    #[test]
+    fn fullness_is_the_prompt_against_the_window_and_nothing_when_either_is_unknown() {
+        let fullness = |prompt_tokens, cached_tokens, window| {
+            let reply = Message {
+                prompt_tokens,
+                cached_tokens,
+                window,
+                ..Default::default()
+            };
+            reply.fullness().unwrap_or_default()
+        };
+        assert_eq!(fullness(76_000, 0, 200_000), "38% of 200K");
+        // Cache hits counted beside the prompt fill the window all the same.
+        assert_eq!(fullness(100, 1_000_000, 1_048_576), "95% of 1M");
+        assert_eq!(fullness(3_291, 0, 131_072), "2% of 128K");
+        assert_eq!(fullness(900, 0, 1_047_576), "0% of 1M");
+        assert_eq!(fullness(900, 0, 1_500_000), "0% of 1.5M");
+        assert_eq!(fullness(900, 0, 16_385), "5% of 16K");
+        assert_eq!(fullness(900, 0, 0), "");
+        assert_eq!(fullness(0, 0, 200_000), "");
     }
 
     #[test]

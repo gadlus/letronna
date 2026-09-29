@@ -1143,6 +1143,7 @@ fn usage(reply: &Message) -> String {
     let input = reply.input_tokens();
     if input > 0 {
         parts.push(format!("{input} in"));
+        parts.extend(reply.fullness());
         if reply.cached_tokens > 0 {
             parts.push(format!("{}% cached", 100 * reply.cached_tokens / input));
         }
