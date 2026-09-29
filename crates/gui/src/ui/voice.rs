@@ -94,10 +94,13 @@ impl Chat {
             }
         })
         .detach();
+        // The session whose draft the composer holds, so the words go back
+        // to it even if another one is on screen by the time they land.
+        let session = self.draft_for;
         cx.spawn_in(window, async move |this, cx| {
             let captured = rx.recv().await;
             let _ = this.update_in(cx, |this, window, cx| {
-                this.recorded(captured, window, cx);
+                this.recorded(captured, session, window, cx);
             });
         })
         .detach();
@@ -108,6 +111,7 @@ impl Chat {
     fn recorded(
         &mut self,
         captured: Result<Result<Captured, String>, async_channel::RecvError>,
+        session: u64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -135,12 +139,7 @@ impl Chat {
             let _ = this.update_in(cx, |this, window, cx| {
                 this.voice = None;
                 match outcome {
-                    // At the caret, not appended, so it lands where the user
-                    // was about to type and the rest of the draft is
-                    // untouched either side of it.
-                    Ok(text) if !text.is_empty() => this
-                        .composer
-                        .update(cx, |input, cx| input.insert(text, window, cx)),
+                    Ok(text) if !text.is_empty() => this.land(session, text, window, cx),
                     Ok(_) => this.error = Some("No speech was heard.".to_owned()),
                     Err(why) => this.error = Some(why),
                 }
@@ -148,6 +147,18 @@ impl Chat {
             });
         })
         .detach();
+    }
+
+    /// Type `text` into the draft of `session`, where the recording began.
+    fn land(&mut self, session: u64, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        if session != self.draft_for && self.store.index_of(session).is_some() {
+            add_to_draft(self.drafts.entry(session).or_default(), &text);
+            return;
+        }
+        // At the caret, not appended, so it lands where the user was about
+        // to type and the rest of the draft is untouched either side of it.
+        self.composer
+            .update(cx, |input, cx| input.insert(text, window, cx));
     }
 
     /// The mic button: plain for a press to start, red with the time
@@ -189,6 +200,15 @@ impl Chat {
 fn elapsed(time: Duration) -> String {
     let secs = time.as_secs();
     format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+/// Add `text` to the end of a draft that is not in the composer, so there is
+/// no caret to put it at, keeping a space between it and what was there.
+fn add_to_draft(draft: &mut String, text: &str) {
+    if !draft.is_empty() && !draft.ends_with(char::is_whitespace) {
+        draft.push(' ');
+    }
+    draft.push_str(text);
 }
 
 /// The recording as a WAV file, transcribed and gone again, whether or not
@@ -248,7 +268,19 @@ fn encode_wav(audio: &Captured) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Captured, elapsed, encode_wav, with_temp_wav};
+    use super::{Captured, add_to_draft, elapsed, encode_wav, with_temp_wav};
+
+    #[test]
+    fn words_for_a_session_off_screen_join_the_end_of_its_draft() {
+        let mut draft = String::new();
+        add_to_draft(&mut draft, "hello");
+        assert_eq!(draft, "hello");
+        add_to_draft(&mut draft, "there");
+        assert_eq!(draft, "hello there");
+        let mut draft = "first line\n".to_owned();
+        add_to_draft(&mut draft, "second");
+        assert_eq!(draft, "first line\nsecond");
+    }
 
     #[test]
     fn the_time_reads_minutes_and_seconds() {
