@@ -52,7 +52,10 @@ pub struct Entry {
 /// What a folder or file is judged as in the checks every read makes.
 fn reachable(root: &Path, path: &Path, data: &Path) -> Result<PathBuf, String> {
     let shown = label(root, path);
-    if let Some(why) = crate::paths::unsafe_raw(&path.to_string_lossy(), Some(root)) {
+    // The tree holds canonical paths, which Windows spells `\\?\C:\...`, the
+    // device form `unsafe_raw` refuses; it is judged as the plain path.
+    let (plain_path, plain_root) = (plain(path), plain(root));
+    if let Some(why) = crate::paths::unsafe_raw(&plain_path, Some(Path::new(&plain_root))) {
         return Err(format!("{shown} {why}."));
     }
     let root = std::fs::canonicalize(root)
@@ -67,6 +70,18 @@ fn reachable(root: &Path, path: &Path, data: &Path) -> Result<PathBuf, String> {
         ));
     }
     Ok(real)
+}
+
+/// `path` as text without the `\\?\` that Windows puts on a canonical path.
+fn plain(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if let Some(share) = text.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{share}");
+    }
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => rest.to_owned(),
+        _ => text.into_owned(),
+    }
 }
 
 /// A path as the user knows it: from the project folder down.
@@ -597,6 +612,14 @@ mod tests {
             assert!(matches!(at(name), Preview::Elsewhere(_)), "{name}");
         }
         assert!(preview_in(&root, &root, &data).is_err());
+    }
+
+    #[test]
+    fn a_canonical_windows_path_loses_its_verbatim_prefix() {
+        assert_eq!(plain(Path::new(r"\\?\C:\work\app")), r"C:\work\app");
+        assert_eq!(plain(Path::new(r"\\?\UNC\nas\p\app")), r"\\nas\p\app");
+        assert_eq!(plain(Path::new(r"\\?\GLOBALROOT\x")), r"\\?\GLOBALROOT\x");
+        assert_eq!(plain(Path::new("/work/app")), "/work/app");
     }
 
     #[test]
