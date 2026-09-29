@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     any::Any,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     io::{BufRead, BufReader},
     path::PathBuf,
     sync::{Mutex, OnceLock},
@@ -57,6 +57,10 @@ pub struct Message {
     /// For `role: "assistant"`: the user stopped this reply part way.
     #[serde(default)]
     pub interrupted: bool,
+    /// For `role: "assistant"`: what the provider wants back with this reply.
+    // Boxed, since few messages have one and every message is kept in memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay: Option<Box<Replay>>,
 }
 
 impl Message {
@@ -78,6 +82,24 @@ pub struct ToolCall {
     pub name: String,
     /// JSON object as sent by the model.
     pub arguments: String,
+}
+
+/// What a provider wants sent back unchanged with a reply on later requests:
+/// the thinking behind it, which it may have signed or encrypted and
+/// otherwise has to work out again or refuses the tool calls that followed.
+/// It means nothing to any other provider, so it goes back only to the
+/// endpoint and model it came from.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Replay {
+    pub endpoint: String,
+    pub model: String,
+    /// OpenRouter's `reasoning_details`, whole and in the order they came.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_details: Vec<Value>,
+    /// The `extra_content` of each tool call that had one, by the call's
+    /// id: where Google's OpenAI-shaped API puts a thought signature.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra_content: BTreeMap<String, Value>,
 }
 
 /// How long ago, in the words a person would use. For listing sessions,
@@ -167,6 +189,9 @@ pub enum Event {
     },
     /// Sent once, before `Finished`, when the model asked for tools.
     ToolCalls(Vec<ToolCall>),
+    /// Sent once, before `Finished`, when a finished reply came with
+    /// something the provider wants back.
+    Replay(Replay),
     /// A try failed in a way that passes, and another follows after a wait.
     Retrying(crate::retry::Retry),
     /// Sent before `Finished` when the reply stopped at the output limit;
@@ -606,8 +631,15 @@ fn body_with(
     // is shortened.
     let old = old_before(window, budget);
     let stubs = stubs(window, old);
+    let turn = window.iter().rposition(opens_turn);
     for (i, m) in window.iter().enumerate() {
         let mut wired = wire_message(m, budget.tool_chars);
+        carry_back(
+            &mut wired,
+            m,
+            connection,
+            turn.is_none_or(|start| i > start),
+        );
         if let Some(stub) = &stubs[i] {
             wired["content"] = stub.as_str().into();
         }
@@ -801,18 +833,23 @@ enum Quirk {
     /// The wrap-up's `tool_choice`; without it a model may still call a
     /// tool, which is then not run.
     ToolChoice,
+    /// Everything `carry_back` adds, which a strict server may not take.
+    Replay,
 }
 
 /// Each quirk by what a refusal says when its field is the one at fault: the
 /// field's name, or for the cap the name it asks for instead, since a server
 /// out of room names both caps and a new name would not give it more.
-const QUIRKS: [(Quirk, &str); 6] = [
+const QUIRKS: [(Quirk, &str); 9] = [
     (Quirk::CompletionTokens, "'max_completion_tokens' instead"),
     (Quirk::Effort, "reasoning_effort"),
     (Quirk::StreamOptions, "stream_options"),
     (Quirk::WebSearch, "web_search"),
     (Quirk::CacheControl, "cache_control"),
     (Quirk::ToolChoice, "tool_choice"),
+    (Quirk::Replay, "reasoning_details"),
+    (Quirk::Replay, "extra_content"),
+    (Quirk::Replay, "reasoning_content"),
 ];
 
 /// The cap sent as `max_completion_tokens`, which counts a model's thinking
@@ -889,6 +926,11 @@ fn apply_quirk(body: &mut Value, quirk: Quirk) -> bool {
         // Markers ride on message parts, not at the top.
         Quirk::CacheControl => remove_everywhere(body, "cache_control"),
         Quirk::ToolChoice => fields.remove("tool_choice").is_some(),
+        Quirk::Replay => fields.get_mut("messages").is_some_and(|messages| {
+            ["reasoning_details", "extra_content", "reasoning_content"]
+                .iter()
+                .fold(false, |found, key| remove_everywhere(messages, key) | found)
+        }),
     }
 }
 
@@ -1102,6 +1144,42 @@ fn wire_message(m: &Message, tool_chars: usize) -> Value {
     v
 }
 
+/// Give back with an assistant message what its provider asked for: the
+/// reasoning details and thought signatures it sent, to the endpoint and
+/// model that sent them and no other. DeepSeek and Kimi in thinking mode
+/// want the reasoning behind a tool call sent back with it, and DeepSeek
+/// refuses the call without it, so theirs get it on every call of the turn
+/// in progress, and an empty one on older calls, whose reasoning they no
+/// longer read.
+fn carry_back(wired: &mut Value, m: &Message, connection: &Connection, this_turn: bool) {
+    if m.role != "assistant" {
+        return;
+    }
+    let (endpoint, model) = route(connection);
+    if let Some(replay) = m
+        .replay
+        .as_ref()
+        .filter(|r| r.endpoint == endpoint && r.model == model)
+    {
+        if !replay.reasoning_details.is_empty() {
+            wired["reasoning_details"] = replay.reasoning_details.clone().into();
+        }
+        for (at, call) in m.tool_calls.iter().enumerate() {
+            if let Some(extra) = replay.extra_content.get(&call.id) {
+                wired["tool_calls"][at]["extra_content"] = extra.clone();
+            }
+        }
+    }
+    let lower = model.to_lowercase();
+    let echoes = ["deepseek", "kimi", "moonshot"]
+        .iter()
+        .any(|family| lower.contains(family));
+    if echoes && !m.tool_calls.is_empty() {
+        let own = this_turn && m.model.trim() == model;
+        wired["reasoning_content"] = if own { m.reasoning.as_str() } else { "" }.into();
+    }
+}
+
 /// Results and file bodies shorter than this, in characters, go out as they
 /// are however old or repeated: a line saying what one was costs about as
 /// much, and the model reads it without calling again.
@@ -1226,24 +1304,8 @@ pub(crate) fn transient(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 502 | 503 | 504 | 520..=527)
 }
 
-/// Turn a provider's complaint into something worth reading.
-///
-/// Two of them mean the same thing and neither says it: the route cannot
-/// take a tool call back in the conversation. Google's adapter wants the
-/// opaque `thought_signature` it issued, which the OpenAI-shaped protocol
-/// has nowhere to carry, and then blames the id; the id is fine. It is not
-/// something the caller can fix by trying again, so the message says what to
-/// do instead.
+/// A provider's complaint, cut to a length worth reading.
 fn explain(message: &str) -> String {
-    let tool_history_unsupported = message.contains("thought_signature")
-        || (message.contains("tool_calls") && message.contains("to be populated"));
-    if tool_history_unsupported {
-        return "This model cannot carry tool calls back into the conversation, so it \
-                stops as soon as it uses one. That is the route, not the request. Pick \
-                another model with /model -- the deepseek and claude routes handle \
-                tools."
-            .to_owned();
-    }
     message.chars().take(400).collect()
 }
 
@@ -1270,8 +1332,10 @@ struct Chunk {
     completion_tokens: Option<u64>,
     prompt_tokens: Option<u64>,
     cached_tokens: Option<u64>,
-    /// Fragments of `(index, id, name, arguments)`; the stream assembles them.
-    tool_calls: Vec<(Option<usize>, String, String, String)>,
+    /// Fragments of `(index, id, name, arguments, extra_content)`; the
+    /// stream assembles them.
+    tool_calls: Vec<(Option<usize>, String, String, String, Value)>,
+    reasoning_details: Vec<Value>,
     finish: Option<FinishReason>,
 }
 
@@ -1291,12 +1355,14 @@ struct Assembler {
     slots: HashMap<usize, usize>,
     /// The call the last fragment fed, which one with no index carries on.
     active: Option<usize>,
+    /// Each call's `extra_content`, by its place in `calls`.
+    extras: Vec<Value>,
 }
 
 impl Assembler {
     /// Add each fragment of a chunk to the call it belongs to.
     fn add(&mut self, chunk: &Chunk) {
-        for (position, (index, id, name, arguments)) in chunk.tool_calls.iter().enumerate() {
+        for (position, (index, id, name, arguments, extra)) in chunk.tool_calls.iter().enumerate() {
             let open = match index {
                 Some(index) => self.slots.get(index).copied(),
                 // One array never holds two pieces of the same call, so only
@@ -1315,9 +1381,13 @@ impl Assembler {
                 Some(slot) if self.calls[slot].id == *id => slot,
                 _ => {
                     self.calls.push(ToolCall::default());
+                    self.extras.push(Value::Null);
                     self.calls.len() - 1
                 }
             };
+            if !extra.is_null() {
+                self.extras[slot].clone_from(extra);
+            }
             if let Some(index) = index {
                 self.slots.insert(*index, slot);
             }
@@ -1428,10 +1498,15 @@ fn parse_chunk(value: &Value) -> Result<Chunk, Failure> {
                         id,
                         text(&c["function"]["name"]),
                         text(&c["function"]["arguments"]),
+                        c["extra_content"].clone(),
                     )
                 })
                 .collect()
         })
+        .unwrap_or_default();
+    let reasoning_details = delta
+        .and_then(|d| d["reasoning_details"].as_array())
+        .cloned()
         .unwrap_or_default();
     // vLLM also sends a `stop_reason`, but there it is the stop string that
     // matched rather than why, so only `finish_reason` is read.
@@ -1447,6 +1522,7 @@ fn parse_chunk(value: &Value) -> Result<Chunk, Failure> {
         prompt_tokens,
         cached_tokens,
         tool_calls,
+        reasoning_details,
         finish,
     })
 }
@@ -1730,7 +1806,7 @@ fn stream(
                 )
             }
             Ok(response) if response.status().is_success() => {
-                match read(response, extra, sender, &mut stands, &mut slow) {
+                match read(response, connection, extra, sender, &mut stands, &mut slow) {
                     Ok(()) => return Ok(()),
                     Err(failure) => failure,
                 }
@@ -1811,6 +1887,7 @@ fn ran_out_reading(e: &std::io::Error) -> bool {
 /// time.
 fn read(
     response: reqwest::blocking::Response,
+    connection: &Connection,
     extra: &Extra,
     sender: &async_channel::Sender<Event>,
     stands: &mut bool,
@@ -1828,7 +1905,7 @@ fn read(
         let began = std::time::Instant::now();
         let mut reply = Reply::default();
         reply.absorb(parse_chunk(&value)?, stands, sender)?;
-        return reply.end(true, began, &extra.tools, sender);
+        return reply.end(true, began, connection, &extra.tools, sender);
     }
     // An event stream can end early for a reason that passes, as when a
     // gateway keeps it open with comments and then gives up on the model.
@@ -1869,7 +1946,34 @@ fn read(
         }
         reply.absorb(parse_event(data)?, stands, sender)?;
     }
-    reply.end(done, began, &extra.tools, sender)
+    reply.end(done, began, connection, &extra.tools, sender)
+}
+
+/// Add streamed reasoning details to those so far. OpenRouter streams a
+/// text a piece at a time under one index, then its signature under the same
+/// index, so pieces of one entry are put back together; an encrypted entry
+/// comes whole and is kept as it came.
+fn join_details(details: &mut Vec<Value>, pieces: Vec<Value>) {
+    for piece in pieces {
+        let same = details.iter().position(|d| {
+            !piece["index"].is_null() && d["index"] == piece["index"] && d["type"] == piece["type"]
+        });
+        let (Some(entry), Value::Object(fields)) = (same.map(|at| &mut details[at]), &piece) else {
+            details.push(piece);
+            continue;
+        };
+        for (key, value) in fields {
+            match (&mut entry[key.as_str()], value) {
+                (Value::String(so_far), Value::String(more))
+                    if key == "text" || key == "summary" =>
+                {
+                    so_far.push_str(more)
+                }
+                (_, Value::Null) => {}
+                (field, value) => *field = value.clone(),
+            }
+        }
+    }
 }
 
 /// A streamed reply as it arrives.
@@ -1880,6 +1984,7 @@ struct Reply {
     prompt_tokens: u64,
     cached_tokens: u64,
     assembler: Assembler,
+    reasoning_details: Vec<Value>,
     finish: Option<FinishReason>,
 }
 
@@ -1908,6 +2013,7 @@ impl Reply {
         // server that never sends [DONE] would cut it off again.
         *stands |= !chunk.tool_calls.is_empty();
         self.assembler.add(&chunk);
+        join_details(&mut self.reasoning_details, chunk.reasoning_details);
         if let Some(text) = chunk.reasoning {
             *stands = true;
             sender
@@ -1931,6 +2037,7 @@ impl Reply {
         self,
         done: bool,
         began: std::time::Instant,
+        connection: &Connection,
         extra_tools: &[Value],
         sender: &async_channel::Sender<Event>,
     ) -> Result<(), Failure> {
@@ -1949,8 +2056,13 @@ impl Reply {
                 "The provider closed the stream early or does not support SSE chat completions.",
             ));
         }
-        let mut calls = self.assembler.calls;
-        calls.retain(|c| !c.name.is_empty());
+        let (mut calls, extras): (Vec<_>, Vec<_>) = self
+            .assembler
+            .calls
+            .into_iter()
+            .zip(self.assembler.extras)
+            .filter(|(c, _)| !c.name.is_empty())
+            .unzip();
         let cut_off = self.finish == Some(FinishReason::Length);
         // The limit falls inside the last call, so its arguments are half
         // written -- half a file, if it was a write. None of the calls is
@@ -1961,6 +2073,18 @@ impl Reply {
         }
         name_unnamed(&mut calls);
         name_as_offered(&mut calls, extra_tools);
+        let (endpoint, model) = route(connection);
+        let replay = Replay {
+            endpoint,
+            model,
+            reasoning_details: self.reasoning_details,
+            extra_content: calls
+                .iter()
+                .zip(extras)
+                .filter(|(_, extra)| !extra.is_null())
+                .map(|(call, extra)| (call.id.clone(), extra))
+                .collect(),
+        };
         let mut received = self.received;
         if !calls.is_empty() {
             received = true;
@@ -1982,6 +2106,13 @@ impl Reply {
                 _ => return Ok(()),
             };
             return Err(Failure::new(FailureKind::BadReply, why));
+        }
+        let carries = !replay.reasoning_details.is_empty() || !replay.extra_content.is_empty();
+        // Reasoning that led to dropped calls is not sent back without them.
+        if carries && !in_call {
+            sender
+                .send_blocking(Event::Replay(replay))
+                .map_err(|_| Failure::new(FailureKind::Stopped, "Chat closed."))?;
         }
         if cut_off {
             sender
@@ -2306,20 +2437,6 @@ mod tests {
         assert_eq!(sent("plain-model"), None);
         assert_eq!(sent("hy-mt2-7b"), None);
         assert_eq!(sent("thinking-model"), Some("xhigh".into()));
-    }
-    #[test]
-    fn the_two_ways_a_route_says_it_cannot_do_tools_read_the_same() {
-        let google = super::explain(
-            "Expected the 'id' of a(n) 'assistant' 'tool_calls' array element to be populated.",
-        );
-        let gemini =
-            super::explain("Function call is missing a thought_signature in functionCall parts.");
-        assert!(google.contains("/model"));
-        assert!(!google.contains("  "), "{google}");
-        assert_eq!(google, gemini);
-        // Anything else is passed through as the provider wrote it.
-        let other = super::explain("You have exceeded your quota.");
-        assert_eq!(other, "You have exceeded your quota.");
     }
 
     #[test]
@@ -3413,14 +3530,16 @@ mod tests {
         let mut body = json!({
             "messages": [{"role": "user", "content": [
                 {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}
-            ]}],
+            ]}, {"role": "assistant", "content": "", "reasoning_content": "",
+                "reasoning_details": [], "tool_calls": [{"id": "a", "extra_content": {}}]}],
             "max_tokens": 8192,
             "stream_options": {"include_usage": true},
             "reasoning_effort": "high",
-            "tools": [{"type": "function"}, {"type": "web_search"}],
-            "tool_choice": "none"
+            "tool_choice": "none",
+            "tools": [{"type": "function"}, {"type": "web_search"}]
         });
-        for (quirk, _) in QUIRKS {
+        let quirks: HashSet<Quirk> = QUIRKS.iter().map(|(quirk, _)| *quirk).collect();
+        for quirk in quirks {
             assert!(apply_quirk(&mut body, quirk));
             // Once is enough: what is gone cannot be the reason for a retry.
             assert!(!apply_quirk(&mut body, quirk));
@@ -3428,7 +3547,8 @@ mod tests {
         assert_eq!(
             body,
             json!({
-                "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]},
+                    {"role": "assistant", "content": "", "tool_calls": [{"id": "a"}]}],
                 "max_completion_tokens": COMPLETION_TOKENS,
                 "tools": [{"type": "function"}]
             })
@@ -5254,5 +5374,230 @@ mod tests {
             ..Default::default()
         }];
         assert!(doomed(&c, &short, &budget(&c, 0)).is_none());
+    }
+
+    /// The reply a turn keeps from `stream`, sent by a provider serving
+    /// `model`, as the session file saves it, and the connection it came on.
+    fn kept_reply(model: &str, stream: &'static str) -> (Message, Connection) {
+        let (endpoint, worker) = serve(vec![("200 OK", "text/event-stream", stream)]);
+        let c = Connection {
+            endpoint,
+            model: model.into(),
+            ..connection()
+        };
+        let mut turn = crate::agent::Turn::new(c.clone());
+        let rx = start(c.clone(), hi());
+        while let Ok(event) = rx.recv_blocking() {
+            turn.absorb(&event);
+            if let Event::Finished(result) = event {
+                result.unwrap();
+                break;
+            }
+        }
+        worker.join().unwrap();
+        let reply = turn.take_reply(model);
+        let saved = serde_json::to_string(&reply).unwrap();
+        (serde_json::from_str(&saved).unwrap(), c)
+    }
+
+    /// "Hi", `reply`, and an answer to each call it made.
+    fn answered(reply: Message) -> Vec<Message> {
+        let mut window = hi();
+        let results: Vec<Message> = reply
+            .tool_calls
+            .iter()
+            .map(|call| Message {
+                role: "tool".into(),
+                content: "fn main() {}".into(),
+                tool_call_id: call.id.clone(),
+                name: call.name.clone(),
+                ..Default::default()
+            })
+            .collect();
+        window.push(reply);
+        window.extend(results);
+        window
+    }
+
+    #[test]
+    fn google_thought_signatures_go_back_on_the_calls_they_came_with() {
+        // Google's OpenAI-shaped API signs only the first of parallel calls.
+        let stream = concat!(
+            r#"data: {"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"extra_content":{"google":{"thought_signature":"CtwFAVSoXO"}},"function":{"arguments":"{\"path\":\"a.rs\"}","name":"read_file"},"id":"function-call-1","index":0,"type":"function"},{"function":{"arguments":"{\"path\":\"b.rs\"}","name":"read_file"},"id":"function-call-2","index":1,"type":"function"}]},"finish_reason":"tool_calls"}],"model":"gemini-3-pro-preview","object":"chat.completion.chunk"}"#,
+            "\n\ndata: [DONE]\n\n"
+        );
+        let (reply, c) = kept_reply("gemini-3-pro-preview", stream);
+        let window = answered(reply);
+        let sent = body(&c, &window, None, None);
+        let calls = &sent["messages"][2]["tool_calls"];
+        assert_eq!(
+            calls[0]["extra_content"],
+            json!({"google": {"thought_signature": "CtwFAVSoXO"}})
+        );
+        assert!(calls[1].get("extra_content").is_none());
+        // Another model, or the same one on another endpoint, gets none.
+        let elsewhere = [
+            Connection {
+                model: "gemini-2.5-flash".into(),
+                ..c.clone()
+            },
+            Connection {
+                endpoint: "https://generativelanguage.googleapis.com/v1beta/openai".into(),
+                ..c.clone()
+            },
+        ];
+        for other in elsewhere {
+            let sent = body(&other, &window, None, None);
+            assert!(
+                sent["messages"][2]["tool_calls"][0]
+                    .get("extra_content")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn openrouter_reasoning_details_are_joined_and_go_back_as_they_came() {
+        // A thought in pieces, its signature after it, then a redacted one.
+        let stream = concat!(
+            r#"data: {"choices":[{"delta":{"role":"assistant","content":"","reasoning":"Let me","reasoning_details":[{"type":"reasoning.text","text":"Let me","format":"anthropic-claude-v1","index":0}]}}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{"content":"","reasoning":" look.","reasoning_details":[{"type":"reasoning.text","text":" look.","format":"anthropic-claude-v1","index":0}]}}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{"content":"","reasoning_details":[{"type":"reasoning.text","text":"","signature":"EqQBCkgIARAB","format":"anthropic-claude-v1","index":0}]}}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{"content":"","reasoning_details":[{"type":"reasoning.encrypted","data":"UmVkYWN0ZWQ=","format":"anthropic-claude-v1","index":1}]}}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"toolu_01","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            "\n\ndata: [DONE]\n\n"
+        );
+        let (reply, c) = kept_reply("anthropic/claude-sonnet-4.5", stream);
+        assert_eq!(reply.reasoning, "Let me look.");
+        let window = answered(reply);
+        let sent = body(&c, &window, None, None);
+        assert_eq!(
+            sent["messages"][2]["reasoning_details"],
+            json!([
+                {"type": "reasoning.text", "text": "Let me look.", "signature": "EqQBCkgIARAB",
+                    "format": "anthropic-claude-v1", "index": 0},
+                {"type": "reasoning.encrypted", "data": "UmVkYWN0ZWQ=",
+                    "format": "anthropic-claude-v1", "index": 1}
+            ])
+        );
+        let switched = Connection {
+            model: "openai/gpt-5".into(),
+            ..c
+        };
+        let sent = body(&switched, &window, None, None);
+        assert!(sent["messages"][2].get("reasoning_details").is_none());
+    }
+
+    /// An assistant message from `model` that thought, then called `id`.
+    fn thought_then_called(id: &str, model: &str) -> Message {
+        Message {
+            role: "assistant".into(),
+            model: model.into(),
+            reasoning: format!("Reasoning before {id}."),
+            tool_calls: vec![call(id, "read_file", "{}")],
+            ..Default::default()
+        }
+    }
+
+    /// The result of the call `id`.
+    fn result_of(id: &str) -> Message {
+        Message {
+            role: "tool".into(),
+            content: "x".into(),
+            tool_call_id: id.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn deepseek_and_kimi_get_their_reasoning_back_on_the_turns_calls() {
+        let asked = |text: &str| Message {
+            role: "user".into(),
+            content: text.into(),
+            ..Default::default()
+        };
+        let window = vec![
+            asked("Read a.rs"),
+            thought_then_called("a", "deepseek-reasoner"),
+            result_of("a"),
+            Message {
+                role: "assistant".into(),
+                content: "Done.".into(),
+                ..Default::default()
+            },
+            asked("Now b.rs and c.rs"),
+            thought_then_called("b", "deepseek-reasoner"),
+            result_of("b"),
+            thought_then_called("c", "deepseek-chat"),
+            result_of("c"),
+        ];
+        let c = Connection {
+            model: "deepseek-reasoner".into(),
+            ..connection()
+        };
+        let sent = body(&c, &window, None, None);
+        let reasoning = |at: usize| sent["messages"][at + 1].get("reasoning_content").cloned();
+        // An older turn's is no longer read, but a call must have one.
+        assert_eq!(reasoning(1), Some(json!("")));
+        assert_eq!(reasoning(3), None);
+        assert_eq!(reasoning(5), Some(json!("Reasoning before b.")));
+        // Another model's thinking is not passed off as this one's.
+        assert_eq!(reasoning(7), Some(json!("")));
+        let kimi = Connection {
+            model: "moonshotai/kimi-k2-thinking".into(),
+            ..connection()
+        };
+        assert_eq!(
+            body(&kimi, &window, None, None)["messages"][6]["reasoning_content"],
+            ""
+        );
+        let other = Connection {
+            model: "qwen3:8b".into(),
+            ..connection()
+        };
+        let sent = body(&other, &window, None, None);
+        let messages = sent["messages"].as_array().unwrap();
+        assert!(
+            messages
+                .iter()
+                .all(|m| m.get("reasoning_content").is_none())
+        );
+    }
+
+    #[test]
+    fn a_route_that_refuses_reasoning_sent_back_is_sent_none_of_it() {
+        let c = Connection {
+            endpoint: "https://strict.example/v1".into(),
+            model: "moonshotai/kimi-k2-instruct".into(),
+            ..connection()
+        };
+        let mut reply = thought_then_called("a", "moonshotai/kimi-k2-instruct");
+        reply.replay = Some(Box::new(Replay {
+            endpoint: "https://strict.example/v1".into(),
+            model: "moonshotai/kimi-k2-instruct".into(),
+            reasoning_details: vec![json!({"type": "reasoning.text", "text": "t", "index": 0})],
+            extra_content: BTreeMap::from([("a".into(), json!({"google": {}}))]),
+        }));
+        let window = answered(reply);
+        let sent = body(&c, &window, None, None);
+        let fields = ["reasoning_details", "reasoning_content"];
+        assert!(fields.iter().all(|f| sent["messages"][2].get(f).is_some()));
+        assert!(sent["messages"][2]["tool_calls"][0]["extra_content"].is_object());
+        // Groq's words for a field it does not take.
+        let refusal = r#"{"error":{"message":"'messages.2' : for 'role:assistant' the following must be satisfied[('messages.2' : property 'reasoning_content' is unsupported)]","type":"invalid_request_error"}}"#;
+        assert!(learn(&c, &sent, refusal));
+        let again = body(&c, &window, None, None);
+        assert!(fields.iter().all(|f| again["messages"][2].get(f).is_none()));
+        assert!(
+            again["messages"][2]["tool_calls"][0]
+                .get("extra_content")
+                .is_none()
+        );
+        // What the retry left out cannot be what it is refused for again.
+        assert!(!learn(&c, &again, refusal));
     }
 }

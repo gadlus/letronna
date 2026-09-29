@@ -12,7 +12,7 @@
 //! into whichever model fitted the other worse. Instead the loop says what it
 //! needs next and stops, and the caller comes back when it has it.
 
-use crate::chat::{Connection, Event, Message, ToolCall};
+use crate::chat::{Connection, Event, Message, Replay, ToolCall};
 use crate::gate::Outcome;
 use crate::tools;
 use std::collections::VecDeque;
@@ -100,6 +100,7 @@ pub struct Live {
     pub prompt_tokens: u64,
     pub cached_tokens: u64,
     pub calls: Vec<ToolCall>,
+    pub replay: Option<Replay>,
     /// The try about to be made again after a failure, while it waits.
     pub retrying: Option<crate::retry::Retry>,
 }
@@ -181,6 +182,7 @@ impl Turn {
                 self.live.cached_tokens = *cached;
             }
             Event::ToolCalls(calls) => self.live.calls = calls.clone(),
+            Event::Replay(replay) => self.live.replay = Some(replay.clone()),
             Event::Retrying(retry) => self.live.retrying = Some(*retry),
             Event::CutOff { in_call } => self.cut_off = Some(*in_call),
             Event::Finished(_) => {}
@@ -201,6 +203,7 @@ impl Turn {
             prompt_tokens: live.prompt_tokens,
             cached_tokens: live.cached_tokens,
             tool_calls: live.calls,
+            replay: live.replay.map(Box::new),
             ..Default::default()
         }
     }
@@ -402,8 +405,10 @@ impl Turn {
         if !self.live.content.trim().is_empty() {
             let mut reply = self.take_reply(model);
             // Calls that came with a reply cut short never ran; kept, each
-            // would need an answer of its own.
+            // would need an answer of its own. What the provider wanted back
+            // went with the whole reply, calls and all.
             reply.tool_calls.clear();
+            reply.replay = None;
             reply.interrupted = true;
             kept.push(reply);
         }
