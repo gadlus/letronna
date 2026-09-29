@@ -647,8 +647,13 @@ impl Chat {
     pub(crate) fn watch_turn_files(&mut self, cx: &mut Context<Self>) {
         let open = &self.store.conversations[self.store.active];
         let key = (open.id, open.messages.len());
-        let streaming_here = self.busy && self.streaming_id == Some(open.id);
-        if streaming_here || self.turn_files_for == Some(key) {
+        if self.busy && self.streaming_id == Some(open.id) {
+            // Asked again, a turn can end at the length of the one it
+            // replaced, whose card would then pass for its own until read.
+            self.show_turn_files(None);
+            return;
+        }
+        if self.turn_files_for == Some(key) {
             return;
         }
         self.turn_files_for = Some(key);
