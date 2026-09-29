@@ -17,6 +17,7 @@ pub mod cancel;
 mod cdp;
 pub mod chat;
 pub mod command;
+pub mod commit;
 pub mod compact;
 pub mod diag;
 pub mod driver;

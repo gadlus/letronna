@@ -83,6 +83,29 @@ fn main() {
             KeyBinding::new("a", ui::changes::AddChange, Some("Changes")),
             KeyBinding::new("r", ui::changes::RevertChange, Some("Changes")),
             KeyBinding::new("escape", ui::changes::LeaveChanges, Some("Changes")),
+            KeyBinding::new("space", ui::changes::ToggleStage, Some("Changes")),
+            KeyBinding::new("]", ui::changes::NextHunk, Some("Changes")),
+            KeyBinding::new("[", ui::changes::PreviousHunk, Some("Changes")),
+            KeyBinding::new("h", ui::changes::ToggleHunk, Some("Changes")),
+            KeyBinding::new("m", ui::changes::WriteMessage, Some("Changes")),
+            KeyBinding::new("g", ui::changes::SuggestMessage, Some("Changes")),
+            // In the commit message; bound after the input's own keys, so
+            // these are tried first.
+            KeyBinding::new(
+                "secondary-enter",
+                ui::changes::CommitStaged,
+                Some("CommitMessage > Input"),
+            ),
+            KeyBinding::new(
+                "secondary-shift-enter",
+                ui::changes::CommitAndPush,
+                Some("CommitMessage > Input"),
+            ),
+            KeyBinding::new(
+                "escape",
+                ui::changes::LeaveMessage,
+                Some("CommitMessage > Input"),
+            ),
         ]);
         platform::tray::init(cx);
         cx.on_window_closed(|cx| {

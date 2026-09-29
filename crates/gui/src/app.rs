@@ -677,7 +677,7 @@ impl Chat {
             video: None,
             video_frame: None,
             panel: Default::default(),
-            changes: crate::ui::changes::Changes::new(cx),
+            changes: crate::ui::changes::Changes::new(window, cx),
             browser: cx.new(|cx| crate::ui::browser::BrowserView::new(window, cx)),
             browser_for: 0,
             drafts: std::collections::HashMap::new(),
@@ -698,6 +698,11 @@ impl Chat {
         };
         let widen = this.follow_browser_layout(window, cx);
         this._subscriptions.push(widen);
+        // The tab getting the keys is a moment the user may have committed
+        // or edited elsewhere, like the window coming to the front.
+        let focus = this.changes.focus.clone();
+        let tab = cx.on_focus_in(&focus, window, |this, _, cx| this.refresh_changes(cx));
+        this._subscriptions.push(tab);
         this.load_models(window, cx);
         // Directly, not through `focus_composer`: the window's root does
         // not exist yet to ask about dialogs, and there can be none.
@@ -995,7 +1000,7 @@ impl Chat {
 
     /// A checked connection for a turn in the session at `ix`, on the gateway
     /// and model chosen now.
-    fn connection_for(
+    pub(crate) fn connection_for(
         &self,
         ix: usize,
         remote: Option<letronna_core::chat::Remote>,
@@ -2508,6 +2513,8 @@ impl Chat {
         self.outstanding = 0;
         self.stop_blocks = 0;
         plugins::emit(cx, plugins::AppEvent::ChatIdle);
+        // The reply may have changed files, or committed them.
+        self.refresh_changes(cx);
         self.send_follow_ups(session, cx);
         // Stop means stop, and after a failure the next turn would most
         // likely fail too: what is waiting goes in at the next ring or prompt.
