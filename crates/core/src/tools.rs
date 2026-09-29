@@ -158,6 +158,7 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(crate::messaging::ReadChat),
         Arc::new(Sessions),
         Arc::new(crate::memory::Remember),
+        Arc::new(crate::skills::UseSkill),
         Arc::new(SearchSessions),
         Arc::new(crate::web::WebFetch),
         Arc::new(crate::media::MakeImage),
@@ -494,6 +495,10 @@ pub fn summary(name: &str, args: &str) -> String {
             v["action"].as_str().unwrap_or_default(),
             v["target"].as_str().unwrap_or_default()
         ),
+        "skill" => match v["file"].as_str() {
+            Some(file) => format!("{} {file}", v["name"].as_str().unwrap_or_default()),
+            None => v["name"].as_str().unwrap_or_default().to_owned(),
+        },
         _ => v["path"].as_str().unwrap_or(".").to_owned(),
     };
     one_line(&text)

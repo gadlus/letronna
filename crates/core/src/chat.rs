@@ -413,9 +413,11 @@ fn body_with(
             system.push_str(" Other people in this chat can read your replies. Nothing on this computer is reachable from here: no files, folders or commands.");
         }
     }
-    // Memory first: it changes rarely, so the prompt's start stays cacheable;
-    // the summary of dropped turns changes as the conversation grows.
+    // Memory and skills first: they change rarely, so the prompt's start
+    // stays cacheable; the summary of dropped turns changes as the
+    // conversation grows.
     system.push_str(&crate::memory::context(connection));
+    system.push_str(&crate::skills::context(connection));
     // Models reckon "today" from their training and guess who they are. The
     // date alone changes once a day, so the prefix above stays cached; the OS
     // says something about this computer, so a shared chat goes without it.
