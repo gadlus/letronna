@@ -66,9 +66,15 @@ pub fn find(name: &str) -> Option<Style> {
     find_in(&dir(), name)
 }
 
+/// The style the settings file names, which is what requests use: the other
+/// process may have picked it since this one loaded its settings.
+pub fn current() -> Option<Style> {
+    find(&crate::store::current_settings().style)
+}
+
 /// The text the system prompt carries for the style in the settings, if any.
 pub(crate) fn chosen() -> Option<String> {
-    find(&crate::store::current_settings().style).map(|style| style.text)
+    current().map(|style| style.text)
 }
 
 fn all_in(dir: &Path) -> Vec<Style> {

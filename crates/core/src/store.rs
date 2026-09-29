@@ -321,7 +321,8 @@ pub struct Store {
     pub active: usize,
     pub settings: Settings,
     /// The settings as JSON when last read or written, so a save puts back
-    /// only the fields changed here since; only loading and `save` touch it.
+    /// only the fields changed here since; only loading, `save` and
+    /// `choose_style` touch it.
     pub settings_written: serde_json::Value,
 }
 
@@ -466,6 +467,18 @@ impl Store {
         self.settings.effort = effort.to_owned();
         if let Some(conversation) = self.conversations.get_mut(index) {
             conversation.effort = Some(effort.to_owned());
+        }
+    }
+
+    /// Have replies written in the style called `name`, empty for none.
+    ///
+    /// Requests read the style from the file, which the other process may
+    /// have changed since this one last wrote, so the pick is written even
+    /// when this copy already holds it; `save` would otherwise skip it.
+    pub fn choose_style(&mut self, name: &str) {
+        self.settings.style = name.to_owned();
+        if let Some(fields) = self.settings_written.as_object_mut() {
+            fields.remove("style");
         }
     }
 
@@ -2966,6 +2979,23 @@ pub(crate) mod tests {
         assert!(crate::styles::chosen().is_some());
         store.settings.style = "gone".into();
         store.save().unwrap();
+        assert_eq!(crate::styles::chosen(), None);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_style_picked_in_one_process_can_be_undone_in_the_other() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("style-two");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let mut window = load();
+        let mut terminal = load();
+        terminal.choose_style("teacher");
+        terminal.save().unwrap();
+        assert!(crate::styles::chosen().is_some());
+        // The window never saw that pick, so it already holds "" itself.
+        window.choose_style("");
+        window.save().unwrap();
         assert_eq!(crate::styles::chosen(), None);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }

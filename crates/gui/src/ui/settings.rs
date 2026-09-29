@@ -1233,7 +1233,7 @@ fn thinking_page(chat: &Entity<Chat>, store: &Store, cx: &App) -> Div {
                 .child(div().text_sm().child(text))
                 .on_click(move |_, _, cx| {
                     chat.update(cx, |this, cx| {
-                        this.store.settings.style = value.clone();
+                        this.store.choose_style(&value);
                         this.save();
                         cx.notify();
                     })

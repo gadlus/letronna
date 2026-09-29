@@ -648,7 +648,7 @@ fn style(runner: &mut Runner, name: &str) {
             };
             style.name
         };
-        runner.store.settings.style = chosen.clone();
+        runner.store.choose_style(&chosen);
         runner.persist();
         render::line(&render::dim(&if chosen.is_empty() {
             "Default style: replies as Letronna usually writes them.".to_owned()
@@ -657,8 +657,9 @@ fn style(runner: &mut Runner, name: &str) {
         }));
         return;
     }
+    // From the file, as requests read it: the window may have picked since.
     // A saved name whose file has gone reads as default, so it is marked so.
-    let current = styles::find(&runner.store.settings.style).map(|s| s.name);
+    let current = styles::current().map(|s| s.name);
     let default = (
         styles::DEFAULT.to_owned(),
         "no style, as Letronna usually writes".to_owned(),
