@@ -11,6 +11,10 @@
 //!
 //! Nobody is watching a card here, so a tool that needs a yes is refused
 //! with a result saying so, unless the server was started with `--yes`.
+//! Even then every call is put to the gate as a session with nobody to ask
+//! would put it, in Bypass: `--yes` answers the cards, not the user's deny
+//! and ask rules, which still refuse, as a rules or hooks file that cannot
+//! be read does.
 //! Calls are answered one at a time, in order: the browser tools must never
 //! run beside each other, and a client that needs more at once can start a
 //! second server. A tool that fails answers with `isError`, so the model on
@@ -22,7 +26,10 @@
 //! The frontend supplies the turn, since only it knows the session, the
 //! model and how approvals inside the turn are answered.
 
+use crate::chat::ToolCall;
+use crate::gate::{self, Gate, Grants, Mode, Outcome};
 use crate::mcp::{PROTOCOL, write_message};
+use crate::permissions;
 use crate::tools::{self, Tool, ToolContext};
 use serde_json::{Value, json};
 use std::io::{BufRead, Write};
@@ -171,9 +178,40 @@ impl Server {
                  Start it with --yes to let its tools run unasked."
             ))));
         }
+        if let Some(why) = self.refused(name, &args) {
+            return Ok(outcome(Err(why)));
+        }
         let hooks = crate::hooks::current();
         let ran = tools::run_found(tool.as_ref(), &args.to_string(), &self.ctx, &hooks);
         Ok(outcome(ran))
+    }
+
+    /// Why the gate would not run the call, as it decides for a session with
+    /// nobody to ask: in Bypass under `--yes`, with the user's rules read
+    /// afresh, since the window may have added one while this server ran.
+    fn refused(&self, name: &str, args: &Value) -> Option<String> {
+        let rules = permissions::load(&permissions::user_file());
+        let mode = if self.yes {
+            Mode::Bypass
+        } else {
+            Mode::Default
+        };
+        let none = Grants::new();
+        let gate = Gate::for_terminal(&self.ctx, &none, &rules, mode, false);
+        let call = ToolCall {
+            name: name.to_owned(),
+            arguments: args.to_string(),
+            ..Default::default()
+        };
+        match gate::decide(&call, &gate) {
+            Outcome::Run => None,
+            Outcome::Refuse(why) => Some(why),
+            // With nobody to answer the gate refuses rather than asks; a
+            // card here would be a yes nobody gave.
+            Outcome::Ask => Some(format!(
+                "`{name}` needs a yes, and nobody is here to give it."
+            )),
+        }
     }
 }
 
@@ -250,8 +288,21 @@ mod tests {
         }
     }
 
+    /// A server offering the two tools above, which the gate finds by name
+    /// on this test's thread as it finds an MCP server's.
     fn server(yes: bool, turn: Option<Turn>) -> Server {
-        Server::new(vec![Arc::new(Echo), Arc::new(Risky)], yes, turn)
+        let offered: Vec<Arc<dyn Tool>> = vec![Arc::new(Echo), Arc::new(Risky)];
+        crate::mcp::serve(offered.clone());
+        Server::new(offered, yes, turn)
+    }
+
+    /// An empty folder for one test, which removes it when done.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("letronna-mcp-serve-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".letronna")).unwrap();
+        dir
     }
 
     /// Sends `lines` through `serve` and reads back each answer.
@@ -346,6 +397,30 @@ mod tests {
             .unwrap();
         assert_eq!(ran["result"]["isError"], false);
         assert_eq!(ran["result"]["content"][0]["text"], "did it");
+    }
+
+    #[test]
+    fn the_users_deny_and_ask_rules_refuse_a_served_call_even_with_yes() {
+        let project = scratch("rules");
+        std::fs::write(
+            project.join(permissions::PROJECT_FILE),
+            r#"[{"tool": "risky", "effect": "deny"}, {"tool": "echo", "effect": "ask"}]"#,
+        )
+        .unwrap();
+        let mut served = server(true, None);
+        served.ctx.workspace = Some(project.clone());
+        let denied = served.answer(&call(7, "risky", json!({}))).unwrap();
+        let asked = served
+            .answer(&call(8, "echo", json!({"text": "hi"})))
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&project);
+        assert_eq!(denied["result"]["isError"], true);
+        let why = denied["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(why.contains("permission rule denies"), "{why}");
+        // An ask rule has nobody to ask, so it is a no, not a quiet yes.
+        assert_eq!(asked["result"]["isError"], true);
+        let why = asked["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(why.contains("nobody"), "{why}");
     }
 
     #[test]
