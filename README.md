@@ -160,7 +160,7 @@ Letronna can use the tools of any [MCP](https://modelcontextprotocol.io) server 
 }
 ```
 
-Servers start when Letronna does, and their tools appear as `mcp__<server>__<tool>` once they answer; `letronna -p` waits up to 15 seconds for them before it asks. Every call asks first unless the tool is listed in `autoApprove`; `"disabled": true` leaves a server off. A server that stops or cannot start is started again: one run here once, one reached by URL up to five times, 1 s later and doubling each time; then `/mcp reconnect <name>` starts it again. A server that says its tools changed is asked for them again.
+Servers start when Letronna does, and their tools appear as `mcp__<server>__<tool>` once they answer; `letronna -p` waits up to 15 seconds for them before it asks. Every call asks first unless the tool is listed in `autoApprove`; `"disabled": true` leaves a server off. A server that stops or cannot start is started again: one run here once, one reached by URL up to five times, 1 s later and doubling each time; then `/mcp reconnect <name>` starts it again. A server that says its tools changed is asked for them again. After editing `mcp.json`, `/mcp reload` or Reload in Settings › MCP starts the servers added, stops those removed and starts again those changed, leaving the rest running.
 
 A server that runs elsewhere -- a hosted one, or one on another machine -- is given by its address instead of a command, with any headers it needs, such as a key:
 

@@ -45,13 +45,33 @@ pub(crate) fn mcp_page(chat: &Entity<Chat>, window: &mut Window, cx: &mut App) -
     for server in &servers {
         list = list.child(server_row(chat, server, &trouble, &waiting, window, cx));
     }
+    // After mcp.json is edited by hand: added servers start, removed ones
+    // stop and changed ones start again, the rest untouched.
+    let reload = {
+        let (chat, trouble, waiting) = (chat.clone(), trouble.clone(), waiting.clone());
+        Button::new("mcp-reload")
+            .framed(cx)
+            .xsmall()
+            .label("Reload")
+            .on_click(move |_, _, cx| {
+                let done = letronna_core::mcp::reload().map(drop);
+                acted(done, &chat, &trouble, &waiting, cx);
+            })
+    };
     v_flex()
         .gap_4()
-        .child(super::settings::heading(
-            "MCP servers",
-            "Servers listed in mcp.json. Their tools join Letronna's own; what they print stays here.",
-            cx,
-        ))
+        .child(
+            h_flex()
+                .items_start()
+                .justify_between()
+                .gap_3()
+                .child(super::settings::heading(
+                    "MCP servers",
+                    "Servers listed in mcp.json. Their tools join Letronna's own; what they print stays here.",
+                    cx,
+                ).flex_1().min_w_0())
+                .child(reload),
+        )
         .children(problem.map(|problem| {
             div()
                 .text_sm()
