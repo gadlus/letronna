@@ -128,7 +128,9 @@ fn fetch(raw: &str, secrets: &[String]) -> Result<String, String> {
         .collect();
     // Redirects are followed here rather than by a policy on the client,
     // which could not see this fetch's keys without a client of its own.
-    // The deadline covers every hop and the page, as the client's did.
+    // A request's own timeout is a deadline for its whole reply, where the
+    // client's bounds only each wait on it, so a page trickled out a byte at
+    // a time still ends when the deadline for every hop and the page does.
     let client = client()?;
     let deadline = Instant::now() + FETCH_TIME;
     let mut url = url;
