@@ -349,7 +349,7 @@ fn bot_check(title: &str) -> bool {
 }
 
 /// The address to open, or why not. A bare `example.com` gets https.
-fn address(raw: &str, secrets: &[String]) -> Result<String, String> {
+pub(crate) fn address(raw: &str, secrets: &[String]) -> Result<String, String> {
     let raw = raw.trim();
     if raw.is_empty() {
         return Err("`url` is required for open.".into());
@@ -421,7 +421,7 @@ fn percent_decoded(text: &str) -> String {
 }
 
 /// The user's own keys and tokens: what no address may carry out.
-fn secrets() -> Vec<String> {
+pub(crate) fn secrets() -> Vec<String> {
     let mut all: Vec<String> = crate::store::load_keys().into_values().collect();
     all.extend(crate::auth::account().map(|account| account.token));
     let chats = crate::messaging::load();
