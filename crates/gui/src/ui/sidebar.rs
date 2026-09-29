@@ -35,6 +35,11 @@ impl Chat {
             .when_some(page, |this, page| {
                 this.on_click(cx.listener(move |this, _, _, cx| {
                     this.page = page;
+                    // The terminal or the session's project may have brought
+                    // skills since the list was read.
+                    if page == Page::Skills {
+                        this.reload_skills();
+                    }
                     cx.notify();
                 }))
             })
