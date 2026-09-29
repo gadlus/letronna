@@ -1425,7 +1425,12 @@ fn take_back(
     }
     // After the redraw, so a failure to save is not cleared off the screen.
     runner.persist();
-    Some(letronna_core::init::typed(&prompt).map_or(prompt, str::to_owned))
+    let prompt = letronna_core::references::typed(&prompt);
+    Some(
+        letronna_core::init::typed(prompt)
+            .unwrap_or(prompt)
+            .to_owned(),
+    )
 }
 
 /// Attach the picture at `raw` to the next message, saved as the window

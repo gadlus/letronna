@@ -26,11 +26,12 @@ pub fn replay(runner: &Runner, session: usize) {
         match message.role.as_str() {
             "user" if message.notice => render::notice(&message.content),
             "user" => {
-                // `/init` shows as typed; a chat app's message can quote someone
-                // else's, fenced.
-                let text = match letronna_core::init::typed(&message.content) {
+                // `/init` and `@` references show as typed; a chat app's
+                // message can quote someone else's, fenced.
+                let content = letronna_core::references::typed(&message.content);
+                let text = match letronna_core::init::typed(content) {
                     Some(typed) => typed.to_owned(),
-                    None => letronna_core::untrusted::shown("", &message.content).0,
+                    None => letronna_core::untrusted::shown("", content).0,
                 };
                 said_over_lines(&render::blue("›"), &text, true)
             }

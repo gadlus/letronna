@@ -924,6 +924,7 @@ impl Chat {
         remote: Option<letronna_core::chat::Remote>,
         cx: &mut Context<Self>,
     ) -> std::result::Result<(), ()> {
+        let from_chat_app = remote.is_some();
         let connection = match self.connection_for(self.store.active, remote) {
             Ok(connection) => connection,
             Err(error) => {
@@ -948,9 +949,16 @@ impl Chat {
         conversation
             .messages
             .extend(inbox::fold(&inbox::take(conversation.id, true)));
+        // Only what the user typed here: a chat app's message is someone
+        // else's, and must not read the user's files by naming them.
+        let content = if from_chat_app {
+            prompt
+        } else {
+            letronna_core::references::expand(&prompt, conversation.workspace.as_deref())
+        };
         conversation.messages.push(Message {
             role: "user".into(),
-            content: prompt,
+            content,
             images,
             ..Default::default()
         });

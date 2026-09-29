@@ -56,14 +56,16 @@ impl Chat {
     }
 
     /// The text of your message at `at`, if that is what is there, with
-    /// `/init` as it was typed rather than its prompt.
+    /// `/init` and `@` references as they were typed.
     fn prompt_text(&self, at: usize) -> Option<String> {
         self.open_messages()
             .get(at)
             .filter(|m| m.role == "user" && !m.notice)
             .map(|m| {
-                letronna_core::init::typed(&m.content)
-                    .map_or_else(|| m.content.clone(), str::to_owned)
+                let typed = letronna_core::references::typed(&m.content);
+                letronna_core::init::typed(typed)
+                    .unwrap_or(typed)
+                    .to_owned()
             })
     }
 

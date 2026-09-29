@@ -277,9 +277,16 @@ impl Chat {
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(Ok(Some(paths))) = receiver.await {
                 let _ = this.update_in(cx, |this, window, cx| {
+                    // As references, which sending expands into the message
+                    // the way a typed `@path` is.
+                    let workspace = this.store.conversations[this.store.active]
+                        .workspace
+                        .clone();
                     let mut text = String::new();
                     for path in paths {
-                        text.push_str(&format!("[attached: {}]\n", path.display()));
+                        let named =
+                            letronna_core::references::reference(&path, workspace.as_deref());
+                        text.push_str(&format!("{named} "));
                     }
                     this.insert(&text, window, cx);
                 });

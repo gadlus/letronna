@@ -95,9 +95,11 @@ impl Runner {
         // What came meanwhile goes in ahead of the prompt, so the user's
         // words are the last thing the model reads.
         self.take_notices(session, true);
+        let workspace = self.store.conversations[session].workspace.as_deref();
+        let content = letronna_core::references::expand(prompt, workspace);
         self.store.conversations[session].messages.push(Message {
             role: "user".into(),
-            content: prompt.to_owned(),
+            content,
             images: std::mem::take(&mut self.images),
             ..Default::default()
         });
@@ -284,11 +286,13 @@ impl Runner {
             // it into the conversation as it is taken.
             let typed = self.bar.take_typed();
             if !typed.is_empty() {
-                self.store.conversations[session]
+                let conversation = &mut self.store.conversations[session];
+                let workspace = conversation.workspace.clone();
+                conversation
                     .messages
-                    .extend(typed.into_iter().map(|content| Message {
+                    .extend(typed.into_iter().map(|typed| Message {
                         role: "user".into(),
-                        content,
+                        content: letronna_core::references::expand(&typed, workspace.as_deref()),
                         folded: true,
                         ..Default::default()
                     }));
