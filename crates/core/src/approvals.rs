@@ -5,10 +5,14 @@
 //! answers: from the session's own rules where they already allow the call,
 //! otherwise by asking the person. Core keeps no rules of its own except
 //! `ForRun`, remembered per run and tool, so a run of many helpers asks once
-//! per tool rather than once per helper. That has to hold when helpers ask at
-//! the same moment too, so a run has one request out per tool at a time: the
-//! others wait for its answer, and ask for themselves only if it was not
-//! `ForRun`.
+//! per tool rather than once per helper -- but only for a later call that
+//! itself still clears the floor and the project's own rules, checked fresh
+//! by `gate::cleared`, so a card answered for one mild call cannot wave
+//! through a different, worse one of the same tool later in the run. That
+//! has to hold when helpers ask at the same moment too, so a run has one
+//! request out per tool at a time: the others wait for its answer, and ask
+//! for themselves only if it was not `ForRun`, or if it was but their own
+//! call does not clear.
 //!
 //! Each request carries its own reply channel, so an answer can only reach
 //! the call it was given for: there is no id to match up, or to forge. And
@@ -137,7 +141,14 @@ pub(crate) fn ask(
             return Err(String::new());
         }
         if asks.granted.contains(&key) {
-            return Ok(());
+            drop(asks);
+            // The grant answers for this tool from whichever call first
+            // asked about it, so it covers this one too only once this
+            // one clears the floor and any rule on its own.
+            if crate::gate::cleared(call, ctx) {
+                return Ok(());
+            }
+            asks = lock(&ASKS);
         }
         if asks.asking.insert(key.clone()) {
             break;
@@ -194,6 +205,15 @@ pub(crate) mod tests {
             name: name.into(),
             arguments: format!(r#"{{"content": "{id}", "command": "{id}"}}"#),
         }
+    }
+
+    /// An empty folder for one test, which the next run of it replaces.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("letronna-approvals-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     /// Asks on a thread of its own, as an agent would, and hands back the answer.
@@ -277,6 +297,64 @@ pub(crate) mod tests {
         assert_eq!(request.call.name, "write_file");
         request.answer(Decision::Deny(String::new()));
         assert_eq!(other_tool.recv_timeout(WAIT), Ok(false));
+    }
+
+    #[test]
+    fn a_grant_does_not_cover_a_later_call_the_floor_refuses() {
+        let _turn = lock(&SERVING);
+        let requests = serve();
+        let ctx = ToolContext::default();
+        let first = asking(1909, call("a", "run_command"), ctx.clone());
+        let request = requests.recv_timeout(WAIT).unwrap();
+        request.answer(Decision::ForRun);
+        assert_eq!(first.recv_timeout(WAIT), Ok(true));
+
+        // A harmless repeat still runs without asking again.
+        let again = asking(1909, call("b", "run_command"), ctx.clone());
+        assert_eq!(again.recv_timeout(WAIT), Ok(true));
+        assert!(
+            requests.try_recv().is_err(),
+            "a harmless repeat asked again"
+        );
+
+        // One the floor would refuse on its own still asks, even though its
+        // tool was granted for the run.
+        let hardline = ToolCall {
+            id: "c".into(),
+            name: "run_command".into(),
+            arguments: r#"{"command": "Remove-Item -Recurse -Force ~"}"#.into(),
+        };
+        let worse = asking(1909, hardline, ctx);
+        let request = requests.recv_timeout(WAIT).unwrap();
+        assert_eq!(request.call.id, "c");
+        request.answer(Decision::Deny(String::new()));
+        assert_eq!(worse.recv_timeout(WAIT), Ok(false));
+    }
+
+    #[test]
+    fn a_grant_does_not_cover_a_later_call_the_projects_rule_denies() {
+        let _turn = lock(&SERVING);
+        let requests = serve();
+        let bare = ToolContext::default();
+        let first = asking(1910, call("a", "run_command"), bare.clone());
+        let request = requests.recv_timeout(WAIT).unwrap();
+        request.answer(Decision::ForRun);
+        assert_eq!(first.recv_timeout(WAIT), Ok(true));
+
+        let project = scratch("denies-run-command");
+        std::fs::create_dir_all(project.join(".letronna")).unwrap();
+        std::fs::write(
+            project.join(".letronna/permissions.json"),
+            r#"[{"tool": "run_command", "effect": "deny"}]"#,
+        )
+        .unwrap();
+        let mut ctx = bare;
+        ctx.workspace = Some(project);
+        let denied = asking(1910, call("b", "run_command"), ctx);
+        let request = requests.recv_timeout(WAIT).unwrap();
+        assert_eq!(request.call.id, "b");
+        request.answer(Decision::Deny(String::new()));
+        assert_eq!(denied.recv_timeout(WAIT), Ok(false));
     }
 
     #[test]

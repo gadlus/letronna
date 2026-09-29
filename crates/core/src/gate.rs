@@ -425,6 +425,27 @@ fn ladder(call: &ToolCall, gate: &Gate, judge: Option<&dyn Fn(&str) -> Verdict>)
     ))
 }
 
+/// Whether `call` still clears the floor and the project's own deny or ask
+/// rules, checked fresh against this call's own arguments: a `ForRun` grant
+/// answers for its tool from whichever call in the run first asked about
+/// it, so a later call of the same tool must clear them on its own rather
+/// than ride on the first one's. The user's own rules stay the frontend's
+/// to hold, so a call only they would stop still reaches its card as
+/// before.
+pub(crate) fn cleared(call: &ToolCall, ctx: &ToolContext) -> bool {
+    let Some(tool) = tools::find(&call.name) else {
+        return false;
+    };
+    let Ok(args) = tools::parse_args(&call.arguments) else {
+        return false;
+    };
+    if matches!(risk(tool.name(), &args, ctx), Some(Risk::Hardline(_))) {
+        return false;
+    }
+    let ruling = permissions::check(&[], tool.as_ref(), &args, ctx);
+    ruling.deny.is_none() && ruling.ask.is_none() && ruling.broken.is_none()
+}
+
 /// Whether the tool named `name` spends the user's credit, which is theirs
 /// to decide rather than a question of safety for the judge.
 fn spends(name: &str) -> bool {
@@ -1563,6 +1584,28 @@ mod tests {
                 assert_eq!(decide(&listing, &gate), Outcome::Run);
             }
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cleared_refuses_what_the_floor_or_the_projects_own_rule_would() {
+        let ctx = ToolContext::default();
+        assert!(cleared(&command("ls"), &ctx));
+        assert!(!cleared(&command(HARDLINE), &ctx));
+
+        let dir =
+            std::env::temp_dir().join(format!("letronna-gate-cleared-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".letronna")).unwrap();
+        std::fs::write(
+            dir.join(".letronna/permissions.json"),
+            r#"[{"tool": "run_command", "effect": "deny"}]"#,
+        )
+        .unwrap();
+        let project = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        assert!(!cleared(&command("ls"), &project));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
