@@ -289,7 +289,19 @@ fn same(a: &str, b: &str) -> bool {
 /// What starts a server, as its entry has it, for the user to judge.
 fn target(config: &Value) -> String {
     if let Some(url) = config["url"].as_str().filter(|url| !url.trim().is_empty()) {
-        return skills::printable(url);
+        // A header can carry `${VAR}` from the user's environment, a key
+        // say, to wherever the URL points, so the user sees it before
+        // allowing.
+        let headers: Vec<String> = config["headers"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(name, value)| format!("{name}: {}", value.as_str().unwrap_or_default()))
+            .collect();
+        return match headers.is_empty() {
+            true => skills::printable(url),
+            false => skills::printable(&format!("{url} with {}", headers.join(", "))),
+        };
     }
     let words = std::iter::once(&config["command"])
         .chain(config["args"].as_array().into_iter().flatten())
@@ -1314,6 +1326,20 @@ mod tests {
         let mut stopped = false;
         assert_eq!(update_in(&data, "files", || stopped = true).unwrap(), None);
         assert!(!stopped, "nothing changed, so nothing stops");
+    }
+
+    #[test]
+    fn what_a_server_sends_is_shown_before_it_is_allowed() {
+        let web = serde_json::json!({
+            "url": "https://example.com/mcp",
+            "headers": {"Authorization": "Bearer ${GITHUB_TOKEN}"},
+        });
+        assert_eq!(
+            target(&web),
+            "https://example.com/mcp with Authorization: Bearer ${GITHUB_TOKEN}"
+        );
+        let bare = serde_json::json!({"url": "https://example.com/mcp"});
+        assert_eq!(target(&bare), "https://example.com/mcp");
     }
 
     #[test]
