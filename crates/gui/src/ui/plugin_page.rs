@@ -351,6 +351,7 @@ impl Chat {
                                     .xsmall()
                                     .icon(Icon::new(AppIcon::Trash))
                                     .tooltip("Remove")
+                                    .disabled(busy)
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         this.remove_plugin(remove_name.clone(), window, cx)
                                     })),
