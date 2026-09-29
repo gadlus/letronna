@@ -368,7 +368,8 @@ pub fn offers_plan(connection: &Connection) -> bool {
 }
 
 /// The `tools` array for a chat completion request. In plan mode the tools
-/// that change things are left out entirely, so the model cannot try them;
+/// that change things are left out entirely, so the model cannot try them,
+/// but for `run_command`, which the gate lets run a command that only reads;
 /// where other people read the replies, so is everything that touches this
 /// computer; `read_chat` exists only where there is a chat to read, and
 /// `exit_plan` only where there is a plan to hand over and someone to take it.
@@ -380,7 +381,7 @@ pub fn specs(connection: &Connection) -> Vec<Value> {
         .is_some_and(|r| r.history.is_some());
     all()
         .iter()
-        .filter(|t| !connection.plan || !t.mutates())
+        .filter(|t| !connection.plan || !t.mutates() || t.name() == "run_command")
         .filter(|t| t.name() != EXIT_PLAN || offers_plan(connection))
         .filter(|t| !shared || !t.machine())
         .filter(|t| history || !t.needs_history())
@@ -729,6 +730,12 @@ pub fn shell(command: &str, cwd: Option<&Path>) -> std::process::Command {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    // A line that only reads runs without asking, so a repository cannot be
+    // left to pick a program for its `git status` to run.
+    let risk = crate::command::assess(command, crate::command::Dialect::here(), cwd).risk;
+    if risk == crate::command::Risk::ReadOnly {
+        cmd.envs(crate::command::GUARDS.iter().copied());
     }
     cmd
 }
@@ -3146,5 +3153,30 @@ mod tests {
             assert!(refused.contains("own folder"), "{refused}");
         }
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn only_a_command_that_only_reads_runs_with_the_git_guards() {
+        let dir = std::env::temp_dir().join(format!("letronna-guards-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        use std::ffi::OsStr;
+        // How many of the guards the line runs with, each with its value.
+        let guards = |line: &str| {
+            let cmd = shell(line, Some(&dir));
+            let set: Vec<_> = cmd.get_envs().collect();
+            crate::command::GUARDS
+                .iter()
+                .filter(|(key, value)| set.contains(&(OsStr::new(key), Some(OsStr::new(value)))))
+                .count()
+        };
+        let all = crate::command::GUARDS.len();
+        assert_eq!(guards("git status"), all);
+        // PowerShell has no `head`, so there the pipe is not known to only read.
+        if cfg!(unix) {
+            assert_eq!(guards("git log --oneline | head -n 3"), all);
+        }
+        assert_eq!(guards("git commit -m wip"), 0);
+        assert_eq!(guards("git status > status.txt"), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

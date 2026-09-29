@@ -529,7 +529,7 @@ impl Chat {
                     .tooltip(if self.plan_mode {
                         "Plan mode on: reads and asks only. Click to let it act."
                     } else {
-                        "Plan mode off. Click to stop it writing or running anything."
+                        "Plan mode off. Click to keep it to reading and read-only commands."
                     })
                     .selected(self.plan_mode)
                     .text_color(if self.plan_mode {

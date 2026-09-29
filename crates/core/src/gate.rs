@@ -114,14 +114,14 @@ fn decide_with(call: &ToolCall, gate: &Gate, judge: Option<&dyn Fn(&str) -> Verd
         Ok(args) => args,
         Err(error) => return Outcome::Refuse(error),
     };
+    let risk = risk(tool.name(), &args, gate.ctx);
     // Layer 0: what this session cannot reach at all.
-    if let Some(why) = unavailable(tool.as_ref(), gate.ctx) {
+    if let Some(why) = unavailable(tool.as_ref(), risk, gate.ctx) {
         return Outcome::Refuse(why);
     }
     // Layer 1, the floor. It comes before every setting and grant: a command
     // that is hard to take back needs a person's yes even when approvals are
     // skipped or the tool is allowed.
-    let risk = risk(tool.name(), &args, gate.ctx);
     match risk {
         Some(Risk::Hardline(why)) => return Outcome::Refuse(never(why)),
         Some(Risk::Dangerous(why)) => return dangerous(why, gate),
@@ -155,8 +155,12 @@ fn decide_with(call: &ToolCall, gate: &Gate, judge: Option<&dyn Fn(&str) -> Verd
     if !opaque && granted.is_some_and(|tools| tools.contains(tool.name())) {
         return Outcome::Run;
     }
-    // Layers 5 (known read-only commands), 6 (edits inside the workspace)
-    // and the judge go here, in that order.
+    // Layer 5: a command that only reads, inside the workspace, needs no
+    // more of a yes than `read_file` does.
+    if risk == Some(Risk::ReadOnly) {
+        return Outcome::Run;
+    }
+    // Layer 6 (edits inside the workspace) goes here, then the judge.
     if let Some(judge) = judge
         && !spends(tool.name())
     {
@@ -203,17 +207,19 @@ fn ruling(tool: &str, verdict: Verdict, human: bool) -> Outcome {
 /// Why `tool` may not run with `args` in `ctx` whoever answers, or `None`.
 pub fn refusal(tool: &dyn Tool, args: &Value, ctx: &ToolContext) -> Option<String> {
     // `tools::run` asks too, for a call that reached it without the gate.
-    if let Some(why) = unavailable(tool, ctx) {
+    let risk = risk(tool.name(), args, ctx);
+    if let Some(why) = unavailable(tool, risk, ctx) {
         return Some(why);
     }
-    match risk(tool.name(), args, ctx) {
+    match risk {
         Some(Risk::Hardline(why)) => Some(never(why)),
         _ => None,
     }
 }
 
-/// Why the session cannot reach `tool` at all, or `None`.
-fn unavailable(tool: &dyn Tool, ctx: &ToolContext) -> Option<String> {
+/// Why the session cannot reach `tool` at all, or `None`; `risk` is what
+/// its command would do, for `run_command`.
+fn unavailable(tool: &dyn Tool, risk: Option<Risk>, ctx: &ToolContext) -> Option<String> {
     let name = tool.name();
     // Only fitting tools are offered, but the model can name any of them;
     // refuse here too rather than trust the offer.
@@ -224,6 +230,15 @@ fn unavailable(tool: &dyn Tool, ctx: &ToolContext) -> Option<String> {
         ));
     }
     if ctx.plan && tool.mutates() {
+        // A command that only reads looks rather than acts.
+        if name == "run_command" {
+            return (risk != Some(Risk::ReadOnly)).then(|| {
+                "`run_command` in plan mode only runs commands that just read inside \
+                 the project, such as `ls`, `cat`, `rg` or `git status`, and this one \
+                 could change things. Describe it in the plan instead."
+                    .into()
+            });
+        }
         return Some(format!(
             "`{name}` is not available in plan mode: it changes things, and plan \
              mode can only look and propose. Describe the change instead."
@@ -693,5 +708,91 @@ mod tests {
             panic!("a fetch nobody can approve was not refused");
         };
         assert!(!why.contains("auto mode"), "{why}");
+    }
+
+    /// A session working in a project folder, where a read needs no yes.
+    fn project(plan: bool) -> ToolContext {
+        ToolContext {
+            workspace: Some(std::env::temp_dir().join("letronna-gate-project")),
+            plan,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_command_that_only_reads_runs_without_asking_in_every_mode() {
+        let none = Grants::new();
+        for (plan, skip_approvals, human) in [
+            (false, false, true),
+            (false, false, false),
+            (false, true, false),
+            (true, false, true),
+            (true, true, false),
+        ] {
+            let ctx = project(plan);
+            let gate = Gate {
+                ctx: &ctx,
+                skip_approvals,
+                grants: &none,
+                human,
+            };
+            for line in ["git status", "ls; cat notes.txt | wc -l"] {
+                assert_eq!(
+                    decide(&command(line), &gate),
+                    Outcome::Run,
+                    "{line:?} with plan {plan}, skip {skip_approvals}, human {human}"
+                );
+            }
+        }
+        // A read written to a file is a write, and still asks.
+        let ctx = project(false);
+        let gate = Gate {
+            ctx: &ctx,
+            skip_approvals: false,
+            grants: &none,
+            human: true,
+        };
+        assert_eq!(
+            decide(&command("cat notes.txt > copy.txt"), &gate),
+            Outcome::Ask
+        );
+        // Searching the web sends the query out, so it still asks.
+        assert!(crate::search::SearchWeb.needs_approval());
+    }
+
+    #[test]
+    fn a_read_does_not_carry_a_hardline_or_dangerous_command_with_it() {
+        let ctx = project(false);
+        let none = Grants::new();
+        let gate = Gate {
+            ctx: &ctx,
+            skip_approvals: false,
+            grants: &none,
+            human: true,
+        };
+        let hardline = decide(&command(&format!("ls; {HARDLINE}")), &gate);
+        assert!(matches!(hardline, Outcome::Refuse(_)), "{hardline:?}");
+        assert_eq!(
+            decide(&command(&format!("ls; {DANGEROUS}")), &gate),
+            Outcome::Ask
+        );
+    }
+
+    #[test]
+    fn plan_mode_refuses_a_command_that_could_change_things() {
+        let ctx = project(true);
+        let none = Grants::new();
+        let gate = Gate {
+            ctx: &ctx,
+            skip_approvals: true,
+            grants: &none,
+            human: true,
+        };
+        for line in ["cargo test", "cat notes.txt > copy.txt", OPAQUE] {
+            let Outcome::Refuse(why) = decide(&command(line), &gate) else {
+                panic!("plan mode ran {line:?}");
+            };
+            assert!(why.contains("plan mode"), "{why}");
+        }
     }
 }
