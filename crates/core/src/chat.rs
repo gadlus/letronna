@@ -4804,6 +4804,14 @@ mod tests {
         // So is one with nothing in it at all.
         let events = reply_of("text/event-stream", "data: [DONE]\n\n");
         assert!(matches!(events[..], [Event::Finished(Ok(()))]));
+        // And one whose only text is an inline block.
+        let events = reply_of(
+            "text/event-stream",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"<think>Hmm.</think>\\n\"},\"finish_reason\":\"stop\"}]}\n\n\
+             data: [DONE]\n\n",
+        );
+        assert!(matches!(&events[0], Event::Reasoning(s) if s == "Hmm."));
+        assert!(matches!(events[1], Event::Finished(Ok(()))));
     }
 
     #[test]
