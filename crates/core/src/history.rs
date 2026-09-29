@@ -257,6 +257,24 @@ pub fn ran_commands(dropped: &[Message]) -> bool {
         .any(|m| m.role == "tool" && m.name == "run_command")
 }
 
+/// The files the tools wrote in `messages` that are inside `workspace`, each
+/// once, relative to it and in the order first written: what a session
+/// changed, for git to be asked about. One outside is not the project's.
+pub fn written(messages: &[Message], workspace: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    let changes = messages
+        .iter()
+        .filter(|m| m.role == "tool")
+        .flat_map(|m| &m.files);
+    for change in changes {
+        let file = PathBuf::from(label(&change.path, Some(workspace)));
+        if file.is_relative() && !files.contains(&file) {
+            files.push(file);
+        }
+    }
+    files
+}
+
 /// One file a rewind would touch.
 #[derive(Clone, Debug)]
 pub struct Restore {
@@ -946,5 +964,36 @@ mod tests {
         assert!(!stale.exists());
         assert!(!root.join("2").exists());
         assert!(root.join("notes").exists());
+    }
+
+    #[test]
+    fn a_session_s_files_are_listed_once_and_only_inside_the_project() {
+        let (project, kept) = scratch("written");
+        let ctx = context(&project, &kept);
+        let one = call(
+            &ctx,
+            "write_file",
+            serde_json::json!({"path": "a.txt", "content": "1"}),
+        );
+        let two = call(
+            &ctx,
+            "write_file",
+            serde_json::json!({"path": "b.txt", "content": "2"}),
+        );
+        let again = call(
+            &ctx,
+            "write_file",
+            serde_json::json!({"path": "a.txt", "content": "3"}),
+        );
+        let outside = Message {
+            role: "tool".into(),
+            files: vec![FileChange {
+                path: std::env::temp_dir().join("elsewhere.txt"),
+                ..FileChange::default()
+            }],
+            ..Default::default()
+        };
+        let files = written(&[one, two, again, outside], &project);
+        assert_eq!(files, vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")]);
     }
 }

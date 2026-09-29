@@ -183,6 +183,10 @@ pub fn command(
             resume(runner, session, workspace, rest);
             Flow::Handled
         }
+        "/diff" => {
+            working_diff(runner, *session, workspace, rest);
+            Flow::Handled
+        }
         "/undo" => {
             match with_files(rest) {
                 Some(files) => undo(runner, *session, workspace, files),
@@ -1316,6 +1320,63 @@ fn pick_up(
     if let Err(error) = runner.resume(index) {
         render::blank();
         render::line(&render::red(&error));
+    }
+}
+
+/// What changed in the project since its last commit, or with `session`
+/// only in the files this session's tools wrote: git's summary, then the
+/// patch in colour.
+fn working_diff(
+    runner: &mut Runner,
+    session: usize,
+    workspace: Option<&std::path::Path>,
+    rest: &str,
+) {
+    render::blank();
+    let conversation = &runner.store.conversations[session];
+    let Some(folder) = conversation
+        .workspace
+        .clone()
+        .or_else(|| workspace.map(Into::into))
+    else {
+        render::line(&render::dim("No project folder, so nothing to compare."));
+        return;
+    };
+    let only = match rest {
+        "" => None,
+        "session" => Some(history::written(&conversation.messages, &folder)),
+        _ => {
+            render::line(&render::red(
+                "Usage: /diff, or /diff session for only the files this session changed.",
+            ));
+            return;
+        }
+    };
+    if only.as_ref().is_some_and(Vec::is_empty) {
+        render::line(&render::dim("This session has not changed any files here."));
+        return;
+    }
+    let diff = runner.bar.busy("reading the changes", move || {
+        letronna_core::git::working_diff(&folder, only.as_deref())
+    });
+    let diff = match diff {
+        Ok(diff) if diff.is_empty() => {
+            render::line(&render::dim("Nothing has changed since the last commit."));
+            return;
+        }
+        Ok(diff) => diff,
+        Err(why) => {
+            render::line(&render::dim(&why));
+            return;
+        }
+    };
+    let width = render::width().saturating_sub(render::PAD.len()).max(20);
+    for line in diff.stat.lines() {
+        render::line(&render::clip(line, width));
+    }
+    render::blank();
+    for line in diff.patch.lines() {
+        render::line(&crate::diff::patch_line(line, width));
     }
 }
 

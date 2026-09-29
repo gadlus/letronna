@@ -1,6 +1,6 @@
 //! The panel on the right of the chat: what goes on beside the
-//! conversation, a tab each -- the browser now; the helpers' activity, the
-//! files, the changes and the jobs join it later.
+//! conversation, a tab each -- the browser and the session's changes now;
+//! the helpers' activity, the files and the jobs join it later.
 //!
 //! It is one fixed panel, not a layout of docks: there are no zones to
 //! drag tabs into and nothing to arrange or break. A tab shows only while
@@ -43,15 +43,17 @@ const FLOAT_CLEAR: Pixels = px(240.);
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PanelTab {
     Browser,
+    Changes,
 }
 
 impl PanelTab {
     /// Every tab, in the order the bar shows them.
-    const ALL: [PanelTab; 1] = [PanelTab::Browser];
+    const ALL: [PanelTab; 2] = [PanelTab::Browser, PanelTab::Changes];
 
     fn label(self) -> &'static str {
         match self {
             PanelTab::Browser => "Browser",
+            PanelTab::Changes => "Changes",
         }
     }
 }
@@ -148,12 +150,14 @@ impl Chat {
                 let browser = self.browser.read(cx);
                 browser.has_content(docked).then(|| browser.waiting())
             }
+            PanelTab::Changes => self.has_changes().then_some(0),
         }
     }
 
-    fn tab_body(&self, tab: PanelTab) -> AnyElement {
+    fn tab_body(&self, tab: PanelTab, cx: &mut Context<Self>) -> AnyElement {
         match tab {
             PanelTab::Browser => self.browser.clone().into_any_element(),
+            PanelTab::Changes => self.changes_tab(cx),
         }
     }
 
@@ -289,7 +293,7 @@ impl Chat {
             .bg(cx.theme().background)
             .border_color(cx.theme().border)
             .child(bar)
-            .child(self.tab_body(open));
+            .child(self.tab_body(open, cx));
         Some(match width {
             Some(width) => panel
                 .relative()
@@ -368,7 +372,14 @@ mod tests {
     #[test]
     fn a_tab_shows_only_with_something_to_show_and_counts_what_waits() {
         assert!(shown_tabs(|_| None).is_empty());
-        assert_eq!(shown_tabs(|_| Some(1)), vec![(PanelTab::Browser, 1)]);
+        assert_eq!(
+            shown_tabs(|tab| (tab == PanelTab::Browser).then_some(1)),
+            vec![(PanelTab::Browser, 1)]
+        );
+        assert_eq!(
+            shown_tabs(|_| Some(0)),
+            vec![(PanelTab::Browser, 0), (PanelTab::Changes, 0)]
+        );
         assert_eq!(title(PanelTab::Browser, 0), "Browser");
         assert_eq!(title(PanelTab::Browser, 1), "Browser 1");
     }

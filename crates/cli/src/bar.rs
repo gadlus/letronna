@@ -108,6 +108,10 @@ pub const COMMANDS: &[Command] = &[
         blurb: "pick up a session; a word finds it by title or what was said",
     },
     Command {
+        name: "/diff",
+        blurb: "what changed in the project; /diff session for this session's files",
+    },
+    Command {
         name: "/undo",
         blurb: "take back the last exchange; --files puts files back too",
     },

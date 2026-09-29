@@ -316,6 +316,8 @@ pub(crate) struct Chat {
     pub(crate) video_frame: Option<std::sync::Arc<RenderImage>>,
     /// The right panel's state: shown or hidden, its width and its tabs.
     pub(crate) panel: crate::ui::panel::Panel,
+    /// The file open in the panel's Changes tab.
+    pub(crate) changes: crate::ui::changes::Changes,
     /// The browser the agent uses, shown beside the chat while it does, and
     /// the session whose browser it shows: each session has its own.
     pub(crate) browser: Entity<crate::ui::browser::BrowserView>,
@@ -668,6 +670,7 @@ impl Chat {
             video: None,
             video_frame: None,
             panel: Default::default(),
+            changes: Default::default(),
             browser: cx.new(|cx| crate::ui::browser::BrowserView::new(window, cx)),
             browser_for: 0,
             drafts: std::collections::HashMap::new(),
