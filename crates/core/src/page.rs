@@ -342,6 +342,9 @@ pub(crate) struct Line {
     /// runs across a link can still be found.
     plain: Option<String>,
     nodes: Vec<i64>,
+    /// The header of the innermost frame it is in, if any: shown above it
+    /// where it is shown without the lines before it.
+    header: Option<Arc<str>>,
 }
 
 /// Words being gathered into one line.
@@ -588,6 +591,7 @@ impl Walk<'_> {
             text: format!("{}- \"{said}\" [e{number}]", pad(indent)),
             plain: run.links.then_some(plain),
             nodes: run.nodes,
+            header: None,
         });
     }
 
@@ -614,6 +618,7 @@ impl Walk<'_> {
                     text: format!("{}- {label} (its frame is not listed)", pad(indent)),
                     plain: None,
                     nodes: node.backend.into_iter().collect(),
+                    header: None,
                 });
             }
             return;
@@ -631,6 +636,7 @@ impl Walk<'_> {
             text: format!("{}- {label} [e{number}]{}", pad(indent), states(node)),
             plain: None,
             nodes: vec![backend],
+            header: None,
         });
         let whole =
             SEALED.contains(&role) || (LABELLED.contains(&role) && !self.usable_inside(at, depth));
@@ -691,22 +697,23 @@ fn shown(node: &Node) -> bool {
 pub(crate) fn framed(frame: &Frame, lines: Vec<Line>) -> Vec<Line> {
     let apart = frame.session.is_some();
     let more = lines.len().saturating_sub(FRAME_LINES);
-    let bare = |text: String| Line {
+    let header: Arc<str> = frame.header().into();
+    let bare = |text: String, header: Option<Arc<str>>| Line {
         text,
         plain: None,
         nodes: Vec::new(),
+        header,
     };
-    let mut out = vec![bare(frame.header())];
+    let mut out = vec![bare(header.to_string(), None)];
     out.extend(lines.into_iter().take(FRAME_LINES).map(|line| Line {
         text: format!("{}{}", pad(1), line.text),
         plain: line.plain,
         nodes: if apart { Vec::new() } else { line.nodes },
+        header: line.header.or_else(|| Some(header.clone())),
     }));
     if more > 0 {
-        out.push(bare(format!(
-            "{}({more} more lines of this frame are not listed)",
-            pad(1)
-        )));
+        let note = format!("{}({more} more lines of this frame are not listed)", pad(1));
+        out.push(bare(note, Some(header)));
     }
     out
 }
@@ -779,6 +786,11 @@ pub(crate) fn cut(text: &str, max: usize) -> String {
 pub(crate) fn window(lines: &[Line], start: usize) -> (String, Option<String>) {
     let start = start.min(lines.len().saturating_sub(1));
     let mut shown = String::new();
+    // Lines from inside a frame read as the page's without its header.
+    if let Some(header) = lines.get(start).and_then(|line| line.header.as_deref()) {
+        shown.push_str(header);
+        shown.push('\n');
+    }
     let mut end = start;
     for line in &lines[start..] {
         if !shown.is_empty() && shown.len() + line.text.len() + 1 > PAGE_CHARS {
@@ -817,18 +829,38 @@ pub(crate) fn matching(lines: &[Line], phrase: &str) -> (String, String) {
         .collect();
     let mut shown = String::new();
     let mut next = 0;
+    // The header of the frame the lines last shown are in: a frame's lines
+    // are shown under it, indented, so none reads as the page's.
+    let mut under = None;
     'found: for at in &found {
         if *at > next && !shown.is_empty() {
             shown.push_str("…\n");
+            under = None;
         }
         let end = (at + 1 + AFTER_MATCH).min(lines.len());
-        for line in &lines[next.max(*at)..end] {
-            let line = line.text.trim_start();
-            if shown.len() + line.len() + 1 > PAGE_CHARS {
+        for (index, line) in lines.iter().enumerate().take(end).skip(next.max(*at)) {
+            let header = line.header.as_deref();
+            let head = header
+                .filter(|_| header != under)
+                .map(|header| format!("{header}\n"));
+            let text = match header {
+                Some(_) => format!("{}{}\n", pad(1), line.text.trim_start()),
+                None => format!("{}\n", line.text.trim_start()),
+            };
+            let head = head.unwrap_or_default();
+            if shown.len() + head.len() + text.len() > PAGE_CHARS {
                 break 'found;
             }
-            shown.push_str(line);
-            shown.push('\n');
+            shown.push_str(&head);
+            shown.push_str(&text);
+            // A frame's own header line heads the lines after it.
+            let heads = lines
+                .get(index + 1)
+                .and_then(|after| after.header.as_deref());
+            under = match heads {
+                Some(heads) if heads == line.text.trim_start() => Some(heads),
+                _ => header,
+            };
         }
         next = end;
     }
@@ -1086,6 +1118,7 @@ mod tests {
                 text: format!("- button \"{n}\" [e{n}]"),
                 plain: None,
                 nodes: vec![n],
+                header: None,
             })
         };
         let near = framed(&frame(false, None), lines().collect());
@@ -1129,6 +1162,7 @@ mod tests {
                 text: format!("- link \"Result {n}\" [e{n}]"),
                 plain: None,
                 nodes: vec![n],
+                header: None,
             })
             .collect();
         let (shown, note) = window(&long, 0);
@@ -1234,5 +1268,50 @@ mod tests {
         assert!(same_origin("https://pay.example", "https://pay.example"));
         assert!(!same_origin("https://pay.example", "https://shop.example"));
         assert!(!same_origin(&opaque.origin, &opaque.origin));
+    }
+
+    #[test]
+    fn lines_shown_from_inside_a_frame_or_found_there_come_under_its_header() {
+        let line = |text: &str| Line {
+            text: text.into(),
+            plain: None,
+            nodes: Vec::new(),
+            header: None,
+        };
+        let mut lines = vec![line("- heading \"Shop\" [e1]")];
+        let inner = vec![
+            line("- textbox \"Card number\" [e2]"),
+            line("- button \"Pay 42\" [e3]"),
+        ];
+        lines.extend(framed(&frame(true, Some("S1")), inner));
+        lines.push(line("- link \"Help\" [e4]"));
+        lines.push(line("- link \"Pay later\" [e5]"));
+        let header = "frame https://pay.example (cross-origin)";
+        let (shown, _) = window(&lines, 2);
+        assert!(
+            shown.starts_with(&format!("{header}\n  - textbox")),
+            "{shown}"
+        );
+        let (from_page, _) = window(&lines, 4);
+        assert!(from_page.starts_with("- link \"Help\""), "{from_page}");
+        // Found in the frame, then on the page after it.
+        let (found, _) = matching(&lines, "Pay 42");
+        assert_eq!(
+            found,
+            format!(
+                "{header}\n  - button \"Pay 42\" [e3]\n- link \"Help\" [e4]\n- link \"Pay later\" [e5]\n"
+            )
+        );
+        let (found, _) = matching(&lines, "Card");
+        assert!(
+            found.starts_with(&format!("{header}\n  - textbox")),
+            "{found}"
+        );
+        // Found just above the frame, whose header comes once.
+        let (found, _) = matching(&lines, "Shop");
+        assert_eq!(
+            found,
+            format!("- heading \"Shop\" [e1]\n{header}\n  - textbox \"Card number\" [e2]\n")
+        );
     }
 }
