@@ -232,7 +232,7 @@ pub fn parse_args(args: &str) -> Result<Value, String> {
 }
 
 /// The file tools, which other agents' models all call with a file path.
-const FILE_TOOLS: &[&str] = &["read_file", "write_file", "edit_file"];
+pub(crate) const FILE_TOOLS: &[&str] = &["read_file", "write_file", "edit_file"];
 
 /// Parameter names other agents use, as (theirs, ours, the tools it applies
 /// to), since a model used to one of them reaches for its names first.

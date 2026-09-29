@@ -71,6 +71,9 @@ pub struct Live {
     pub calls: Vec<ToolCall>,
     /// The try about to be made again after a failure, while it waits.
     pub retrying: Option<crate::retry::Retry>,
+    /// Set while the turns the window dropped are summarized, until the
+    /// reply starts.
+    pub compacting: bool,
 }
 
 /// One user turn in flight.
@@ -124,8 +127,10 @@ impl Turn {
 
     /// Fold a streamed event into the reply being built.
     pub fn absorb(&mut self, event: &Event) {
-        // Whatever follows a retry comes from the new try, so it is under way.
+        // Whatever follows a retry comes from the new try, and whatever
+        // follows the summary from the reply, so either is under way.
         self.live.retrying = None;
+        self.live.compacting = false;
         match event {
             Event::Delta(text) => self.live.content.push_str(text),
             Event::Reasoning(text) => self.live.reasoning.push_str(text),
@@ -142,6 +147,7 @@ impl Turn {
             }
             Event::ToolCalls(calls) => self.live.calls = calls.clone(),
             Event::Retrying(retry) => self.live.retrying = Some(*retry),
+            Event::Compacting => self.live.compacting = true,
             Event::CutOff { in_call } => self.cut_off = Some(*in_call),
             Event::Finished(_) => {}
         }

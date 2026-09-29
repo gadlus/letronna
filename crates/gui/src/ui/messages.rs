@@ -130,13 +130,17 @@ impl Chat {
                         .xsmall()
                         .color(cx.theme().primary),
                 )
-                .child(
-                    self.turn
-                        .as_ref()
-                        .and_then(|turn| turn.live.retrying)
-                        .filter(|_| streaming)
-                        .map_or_else(|| "Thinking…".to_owned(), |retry| retry.to_string()),
-                )
+                .child({
+                    let live = self.turn.as_ref().filter(|_| streaming).map(|t| &t.live);
+                    match (
+                        live.and_then(|l| l.retrying),
+                        live.is_some_and(|l| l.compacting),
+                    ) {
+                        (Some(retry), _) => retry.to_string(),
+                        (None, true) => "Compacting…".to_owned(),
+                        (None, false) => "Thinking…".to_owned(),
+                    }
+                })
                 .into_any_element()
         } else {
             TextView::markdown(md, message.content.clone(), window, cx)
