@@ -22,6 +22,8 @@ pub struct ToolContext {
     /// The conversation the call is made in, which keeps a browser of its
     /// own; 0 for none in particular.
     pub conversation: u64,
+    /// Where the file tools note what they write, for a rewind to put back.
+    pub files: crate::history::Log,
 }
 
 impl ToolContext {
@@ -30,6 +32,7 @@ impl ToolContext {
             workspace: connection.workspace.clone(),
             remote: connection.remote.clone(),
             conversation: connection.conversation,
+            files: crate::history::Log::default(),
         }
     }
 
@@ -416,7 +419,7 @@ impl Tool for WriteFile {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        crate::write::atomic(&path, text.as_bytes())?;
+        crate::write::atomic(&path, text.as_bytes(), &ctx.files)?;
         Ok(format!("Wrote {} bytes.", text.len()))
     }
 }
@@ -475,7 +478,7 @@ impl Tool for EditFile {
             return Ok("Already applied; nothing changed.".into());
         }
         crate::write::check_syntax(&path, Some(text.as_bytes()), &done.text)?;
-        crate::write::atomic(&path, done.text.as_bytes())?;
+        crate::write::atomic(&path, done.text.as_bytes(), &ctx.files)?;
         Ok(match (done.replaced, done.already) {
             (1, 0) => "Edited.".into(),
             (n, 0) => format!("Edited {n} places."),

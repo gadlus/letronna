@@ -832,7 +832,7 @@ impl Chat {
         let ctx = self
             .turn
             .as_ref()
-            .map(|turn| letronna_core::tools::ToolContext::of(&turn.connection))
+            .map(agent::Turn::tool_context)
             .unwrap_or_default();
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {

@@ -216,7 +216,7 @@ impl Runner {
     }
 
     fn run_call(&mut self, turn: &mut Turn, call: letronna_core::chat::ToolCall) {
-        let ctx = tools::ToolContext::of(&turn.connection);
+        let ctx = turn.tool_context();
         let summary = tools::summary(&call.name, &call.arguments);
         let outcome = self.run_off_the_loop(&call, ctx, &summary);
         // Every turn of the conversation opens with a blank line, whoever is

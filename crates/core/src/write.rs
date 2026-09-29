@@ -12,7 +12,8 @@
 //! place as before. Every write ends by checking the size on disk. The folder
 //! itself is not synced: a power cut may undo the rename, which still leaves
 //! the old file whole. The file tools write through [`atomic`] and nothing
-//! else, so there is one place to see every change they make.
+//! else, so there is one place to see every change they make: it hands the
+//! old bytes to the turn's `history::Log` first, for a rewind to put back.
 
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::Write;
@@ -23,8 +24,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static TEMPS: AtomicU64 = AtomicU64::new(0);
 
 /// Replace `path`'s contents with `bytes`, whole or not at all wherever the
-/// file can be swapped.
-pub fn atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+/// file can be swapped, noting the change in `log`.
+pub fn atomic(path: &Path, bytes: &[u8], log: &crate::history::Log) -> Result<(), String> {
     let shown = path.display();
     let target = through_link(path)?;
     let old = match std::fs::metadata(&target) {
@@ -41,6 +42,8 @@ pub fn atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     {
         return Err(format!("`{shown}` is read-only."));
     }
+    // Only once the write is sure to be tried, so a refused one keeps nothing.
+    let before = log.keep(&target, old.is_some());
     let swapped = swap(&target, bytes, old.as_ref())
         .map_err(|e| format!("Could not write `{shown}`: {e}"))?;
     if !swapped {
@@ -53,6 +56,7 @@ pub fn atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
             bytes.len()
         ));
     }
+    log.note(path, before, bytes);
     Ok(())
 }
 
@@ -247,6 +251,7 @@ fn with_comments(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::Log;
 
     /// An empty folder of its own for one test.
     fn folder(name: &str) -> PathBuf {
@@ -278,14 +283,14 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = folder("mode");
         std::fs::write(dir.join("plain.txt"), "").unwrap();
-        atomic(&dir.join("new.txt"), b"new").unwrap();
+        atomic(&dir.join("new.txt"), b"new", &Log::default()).unwrap();
         assert_eq!(std::fs::read_to_string(dir.join("new.txt")).unwrap(), "new");
         assert_eq!(mode(&dir.join("new.txt")), mode(&dir.join("plain.txt")));
 
         let script = dir.join("run.sh");
         std::fs::write(&script, "echo old\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o750)).unwrap();
-        atomic(&script, b"echo new\n").unwrap();
+        atomic(&script, b"echo new\n", &Log::default()).unwrap();
         assert_eq!(std::fs::read_to_string(&script).unwrap(), "echo new\n");
         assert_eq!(mode(&script), 0o750);
         assert_eq!(names(&dir), ["new.txt", "plain.txt", "run.sh"]);
@@ -298,7 +303,7 @@ mod tests {
         let dir = folder("link");
         std::fs::write(dir.join("real.txt"), "old").unwrap();
         std::os::unix::fs::symlink("real.txt", dir.join("link.txt")).unwrap();
-        atomic(&dir.join("link.txt"), b"new").unwrap();
+        atomic(&dir.join("link.txt"), b"new", &Log::default()).unwrap();
         let link = std::fs::symlink_metadata(dir.join("link.txt")).unwrap();
         assert!(link.file_type().is_symlink());
         assert_eq!(
@@ -307,7 +312,7 @@ mod tests {
         );
 
         std::os::unix::fs::symlink("gone.txt", dir.join("dangling.txt")).unwrap();
-        let err = atomic(&dir.join("dangling.txt"), b"x").unwrap_err();
+        let err = atomic(&dir.join("dangling.txt"), b"x", &Log::default()).unwrap_err();
         assert!(err.contains("does not exist"), "{err}");
         assert!(!dir.join("gone.txt").exists());
         assert_eq!(names(&dir), ["dangling.txt", "link.txt", "real.txt"]);
@@ -322,7 +327,7 @@ mod tests {
         let file = dir.join("a.txt");
         std::fs::write(&file, "old").unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let written = atomic(&file, b"new contents");
+        let written = atomic(&file, b"new contents", &Log::default());
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         written.unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "new contents");
@@ -338,7 +343,7 @@ mod tests {
         let mut permissions = std::fs::metadata(&file).unwrap().permissions();
         permissions.set_readonly(true);
         std::fs::set_permissions(&file, permissions.clone()).unwrap();
-        let err = atomic(&file, b"new").unwrap_err();
+        let err = atomic(&file, b"new", &Log::default()).unwrap_err();
         assert!(err.contains("read-only"), "{err}");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "old");
         #[allow(clippy::permissions_set_readonly_false)]
@@ -346,7 +351,7 @@ mod tests {
         std::fs::set_permissions(&file, permissions).unwrap();
 
         std::fs::create_dir(dir.join("sub")).unwrap();
-        assert!(atomic(&dir.join("sub"), b"x").is_err());
+        assert!(atomic(&dir.join("sub"), b"x", &Log::default()).is_err());
         assert_eq!(names(&dir), ["a.txt", "sub"]);
         std::fs::remove_dir_all(dir).unwrap();
     }

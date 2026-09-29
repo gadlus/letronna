@@ -14,6 +14,7 @@ pub mod chat;
 pub mod compact;
 mod edit;
 pub mod gateway;
+pub mod history;
 pub mod jobs;
 pub mod mcp;
 pub mod media;
