@@ -47,6 +47,10 @@ pub const MAX_CONTINUATIONS: u32 = 20;
 const CHECK_TIME: Duration = Duration::from_secs(10 * 60);
 /// How often a running check is looked at for its end, a stop or its limit.
 const CHECK_POLL: Duration = Duration::from_millis(50);
+/// How long the judge may take before the look gives up and pauses the
+/// goal: its answer is one short object, and a stalled gateway would
+/// otherwise hold the session for minutes of retries.
+const JUDGE_TIME: Duration = Duration::from_secs(60);
 /// How much of the check's output the judge reads, in bytes with its
 /// fence, both ends kept.
 const CHECK_CHARS: usize = 4_000;
@@ -291,8 +295,36 @@ pub fn review(goal: &Goal, connection: &Connection, reply: &str, cancel: &Cancel
         reply,
         cancel,
         |command| check(connection, command, cancel),
-        |prompt| crate::agents::quick(connection, prompt, cancel.clone()),
+        |prompt| {
+            within(JUDGE_TIME, cancel, |stop| {
+                crate::agents::quick(connection, prompt, stop)
+            })
+        },
     )
+}
+
+/// What `ask` answers when handed a stop that `cancel` or `limit` sets,
+/// with running out of time said as such.
+fn within(
+    limit: Duration,
+    cancel: &Cancel,
+    ask: impl FnOnce(Cancel) -> Result<String, String>,
+) -> Result<String, String> {
+    let bounded = cancel.child();
+    let timer = bounded.clone();
+    std::thread::spawn(move || {
+        if timer.sleep(limit) {
+            timer.set();
+        }
+    });
+    let answer = ask(bounded.clone());
+    let late = bounded.is_set() && !cancel.is_set();
+    // Wakes the timer, whose thread would otherwise sleep on.
+    bounded.set();
+    match answer {
+        Err(_) if late => Err(format!("no verdict came within {} s", limit.as_secs())),
+        answer => answer,
+    }
 }
 
 /// Whether any of session `session`'s jobs, helpers, workflows or wake-ups
@@ -1033,5 +1065,28 @@ mod tests {
         assert_ne!(run, check_run(4, "cargo test --release"));
         assert_ne!(run, check_run(5, "cargo test"));
         assert!(run >= 1 << 63);
+    }
+
+    #[test]
+    fn a_judge_that_takes_too_long_is_given_up_on() {
+        let cancel = Cancel::default();
+        let started = Instant::now();
+        let answer = within(Duration::from_secs(1), &cancel, |stop| {
+            stop.sleep(Duration::from_secs(30));
+            Err("Stopped.".into())
+        });
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(answer, Err("no verdict came within 1 s".into()));
+        // A user's stop is theirs, and one in time is the answer.
+        cancel.set();
+        let answer = within(Duration::from_secs(30), &cancel, |stop| {
+            assert!(stop.is_set());
+            Err("Stopped.".into())
+        });
+        assert_eq!(answer, Err("Stopped.".into()));
+        let answer = within(Duration::from_secs(30), &Cancel::default(), |_| {
+            Ok("{}".into())
+        });
+        assert_eq!(answer, Ok("{}".into()));
     }
 }
