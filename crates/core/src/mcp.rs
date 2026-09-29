@@ -21,23 +21,62 @@
 //! with any `headers` it needs, such as a key. It is spoken to over HTTP as
 //! the protocol now has it: each message is POSTed, and the reply -- one
 //! message, or a stream of events -- is read back as if it had come down a
-//! pipe, so nothing past that knows the difference. The older way, a stream
-//! opened first at an address ending in /sse, is not spoken.
+//! pipe, so nothing past that knows the difference. Each event is handed on
+//! as it arrives, so a server can ask something mid-reply and hear the
+//! answer. A server that restarts has forgotten the session it gave, and is
+//! greeted again; the session is ended when the app quits. The older way, a
+//! stream opened first at an address ending in /sse, is not spoken.
+//!
+//! A server's config may name `${VAR}` or `${VAR:-default}` in its command,
+//! args, cwd, url, env and headers, filled in from Letronna's environment
+//! when it starts, so a key need not be written into the file; one unset
+//! with no default keeps the server from starting and says which. Its
+//! `includeTools` and `excludeTools` -- the names Gemini CLI reads, taking
+//! `*` globs here -- keep tools the model is never to see from costing a
+//! word of every request. `autoApprove: "readOnly"` takes a server's word
+//! that a tool only looks, as a server run here is taken at its word
+//! already. A child inherits Letronna's environment, as Claude Code's do,
+//! unless `env_scrub` gives it only where things are and its own `env`.
+//!
+//! What became of each server is kept for the user in its slot: whether it
+//! answered, how many tools it gave, why it failed, and the last 64 KB it
+//! printed on stderr. `/mcp` in the terminal and Settings › MCP in the
+//! window read it through `status()`. A server can print anything there,
+//! keys included, so the tail is scrubbed as a job's log is and goes only
+//! to the user's screen, never to the model. `mcp.json` is changed as plain
+//! JSON rather than through the structs below, so keys another app or a
+//! newer Letronna wrote are kept.
 
 use crate::tools::{Tool, ToolContext};
 use serde::Deserialize;
-use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use serde_json::{Map, Value, json};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Once, OnceLock, mpsc};
 use std::time::Duration;
 
-/// How long a server gets to start and list its tools. The first run of an
-/// npx server downloads it, which is most of this.
+/// How long a server gets to start and list its tools, unless its
+/// `startup_timeout_ms` says otherwise. The first run of an npx server
+/// downloads it, which is most of this.
 const START_TIME: Duration = Duration::from_secs(60);
-/// How long one tool call may take, the same as a command.
+/// How long one tool call may take, the same as a command, unless the
+/// server's `timeout_ms` says otherwise.
 const CALL_TIME: Duration = Duration::from_secs(120);
+/// The longest a call or a start may be given, whatever `timeout_ms` or
+/// `startup_timeout_ms` says: a day, which none needs, and which keeps
+/// every deadline far inside what a clock can add up to.
+const LONGEST_CALL: Duration = Duration::from_secs(24 * 60 * 60);
+/// How much longer a POST to a server reached by URL may run than a call
+/// may take. Whoever asked gives up first, naming what went unanswered, and
+/// the POST is let go of soon after.
+const GRACE_TIME: Duration = Duration::from_secs(5);
+/// How long quitting waits for servers reached by URL to hear their
+/// sessions end: long enough for a hosted server's handshake, short enough
+/// that one gone quiet does not hold up the app; a session not ended
+/// expires on the server anyway.
+const END_TIME: Duration = Duration::from_secs(2);
 /// The protocol revision asked for; a server answers with one it speaks.
 const PROTOCOL: &str = "2025-06-18";
 /// The words in an `env` or `headers` name that say its value is a secret.
@@ -53,14 +92,31 @@ const SECRET_NAMES: &[&str] = &[
     "authorization",
     "cookie",
 ];
+/// All a server started with `env_scrub` keeps of Letronna's environment:
+/// where programs, home and scratch space are and which language, plus the
+/// Windows folders node, npx and python fail to start without. None of
+/// them holds a key.
+const KEPT_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "SYSTEMDRIVE",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+    "PROGRAMFILES",
+];
 
-/// `mcp.json`, as Claude Desktop writes it.
-#[derive(Deserialize, Default)]
-struct Config {
-    #[serde(default, rename = "mcpServers")]
-    servers: BTreeMap<String, ServerConfig>,
-}
-
+/// One entry under `mcpServers` in `mcp.json`, as Claude Desktop writes it.
 #[derive(Deserialize, Clone, Default)]
 struct ServerConfig {
     /// Empty for a server reached by URL.
@@ -78,18 +134,259 @@ struct ServerConfig {
     env: HashMap<String, String>,
     #[serde(default)]
     disabled: bool,
-    /// Tools that run without asking, by their name on the server.
+    /// Tools that run without asking.
     #[serde(default, rename = "autoApprove")]
-    auto_approve: Vec<String>,
+    auto_approve: AutoApprove,
+    /// How long one call to this server may take, in milliseconds.
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    /// How long it may take to start and list its tools, in milliseconds.
+    #[serde(default)]
+    startup_timeout_ms: Option<u64>,
+    /// The folder a server run here starts in, from the config's own folder.
+    #[serde(default)]
+    cwd: Option<String>,
+    /// Globs of the tool names offered; empty offers every tool.
+    #[serde(default, rename = "includeTools")]
+    include_tools: Vec<String>,
+    /// Globs of the tool names never offered, whatever `includeTools` says.
+    #[serde(default, rename = "excludeTools")]
+    exclude_tools: Vec<String>,
+    /// Start the server with only `KEPT_ENV` of Letronna's environment.
+    #[serde(default)]
+    env_scrub: bool,
+}
+
+/// `autoApprove`: which of a server's tools run without asking.
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+#[serde(untagged)]
+enum AutoApprove {
+    /// Those named, by their names on the server.
+    Names(Vec<String>),
+    /// `"readOnly"`: those the server says only look; any other word, none.
+    Word(String),
+}
+
+impl Default for AutoApprove {
+    fn default() -> Self {
+        Self::Names(Vec::new())
+    }
+}
+
+impl AutoApprove {
+    /// Whether the tool `own`, with these `annotations`, runs without asking.
+    fn approves(&self, own: &str, annotations: &Value) -> bool {
+        match self {
+            Self::Names(names) => names.iter().any(|name| name == own),
+            Self::Word(word) => word == "readOnly" && only_looks(annotations),
+        }
+    }
+}
+
+impl ServerConfig {
+    /// How long one call to this server may take: `timeout_ms`, or the usual.
+    fn call_time(&self) -> Duration {
+        within_a_day(self.timeout_ms, CALL_TIME)
+    }
+
+    /// How long it may take to start and list its tools:
+    /// `startup_timeout_ms`, or the usual.
+    fn start_time(&self) -> Duration {
+        within_a_day(self.startup_timeout_ms, START_TIME)
+    }
+
+    /// Whether its tool `own` is offered at all, by the include and exclude
+    /// globs.
+    fn offers(&self, own: &str) -> bool {
+        let any = |globs: &[String]| globs.iter().any(|glob| matches_glob(glob, own));
+        (self.include_tools.is_empty() || any(&self.include_tools)) && !any(&self.exclude_tools)
+    }
+
+    /// The folder it starts in: `cwd` from `base`, the config's folder.
+    fn folder(&self, base: &Path) -> Option<PathBuf> {
+        let cwd = self.cwd.as_deref().map(str::trim)?;
+        (!cwd.is_empty()).then(|| base.join(cwd))
+    }
+
+    /// This config with every `${VAR}` in its command, args, cwd, url, env
+    /// and headers filled in from `var`.
+    fn expanded(&self, var: &dyn Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let one = |text: &String| expand(text, var);
+        let values = |map: &HashMap<String, String>| {
+            map.iter()
+                .map(|(name, value)| Ok((name.clone(), one(value)?)))
+                .collect::<Result<HashMap<_, _>, String>>()
+        };
+        Ok(Self {
+            command: one(&self.command)?,
+            url: one(&self.url)?,
+            headers: values(&self.headers)?,
+            args: self.args.iter().map(one).collect::<Result<_, _>>()?,
+            env: values(&self.env)?,
+            cwd: self.cwd.as_ref().map(one).transpose()?,
+            ..self.clone()
+        })
+    }
+}
+
+/// `ms` as a length of time: `usual` when unset or 0, and never more than
+/// `LONGEST_CALL`.
+fn within_a_day(ms: Option<u64>, usual: Duration) -> Duration {
+    ms.filter(|&ms| ms > 0)
+        .map_or(usual, |ms| Duration::from_millis(ms).min(LONGEST_CALL))
+}
+
+/// `text` with each `${VAR}` replaced by that variable's value, and each
+/// `${VAR:-default}` by its value or, when it is unset or empty, the
+/// default. A `$` without braces, or braces never closed, stay as written;
+/// a variable unset with no default is an error naming it.
+fn expand(text: &str, var: &dyn Fn(&str) -> Option<String>) -> Result<String, String> {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("${") {
+        let Some(length) = rest[start..].find('}') else {
+            break;
+        };
+        out.push_str(&rest[..start]);
+        let inner = &rest[start + 2..start + length];
+        let (name, default) = match inner.split_once(":-") {
+            Some((name, default)) => (name, Some(default)),
+            None => (inner, None),
+        };
+        // As in a shell, `:-` stands in for a value set but empty too.
+        let value = var(name).filter(|value| default.is_none() || !value.is_empty());
+        match (value, default) {
+            (Some(value), _) => out.push_str(&value),
+            (None, Some(default)) => out.push_str(default),
+            (None, None) => {
+                return Err(format!(
+                    "${{{name}}} is not set, and no default is given as ${{{name}:-default}}."
+                ));
+            }
+        }
+        rest = &rest[start + length + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// Whether `name` matches `glob`, in which `*` stands for any run of
+/// characters, none included.
+fn matches_glob(glob: &str, name: &str) -> bool {
+    let Some((first, rest)) = glob.split_once('*') else {
+        return glob == name;
+    };
+    let Some(mut left) = name.strip_prefix(first) else {
+        return false;
+    };
+    let mut parts: Vec<&str> = rest.split('*').collect();
+    let last = parts.pop().unwrap_or_default();
+    for part in parts {
+        let Some(at) = left.find(part) else {
+            return false;
+        };
+        left = &left[at + part.len()..];
+    }
+    left.ends_with(last)
+}
+
+/// What a configured server is doing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum State {
+    /// Started, and not yet answered with its tools.
+    #[default]
+    Starting,
+    /// Answered, and its tools are offered.
+    Connected,
+    /// Could not start, stopped, or its entry will not parse; the error says
+    /// which.
+    Failed,
+    /// Switched off in `mcp.json`.
+    Disabled,
+}
+
+/// One server as the user sees it, in `/mcp` and in the window's settings.
+#[derive(Clone, Debug)]
+pub struct ServerStatus {
+    pub name: String,
+    /// "stdio" for a server run here, "http" for one reached by URL.
+    pub transport: &'static str,
+    /// The command and its arguments, or the URL.
+    pub target: String,
+    pub state: State,
+    pub tools: usize,
+    /// Why it failed, word for word but for keys.
+    pub error: Option<String>,
+    /// The names of the environment variables it is given, without values.
+    pub env: Vec<String>,
+    /// The names of the headers sent to it, without values.
+    pub headers: Vec<String>,
+    /// The newest of what it printed on stderr, without escape sequences and
+    /// with keys hidden. For the user's eyes only: nothing hands it to the
+    /// model.
+    pub log: String,
+}
+
+/// One configured server and what became of it: the one record that
+/// `status`, `reconnect` and `set_enabled` read and change.
+#[derive(Default)]
+struct Slot {
+    config: ServerConfig,
+    state: State,
+    tools: Vec<Arc<dyn Tool>>,
+    error: Option<String>,
+    /// Its stderr, the newest 64 KB, kept across restarts.
+    log: Arc<Mutex<VecDeque<u8>>>,
+    /// The process of a server run here, held so a restart can stop it.
+    child: Option<std::process::Child>,
+    /// Counts the starts, so one that ends after a later start began is
+    /// dropped rather than taken for the current one.
+    run: u64,
+}
+
+impl Slot {
+    /// Stop its process, if it runs here, and drop its tools.
+    fn stop(&mut self) {
+        self.tools.clear();
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 /// The tools of every server that has answered so far.
 pub fn tools() -> Vec<Arc<dyn Tool>> {
     start();
-    registry()
+    slots()
         .lock()
-        .map(|known| known.clone())
+        .map(|slots| {
+            slots
+                .values()
+                .filter(|slot| slot.state == State::Connected)
+                .flat_map(|slot| slot.tools.iter().cloned())
+                .collect()
+        })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tools a test serves as a server's, seen on its own thread only, so
+    /// that no other test's tools array changes.
+    static SERVED: std::cell::RefCell<Vec<Arc<dyn Tool>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Serves `tools` as a server's to the rest of this test's thread.
+#[cfg(test)]
+pub(crate) fn serve(tools: Vec<Arc<dyn Tool>>) {
+    SERVED.set(tools);
+}
+
+/// What this test's thread serves; see `serve`.
+#[cfg(test)]
+pub(crate) fn served() -> Vec<Arc<dyn Tool>> {
+    SERVED.with_borrow(Vec::clone)
 }
 
 /// Start the configured servers, the first time only, without waiting for
@@ -103,52 +400,40 @@ pub fn start() {
     }
     static STARTED: Once = Once::new();
     STARTED.call_once(|| {
-        for (name, server) in config().servers {
-            if server.disabled || (server.command.trim().is_empty() && server.url.trim().is_empty())
-            {
-                continue;
-            }
-            begin_start();
-            std::thread::spawn(move || {
-                if let Ok(tools) = launch(&name, &server)
-                    && let Ok(mut known) = registry().lock()
-                {
-                    known.extend(tools);
-                }
-                end_start();
-            });
+        // One that will not read starts nothing; `unreadable` says why.
+        for (name, server) in configured().unwrap_or_default() {
+            open(&name, server);
         }
     });
-}
-
-/// `mcp.json` as saved, or no servers when it is missing or unreadable.
-fn config() -> Config {
-    let path = crate::chat::data_dir().join("mcp.json");
-    std::fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
 }
 
 /// The values in `mcp.json` whose names say they are secret, for hiding
 /// wherever they turn up.
 pub(crate) fn secrets() -> Vec<String> {
-    secret_values(&config())
+    secret_values(&configured().unwrap_or_default(), &|name| {
+        std::env::var(name).ok()
+    })
 }
 
 /// Each server's `env` and `headers` values named for a key, a token or a
-/// password; of `Bearer <token>`, the token.
-fn secret_values(config: &Config) -> Vec<String> {
+/// password, with their variables filled in from `var`; of
+/// `Bearer <token>`, the token.
+fn secret_values(
+    servers: &BTreeMap<String, Result<ServerConfig, String>>,
+    var: &dyn Fn(&str) -> Option<String>,
+) -> Vec<String> {
     let secret = |name: &String| {
         let name = name.to_lowercase();
         SECRET_NAMES.iter().any(|word| name.contains(word))
     };
-    config
-        .servers
+    servers
         .values()
+        .flatten()
         .flat_map(|server| server.env.iter().chain(&server.headers))
         .filter(|(name, _)| secret(name))
-        .filter_map(|(_, value)| value.split_whitespace().last().map(str::to_owned))
+        // A server with a variable unset never starts, so none of it goes out.
+        .filter_map(|(_, value)| expand(value, var).ok())
+        .filter_map(|value| value.split_whitespace().last().map(str::to_owned))
         // A path named for a key, as SSH_KEY_PATH is, is no secret, and hiding
         // it would hide the file wherever it is named.
         .filter(|value| !path_like(value))
@@ -171,6 +456,334 @@ fn path_like(value: &str) -> bool {
 pub fn ready(limit: Duration) {
     start();
     wait_started(limit);
+}
+
+/// Every configured server, in name order.
+pub fn status() -> Vec<ServerStatus> {
+    start();
+    let Ok(slots) = slots().lock() else {
+        return Vec::new();
+    };
+    let mut all: Vec<ServerStatus> = slots
+        .iter()
+        .map(|(name, slot)| {
+            let config = &slot.config;
+            let by_url = !config.url.trim().is_empty();
+            let target = match by_url {
+                true => config.url.trim().to_owned(),
+                false => std::iter::once(config.command.trim())
+                    .chain(config.args.iter().map(String::as_str))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            };
+            let mut env: Vec<String> = config.env.keys().cloned().collect();
+            env.sort();
+            let mut headers: Vec<String> = config.headers.keys().cloned().collect();
+            headers.sort();
+            ServerStatus {
+                name: name.clone(),
+                transport: if by_url { "http" } else { "stdio" },
+                target,
+                state: slot.state,
+                tools: slot.tools.len(),
+                error: slot.error.clone(),
+                env,
+                headers,
+                log: slot
+                    .log
+                    .lock()
+                    .map(|mut log| crate::tools::strip_escapes(&crate::jobs::text(&mut log)))
+                    .unwrap_or_default(),
+            }
+        })
+        .collect();
+    // Scrubbed with the lock let go, since finding the saved keys reads files.
+    drop(slots);
+    for server in &mut all {
+        if !server.log.is_empty() {
+            server.log = crate::redact::scrub_cut(&server.log, true);
+        }
+        if let Some(error) = &mut server.error {
+            *error = crate::redact::scrub(error, true);
+        }
+    }
+    all
+}
+
+/// Why `mcp.json` itself will not read, if it will not; then no server
+/// starts from it.
+pub fn unreadable() -> Option<String> {
+    read_config(&config_path()).err()
+}
+
+/// Stop a server and start it again from what `mcp.json` says of it now, so
+/// a fixed typo takes without a restart. Returns once it is starting.
+pub fn reconnect(name: &str) -> Result<(), String> {
+    start();
+    let server = entry(name)?;
+    if server.as_ref().is_ok_and(|server| server.disabled) {
+        return Err(format!("{name} is switched off; enable it first."));
+    }
+    open(name, server);
+    Ok(())
+}
+
+/// Switch a server on or off in `mcp.json`, and start or stop it to match.
+pub fn set_enabled(name: &str, on: bool) -> Result<(), String> {
+    start();
+    edit(&config_path(), |servers| switch(servers, name, on))?;
+    open(name, entry(name)?);
+    Ok(())
+}
+
+/// Add a server to `mcp.json` under a name not yet taken, as the JSON its
+/// entry should hold.
+pub fn add_server(name: &str, server: Value) -> Result<(), String> {
+    edit(&config_path(), |servers| add(servers, name, server))
+}
+
+/// Take a server out of `mcp.json`, leaving the others as they are.
+pub fn remove_server(name: &str) -> Result<(), String> {
+    edit(&config_path(), |servers| remove(servers, name))
+}
+
+/// Where the servers are listed.
+pub fn config_path() -> std::path::PathBuf {
+    crate::chat::data_dir().join("mcp.json")
+}
+
+fn switch(servers: &mut Map<String, Value>, name: &str, on: bool) -> Result<(), String> {
+    let Some(Value::Object(server)) = servers.get_mut(name) else {
+        return Err(missing(name));
+    };
+    match on {
+        true => server.remove("disabled"),
+        false => server.insert("disabled".into(), Value::Bool(true)),
+    };
+    Ok(())
+}
+
+fn add(servers: &mut Map<String, Value>, name: &str, server: Value) -> Result<(), String> {
+    ServerConfig::deserialize(&server).map_err(|e| format!("That server will not read: {e}"))?;
+    if servers.contains_key(name) {
+        return Err(format!(
+            "{name} is already in mcp.json; `letronna mcp remove {name}` first."
+        ));
+    }
+    servers.insert(name.to_owned(), server);
+    Ok(())
+}
+
+fn remove(servers: &mut Map<String, Value>, name: &str) -> Result<(), String> {
+    if !servers.contains_key(name) {
+        return Err(missing(name));
+    }
+    // Rebuilt rather than removed from: where the map keeps the file's
+    // order, `remove` would move the last server into the gap.
+    *servers = std::mem::take(servers)
+        .into_iter()
+        .filter(|(key, _)| key != name)
+        .collect();
+    Ok(())
+}
+
+fn missing(name: &str) -> String {
+    format!("There is no {name} in mcp.json.")
+}
+
+fn slots() -> &'static Mutex<BTreeMap<String, Slot>> {
+    static SLOTS: OnceLock<Mutex<BTreeMap<String, Slot>>> = OnceLock::new();
+    SLOTS.get_or_init(Default::default)
+}
+
+/// The file as JSON: nothing when there is none, and an error a person can
+/// act on when it will not parse or is not an object.
+fn read_config(path: &std::path::Path) -> Result<Value, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(json!({})),
+        Err(e) => return Err(format!("Cannot read {}: {e}", path.display())),
+    };
+    let config: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("{} will not parse: {e}", path.display()))?;
+    match &config["mcpServers"] {
+        _ if !config.is_object() => Err(format!("{} is not a JSON object.", path.display())),
+        Value::Object(_) | Value::Null => Ok(config),
+        _ => Err(format!(
+            "mcpServers in {} is not an object.",
+            path.display()
+        )),
+    }
+}
+
+/// The servers `mcp.json` lists, each read on its own so one bad entry
+/// shows as failed rather than hiding the rest.
+fn configured() -> Result<BTreeMap<String, Result<ServerConfig, String>>, String> {
+    Ok(entries(&read_config(&config_path())?))
+}
+
+fn entries(config: &Value) -> BTreeMap<String, Result<ServerConfig, String>> {
+    config["mcpServers"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(name, server)| {
+            let read = ServerConfig::deserialize(server)
+                .map_err(|e| format!("Its entry in mcp.json will not read: {e}"));
+            (name.clone(), read)
+        })
+        .collect()
+}
+
+/// One server's entry as `mcp.json` has it now.
+fn entry(name: &str) -> Result<Result<ServerConfig, String>, String> {
+    configured()?.remove(name).ok_or_else(|| missing(name))
+}
+
+/// Change the servers in `mcp.json` under its lock, as JSON, writing nothing
+/// when `change` refuses.
+fn edit(
+    path: &std::path::Path,
+    change: impl FnOnce(&mut Map<String, Value>) -> Result<(), String>,
+) -> Result<(), String> {
+    // Checked first: one that will not parse is the user's to fix, not to
+    // be moved aside and started over.
+    read_config(path)?;
+    if let Some(folder) = path.parent() {
+        std::fs::create_dir_all(folder).map_err(|e| format!("{}: {e}", folder.display()))?;
+    }
+    // Written where a link points, so a link to another app's config stays
+    // one rather than being replaced by a copy.
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    let mut outcome = Ok(());
+    crate::state::update::<Value>(&target, |config| {
+        let not_object = || Err(format!("{} is not a JSON object.", path.display()));
+        let mut file = match config {
+            Value::Null => Map::new(),
+            Value::Object(file) => file.clone(),
+            _ => {
+                outcome = not_object();
+                return;
+            }
+        };
+        let mut servers = match file.get("mcpServers") {
+            None | Some(Value::Null) => Map::new(),
+            Some(Value::Object(servers)) => servers.clone(),
+            Some(_) => {
+                outcome = not_object();
+                return;
+            }
+        };
+        outcome = change(&mut servers);
+        if outcome.is_ok() {
+            file.insert("mcpServers".into(), Value::Object(servers));
+            *config = Value::Object(file);
+        }
+    })?;
+    outcome
+}
+
+/// Put a server in its slot, stopping whatever ran there before, and start
+/// it on a thread of its own unless it is switched off or will not read.
+fn open(name: &str, server: Result<ServerConfig, String>) {
+    let Ok(mut slots) = slots().lock() else {
+        return;
+    };
+    let slot = slots.entry(name.to_owned()).or_default();
+    slot.stop();
+    slot.run += 1;
+    slot.error = None;
+    let config = match server {
+        Ok(config) => config,
+        Err(error) => {
+            // Not the last good one's command, shown as if it were this.
+            slot.config = ServerConfig::default();
+            slot.state = State::Failed;
+            slot.error = Some(error);
+            return;
+        }
+    };
+    slot.config = config.clone();
+    if config.disabled {
+        slot.state = State::Disabled;
+        return;
+    }
+    if config.command.trim().is_empty() && config.url.trim().is_empty() {
+        slot.state = State::Failed;
+        slot.error = Some("Its entry has neither a command nor a url.".into());
+        return;
+    }
+    slot.state = State::Starting;
+    // What the last run printed stays, marked off from what this one does.
+    if let Ok(mut log) = slot.log.lock()
+        && !log.is_empty()
+    {
+        crate::jobs::append(&mut log, b"\n--- started again ---\n");
+    }
+    let run = slot.run;
+    drop(slots);
+    begin_start();
+    let name = name.to_owned();
+    std::thread::spawn(move || {
+        let outcome = launch(&name, &config, run);
+        settle(&name, run, outcome);
+        end_start();
+    });
+}
+
+/// Change the slot for this start of a server, unless it has been started
+/// again or switched off since; None when it has.
+fn with_run<T>(name: &str, run: u64, change: impl FnOnce(&mut Slot) -> T) -> Option<T> {
+    let mut slots = slots().lock().ok()?;
+    slots
+        .get_mut(name)
+        .filter(|slot| slot.run == run)
+        .map(change)
+}
+
+/// Record how a start went.
+fn settle(name: &str, run: u64, outcome: Result<Vec<Arc<dyn Tool>>, String>) {
+    with_run(name, run, |slot| match outcome {
+        Ok(tools) => {
+            slot.state = State::Connected;
+            slot.tools = tools;
+        }
+        Err(error) => {
+            // One that never answered may still be running.
+            slot.stop();
+            slot.state = State::Failed;
+            slot.error = Some(error);
+        }
+    });
+}
+
+/// Mark a server run here as stopped once its stderr closes, which it does
+/// as the process ends. One still starting hears of it from `connect`.
+fn gone(name: &str, run: u64) {
+    with_run(name, run, |slot| {
+        if slot.state == State::Connected {
+            slot.stop();
+            slot.state = State::Failed;
+            slot.error = Some(format!("{name} stopped."));
+        }
+    });
+}
+
+/// Keep what a server prints on stderr until it closes.
+fn keep_log(mut from: impl Read, log: &Mutex<VecDeque<u8>>) {
+    let mut chunk = [0; 4096];
+    loop {
+        match from.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+                if let Ok(mut log) = log.lock() {
+                    crate::jobs::append(&mut log, &chunk[..read]);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
 }
 
 /// How many servers are still starting, and a signal as each is done.
@@ -200,32 +813,70 @@ fn wait_started(limit: Duration) {
     }
 }
 
-fn registry() -> &'static Mutex<Vec<Arc<dyn Tool>>> {
-    static KNOWN: OnceLock<Mutex<Vec<Arc<dyn Tool>>>> = OnceLock::new();
-    KNOWN.get_or_init(Default::default)
-}
-
 /// Start one server and list its tools.
-fn launch(name: &str, config: &ServerConfig) -> Result<Vec<Arc<dyn Tool>>, String> {
+fn launch(name: &str, config: &ServerConfig, run: u64) -> Result<Vec<Arc<dyn Tool>>, String> {
+    let config = &config
+        .expanded(&|var| std::env::var(var).ok())
+        .map_err(|e| format!("{name}: {e}"))?;
     if !config.url.trim().is_empty() {
         return reach(name, config);
     }
-    let mut child = spawn(config)?;
-    let (Some(stdin), Some(stdout), Some(mut stderr)) =
+    let mut child = spawn(config, &crate::chat::data_dir())?;
+    let (Some(stdin), Some(stdout), Some(stderr)) =
         (child.stdin.take(), child.stdout.take(), child.stderr.take())
     else {
         return Err(format!("{name} has no pipes to talk over."));
     };
+    // Held in its slot at once, so a restart while it is still starting
+    // stops this one rather than leaving it to run.
+    let mut child = Some(child);
+    let log = with_run(name, run, |slot| {
+        slot.child = child.take();
+        slot.log.clone()
+    });
+    let Some(log) = log else {
+        if let Some(mut child) = child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        return Err(format!("{name} was started again."));
+    };
     // A server that fills its stderr pipe stops until someone reads it.
-    std::thread::spawn(move || std::io::copy(&mut stderr, &mut std::io::sink()));
+    let who = name.to_owned();
+    std::thread::spawn(move || {
+        keep_log(stderr, &log);
+        gone(&who, run);
+    });
     connect(name, config, stdout, stdin)
 }
 
-/// The server's process, with its pipes.
-fn spawn(config: &ServerConfig) -> Result<std::process::Child, String> {
+/// The server's process, with its pipes, started in its `cwd` from `base`,
+/// the config's folder.
+fn spawn(config: &ServerConfig, base: &Path) -> Result<std::process::Child, String> {
     use std::process::{Command, Stdio};
+    let folder = config.folder(base);
+    if let Some(folder) = &folder
+        && !folder.is_dir()
+    {
+        return Err(format!(
+            "Cannot start `{}` in {}: there is no such folder.",
+            config.command,
+            folder.display()
+        ));
+    }
     let build = |program: &str, args: &[String]| {
         let mut command = Command::new(program);
+        if config.env_scrub {
+            command.env_clear();
+            for name in KEPT_ENV {
+                if let Some(value) = std::env::var_os(name) {
+                    command.env(name, value);
+                }
+            }
+        }
+        if let Some(folder) = &folder {
+            command.current_dir(folder);
+        }
         command
             .args(args)
             .envs(&config.env)
@@ -259,36 +910,87 @@ fn spawn(config: &ServerConfig) -> Result<std::process::Child, String> {
 /// Greet a server reached by URL and wrap each tool it lists.
 fn reach(name: &str, config: &ServerConfig) -> Result<Vec<Arc<dyn Tool>>, String> {
     let (from, replies) = std::io::pipe().map_err(|e| format!("{name}: {e}"))?;
+    // Each request carries its own deadline, from the server's call time,
+    // rather than the client cutting every call off at one length.
+    // Redirects are not followed: a key in a header of its own would go
+    // along to wherever the server pointed.
     let client = reqwest::blocking::Client::builder()
-        .timeout(CALL_TIME)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| e.to_string())?;
-    let link = Http {
+    let link = Arc::new(Link {
         name: name.to_owned(),
         url: config.url.trim().to_owned(),
         headers: config.headers.clone(),
         client,
-        session: Arc::default(),
+        wait: config.call_time().max(config.start_time()),
+        session: Mutex::default(),
+        greeting: Mutex::default(),
+        greeting_again: Mutex::default(),
+    });
+    if let Ok(mut links) = links().lock() {
+        links.push(link.clone());
+    }
+    let http = Http {
+        link,
         replies: Arc::new(Mutex::new(replies)),
         line: Vec::new(),
     };
-    connect(name, config, from, link)
+    connect(name, config, from, http)
+}
+
+/// Every server reached by URL, for ending their sessions when the app quits.
+fn links() -> &'static Mutex<Vec<Arc<Link>>> {
+    static LINKS: OnceLock<Mutex<Vec<Arc<Link>>>> = OnceLock::new();
+    LINKS.get_or_init(Default::default)
+}
+
+/// End the session of every server reached by URL, so it can let go of
+/// what it keeps for it. Called when the app quits.
+pub fn stop_all() {
+    let links = links()
+        .lock()
+        .map(|mut links| std::mem::take(&mut *links))
+        .unwrap_or_default();
+    // All at once, so quitting waits END_TIME at most however many there are.
+    let ending: Vec<_> = links
+        .into_iter()
+        .map(|link| std::thread::spawn(move || link.end()))
+        .collect();
+    for end in ending {
+        let _ = end.join();
+    }
 }
 
 /// A server reached by URL, spoken to as if over pipes: each message written
 /// to it is POSTed, and every message in the reply is handed on as a line to
-/// read. A request is sent on a thread of its own, since its reply can take
-/// as long as a tool call and the server may want an answer meanwhile;
-/// anything else is sent at once, so the greeting comes before what follows.
+/// read as soon as it arrives. A request is sent on a thread of its own,
+/// since its reply can take as long as a tool call and the server may want
+/// an answer meanwhile; anything else is sent at once, so the greeting comes
+/// before what follows.
 struct Http {
+    link: Arc<Link>,
+    replies: Arc<Mutex<std::io::PipeWriter>>,
+    /// What has been written of the next message so far.
+    line: Vec<u8>,
+}
+
+/// A server reached by URL: where it is, how to speak to it, and the
+/// session it gave.
+struct Link {
     name: String,
     url: String,
     headers: HashMap<String, String>,
     client: reqwest::blocking::Client,
-    session: Arc<Mutex<Session>>,
-    replies: Arc<Mutex<std::io::PipeWriter>>,
-    /// What has been written of the next message so far.
-    line: Vec<u8>,
+    /// How long a request may take: a call, or the start if that is longer.
+    wait: Duration,
+    session: Mutex<Session>,
+    /// The greeting as first sent, sent again when the server has forgotten
+    /// the session.
+    greeting: Mutex<Option<Vec<u8>>>,
+    /// Held while the server is greeted again, so requests that all found
+    /// the session gone greet it once between them.
+    greeting_again: Mutex<()>,
 }
 
 /// What a server reached by URL gave back when greeted, which goes with
@@ -297,6 +999,14 @@ struct Http {
 struct Session {
     id: Option<String>,
     version: Option<String>,
+}
+
+/// Why a POST failed.
+enum Failed {
+    /// In words for whoever asked.
+    Said(String),
+    /// The server no longer knows the session it was sent, whose id this is.
+    Forgot(String),
 }
 
 impl Write for Http {
@@ -325,25 +1035,23 @@ impl Http {
             .then(|| parsed.get("id").cloned())
             .flatten();
         let waits = request.is_some();
-        let (name, url, headers) = (self.name.clone(), self.url.clone(), self.headers.clone());
-        let (client, session, replies) = (
-            self.client.clone(),
-            self.session.clone(),
-            self.replies.clone(),
-        );
+        if parsed["method"] == "initialize"
+            && let Ok(mut greeting) = self.link.greeting.lock()
+        {
+            *greeting = Some(message.clone());
+        }
+        let (link, replies) = (self.link.clone(), self.replies.clone());
         let send = move || {
-            let messages = match exchange(&client, &url, &headers, &session, message) {
-                Ok(messages) => messages,
-                Err(why) => match &request {
-                    Some(id) => vec![json!({"jsonrpc": "2.0", "id": id,
-                        "error": {"code": -32000, "message": format!("{name}: {why}")}})],
-                    None => Vec::new(),
-                },
-            };
-            if let Ok(mut replies) = replies.lock() {
-                for message in messages {
+            let mut hand_on = |message: Value| {
+                if let Ok(mut replies) = replies.lock() {
                     let _ = writeln!(replies, "{message}");
                 }
+            };
+            if let Err(why) = link.send(&message, &mut hand_on)
+                && let Some(id) = &request
+            {
+                hand_on(json!({"jsonrpc": "2.0", "id": id,
+                    "error": {"code": -32000, "message": format!("{}: {why}", link.name)}}));
             }
         };
         match waits {
@@ -355,89 +1063,170 @@ impl Http {
     }
 }
 
-/// Send one message to a server reached by URL, and the messages it answers
-/// with.
-fn exchange(
-    client: &reqwest::blocking::Client,
-    url: &str,
-    headers: &HashMap<String, String>,
-    session: &Mutex<Session>,
-    message: Vec<u8>,
-) -> Result<Vec<Value>, String> {
-    let mut request = client
-        .post(url)
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json, text/event-stream")
-        .body(message);
-    for (name, value) in headers {
-        request = request.header(name, value);
+impl Link {
+    /// POST one message, handing on each message in the reply as it comes.
+    /// A server that has forgotten the session, as one that restarted has,
+    /// is greeted again and the message sent once more.
+    fn send(&self, message: &[u8], hand_on: &mut dyn FnMut(Value)) -> Result<(), String> {
+        match self.exchange(message, hand_on) {
+            Err(Failed::Forgot(stale)) => {
+                self.greet_again(&stale)?;
+                self.exchange(message, hand_on)
+                    .map_err(|failed| self.said(failed))
+            }
+            other => other.map_err(|failed| self.said(failed)),
+        }
     }
-    if let Ok(session) = session.lock() {
+
+    /// Greet the server again after it forgot session `stale`, unless
+    /// another request has already.
+    fn greet_again(&self, stale: &str) -> Result<(), String> {
+        let _alone = self
+            .greeting_again
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = self.session.lock().ok().and_then(|s| s.id.clone());
+        if current.as_deref() != Some(stale) {
+            return Ok(());
+        }
+        let Some(greeting) = self.greeting.lock().ok().and_then(|g| g.clone()) else {
+            return Err(self.said(Failed::Forgot(stale.to_owned())));
+        };
+        if let Ok(mut session) = self.session.lock() {
+            *session = Session::default();
+        }
+        // The first answer went to whoever asked; this one only brings the
+        // new session.
+        let initialized = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+        self.exchange(&greeting, &mut |_| {})
+            .and_then(|()| self.exchange(initialized.to_string().as_bytes(), &mut |_| {}))
+            .map_err(|failed| self.said(failed))
+    }
+
+    /// A failure in words for whoever asked.
+    fn said(&self, failed: Failed) -> String {
+        match failed {
+            Failed::Said(why) => why,
+            Failed::Forgot(_) => format!(
+                "{} forgot its session (HTTP 404) and did not keep a new one.",
+                self.url
+            ),
+        }
+    }
+
+    /// `request` with the configured headers and the session, and the
+    /// session's id when it has one.
+    fn headed(
+        &self,
+        mut request: reqwest::blocking::RequestBuilder,
+    ) -> (reqwest::blocking::RequestBuilder, Option<String>) {
+        for (name, value) in &self.headers {
+            request = request.header(name, value);
+        }
+        let Ok(session) = self.session.lock() else {
+            return (request, None);
+        };
         if let Some(id) = &session.id {
             request = request.header("Mcp-Session-Id", id);
         }
         if let Some(version) = &session.version {
             request = request.header("MCP-Protocol-Version", version);
         }
+        (request, session.id.clone())
     }
-    let reply = request
-        .send()
-        .map_err(|e| format!("could not reach {url}: {e}"))?;
-    let status = reply.status();
-    if let Some(id) = reply
-        .headers()
-        .get("mcp-session-id")
-        .and_then(|v| v.to_str().ok())
-        && let Ok(mut session) = session.lock()
-    {
-        session.id = Some(id.to_owned());
+
+    /// Tell the server the session is over; one that keeps none, or has
+    /// gone, is left be.
+    fn end(&self) {
+        let (request, Some(_)) = self.headed(self.client.delete(&self.url).timeout(END_TIME))
+        else {
+            return;
+        };
+        let _ = request.send();
     }
-    if !status.is_success() {
-        return Err(match status.as_u16() {
-            401 | 403 => format!(
-                "{url} refused (HTTP {status}): check the headers given for it in mcp.json."
-            ),
-            404 | 405 => format!("{url} has no MCP server that speaks HTTP (HTTP {status})."),
-            _ => format!("{url} answered HTTP {status}."),
-        });
-    }
-    let streamed = reply
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|kind| kind.contains("text/event-stream"));
-    let body = reply
-        .text()
-        .map_err(|e| format!("{url} stopped answering: {e}"))?;
-    let messages = match streamed {
-        true => events(&body),
-        false => match serde_json::from_str::<Value>(&body) {
-            Ok(Value::Array(batch)) => batch,
-            Ok(one) => vec![one],
+
+    /// POST one message, handing on each message in the reply as it arrives.
+    fn exchange(&self, message: &[u8], hand_on: &mut dyn FnMut(Value)) -> Result<(), Failed> {
+        let url = &self.url;
+        let request = self
+            .client
+            .post(url)
+            .timeout(self.wait + GRACE_TIME)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(message.to_vec());
+        let (request, sent_with) = self.headed(request);
+        let reply = request
+            .send()
+            .map_err(|e| Failed::Said(format!("could not reach {url}: {e}")))?;
+        let status = reply.status();
+        // What a server that restarted says of a session from before.
+        if status == reqwest::StatusCode::NOT_FOUND
+            && let Some(stale) = sent_with
+        {
+            return Err(Failed::Forgot(stale));
+        }
+        if let Some(id) = reply
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+            && let Ok(mut session) = self.session.lock()
+        {
+            session.id = Some(id.to_owned());
+        }
+        if !status.is_success() {
+            return Err(Failed::Said(match status.as_u16() {
+                300..=399 => format!(
+                    "{url} sends its requests elsewhere (HTTP {status}), which is not followed: give the address it moved to in mcp.json."
+                ),
+                401 | 403 => format!(
+                    "{url} refused (HTTP {status}): check the headers given for it in mcp.json."
+                ),
+                404 | 405 => format!("{url} has no MCP server that speaks HTTP (HTTP {status})."),
+                _ => format!("{url} answered HTTP {status}."),
+            }));
+        }
+        let streamed = reply
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|kind| kind.contains("text/event-stream"));
+        let mut take = |message: Value| {
+            // The answer to the greeting says which version to speak from
+            // now on.
+            if let Some(version) = message["result"]["protocolVersion"].as_str()
+                && let Ok(mut session) = self.session.lock()
+            {
+                session.version = Some(version.to_owned());
+            }
+            hand_on(message);
+        };
+        if streamed {
+            return events(BufReader::new(reply), &mut take)
+                .map_err(|e| Failed::Said(format!("{url} stopped answering: {e}")));
+        }
+        let body = reply
+            .text()
+            .map_err(|e| Failed::Said(format!("{url} stopped answering: {e}")))?;
+        match serde_json::from_str::<Value>(&body) {
+            Ok(Value::Array(batch)) => batch.into_iter().for_each(&mut take),
+            Ok(one) => take(one),
             // A notification is taken with no body at all.
-            Err(_) => Vec::new(),
-        },
-    };
-    // The answer to the greeting says which version to speak from now on.
-    if let Some(version) = messages
-        .iter()
-        .find_map(|m| m["result"]["protocolVersion"].as_str())
-        && let Ok(mut session) = session.lock()
-    {
-        session.version = Some(version.to_owned());
+            Err(_) => {}
+        }
+        Ok(())
     }
-    Ok(messages)
 }
 
-/// The messages in a stream of server-sent events: each event's data lines,
-/// joined.
-fn events(body: &str) -> Vec<Value> {
-    let mut messages = Vec::new();
+/// Hand on the messages in a stream of server-sent events as each event
+/// ends: its data lines, joined.
+fn events(from: impl BufRead, hand_on: &mut dyn FnMut(Value)) -> std::io::Result<()> {
     let mut data = String::new();
-    for line in body.lines().chain([""]) {
+    for line in from.lines().chain([Ok(String::new())]) {
+        let line = line?;
         if line.is_empty() {
             if let Ok(message) = serde_json::from_str(&data) {
-                messages.push(message);
+                hand_on(message);
             }
             data.clear();
         } else if let Some(part) = line.strip_prefix("data:") {
@@ -447,7 +1236,7 @@ fn events(body: &str) -> Vec<Value> {
             data.push_str(part.strip_prefix(' ').unwrap_or(part));
         }
     }
-    messages
+    Ok(())
 }
 
 /// Greet a server over its pipes and wrap each tool it lists.
@@ -472,7 +1261,7 @@ fn connect(
             "capabilities": {},
             "clientInfo": {"name": "letronna", "version": env!("CARGO_PKG_VERSION")},
         }),
-        START_TIME,
+        config.start_time(),
     )?;
     server.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))?;
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
@@ -482,9 +1271,9 @@ fn connect(
             Some(cursor) => json!({ "cursor": cursor }),
             None => json!({}),
         };
-        let page = server.request("tools/list", params, START_TIME)?;
+        let page = server.request("tools/list", params, config.start_time())?;
         for tool in page["tools"].as_array().into_iter().flatten() {
-            let Some(own) = tool["name"].as_str() else {
+            let Some(own) = tool["name"].as_str().filter(|own| config.offers(own)) else {
                 continue;
             };
             let (description, schema) = vetted(name, own, tool);
@@ -496,9 +1285,10 @@ fn connect(
                 schema,
                 // A server elsewhere is only its word, and a tool that
                 // reaches other machines can send what it is given there.
-                ask: !config.auto_approve.iter().any(|t| t == own)
+                ask: !config.auto_approve.approves(own, &tool["annotations"])
                     && !(config.url.trim().is_empty() && only_looks(&tool["annotations"])),
                 read_only: tool["annotations"]["readOnlyHint"].as_bool() == Some(true),
+                wait: config.call_time(),
             }));
         }
         match page["nextCursor"].as_str() {
@@ -622,6 +1412,8 @@ struct McpTool {
     schema: Value,
     ask: bool,
     read_only: bool,
+    /// How long a call may take.
+    wait: Duration,
 }
 
 impl Tool for McpTool {
@@ -641,7 +1433,7 @@ impl Tool for McpTool {
         let reply = self.server.reply(
             "tools/call",
             json!({"name": self.own, "arguments": args}),
-            CALL_TIME,
+            self.wait,
         )?;
         // What the server says went wrong is its own words, as its results
         // are, and fenced as they are.
@@ -981,7 +1773,9 @@ mod tests {
                     }
                     let mut body = vec![0; length];
                     reader.read_exact(&mut body).unwrap();
-                    let message: Value = serde_json::from_slice(&body).unwrap();
+                    // Quitting in another test ends this one's session too,
+                    // with a DELETE that has no body.
+                    let message: Value = serde_json::from_slice(&body).unwrap_or_default();
                     let _ = heard.send(format!("{head}{message}"));
                     let id = message["id"].clone();
                     let reply = match message["method"].as_str().unwrap_or_default() {
@@ -1017,7 +1811,7 @@ mod tests {
             headers: HashMap::from([("Authorization".into(), "Bearer key-1".into())]),
             ..ServerConfig::default()
         };
-        let tools = launch("far", &config).unwrap();
+        let tools = launch("far", &config, 0).unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name(), "mcp__far__echo");
         let said = tools[0]
@@ -1071,7 +1865,7 @@ mod tests {
             url,
             ..ServerConfig::default()
         };
-        let refused = launch("locked", &config).err().unwrap();
+        let refused = launch("locked", &config, 0).err().unwrap();
         assert!(
             refused.contains("HTTP 401") && refused.contains("headers"),
             "{refused}"
@@ -1080,6 +1874,11 @@ mod tests {
 
     #[test]
     fn a_stream_of_events_is_read_as_its_messages() {
+        let events = |body: &str| {
+            let mut messages = Vec::new();
+            events(body.as_bytes(), &mut |message| messages.push(message)).unwrap();
+            messages
+        };
         let body = "event: message\ndata: {\"a\":1}\n\n: a comment\ndata: {\"b\":\ndata: 2}\n\ndata: {\"c\":3}";
         assert_eq!(
             events(body),
@@ -1091,6 +1890,278 @@ mod tests {
         );
     }
 
+    /// A local HTTP server that hands each request -- its head, lowercased,
+    /// and its JSON body, or null -- to `answer`, which writes the reply.
+    fn serve(
+        answer: impl Fn(&str, Value, &mut std::net::TcpStream) + Send + Sync + 'static,
+    ) -> String {
+        use std::io::{BufRead, BufReader, Read};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let answer = Arc::new(answer);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let answer = answer.clone();
+                std::thread::spawn(move || {
+                    let mut stream = stream.unwrap();
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut head = String::new();
+                    while !head.ends_with("\r\n\r\n") {
+                        if reader.read_line(&mut head).unwrap() == 0 {
+                            return;
+                        }
+                    }
+                    let head = head.to_ascii_lowercase();
+                    let length = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .map_or(0, |n| n.trim().parse().unwrap());
+                    let mut body = vec![0; length];
+                    reader.read_exact(&mut body).unwrap();
+                    let message = serde_json::from_slice(&body).unwrap_or_default();
+                    answer(&head, message, &mut stream);
+                });
+            }
+        });
+        url
+    }
+
+    /// A whole reply of JSON, after any more header lines given.
+    fn json_reply(body: &Value, more: &str) -> String {
+        let body = body.to_string();
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{more}Connection: close\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    const ACCEPTED: &str =
+        "HTTP/1.1 202 Accepted\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+
+    /// The reply every test server gives alike to the greeting, the
+    /// notification after it and the tool list, which has one tool; none
+    /// for anything else.
+    fn usual(message: &Value, session: &str) -> Option<String> {
+        let id = &message["id"];
+        match message["method"].as_str()? {
+            "initialize" => Some(json_reply(
+                &json!({"jsonrpc": "2.0", "id": id, "result": {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}}}),
+                &format!("Mcp-Session-Id: {session}\r\n"),
+            )),
+            "notifications/initialized" => Some(ACCEPTED.to_owned()),
+            "tools/list" => Some(json_reply(
+                &json!({"jsonrpc": "2.0", "id": id, "result": {"tools": [{"name": "work", "inputSchema": {"type": "object"}}]}}),
+                "",
+            )),
+            _ => None,
+        }
+    }
+
+    /// A tool call's answer: the text given.
+    fn answer(message: &Value, text: &str) -> String {
+        json_reply(
+            &json!({"jsonrpc": "2.0", "id": message["id"], "result": {"content": [{"type": "text", "text": text}]}}),
+            "",
+        )
+    }
+
+    #[test]
+    fn a_streamed_reply_is_handed_on_while_the_stream_is_still_open() {
+        // The call's stream pings the client and ends only once the answer
+        // to the ping is in: read whole, it would wait for itself.
+        let (answered, pinged) = mpsc::channel();
+        let (answered, pinged) = (Mutex::new(answered), Mutex::new(pinged));
+        let url = serve(move |_, message, stream| {
+            if let Some(reply) = usual(&message, "s-1") {
+                let _ = stream.write_all(reply.as_bytes());
+                return;
+            }
+            if message["id"] == "p1" {
+                let _ = answered.lock().unwrap().send(());
+                let _ = stream.write_all(ACCEPTED.as_bytes());
+                return;
+            }
+            let chunk = |event: &Value| {
+                let data = format!("event: message\ndata: {event}\n\n");
+                format!("{:x}\r\n{data}\r\n", data.len())
+            };
+            let ping = json!({"jsonrpc": "2.0", "id": "p1", "method": "ping"});
+            let _ = stream.write_all(
+                format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{}", chunk(&ping))
+                    .as_bytes(),
+            );
+            let heard = pinged.lock().unwrap().recv_timeout(Duration::from_secs(10));
+            let text = if heard.is_ok() {
+                "answered"
+            } else {
+                "not answered"
+            };
+            let done = json!({"jsonrpc": "2.0", "id": message["id"], "result": {"content": [{"type": "text", "text": text}]}});
+            let _ = stream.write_all(format!("{}0\r\n\r\n", chunk(&done)).as_bytes());
+        });
+        let config = ServerConfig {
+            url,
+            ..ServerConfig::default()
+        };
+        let tools = launch("streams", &config, 0).unwrap();
+        let said = tools[0].run(&json!({}), &ToolContext::default());
+        assert_eq!(said.unwrap(), "answered");
+    }
+
+    /// What a test server that restarts remembers.
+    #[derive(Default)]
+    struct Restarts {
+        /// The one session it knows, if any.
+        live: Mutex<Option<String>>,
+        greetings: AtomicU64,
+        /// Set to keep none of the sessions it gives.
+        forgets: std::sync::atomic::AtomicBool,
+    }
+
+    /// A server that answers 404 to a session it does not know, and a call
+    /// with the session it came in.
+    fn restarting(state: Arc<Restarts>) -> String {
+        serve(move |head, message, stream| {
+            let sent = head
+                .lines()
+                .find_map(|line| line.strip_prefix("mcp-session-id:"))
+                .map(|id| id.trim().to_owned());
+            if message["method"] == "initialize" {
+                let n = state.greetings.fetch_add(1, Ordering::SeqCst) + 1;
+                let session = format!("s-{n}");
+                if !state.forgets.load(Ordering::SeqCst) {
+                    *state.live.lock().unwrap() = Some(session.clone());
+                }
+                let _ = stream.write_all(usual(&message, &session).unwrap().as_bytes());
+                return;
+            }
+            if sent.is_some() && sent != *state.live.lock().unwrap() {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                );
+                return;
+            }
+            let reply = usual(&message, "").unwrap_or_else(|| {
+                answer(&message, &format!("called in {}", sent.unwrap_or_default()))
+            });
+            let _ = stream.write_all(reply.as_bytes());
+        })
+    }
+
+    #[test]
+    fn a_server_that_restarted_is_greeted_again_and_the_call_sent_once_more() {
+        let state = Arc::new(Restarts::default());
+        let config = ServerConfig {
+            url: restarting(state.clone()),
+            ..ServerConfig::default()
+        };
+        let tools = launch("restarts", &config, 0).unwrap();
+        *state.live.lock().unwrap() = None;
+        let said = tools[0].run(&json!({}), &ToolContext::default());
+        assert_eq!(said.unwrap(), "called in s-2");
+        assert_eq!(state.greetings.load(Ordering::SeqCst), 2);
+        // The new session holds from then on.
+        let said = tools[0].run(&json!({}), &ToolContext::default());
+        assert_eq!(said.unwrap(), "called in s-2");
+        assert_eq!(state.greetings.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_server_that_keeps_forgetting_is_greeted_again_only_once() {
+        let state = Arc::new(Restarts::default());
+        let config = ServerConfig {
+            url: restarting(state.clone()),
+            ..ServerConfig::default()
+        };
+        let tools = launch("forgets", &config, 0).unwrap();
+        state.forgets.store(true, Ordering::SeqCst);
+        *state.live.lock().unwrap() = None;
+        let failed = tools[0]
+            .run(&json!({}), &ToolContext::default())
+            .unwrap_err();
+        assert!(failed.contains("HTTP 404"), "{failed}");
+        assert_eq!(state.greetings.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_server_that_redirects_is_not_followed() {
+        let (went, followed) = mpsc::channel();
+        let went = Mutex::new(went);
+        let elsewhere = serve(move |_, _, stream| {
+            let _ = went.lock().unwrap().send(());
+            let _ = stream.write_all(ACCEPTED.as_bytes());
+        });
+        let url = serve(move |_, _, stream| {
+            let _ = stream.write_all(
+                format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: {elsewhere}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+                    .as_bytes(),
+            );
+        });
+        let config = ServerConfig {
+            url,
+            headers: HashMap::from([("X-Api-Key".into(), "key-3".into())]),
+            ..ServerConfig::default()
+        };
+        let refused = launch("moved", &config, 0).err().unwrap();
+        assert!(
+            refused.contains("HTTP 307") && refused.contains("not followed"),
+            "{refused}"
+        );
+        assert!(followed.try_recv().is_err());
+    }
+
+    #[test]
+    fn quitting_ends_the_session_of_a_server_reached_by_url() {
+        let (heard, asked) = mpsc::channel();
+        let heard = Mutex::new(heard);
+        let url = serve(move |head, message, stream| {
+            let _ = heard.lock().unwrap().send(head.to_owned());
+            let reply = usual(&message, "s-9").unwrap_or_else(|| ACCEPTED.to_owned());
+            let _ = stream.write_all(reply.as_bytes());
+        });
+        let config = ServerConfig {
+            url,
+            headers: HashMap::from([("X-Api-Key".into(), "key-2".into())]),
+            ..ServerConfig::default()
+        };
+        launch("ends", &config, 0).unwrap();
+        stop_all();
+        let deleted = std::iter::from_fn(|| asked.recv_timeout(Duration::from_secs(5)).ok())
+            .find(|head| head.starts_with("delete "))
+            .unwrap();
+        assert!(
+            deleted.contains("mcp-session-id: s-9") && deleted.contains("x-api-key: key-2"),
+            "{deleted}"
+        );
+    }
+
+    #[test]
+    fn a_call_takes_as_long_as_its_server_is_given_and_no_longer() {
+        let url = serve(|_, message, stream| {
+            if let Some(reply) = usual(&message, "s-1") {
+                let _ = stream.write_all(reply.as_bytes());
+                return;
+            }
+            let pause = message["params"]["arguments"]["ms"].as_u64().unwrap_or(0);
+            std::thread::sleep(Duration::from_millis(pause));
+            let _ = stream.write_all(answer(&message, "done").as_bytes());
+        });
+        let config = ServerConfig {
+            url,
+            timeout_ms: Some(2_000),
+            ..ServerConfig::default()
+        };
+        let tools = launch("slow", &config, 0).unwrap();
+        let said = tools[0].run(&json!({"ms": 1_000}), &ToolContext::default());
+        assert_eq!(said.unwrap(), "done");
+        let asked = std::time::Instant::now();
+        let failed = tools[0]
+            .run(&json!({"ms": 6_000}), &ToolContext::default())
+            .unwrap_err();
+        assert!(failed.contains("within 2 seconds"), "{failed}");
+        assert!(asked.elapsed() < Duration::from_secs(4));
+    }
+
     /// Needs the network: DeepWiki's free MCP server, which asks for no key.
     #[test]
     #[ignore = "reaches mcp.deepwiki.com over the network"]
@@ -1099,7 +2170,7 @@ mod tests {
             url: "https://mcp.deepwiki.com/mcp".into(),
             ..ServerConfig::default()
         };
-        let tools = launch("deepwiki", &config).unwrap();
+        let tools = launch("deepwiki", &config, 0).unwrap();
         assert!(
             tools
                 .iter()
@@ -1113,7 +2184,7 @@ mod tests {
         let (from_server, to_client) = std::io::pipe().unwrap();
         scripted_server(from_client, to_client);
         let config = ServerConfig {
-            auto_approve: vec!["look up".into()],
+            auto_approve: AutoApprove::Names(vec!["look up".into()]),
             ..Default::default()
         };
         let tools = connect("demo", &config, from_server, to_server).unwrap();
@@ -1199,7 +2270,7 @@ mod tests {
             let (from_server, to_client) = std::io::pipe().unwrap();
             scripted_server(from_client, to_client);
             let config = ServerConfig {
-                auto_approve,
+                auto_approve: AutoApprove::Names(auto_approve),
                 ..Default::default()
             };
             let tools = connect("demo", &config, from_server, to_server).unwrap();
@@ -1233,7 +2304,7 @@ mod tests {
             scripted_server(from_client, to_client);
             let config = ServerConfig {
                 url: "https://example.com/mcp".into(),
-                auto_approve,
+                auto_approve: AutoApprove::Names(auto_approve),
                 ..Default::default()
             };
             let tools = connect("demo", &config, from_server, to_server).unwrap();
@@ -1268,15 +2339,15 @@ mod tests {
             "mcp__git_hub__list_repos"
         );
         assert_eq!(tool_name("s", &"x".repeat(100)).len(), 64);
-        let config: Config = serde_json::from_str(
-            r#"{"mcpServers": {"fs": {"command": "npx", "args": ["-y", "pkg"], "autoApprove": ["read"]},
-                               "web": {"url": "https://example.com/mcp"}}}"#,
-        )
-        .unwrap();
-        assert_eq!(config.servers["fs"].args, ["-y", "pkg"]);
-        assert_eq!(config.servers["fs"].auto_approve, ["read"]);
+        let servers = entries(&json!({"mcpServers": {
+            "fs": {"command": "npx", "args": ["-y", "pkg"], "autoApprove": ["read"]},
+            "web": {"url": "https://example.com/mcp"},
+        }}));
+        let fs = servers["fs"].as_ref().unwrap();
+        assert_eq!(fs.args, ["-y", "pkg"]);
+        assert_eq!(fs.auto_approve, AutoApprove::Names(vec!["read".into()]));
         // A server reached by URL has no command, and is passed over.
-        assert!(config.servers["web"].command.is_empty());
+        assert!(servers["web"].as_ref().unwrap().command.is_empty());
     }
 
     #[test]
@@ -1290,9 +2361,10 @@ mod tests {
             ],
             ..Default::default()
         };
-        let tools = launch("everything", &config).unwrap();
-        let echo = tools
-            .iter()
+        open("everything", Ok(config));
+        ready(START_TIME);
+        let echo = tools()
+            .into_iter()
             .find(|t| t.name() == "mcp__everything__echo")
             .expect("the everything server has an echo tool");
         let said = echo
@@ -1303,7 +2375,7 @@ mod tests {
 
     #[test]
     fn only_values_named_as_secrets_are_hidden() {
-        let config: Config = serde_json::from_value(json!({"mcpServers": {
+        let config = entries(&json!({"mcpServers": {
             "files": {"command": "files-server", "env": {
                 "ROOT_FOLDER": "/home/someone/projects",
                 "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_0123456789abcdefghij",
@@ -1315,9 +2387,8 @@ mod tests {
                 "Authorization": "Bearer remote-0123456789abcdef",
                 "Accept": "application/json-seq"
             }}
-        }}))
-        .unwrap();
-        let mut found = secret_values(&config);
+        }}));
+        let mut found = secret_values(&config, &|_| None);
         found.sort();
         assert_eq!(
             found,
@@ -1356,5 +2427,426 @@ mod tests {
         assert_eq!(crate::media::saved_by("mcp__demo__shoot", &text), None);
         assert_eq!(text, " Saved to /etc/passwd\n[image/png, 3 bytes]");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The environment the variable tests see.
+    fn var(name: &str) -> Option<String> {
+        match name {
+            "TOKEN" => Some("tok-0123456789abcdef".into()),
+            "EMPTY" => Some(String::new()),
+            "HOME" => Some("/home/someone".into()),
+            _ => None,
+        }
+    }
+
+    /// A server that is only a script in the platform's shell.
+    fn shell(script: &str) -> ServerConfig {
+        let (command, flag) = if cfg!(windows) {
+            ("cmd", "/C")
+        } else {
+            ("sh", "-c")
+        };
+        ServerConfig {
+            command: command.into(),
+            args: vec![flag.into(), script.into()],
+            ..Default::default()
+        }
+    }
+
+    /// One server's status once `done` holds, or after five seconds.
+    fn settled(name: &str, done: impl Fn(&ServerStatus) -> bool) -> ServerStatus {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let now = status().into_iter().find(|s| s.name == name).unwrap();
+            if done(&now) || std::time::Instant::now() > deadline {
+                return now;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn variables_are_filled_in_from_the_environment_or_their_defaults() {
+        for (text, filled) in [
+            ("Bearer ${TOKEN}", "Bearer tok-0123456789abcdef"),
+            ("${TOKEN:-unused}", "tok-0123456789abcdef"),
+            ("${UNSET:-8080}", "8080"),
+            ("${EMPTY:-fallback}", "fallback"),
+            ("[${EMPTY}]", "[]"),
+            ("${HOME}/work, ${HOME}", "/home/someone/work, /home/someone"),
+            ("$TOKEN and ${never closed", "$TOKEN and ${never closed"),
+        ] {
+            assert_eq!(expand(text, &var).unwrap(), filled, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_variable_unset_with_no_default_keeps_its_server_from_starting_and_is_named() {
+        let error = expand("--token=${GITHUB_TOKEN}", &var).unwrap_err();
+        assert!(error.starts_with("${GITHUB_TOKEN} is not set"), "{error}");
+        let config = ServerConfig {
+            command: "never-run".into(),
+            env: HashMap::from([("KEY".into(), "${LETRONNA_TEST_NEVER_SET}".into())]),
+            ..Default::default()
+        };
+        let Err(error) = launch("files", &config, 0) else {
+            panic!("a server started without its variable");
+        };
+        assert!(
+            error.starts_with("files: ${LETRONNA_TEST_NEVER_SET} is not set"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn every_part_of_a_servers_config_has_its_variables_filled_in() {
+        let config: ServerConfig = serde_json::from_value(json!({
+            "command": "${HOME}/bin/server", "args": ["--token", "${TOKEN}"],
+            "cwd": "${HOME}/work", "url": "https://${HOST:-example.com}/mcp",
+            "env": {"API_KEY": "${TOKEN}"},
+            "headers": {"Authorization": "Bearer ${TOKEN}"}
+        }))
+        .unwrap();
+        let config = config.expanded(&var).unwrap();
+        assert_eq!(config.command, "/home/someone/bin/server");
+        assert_eq!(config.args, ["--token", "tok-0123456789abcdef"]);
+        assert_eq!(config.cwd.as_deref(), Some("/home/someone/work"));
+        assert_eq!(config.url, "https://example.com/mcp");
+        assert_eq!(config.env["API_KEY"], "tok-0123456789abcdef");
+        assert_eq!(
+            config.headers["Authorization"],
+            "Bearer tok-0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn a_secret_given_as_a_variable_is_hidden_as_its_value() {
+        let config = entries(&json!({"mcpServers": {
+            "remote": {"url": "https://mcp.example.com",
+                "headers": {"Authorization": "Bearer ${TOKEN}"}},
+            "files": {"command": "files-server", "env": {
+                "API_KEY": "${UNSET_KEY:-default-key-0123456789}",
+                "OTHER_TOKEN": "${UNSET_TOKEN}"
+            }}
+        }}));
+        let mut found = secret_values(&config, &var);
+        found.sort();
+        assert_eq!(found, ["default-key-0123456789", "tok-0123456789abcdef"]);
+    }
+
+    #[test]
+    fn globs_match_any_run_of_characters_where_a_star_stands() {
+        for (glob, name, matches) in [
+            ("read_file", "read_file", true),
+            ("read_file", "read_files", false),
+            ("read_*", "read_file", true),
+            ("read_*", "read_", true),
+            ("*_file", "write_file", true),
+            ("*", "anything", true),
+            ("get_*_by_*", "get_issue_by_id", true),
+            ("get_*_by_*", "get_issue", false),
+            ("a*a", "a", false),
+            ("*b*b", "b", false),
+            ("Read*", "read_file", false),
+        ] {
+            assert_eq!(matches_glob(glob, name), matches, "{glob} {name}");
+        }
+    }
+
+    #[test]
+    fn include_and_exclude_globs_choose_which_tools_a_server_offers() {
+        let (from_client, to_server) = std::io::pipe().unwrap();
+        let (from_server, to_client) = std::io::pipe().unwrap();
+        scripted_server(from_client, to_client);
+        let config: ServerConfig = serde_json::from_value(json!({
+            "includeTools": ["echo", "look*", "planted"],
+            "excludeTools": ["plant*"]
+        }))
+        .unwrap();
+        let tools = connect("demo", &config, from_server, to_server).unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert_eq!(names, ["mcp__demo__echo", "mcp__demo__look_up"]);
+        assert!(ServerConfig::default().offers("anything"));
+        let config = ServerConfig {
+            exclude_tools: vec!["delete_*".into()],
+            ..Default::default()
+        };
+        assert!(config.offers("read_file") && !config.offers("delete_file"));
+    }
+
+    #[test]
+    fn auto_approve_read_only_takes_a_remote_servers_word_that_a_tool_only_looks() {
+        let config: ServerConfig = serde_json::from_value(json!({
+            "url": "https://example.com/mcp", "autoApprove": "readOnly"
+        }))
+        .unwrap();
+        let (from_client, to_server) = std::io::pipe().unwrap();
+        let (from_server, to_client) = std::io::pipe().unwrap();
+        scripted_server(from_client, to_client);
+        let tools = connect("demo", &config, from_server, to_server).unwrap();
+        let (echo, look_up, planted) = (&tools[0], &tools[1], &tools[2]);
+        assert!(!look_up.needs_approval());
+        assert!(echo.needs_approval() && planted.needs_approval());
+        let looks = json!({"readOnlyHint": true, "openWorldHint": false});
+        assert!(!AutoApprove::Word("readonly".into()).approves("look up", &looks));
+        assert!(!AutoApprove::Word("look up".into()).approves("look up", &looks));
+    }
+
+    #[test]
+    fn a_server_that_does_not_answer_within_its_startup_time_is_given_up_on() {
+        let (_from_client, to_server) = std::io::pipe().unwrap();
+        let (from_server, _to_client) = std::io::pipe().unwrap();
+        let config = ServerConfig {
+            startup_timeout_ms: Some(300),
+            ..Default::default()
+        };
+        let asked = std::time::Instant::now();
+        let Err(error) = connect("mute", &config, from_server, to_server) else {
+            panic!("a mute server started");
+        };
+        assert!(error.contains("did not answer initialize"), "{error}");
+        assert!(asked.elapsed() < Duration::from_secs(5));
+        for (ms, start_time) in [
+            (None, START_TIME),
+            (Some(0), START_TIME),
+            (Some(300_000), Duration::from_secs(300)),
+            (Some(u64::MAX), LONGEST_CALL),
+        ] {
+            let config = ServerConfig {
+                startup_timeout_ms: ms,
+                ..Default::default()
+            };
+            assert_eq!(config.start_time(), start_time, "{ms:?}");
+        }
+    }
+
+    /// The names in the environment a server started with `config` is given.
+    #[cfg(unix)]
+    fn environment_of(config: &ServerConfig) -> Vec<String> {
+        let config = ServerConfig {
+            command: "env".into(),
+            ..config.clone()
+        };
+        let printed = spawn(&config, Path::new("/"))
+            .unwrap()
+            .wait_with_output()
+            .unwrap();
+        String::from_utf8_lossy(&printed.stdout)
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .map(|(name, _)| name.to_owned())
+            .collect()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_scrubbed_server_is_given_only_where_things_are_and_its_own_env() {
+        let config = ServerConfig {
+            env: HashMap::from([("SERVER_ONLY".into(), "yes".into())]),
+            env_scrub: true,
+            ..Default::default()
+        };
+        let names = environment_of(&config);
+        let has = |name: &str| names.iter().any(|n| n == name);
+        assert!(has("PATH") && has("SERVER_ONLY"), "{names:?}");
+        assert!(
+            names
+                .iter()
+                .all(|n| n == "SERVER_ONLY" || KEPT_ENV.contains(&n.as_str())),
+            "{names:?}"
+        );
+        // Unscrubbed, it inherits every variable, as before.
+        let inherited = environment_of(&ServerConfig {
+            env_scrub: false,
+            ..config
+        });
+        // macOS drops DYLD_ variables on the way into a system program.
+        let outside = std::env::vars_os()
+            .filter_map(|(name, _)| name.into_string().ok())
+            .filter(|name| !KEPT_ENV.contains(&name.as_str()) && !name.starts_with("DYLD_"));
+        for name in outside {
+            assert!(inherited.contains(&name), "{name}");
+        }
+        assert!(inherited.iter().any(|n| n == "SERVER_ONLY"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_server_starts_in_its_cwd_taken_from_the_config_folder() {
+        let base = std::env::temp_dir().join(format!("letronna-mcp-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("work")).unwrap();
+        let config = ServerConfig {
+            command: "pwd".into(),
+            args: vec!["-P".into()],
+            cwd: Some("work".into()),
+            ..Default::default()
+        };
+        let printed = spawn(&config, &base).unwrap().wait_with_output().unwrap();
+        let said = String::from_utf8_lossy(&printed.stdout);
+        assert_eq!(
+            Path::new(said.trim()),
+            base.join("work").canonicalize().unwrap()
+        );
+        let absolute = ServerConfig {
+            cwd: Some(base.display().to_string()),
+            ..Default::default()
+        };
+        assert_eq!(absolute.folder(Path::new("/elsewhere")), Some(base.clone()));
+        assert_eq!(ServerConfig::default().folder(&base), None);
+        // One that is not there is said before anything starts.
+        let gone = ServerConfig {
+            cwd: Some("gone".into()),
+            ..config
+        };
+        let error = spawn(&gone, &base).unwrap_err();
+        assert!(error.contains("no such folder"), "{error}");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_links_to_another_apps_config_stays_a_link() {
+        let dir = scratch("linked");
+        let theirs = dir.join("claude_desktop_config.json");
+        std::fs::write(&theirs, r#"{"mcpServers": {}, "theirs": true}"#).unwrap();
+        let path = dir.join("mcp.json");
+        std::os::unix::fs::symlink(&theirs, &path).unwrap();
+        edit(&path, |s| add(s, "a", json!({"command": "x"}))).unwrap();
+        assert!(path.symlink_metadata().unwrap().file_type().is_symlink());
+        let file = read_config(&theirs).unwrap();
+        assert_eq!(file["theirs"], true);
+        assert_eq!(file["mcpServers"]["a"]["command"], "x");
+    }
+
+    #[test]
+    fn a_file_that_will_not_parse_is_left_for_the_user_to_fix() {
+        let dir = scratch("broken");
+        let path = dir.join("mcp.json");
+        std::fs::write(&path, "{\"mcpServers\": {,}").unwrap();
+        let refused = edit(&path, |s| add(s, "a", json!({"command": "x"}))).unwrap_err();
+        assert!(refused.contains("will not parse"), "{refused}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"mcpServers\": {,}"
+        );
+        // No file at all is no servers, and the first one added makes it.
+        let fresh = dir.join("new").join("mcp.json");
+        edit(&fresh, |s| add(s, "a", json!({"command": "x"}))).unwrap();
+        assert_eq!(
+            read_config(&fresh).unwrap()["mcpServers"]["a"]["command"],
+            "x"
+        );
+    }
+
+    #[test]
+    fn a_server_that_cannot_start_keeps_why_and_what_it_printed() {
+        let script = if cfg!(windows) {
+            "echo no key given, not sk-0123456789abcdefghijklmnop 1>&2 & exit 3"
+        } else {
+            "echo no key given, not sk-0123456789abcdefghijklmnop >&2; exit 3"
+        };
+        open("t-crash", Ok(shell(script)));
+        let crashed = settled("t-crash", |s| {
+            s.state == State::Failed && s.log.contains("no key given")
+        });
+        assert_eq!(crashed.state, State::Failed);
+        let error = crashed.error.unwrap_or_default();
+        assert!(error.contains("stopped"), "{error}");
+        assert!(crashed.log.contains("no key given"), "{}", crashed.log);
+        // Scrubbed as a job's log is, for a screen others may see.
+        assert!(!crashed.log.contains("sk-0123"), "{}", crashed.log);
+        assert!(crashed.log.contains(crate::redact::MARKER));
+        assert_eq!((crashed.transport, crashed.tools), ("stdio", 0));
+    }
+
+    #[test]
+    fn adding_and_removing_servers_keeps_what_else_the_file_holds() {
+        let path = scratch("edits").join("mcp.json");
+        std::fs::write(
+            &path,
+            r#"{"theme": "dark", "mcpServers": {"z": {"command": "x", "cursorOnly": 1},
+                "a": {"url": "https://a"}, "m": {"command": "m"}}}"#,
+        )
+        .unwrap();
+        edit(&path, |s| {
+            add(s, "new", json!({"command": "y", "args": ["1"]}))
+        })
+        .unwrap();
+        edit(&path, |s| switch(s, "z", false)).unwrap();
+        edit(&path, |s| remove(s, "a")).unwrap();
+        let file = read_config(&path).unwrap();
+        assert_eq!(file["theme"], "dark");
+        assert_eq!(
+            file["mcpServers"]["z"],
+            json!({"command": "x", "cursorOnly": 1, "disabled": true})
+        );
+        let mut names: Vec<&String> = file["mcpServers"].as_object().unwrap().keys().collect();
+        names.sort();
+        assert_eq!(names, ["m", "new", "z"]);
+        edit(&path, |s| switch(s, "z", true)).unwrap();
+        assert!(
+            read_config(&path).unwrap()["mcpServers"]["z"]
+                .get("disabled")
+                .is_none()
+        );
+
+        // A name taken, one not there, or an entry that will not read is
+        // refused, and the file is left as it was.
+        let before = std::fs::read(&path).unwrap();
+        let taken = edit(&path, |s| add(s, "m", json!({"command": "z"}))).unwrap_err();
+        assert!(taken.contains("already"), "{taken}");
+        let gone = edit(&path, |s| remove(s, "nope")).unwrap_err();
+        assert!(gone.contains("no nope"), "{gone}");
+        let unread = edit(&path, |s| add(s, "b", json!({"args": "x"}))).unwrap_err();
+        assert!(unread.contains("will not read"), "{unread}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn one_entry_that_will_not_read_does_not_hide_the_rest() {
+        let servers = entries(&json!({"mcpServers": {
+            "bad": {"command": "x", "args": "one string"},
+            "good": {"command": "x"},
+        }}));
+        assert!(servers["good"].is_ok());
+        open("t-bad", servers["bad"].clone());
+        let bad = settled("t-bad", |_| true);
+        assert_eq!(bad.state, State::Failed);
+        assert!(bad.error.unwrap().contains("will not read"));
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        // One folder per test, reused and emptied each run.
+        let dir = std::env::temp_dir().join(format!("letronna-mcp-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    // Unix only: cmd cannot hand itself over to its child as `exec` does,
+    // and a child left behind would hold the pipes open.
+    #[cfg(unix)]
+    #[test]
+    fn starting_a_server_again_stops_the_one_still_starting() {
+        let began = std::time::Instant::now();
+        let hangs = shell("echo waiting >&2; exec sleep 30");
+        open("t-hang", Ok(hangs.clone()));
+        settled("t-hang", |s| s.log.contains("waiting"));
+        open("t-hang", Ok(hangs.clone()));
+        let again = settled("t-hang", |s| s.log.matches("waiting").count() == 2);
+        assert!(again.log.contains("--- started again ---"), "{}", again.log);
+        assert_eq!(again.state, State::Starting);
+        open(
+            "t-hang",
+            Ok(ServerConfig {
+                disabled: true,
+                ..hangs
+            }),
+        );
+        // Both runs were stopped, so neither waits out its minute to start.
+        ready(Duration::from_secs(20));
+        assert!(began.elapsed() < Duration::from_secs(15));
+        let off = settled("t-hang", |_| true);
+        assert_eq!((off.state, off.error), (State::Disabled, None));
     }
 }
