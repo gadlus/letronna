@@ -2547,7 +2547,7 @@ impl Chat {
         let Some(ix) = self.store.index_of(id) else {
             return false;
         };
-        let Some(standing) = self.store.conversations[ix].goal.clone() else {
+        let Some(standing) = goal::active(&self.store.conversations[ix].goal) else {
             return false;
         };
         let mut connection = match self.connection_for(ix, None) {
@@ -2604,7 +2604,7 @@ impl Chat {
                 self.note = Some(notice);
                 self.start_in(id, goal::continuation(message), cx);
             }
-            goal::Step::Met(notice) | goal::Step::Stop(notice) => {
+            goal::Step::Done(notice) | goal::Step::Pause { notice, .. } => {
                 self.note = Some(notice);
                 self.wake_idle(cx);
             }

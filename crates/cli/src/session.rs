@@ -138,13 +138,14 @@ impl Runner {
             if self.stopped || self.bar.finished() {
                 goal::interrupted(&mut self.store.conversations[session].goal);
                 self.persist();
+                self.show_goal();
                 return answer;
             }
             // What was typed is the user's next turn, which the goal waits for.
             if answer.is_err() || self.bar.has_queued() {
                 return answer;
             }
-            let Some(standing) = self.store.conversations[session].goal.clone() else {
+            let Some(standing) = goal::active(&self.store.conversations[session].goal) else {
                 return answer;
             };
             let connection = self.connection(session);
@@ -173,28 +174,34 @@ impl Runner {
                     render::said(&render::dim("●"), &render::dim("Stopped."));
                     goal::Step::Cleared
                 }
-                Err(Unheard::Gone) => {
-                    goal::Step::Stop("The goal check ended without a verdict.".into())
-                }
+                Err(Unheard::Gone) => goal::Step::Pause {
+                    notice: "The goal check ended without a verdict. The goal is paused; \
+                             /goal resume carries on."
+                        .into(),
+                    why: "the check failed".into(),
+                },
             };
             cancel.set();
             let conversation = &mut self.store.conversations[session];
             goal::settle(&mut conversation.goal, &step);
             let (notice, message) = match step {
                 goal::Step::Continue { notice, message } => (notice, Some(message)),
-                goal::Step::Met(notice) | goal::Step::Stop(notice) => (notice, None),
+                goal::Step::Done(notice) | goal::Step::Pause { notice, .. } => (notice, None),
                 goal::Step::Cleared => {
                     goal::interrupted(&mut conversation.goal);
                     self.persist();
+                    self.show_goal();
                     return answer;
                 }
             };
             render::blank();
             render::said(&render::dim("●"), &render::dim(&notice));
+            self.show_goal();
             let Some(message) = message else {
                 self.persist();
                 return answer;
             };
+            let conversation = &mut self.store.conversations[session];
             conversation.messages.push(goal::continuation(message));
             conversation.updated = chat::now();
             self.persist();
@@ -997,9 +1004,18 @@ impl Runner {
             letronna_core::store::fill(conversation);
             self.bar.set_plan(&conversation.todos);
         }
+        self.show_goal();
         // Each session has its own model, and the footer names it.
         let note = crate::banner::footer(self);
         self.bar.set_footer(note);
+    }
+
+    /// Show the open session's goal over the box, as the window does, or
+    /// nothing when it has none.
+    pub fn show_goal(&mut self) {
+        let conversation = self.store.conversations.get(self.store.active);
+        let line = conversation.and_then(|c| c.goal.as_ref().map(goal::Goal::line));
+        self.bar.set_goal(line);
     }
 
     /// A session of its own.
@@ -1014,6 +1030,7 @@ impl Runner {
         let index = self.store.conversations.len() - 1;
         self.store.active = index;
         self.bar.set_plan(&[]);
+        self.bar.set_goal(None);
         let note = crate::banner::footer(self);
         self.bar.set_footer(note);
         index

@@ -230,6 +230,7 @@ pub fn command(
             let goal = &mut runner.store.conversations[*session].goal;
             let said = goal::apply_command(goal, goal::parse(rest));
             runner.persist();
+            runner.show_goal();
             render::blank();
             match said {
                 Ok(said) => said
@@ -1541,6 +1542,7 @@ fn branch(runner: &mut Runner, session: &mut usize, name: &str) {
     *session = runner.store.conversations.len() - 1;
     runner.store.active = *session;
     runner.persist();
+    runner.show_goal();
     render::blank();
     render::line(&render::dim(&format!(
         "Now in {title}. The original is kept; /resume goes back to it."

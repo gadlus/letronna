@@ -129,7 +129,7 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "/goal",
-        blurb: "keep working until a goal is met: /goal <text>, check <command>, clear",
+        blurb: "keep working until a goal is met: /goal <text>, check <command>, resume, clear",
     },
     Command {
         name: "/image",
@@ -342,6 +342,8 @@ pub struct Bar {
     /// The open session's checklist, shown over the box while any of it is
     /// left to do.
     plan: Vec<Todo>,
+    /// The open session's goal on one line, shown over the box while it has one.
+    goal: Option<String>,
     /// The session whose helpers are shown, or 0 before one is open.
     helpers_of: u64,
     /// A line for each of its helpers at work, as last looked at.
@@ -386,6 +388,7 @@ impl Bar {
             waiting: None,
             ticked: std::time::Instant::now(),
             plan: Vec::new(),
+            goal: None,
             helpers_of: 0,
             relay: Vec::new(),
             looked: std::time::Instant::now(),
@@ -431,6 +434,12 @@ impl Bar {
     /// Show this checklist over the box, in place of the one before.
     pub fn set_plan(&mut self, todos: &[Todo]) {
         self.plan = todos.to_vec();
+        self.settle();
+    }
+
+    /// Show this goal line over the box, or none.
+    pub fn set_goal(&mut self, line: Option<String>) {
+        self.goal = line;
         self.settle();
     }
 
@@ -1310,6 +1319,14 @@ impl Bar {
                 ));
             }
         }
+        // Next to the box, since what is typed there ends the run it drives.
+        if let Some(goal) = &self.goal {
+            lines.push(format!(
+                "{}{}",
+                render::PAD,
+                render::dim(&one_row(goal, room))
+            ));
+        }
         lines.push(format!(
             "{}{}",
             render::MARGIN,
@@ -1905,6 +1922,20 @@ mod tests {
         assert_eq!(late.len(), 1 + PLAN_ROWS);
         assert_eq!(late[1], "    ✓ step 8");
         assert_eq!(late.last().unwrap(), "    ○ step 12");
+    }
+
+    #[test]
+    fn a_goal_shows_on_the_line_over_the_box_until_it_goes() {
+        let mut bar = Bar::new(String::new());
+        assert!(above_the_box(&bar).is_empty());
+        bar.set_goal(Some(
+            "Goal: ship it · 20/20 · paused: 20 continuations".into(),
+        ));
+        let above = above_the_box(&bar);
+        assert_eq!(above.len(), 1, "{above:?}");
+        assert!(above[0].contains("paused: 20 continuations"), "{above:?}");
+        bar.set_goal(None);
+        assert!(above_the_box(&bar).is_empty());
     }
 
     #[test]

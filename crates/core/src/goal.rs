@@ -8,10 +8,13 @@
 //! cheap model call that answers with a single JSON verdict. `continue` sends
 //! the agent back, in Letronna's words, with the judge's note on what is
 //! left fenced as untrusted, since the judge read what pages and files
-//! said; `met`, `blocked` and `waiting` stop, and so does a verdict that
-//! cannot be read, since carrying on is the costly mistake. So do twenty
-//! continuations in a row, however sure the judge is that the next will do
-//! it.
+//! said; `met` and `blocked` drop the goal; `waiting` pauses it, and so
+//! does a verdict that cannot be read, since carrying on is the costly
+//! mistake. So do twenty continuations in a row, however sure the judge is
+//! that the next will do it. A paused goal stays set but is not looked at
+//! again, whatever the user sends, until `/goal resume` or a new goal: a
+//! question asked an hour later about something else must not wake twenty
+//! turns of work the user had put aside.
 //!
 //! The look runs on the headless driver with no tools and no history, the
 //! goal, the last reply and the check's output being all it reads, on the
@@ -72,6 +75,10 @@ pub struct Goal {
     /// Turns started automatically since the user last typed or stopped.
     #[serde(default)]
     pub continuations: u32,
+    /// Why the goal is paused, when it is: set, but not looked at until the
+    /// user resumes it or sets another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused: Option<String>,
 }
 
 /// How far the judge says the goal is.
@@ -95,10 +102,10 @@ pub struct Verdict {
 pub enum Step {
     /// Show `notice`, then start a turn on `continuation(message)`.
     Continue { notice: String, message: String },
-    /// The goal is reached: show the notice and drop the goal.
-    Met(String),
-    /// Stop and show why, keeping the goal for the user's next turn.
-    Stop(String),
+    /// The goal is reached, or out of reach: show the notice and drop it.
+    Done(String),
+    /// Show `notice` and pause the goal for `why` until the user resumes it.
+    Pause { notice: String, why: String },
     /// The user stopped or typed meanwhile, so nothing follows and nothing is said.
     Cleared,
 }
@@ -111,6 +118,8 @@ pub enum Command {
     Set(String),
     /// Set the check command, or drop it when empty.
     Check(String),
+    /// Make a paused goal active again, with its count started over.
+    Resume,
     Clear,
 }
 
@@ -120,18 +129,27 @@ impl Goal {
         Goal {
             text: text.trim().to_owned(),
             check,
-            continuations: 0,
+            ..Default::default()
         }
     }
 
-    /// How the goal reads on one line, with its count once it has one.
+    /// How the goal reads on one line, with its count once it has one and
+    /// why it is paused when it is.
     pub fn line(&self) -> String {
         let mut line = format!("Goal: {}", tools::one_line(&self.text));
         if self.continuations > 0 {
             line.push_str(&format!(" · {}/{MAX_CONTINUATIONS}", self.continuations));
         }
+        if let Some(why) = &self.paused {
+            line.push_str(&format!(" · paused: {why}"));
+        }
         line
     }
+}
+
+/// The session's goal, when it has one that is not paused.
+pub fn active(goal: &Option<Goal>) -> Option<Goal> {
+    goal.clone().filter(|goal| goal.paused.is_none())
 }
 
 /// Reads what follows `/goal`.
@@ -142,6 +160,9 @@ pub fn parse(args: &str) -> Command {
     }
     if args == "clear" {
         return Command::Clear;
+    }
+    if args == "resume" {
+        return Command::Resume;
     }
     match args.strip_prefix("check") {
         Some(rest) if rest.is_empty() || rest.starts_with(char::is_whitespace) => {
@@ -155,17 +176,15 @@ pub fn parse(args: &str) -> Command {
 pub fn apply_command(goal: &mut Option<Goal>, command: Command) -> Result<String, String> {
     match command {
         Command::Show => Ok(match goal {
-            Some(goal) => match &goal.check {
-                Some(check) => format!("{}\nChecked with: {check}", goal.line()),
-                None => goal.line(),
-            },
+            Some(goal) => shown(goal),
             None => "No goal is set. /goal <what to reach> sets one.".to_owned(),
         }),
         Command::Set(text) => {
             let check = goal.take().and_then(|old| old.check);
             let set = Goal::new(&text, check);
             let said = format!(
-                "{}\nChecked after each turn until it is met, blocked or waiting on you.",
+                "{}\nChecked after each turn until it is met or blocked; it pauses when it \
+                 waits on you.",
                 set.line()
             );
             *goal = Some(set);
@@ -183,6 +202,17 @@ pub fn apply_command(goal: &mut Option<Goal>, command: Command) -> Result<String
             goal.check = Some(check);
             Ok(said)
         }
+        Command::Resume => {
+            let Some(goal) = goal.as_mut() else {
+                return Err("No goal is set. /goal <what to reach> sets one.".into());
+            };
+            goal.paused = None;
+            goal.continuations = 0;
+            Ok(format!(
+                "{}\nResumed: checked after your next turn.",
+                goal.line()
+            ))
+        }
         Command::Clear => Ok(match goal.take() {
             Some(_) => "Goal cleared.".to_owned(),
             None => "No goal was set.".to_owned(),
@@ -190,16 +220,29 @@ pub fn apply_command(goal: &mut Option<Goal>, command: Command) -> Result<String
     }
 }
 
+/// The goal as `/goal` shows it: its line, its check, and how to go on.
+fn shown(goal: &Goal) -> String {
+    let mut shown = goal.line();
+    if let Some(check) = &goal.check {
+        shown.push_str(&format!("\nChecked with: {check}"));
+    }
+    if goal.paused.is_some() {
+        shown.push_str("\n/goal resume carries on from here.");
+    }
+    shown
+}
+
 /// The user typed or stopped: the automatic run is over, and the next one
-/// gets its full count.
+/// gets its full count. A paused goal stays as it is, count and all, since
+/// only `/goal resume` or a new goal makes it active again.
 pub fn interrupted(goal: &mut Option<Goal>) {
-    if let Some(goal) = goal {
+    if let Some(goal) = goal.as_mut().filter(|goal| goal.paused.is_none()) {
         goal.continuations = 0;
     }
 }
 
-/// Puts `step` into the session's goal: one more continuation counted, or
-/// a goal that is met dropped.
+/// Puts `step` into the session's goal: one more continuation counted, a
+/// goal that is done dropped, or one that paused marked so.
 pub fn settle(goal: &mut Option<Goal>, step: &Step) {
     match step {
         Step::Continue { .. } => {
@@ -207,8 +250,13 @@ pub fn settle(goal: &mut Option<Goal>, step: &Step) {
                 goal.continuations += 1;
             }
         }
-        Step::Met(_) => *goal = None,
-        Step::Stop(_) | Step::Cleared => {}
+        Step::Done(_) => *goal = None,
+        Step::Pause { why, .. } => {
+            if let Some(goal) = goal {
+                goal.paused = Some(why.clone());
+            }
+        }
+        Step::Cleared => {}
     }
 }
 
@@ -256,17 +304,19 @@ fn review_with(
 fn decide(goal: &Goal, judged: Result<String, String>) -> Step {
     let verdict = match judged.and_then(|reply| verdict(&reply)) {
         Ok(verdict) => verdict,
-        Err(why) => return Step::Stop(format!("The goal check stopped: {why}")),
+        Err(why) => return pause(format!("The goal check failed: {why}"), "the check failed"),
     };
     let reason = verdict.reason;
     match verdict.status {
-        Status::Met => Step::Met(format!("Goal met: {reason}")),
-        Status::Blocked => Step::Stop(format!("Goal blocked: {reason}")),
-        Status::Waiting => Step::Stop(format!("Goal waiting on you: {reason}")),
-        Status::Continue if goal.continuations >= MAX_CONTINUATIONS => Step::Stop(format!(
-            "Goal not met after {MAX_CONTINUATIONS} continuations, so it stopped: {reason}. \
-             Send a message to carry on, or /goal clear."
+        Status::Met => Step::Done(format!("Goal met: {reason}")),
+        Status::Blocked => Step::Done(format!(
+            "Goal blocked, so it is cleared: {reason}. /goal <what to reach> sets it again."
         )),
+        Status::Waiting => pause(format!("Goal waiting on you: {reason}"), "waiting on you"),
+        Status::Continue if goal.continuations >= MAX_CONTINUATIONS => pause(
+            format!("Goal not met after {MAX_CONTINUATIONS} continuations: {reason}"),
+            &format!("{MAX_CONTINUATIONS} continuations"),
+        ),
         Status::Continue => {
             let count = goal.continuations + 1;
             Step::Continue {
@@ -274,6 +324,14 @@ fn decide(goal: &Goal, judged: Result<String, String>) -> Step {
                 message: carry_on(goal, &reason),
             }
         }
+    }
+}
+
+/// A pause for `why`, its notice saying how to go on.
+fn pause(notice: String, why: &str) -> Step {
+    Step::Pause {
+        notice: format!("{notice}. The goal is paused; /goal resume carries on."),
+        why: why.to_owned(),
     }
 }
 
@@ -440,7 +498,7 @@ mod tests {
     fn run_loop(goal: Goal, model: &Scripted) -> (Vec<Step>, Option<Goal>) {
         let mut kept = Some(goal);
         let mut steps = Vec::new();
-        while let Some(goal) = kept.clone() {
+        while let Some(goal) = active(&kept) {
             let step = review_with(
                 &goal,
                 "Fixed one test.",
@@ -459,10 +517,17 @@ mod tests {
     }
 
     #[test]
-    fn a_met_verdict_stops_and_drops_the_goal() {
+    fn a_met_or_blocked_verdict_stops_and_drops_the_goal() {
         let model = Scripted::new(&[r#"{"status":"met","reason":"all tests pass"}"#]);
         let (steps, kept) = run_loop(goal(None), &model);
-        assert_eq!(steps, [Step::Met("Goal met: all tests pass".into())]);
+        assert_eq!(steps, [Step::Done("Goal met: all tests pass".into())]);
+        assert_eq!(kept, None);
+        let model = Scripted::new(&[r#"{"status":"blocked","reason":"no access"}"#]);
+        let (steps, kept) = run_loop(goal(None), &model);
+        assert!(
+            matches!(&steps[..], [Step::Done(n)] if n.starts_with("Goal blocked, so it is cleared: no access")),
+            "{steps:?}"
+        );
         assert_eq!(kept, None);
     }
 
@@ -489,14 +554,23 @@ mod tests {
         assert!(continuation(message.clone()).notice);
         assert_eq!(
             steps[1],
-            Step::Stop("Goal waiting on you: needs a key".into())
+            Step::Pause {
+                notice: "Goal waiting on you: needs a key. The goal is paused; /goal resume \
+                         carries on."
+                    .into(),
+                why: "waiting on you".into(),
+            }
         );
-        // Kept for the user's next turn, with the continuation counted.
-        assert_eq!(kept.map(|g| g.continuations), Some(1));
+        // Kept but paused, with the continuation counted.
+        let kept = kept.unwrap();
+        assert_eq!(
+            (kept.continuations, kept.paused.as_deref()),
+            (1, Some("waiting on you"))
+        );
     }
 
     #[test]
-    fn continuations_stop_at_twenty() {
+    fn continuations_pause_at_twenty() {
         let replies = vec![r#"{"status":"continue","reason":"not yet"}"#; 21];
         let model = Scripted::new(&replies);
         let (steps, kept) = run_loop(goal(None), &model);
@@ -506,18 +580,20 @@ mod tests {
             .count();
         assert_eq!(continued, MAX_CONTINUATIONS as usize);
         assert_eq!(steps.len(), 21);
-        let Some(Step::Stop(notice)) = steps.last() else {
+        let Some(Step::Pause { notice, .. }) = steps.last() else {
             panic!("{steps:?}");
         };
         assert!(
             notice.starts_with("Goal not met after 20 continuations"),
             "{notice}"
         );
-        assert_eq!(kept.map(|g| g.continuations), Some(MAX_CONTINUATIONS));
+        let kept = kept.unwrap();
+        assert_eq!(kept.continuations, MAX_CONTINUATIONS);
+        assert_eq!(kept.paused.as_deref(), Some("20 continuations"));
     }
 
     #[test]
-    fn a_bad_verdict_or_an_error_stops_the_loop() {
+    fn a_bad_verdict_or_an_error_pauses_the_goal() {
         for reply in [
             "Yes, the goal is met.",
             r#"{"status":"done","reason":"finished"}"#,
@@ -529,10 +605,10 @@ mod tests {
             let model = Scripted::new(&[reply]);
             let (steps, kept) = run_loop(goal(None), &model);
             assert!(
-                matches!(steps.as_slice(), [Step::Stop(n)] if n.starts_with("The goal check stopped")),
+                matches!(steps.as_slice(), [Step::Pause { notice, .. }] if notice.starts_with("The goal check failed")),
                 "{reply:?} gave {steps:?}"
             );
-            assert!(kept.is_some());
+            assert_eq!(kept.unwrap().paused.as_deref(), Some("the check failed"));
         }
         let step = review_with(
             &goal(None),
@@ -541,7 +617,7 @@ mod tests {
             |_| String::new(),
             |_| Err("HTTP status server error (502 Bad Gateway)".into()),
         );
-        assert!(matches!(step, Step::Stop(n) if n.contains("502")));
+        assert!(matches!(step, Step::Pause { notice, .. } if notice.contains("502")));
     }
 
     #[test]
@@ -588,7 +664,7 @@ mod tests {
             |command| format!("ran {command}: test result: ok"),
             |prompt| model.ask(prompt),
         );
-        assert_eq!(step, Step::Met("Goal met: green".into()));
+        assert_eq!(step, Step::Done("Goal met: green".into()));
         let asked = model.asked.borrow();
         assert!(asked[0].contains("<goal>\nmake the tests pass\n</goal>"));
         let (reply, check) = asked[0].split_once("`cargo test`").unwrap();
@@ -660,5 +736,36 @@ mod tests {
             "Goal cleared."
         );
         assert_eq!(kept, None);
+    }
+
+    #[test]
+    fn a_paused_goal_waits_for_resume_whatever_the_user_says() {
+        let paused = Goal {
+            continuations: 20,
+            paused: Some("20 continuations".into()),
+            ..goal(None)
+        };
+        let mut kept = Some(paused.clone());
+        assert_eq!(active(&kept), None);
+        // An unrelated message neither wakes it nor starts its count again.
+        interrupted(&mut kept);
+        assert_eq!(kept, Some(paused));
+        let shown = apply_command(&mut kept, Command::Show).unwrap();
+        assert!(
+            shown.ends_with("/goal resume carries on from here."),
+            "{shown}"
+        );
+        assert_eq!(parse(" resume "), Command::Resume);
+        let said = apply_command(&mut kept, Command::Resume).unwrap();
+        assert!(
+            said.ends_with("Resumed: checked after your next turn."),
+            "{said}"
+        );
+        assert_eq!(active(&kept), Some(goal(None)));
+        assert!(apply_command(&mut None, Command::Resume).is_err());
+        // A new goal is active whatever the one it replaces was.
+        kept.as_mut().unwrap().paused = Some("blocked".into());
+        apply_command(&mut kept, parse("ship it")).unwrap();
+        assert!(active(&kept).is_some());
     }
 }
