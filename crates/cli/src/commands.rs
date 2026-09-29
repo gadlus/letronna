@@ -923,6 +923,27 @@ fn add_skills(runner: &mut Runner, source: &str) {
 /// the window; this is the shortlist you would actually pick from.
 const SESSION_CHOICES: usize = 9;
 
+/// How a session reads in the `/resume` list: its title, project folder and
+/// length.
+fn choice_label(conversation: &store::Conversation) -> String {
+    let title = match conversation.title.trim() {
+        "" => "untitled".to_owned(),
+        title => title.to_owned(),
+    };
+    let folder = conversation
+        .workspace
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "no project".into());
+    // Listed sessions are not read yet, so their messages are empty and the
+    // count comes from the listing.
+    format!(
+        "{title}  ·  {folder}  ·  {} messages",
+        conversation.length()
+    )
+}
+
 /// Pick up a session from before. The same files the window uses, so a
 /// conversation started there can be carried on here. With a `term`, only
 /// sessions whose title holds it are offered, or failing that, those where
@@ -958,23 +979,7 @@ pub fn resume(
 
     let labels: Vec<String> = recent
         .iter()
-        .map(|i| {
-            let conversation = &runner.store.conversations[*i];
-            let title = match conversation.title.trim() {
-                "" => "untitled".to_owned(),
-                title => title.to_owned(),
-            };
-            let folder = conversation
-                .workspace
-                .as_ref()
-                .and_then(|p| p.file_name())
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "no project".into());
-            format!(
-                "{title}  ·  {folder}  ·  {} messages",
-                conversation.messages.len()
-            )
-        })
+        .map(|i| choice_label(&runner.store.conversations[*i]))
         .collect();
 
     render::blank();
@@ -1632,7 +1637,7 @@ pub fn gateways(runner: &mut Runner) {
 
 #[cfg(test)]
 mod tests {
-    use super::{agent_rows, from_match, last_prompt, with_files};
+    use super::{agent_rows, choice_label, from_match, last_prompt, with_files};
     use letronna_core::agents::Seen;
     use letronna_core::chat::Message;
     use letronna_core::driver::Status;
@@ -1769,6 +1774,30 @@ mod tests {
         assert_eq!(
             from_match("nothing here", "\"signing key\""),
             "nothing here"
+        );
+    }
+
+    #[test]
+    fn a_listed_session_is_offered_with_the_messages_it_holds() {
+        // As the terminal lists it at start: counted, none of it read yet.
+        let listed = letronna_core::store::Conversation {
+            title: "Fix the build".into(),
+            workspace: Some("/work/letronna".into()),
+            counted: 4,
+            ..Default::default()
+        };
+        assert_eq!(
+            choice_label(&listed),
+            "Fix the build  ·  letronna  ·  4 messages"
+        );
+        // Once read, the messages themselves are the count.
+        let read = letronna_core::store::Conversation {
+            messages: vec![said("user", "one"), said("assistant", "two")],
+            ..Default::default()
+        };
+        assert_eq!(
+            choice_label(&read),
+            "untitled  ·  no project  ·  2 messages"
         );
     }
 }
