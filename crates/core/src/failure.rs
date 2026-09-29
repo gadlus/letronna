@@ -55,7 +55,21 @@ pub struct Failure {
     pub kind: FailureKind,
     /// How long the provider asked to be left alone, when it said.
     pub retry_after: Option<Duration>,
+    /// The limits an overflow named, when the failure is one.
+    pub overflow: Option<Overflow>,
     message: String,
+}
+
+/// What an overflow error said about the limits it ran into, in tokens;
+/// `None` is not said.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Overflow {
+    /// The most one request may hold, prompt and reply together.
+    pub context: Option<u64>,
+    /// What the prompt came to, as the provider counted it.
+    pub input: Option<u64>,
+    /// The most one reply may run to.
+    pub output: Option<u64>,
 }
 
 impl Failure {
@@ -64,6 +78,7 @@ impl Failure {
         Self {
             kind,
             retry_after: None,
+            overflow: None,
             message: message.into(),
         }
     }
@@ -86,13 +101,13 @@ pub fn classify(status: Option<u16>, headers: &HeaderMap, body: &Value) -> Failu
     let text = error.unwrap_or(body).to_string().to_lowercase();
     let kind = code
         .and_then(|code| by_status(code, error))
-        .or_else(|| by_code(error))
-        .or_else(|| {
-            PHRASES
-                .iter()
-                .find(|(phrase, _)| text.contains(phrase))
-                .map(|(_, kind)| *kind)
+        // Ollama answers an overflow with a 500, as it does a crash, and
+        // waiting would only send the same request again.
+        .filter(|kind| {
+            *kind != FailureKind::Server || by_phrase(&text) != Some(FailureKind::ContextTooLong)
         })
+        .or_else(|| by_code(error))
+        .or_else(|| by_phrase(&text))
         .unwrap_or(match code {
             // A 404 that names no missing model is more often a wrong base
             // URL, which no other model would mend.
@@ -100,9 +115,19 @@ pub fn classify(status: Option<u16>, headers: &HeaderMap, body: &Value) -> Failu
             Some(400..=499) => FailureKind::BadRequest,
             _ => FailureKind::Unknown,
         });
+    let overflow = match kind {
+        FailureKind::ContextTooLong => Some(limits(&text, error)),
+        // A reply asked for that is longer than the model writes is turned
+        // down as a bad request, and only its numbers say why.
+        FailureKind::BadRequest => {
+            Some(limits(&text, error)).filter(|o| o.output.is_some() || o.context.is_some())
+        }
+        _ => None,
+    };
     Failure {
         kind,
         retry_after: retry_after(headers),
+        overflow,
         message: words(status, body),
     }
 }
@@ -175,6 +200,63 @@ const PHRASES: &[(&str, FailureKind)] = &[
     ("not exist", FailureKind::NotFound),
     ("not found", FailureKind::NotFound),
 ];
+
+/// The kind the first of `PHRASES` found in the lowercase `text` names.
+fn by_phrase(text: &str) -> Option<FailureKind> {
+    PHRASES
+        .iter()
+        .find(|(phrase, _)| text.contains(phrase))
+        .map(|(_, kind)| *kind)
+}
+
+/// The limits an overflow error names, read from its lowercase `text` and
+/// from the numbers llama.cpp puts beside its words.
+fn limits(text: &str, error: Option<&Value>) -> Overflow {
+    let field = |name: &str| error.and_then(|e| e.get(name)?.as_u64());
+    let nth = |phrase: &str, n: usize| numbers(text, phrase).get(n).copied();
+    Overflow {
+        // OpenAI, OpenRouter and vLLM, then Anthropic's two.
+        context: field("n_ctx")
+            .or_else(|| nth("maximum context length is", 0))
+            .or_else(|| nth("prompt is too long", 1))
+            .or_else(|| nth("exceed context limit", 2)),
+        input: field("n_prompt_tokens")
+            .or_else(|| nth("resulted in", 0))
+            .or_else(|| nth("request has", 0))
+            .or_else(|| before(text, " of text input"))
+            .or_else(|| before(text, " in the messages"))
+            .or_else(|| nth("prompt is too long", 0))
+            .or_else(|| nth("exceed context limit", 0)),
+        // OpenAI's, then Anthropic's "max_tokens: 64000 > 32000, which is
+        // the maximum allowed number of output tokens".
+        output: nth("supports at most", 0).or_else(|| {
+            text.contains("maximum allowed number of output tokens")
+                .then(|| nth("max_tokens:", 1))
+                .flatten()
+        }),
+    }
+}
+
+/// The numbers in the clause of `text` that `phrase` begins, in order.
+fn numbers(text: &str, phrase: &str) -> Vec<u64> {
+    let Some(at) = text.find(phrase) else {
+        return Vec::new();
+    };
+    let rest = &text[at + phrase.len()..];
+    // A quote ends the clause too: the text is the error's JSON.
+    let clause = &rest[..rest.find([',', '.', '"']).unwrap_or(rest.len())];
+    clause
+        .split(|c: char| !c.is_ascii_digit())
+        .filter_map(|n| n.parse().ok())
+        .collect()
+}
+
+/// The number just before the first `phrase` in `text`.
+fn before(text: &str, phrase: &str) -> Option<u64> {
+    let head = &text[..text.find(phrase)?];
+    let digits = head.trim_end_matches(|c: char| c.is_ascii_digit());
+    head[digits.len()..].parse().ok()
+}
 
 /// The wait `Retry-After` asks for, from now.
 fn retry_after(headers: &HeaderMap) -> Option<Duration> {
@@ -521,5 +603,108 @@ mod tests {
         assert_eq!(wait("Wed, 21 Oct 2026 07:27:00 GMT"), None);
         assert_eq!(wait(" 12 "), Some(Duration::from_secs(12)));
         assert_eq!(wait("soon"), None);
+    }
+
+    #[test]
+    fn each_overflow_wording_gives_the_numbers_it_names() {
+        let limits = |context, input, output| Overflow {
+            context,
+            input,
+            output,
+        };
+        let cases = [
+            // OpenAI, now and before.
+            (
+                400,
+                r#"{"error":{"message":"This model's maximum context length is 128000 tokens. However, your messages resulted in 130532 tokens. Please reduce the length of the messages.","type":"invalid_request_error","param":"messages","code":"context_length_exceeded"}}"#,
+                FailureKind::ContextTooLong,
+                limits(Some(128_000), Some(130_532), None),
+            ),
+            (
+                400,
+                r#"{"error":{"message":"This model's maximum context length is 8192 tokens. However, you requested 8500 tokens (7000 in the messages, 1500 in the completion). Please reduce the length of the messages or completion.","type":"invalid_request_error","param":"messages","code":"context_length_exceeded"}}"#,
+                FailureKind::ContextTooLong,
+                limits(Some(8_192), Some(7_000), None),
+            ),
+            (
+                400,
+                r#"{"error":{"message":"max_tokens is too large: 50000. This model supports at most 16384 completion tokens, whereas you provided 50000.","type":"invalid_request_error","param":"max_tokens","code":null}}"#,
+                FailureKind::BadRequest,
+                limits(None, None, Some(16_384)),
+            ),
+            // OpenRouter's own, and Anthropic's through it.
+            (
+                400,
+                r#"{"error":{"message":"This endpoint's maximum context length is 200000 tokens. However, you requested about 213000 tokens (204808 of text input, 8192 in the output). Please reduce the length of either one.","code":400}}"#,
+                FailureKind::ContextTooLong,
+                limits(Some(200_000), Some(204_808), None),
+            ),
+            (
+                400,
+                r#"{"error":{"message":"Provider returned error","code":400,"metadata":{"raw":"{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"prompt is too long: 208437 tokens > 200000 maximum\"}}","provider_name":"Anthropic"}}}"#,
+                FailureKind::ContextTooLong,
+                limits(Some(200_000), Some(208_437), None),
+            ),
+            (
+                400,
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"input length and `max_tokens` exceed context limit: 188240 + 21333 > 200000, decrease input length or `max_tokens` and try again"}}"#,
+                FailureKind::BadRequest,
+                limits(Some(200_000), Some(188_240), None),
+            ),
+            (
+                400,
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: 64000 > 32000, which is the maximum allowed number of output tokens for claude-opus-4-20250514"}}"#,
+                FailureKind::BadRequest,
+                limits(None, None, Some(32_000)),
+            ),
+            // vLLM, for a long prompt and for a long reply.
+            (
+                400,
+                r#"{"object":"error","message":"This model's maximum context length is 32768 tokens. However, you requested 33792 tokens (25600 in the messages, 8192 in the completion). Please reduce the length of the messages or completion.","type":"BadRequestError","param":null,"code":400}"#,
+                FailureKind::ContextTooLong,
+                limits(Some(32_768), Some(25_600), None),
+            ),
+            (
+                400,
+                r#"{"error":{"message":"'max_tokens' or 'max_completion_tokens' is too large: 8192. This model's maximum context length is 32768 tokens and your request has 30000 input tokens (8192 > 32768 - 30000).","type":"BadRequestError","param":null,"code":400}}"#,
+                FailureKind::ContextTooLong,
+                limits(Some(32_768), Some(30_000), None),
+            ),
+            // llama.cpp, with its numbers beside the words and before it had them.
+            (
+                400,
+                r#"{"error":{"code":400,"message":"the request exceeds the available context size, try increasing it","type":"exceed_context_size_error","n_prompt_tokens":4589,"n_ctx":4096}}"#,
+                FailureKind::ContextTooLong,
+                limits(Some(4_096), Some(4_589), None),
+            ),
+            (
+                400,
+                r#"{"error":{"code":400,"message":"the request exceeds the available context size. try increasing the context size or enable context shift","type":"invalid_request_error"}}"#,
+                FailureKind::ContextTooLong,
+                Overflow::default(),
+            ),
+            // Ollama answers with a 500, and a proxy's size limit says nothing.
+            (
+                500,
+                r#"{"error":{"message":"the input length exceeds the context length","type":"api_error","param":null,"code":null}}"#,
+                FailureKind::ContextTooLong,
+                Overflow::default(),
+            ),
+            (413, "{}", FailureKind::ContextTooLong, Overflow::default()),
+        ];
+        for (status, body, expected, numbers) in cases {
+            let body: Value = serde_json::from_str(body).unwrap();
+            let failure = classify(Some(status), &HeaderMap::new(), &body);
+            assert_eq!(failure.kind, expected, "{body}");
+            assert_eq!(failure.overflow, Some(numbers), "{body}");
+        }
+    }
+
+    #[test]
+    fn a_bad_request_that_names_no_limit_is_no_overflow() {
+        let body = serde_json::json!({"error": {"message": "Invalid value for 'temperature': 3", "type": "invalid_request_error"}});
+        let failure = classify(Some(400), &HeaderMap::new(), &body);
+        assert_eq!(failure.kind, FailureKind::BadRequest);
+        assert_eq!(failure.overflow, None);
     }
 }
