@@ -428,7 +428,10 @@ fn ladder(call: &ToolCall, gate: &Gate, judge: Option<&dyn Fn(&str) -> Verdict>)
 /// Whether the tool named `name` spends the user's credit, which is theirs
 /// to decide rather than a question of safety for the judge.
 fn spends(name: &str) -> bool {
-    matches!(name, "make_image" | "speak" | "transcribe" | "make_video")
+    matches!(
+        name,
+        "make_image" | "edit_image" | "speak" | "transcribe" | "make_video"
+    )
 }
 
 /// What the judge's `verdict` on `tool` means for the call.

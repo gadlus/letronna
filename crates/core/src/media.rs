@@ -4,7 +4,9 @@
 //! uses: only Letronna sells them, and they are paid from the signed-in
 //! account's credit. So every one of them asks first -- it spends money --
 //! and its card says so. None is offered while signed out, when it could
-//! only fail.
+//! only fail. Editing a picture is the exception: it goes to the chat's own
+//! gateway, since OpenAI and the servers copying it have the same route, and
+//! is offered signed out whenever that gateway is not Letronna.
 //!
 //! What is made is saved as a file: in `media/` in the project folder, or in
 //! Letronna's own data folder when no project is attached. The result starts
@@ -100,6 +102,324 @@ impl Tool for MakeImage {
             path.display(),
             size(bytes.len())
         ))
+    }
+}
+
+pub struct EditImage;
+impl Tool for EditImage {
+    fn name(&self) -> &'static str {
+        "edit_image"
+    }
+    fn description(&self) -> &'static str {
+        "Change pictures as a description says -- edit one, combine several, or redraw only where a mask marks -- and save the result as a file. The pictures are files in the project, or ones already in this conversation by the path their result named. It goes to the chat's own gateway: on Letronna's hosted models it is paid from the user's credit, a few cents an image. Use it only when the user asks for a picture to be changed."
+    }
+    fn parameters(&self) -> Value {
+        json!({"type": "object", "properties": {
+            "images": {"type": "array", "items": {"type": "string"}, "description": "The pictures to edit, relative to the workspace, or a path in Letronna's media folder as an earlier result named it. Up to 16; the mask applies to the first."},
+            "prompt": {"type": "string", "description": "What to change, or what to make of the pictures, in detail."},
+            "mask": {"type": "string", "description": "A PNG the size of the first picture whose fully transparent parts are the only ones redrawn. Left out, the model decides."},
+            "size": {"type": "string", "description": "Width x height in pixels, such as 1024x1024. Left out, the model's own."},
+            "model": {"type": "string", "description": "An image model that can edit. Left out, the one the user picked, or the gateway's own."}
+        }, "required": ["images", "prompt"]})
+    }
+    fn needs_approval(&self) -> bool {
+        true
+    }
+    // Off Letronna it is the chat's own gateway that is paid, which needs no
+    // account; on it, the credit does.
+    fn offered(&self, connection: &Connection) -> bool {
+        crate::auth::signed_in() || !hosted(&connection.endpoint)
+    }
+    fn mutates(&self) -> bool {
+        true
+    }
+    fn preview(&self, args: &Value, ctx: &ToolContext) -> String {
+        let named: Vec<String> = pictures(args).iter().map(|p| format!("`{p}`")).collect();
+        let mut what = format!(
+            "Edit {}: {}",
+            named.join(", "),
+            args["prompt"].as_str().unwrap_or_default()
+        );
+        if let Some(mask) = args["mask"].as_str() {
+            what.push_str(&format!("\nOnly where `{mask}` is transparent."));
+        }
+        if let Some(size) = args["size"].as_str() {
+            what.push_str(&format!("\nSize: {size}"));
+        }
+        let endpoint = ctx
+            .caller
+            .connection
+            .as_deref()
+            .map(|c| c.endpoint.clone())
+            .unwrap_or_default();
+        if hosted(&endpoint) {
+            return card(what, args, "image");
+        }
+        let model = args["model"].as_str().unwrap_or("its own model");
+        let at = match endpoint.trim() {
+            "" => "the chat's gateway".to_owned(),
+            endpoint => endpoint.to_owned(),
+        };
+        format!("{what}\n\nMade by {model} at {at}, paid to that gateway.")
+    }
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
+        let prompt = required(args, "prompt")?;
+        let Some(connection) = ctx.caller.connection.as_deref() else {
+            return Err("Pictures are edited on the chat's gateway, and none was given.".into());
+        };
+        let chat = crate::chat::validate(connection)?;
+        let base = chat.strip_suffix("/chat/completions").unwrap_or(&chat);
+        let on_letronna = hosted(base);
+        let place = if on_letronna {
+            "Letronna's hosted models".to_owned()
+        } else {
+            format!("the gateway at {base}")
+        };
+        // The pick in the model menu is a hosted model's, which another
+        // gateway would not know.
+        let model = match on_letronna {
+            true => model_for(args, "image"),
+            false => args["model"].as_str().map(str::to_owned),
+        };
+        let rules = edit_rules(model.as_deref());
+        let raws = pictures(args);
+        if raws.is_empty() {
+            return Err("`images` is required: the pictures to edit.".into());
+        }
+        if raws.len() > rules.most {
+            return Err(format!(
+                "{} pictures were given; {} takes at most {}.",
+                raws.len(),
+                model.as_deref().unwrap_or("an image edit"),
+                rules.most
+            ));
+        }
+        let mut images = Vec::new();
+        for raw in &raws {
+            let path = crate::messaging::files::pick(raw, ctx)?;
+            images.push(upload_ready(&path, raw, rules.bytes, rules.png)?);
+        }
+        let mask = match args["mask"].as_str() {
+            Some(raw) => {
+                let path = crate::messaging::files::pick(raw, ctx)?;
+                let mask = upload_ready(&path, raw, MASK_BYTES, true)?;
+                let (first, shape) = (dimensions(&images[0].1), dimensions(&mask.1));
+                if first != shape {
+                    return Err(format!(
+                        "The mask `{raw}` is {}, and `{}` is {}; a mask must be the size of the first picture.",
+                        shown(shape),
+                        raws[0],
+                        shown(first)
+                    ));
+                }
+                Some(mask)
+            }
+            None => None,
+        };
+        let mut fields = vec![("prompt", prompt.to_owned()), ("n", "1".to_owned())];
+        if let Some(model) = &model {
+            fields.push(("model", model.clone()));
+        }
+        if let Some(size) = args["size"].as_str() {
+            fields.push(("size", size.to_owned()));
+        }
+        // dall-e-2 answers with a link unless asked, and the newer models
+        // refuse the field.
+        if rules.legacy {
+            fields.push(("response_format", "b64_json".to_owned()));
+        }
+        let fields: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let field = if rules.legacy { "image" } else { "image[]" };
+        let mut files: Vec<(&str, &Path, &[u8])> = images
+            .iter()
+            .map(|(name, bytes)| (field, name.as_path(), bytes.as_slice()))
+            .collect();
+        if let Some((name, bytes)) = &mask {
+            files.push(("mask", name.as_path(), bytes.as_slice()));
+        }
+        let (boundary, body) = forms(&fields, &files);
+        let mut request = client(MAKE_TIME)?
+            .post(format!("{base}/images/edits"))
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(body);
+        if !connection.key.trim().is_empty() {
+            request = request.bearer_auth(connection.key.trim());
+        }
+        let reply = request.send().map_err(|e| match e.is_timeout() {
+            true => format!("No answer came from {place} in time."),
+            false => format!("Could not reach {place}."),
+        })?;
+        let status = reply.status().as_u16();
+        let reply: Value = reply.json().unwrap_or_default();
+        if !(200..300).contains(&status) {
+            return Err(edit_refusal(status, &reply, &place, model.as_deref()));
+        }
+        if let Some(why) = refusal(&reply) {
+            return Err(why);
+        }
+        let encoded = reply["data"][0]["b64_json"]
+            .as_str()
+            .ok_or("No edited image came back.")?;
+        let bytes = base64(encoded).ok_or("The edited image came back damaged.")?;
+        let path = save(ctx, prompt, image_extension(&bytes), &bytes)?;
+        let from: Vec<String> = raws.iter().map(|raw| format!("`{raw}`")).collect();
+        Ok(format!(
+            "{SAVED}{}\nA {} image, edited from {}.",
+            path.display(),
+            size(bytes.len()),
+            from.join(", ")
+        ))
+    }
+}
+
+/// The largest picture the edits route takes, as OpenAI documents it for
+/// its gpt-image models, which most gateways copy.
+const EDIT_BYTES: u64 = 50 * 1024 * 1024;
+/// The largest mask, and the largest picture dall-e-2 takes.
+const MASK_BYTES: u64 = 4 * 1024 * 1024;
+
+/// What the edits route takes from a model, so a picture it would refuse is
+/// refused here before it is uploaded and paid for.
+struct EditRules {
+    /// How many pictures at once.
+    most: usize,
+    /// How large each may be.
+    bytes: u64,
+    /// Whether each must be a PNG.
+    png: bool,
+    /// dall-e-2, which names the field `image` and sends links by default.
+    legacy: bool,
+}
+
+fn edit_rules(model: Option<&str>) -> EditRules {
+    let legacy = model.is_some_and(|m| m.starts_with("dall-e"));
+    match legacy {
+        true => EditRules {
+            most: 1,
+            bytes: MASK_BYTES,
+            png: true,
+            legacy,
+        },
+        false => EditRules {
+            most: 16,
+            bytes: EDIT_BYTES,
+            png: false,
+            legacy,
+        },
+    }
+}
+
+/// The `images` a call names; a single path is taken as a list of one,
+/// which is how models often send it.
+fn pictures(args: &Value) -> Vec<String> {
+    let list = match &args["images"] {
+        Value::String(one) => vec![one.as_str()],
+        Value::Array(all) => all.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    };
+    list.into_iter()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Whether `endpoint` is Letronna's own hosted gateway.
+fn hosted(endpoint: &str) -> bool {
+    endpoint.trim().trim_end_matches('/') == crate::auth::hosted_base()
+}
+
+/// The picture at `path` as it is uploaded, and the name it goes by: as it
+/// is when the route takes it, else as a PNG. `most` is checked on the file
+/// before it is read, and again on a PNG made of it.
+fn upload_ready(
+    path: &Path,
+    raw: &str,
+    most: u64,
+    png: bool,
+) -> Result<(PathBuf, Vec<u8>), String> {
+    let length = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
+    if length > most {
+        return Err(format!(
+            "`{raw}` is {}; an image edit takes pictures up to {}.",
+            size(length as usize),
+            size(most as usize)
+        ));
+    }
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    // Named by what it is, as a picture saved under the wrong extension
+    // would be sent as the wrong type.
+    match picture_kind(&bytes) {
+        Some("png") => return Ok((path.with_extension("png"), bytes)),
+        Some(kind @ ("jpg" | "webp")) if !png => return Ok((path.with_extension(kind), bytes)),
+        _ => {}
+    }
+    let picture = image::load_from_memory(&bytes).map_err(|_| {
+        format!("`{raw}` is not a picture that can be edited: a PNG, JPEG, WebP, GIF or BMP.")
+    })?;
+    // With an alpha channel, which a mask is read by.
+    let mut converted = Vec::new();
+    image::DynamicImage::ImageRgba8(picture.to_rgba8())
+        .write_to(
+            &mut std::io::Cursor::new(&mut converted),
+            image::ImageFormat::Png,
+        )
+        .map_err(|e| format!("`{raw}` could not be made a PNG: {e}"))?;
+    if converted.len() as u64 > most {
+        return Err(format!(
+            "`{raw}` is {} as a PNG, which it has to be sent as; an image edit takes pictures up to {}.",
+            size(converted.len()),
+            size(most as usize)
+        ));
+    }
+    Ok((path.with_extension("png"), converted))
+}
+
+/// A picture's width and height, read from its header alone.
+fn dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()
+}
+
+/// Width by height as a message says it.
+fn shown(dimensions: Option<(u32, u32)>) -> String {
+    dimensions.map_or("of a size that cannot be read".to_owned(), |(w, h)| {
+        format!("{w}x{h}")
+    })
+}
+
+/// Why the edits route turned a request down, in words that say what to do:
+/// a gateway without the route answers 404 or 405, and one whose model
+/// cannot edit usually says so about the model.
+fn edit_refusal(status: u16, body: &Value, place: &str, model: Option<&str>) -> String {
+    let why = refusal(body).or_else(|| body["detail"].as_str().map(str::to_owned));
+    let about_model = body["error"]["param"] == "model"
+        || body["error"]["code"]
+            .as_str()
+            .is_some_and(|code| code.contains("model"))
+        || why
+            .as_deref()
+            .is_some_and(|why| why.to_ascii_lowercase().contains("model"));
+    match status {
+        404 | 400 | 422 if about_model => {
+            let who = model.map_or("The model it picks".to_owned(), |m| format!("`{m}`"));
+            let why = why.unwrap_or_else(|| format!("it answered {status}"));
+            format!(
+                "{who} cannot edit images on {place} ({why}). Name a model that can, such as gpt-image-1."
+            )
+        }
+        404 | 405 => format!(
+            "There is no image edits route on {place}: /images/edits answered {status}. \
+             Pictures can be edited on Letronna's hosted models, or on an OpenAI-compatible \
+             server that has that route."
+        ),
+        _ => why.unwrap_or_else(|| format!("The edit was turned down: {place} answered {status}.")),
     }
 }
 
@@ -357,8 +677,9 @@ pub fn saved(result: &str) -> Option<PathBuf> {
 
 /// The tools whose results start with `SAVED` and the file they wrote; an
 /// MCP tool's too, which saves the pictures its server sends.
-const SAVERS: [&str; 5] = [
+const SAVERS: [&str; 6] = [
     "make_image",
+    "edit_image",
     "speak",
     "make_video",
     "read_file",
@@ -658,20 +979,19 @@ pub(crate) fn form(
     path: &Path,
     bytes: &[u8],
 ) -> (String, Vec<u8>) {
+    forms(fields, &[(field, path, bytes)])
+}
+
+/// `form` with any number of files, each as its field, the path it is named
+/// as, and its bytes: what the image edits route takes.
+fn forms(fields: &[(&str, &str)], files: &[(&str, &Path, &[u8])]) -> (String, Vec<u8>) {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or_default();
     let boundary = format!("letronna-{stamp:x}");
-    // A quote or line break would end the header early.
-    let name: String = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "file".into())
-        .chars()
-        .map(|c| if c == '"' || c.is_control() { '_' } else { c })
-        .collect();
-    let mut body = Vec::with_capacity(bytes.len() + 512);
+    let total: usize = files.iter().map(|(_, _, bytes)| bytes.len()).sum();
+    let mut body = Vec::with_capacity(total + 512);
     for (key, value) in fields {
         body.extend_from_slice(
             format!(
@@ -680,16 +1000,27 @@ pub(crate) fn form(
             .as_bytes(),
         );
     }
-    body.extend_from_slice(
-        format!(
-            "--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"; filename=\"{name}\"\r\n\
-             Content-Type: {}\r\n\r\n",
-            file_type(path)
-        )
-        .as_bytes(),
-    );
-    body.extend_from_slice(bytes);
-    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    for (field, path, bytes) in files {
+        // A quote or line break would end the header early.
+        let name: String = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "file".into())
+            .chars()
+            .map(|c| if c == '"' || c.is_control() { '_' } else { c })
+            .collect();
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"; filename=\"{name}\"\r\n\
+                 Content-Type: {}\r\n\r\n",
+                file_type(path)
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
     (boundary, body)
 }
 
@@ -965,7 +1296,13 @@ mod tests {
 
     #[test]
     fn every_media_tool_asks_first_and_stays_out_of_plan_mode() {
-        for name in ["make_image", "speak", "transcribe", "make_video"] {
+        for name in [
+            "make_image",
+            "edit_image",
+            "speak",
+            "transcribe",
+            "make_video",
+        ] {
             let tool = crate::tools::find(name).unwrap_or_else(|| panic!("{name} missing"));
             assert!(
                 tool.needs_approval() && tool.mutates() && tool.machine(),
@@ -1017,6 +1354,316 @@ mod tests {
                 "$0.41 / second"
             ]
         );
+    }
+
+    /// A data folder of its own, set as `AGENT_DATA_DIR` while the guard is
+    /// held, with a project folder beside it.
+    fn scratch(name: &str) -> (std::sync::MutexGuard<'static, ()>, PathBuf) {
+        let turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("letronna-edit-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("project")).unwrap();
+        std::fs::create_dir_all(dir.join("data").join("media")).unwrap();
+        unsafe { std::env::set_var("AGENT_DATA_DIR", dir.join("data")) };
+        (turn, dir)
+    }
+
+    /// A call made in `project` on the gateway at `base`, with a made-up key.
+    fn on_gateway(base: &str, project: &Path) -> ToolContext {
+        ToolContext::of(&Connection {
+            endpoint: format!("{base}/v1"),
+            model: "chat-model".into(),
+            key: "test-key".into(),
+            workspace: Some(project.to_path_buf()),
+            ..Default::default()
+        })
+    }
+
+    /// A gateway on this computer that answers one request with `status`
+    /// and `reply`, and hands back that request's head and body.
+    fn gateway(status: &str, reply: &str) -> (String, std::thread::JoinHandle<(String, Vec<u8>)>) {
+        use std::io::{Read, Write};
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.local_addr().unwrap());
+        let answer = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+            reply.len()
+        );
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = server.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let mut block = [0; 65536];
+            let (head, body) = loop {
+                let n = socket.read(&mut block).unwrap();
+                assert_ne!(n, 0);
+                bytes.extend_from_slice(&block[..n]);
+                let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&bytes[..end]).to_lowercase();
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length: "))
+                    .map_or(0, |n| n.parse().unwrap());
+                if bytes.len() >= end + 4 + len {
+                    break (head, bytes[end + 4..end + 4 + len].to_vec());
+                }
+            };
+            socket.write_all(answer.as_bytes()).unwrap();
+            (head, body)
+        });
+        (base, worker)
+    }
+
+    /// A blank picture `width` by `height` in `format`.
+    fn picture(width: u32, height: u32, format: image::ImageFormat) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image::DynamicImage::new_rgba8(width, height)
+            .write_to(&mut std::io::Cursor::new(&mut bytes), format)
+            .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn an_edit_sends_every_picture_and_the_mask_in_one_form_and_saves_the_result() {
+        let (_turn, dir) = scratch("form");
+        let project = dir.join("project");
+        std::fs::write(
+            project.join("cat.png"),
+            picture(4, 4, image::ImageFormat::Png),
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("hole.png"),
+            picture(4, 4, image::ImageFormat::Png),
+        )
+        .unwrap();
+        // One already in the conversation, as a GIF, which the route does not take.
+        let earlier = dir.join("data").join("media").join("hat.gif");
+        std::fs::write(&earlier, picture(4, 4, image::ImageFormat::Gif)).unwrap();
+        let made = picture(2, 2, image::ImageFormat::Png);
+        let reply = json!({"data": [{"b64_json": to_base64(&made)}]}).to_string();
+        let (base, asked) = gateway("200 OK", &reply);
+        let args = json!({
+            "images": ["cat.png", earlier.to_string_lossy()],
+            "mask": "hole.png",
+            "prompt": "put the hat on the cat",
+            "model": "gpt-image-1",
+            "size": "1024x1024"
+        });
+        let out = EditImage.run(&args, &on_gateway(&base, &project)).unwrap();
+        let (head, body) = asked.join().unwrap();
+        assert!(head.starts_with("post /v1/images/edits "), "{head}");
+        assert!(head.contains("authorization: bearer test-key"), "{head}");
+        let boundary = head
+            .lines()
+            .find_map(|l| l.strip_prefix("content-type: multipart/form-data; boundary="))
+            .unwrap()
+            .to_owned();
+        let text = String::from_utf8_lossy(&body);
+        for field in [
+            "name=\"prompt\"\r\n\r\nput the hat on the cat\r\n",
+            "name=\"n\"\r\n\r\n1\r\n",
+            "name=\"model\"\r\n\r\ngpt-image-1\r\n",
+            "name=\"size\"\r\n\r\n1024x1024\r\n",
+            "name=\"image[]\"; filename=\"cat.png\"\r\nContent-Type: image/png\r\n\r\n\x7fPNG",
+            "name=\"image[]\"; filename=\"hat.png\"\r\nContent-Type: image/png\r\n\r\n",
+            "name=\"mask\"; filename=\"hole.png\"\r\nContent-Type: image/png\r\n\r\n",
+        ] {
+            let field = field.replace("\x7f", "\u{FFFD}");
+            assert!(text.contains(&field), "{field:?} missing from {text:?}");
+        }
+        assert!(
+            !text.contains("GIF89a") && !text.contains("response_format"),
+            "{text:?}"
+        );
+        assert!(text.ends_with(&format!("--{boundary}--\r\n")), "{text:?}");
+        // Saved as a made image is, and named as the window finds it.
+        let path = saved_by("edit_image", &out).unwrap();
+        assert_eq!(path.parent().unwrap(), project.join("media"));
+        assert_eq!(std::fs::read(&path).unwrap(), made);
+        assert!(out.contains("edited from `cat.png`"), "{out}");
+        // Off Letronna it is offered signed out, and on it only signed in.
+        let custom = Connection {
+            endpoint: format!("{base}/v1"),
+            ..Default::default()
+        };
+        let letronna = Connection {
+            endpoint: crate::auth::hosted_base(),
+            ..Default::default()
+        };
+        assert!(EditImage.offered(&custom) && !EditImage.offered(&letronna));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_picture_outside_the_project_or_holding_keys_is_never_sent() {
+        let (_turn, dir) = scratch("refused");
+        let project = dir.join("project");
+        std::fs::write(dir.join("away.png"), picture(4, 4, image::ImageFormat::Png)).unwrap();
+        std::fs::write(project.join(".env"), "KEY=secret").unwrap();
+        std::fs::write(
+            project.join("cat.png"),
+            picture(4, 4, image::ImageFormat::Png),
+        )
+        .unwrap();
+        // Nothing listens here: a refusal comes before any upload.
+        let ctx = on_gateway("http://127.0.0.1:9", &project);
+        let away = dir.join("away.png").to_string_lossy().into_owned();
+        for (images, mask, expected) in [
+            (json!(["../away.png"]), None, "is outside the"),
+            (json!([away]), None, "is outside the"),
+            (json!([".env"]), None, "keys, passwords or tokens"),
+            (
+                json!(["cat.png"]),
+                Some(".env"),
+                "keys, passwords or tokens",
+            ),
+            (json!([]), None, "`images` is required"),
+        ] {
+            let mut args = json!({"images": images, "prompt": "a hat"});
+            if let Some(mask) = mask {
+                args["mask"] = mask.into();
+            }
+            let refused = EditImage.run(&args, &ctx).unwrap_err();
+            assert!(refused.contains(expected), "{refused}");
+        }
+        // A call with no gateway at all says so rather than guessing one.
+        let bare = ToolContext {
+            workspace: Some(project.clone()),
+            ..Default::default()
+        };
+        let args = json!({"images": ["cat.png"], "prompt": "a hat"});
+        assert!(EditImage.run(&args, &bare).unwrap_err().contains("gateway"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pictures_the_route_would_refuse_for_their_size_are_stopped_before_upload() {
+        let (_turn, dir) = scratch("size");
+        let project = dir.join("project");
+        let ctx = on_gateway("http://127.0.0.1:9", &project);
+        // Sparse, so the size is there without the disk being written.
+        let sized = |name: &str, bytes: u64| {
+            let file = std::fs::File::create(project.join(name)).unwrap();
+            file.set_len(bytes).unwrap();
+        };
+        sized("huge.png", EDIT_BYTES + 1);
+        sized("big.png", MASK_BYTES + 1);
+        std::fs::write(
+            project.join("cat.png"),
+            picture(4, 4, image::ImageFormat::Png),
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("wide.png"),
+            picture(8, 4, image::ImageFormat::Png),
+        )
+        .unwrap();
+        std::fs::write(project.join("note.png"), "not a picture").unwrap();
+        let many: Vec<&str> = vec!["cat.png"; 17];
+        for (args, expected) in [
+            (json!({"images": ["huge.png"]}), "up to 50.0 MB"),
+            (
+                json!({"images": ["cat.png"], "mask": "big.png"}),
+                "up to 4.0 MB",
+            ),
+            (
+                json!({"images": ["big.png"], "model": "dall-e-2"}),
+                "up to 4.0 MB",
+            ),
+            (
+                json!({"images": ["cat.png", "cat.png"], "model": "dall-e-2"}),
+                "at most 1",
+            ),
+            (json!({"images": many}), "at most 16"),
+            (
+                json!({"images": ["cat.png"], "mask": "wide.png"}),
+                "is 8x4, and `cat.png` is 4x4",
+            ),
+            (
+                json!({"images": ["note.png"]}),
+                "not a picture that can be edited",
+            ),
+        ] {
+            let mut args = args;
+            args["prompt"] = "a hat".into();
+            let refused = EditImage.run(&args, &ctx).unwrap_err();
+            assert!(refused.contains(expected), "{expected}: {refused}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_gateway_without_the_route_or_a_model_that_cannot_edit_says_so() {
+        let place = "the gateway at http://localhost/v1";
+        let no_route = [
+            (404, json!(null)),
+            (404, json!({"detail": "Not Found"})),
+            (405, json!({"error": "Method Not Allowed"})),
+        ];
+        for (status, body) in no_route {
+            let why = edit_refusal(status, &body, place, Some("gpt-image-1"));
+            assert!(
+                why.contains("no image edits route on the gateway at"),
+                "{why}"
+            );
+            assert!(why.contains(&format!("answered {status}")), "{why}");
+        }
+        let cannot = [
+            (
+                404,
+                json!({"error": {"code": "model_not_found", "message": "No such thing."}}),
+            ),
+            (
+                400,
+                json!({"error": {"message": "Model flux.2-pro does not support edits."}}),
+            ),
+            (
+                400,
+                json!({"error": {"param": "model", "message": "Invalid value."}}),
+            ),
+        ];
+        for (status, body) in cannot {
+            let why = edit_refusal(status, &body, place, Some("flux.2-pro"));
+            assert!(
+                why.starts_with("`flux.2-pro` cannot edit images on"),
+                "{why}"
+            );
+        }
+        let unnamed = json!({"error": {"message": "This model cannot edit."}});
+        let why = edit_refusal(400, &unnamed, place, None);
+        assert!(why.starts_with("The model it picks cannot edit"), "{why}");
+        // Anything else is the gateway's own reason, as other media calls give it.
+        let credit = json!({"error": {"message": "Not enough credit."}});
+        assert_eq!(
+            edit_refusal(402, &credit, place, None),
+            "Not enough credit."
+        );
+        assert!(edit_refusal(500, &json!(null), place, None).contains("answered 500"));
+
+        // And end to end, from a server that has no such route.
+        let (_turn, dir) = scratch("route");
+        let project = dir.join("project");
+        std::fs::write(
+            project.join("cat.png"),
+            picture(4, 4, image::ImageFormat::Png),
+        )
+        .unwrap();
+        let (base, asked) = gateway("404 Not Found", "404 page not found");
+        let args = json!({"images": ["cat.png"], "prompt": "a hat"});
+        let why = EditImage
+            .run(&args, &on_gateway(&base, &project))
+            .unwrap_err();
+        asked.join().unwrap();
+        assert!(why.contains("no image edits route"), "{why}");
+        assert!(!project.join("media").exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
