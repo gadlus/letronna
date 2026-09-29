@@ -9,11 +9,13 @@
 use crate::bar::Bar;
 use crate::render;
 use crate::session::Runner;
-use letronna_core::chat::{self, Message};
+use letronna_core::approvals::{self, Decision};
+use letronna_core::chat::{self, Message, ToolCall};
 use letronna_core::driver::{self, Allow, Outcome, Spec};
-use letronna_core::gate::Mode;
+use letronna_core::gate::{self, Gate, Grants, Mode};
 use letronna_core::mcp::{self, ServerStatus, State};
 use letronna_core::mcp_serve;
+use letronna_core::permissions::{self, Rule};
 use letronna_core::store::Transcript;
 use letronna_core::tools::ToolContext;
 use serde_json::{Map, Value, json};
@@ -223,12 +225,7 @@ fn serve(words: &[String]) -> Result<(), String> {
     let turn = allow_turn.then(|| {
         // Served once, before any turn: a request with nobody serving is
         // declined at once, and there is no keyboard behind this stdin.
-        crate::answer_approvals(
-            yes,
-            false,
-            ToolContext::default(),
-            letronna_core::cancel::Cancel::default(),
-        );
+        answer_from_gate(yes);
         let turn: mcp_serve::Turn = Box::new(move |prompt| turn(prompt, yes));
         turn
     });
@@ -241,6 +238,42 @@ fn serve(words: &[String]) -> Result<(), String> {
     mcp::stop_all();
     letronna_core::diag::stop();
     served
+}
+
+/// Answers the calls a turn asks a yes for as the gate settles a helper's
+/// with no terminal to ask on, saying why one was refused on stderr, since
+/// stdout is the protocol's.
+fn answer_from_gate(yes: bool) {
+    let requests = approvals::serve();
+    std::thread::spawn(move || {
+        for request in requests {
+            // Read afresh each time, since the window may have added one.
+            let rules = permissions::load(&permissions::user_file());
+            let decision = decided(&request.call, request.root, yes, &rules);
+            if let Decision::Deny(why) = &decision {
+                eprintln!("`{}`: {why}", request.call.name);
+            }
+            request.answer(decision);
+        }
+    });
+}
+
+/// What the gate makes of `call` in session `root` with nobody to ask, as
+/// the terminal settles a helper's: in Bypass under --yes, so a yes to every
+/// card still leaves the floor and the user's deny and ask rules to refuse.
+fn decided(call: &ToolCall, root: u64, yes: bool, rules: &Result<Vec<Rule>, String>) -> Decision {
+    let mut ctx = ToolContext::default();
+    ctx.conversation = root;
+    ctx.workspace = std::env::current_dir().ok();
+    let mode = if yes { Mode::Bypass } else { Mode::Default };
+    let none = Grants::new();
+    match gate::decide(call, &Gate::for_terminal(&ctx, &none, rules, mode, false)) {
+        gate::Outcome::Run => Decision::Once,
+        gate::Outcome::Refuse(why) => Decision::Deny(why),
+        // With nobody to answer the gate refuses rather than asks; a card
+        // here would be a yes nobody gave.
+        gate::Outcome::Ask => Decision::Deny(String::new()),
+    }
 }
 
 /// Runs `prompt` as `letronna -p` would, in a session of its own that is
@@ -460,10 +493,50 @@ fn is_header(word: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use letronna_core::permissions::Effect;
 
     fn read(words: &[&str]) -> Result<(String, Value), String> {
         let words: Vec<String> = words.iter().map(|w| w.to_string()).collect();
         entry(&words)
+    }
+
+    /// A turn's `run_command` call of `line`.
+    fn command(line: &str) -> ToolCall {
+        ToolCall {
+            name: "run_command".into(),
+            arguments: json!({"command": line}).to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_turns_calls_under_yes_still_meet_the_floor_and_the_deny_rules() {
+        let none = Ok(Vec::new());
+        assert_eq!(decided(&command("ls"), 1, true, &none), Decision::Once);
+        let Decision::Deny(why) = decided(&command("rm -rf victim"), 1, true, &none) else {
+            panic!("a folder was deleted with nobody to ask");
+        };
+        assert!(why.contains("nobody"), "{why}");
+        let denied = Ok(vec![Rule {
+            tool: "run_command".into(),
+            pattern: "ls".into(),
+            effect: Effect::Deny,
+            project: None,
+        }]);
+        let Decision::Deny(why) = decided(&command("ls"), 1, true, &denied) else {
+            panic!("a denied command ran");
+        };
+        assert!(why.contains("permission rule denies"), "{why}");
+    }
+
+    #[test]
+    fn a_turns_calls_without_yes_are_refused_unless_they_only_read() {
+        let none = Ok(Vec::new());
+        assert!(matches!(
+            decided(&command("touch made"), 1, false, &none),
+            Decision::Deny(_)
+        ));
+        assert_eq!(decided(&command("ls"), 1, false, &none), Decision::Once);
     }
 
     #[test]
