@@ -42,6 +42,16 @@
 //! rather than left out. Its report is only what it said after the directive.
 //! `/btw` is a fork that may call nothing and makes one request, and its
 //! answer goes to the user and nowhere else.
+//!
+//! A kept helper stays after it reports, idle, holding no thread: only its
+//! entry here, a wake left with its mailbox and a deadline on the timer
+//! thread, so nothing looks in on it meanwhile. Mail, a place freeing for mail
+//! that found none, or a task the shared task list rings it with wakes it from
+//! its transcript -- on its session's connection as the front end last noted
+//! it, never the one it was kept on, so it follows the session into plan mode
+//! -- and after half an hour with nothing to do it ends. Every run of it
+//! spends from the one budget it started with. It runs only in the
+//! background, where a notice carries each answer back.
 
 use crate::agent_defs::{self, AgentDef};
 use crate::budget::{Budget, short};
@@ -52,6 +62,7 @@ use crate::inbox::{self, LINE_BREAKS, Notice, When};
 use crate::mcp_find;
 use crate::store::Transcript;
 use crate::tasks::{self, Key, State, Task};
+use crate::timers::{self, TimerId};
 use crate::tools::{self, Caller, Tool, ToolContext};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -59,7 +70,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// The first helper id. Session ids count up from 1, so ids from 2^40 on never
 /// meet one, and a helper's id can key its browser, jobs and mailbox beside
@@ -80,6 +91,14 @@ const DEPTH: u8 = 2;
 /// Dozens of rounds of reading files, and a ceiling on what a tree that goes
 /// round in circles can cost.
 const BUDGET: u64 = 500_000;
+/// How long a kept helper waits idle for more work: long enough for the rest
+/// of the turn that kept it, or a build or a review, to bring the next task,
+/// and short enough that a forgotten one ends well before the session does.
+const KEEP: Duration = Duration::from_secs(30 * 60);
+/// A session's: as many as run at once, so a whole fan-out can wait for its
+/// next round; past that an idle helper is mostly a forgotten one, and each
+/// replays its whole transcript when something wakes it.
+const KEPT: usize = 8;
 /// The longest name a helper can be given, before a number is put after it.
 const NAME_CHARS: usize = 64;
 /// Names that mean someone other than a helper to an agent talking to one.
@@ -134,6 +153,20 @@ struct Helper {
     asked_to_stop: bool,
     /// Set when the user stopped it, after which nothing picks it back up.
     stopped_by_user: bool,
+    /// For a kept helper, the budget every run of it spends from, so it has one
+    /// for its whole life; None once it has ended for good.
+    keep: Option<Arc<Budget>>,
+    /// Set while a kept helper waits for more work, holding no thread.
+    idle: Option<Idle>,
+    /// The input tokens of a kept helper's earlier runs, which the list adds
+    /// to its latest's, since one budget pays for them all.
+    earlier: u64,
+}
+
+/// A kept helper between tasks: when it ends if nothing wakes it first.
+struct Idle {
+    until: Instant,
+    timer: TimerId,
 }
 
 /// One run of a helper: whom it answers to, and how it is getting on. Its stop
@@ -232,6 +265,17 @@ static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(FIRST_ID);
 
+/// Each session's connection as its front end last set it, which a kept
+/// helper's wakes run on, so none works on a key or in a mode the session has
+/// left. Taken inside the registry's lock, never around it.
+static CURRENT: Mutex<BTreeMap<u64, Connection>> = Mutex::new(BTreeMap::new());
+
+/// What the shared task list runs when a kept helper ends for good, with its
+/// session and name.
+static ON_END: Mutex<Option<OnEnd>> = Mutex::new(None);
+
+type OnEnd = fn(u64, &str);
+
 fn registry() -> MutexGuard<'static, Registry> {
     // Nothing that can panic runs under the lock, so a poisoned one is still whole.
     REGISTRY.lock().unwrap_or_else(PoisonError::into_inner)
@@ -246,7 +290,29 @@ struct Slot {
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        registry().running.retain(|helper| helper.id != self.id);
+        let mut registry = registry();
+        registry.running.retain(|helper| helper.id != self.id);
+        let idle: Vec<AgentId> = (registry.helpers.iter())
+            .filter(|helper| helper.idle.is_some())
+            .map(|helper| helper.id)
+            .collect();
+        let running = registry.running.len();
+        drop(registry);
+        if idle.is_empty() {
+            return;
+        }
+        // Mail that found every place taken waits in an idle helper's mailbox,
+        // and nothing else wakes it now that a place is free.
+        let waiting: Vec<AgentId> = (inbox::pending().into_iter())
+            .filter(|id| idle.contains(id))
+            .collect();
+        if waiting.is_empty() {
+            return;
+        }
+        let free = Limits::read().at_once.saturating_sub(running);
+        for id in waiting.into_iter().take(free) {
+            rouse(id);
+        }
     }
 }
 
@@ -290,7 +356,7 @@ impl Tool for Agent {
         "agent"
     }
     fn description(&self) -> &'static str {
-        "Hand a task to a helper agent that works with its own context and reports back. Use it to explore or check many files without filling your own context. The helper has not seen this conversation: brief it fully. Its report is all you get back; verify what matters. In the window and the terminal it runs in the background by default: carry on or end your turn, and a notice comes when it finishes. Do not poll or wait for it. Otherwise it works while you wait, and its report is this call's result."
+        "Hand a task to a helper agent that works with its own context and reports back. Use it to explore or check many files without filling your own context. The helper has not seen this conversation: brief it fully. Its report is all you get back; verify what matters. In the window and the terminal it runs in the background by default: carry on or end your turn, and a notice comes when it finishes. Do not poll or wait for it. Otherwise it works while you wait, and its report is this call's result. With keep, it stays after reporting, idle with its context, until a message through the agents tool gives it more work; it ends after 30 idle minutes."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -300,7 +366,8 @@ impl Tool for Agent {
             "name": {"type": "string", "description": "A handle for the agents tool. Defaults to the type."},
             "model": {"type": "string", "description": "A model id on this gateway. Default: the type's, then Settings, then yours."},
             "background": {"type": "boolean", "description": "Default true in the window and terminal: return now and get a notice when it finishes. false waits for the report."},
-            "fork": {"type": "boolean", "description": "Start it from a copy of this conversation rather than from nothing: it has seen everything so far, so the prompt only says what to do. It keeps your model and tools, whatever type and model say."}
+            "fork": {"type": "boolean", "description": "Start it from a copy of this conversation rather than from nothing: it has seen everything so far, so the prompt only says what to do. It keeps your model and tools, whatever type and model say."},
+            "keep": {"type": "boolean", "description": "Keep it for more work after it reports, in the background only. Default false."}
         }, "required": ["description", "prompt"]})
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
@@ -317,7 +384,7 @@ impl Tool for Agents {
         "agents"
     }
     fn description(&self) -> &'static str {
-        "Work with the helpers you started, by name. list: yours and how they are doing. send: a message; a running helper reads it at its next step, and a finished one carries on from where it stopped, with its context. From a helper, \"main\" reaches the agent that started you. stop: end one early. report: its last answer, whole, in pages. types: the helper types. A helper you are waiting for blocks your call, so only those in the background hear you while they run. Never ask another agent to do what was refused or declined here."
+        "Work with the helpers you started, by name. list: yours and how they are doing. send: a message; a running helper reads it at its next step, and a finished or idle one carries on from where it stopped, with its context. From a helper, \"main\" reaches the agent that started you. stop: end one early. report: its last answer, whole, in pages. types: the helper types. A helper you are waiting for blocks your call, so only those in the background hear you while they run. Never ask another agent to do what was refused or declined here."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -383,6 +450,10 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
     };
     let owner = caller.agent.unwrap_or(caller.root);
     let background = in_background(args, inbox::listened(), caller.depth, parent);
+    let keep = args["keep"].as_bool() == Some(true);
+    if keep {
+        may_keep(background, caller.root)?;
+    }
     // No call waits for a helper in the background, so it shares no call's allowance.
     let waiting = if background { 0 } else { owner };
     let cancel = cancel_for(background, ctx);
@@ -428,6 +499,7 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
     }
     .write(&sidecar)?;
     let run = Run::new(owner, background);
+    let budget = Arc::new(Budget::new(limits.budget, caller.budget.clone()));
     let spec = Spec {
         connection,
         transcript,
@@ -439,7 +511,7 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
         allow,
         rounds: def.rounds.unwrap_or(ROUNDS),
         cancel,
-        budget: Some(Arc::new(Budget::new(limits.budget, caller.budget.clone()))),
+        budget: Some(budget.clone()),
         status: run.status.clone(),
         depth: caller.depth + 1,
         fork: forking,
@@ -457,35 +529,63 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
         ended: None,
         asked_to_stop: false,
         stopped_by_user: false,
+        keep: keep.then_some(budget),
+        idle: None,
+        earlier: 0,
     });
     let started = format!(
         "Started {} ({}) in the background. A notice comes when it finishes; do not poll or \
          wait for it. Carry on, or end your turn.",
         slot.name, label
     );
-    launch(spec, slot, background, label, started)
+    launch(spec, slot, background, label, started, Vec::new())
 }
 
-/// Sets a helper to work in the place `slot` holds: in the background, where
-/// the call's answer is `started` and a notice follows, or while the call
-/// waits, where the answer is its report.
+/// Sets a helper to work in the place `slot` holds, with `next` folded in as
+/// its next turn: in the background, where the call's answer is `started` and
+/// a notice follows, or while the call waits, where the answer is its report.
 fn launch(
     spec: Spec,
     slot: Slot,
     background: bool,
     kind: &str,
     started: String,
+    next: Vec<Notice>,
 ) -> Result<String, String> {
     let rounds = spec.rounds;
     if background {
-        set_off(spec, slot, kind, rounds)?;
+        set_off(spec, slot, kind, rounds, next)?;
         return Ok(started);
     }
     let report = driver::run(spec);
     let share = MAX_REPORT / slot.together.load(Ordering::Relaxed).max(1);
     let name = slot.name.clone();
-    close(slot, &report, |_| ());
+    close(slot, &report, |_, _| ());
     answer(&name, &report, rounds, share)
+}
+
+/// Refuses to keep a helper where nothing would wake it, or past session
+/// `root`'s cap.
+fn may_keep(background: bool, root: u64) -> Result<(), String> {
+    if !background {
+        return Err(
+            "`keep` needs a helper in the background: one the session's own agent starts in \
+             the window or the terminal, without background false."
+                .into(),
+        );
+    }
+    // Counted before the helper is listed, so calls side by side can pass it
+    // together, by no more than can run at once.
+    let kept = (registry().helpers.iter())
+        .filter(|helper| helper.root == root && helper.keep.is_some())
+        .count();
+    if kept >= KEPT {
+        return Err(format!(
+            "{KEPT} of this session's helpers are kept already, the most. Do not retry with \
+             keep: start this one without it, or stop a kept one you no longer need."
+        ));
+    }
+    Ok(())
 }
 
 /// Which tools a helper of type `def` may call, of the `tools` it is offered.
@@ -514,38 +614,67 @@ fn cancel_for(background: bool, ctx: &ToolContext) -> Cancel {
     }
 }
 
-/// Starts a helper on a thread of its own; when it ends, its owner hears how
-/// it went in a notice.
-fn set_off(spec: Spec, slot: Slot, kind: &str, rounds: usize) -> Result<(), String> {
-    let (id, key) = (slot.id, Key::Agent(slot.id));
+/// Starts a helper on a thread of its own with `next` folded in as its next
+/// turn; when it ends, its owner hears how it went in a notice.
+fn set_off(
+    spec: Spec,
+    slot: Slot,
+    kind: &str,
+    rounds: usize,
+    next: Vec<Notice>,
+) -> Result<(), String> {
+    let (id, key, owner) = (slot.id, Key::Agent(slot.id), spec.owner);
     let name = slot.name.clone();
     // Registered before it runs, so one that ends at once still has an owner to tell.
-    tasks::register(Task::new(key, spec.owner, None, &name));
+    tasks::register(Task::new(key, owner, None, &name));
     let about = kind.to_owned();
+    let unread = next.clone();
     let started = driver::spawn(spec, move |report| {
-        close(slot, report, |by_user| {
-            let (state, notice) = ended(&name, &about, report, rounds, by_user);
+        close(slot, report, |by_user, after| {
+            let (state, notice) = ended(&name, &about, report, rounds, by_user, after);
             tasks::finish(&key, state, notice);
         });
+        // In its transcript, but unread by a run stopped or failed before its
+        // first answer, such as one a stop reached as it woke.
+        if report.input == 0 {
+            hand_up(owner, &name, next);
+        }
     });
     if let Err(error) = started {
-        tasks::finish(&key, State::Failed(error.clone()), None);
-        if let Some(helper) = registry().helpers.iter_mut().find(|h| h.id == id) {
-            helper.ended = Some("failed".into());
-        }
+        fail(id, error.clone(), unread);
         return Err(error);
     }
     Ok(())
 }
 
+/// Ends helper `id`, whose run could not start, for good as failed with
+/// `error`, and passes on the `unread` it was to carry on with.
+fn fail(id: AgentId, error: String, unread: Vec<Notice>) {
+    let ending = {
+        let mut registry = registry();
+        let Some(helper) = registry.helpers.iter_mut().find(|h| h.id == id) else {
+            return;
+        };
+        helper.ended = Some("failed".into());
+        let for_good = helper.keep.take().is_some();
+        inbox::unwake(id);
+        Ending::of(helper, unread, for_good)
+    };
+    let key = Key::Agent(id);
+    tasks::register(Task::new(key, ending.owner, None, &ending.name));
+    tasks::finish(&key, State::Failed(error), None);
+    ending.pass_on();
+}
+
 /// Ends a helper's run: gives its place back, has `tell` say how it went,
-/// given whether the user stopped it, marks it ended, and passes on the mail
-/// that came after the driver last looked.
-fn close(slot: Slot, report: &Report, tell: impl FnOnce(bool)) {
+/// given whether the user stopped it and what becomes of it, marks it ended
+/// or idle, and passes on the mail that came after the driver last looked,
+/// which wakes a kept one again.
+fn close(slot: Slot, report: &Report, tell: impl FnOnce(bool, After)) {
     let id = slot.id;
     // Free before the owner hears, so it can start another at once.
     drop(slot);
-    let (owner, name, sidecar, late, by_user) = {
+    let (sidecar, by_user, after, ending) = {
         // The lock a message to it takes, so a message either lands in the
         // mailbox before this empties it or finds the helper ended.
         let mut registry = registry();
@@ -553,21 +682,90 @@ fn close(slot: Slot, report: &Report, tell: impl FnOnce(bool)) {
             return;
         };
         let by_user = report.status == Outcome::Stopped && !helper.asked_to_stop;
+        // Only one that answered, and only in the background, where a notice
+        // carries each answer to its owner.
+        let answered = matches!(report.status, Outcome::Done | Outcome::RoundLimit);
+        let after = match &helper.keep {
+            Some(budget) if helper.run.background && answered => match budget.check() {
+                Ok(()) => After::Idles,
+                Err(_) => After::Spent,
+            },
+            _ => After::Ends,
+        };
         // Before it counts as ended, since a message that finds it ended picks
         // it up again, and the next run's finish must come after this one's.
-        tell(by_user);
+        tell(by_user, after);
         helper.ended = Some(how(&report.status, by_user).into());
         helper.asked_to_stop = false;
         helper.stopped_by_user = by_user;
-        let late = inbox::take(id, true);
-        (
-            helper.run.owner,
-            helper.name.clone(),
-            helper.sidecar.clone(),
-            late,
-            by_user,
-        )
+        let ending = if after == After::Idles {
+            park(helper, Instant::now() + KEEP);
+            Ending::of(helper, Vec::new(), false)
+        } else {
+            let for_good = helper.keep.take().is_some();
+            // Set by a push that came as it last parked, and never spent.
+            inbox::unwake(id);
+            Ending::of(helper, inbox::take(id, true), for_good)
+        };
+        (helper.sidecar.clone(), by_user, after, ending)
     };
+    // Mail that came before its wake was set up wakes it now instead.
+    if after == After::Idles && inbox::pending().contains(&id) {
+        rouse(id);
+    }
+    ending.pass_on();
+    if by_user {
+        keep_stopped(&sidecar);
+    }
+}
+
+/// What becomes of a helper once a run of it ends.
+#[derive(Clone, Copy, PartialEq)]
+enum After {
+    /// It ends, as one not kept always does.
+    Ends,
+    /// It is kept, and waits idle for more work.
+    Idles,
+    /// It is kept, but ends: the budget it has for its whole life is spent.
+    Spent,
+}
+
+/// What a helper leaves when a run of it or its wait ends: the mail it never
+/// read, and for a kept one ending for good, word for the shared task list.
+struct Ending {
+    owner: u64,
+    root: u64,
+    name: String,
+    late: Vec<Notice>,
+    for_good: bool,
+}
+
+impl Ending {
+    /// What `helper` leaves, with `late` unread.
+    fn of(helper: &Helper, late: Vec<Notice>, for_good: bool) -> Self {
+        Self {
+            owner: helper.run.owner,
+            root: helper.root,
+            name: helper.name.clone(),
+            late,
+            for_good,
+        }
+    }
+
+    /// Passes the mail on to the owner, and tells the task list of a kept
+    /// helper that has ended for good; outside the registry's lock, since
+    /// either may call back into it.
+    fn pass_on(self) {
+        hand_up(self.owner, &self.name, self.late);
+        let hook = *ON_END.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(hook) = hook.filter(|_| self.for_good) {
+            hook(self.root, &self.name);
+        }
+    }
+}
+
+/// Passes mail helper `name` never read to `owner`, saying so.
+fn hand_up(owner: u64, name: &str, late: Vec<Notice>) {
     for notice in late {
         inbox::push(
             owner,
@@ -576,19 +774,200 @@ fn close(slot: Slot, report: &Report, tell: impl FnOnce(bool)) {
                     "{name} ended before it read this, from {}:\n{}",
                     notice.from, notice.text
                 ),
-                from: name.clone(),
+                from: name.to_owned(),
                 when: notice.when,
             },
         );
     }
-    if by_user {
-        // Refused here already by the flag above; the file keeps it refused
-        // for whatever reads the sidecar later.
-        let _ = Sidecar::read(&sidecar).and_then(|mut what| {
-            what.stopped_by_user = true;
-            what.write(&sidecar)
-        });
+}
+
+/// Marks the helper whose sidecar is at `sidecar` as stopped by the user.
+fn keep_stopped(sidecar: &Path) {
+    // Refused in the registry already; the file keeps it refused for whatever
+    // reads the sidecar later.
+    let _ = Sidecar::read(sidecar).and_then(|mut what| {
+        what.stopped_by_user = true;
+        what.write(sidecar)
+    });
+}
+
+/// Leaves kept helper `helper` waiting for more work with no thread until
+/// `until`: mail wakes it, and its timer ends it then.
+fn park(helper: &mut Helper, until: Instant) {
+    let id = helper.id;
+    let timer = timers::at(until, Box::new(move || expire(id, until)));
+    helper.idle = Some(Idle { until, timer });
+    inbox::wake_on(id, Box::new(move || rouse(id)));
+}
+
+/// Wakes kept helper `id` on a thread of its own, since mail arrives on any
+/// thread, the timer's included, with whatever locks it holds.
+fn rouse(id: AgentId) {
+    let spawned = std::thread::Builder::new()
+        .name(format!("wake-{id}"))
+        .spawn(move || wake(id));
+    // Its mail waits for the next wake, a freed place or its end. Set without
+    // the registry's lock, which the push that ran this may hold.
+    if spawned.is_err() {
+        inbox::wake_on(id, Box::new(move || rouse(id)));
     }
+}
+
+/// Picks kept helper `id` back up with the mail waiting for it, if it is
+/// still idle, a place is free and its session's connection is known; else
+/// the mail waits for the next wake, a freed place or its end.
+fn wake(id: AgentId) {
+    let limits = Limits::read();
+    let Some(woken) = take_idle(id, limits.at_once) else {
+        // Only while it is idle, since one that ended passed its mail on.
+        let registry = registry();
+        if (registry.helpers.iter()).any(|helper| helper.id == id && helper.idle.is_some()) {
+            inbox::wake_on(id, Box::new(move || rouse(id)));
+        }
+        return;
+    };
+    let mail = inbox::take(id, true);
+    if mail.is_empty() {
+        settle(woken);
+        return;
+    }
+    // One that cannot carry on has ended, passing its mail on.
+    let _ = carry_on(woken, &limits, mail);
+}
+
+/// An idle helper taken back to work, before it is handed anything to do.
+struct Woken {
+    claimed: Claimed,
+    /// Its session's connection as it is now, which it works on.
+    now: Connection,
+    n: u32,
+    sidecar: PathBuf,
+    /// How its last run ended, and when it would have stopped waiting, both of
+    /// which it keeps if it goes back to waiting.
+    was: Option<String>,
+    until: Instant,
+}
+
+/// Takes a place for idle helper `id` to carry on in, in the background, if
+/// it is still idle, a place is free and its session's connection is known:
+/// under the lock a stop or its end takes, so neither can come between.
+fn take_idle(id: AgentId, at_once: usize) -> Option<Woken> {
+    let mut registry = registry();
+    let at =
+        (registry.helpers.iter()).position(|helper| helper.id == id && helper.idle.is_some())?;
+    full(&registry, at_once).ok()?;
+    let helper = &registry.helpers[at];
+    // Not the connection it was kept on: the session may have gone into plan
+    // mode, or onto another key, since.
+    let now = current(helper.root)?;
+    let (n, sidecar, was) = (helper.n, helper.sidecar.clone(), helper.ended.clone());
+    let until = helper.idle.as_ref()?.until;
+    let run = Run::new(helper.run.owner, true);
+    let claimed = back_to_work(&mut registry, at, run, 0, Cancel::default());
+    Some(Woken {
+        claimed,
+        now,
+        n,
+        sidecar,
+        was,
+        until,
+    })
+}
+
+/// Leaves helper `woken`, which was handed nothing to do, waiting again as it
+/// was, or ends it if a stop came meanwhile.
+fn settle(woken: Woken) {
+    let Woken {
+        claimed,
+        was,
+        until,
+        ..
+    } = woken;
+    let id = claimed.slot.id;
+    drop(claimed.slot);
+    let mut registry = registry();
+    let Some(helper) = registry.helpers.iter_mut().find(|h| h.id == id) else {
+        return;
+    };
+    if !claimed.cancel.is_set() {
+        helper.ended = was;
+        park(helper, until);
+        drop(registry);
+        // Mail that came meanwhile found it at work, and rang nothing.
+        if inbox::pending().contains(&id) {
+            rouse(id);
+        }
+        return;
+    }
+    let by_user = !helper.asked_to_stop;
+    helper.asked_to_stop = false;
+    helper.stopped_by_user = by_user;
+    let sidecar = helper.sidecar.clone();
+    let shown = how(&Outcome::Stopped, by_user);
+    let ending = end_idle(helper, shown.into(), State::Stopped);
+    drop(registry);
+    ending.pass_on();
+    if by_user {
+        keep_stopped(&sidecar);
+    }
+}
+
+/// Sets helper `woken` to work with `next` as its next turn; one whose
+/// conversation cannot be read ends for good, passing `next` on unread.
+fn carry_on(woken: Woken, limits: &Limits, next: Vec<Notice>) -> Result<(), String> {
+    let Woken {
+        claimed,
+        now,
+        n,
+        sidecar,
+        ..
+    } = woken;
+    let (id, name) = (claimed.slot.id, claimed.slot.name.clone());
+    let (what, def, transcript) = match reread(now.conversation, &now, &name, n, &sidecar, &next) {
+        Ok(read) => read,
+        Err(error) => {
+            drop(claimed);
+            fail(id, error.clone(), next);
+            return Err(error);
+        }
+    };
+    let caller = ToolContext::of(&now).caller;
+    let spec = rerun(&caller, &now, what, &def, transcript, &claimed, limits);
+    let rounds = spec.rounds;
+    set_off(spec, claimed.slot, &def.name, rounds, next)
+}
+
+/// Ends kept helper `id`, idle until `until`, unless it has woken since.
+fn expire(id: AgentId, until: Instant) {
+    let mut registry = registry();
+    let idle = (registry.helpers.iter_mut()).find(|helper| {
+        helper.id == id && helper.idle.as_ref().is_some_and(|idle| idle.until == until)
+    });
+    let Some(helper) = idle else {
+        return;
+    };
+    let how = format!("ended after {} idle minutes", KEEP.as_secs() / 60);
+    let ending = end_idle(helper, how.clone(), State::Done(how));
+    drop(registry);
+    ending.pass_on();
+}
+
+/// Ends idle helper `helper` for good, shown as `how` with its task left in
+/// `state`, and says who hears the mail it never read.
+fn end_idle(helper: &mut Helper, how: String, state: State) -> Ending {
+    if let Some(idle) = helper.idle.take() {
+        timers::cancel(idle.timer);
+    }
+    inbox::unwake(helper.id);
+    helper.keep = None;
+    helper.ended = Some(how);
+    // Listed afresh, since going idle was its task's one finish; its owner
+    // heard its report then, so nobody is told again.
+    let key = Key::Agent(helper.id);
+    tasks::register(Task::new(key, helper.run.owner, None, &helper.name));
+    tasks::finish(&key, state, None);
+    let late = inbox::take(helper.id, true);
+    Ending::of(helper, late, true)
 }
 
 /// How a run that ended is shown in the list.
@@ -697,14 +1076,26 @@ fn occupy(registry: &mut Registry, id: AgentId, name: String, owner: u64, cancel
     Slot { id, name, together }
 }
 
-/// Stops the running helper `id`, and says whether there was one. The stop
-/// counts as the user's, so nothing picks the helper back up.
+/// Stops the running helper `id`, or ends it at once if it is kept and idle,
+/// and says whether there was one. The stop counts as the user's, so nothing
+/// picks the helper back up.
 pub fn stop(id: AgentId) -> bool {
-    let cancel = registry()
-        .running
-        .iter()
-        .find(|helper| helper.id == id)
-        .map(|helper| helper.cancel.clone());
+    let cancel = {
+        let mut registry = registry();
+        let idle =
+            (registry.helpers.iter_mut()).find(|helper| helper.id == id && helper.idle.is_some());
+        if let Some(helper) = idle {
+            helper.stopped_by_user = true;
+            let sidecar = helper.sidecar.clone();
+            let ending = end_idle(helper, "stopped by the user".into(), State::Stopped);
+            drop(registry);
+            ending.pass_on();
+            keep_stopped(&sidecar);
+            return true;
+        }
+        let running = registry.running.iter().find(|helper| helper.id == id);
+        running.map(|helper| helper.cancel.clone())
+    };
     let Some(cancel) = cancel else {
         return false;
     };
@@ -790,6 +1181,74 @@ fn child(
         conversation: id,
         ..parent.clone()
     }
+}
+
+/// Offers a task to session `root`'s idle kept helpers, the one idle longest
+/// first, and says which took it. Each is given a place to run in first; then
+/// `claim` is handed its name, and takes the task for it and says what it is,
+/// or passes with None; and the one it takes it for starts on it at once, so
+/// a claimed task never waits. None means nobody took it: none was idle, no
+/// place was free, the session's connection is not known yet, or `claim`
+/// passed on each. A helper that took one can still end without reading or
+/// finishing it -- stopped, failed, out of budget, or unable to start -- and
+/// then the task comes back to the session as unread mail, and the hook set
+/// with `on_end` hears the helper has ended for good, so the task list can
+/// open again what it gave it. `claim` and the hook run with no lock of this
+/// module's held; call this holding no lock either of them takes.
+pub fn ring(root: u64, mut claim: impl FnMut(&str) -> Option<Notice>) -> Option<String> {
+    let limits = Limits::read();
+    let mut idle: Vec<(Instant, AgentId)> = {
+        let registry = registry();
+        (registry.helpers.iter())
+            .filter(|helper| helper.root == root)
+            .filter_map(|helper| Some((helper.idle.as_ref()?.until, helper.id)))
+            .collect()
+    };
+    // Each waits as long, so the one that ends first went idle first.
+    idle.sort_unstable();
+    for (_, id) in idle {
+        let Some(woken) = take_idle(id, limits.at_once) else {
+            continue;
+        };
+        let name = woken.claimed.slot.name.clone();
+        let Some(task) = claim(&name) else {
+            settle(woken);
+            continue;
+        };
+        // One that cannot start has ended for good, which `on_end` hears.
+        let _ = carry_on(woken, &limits, vec![task]);
+        return Some(name);
+    }
+    None
+}
+
+/// Notes `connection` as what its session works on now, which the session's
+/// kept helpers wake on; the window and the terminal call this as each turn
+/// starts.
+pub fn connected(connection: &Connection) {
+    let mut current = CURRENT.lock().unwrap_or_else(PoisonError::into_inner);
+    current.insert(connection.conversation, connection.clone());
+}
+
+/// Notes plan mode switched on or off in every session, as the window and the
+/// terminal switch it, so no kept helper wakes outside it.
+pub fn set_plan(plan: bool) {
+    let mut current = CURRENT.lock().unwrap_or_else(PoisonError::into_inner);
+    for connection in current.values_mut() {
+        connection.plan = plan;
+    }
+}
+
+/// The connection session `root` works on now, if its front end has said.
+fn current(root: u64) -> Option<Connection> {
+    let current = CURRENT.lock().unwrap_or_else(PoisonError::into_inner);
+    current.get(&root).cloned()
+}
+
+/// Has `hook` hear the session and name of each kept helper that ends for
+/// good, in place of any hook set before.
+pub fn on_end(hook: fn(u64, &str)) {
+    *ON_END.lock().unwrap_or_else(PoisonError::into_inner) = Some(hook);
 }
 
 /// The tools a helper may use, in the order it is offered them: those its
@@ -1049,6 +1508,7 @@ fn ended(
     report: &Report,
     rounds: usize,
     by_user: bool,
+    after: After,
 ) -> (State, Option<Notice>) {
     let ran = match report.rounds {
         1 => "1 round".to_owned(),
@@ -1104,6 +1564,18 @@ fn ended(
     } else {
         &report.text
     });
+    match after {
+        After::Ends => {}
+        After::Idles => text.push_str(&format!(
+            "\n{name} is idle now: a message through the agents tool wakes it with its context, \
+             and it ends after {} idle minutes.",
+            KEEP.as_secs() / 60
+        )),
+        After::Spent => text.push_str(&format!(
+            "\n{name} has ended rather than wait for more work: the budget every run of it \
+             spends from is spent."
+        )),
+    }
     // Last, where it survives the fold's trim, which keeps a notice's two ends.
     let whole = json!({"action": "report", "to": name});
     text.push_str(&format!("\nWhole report: agents {whole}"));
@@ -1111,6 +1583,11 @@ fn ended(
         from: format!("helper {name}"),
         when: When::Next,
         text,
+    };
+    let state = if after == After::Idles {
+        State::Idle
+    } else {
+        state
     };
     (state, Some(notice))
 }
@@ -1160,9 +1637,13 @@ fn list(caller: &Caller) -> String {
     let registry = registry();
     let mut rows = vec![["name", "type", "state", "rounds", "tokens"].map(String::from)];
     for helper in yours(&registry.helpers, caller) {
-        let state = match &helper.ended {
-            Some(how) => how.clone(),
-            None => format!("running · {}", took(helper.run.started.elapsed().as_secs())),
+        let state = match (&helper.idle, &helper.ended) {
+            (Some(idle), _) => {
+                let left = idle.until.saturating_duration_since(Instant::now());
+                format!("idle · {}m left", left.as_secs().div_ceil(60))
+            }
+            (None, Some(how)) => how.clone(),
+            (None, None) => format!("running · {}", took(helper.run.started.elapsed().as_secs())),
         };
         let status = &helper.run.status;
         rows.push([
@@ -1170,7 +1651,7 @@ fn list(caller: &Caller) -> String {
             helper.kind.clone(),
             state,
             status.rounds.load(Ordering::Relaxed).to_string(),
-            short(status.input.load(Ordering::Relaxed)),
+            short(helper.earlier + status.input.load(Ordering::Relaxed)),
         ]);
     }
     drop(registry);
@@ -1274,7 +1755,7 @@ fn send(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Stri
         Reached::Queued(name) => return Ok(queued(&name)),
         Reached::Ended { name, n, sidecar } => (name, n, sidecar),
     };
-    resume(args, ctx, limits, &name, n, &sidecar, notice)
+    resume(args, ctx, limits, &name, n, &sidecar, vec![notice])
 }
 
 /// Leaves `message` for whoever the calling helper answers to.
@@ -1336,8 +1817,8 @@ fn reach(caller: &Caller, to: &str, notice: &Notice) -> Result<Reached, String> 
     })
 }
 
-/// Picks helper `name`, which has ended, back up from its transcript with
-/// `notice` as its next turn, as the caller's own from now on.
+/// Picks helper `name`, which has ended or is idle, back up from its
+/// transcript with `notices` as its next turn, as the caller's own from now on.
 fn resume(
     args: &Value,
     ctx: &ToolContext,
@@ -1345,19 +1826,60 @@ fn resume(
     name: &str,
     n: u32,
     sidecar: &Path,
-    notice: Notice,
+    notices: Vec<Notice>,
 ) -> Result<String, String> {
     let caller = &ctx.caller;
     check(caller, &ctx.cancel, limits)?;
     let Some(sender) = caller.connection.as_deref() else {
         return Err("A helper can only be picked back up from a conversation.".into());
     };
+    let (what, def, transcript) = reread(caller.root, sender, name, n, sidecar, &notices)?;
+    let owner = caller.agent.unwrap_or(caller.root);
+    let background = in_background(args, inbox::listened(), caller.depth, sender);
+    let waiting = if background { 0 } else { owner };
+    let cancel = cancel_for(background, ctx);
+    let run = Run::new(owner, background);
+    let claimed = claim(
+        caller.root,
+        name,
+        run,
+        waiting,
+        cancel,
+        limits.at_once,
+        notices.clone(),
+    );
+    let Some(claimed) = claimed? else {
+        return Ok(queued(name));
+    };
+    let started = if claimed.kept.is_some() {
+        format!("Woke {name} with your message. A notice comes when it is done.")
+    } else {
+        format!(
+            "{name} had finished; it is carrying on from where it stopped, with your message. A \
+             notice comes when it is done."
+        )
+    };
+    let label = if what.fork { "fork" } else { def.name.as_str() }.to_owned();
+    let spec = rerun(caller, sender, what, &def, transcript, &claimed, limits);
+    launch(spec, claimed.slot, background, &label, started, notices)
+}
+
+/// What helper `name` of session `root` is, and its conversation so far with
+/// `notices` folded in as its next turn, read back to carry on on `sender`.
+fn reread(
+    root: u64,
+    sender: &Connection,
+    name: &str,
+    n: u32,
+    sidecar: &Path,
+    notices: &[Notice],
+) -> Result<(Sidecar, AgentDef, Transcript), String> {
     let what = Sidecar::read(sidecar)?;
     if what.stopped_by_user {
         return Err(user_stopped(name));
     }
     let def = agent_defs::find(&what.kind, sender.workspace.as_deref())?;
-    let Some(mut transcript) = Transcript::open(caller.root, n) else {
+    let Some(mut transcript) = Transcript::open(root, n) else {
         return Err(format!(
             "{name}'s conversation could not be read, so it cannot carry on. Start a new helper."
         ));
@@ -1365,66 +1887,73 @@ fn resume(
     transcript
         .conversation
         .messages
-        .extend(inbox::fold(std::slice::from_ref(&notice)));
-    let owner = caller.agent.unwrap_or(caller.root);
-    let background = in_background(args, inbox::listened(), caller.depth, sender);
-    let run = Run::new(owner, background);
-    let status = run.status.clone();
-    let waiting = if background { 0 } else { owner };
-    let cancel = cancel_for(background, ctx);
-    let claimed = claim(
-        caller.root,
-        name,
-        run,
-        waiting,
-        cancel.clone(),
-        limits.at_once,
-        notice,
-    );
-    let Some(slot) = claimed? else {
-        return Ok(queued(name));
-    };
+        .extend(inbox::fold(notices));
+    Ok((what, def, transcript))
+}
+
+/// The run of helper `what` that carries on in the place `claimed` took, on
+/// `sender`'s connection for `caller`, narrowed as when it started.
+fn rerun(
+    caller: &Caller,
+    sender: &Connection,
+    what: Sidecar,
+    def: &AgentDef,
+    transcript: Transcript,
+    claimed: &Claimed,
+    limits: &Limits,
+) -> Spec {
+    let (fork, from) = (what.fork, what.from);
+    let allowed = what.allow.clone();
     let connection = Connection {
         model: what.model,
         // Only ever narrowed, as when it started.
         plan: sender.plan || what.plan,
         workspace: what.worktree.or_else(|| sender.workspace.clone()),
-        conversation: slot.id,
+        conversation: claimed.slot.id,
         ..sender.clone()
     };
-    let allow = match what.allow {
-        Some(names) => Allow::Only(names),
-        None if what.fork => Allow::All,
-        None => allow(&def, usable(&connection, &def)),
-    };
-    let spec = Spec {
+    let tools = usable(&connection, def);
+    // A kept one's for its whole life, or a new one under the caller's.
+    let budget = (claimed.kept.clone())
+        .unwrap_or_else(|| Arc::new(Budget::new(limits.budget, caller.budget.clone())));
+    Spec {
         connection,
         transcript,
-        id: slot.id,
-        owner,
+        id: claimed.slot.id,
+        owner: caller.agent.unwrap_or(caller.root),
         root: caller.root,
-        run: caller.run.unwrap_or(slot.id),
-        label: slot.name.clone(),
-        allow,
+        run: caller.run.unwrap_or(claimed.slot.id),
+        label: claimed.slot.name.clone(),
+        // A fork is held to what it was given, or to its parent's tools.
+        allow: match allowed {
+            Some(names) => Allow::Only(names),
+            None if fork => Allow::All,
+            None => allow(def, tools),
+        },
         rounds: def.rounds.unwrap_or(ROUNDS),
-        cancel,
-        budget: Some(Arc::new(Budget::new(limits.budget, caller.budget.clone()))),
-        status,
+        cancel: claimed.cancel.clone(),
+        budget: Some(budget),
+        status: claimed.status.clone(),
         depth: caller.depth + 1,
-        fork: what.fork,
-        from: what.from,
-    };
-    let started = format!(
-        "{name} had finished; it is carrying on from where it stopped, with your message. A \
-         notice comes when it is done."
-    );
-    let label = if what.fork { "fork" } else { def.name.as_str() };
-    launch(spec, slot, background, label, started)
+        fork,
+        from,
+    }
+}
+
+/// A helper's place to carry on in, taken back from idle or ended.
+struct Claimed {
+    slot: Slot,
+    cancel: Cancel,
+    /// How the run it carries on in is getting on, as the list shows.
+    status: Arc<Status>,
+    /// The budget a kept one spends from for its whole life; None for one
+    /// that was not kept.
+    kept: Option<Arc<Budget>>,
 }
 
 /// Takes a place for helper `name` of session `root` to carry on in as `run`
-/// says, until `cancel` stops it, or None when it is running again already and
-/// `notice` waits in its mailbox instead.
+/// says, until `cancel` stops it; or None when it is running again already
+/// and `notices` wait in its mailbox instead.
 fn claim(
     root: u64,
     name: &str,
@@ -1432,8 +1961,8 @@ fn claim(
     waiting: u64,
     cancel: Cancel,
     at_once: usize,
-    notice: Notice,
-) -> Result<Option<Slot>, String> {
+    notices: Vec<Notice>,
+) -> Result<Option<Claimed>, String> {
     let mut registry = registry();
     let Some(at) =
         (registry.helpers.iter()).position(|helper| helper.root == root && helper.name == name)
@@ -1447,16 +1976,43 @@ fn claim(
         return Err(user_stopped(name));
     }
     if helper.ended.is_none() {
-        inbox::push(helper.id, notice);
+        for notice in notices {
+            inbox::push(helper.id, notice);
+        }
         return Ok(None);
     }
     full(&registry, at_once)?;
+    Ok(Some(back_to_work(&mut registry, at, run, waiting, cancel)))
+}
+
+/// Puts helper `at`, idle or ended, back in the running list as one of
+/// `waiting`'s that `cancel` stops, to carry on as `run` says.
+fn back_to_work(
+    registry: &mut Registry,
+    at: usize,
+    run: Run,
+    waiting: u64,
+    cancel: Cancel,
+) -> Claimed {
     let helper = &mut registry.helpers[at];
-    let id = helper.id;
+    let (id, name) = (helper.id, helper.name.clone());
+    if let Some(idle) = helper.idle.take() {
+        timers::cancel(idle.timer);
+        helper.earlier += helper.run.status.input.load(Ordering::Relaxed);
+    }
+    let status = run.status.clone();
     helper.run = run;
     helper.ended = None;
-    let slot = occupy(&mut registry, id, name.to_owned(), waiting, cancel);
-    Ok(Some(slot))
+    let kept = helper.keep.clone();
+    // Spent or taken back, so mail from now on waits for its steps.
+    inbox::unwake(id);
+    let slot = occupy(registry, id, name, waiting, cancel.clone());
+    Claimed {
+        slot,
+        cancel,
+        status,
+        kept,
+    }
 }
 
 /// Stops helper `to` of the caller's, and its own helpers with it; what it
@@ -1465,6 +2021,14 @@ fn stop_by_name(caller: &Caller, to: &str) -> Result<String, String> {
     let mut registry = registry();
     let helper = mine(&registry.helpers, caller, to)?;
     let (id, name, background) = (helper.id, helper.name.clone(), helper.run.background);
+    let idle =
+        (registry.helpers.iter_mut()).find(|helper| helper.id == id && helper.idle.is_some());
+    if let Some(helper) = idle {
+        let ending = end_idle(helper, "stopped".into(), State::Stopped);
+        drop(registry);
+        ending.pass_on();
+        return Ok(format!("Stopped {name}, which was idle."));
+    }
     // Taken under the lock that marks the stop an agent's below, where `stop`
     // would look again later and could reach a run picked up since, unmarked.
     let running = registry.running.iter().find(|helper| helper.id == id);
@@ -1809,6 +2373,9 @@ mod tests {
             ended: Some("finished".into()),
             asked_to_stop: false,
             stopped_by_user: false,
+            keep: None,
+            idle: None,
+            earlier: 0,
         }
     }
 
@@ -2665,7 +3232,7 @@ mod tests {
 
         // One that ends before its next step passes it on to its owner.
         assert!(steer(id, "And the docs."));
-        close(slot, &report(Outcome::Done, "Done."), |_| ());
+        close(slot, &report(Outcome::Done, "Done."), |_, _| ());
         let passed: Vec<String> = (inbox::take(9_601, true).into_iter())
             .map(|notice| notice.text)
             .collect();
@@ -2959,5 +3526,494 @@ mod tests {
             name: name.into(),
             arguments: args.to_string(),
         }
+    }
+
+    #[test]
+    fn a_claimable_task_wakes_an_idle_helper() {
+        let session = Session::new("ring");
+        let (_ctx, provider, id) = kept(&session, "claimer", &["Done: the tests pass."]);
+        let mut offered = Vec::new();
+        let took = ring(4_242, |name| {
+            offered.push(name.to_owned());
+            Some(Notice {
+                from: "tasks".into(),
+                when: When::Next,
+                text: format!("task 1 is yours, {name}: check the tests"),
+            })
+        });
+        let notices = heard(4_242);
+        let sent = provider.sent();
+
+        assert_eq!(offered, ["claimer"]);
+        assert_eq!(took.as_deref(), Some("claimer"));
+        let said = said_in(&sent[1]);
+        assert!(
+            said[2]
+                .1
+                .contains("task 1 is yours, claimer: check the tests"),
+            "{said:?}"
+        );
+        assert!(notices[0].text.contains("Done: the tests pass."));
+        assert!(stop(id));
+    }
+
+    #[test]
+    fn a_helper_not_kept_ends_as_before() {
+        let session = Session::new("unkept");
+        inbox::listen();
+        let (endpoint, provider) = Stub::start(vec![reply("The notes say hello.", None)]);
+        let args = json!({"description": "Read the notes", "type": "explore", "name": "once",
+            "prompt": "Read notes.txt."});
+        call(session.context(endpoint.clone()), args).unwrap();
+        let notices = heard(4_242);
+        provider.sent();
+
+        assert!(!notices[0].text.contains("idle"), "{notices:?}");
+        assert!(row(&session.context(endpoint), "once").contains("finished"));
+        assert_eq!(task_of("once"), State::Done("finished".into()));
+        let id = (registry().helpers.iter())
+            .find(|helper| helper.root == 4_242 && helper.name == "once")
+            .inspect(|helper| assert!(helper.keep.is_none() && helper.idle.is_none()))
+            .map(|helper| helper.id)
+            .unwrap();
+        // Mail waits for whoever picks it back up, rather than waking it.
+        inbox::push(id, from_elsewhere());
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(inbox::take(id, true).len(), 1);
+    }
+
+    #[test]
+    fn a_kept_helper_reports_and_goes_idle_holding_no_place() {
+        let session = Session::new("keep");
+        let (ctx, provider, id) = kept(&session, "keeper", &[]);
+        provider.sent();
+
+        assert!(registry().running.is_empty());
+        assert!(row(&ctx, "keeper").contains("idle · 30m left"));
+        assert_eq!(task_of("keeper"), State::Idle);
+        let until = (registry().helpers.iter())
+            .find(|helper| helper.id == id)
+            .and_then(|helper| Some(helper.idle.as_ref()?.until))
+            .unwrap();
+        assert!(until > Instant::now() + KEEP - WAIT && until <= Instant::now() + KEEP);
+        assert!(stop(id));
+    }
+
+    #[test]
+    fn a_kept_helper_spends_one_budget_for_its_whole_life() {
+        let session = Session::new("budget");
+        // Each reply costs 1,050: a run fits twice over, and three do not.
+        std::fs::write(
+            session.data.join("settings.json"),
+            r#"{"endpoint": "", "model": "", "helper_budget": 2500}"#,
+        )
+        .unwrap();
+        let (ctx, provider, id) = kept(&session, "thrifty", &["Second.", "Third."]);
+        let send = |text: &str| json!({"action": "send", "to": "thrifty", "message": text});
+        talk(ctx.clone(), send("Once more.")).unwrap();
+        let second = heard(4_242);
+        let tokens_then = row(&ctx, "thrifty");
+        talk(ctx.clone(), send("And again.")).unwrap();
+        let third = heard(4_242);
+        provider.sent();
+
+        assert!(second[0].text.contains("is idle now"), "{second:?}");
+        assert!(
+            tokens_then.contains("idle") && tokens_then.ends_with("2k"),
+            "{tokens_then}"
+        );
+        assert!(
+            third[0].text.contains(
+                "thrifty has ended rather than wait for more work: the budget every run of it \
+                 spends from is spent."
+            ),
+            "{third:?}"
+        );
+        assert!(!is_idle(id));
+        let last = row(&ctx, "thrifty");
+        assert!(last.contains("finished") && last.ends_with("3k"), "{last}");
+    }
+
+    #[test]
+    fn a_message_wakes_an_idle_helper_with_its_transcript() {
+        let session = Session::new("wake");
+        let (ctx, provider, id) = kept(&session, "woken", &["The tests pass too."]);
+        let message = json!({"action": "send", "to": "woken", "message": "Now check the tests."});
+        let out = talk(ctx.clone(), message).unwrap();
+        let notices = heard(4_242);
+        let sent = provider.sent();
+
+        assert_eq!(
+            out,
+            "Woke woken with your message. A notice comes when it is done."
+        );
+        let said = said_in(&sent[1]);
+        assert_eq!(said.len(), 3, "{said:?}");
+        assert!(said[0].1.starts_with(TASK_HEADER), "{said:?}");
+        assert_eq!(said[1], ("assistant", "The notes say hello."));
+        assert_eq!(
+            said[2],
+            ("user", from_main("Now check the tests.").as_str())
+        );
+        // It answered again and waits again, and an agent's stop ends it at once.
+        assert!(
+            notices[0].text.contains("The tests pass too."),
+            "{notices:?}"
+        );
+        assert!(is_idle(id));
+        let stopping = json!({"action": "stop", "to": "woken"});
+        assert_eq!(
+            talk(ctx.clone(), stopping),
+            Ok("Stopped woken, which was idle.".into())
+        );
+        assert!(row(&ctx, "woken").contains("stopped"));
+    }
+
+    #[test]
+    fn a_users_stop_as_an_idle_helper_wakes_ends_it_and_hands_its_mail_up() {
+        let session = Session::new("stop-race");
+        let (ctx, provider, id) = kept(&session, "raced", &[]);
+        provider.sent();
+        // The stop lands before the wake takes a place: the wake finds it
+        // ended, and runs nothing.
+        mail_without_a_wake(id);
+        assert!(stop(id));
+        wake(id);
+        let early = inbox::take(4_242, true);
+        // The stop lands once the wake has its place: the run ends before
+        // its first request, and the mail it took comes back unread.
+        let (_, provider, late) = kept(&session, "raced-late", &[]);
+        provider.sent();
+        mail_without_a_wake(late);
+        let woken = take_idle(late, AT_ONCE).unwrap();
+        assert!(stop(late));
+        carry_on(woken, &usual(), inbox::take(late, true)).unwrap();
+        let after = heard(4_242);
+
+        assert_eq!(texts(&early), [unread("raced")]);
+        assert_eq!(texts(&after), [unread("raced-late")]);
+        for name in ["raced", "raced-late"] {
+            assert!(row(&ctx, name).contains("stopped by the user"), "{name}");
+        }
+        assert_eq!(sidecar(&session, 2)["stopped_by_user"], true);
+    }
+
+    #[test]
+    fn a_wake_runs_in_the_sessions_mode_now_and_waits_for_one_it_knows() {
+        let session = Session::new("plan-wake");
+        let (ctx, provider, id) = kept(&session, "planner", &["Planned."]);
+        // With no connection noted for its session, mail waits.
+        CURRENT.lock().unwrap().remove(&4_242);
+        inbox::push(id, from_elsewhere());
+        std::thread::sleep(Duration::from_millis(200));
+        let waited = is_idle(id) && inbox::pending().contains(&id);
+        // The session goes into plan mode after the helper was kept.
+        connected(ctx.caller.connection.as_deref().unwrap());
+        set_plan(true);
+        inbox::push(id, from_elsewhere());
+        let notices = heard(4_242);
+        set_plan(false);
+        let sent = provider.sent();
+
+        assert!(waited, "it ran on the connection it was kept on");
+        assert!(notices[0].text.contains("Planned."), "{notices:?}");
+        assert!(offered(&sent[0]).contains(&"write_file"));
+        let woken = offered(&sent[1]);
+        assert!(
+            woken.contains(&"read_file") && !woken.contains(&"write_file"),
+            "{woken:?}"
+        );
+        assert!(stop(id));
+    }
+
+    #[test]
+    fn an_agents_stop_of_an_idle_helper_ends_it_for_good() {
+        let session = Session::new("agent-stop-race");
+        let (ctx, provider, id) = kept(&session, "stilled", &[]);
+        provider.sent();
+        mail_without_a_wake(id);
+        let stop_it = |name: &str| talk(ctx.clone(), json!({"action": "stop", "to": name}));
+        let stopped = stop_it("stilled");
+        wake(id);
+        let early = inbox::take(4_242, true);
+        let (_, provider, late) = kept(&session, "stilled-late", &[]);
+        provider.sent();
+        mail_without_a_wake(late);
+        let woken = take_idle(late, AT_ONCE).unwrap();
+        let stopping = stop_it("stilled-late");
+        carry_on(woken, &usual(), inbox::take(late, true)).unwrap();
+        let mut after = heard(4_242);
+        while after.len() < 2 {
+            after.extend(heard(4_242));
+        }
+
+        assert_eq!(stopped, Ok("Stopped stilled, which was idle.".into()));
+        assert_eq!(texts(&early), [unread("stilled")]);
+        assert_eq!(
+            stopping,
+            Ok("Stopping stilled-late; what it has so far comes as a notice.".into())
+        );
+        assert!(
+            after[0].text.starts_with("helper stilled-late was stopped"),
+            "{after:?}"
+        );
+        assert_eq!(after[1].text, unread("stilled-late"));
+        // Neither runs again.
+        assert!(!is_idle(id) && !is_idle(late));
+        for name in ["stilled", "stilled-late"] {
+            assert!(row(&ctx, name).contains("stopped"), "{name}");
+        }
+    }
+
+    #[test]
+    fn an_idle_helper_ends_after_its_time() {
+        let session = Session::new("expire");
+        let (ctx, provider, id) = kept(&session, "expiring", &[]);
+        provider.sent();
+        // Its timer brought forward to now, so the timer thread ends it at once.
+        {
+            let mut registry = registry();
+            let helper = registry.helpers.iter_mut().find(|h| h.id == id).unwrap();
+            let idle = helper.idle.as_mut().unwrap();
+            timers::cancel(idle.timer);
+            let until = Instant::now();
+            idle.until = until;
+            idle.timer = timers::at(until, Box::new(move || expire(id, until)));
+        }
+        let deadline = Instant::now() + WAIT;
+        while is_idle(id) {
+            assert!(Instant::now() < deadline, "it never ended");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(row(&ctx, "expiring").contains("ended after 30 idle minutes"));
+        let ended = State::Done("ended after 30 idle minutes".into());
+        assert_eq!(task_of("expiring"), ended);
+        // Its report came as it went idle, so its end tells nobody, and mail
+        // no longer wakes it.
+        assert!(inbox::take(4_242, true).is_empty());
+        inbox::push(id, from_elsewhere());
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(inbox::take(id, true).len(), 1);
+    }
+
+    /// A message that is no one's in particular, for mailboxes nothing should wake.
+    fn from_elsewhere() -> Notice {
+        Notice {
+            from: "main".into(),
+            when: When::Next,
+            text: "message from main:\nanyone there?".into(),
+        }
+    }
+
+    /// The non-system turns a request carried, as role and text.
+    fn said_in(body: &Value) -> Vec<(&str, &str)> {
+        (body["messages"].as_array().unwrap().iter())
+            .filter(|message| message["role"] != "system")
+            .map(|m| (m["role"].as_str().unwrap(), m["content"].as_str().unwrap()))
+            .collect()
+    }
+
+    /// Whether helper `id` is idle.
+    fn is_idle(id: AgentId) -> bool {
+        (registry().helpers.iter()).any(|helper| helper.id == id && helper.idle.is_some())
+    }
+
+    /// Starts `name`, kept, on a stub that answers "The notes say hello." and
+    /// then each of `more`, and waits for it to go idle.
+    fn kept(session: &Session, name: &str, more: &[&str]) -> (ToolContext, Stub, AgentId) {
+        inbox::listen();
+        let mut replies = vec![reply("The notes say hello.", None)];
+        replies.extend(more.iter().map(|text| reply(text, None)));
+        let (endpoint, provider) = Stub::start(replies);
+        let ctx = session.context(endpoint);
+        // As the front end notes it when the turn starts.
+        connected(ctx.caller.connection.as_deref().unwrap());
+        let args = json!({"description": "Read the notes", "type": "general", "name": name,
+            "prompt": "Read notes.txt.", "keep": true});
+        call(ctx.clone(), args).unwrap();
+        let notices = heard(4_242);
+        assert!(notices[0].text.contains("is idle now"), "{notices:?}");
+        let id = (registry().helpers.iter())
+            .find(|helper| helper.root == 4_242 && helper.name == name)
+            .map(|helper| helper.id)
+            .unwrap();
+        (ctx, provider, id)
+    }
+
+    #[test]
+    fn kept_helpers_are_capped_and_idle_ones_take_no_running_place() {
+        let session = Session::new("kept-cap");
+        inbox::listen();
+        let ctx = session.context("http://127.0.0.1:9/v1".into());
+        let waited = json!({"description": "d", "prompt": "p", "keep": true, "background": false});
+        let Err(refused) = call(ctx.clone(), waited) else {
+            panic!("a helper was kept that nothing would wake");
+        };
+        assert!(refused.starts_with("`keep` needs a helper in the background"));
+        let far = Instant::now() + KEEP;
+        let ids: Vec<AgentId> = (0..KEPT as u64).map(|n| 96_001 + n).collect();
+        for &id in &ids {
+            let idle = Idle {
+                until: far,
+                timer: timers::at(far, Box::new(|| ())),
+            };
+            let helper = Helper {
+                keep: Some(Arc::new(Budget::new(BUDGET, None))),
+                idle: Some(idle),
+                ..known(id, 4_242, 4_242, "kept", "general")
+            };
+            registry().helpers.push(helper);
+        }
+        let more = json!({"description": "d", "prompt": "p", "keep": true});
+        let refused = call(ctx.clone(), more);
+        // Each session has a cap of its own.
+        let elsewhere = may_keep(true, 9_601);
+        let places: Vec<Slot> = (0..AT_ONCE)
+            .map(|_| reserve(9_602, 9_602, "runner", AT_ONCE, Cancel::default()).unwrap())
+            .collect();
+        drop(places);
+        let mut registry = registry();
+        for helper in registry.helpers.iter_mut().filter(|h| ids.contains(&h.id)) {
+            end_idle(helper, "stopped".into(), State::Stopped);
+        }
+        drop(registry);
+
+        assert_eq!(
+            refused,
+            Err(
+                "8 of this session's helpers are kept already, the most. Do not retry with \
+                 keep: start this one without it, or stop a kept one you no longer need."
+                    .into()
+            )
+        );
+        assert_eq!(elsewhere, Ok(()));
+    }
+
+    #[test]
+    fn mail_that_finds_every_place_taken_is_read_once_one_frees() {
+        let session = Session::new("full");
+        let (_ctx, provider, id) = kept(&session, "patient", &["Read it."]);
+        let places: Vec<Slot> = (0..AT_ONCE)
+            .map(|_| reserve(9_603, 9_603, "runner", AT_ONCE, Cancel::default()).unwrap())
+            .collect();
+        inbox::push(id, from_elsewhere());
+        std::thread::sleep(Duration::from_millis(200));
+        let waited = is_idle(id) && inbox::pending().contains(&id);
+        drop(places);
+        let notices = heard(4_242);
+        let sent = provider.sent();
+
+        assert!(waited, "it ran with no place free, or lost its mail");
+        assert!(notices[0].text.contains("Read it."), "{notices:?}");
+        let said = said_in(&sent[1]);
+        assert!(said[2].1.contains("anyone there?"), "{said:?}");
+        assert!(stop(id));
+    }
+
+    /// Leaves mail for idle helper `id` with its wake taken back, as when a
+    /// stop or a wake comes between the push and the thread it starts.
+    fn mail_without_a_wake(id: AgentId) {
+        inbox::unwake(id);
+        inbox::push(id, from_elsewhere());
+    }
+
+    /// The names of the tools a request offered.
+    fn offered(body: &Value) -> Vec<&str> {
+        (body["tools"].as_array().unwrap().iter())
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn ring_takes_a_place_before_it_offers_a_task_and_says_who_took_it() {
+        static ENDS: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
+        let session = Session::new("ring-place");
+        let (_ctx, provider, id) = kept(&session, "ringer", &[]);
+        provider.sent();
+        let task = |text: String| Notice {
+            from: "tasks".into(),
+            when: When::Next,
+            text,
+        };
+        let places: Vec<Slot> = (0..AT_ONCE)
+            .map(|_| reserve(9_604, 9_604, "runner", AT_ONCE, Cancel::default()).unwrap())
+            .collect();
+        let mut offered = 0;
+        let when_full = ring(4_242, |_| {
+            offered += 1;
+            Some(task("task 1".into()))
+        });
+        drop(places);
+        let until = until_of(id);
+        let passed = ring(4_242, |_| None);
+        let still = until_of(id);
+        on_end(|root: u64, name: &str| ENDS.lock().unwrap().push((root, name.to_owned())));
+        // A stop that lands once it has taken the task.
+        let took = ring(4_242, |name| {
+            assert!(stop(id));
+            Some(task(format!("task 2 is yours, {name}")))
+        });
+        let back = heard(4_242);
+        *ON_END.lock().unwrap() = None;
+
+        assert_eq!((when_full, offered), (None, 0));
+        assert_eq!(passed, None);
+        assert!(until.is_some() && still == until, "{until:?} {still:?}");
+        assert_eq!(took.as_deref(), Some("ringer"));
+        assert_eq!(
+            texts(&back),
+            ["ringer ended before it read this, from tasks:\ntask 2 is yours, ringer"]
+        );
+        assert_eq!(*ENDS.lock().unwrap(), [(4_242, "ringer".to_owned())]);
+    }
+
+    /// The row the agents list shows for `name`.
+    fn row(ctx: &ToolContext, name: &str) -> String {
+        let listed = talk(ctx.clone(), json!({"action": "list"})).unwrap();
+        let row = listed
+            .lines()
+            .find(|line| line.starts_with(&format!("{name} ")));
+        row.unwrap_or_else(|| panic!("{name} is not listed:\n{listed}"))
+            .to_owned()
+    }
+
+    #[test]
+    fn stopping_an_idle_helper_ends_it_at_once() {
+        let session = Session::new("stop-idle");
+        let (ctx, provider, id) = kept(&session, "idler", &[]);
+        provider.sent();
+
+        assert!(stop(id));
+        assert!(!stop(id), "it was stopped twice");
+        assert!(row(&ctx, "idler").contains("stopped by the user"));
+        assert_eq!(task_of("idler"), State::Stopped);
+        assert_eq!(sidecar(&session, 1)["stopped_by_user"], true);
+        let message = json!({"action": "send", "to": "idler", "message": "One more thing."});
+        assert_eq!(talk(ctx, message), Err(user_stopped("idler")));
+    }
+
+    /// Where the test session's task for helper `name` has got to.
+    fn task_of(name: &str) -> State {
+        let task = tasks::list(4_242)
+            .into_iter()
+            .find(|task| task.label == name);
+        task.unwrap().state
+    }
+
+    fn texts(notices: &[Notice]) -> Vec<String> {
+        notices.iter().map(|notice| notice.text.clone()).collect()
+    }
+
+    /// What helper `name`'s owner hears of `from_elsewhere` when it went unread.
+    fn unread(name: &str) -> String {
+        format!("{name} ended before it read this, from main:\nmessage from main:\nanyone there?")
+    }
+
+    /// When idle helper `id` ends if nothing wakes it, or None if it is not idle.
+    fn until_of(id: AgentId) -> Option<Instant> {
+        let registry = registry();
+        let helper = registry.helpers.iter().find(|helper| helper.id == id)?;
+        Some(helper.idle.as_ref()?.until)
     }
 }

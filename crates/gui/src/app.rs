@@ -1,5 +1,5 @@
 use crate::prelude::*;
-use letronna_core::{agent, approvals, inbox};
+use letronna_core::{agent, agents, approvals, inbox};
 
 pub(crate) const BRAND: &str = "Letronna";
 
@@ -924,6 +924,8 @@ impl Chat {
         let model = connection.model.clone();
         self.busy = true;
         self.streaming_id = Some(target_id);
+        // What the session's kept helpers wake on from now on.
+        agents::connected(&connection);
         self.turn = Some(agent::Turn::new(connection));
         // A browser closed during the last turn shows again in this one.
         self.browser.update(cx, |view, _| view.dismissed = false);
@@ -1902,6 +1904,7 @@ impl Chat {
             return;
         };
         self.modes.insert(session.id, mode);
+        agents::set_plan(mode == letronna_core::gate::Mode::Plan);
         self.approvals_changed(cx);
         cx.notify();
     }
@@ -2162,6 +2165,7 @@ impl Chat {
         };
         self.busy = true;
         self.streaming_id = Some(id);
+        agents::connected(&connection);
         self.turn = Some(agent::Turn::new(connection));
         self.error = None;
         self.run_turn(cx);

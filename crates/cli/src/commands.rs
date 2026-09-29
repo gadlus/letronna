@@ -56,6 +56,7 @@ pub fn command(
             } else {
                 Mode::Plan
             };
+            letronna_core::agents::set_plan(runner.mode == Mode::Plan);
             let note = footer(runner);
             runner.bar.set_footer(note);
             render::blank();

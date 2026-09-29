@@ -156,6 +156,8 @@ impl Runner {
     /// Run the agent to completion on the conversation as it stands.
     fn run(&mut self, connection: Connection, session: usize) -> Result<String, String> {
         self.bar.show_helpers_of(connection.conversation);
+        // What the session's kept helpers wake on from now on.
+        agents::connected(&connection);
         let mut turn = Turn::new(connection);
         self.stopped = false;
         self.bar.working(true);
