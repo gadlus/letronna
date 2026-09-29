@@ -16,6 +16,10 @@ chrono.workspace = true
 # rustls, and semver already in the lock file.
 ring = "0.17"
 semver = "1"
+# The search tool: ripgrep's walker, which honours .gitignore, and its
+# regex engine, both already in the lock file under the window's crates.
+ignore = "0.4"
+regex = "1"
 # Discord's Gateway, for hearing server mentions as they happen. Blocking
 # like reqwest here, and on the same rustls.
 tungstenite = { version = "0.30", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }

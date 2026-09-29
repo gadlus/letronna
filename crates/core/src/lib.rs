@@ -21,6 +21,7 @@ pub mod diag;
 mod edit;
 pub mod failure;
 pub mod gateway;
+mod grep;
 pub mod inbox;
 pub mod jobs;
 pub mod mcp;
