@@ -648,6 +648,7 @@ fn usage_line(message: &Message) -> String {
     let input = message.input_tokens();
     if input > 0 {
         parts.push(format!("{input} in"));
+        parts.extend(message.fullness());
         if message.cached_tokens > 0 {
             let share = 100 * message.cached_tokens / input;
             parts.push(format!("{share}% cached"));
@@ -865,5 +866,20 @@ mod tests {
             ..message.clone()
         };
         assert_eq!(usage_line(&uncached), "16 out · 18.4 tok/s · 3291 in");
+    }
+
+    #[test]
+    fn usage_line_says_how_full_the_window_was_after_the_prompt() {
+        let message = Message {
+            tokens: 16,
+            prompt_tokens: 76_000,
+            cached_tokens: 72_200,
+            window: 200_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            usage_line(&message),
+            "16 out · 76000 in · 38% of 200K · 95% cached"
+        );
     }
 }

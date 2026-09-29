@@ -68,6 +68,8 @@ pub struct Live {
     pub per_second: f32,
     pub prompt_tokens: u64,
     pub cached_tokens: u64,
+    /// The model's window as the model facts give it, once the usage is in.
+    pub window: u64,
     pub calls: Vec<ToolCall>,
     /// The try about to be made again after a failure, while it waits.
     pub retrying: Option<crate::retry::Retry>,
@@ -139,6 +141,9 @@ impl Turn {
                 self.live.per_second = *per_second;
                 self.live.prompt_tokens = *prompt;
                 self.live.cached_tokens = *cached;
+                let model = self.connection.model.trim();
+                let facts = crate::models::facts(&self.connection.endpoint, model);
+                self.live.window = facts.context.unwrap_or(0);
             }
             Event::ToolCalls(calls) => self.live.calls = calls.clone(),
             Event::Retrying(retry) => self.live.retrying = Some(*retry),
@@ -160,6 +165,7 @@ impl Turn {
             per_second: live.per_second,
             prompt_tokens: live.prompt_tokens,
             cached_tokens: live.cached_tokens,
+            window: live.window,
             tool_calls: live.calls,
             ..Default::default()
         }
@@ -339,6 +345,27 @@ mod tests {
         // The next reply must not inherit any of that.
         assert!(turn.live.content.is_empty());
         assert_eq!(turn.take_reply("some-model").tokens, 0);
+    }
+
+    #[test]
+    fn a_reply_carries_its_models_window_when_the_facts_know_it() {
+        let usage = Event::Usage {
+            completion: 12,
+            per_second: 4.0,
+            prompt: 76_000,
+            cached: 0,
+        };
+        let mut known = turn();
+        known.connection.endpoint = "https://fullness.test/v1".into();
+        known.connection.model = "claude-sonnet-4-5".into();
+        known.absorb(&usage);
+        let reply = known.take_reply("claude-sonnet-4-5");
+        assert_eq!(reply.window, 200_000);
+        assert_eq!(reply.fullness().as_deref(), Some("38% of 200K"));
+
+        let mut unknown = turn();
+        unknown.absorb(&usage);
+        assert_eq!(unknown.take_reply("test").fullness(), None);
     }
 
     #[test]
