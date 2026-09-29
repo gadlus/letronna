@@ -30,6 +30,7 @@ pub mod history;
 pub mod inbox;
 pub mod jobs;
 pub mod judge;
+pub mod limits;
 pub mod mcp;
 pub mod media;
 pub mod memory;

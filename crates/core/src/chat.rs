@@ -1712,6 +1712,13 @@ fn stream(
             Ok(response) => {
                 let status = response.status();
                 let headers = response.headers().clone();
+                // Other calls to this provider hold off too, not just this one.
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    crate::limits::backoff(
+                        &connection.endpoint,
+                        crate::limits::retry_after(&headers),
+                    );
+                }
                 let error = response.text().unwrap_or_default();
                 // Send it again without what the refusal named, which requests
                 // to this model leave out from then on -- unless the turn was
