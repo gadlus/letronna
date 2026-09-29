@@ -134,6 +134,7 @@ pub type Handle = std::thread::JoinHandle<Report>;
 /// Runs the agent on this thread until it answers, is stopped, or runs out of rounds or budget.
 pub fn run(mut spec: Spec) -> Report {
     let started = Instant::now();
+    crate::hooks::new_turn(spec.connection.conversation);
     let mut turn = Turn::with_limit(spec.connection.clone(), spec.rounds);
     let mut report = Report {
         status: Outcome::Done,
@@ -189,6 +190,7 @@ pub fn spawn(spec: Spec, then: impl FnOnce(&Report) + Send + 'static) -> Result<
 
 /// Calls the model and works through what it asks for, round after round, until the run ends.
 fn steps(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result<Outcome, String> {
+    let mut sent_back = 0;
     loop {
         if spec.cancel.is_set() {
             return Ok(Outcome::Stopped);
@@ -221,9 +223,28 @@ fn steps(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result<Outcom
             let answered = mail.is_none();
             spec.transcript.conversation.messages.extend(mail);
             save(&mut spec.transcript)?;
-            if answered {
-                return Ok(Outcome::Done);
+            if !answered {
+                continue;
             }
+            // A session's own agent, as `-p` runs it, hears its Stop hooks as a
+            // turn in the terminal does; a helper's answer is its parent's to judge.
+            let feedback = (spec.depth == 0 && sent_back < crate::hooks::STOP_BLOCKS)
+                .then(|| {
+                    let last = last_said(&spec.transcript.conversation.messages);
+                    crate::hooks::stop(&context(spec), &last, sent_back > 0)
+                })
+                .flatten();
+            let Some(feedback) = feedback else {
+                return Ok(Outcome::Done);
+            };
+            sent_back += 1;
+            spec.transcript.conversation.messages.push(Message {
+                role: "user".into(),
+                content: feedback,
+                folded: true,
+                ..Default::default()
+            });
+            save(&mut spec.transcript)?;
             continue;
         }
         save(&mut spec.transcript)?;
@@ -233,6 +254,10 @@ fn steps(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result<Outcom
         report.rounds += 1;
         spec.status.rounds.store(report.rounds, Ordering::Relaxed);
         work_through(spec, turn, report)?;
+        // A hook's `continue: false`, whose results are kept.
+        if crate::hooks::halted(spec.connection.conversation) {
+            return Ok(Outcome::Stopped);
+        }
     }
 }
 

@@ -269,6 +269,10 @@ pub(crate) struct Chat {
     /// A passing note for the next time the window draws: a new version, or
     /// a turn stopped at its round cap.
     pub(crate) note: Option<String>,
+    /// Hook failures to show once, the next time the window is drawn.
+    pub(crate) hook_note: Option<String>,
+    /// How many times this turn a Stop hook has sent the model back to work.
+    pub(crate) stop_blocks: u32,
     pub(crate) scroll: ScrollHandle,
     /// Whether the chat keeps to its newest message as more arrives.
     pub(crate) following: bool,
@@ -577,6 +581,8 @@ impl Chat {
             error: error.or(skills_error),
             updating: Default::default(),
             note: None,
+            hook_note: None,
+            stop_blocks: 0,
             scroll: ScrollHandle::new(),
             following: true,
             followed_offset: px(0.),
@@ -772,6 +778,10 @@ impl Chat {
         let target_id = conversation.id;
         self.busy = true;
         self.streaming_id = Some(target_id);
+        // Off this thread, as it may read hooks.json; long before the model
+        // asks for its first call.
+        let conversation = connection.conversation;
+        std::thread::spawn(move || letronna_core::hooks::new_turn(conversation));
         self.turn = Some(agent::Turn::new(connection));
         // A browser closed during the last turn shows again in this one.
         self.browser.update(cx, |view, _| view.dismissed = false);
@@ -923,6 +933,10 @@ impl Chat {
                 request.label
             ));
         }
+        let mut ctx = letronna_core::tools::ToolContext::default();
+        ctx.conversation = request.root;
+        ctx.workspace = self.store.conversations[ix].workspace.clone();
+        letronna_core::hooks::card(ctx, &request.call.name);
         self.agent_asks.push_back(request);
     }
 
@@ -1134,11 +1148,70 @@ impl Chat {
         let more = self.turn.as_mut().is_some_and(|turn| turn.begin(calls));
         if more {
             self.advance_tools(cx);
-        } else {
-            if let Some(note) = self.turn.as_ref().and_then(agent::Turn::capped) {
-                self.note = Some(note);
-            }
+        } else if let Some(note) = self.turn.as_ref().and_then(agent::Turn::capped) {
+            // Past the limit on rounds; a Stop hook must not undo the limit.
+            self.note = Some(note);
             self.finish(cx);
+        } else {
+            self.stop_hooks(cx);
+        }
+    }
+
+    /// The model has finished: let the Stop hooks look, off the UI thread,
+    /// then end the turn or send the model back to what one says is left.
+    fn stop_hooks(&mut self, cx: &mut Context<Self>) {
+        if self.stop_blocks >= letronna_core::hooks::STOP_BLOCKS {
+            self.note = Some(letronna_core::hooks::STOP_CAPPED.into());
+            return self.finish(cx);
+        }
+        if !letronna_core::hooks::wanted(letronna_core::hooks::Event::Stop) {
+            return self.finish(cx);
+        }
+        let last = self
+            .streaming_id
+            .and_then(|id| self.store.index_of(id))
+            .and_then(|ix| self.store.conversations[ix].messages.last())
+            .filter(|message| message.role == "assistant")
+            .map(|message| message.content.clone())
+            .unwrap_or_default();
+        let again = self.stop_blocks > 0;
+        let mut ctx = self.call_context();
+        ctx.cancel = self.turn_stop.clone();
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let _ = tx.send_blocking(letronna_core::hooks::stop(&ctx, &last, again));
+        });
+        let generation = self.generation;
+        cx.spawn(async move |this, cx| {
+            if let Ok(feedback) = rx.recv().await {
+                let _ = this.update(cx, |this, cx| {
+                    if this.generation == generation {
+                        this.after_stop_hooks(feedback, cx)
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Ends the turn, or sends the model back with what a Stop hook said, at
+    /// most `STOP_BLOCKS` times in a row.
+    fn after_stop_hooks(&mut self, feedback: Option<String>, cx: &mut Context<Self>) {
+        self.show_hook_problems();
+        let ix = self.streaming_id.and_then(|id| self.store.index_of(id));
+        match (feedback, ix) {
+            (Some(feedback), Some(ix)) => {
+                self.stop_blocks += 1;
+                self.store.conversations[ix].messages.push(Message {
+                    role: "user".into(),
+                    content: feedback,
+                    folded: true,
+                    ..Default::default()
+                });
+                self.save();
+                self.run_turn(cx);
+            }
+            _ => self.finish(cx),
         }
     }
 
@@ -1207,6 +1280,13 @@ impl Chat {
                 }
                 _ => None,
             };
+            if let agent::Next::AskUser(call) = &next {
+                // What holds every call for a yes, beside each card.
+                if let Some(error) = letronna_core::hooks::trouble() {
+                    self.hook_note = Some(error);
+                }
+                letronna_core::hooks::card(self.call_context(), &call.name);
+            }
         }
         self.asking = asking;
         if let agent::Next::AskUser(call) | agent::Next::Run(call) = &next {
@@ -1252,7 +1332,13 @@ impl Chat {
                 if let Some(ix) = self.streaming_id.and_then(|id| self.store.index_of(id)) {
                     let conversation = &mut self.store.conversations[ix];
                     conversation.messages.extend(results);
-                    self.fold_and_ask(ix, cx);
+                    // A hook's `continue: false`, shown with the results.
+                    if letronna_core::hooks::halted(conversation.id) {
+                        self.save();
+                        self.finish(cx);
+                    } else {
+                        self.fold_and_ask(ix, cx);
+                    }
                 } else {
                     self.finish(cx);
                 }
@@ -1352,6 +1438,7 @@ impl Chat {
         if let Some(turn) = self.turn.as_mut() {
             turn.finish_id(id, result);
         }
+        self.show_hook_problems();
         // The calls still running are drawn from the queue, which just lost one.
         cx.notify();
         self.advance_tools(cx);
@@ -1362,7 +1449,24 @@ impl Chat {
         if let Some(turn) = self.turn.as_mut() {
             turn.finish_call(result);
         }
+        self.show_hook_problems();
         self.advance_tools(cx);
+    }
+
+    /// Hook failures since the last look, for a notice the next draw shows.
+    fn show_hook_problems(&mut self) {
+        let problems = letronna_core::hooks::problems();
+        if problems.is_empty() {
+            return;
+        }
+        // A few lines, so a burst of failures cannot fill the window; the
+        // rest are counted.
+        const LINES: usize = 3;
+        let mut note = problems[..problems.len().min(LINES)].join("\n");
+        if problems.len() > LINES {
+            note.push_str(&format!("\n… and {} more", problems.len() - LINES));
+        }
+        self.hook_note = Some(note);
     }
 
     /// Stop any running poller and start one if messaging is set up. Called
@@ -1929,6 +2033,7 @@ impl Chat {
         // Calls a stop left running come back to a generation that is gone,
         // so the next turn must not wait for them.
         self.outstanding = 0;
+        self.stop_blocks = 0;
         plugins::emit(cx, plugins::AppEvent::ChatIdle);
         self.send_follow_ups(session, cx);
         // Stop means stop, and after a failure the next turn would most
@@ -1982,6 +2087,8 @@ impl Chat {
         };
         self.busy = true;
         self.streaming_id = Some(id);
+        let conversation = connection.conversation;
+        std::thread::spawn(move || letronna_core::hooks::new_turn(conversation));
         self.turn = Some(agent::Turn::new(connection));
         self.error = None;
         self.run_turn(cx);
@@ -2130,6 +2237,12 @@ impl Render for Chat {
         }
         if let Some(note) = self.note.take() {
             window.push_notification(gpui_component::notification::Notification::info(note), cx);
+        }
+        if let Some(note) = self.hook_note.take() {
+            window.push_notification(
+                gpui_component::notification::Notification::warning(note),
+                cx,
+            );
         }
         if let Some(error) = self.error.take() {
             let text = error.clone();
