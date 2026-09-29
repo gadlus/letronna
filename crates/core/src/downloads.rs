@@ -973,6 +973,37 @@ impl Keeper {
 }
 
 #[cfg(test)]
+impl Keeper {
+    /// A keeper with no browser behind it, for tests of what opens and ends
+    /// its windows.
+    pub(crate) fn unplugged() -> Arc<Keeper> {
+        let inner = Inner {
+            calls: None,
+            events: None,
+            staging: PathBuf::new(),
+            context: None,
+            mine: String::new(),
+            headed: false,
+            window: None,
+            unclaimed: HashMap::new(),
+            notes: Vec::new(),
+            reading: false,
+            rounds: 0,
+            broken: None,
+        };
+        Arc::new(Keeper {
+            inner: Mutex::new(inner),
+            read: Condvar::new(),
+        })
+    }
+
+    /// Whether a window is open and in its grace after an action.
+    pub(crate) fn in_grace(&self) -> bool {
+        (self.lock().window.as_ref()).is_some_and(|window| window.until.is_some())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
