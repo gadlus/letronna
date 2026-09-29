@@ -257,6 +257,7 @@ fn import_claude_code(path: &Path) -> Result<Imported, String> {
             path.display()
         ));
     }
+    let messages = join_rounds(messages);
     let title = first_user_title(&messages);
     Ok(Imported {
         source: Source {
@@ -567,6 +568,7 @@ fn import_codex(path: &Path) -> Result<Imported, String> {
             path.display()
         ));
     }
+    let messages = join_rounds(messages);
     let title = first_user_title(&messages);
     Ok(Imported {
         source: Source {
@@ -734,6 +736,38 @@ fn codex_output_text(output: &Value) -> String {
 }
 
 // -- Shared ----------------------------------------------------------------
+
+/// Assistant messages that follow one another folded into one. Claude Code
+/// writes a record per content block and Codex an item per call, so one
+/// round with two parallel calls arrives as two assistant messages, and the
+/// first call's result then no longer follows the message that made it.
+fn join_rounds(messages: Vec<Message>) -> Vec<Message> {
+    let mut out: Vec<Message> = Vec::with_capacity(messages.len());
+    for message in messages {
+        match out.last_mut() {
+            Some(last) if last.role == "assistant" && message.role == "assistant" => {
+                if !message.content.is_empty() {
+                    if !last.content.is_empty() {
+                        last.content.push('\n');
+                    }
+                    last.content.push_str(&message.content);
+                }
+                if !message.reasoning.is_empty() {
+                    if !last.reasoning.is_empty() {
+                        last.reasoning.push('\n');
+                    }
+                    last.reasoning.push_str(&message.reasoning);
+                }
+                if last.model.is_empty() {
+                    last.model = message.model;
+                }
+                last.tool_calls.extend(message.tool_calls);
+            }
+            _ => out.push(message),
+        }
+    }
+    out
+}
 
 fn subdirs(dir: &Path) -> Vec<PathBuf> {
     std::fs::read_dir(dir)
@@ -1013,5 +1047,27 @@ mod tests {
             into_conversation(imported(Some(here.clone())), 1).workspace,
             Some(here)
         );
+    }
+
+    #[test]
+    fn parallel_calls_stay_in_front_of_their_results() {
+        let dir = scratch("parallel");
+        let text = concat!(
+            r#"{"type":"user","message":{"content":"go"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"a","name":"read_file","input":{}}]}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"b","name":"read_file","input":{}}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"a","content":"x"}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"b","content":"y"}]}}"#,
+            "\n",
+        );
+        let path = write(&dir, "par.jsonl", text);
+        let messages = import_claude_code(&path).unwrap().messages;
+        let roles: Vec<&str> = messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["user", "assistant", "tool", "tool"]);
+        assert_eq!(messages[1].tool_calls.len(), 2);
     }
 }
