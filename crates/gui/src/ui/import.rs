@@ -304,11 +304,11 @@ impl Chat {
 }
 
 /// Whether `candidate` holds every word of `query`, already lowercase, in
-/// its title, its tool's name or its project folder.
+/// its title, its tool's name or its project folder, each as its row shows it.
 fn matches(candidate: &Candidate, query: &str) -> bool {
     let haystack = format!(
         "{} {} {}",
-        candidate.title,
+        title(candidate),
         candidate.tool.label(),
         folder(candidate)
     )
@@ -377,6 +377,10 @@ mod tests {
         assert_eq!(title(&c), "Untitled");
         assert_eq!(folder(&c), "no project");
         assert!(matches(&c, "no project"));
+        assert!(
+            matches(&c, "untitled"),
+            "what the row shows is what is searched"
+        );
     }
 
     #[test]
