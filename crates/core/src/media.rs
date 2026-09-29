@@ -370,9 +370,10 @@ fn upload_ready(
     let picture = image::load_from_memory(&bytes).map_err(|_| {
         format!("`{raw}` is not a picture that can be edited: a PNG, JPEG, WebP, GIF or BMP.")
     })?;
-    // With an alpha channel, which a mask is read by.
+    // With an alpha channel, which a mask is read by; taken rather than
+    // copied, as a small GIF can decode to hundreds of megabytes.
     let mut converted = Vec::new();
-    image::DynamicImage::ImageRgba8(picture.to_rgba8())
+    image::DynamicImage::ImageRgba8(picture.into_rgba8())
         .write_to(
             &mut std::io::Cursor::new(&mut converted),
             image::ImageFormat::Png,
