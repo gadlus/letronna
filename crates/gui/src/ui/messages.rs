@@ -624,7 +624,11 @@ impl Chat {
                             .min_w_0()
                             .text_xs()
                             .text_color(muted)
-                            .truncate()
+                            // Clipped, not truncated: gpui keeps the first
+                            // width a truncated line was measured at, here
+                            // too narrow, and drew the line as "…".
+                            .overflow_hidden()
+                            .whitespace_nowrap()
                             .child(letronna_core::tools::one_line(&message.content)),
                     )
                     .children(actions.map(|actions| div().pt_1().child(actions))),
