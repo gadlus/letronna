@@ -3161,6 +3161,10 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn a_sandboxed_command_runs_confined_and_says_so() {
+        // As in the sandbox's own test: a sandboxed runner cannot start one.
+        if !crate::sandbox::available() {
+            return;
+        }
         let dir =
             std::env::temp_dir().join(format!("letronna-tools-sandboxed-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
