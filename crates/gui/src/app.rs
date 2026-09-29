@@ -1864,7 +1864,7 @@ impl Render for Chat {
                         .pb_2()
                         .children(self.busy_note(cx))
                         .children(self.todo_panel(cx))
-                        .child(self.composer(cx)),
+                        .child(self.composer(pane < px(600.), cx)),
                 )
             })
             .child(self.status_bar(cx))
