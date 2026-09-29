@@ -235,9 +235,20 @@ fn with_temp_wav<T>(
         "letronna-voice-{}-{stamp:x}.wav",
         std::process::id()
     ));
-    let result = std::fs::write(&path, wav)
+    // Only the user may read it, since the temp directory is shared on
+    // Linux; and a new file only, so a link planted at the name is not
+    // followed and then removed below.
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options
+        .open(&path)
+        .map_err(|e| format!("Could not save the recording: {e}"))?;
+    let result = std::io::Write::write_all(&mut file, wav)
         .map_err(|e| format!("Could not save the recording: {e}"))
         .and_then(|()| send(&path));
+    drop(file);
     let _ = std::fs::remove_file(&path);
     result
 }
@@ -336,26 +347,33 @@ mod tests {
 
     #[test]
     fn the_temp_recording_is_removed_whether_or_not_it_was_sent() {
-        let before = temp_voice_files();
-        let sent = with_temp_wav(b"not really a wav", |_| Ok::<_, String>(()));
-        assert!(sent.is_ok());
-        assert_eq!(temp_voice_files(), before);
-        let failed = with_temp_wav(b"not really a wav", |_| Err::<(), _>("nope".to_owned()));
+        let sent = with_temp_wav(b"not really a wav", |path| {
+            assert_eq!(
+                std::fs::read(path).ok().as_deref(),
+                Some(&b"not really a wav"[..])
+            );
+            Ok::<_, String>(path.to_owned())
+        });
+        let sent = sent.expect("sent");
+        assert!(!sent.exists());
+        let mut seen = None;
+        let failed = with_temp_wav(b"not really a wav", |path| {
+            seen = Some(path.to_owned());
+            Err::<(), _>("nope".to_owned())
+        });
         assert_eq!(failed, Err("nope".to_owned()));
-        assert_eq!(temp_voice_files(), before);
+        assert!(seen.is_some_and(|path| !path.exists()));
     }
 
-    fn temp_voice_files() -> Vec<std::path::PathBuf> {
-        std::fs::read_dir(std::env::temp_dir())
-            .into_iter()
-            .flatten()
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("letronna-voice-"))
-            })
-            .collect()
+    #[cfg(unix)]
+    #[test]
+    fn only_the_user_can_read_the_temp_recording() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = with_temp_wav(b"words", |path| {
+            std::fs::metadata(path)
+                .map(|meta| meta.permissions().mode() & 0o777)
+                .map_err(|e| e.to_string())
+        });
+        assert_eq!(mode, Ok(0o600));
     }
 }
