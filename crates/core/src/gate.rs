@@ -326,6 +326,17 @@ fn ladder(call: &ToolCall, gate: &Gate, judge: Option<&dyn Fn(&str) -> Verdict>)
     if let Some(why) = marked(tool.as_ref(), &args) {
         return Outcome::Refuse(why);
     }
+    // Computer use acts on the one app its call names, found here so that
+    // the grants below see the app rather than what was typed; Letronna's
+    // own windows and the system's password prompts are refused outright.
+    let target = if tool.name() == crate::computer::COMPUTER {
+        match crate::computer::gated(&args) {
+            Ok(target) => Some(target),
+            Err(why) => return Outcome::Refuse(why),
+        }
+    } else {
+        None
+    };
     // Layer 1, the floor. It comes before every setting and grant: a command
     // that is hard to take back needs a person's yes even when approvals are
     // skipped or the tool is allowed.
@@ -386,11 +397,15 @@ fn ladder(call: &ToolCall, gate: &Gate, judge: Option<&dyn Fn(&str) -> Verdict>)
     if gate.mode == Mode::Bypass {
         return Outcome::Run;
     }
-    // Layer 4: what the user allowed in this session or by rule.
-    let granted = gate
-        .grants
-        .get(&gate.ctx.conversation)
-        .is_some_and(|tools| tools.contains(tool.name()));
+    // Layer 4: what the user allowed in this session or by rule. A yes to
+    // computer use covers its app alone, so the tool's name grants nothing.
+    let granted = match &target {
+        Some(target) => crate::computer::granted(gate.ctx.conversation, target),
+        None => gate
+            .grants
+            .get(&gate.ctx.conversation)
+            .is_some_and(|tools| tools.contains(tool.name())),
+    };
     if !opaque && (granted || ruling.allow) {
         return Outcome::Run;
     }

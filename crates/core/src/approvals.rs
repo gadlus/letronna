@@ -4,11 +4,11 @@
 //! its calls needs a yes it asks here and whichever frontend took `serve`
 //! answers: from the session's own rules where they already allow the call,
 //! otherwise by asking the person. Core keeps no rules of its own except
-//! `ForRun`, remembered per run and tool, so a run of many helpers asks once
-//! per tool rather than once per helper. That has to hold when helpers ask at
-//! the same moment too, so a run has one request out per tool at a time: the
-//! others wait for its answer, and ask for themselves only if it was not
-//! `ForRun`.
+//! `ForRun`, remembered per run and tool (and app, for computer use), so a
+//! run of many helpers asks once per tool rather than once per helper. That
+//! has to hold when helpers ask at the same moment too, so a run has one
+//! request out per tool at a time: the others wait for its answer, and ask
+//! for themselves only if it was not `ForRun`.
 //!
 //! Each request carries its own reply channel, so an answer can only reach
 //! the call it was given for: there is no id to match up, or to forge. And
@@ -130,7 +130,8 @@ pub(crate) fn ask(
         drop(lock(&ASKS));
         SETTLED.notify_all();
     });
-    let key = (run, call.name.clone());
+    // Computer use's is kept per app too, so a yes for one app covers no other.
+    let key = (run, crate::computer::grant_key(call));
     let mut asks = lock(&ASKS);
     loop {
         if ctx.cancel.is_set() {

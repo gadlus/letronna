@@ -5,7 +5,8 @@
 //! "never `git push`" at all. A rule names a tool and a pattern: for
 //! `run_command`, the words a command starts with, matched on each command
 //! of the line as command.rs splits it, so `cargo test` never covers
-//! `cargo test; rm -rf x`; for a tool with a `path`, a glob such as `src/**`.
+//! `cargo test; rm -rf x`; for a tool with a `path`, a glob such as `src/**`;
+//! for `computer`, `app:` and an app's name or id, or `screen`.
 //!
 //! The user's rules live in `permissions.json` in the data folder, each
 //! either everywhere or tied to one project folder, which is how "Always
@@ -95,8 +96,9 @@ pub struct Rule {
     /// The tool's name, such as `run_command`.
     pub tool: String,
     /// The words a command starts with for `run_command`, a glob for a tool
-    /// with a `path`; `*` for every call of the tool, which a deny or ask
-    /// rule may also say by leaving it empty.
+    /// with a `path`, `app:` and an app's name or id or `screen` for
+    /// `computer`; `*` for every call of the tool, which a deny or ask rule
+    /// may also say by leaving it empty.
     #[serde(default)]
     pub pattern: String,
     /// What becomes of a call the rule matches.
@@ -135,6 +137,9 @@ enum Target {
     /// A file tool's `path`, from the project folder where it lies in it,
     /// and whether that is sure; see `place`.
     Path(String, bool),
+    /// What a `computer` call acts on, by each name a rule may give it, in
+    /// lower case; see `computer::rule_names`.
+    App(Vec<String>),
     /// Any other tool, which only a rule with no pattern covers.
     Call,
 }
@@ -356,6 +361,9 @@ fn target(tool: &dyn Tool, args: &Value, ctx: &ToolContext) -> Target {
         let line = command::assess(line, Dialect::here(), ctx.workspace.as_deref());
         return Target::Commands(line.commands);
     }
+    if tool.name() == crate::computer::COMPUTER {
+        return Target::App(crate::computer::rule_names(args));
+    }
     if has_path(tool) {
         let (path, sure) = place(tools::path_arg(args), ctx);
         return Target::Path(path, sure);
@@ -375,8 +383,16 @@ fn touches(rule: &Rule, target: &Target) -> bool {
         // another folder only stops more, one missing it where it is the
         // same folder would let the call by.
         Target::Path(path, _) => fits(&rule.pattern, path, true),
+        Target::App(names) => named(&rule.pattern, names),
         Target::Call => false,
     }
+}
+
+/// Whether `pattern`, such as `app:Mail` or `app:com.apple.*`, fits one of
+/// an app's `names`, without case: a name on screen is no path to fold.
+fn named(pattern: &str, names: &[String]) -> bool {
+    let pattern = pattern.trim().to_lowercase();
+    names.iter().any(|name| fits_name(&pattern, name))
 }
 
 /// Whether any of `commands`, or a command one hands to another shell,
@@ -409,6 +425,11 @@ fn covered(rules: &[Rule], target: &Target) -> bool {
                 && allows
                     .iter()
                     .any(|rule| fits(&rule.pattern, path, FOLDS_CASE))
+        }
+        // By the app's id alone, the first name: another app can take its name.
+        Target::App(names) => {
+            let id = names.get(..1).unwrap_or_default();
+            allows.iter().any(|rule| named(&rule.pattern, id))
         }
         Target::Call => false,
     }

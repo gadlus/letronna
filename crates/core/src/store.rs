@@ -256,6 +256,12 @@ pub struct Settings {
     /// its full `mcp__server__tool` name; a name no tool has is passed over.
     #[serde(default, deserialize_with = "tool_names")]
     pub disabled_tools: Vec<String>,
+    /// Offers the `computer` tool, which sees and uses other apps' windows,
+    /// asking once for each app; only where Letronna has a backend for the
+    /// system. Edited by hand with Letronna closed, until the window has a
+    /// switch for it.
+    #[serde(default)]
+    pub computer_use: bool,
 }
 
 // Written out rather than derived so the film grain starts on for a first
@@ -271,6 +277,7 @@ impl Default for Settings {
             helper_depth: 0,
             helper_budget: 0,
             disabled_tools: Vec::new(),
+            computer_use: false,
             gateway: String::new(),
             custom_endpoint: String::new(),
             presence: String::new(),
@@ -1672,6 +1679,12 @@ pub(crate) fn context_cap() -> u64 {
 /// edit counts from the next request.
 pub(crate) fn disabled_tools() -> Vec<String> {
     settings().0.disabled_tools
+}
+
+/// Whether the settings file turns computer use on, read again each time as
+/// `disabled_tools` is.
+pub(crate) fn computer_use() -> bool {
+    settings().0.computer_use
 }
 
 /// The settings file. A file that will not read at all is kept aside by

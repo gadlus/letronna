@@ -18,6 +18,7 @@ mod cdp;
 pub mod chat;
 pub mod command;
 pub mod compact;
+pub mod computer;
 pub mod diag;
 pub mod driver;
 mod edit;
