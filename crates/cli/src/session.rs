@@ -279,10 +279,11 @@ impl Runner {
     /// included -- so the one moment you most want to call something off was
     /// the one moment nothing was listening.
     ///
-    /// Stopping stops waiting. The thread is left to finish into a channel
-    /// nobody is reading; what it was doing to the disk it will still do, and
-    /// a command it started keeps running under `list_jobs` where it can be
-    /// stopped by name.
+    /// Stopping sets the call's token, which ends a wait or a running command
+    /// at once. Anything else is left to finish into a channel nobody is
+    /// reading; what it was doing to the disk it will still do, and a
+    /// background command it started keeps running under `list_jobs` where it
+    /// can be stopped by name.
     fn run_off_the_loop(
         &mut self,
         call: &letronna_core::chat::ToolCall,
@@ -290,6 +291,7 @@ impl Runner {
         summary: &str,
     ) -> Result<String, String> {
         let (name, arguments) = (call.name.clone(), call.arguments.clone());
+        let stop = ctx.cancel.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
             let _ = sender.send(tools::run(&name, &arguments, &ctx));
@@ -299,10 +301,13 @@ impl Runner {
             .wait_line_about(&format!("{}({summary})", call.name));
         let outcome = match self.wait_on(&receiver) {
             Ok(outcome) => outcome,
-            Err(Unheard::Stopped) => Err(format!(
-                "The user stopped `{}` while it was running. Ask before starting it again.",
-                call.name
-            )),
+            Err(Unheard::Stopped) => {
+                stop.set();
+                Err(format!(
+                    "The user stopped `{}` while it was running. Ask before starting it again.",
+                    call.name
+                ))
+            }
             Err(Unheard::Gone) => Err(format!("`{}` stopped without finishing.", call.name)),
         };
         self.bar.wait_line(false);
