@@ -59,10 +59,12 @@ impl Chat {
 
     /// Run `work` off the UI thread, then say what it came to and read the
     /// plugins and skills again. One at a time: each waits on git or the
-    /// network.
+    /// network. When it succeeds, the add box is emptied if it still holds
+    /// `typed`.
     fn plugin_task(
         &mut self,
         work: impl FnOnce() -> Result<String, String> + Send + 'static,
+        typed: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -74,8 +76,14 @@ impl Chat {
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let done = cx.background_executor().spawn(async move { work() }).await;
-            let _ = this.update_in(cx, |this, _, cx| {
+            let _ = this.update_in(cx, |this, window, cx| {
                 this.plugins.busy = false;
+                let source = &this.plugins.source;
+                if done.is_ok()
+                    && typed.is_some_and(|typed| source.read(cx).value().trim() == typed)
+                {
+                    source.update(cx, |input, cx| input.set_value("", window, cx));
+                }
                 this.plugins.note = Some(done);
                 this.reload_plugins();
                 this.reload_skills();
@@ -92,13 +100,18 @@ impl Chat {
         if source.is_empty() {
             return;
         }
-        self.install_plugin(source, window, cx);
+        self.install_plugin(source.clone(), Some(source), window, cx);
     }
 
-    fn install_plugin(&mut self, source: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.plugins
-            .source
-            .update(cx, |input, cx| input.set_value("", window, cx));
+    /// Install from `source`; `typed` is the add box's text it came from,
+    /// if it did, which is left there until the install succeeds.
+    fn install_plugin(
+        &mut self,
+        source: String,
+        typed: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.plugin_task(
             move || {
                 extensions::add(&source).map(|plugin| match plugin.allowed {
@@ -109,6 +122,7 @@ impl Chat {
                     ),
                 })
             },
+            typed,
             window,
             cx,
         );
@@ -125,6 +139,7 @@ impl Chat {
                     ),
                 })
             },
+            None,
             window,
             cx,
         );
@@ -454,7 +469,7 @@ impl Chat {
                                 .label(if installed { "Installed" } else { "Install" })
                                 .disabled(installed || busy)
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.install_plugin(repo.clone(), window, cx)
+                                    this.install_plugin(repo.clone(), None, window, cx)
                                 })),
                         )
                         .into_any_element()
