@@ -135,20 +135,27 @@ struct Answered {
 /// What one session's requests left to compare with.
 #[derive(Default)]
 struct Session {
-    /// The request out now, and when it was sent.
-    pending: Option<(Prefix, u64)>,
+    /// The request out now, its ticket, and when it was sent.
+    pending: Option<(u64, Prefix, u64)>,
     last: Option<Answered>,
+    /// Tickets handed out so far.
+    tickets: u64,
 }
 
 impl Session {
-    fn sent(&mut self, prefix: Prefix, now: u64) {
-        self.pending = Some((prefix, now));
+    /// Note the request and give the ticket its answer is taken with.
+    fn sent(&mut self, prefix: Prefix, now: u64) -> u64 {
+        self.tickets += 1;
+        self.pending = Some((self.tickets, prefix, now));
+        self.tickets
     }
 
     /// Take the answer to the pending request, which served `cached` tokens
-    /// from the cache, and say why it missed if it did.
-    fn answered(&mut self, cached: u64, now: u64) -> Option<Miss> {
-        let (prefix, sent) = self.pending.take()?;
+    /// from the cache, and say why it missed if it did. A stream the user
+    /// stopped waiting for can still end after the next request is out, so
+    /// an answer whose `ticket` is not the pending one's is left out.
+    fn answered(&mut self, ticket: u64, cached: u64, now: u64) -> Option<Miss> {
+        let (_, prefix, sent) = self.pending.take_if(|(at, ..)| *at == ticket)?;
         let this = Answered {
             prefix,
             at: now,
@@ -179,25 +186,26 @@ fn sessions() -> &'static Mutex<HashMap<u64, Session>> {
     SESSIONS.get_or_init(Default::default)
 }
 
-/// Note the prefix of a request just built for `conversation`. A call made
-/// outside any session, with id 0, has nothing to compare with and is left
-/// out.
-pub(crate) fn sent(conversation: u64, prefix: Prefix) {
+/// Note the prefix of a request just built for `conversation`, giving the
+/// ticket its answer is taken with. A call made outside any session, with
+/// id 0, has nothing to compare with and is left out.
+pub(crate) fn sent(conversation: u64, prefix: Prefix) -> u64 {
     if conversation == 0 {
-        return;
+        return 0;
     }
-    if let Ok(mut sessions) = sessions().lock() {
-        let now = crate::chat::now();
-        sessions.entry(conversation).or_default().sent(prefix, now);
-    }
+    let Ok(mut sessions) = sessions().lock() else {
+        return 0;
+    };
+    let now = crate::chat::now();
+    sessions.entry(conversation).or_default().sent(prefix, now)
 }
 
-/// The miss, if the answer to `conversation`'s pending request served far
+/// The miss, if the answer to `conversation`'s request `ticket` served far
 /// fewer than `cached` tokens from the cache than the answer before it.
-pub(crate) fn answered(conversation: u64, cached: u64) -> Option<Miss> {
+pub(crate) fn answered(conversation: u64, ticket: u64, cached: u64) -> Option<Miss> {
     let mut sessions = sessions().lock().ok()?;
     let session = sessions.get_mut(&conversation)?;
-    session.answered(cached, crate::chat::now())
+    session.answered(ticket, cached, crate::chat::now())
 }
 
 #[cfg(test)]
@@ -221,11 +229,11 @@ mod tests {
     /// the first serving 8,000 cached tokens and the second `cached`.
     fn second(first: Prefix, next: Prefix, apart: u64, cached: u64) -> Option<Reason> {
         let mut session = Session::default();
-        session.sent(first, 1_000);
-        assert_eq!(session.answered(8_000, 1_010), None);
-        session.sent(next, 1_010 + apart);
+        let ticket = session.sent(first, 1_000);
+        assert_eq!(session.answered(ticket, 8_000, 1_010), None);
+        let ticket = session.sent(next, 1_010 + apart);
         session
-            .answered(cached, 1_020 + apart)
+            .answered(ticket, cached, 1_020 + apart)
             .map(|miss| miss.reason)
     }
 
@@ -278,22 +286,22 @@ mod tests {
     fn a_small_or_unreported_cache_never_misses() {
         let same = prefix_with(None, "");
         let mut session = Session::default();
-        session.sent(same, 0);
-        assert_eq!(session.answered(500, 1), None);
-        session.sent(same, 2);
-        assert_eq!(session.answered(0, 3), None);
+        let ticket = session.sent(same, 0);
+        assert_eq!(session.answered(ticket, 500, 1), None);
+        let ticket = session.sent(same, 2);
+        assert_eq!(session.answered(ticket, 0, 3), None);
         // An answer with no request noted for it is nothing to compare.
-        assert_eq!(session.answered(0, 4), None);
+        assert_eq!(session.answered(ticket, 0, 4), None);
     }
 
     #[test]
     fn a_miss_says_what_was_cached_before_and_after() {
         let mut session = Session::default();
         let same = prefix_with(None, "");
-        session.sent(same, 0);
-        session.answered(6_000, 1);
-        session.sent(same, 2);
-        let miss = session.answered(100, 3);
+        let ticket = session.sent(same, 0);
+        session.answered(ticket, 6_000, 1);
+        let ticket = session.sent(same, 2);
+        let miss = session.answered(ticket, 100, 3);
         assert_eq!(
             miss,
             Some(Miss {
@@ -302,6 +310,20 @@ mod tests {
                 cached: 100,
             })
         );
+    }
+
+    #[test]
+    fn a_stopped_streams_late_answer_leaves_the_next_request_alone() {
+        let mut session = Session::default();
+        let same = prefix_with(None, "");
+        let ticket = session.sent(same, 0);
+        session.answered(ticket, 6_000, 1);
+        let stopped = session.sent(same, 2);
+        let next = session.sent(prefix_with(Some(Reason::Memory), "new"), 3);
+        // The stopped reply ends after the next request went out.
+        assert_eq!(session.answered(stopped, 100, 4), None);
+        let miss = session.answered(next, 100, 5).map(|miss| miss.reason);
+        assert_eq!(miss, Some(Reason::Memory));
     }
 
     #[test]

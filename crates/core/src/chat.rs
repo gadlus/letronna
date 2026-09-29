@@ -2037,7 +2037,7 @@ fn stream(
         &extra.tools,
         Some(&mut prefix),
     );
-    crate::cache_miss::sent(connection.conversation, prefix);
+    let ticket = crate::cache_miss::sent(connection.conversation, prefix);
     let mut request = client()
         .map_err(|e| Failure::new(FailureKind::Unknown, e))?
         .post(endpoint)
@@ -2071,7 +2071,15 @@ fn stream(
                 )
             }
             Ok(response) if response.status().is_success() => {
-                match read(response, connection, extra, sender, &mut stands, &mut slow) {
+                match read(
+                    response,
+                    connection,
+                    extra,
+                    ticket,
+                    sender,
+                    &mut stands,
+                    &mut slow,
+                ) {
                     Ok(()) => return Ok(()),
                     Err(failure) => failure,
                 }
@@ -2149,11 +2157,12 @@ fn ran_out_reading(e: &std::io::Error) -> bool {
 
 /// Pass a successful reply on as it arrives, setting `stands` once the model
 /// has begun it or when it is no event stream, and `slow` if it runs out of
-/// time.
+/// time. `ticket` is the one `cache_miss::sent` gave for the request.
 fn read(
     response: reqwest::blocking::Response,
     connection: &Connection,
     extra: &Extra,
+    ticket: u64,
     sender: &async_channel::Sender<Event>,
     stands: &mut bool,
     slow: &mut bool,
@@ -2170,7 +2179,7 @@ fn read(
         let began = std::time::Instant::now();
         let mut reply = Reply::default();
         reply.absorb(parse_chunk(&value)?, stands, sender)?;
-        return reply.end(true, began, connection, &extra.tools, sender);
+        return reply.end(true, began, connection, &extra.tools, ticket, sender);
     }
     // An event stream can end early for a reason that passes, as when a
     // gateway keeps it open with comments and then gives up on the model.
@@ -2211,7 +2220,7 @@ fn read(
         }
         reply.absorb(parse_event(data)?, stands, sender)?;
     }
-    reply.end(done, began, connection, &extra.tools, sender)
+    reply.end(done, began, connection, &extra.tools, ticket, sender)
 }
 
 /// Add streamed reasoning details to those so far. OpenRouter streams a
@@ -2316,6 +2325,7 @@ impl Reply {
         began: std::time::Instant,
         connection: &Connection,
         extra_tools: &[Value],
+        ticket: u64,
         sender: &async_channel::Sender<Event>,
     ) -> Result<(), Failure> {
         if self.completion_tokens > 0 {
@@ -2330,7 +2340,7 @@ impl Reply {
                 cost: self.cost,
             });
             if let Some(miss) =
-                crate::cache_miss::answered(connection.conversation, self.cached_tokens)
+                crate::cache_miss::answered(connection.conversation, ticket, self.cached_tokens)
             {
                 crate::diag::event(
                     "cache_miss",
