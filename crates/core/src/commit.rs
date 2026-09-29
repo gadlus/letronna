@@ -361,8 +361,9 @@ pub fn commit(folder: &Path, message: &str) -> Result<String, String> {
     if tree(folder)?.staged.is_empty() {
         return Err("Nothing is staged, so there is nothing to commit.".into());
     }
-    // `--cleanup=strip` drops the comment lines an editor would have.
-    let args = ["commit", "--quiet", "--cleanup=strip", "--file=-"];
+    // No editor wrote comment lines into the box, so a line starting with
+    // `#`, such as an issue number, is the user's and is kept.
+    let args = ["commit", "--quiet", "--cleanup=whitespace", "--file=-"];
     run(folder, &args, Some(message), Guards::Off, SLOW, &[0])?;
     let made = look(folder, &["log", "-1", "--format=%h %s"])?;
     Ok(format!("Committed {}.", made.trim()))
@@ -1031,6 +1032,16 @@ mod tests {
         assert!(why.contains("Nothing is staged"), "{why}");
         let why = commit(&folder, "  \n").unwrap_err();
         assert!(why.contains("message"), "{why}");
+    }
+
+    #[test]
+    fn a_line_starting_with_a_hash_stays_in_the_message() {
+        let folder = repo("hash-line");
+        std::fs::write(folder.join("a.txt"), "changed\n").unwrap();
+        setup(&folder, &["add", "a.txt"]);
+        commit(&folder, "Change the file\n\n#297 needed this.\n").unwrap();
+        let message = setup(&folder, &["log", "-1", "--format=%B"]);
+        assert_eq!(message, "Change the file\n\n#297 needed this.\n\n");
     }
 
     #[cfg(unix)]
