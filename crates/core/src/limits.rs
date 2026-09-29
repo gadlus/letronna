@@ -185,6 +185,17 @@ impl Gate {
         Some(permit)
     }
 
+    /// A turn on this provider if one is free now, for a call worth making
+    /// only if it need not wait in line.
+    pub fn try_acquire(&'static self) -> Option<Permit> {
+        let mut state = self.lock();
+        if !state.waiters.is_empty() || !state.free(Instant::now()) {
+            return None;
+        }
+        state.in_use += 1;
+        Some(Permit { gate: self })
+    }
+
     /// Counts a reply the provider gave in full; each `limit` of them lets one
     /// more stream through, up to the cap.
     pub fn answered(&'static self) {

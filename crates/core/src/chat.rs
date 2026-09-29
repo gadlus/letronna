@@ -1911,7 +1911,7 @@ fn begin(
         // Whoever still reads the reply's events hears the end rather than
         // waiting on the summary.
         drop(sender);
-        if let Some(making) = making {
+        if let Some((making, _permit)) = making {
             making.make(&connection, budget.tokens);
         }
     });
@@ -1920,12 +1920,12 @@ fn begin(
 
 /// The place claimed for the summary of what the window drops at its next
 /// step, when the next turn after a reply to `messages` is likely to take it
-/// there.
+/// there, and the provider's turn it is asked on.
 fn claim_next<'a>(
     connection: &Connection,
     messages: &'a [Message],
     budget: &Budget,
-) -> Option<crate::compact::Making<'a>> {
+) -> Option<(crate::compact::Making<'a>, crate::limits::Permit)> {
     // A quarter of the window: more than most replies and results, so the
     // summary is ready in time, and not so much that it is made long before.
     // The places the window starts at stay put, so one made early is used
@@ -1936,7 +1936,12 @@ fn claim_next<'a>(
     if next <= window_start(messages, budget) || next >= messages.len() {
         return None;
     }
-    crate::compact::claim(connection, &messages[..next])
+    // Nobody waits for it yet, so it is a background call: without a permit
+    // it could take the stream the provider keeps for the next round, sent
+    // at once while it runs. With none free the step asks as it did.
+    let permit = crate::limits::gate(&connection.endpoint).try_acquire()?;
+    let making = crate::compact::claim(connection, &messages[..next])?;
+    Some((making, permit))
 }
 
 /// Send `messages` in the window `budget` gives, unless what no window
@@ -4078,6 +4083,25 @@ mod tests {
         // asked for once.
         assert_eq!(kept, Some((dropped, "The summary so far.".to_owned())));
         assert_eq!(asked.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn no_summary_is_made_ahead_while_the_background_has_every_stream() {
+        // A provider of its own, which nothing else in the tests holds.
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1", server.local_addr().unwrap());
+        let c = Connection {
+            endpoint: endpoint.clone(),
+            conversation: u64::MAX - 5,
+            ..connection()
+        };
+        let quiet = long_talk(&format!("gated {}", std::process::id()), 7);
+        // A helper's stream: the one left is the next round's.
+        let helper = crate::limits::gate(&endpoint).try_acquire();
+        assert!(helper.is_some());
+        assert!(claim_next(&c, &quiet, &Budget::SMALL).is_none());
+        drop(helper);
+        assert!(claim_next(&c, &quiet, &Budget::SMALL).is_some());
     }
 
     #[test]
