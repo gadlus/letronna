@@ -353,7 +353,7 @@ fn together(spec: &Spec, batch: &[ToolCall]) -> Vec<Option<Result<String, String
 }
 
 /// Why this agent may not call `name`, when it may not.
-fn refusal(allow: &Allow, name: &str) -> Option<String> {
+pub(crate) fn refusal(allow: &Allow, name: &str) -> Option<String> {
     if name == tools::ASK_USER {
         return Some(NO_QUESTIONS.into());
     }
@@ -380,6 +380,10 @@ fn context(spec: &Spec) -> ToolContext {
             depth: spec.depth,
             budget: spec.budget.clone(),
             run: Some(spec.run),
+            allowed: match &spec.allow {
+                Allow::All => None,
+                Allow::Only(names) => Some(names.as_slice().into()),
+            },
             ..ctx.caller.clone()
         },
         ..ctx

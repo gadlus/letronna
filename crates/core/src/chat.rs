@@ -609,7 +609,7 @@ pub(crate) fn opens_turn(message: &Message) -> bool {
 }
 
 #[cfg(test)]
-fn body(
+pub(crate) fn body(
     connection: &Connection,
     window: &[Message],
     summary: Option<&str>,
@@ -708,6 +708,14 @@ fn body_with(
     let old = old_before(window, budget);
     let stubs = stubs(window, old);
     let turn = window.iter().rposition(opens_turn);
+    // Once, so the calls in the history and the array agree on whether the
+    // MCP tools go out on demand.
+    let every = if connection.tools {
+        crate::tools::all()
+    } else {
+        Vec::new()
+    };
+    let on_demand = connection.tools && crate::mcp_find::on_demand(&every);
     for (i, m) in window.iter().enumerate() {
         let mut wired = wire_message(m, budget.tool_chars);
         carry_back(
@@ -734,6 +742,9 @@ fn body_with(
                     wired["tool_calls"][at]["function"]["arguments"] = counted.into();
                 }
             }
+        }
+        if on_demand {
+            crate::mcp_find::wrap(&mut wired, connection);
         }
         context.push(wired);
         // A tool result carries text only, so the picture follows as the
@@ -785,7 +796,8 @@ fn body_with(
         "stream_options": {"include_usage": true}
     });
     if connection.tools {
-        let mut tools = crate::tools::specs(connection);
+        let mut tools = crate::tools::specs_of(&every, connection, on_demand);
+        crate::mcp_find::fit(&mut tools, connection);
         if connection.search {
             // The gateway's own search, alongside our functions rather than
             // instead of them: the model picks whichever it needs, and the
@@ -1502,6 +1514,18 @@ fn name_unnamed(calls: &mut [ToolCall]) {
     }
 }
 
+/// Gives each of `calls` an id and the name of the tool it calls, before
+/// anything decides about them.
+fn name_calls(calls: &mut [ToolCall], extra: &[Value]) {
+    name_unnamed(calls);
+    name_as_offered(calls, extra);
+    // So that no gate or rule sees the stand-in but always the MCP tool it
+    // calls, named as offered too: the model wrote that name as well.
+    if crate::mcp_find::resolve(calls) {
+        name_as_offered(calls, extra);
+    }
+}
+
 /// Call each tool by the name it was offered under.
 ///
 /// Some gateways hand the name back in a case of their own -- `ListDir` for
@@ -2184,8 +2208,7 @@ impl Reply {
         if in_call {
             calls.clear();
         }
-        name_unnamed(&mut calls);
-        name_as_offered(&mut calls, extra_tools);
+        name_calls(&mut calls, extra_tools);
         let (endpoint, model) = route(connection);
         let replay = Replay {
             endpoint,
@@ -4608,6 +4631,79 @@ mod tests {
         assert_eq!(calls[0].name, "read_file");
         assert_eq!(calls[0].arguments, r#"{"path":"a.rs"}"#);
         assert!(matches!(events[2], Event::Finished(Ok(()))));
+    }
+
+    #[test]
+    fn a_call_through_call_mcp_tool_meets_the_gate_as_the_tool_it_names() {
+        use crate::agent::{Next, Turn};
+        use crate::gate::{Gate, Grants, Mode};
+        use crate::permissions::{Effect, Rule};
+        use crate::tools::ToolContext;
+        let events = reply_of(
+            "application/json",
+            r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"call_mcp_tool","arguments":"{\"name\":\"mcp__files__delete\",\"arguments\":{\"path\":\"a.rs\"}}"}}]},"finish_reason":"tool_calls"}]}"#,
+        );
+        let Event::ToolCalls(calls) = &events[0] else {
+            panic!("no calls");
+        };
+        assert_eq!(calls[0].name, "mcp__files__delete");
+        assert_eq!(calls[0].arguments, r#"{"path":"a.rs"}"#);
+        // The gate finds the server's tool by that name, as a turn runs it.
+        crate::mcp::serve(vec![crate::mcp_find::tests::fake(
+            "mcp__files__delete",
+            "Delete a file.",
+            true,
+        )]);
+        let mut turn = Turn::new(connection());
+        assert!(turn.begin(calls.clone()));
+        let rule = |effect| {
+            Ok(vec![Rule {
+                tool: "mcp__files__delete".into(),
+                pattern: String::new(),
+                effect,
+                project: None,
+            }])
+        };
+        let none = Grants::new();
+        let next = |rules: &Result<Vec<Rule>, String>, mode, plan| {
+            let ctx = ToolContext {
+                plan,
+                ..Default::default()
+            };
+            turn.next(|call| {
+                crate::gate::decide(call, &Gate::for_window(&ctx, &none, rules, mode, None))
+            })
+        };
+        assert!(matches!(
+            next(&Ok(Vec::new()), Mode::Bypass, false),
+            Next::Run(_)
+        ));
+        assert!(matches!(
+            next(&rule(Effect::Deny), Mode::Bypass, false),
+            Next::Refuse(..)
+        ));
+        assert!(matches!(
+            next(&rule(Effect::Ask), Mode::Bypass, false),
+            Next::AskUser(_)
+        ));
+        assert!(matches!(
+            next(&Ok(Vec::new()), Mode::Bypass, true),
+            Next::Refuse(..)
+        ));
+    }
+
+    #[test]
+    fn a_name_inside_call_mcp_tool_is_forgiven_its_case_as_a_direct_one_is() {
+        crate::mcp::serve(vec![crate::mcp_find::tests::fake(
+            "mcp__GitHub__create_issue",
+            "Create an issue.",
+            true,
+        )]);
+        let mut calls = vec![crate::mcp_find::tests::wrapped(
+            r#"{"name": "mcp__github__createIssue", "arguments": {}}"#,
+        )];
+        name_calls(&mut calls, &[]);
+        assert_eq!(calls[0].name, "mcp__GitHub__create_issue");
     }
 
     /// A plain exchange of about 300 tokens, numbered so no two are alike.

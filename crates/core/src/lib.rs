@@ -33,6 +33,7 @@ pub mod jobs;
 pub mod judge;
 pub mod limits;
 pub mod mcp;
+mod mcp_find;
 pub mod media;
 pub mod memory;
 pub mod messaging;

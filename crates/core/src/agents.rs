@@ -39,6 +39,7 @@ use crate::cancel::Cancel;
 use crate::chat::{Connection, Message, trim};
 use crate::driver::{self, AgentId, Allow, Outcome, Report, Spec, Status};
 use crate::inbox::{self, LINE_BREAKS, Notice, When};
+use crate::mcp_find;
 use crate::store::Transcript;
 use crate::tasks::{self, Key, State, Task};
 use crate::tools::{self, Caller, Tool, ToolContext};
@@ -721,13 +722,21 @@ fn child(
 
 /// The tools a helper may use, in the order it is offered them: those its
 /// connection offers and its type allows, less those no helper may use.
+/// MCP tools count as offered when they go out on demand, so a type allows
+/// the same ones either way, and then the pair that finds and calls them
+/// comes last.
 fn usable(connection: &Connection, def: &AgentDef) -> Vec<String> {
-    tools::specs(connection)
+    let every = tools::all();
+    let mut usable: Vec<String> = tools::specs_of(&every, connection, false)
         .iter()
         .filter_map(|spec| spec["function"]["name"].as_str())
         .filter(|name| def.allows(name) && !driver::DENY.contains(name))
         .map(str::to_owned)
-        .collect()
+        .collect();
+    if mcp_find::on_demand(&every) && usable.iter().any(|name| mcp_find::is_mcp(name)) {
+        usable.extend([mcp_find::FIND_TOOLS, mcp_find::CALL_MCP_TOOL].map(String::from));
+    }
+    usable
 }
 
 /// A helper's first message: what it is, what it may use and what to give
@@ -735,6 +744,13 @@ fn usable(connection: &Connection, def: &AgentDef) -> Vec<String> {
 /// something the user said.
 fn task(def: &AgentDef, tools: &[String], prompt: &str) -> Message {
     let about = format!("You are a helper ({}). {}", def.name, def.prompt);
+    // MCP tools on demand are too many to name; find_tools finds them.
+    let on_demand = tools.iter().any(|name| name == mcp_find::FIND_TOOLS);
+    let tools: Vec<&str> = tools
+        .iter()
+        .map(String::as_str)
+        .filter(|name| !on_demand || !mcp_find::is_mcp(name))
+        .collect();
     let tools = if tools.is_empty() {
         "none".to_owned()
     } else {
@@ -1800,6 +1816,76 @@ mod tests {
         assert_eq!(model(Some("call-model"), &typed), "call-model");
         assert_eq!(model(None, &typed), "type-model");
         assert_eq!(model(None, &def(false)), "setting-model");
+    }
+
+    #[test]
+    fn a_helper_reaches_the_mcp_tools_its_type_allows_when_they_go_out_on_demand() {
+        use crate::mcp_find::tests::{fake, server, wrapped};
+        let mut served = server(40, 30);
+        served.push(fake("mcp__big__delete", "Delete a thing.", true));
+        crate::mcp::serve(served);
+        let looking = AgentDef {
+            name: "explore".into(),
+            tools: Some(vec!["read_file".into()]),
+            plan: true,
+            ..Default::default()
+        };
+        let planning = Connection {
+            plan: true,
+            ..Default::default()
+        };
+        let tools = usable(&planning, &looking);
+        for name in [
+            "read_file",
+            "mcp__big__tool_1",
+            mcp_find::FIND_TOOLS,
+            mcp_find::CALL_MCP_TOOL,
+        ] {
+            assert!(tools.contains(&name.to_owned()), "{name}: {tools:?}");
+        }
+        // Plan mode keeps what changes things away, found or not.
+        assert!(!tools.contains(&"mcp__big__delete".to_owned()));
+        // It is told of the pair, not of every tool the pair finds.
+        let told = task(&looking, &tools, "Look.").content;
+        assert!(
+            told.contains("use: read_file, find_tools, call_mcp_tool."),
+            "{told}"
+        );
+        assert!(!told.contains("mcp__big__"));
+        let looked = allow(&looking, tools);
+        let mut calls = vec![wrapped(r#"{"name": "mcp__big__tool_1", "arguments": {}}"#)];
+        mcp_find::resolve(&mut calls);
+        assert_eq!(driver::refusal(&looked, &calls[0].name), None);
+        assert!(driver::refusal(&looked, "mcp__big__delete").is_some());
+        // A type that names a tool it may not use loses that one only.
+        let wary = AgentDef {
+            name: "wary".into(),
+            disallowed: vec!["mcp__big__tool_2".into()],
+            ..Default::default()
+        };
+        let tools = usable(&Connection::default(), &wary);
+        let warned = allow(&wary, tools.clone());
+        assert!(driver::refusal(&warned, "mcp__big__tool_2").is_some());
+        assert_eq!(driver::refusal(&warned, "mcp__big__tool_3"), None);
+        assert_eq!(driver::refusal(&warned, mcp_find::FIND_TOOLS), None);
+        // Nor does find_tools show it that one.
+        let ctx = ToolContext {
+            caller: Caller {
+                allowed: Some(tools.as_slice().into()),
+                ..Caller::default()
+            },
+            ..Default::default()
+        };
+        let query = r#"{"query": "mcp__big__tool_2"}"#;
+        let found = tools::run(mcp_find::FIND_TOOLS, query, &ctx).unwrap();
+        let words = |text: &str| {
+            text.split(|c: char| !c.is_alphanumeric() && c != '_')
+                .any(|word| word == "mcp__big__tool_2")
+        };
+        assert!(
+            found.contains("mcp__big__tool_3") && !words(&found),
+            "{found}"
+        );
     }
 
     #[test]
