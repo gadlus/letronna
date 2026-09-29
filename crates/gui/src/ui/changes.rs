@@ -1434,6 +1434,7 @@ fn entry_row(entry: &Entry, selected: bool, cx: &App) -> Div {
         None => entry.path.display().to_string(),
     };
     h_flex()
+        .w_full()
         .h(ROW)
         .pl_2()
         .gap_2()
