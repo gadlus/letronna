@@ -59,7 +59,7 @@ impl Chat {
     fn prompt_text(&self, at: usize) -> Option<String> {
         self.open_messages()
             .get(at)
-            .filter(|m| m.role == "user")
+            .filter(|m| m.role == "user" && !m.notice)
             .map(|m| m.content.clone())
     }
 

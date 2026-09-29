@@ -44,6 +44,9 @@ impl Chat {
                 .children(bar)
                 .into_any_element();
         }
+        if message.notice {
+            return self.notice_row(index, message, window, cx);
+        }
         let is_user = message.role == "user";
         let session = self.store.conversations[self.store.active].id;
         let editing = is_user && self.editing_message == Some((session, index));
@@ -319,6 +322,82 @@ impl Chat {
                     .text_color(cx.theme().muted_foreground)
                     .child(text.to_owned()),
             )
+            .into_any_element()
+    }
+
+    /// Something that happened meanwhile, such as a job exiting: one quiet
+    /// line rather than a card, since nobody here said it; click to read it.
+    fn notice_row(
+        &self,
+        index: usize,
+        message: &Message,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let key = self.open_key(index);
+        let open = self.thinking_open.contains(&key);
+        // The first line tells the model what a notice is not; here the row's
+        // look says so, and it starts at what happened.
+        let body = message
+            .content
+            .split_once('\n')
+            .map_or("", |(_, rest)| rest)
+            .to_owned();
+        let first = body.lines().next().unwrap_or_default();
+        let headline = letronna_core::tools::one_line(first.strip_prefix("- ").unwrap_or(first));
+        v_flex()
+            .w_full()
+            .gap_1()
+            .child(
+                h_flex()
+                    .id(("notice", index))
+                    .h(px(26.))
+                    .min_w_0()
+                    .w_full()
+                    .px_2()
+                    .gap_1p5()
+                    .items_center()
+                    .rounded(cx.theme().radius)
+                    .cursor_pointer()
+                    .text_xs()
+                    .font_family(HEADING_FONT)
+                    .text_color(cx.theme().muted_foreground)
+                    .hover(|s| s.bg(cx.theme().secondary.opacity(0.5)))
+                    .child(
+                        Icon::new(if open {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size_3(),
+                    )
+                    .child("Notice")
+                    .child(div().min_w_0().truncate().child(headline))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.thinking_open.remove(&key) {
+                            this.thinking_open.insert(key);
+                        }
+                        cx.notify();
+                    })),
+            )
+            .when(open, |this| {
+                this.child(
+                    div()
+                        .ml_2()
+                        .pl_3()
+                        .min_w_0()
+                        .border_l_2()
+                        .border_color(cx.theme().border)
+                        .text_color(cx.theme().muted_foreground)
+                        .child(crate::ui::code_block(
+                            ("notice-out", index),
+                            body,
+                            px(220.),
+                            window,
+                            cx,
+                        )),
+                )
+            })
             .into_any_element()
     }
 

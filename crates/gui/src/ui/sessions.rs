@@ -140,7 +140,9 @@ impl Chat {
         let c = &self.store.conversations[index];
         let mut text = format!("# {}\n\n", c.title);
         for m in &c.messages {
-            let who = if m.role == "user" {
+            let who = if m.notice {
+                "Notice".to_string()
+            } else if m.role == "user" {
                 "You".to_string()
             } else if m.model.is_empty() {
                 "Assistant".to_string()
