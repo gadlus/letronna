@@ -318,6 +318,9 @@ pub(crate) struct Chat {
     /// sessions' drafts wait here, by session id.
     pub(crate) drafts: std::collections::HashMap<u64, String>,
     pub(crate) draft_for: u64,
+    /// Pictures pasted, dropped or picked for each session's next message,
+    /// saved already, by session id.
+    pub(crate) attachments: std::collections::HashMap<u64, Vec<PathBuf>>,
     pub(crate) error: Option<String>,
     /// Where updating stands, for the About page and the status bar.
     pub(crate) updating: crate::ui::update::Updating,
@@ -662,6 +665,7 @@ impl Chat {
             browser_for: 0,
             drafts: std::collections::HashMap::new(),
             draft_for,
+            attachments: std::collections::HashMap::new(),
             error: error.or(skills_error),
             updating: Default::default(),
             note: None,
@@ -814,7 +818,8 @@ impl Chat {
         if self.busy {
             return;
         }
-        if prompt.is_empty() {
+        let images = self.attached().to_vec();
+        if prompt.is_empty() && images.is_empty() {
             self.composer
                 .update(cx, |input, cx| input.set_value("", window, cx));
             return;
@@ -829,8 +834,11 @@ impl Chat {
         };
         self.composer
             .update(cx, |input, cx| input.set_value("", window, cx));
-        if self.dispatch(prompt, None, cx).is_err() {
+        let session = self.store.conversations[self.store.active].id;
+        if self.dispatch(prompt, images, None, cx).is_err() {
             self.open_settings(window, cx);
+        } else {
+            self.attachments.remove(&session);
         }
     }
 
@@ -905,6 +913,7 @@ impl Chat {
     pub(crate) fn dispatch(
         &mut self,
         prompt: String,
+        images: Vec<PathBuf>,
         remote: Option<letronna_core::chat::Remote>,
         cx: &mut Context<Self>,
     ) -> std::result::Result<(), ()> {
@@ -935,6 +944,7 @@ impl Chat {
         conversation.messages.push(Message {
             role: "user".into(),
             content: prompt,
+            images,
             ..Default::default()
         });
         let target_id = conversation.id;
@@ -1213,7 +1223,10 @@ impl Chat {
         if schedule.mode != letronna_core::gate::Mode::Default {
             self.unattended.insert(session, schedule.mode);
         }
-        if self.dispatch(schedule.prompt.clone(), None, cx).is_err() {
+        if self
+            .dispatch(schedule.prompt.clone(), Vec::new(), None, cx)
+            .is_err()
+        {
             // The gateway is not usable, so the run never started and
             // `finish` will not come round to report it.
             self.scheduled.remove(&session);
@@ -1932,7 +1945,7 @@ impl Chat {
         };
         self.modes.insert(id, mode);
         if self
-            .dispatch(message.text, Some(message.remote), cx)
+            .dispatch(message.text, Vec::new(), Some(message.remote), cx)
             .is_ok()
         {
             self.keep_typing(source, cx);
@@ -2488,7 +2501,7 @@ impl Chat {
         let text = std::mem::take(&mut self.follow_ups).join("\n\n");
         let viewing = self.store.active;
         self.store.active = ix;
-        let sent = self.dispatch(text.clone(), None, cx).is_ok();
+        let sent = self.dispatch(text.clone(), Vec::new(), None, cx).is_ok();
         self.store.active = viewing;
         if !sent {
             self.returned_follow_ups = Some(text);
@@ -2873,7 +2886,10 @@ impl Render for Chat {
             })
             .child(body)
             .when(self.page == Page::Chat, |this| {
-                this.child(
+                this.on_drop(cx.listener(|this, dropped: &ExternalPaths, window, cx| {
+                    this.attach_files(dropped.paths().to_vec(), window, cx)
+                }))
+                .child(
                     v_flex()
                         .w(column)
                         .mx_auto()

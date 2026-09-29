@@ -128,6 +128,10 @@ pub const COMMANDS: &[Command] = &[
         blurb: "ask something aside; the answer is not kept",
     },
     Command {
+        name: "/image",
+        blurb: "attach a picture to your next message: /image <path>",
+    },
+    Command {
         name: "/where",
         blurb: "show the project folder and session file",
     },

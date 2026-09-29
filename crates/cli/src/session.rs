@@ -41,6 +41,8 @@ pub struct Runner {
     /// Whether the user stopped the last turn, which keeps a ring from
     /// starting another before they say something.
     pub stopped: bool,
+    /// Pictures `/image` attached, which go with the next message.
+    pub images: Vec<std::path::PathBuf>,
 }
 
 impl Runner {
@@ -96,6 +98,7 @@ impl Runner {
         self.store.conversations[session].messages.push(Message {
             role: "user".into(),
             content: prompt.to_owned(),
+            images: std::mem::take(&mut self.images),
             ..Default::default()
         });
         self.persist();

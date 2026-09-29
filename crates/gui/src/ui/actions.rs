@@ -67,6 +67,14 @@ impl Chat {
             })
     }
 
+    /// The pictures your message at `at` carried, to go with it again.
+    fn prompt_images(&self, at: usize) -> Vec<PathBuf> {
+        self.open_messages()
+            .get(at)
+            .map(|m| m.images.clone())
+            .unwrap_or_default()
+    }
+
     /// What a turn says, for copying: your message, or the reply's words
     /// without its tool calls.
     fn turn_text(&self, span: Span) -> String {
@@ -146,8 +154,9 @@ impl Chat {
             cx.notify();
             return;
         }
+        let images = self.prompt_images(at);
         self.back_to(at, window, cx);
-        self.ask_again(text, window, cx);
+        self.ask_again(text, images, window, cx);
     }
 
     /// Whether you asked anything after your message at `at`, which asking
@@ -184,11 +193,18 @@ impl Chat {
         let Some(text) = self.prompt_text(at) else {
             return;
         };
+        let images = self.prompt_images(at);
         self.back_to(at, window, cx);
-        self.ask_again(text, window, cx);
+        self.ask_again(text, images, window, cx);
     }
 
-    fn ask_again(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn ask_again(
+        &mut self,
+        text: String,
+        images: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // What had the keys, the edit box or the turn's buttons, is gone.
         self.focus_composer(window, cx);
         let Some(prompt) = self.prompt_for(text.clone(), cx) else {
@@ -196,7 +212,7 @@ impl Chat {
                 .update(cx, |input, cx| input.set_value(text, window, cx));
             return;
         };
-        if self.dispatch(prompt, None, cx).is_err() {
+        if self.dispatch(prompt, images, None, cx).is_err() {
             // Not asked, so the text waits in the box rather than being lost.
             self.composer
                 .update(cx, |input, cx| input.set_value(text, window, cx));

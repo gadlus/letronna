@@ -8,10 +8,15 @@
 //! What is made is saved as a file: in `media/` in the project folder, or in
 //! Letronna's own data folder when no project is attached. The result starts
 //! with `Saved to <path>`, which is how the window finds the file to show.
+//! A picture read_file opened or an MCP server sent, and one the user
+//! attached, is saved the same way but always in Letronna's own folder, as
+//! browse's screenshots are: it belongs to the session, and looking writes
+//! nothing into the project. The chat shows the newest few to the model.
 
 use crate::tools::{Tool, ToolContext};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -27,6 +32,9 @@ const VIDEO_POLL: Duration = Duration::from_secs(5);
 const VIDEO_WAIT: Duration = Duration::from_secs(600);
 /// The largest file the API takes for transcription.
 const UPLOAD_BYTES: u64 = 25 * 1024 * 1024;
+/// The largest picture a model is sent: Anthropic refuses one over 5 MB of
+/// base64, which is four thirds of the file.
+pub const PICTURE_BYTES: usize = 5 * 1024 * 1024 / 4 * 3;
 
 pub struct MakeImage;
 impl Tool for MakeImage {
@@ -318,15 +326,22 @@ pub fn saved(result: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// The tools whose results start with `SAVED` and the file they wrote.
-const SAVERS: [&str; 4] = ["make_image", "speak", "make_video", crate::browser::BROWSE];
+/// The tools whose results start with `SAVED` and the file they wrote; an
+/// MCP tool's too, which saves the pictures its server sends.
+const SAVERS: [&str; 5] = [
+    "make_image",
+    "speak",
+    "make_video",
+    "read_file",
+    crate::browser::BROWSE,
+];
 
 /// The file `tool`'s result says it saved, believed only from `SAVERS`, and
 /// from browse only when Windows would open it as a plain file.
 pub fn saved_by(tool: &str, result: &str) -> Option<PathBuf> {
     // Any other result -- a file read out, a command's output -- can start
     // with the same words, and the window would then open that path.
-    if !SAVERS.contains(&tool) {
+    if !SAVERS.contains(&tool) && !crate::mcp::is_tool(tool) {
         return None;
     }
     let path = saved(result)?;
@@ -523,6 +538,22 @@ fn card(what: String, args: &Value, kind: &str) -> String {
     format!("{what}\n\nMade by {model}, paid from your Letronna credit.")
 }
 
+/// Save a picture the user attached, in Letronna's own `media/` as browse's
+/// screenshots are: it belongs to the session, not the project. `name` is
+/// what it was called.
+pub fn attach(name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    let kind =
+        picture_kind(bytes).ok_or("Only a PNG, JPEG, GIF or WebP picture can be attached.")?;
+    if bytes.len() > PICTURE_BYTES {
+        return Err(format!(
+            "The picture is {}; the most a model is sent is {}.",
+            size(bytes.len()),
+            size(PICTURE_BYTES)
+        ));
+    }
+    save(&ToolContext::default(), name, kind, bytes)
+}
+
 /// Save what was made under `media/`, named after what it shows and when.
 pub(crate) fn save(
     ctx: &ToolContext,
@@ -542,14 +573,27 @@ pub(crate) fn save(
         chrono::Local::now().format("%Y%m%d-%H%M%S")
     );
     let mut path = dir.join(format!("{name}.{extension}"));
-    // Two made in the same second must not overwrite each other.
+    // Two made in the same second must not overwrite each other, even when
+    // made at once, as two pictures read_file opens side by side can be.
     let mut n = 2;
-    while path.exists() {
-        path = dir.join(format!("{name}-{n}.{extension}"));
-        n += 1;
+    loop {
+        let created = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path);
+        match created {
+            Ok(mut file) => {
+                file.write_all(bytes)
+                    .map_err(|e| format!("Cannot save {}: {e}", path.display()))?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                path = dir.join(format!("{name}-{n}.{extension}"));
+                n += 1;
+            }
+            Err(e) => return Err(format!("Cannot save {}: {e}", path.display())),
+        }
     }
-    std::fs::write(&path, bytes).map_err(|e| format!("Cannot save {}: {e}", path.display()))?;
-    Ok(path)
 }
 
 /// The first words of a description, as a file name carries them anywhere.
@@ -634,13 +678,32 @@ fn audio_type(path: &Path) -> &'static str {
 
 /// The file type an image's first bytes say it is.
 fn image_extension(bytes: &[u8]) -> &'static str {
-    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
-        "jpg"
+    picture_kind(bytes).unwrap_or("png")
+}
+
+/// The file type of a picture every provider takes -- PNG, JPEG, GIF or
+/// WebP -- as its first bytes say; None for anything else.
+pub fn picture_kind(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("jpg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("gif")
     } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(&b"WEBP"[..]) {
-        "webp"
+        Some("webp")
     } else {
-        "png"
+        None
     }
+}
+
+/// Whether `path` is named as a picture a model can be shown.
+pub fn is_picture(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| {
+        ["png", "jpg", "jpeg", "gif", "webp"]
+            .iter()
+            .any(|kind| extension.eq_ignore_ascii_case(kind))
+    })
 }
 
 /// The file type audio came back as, from its content type.
@@ -654,7 +717,7 @@ fn audio_extension(content_type: &str) -> &'static str {
     }
 }
 
-fn size(bytes: usize) -> String {
+pub(crate) fn size(bytes: usize) -> String {
     if bytes >= 1024 * 1024 {
         format!("{:.1} MB", bytes as f64 / (1024. * 1024.))
     } else {
@@ -689,10 +752,14 @@ pub(crate) fn base64(text: &str) -> Option<Vec<u8>> {
 }
 
 /// An image file as a `data:` address, which is how a chat request carries
-/// a picture. None when the file cannot be read.
+/// a picture. None when the file cannot be read, is not a picture every
+/// provider takes, or is larger than `PICTURE_BYTES`.
 pub(crate) fn data_url(path: &Path) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
-    let kind = match image_extension(&bytes) {
+    if bytes.len() > PICTURE_BYTES {
+        return None;
+    }
+    let kind = match picture_kind(&bytes)? {
         "jpg" => "jpeg",
         other => other,
     };
@@ -805,7 +872,8 @@ mod tests {
                 Some(PathBuf::from("media/a-cat.png"))
             );
         }
-        for name in ["read_file", "run_command", "web_fetch", "transcribe"] {
+        assert!(saved_by("mcp__demo__shoot", result).is_some());
+        for name in ["edit_file", "run_command", "web_fetch", "transcribe"] {
             assert_eq!(saved_by(name, result), None, "{name}");
         }
         let share = r"Saved to \\nowhere.invalid\s\a.png — https://example.com";
