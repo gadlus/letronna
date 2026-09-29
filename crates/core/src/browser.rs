@@ -1555,10 +1555,15 @@ fn changed(old: &str, new: &str) -> Option<String> {
     if out.len() + whole >= new.len() {
         return None;
     }
-    // A long page's changes may still be more than one listing shows.
+    // A long page's changes may still be more than one listing shows. One
+    // place alone past that would be cut in its middle on the way to the
+    // model, so the listing, which fits, is shown instead.
     let mut shown = 0;
     for hunk in &hunks {
-        if out.len() + hunk.len() + 1 > PAGE_CHARS && shown > 0 {
+        if out.len() + hunk.len() + 1 > PAGE_CHARS {
+            if shown == 0 {
+                return None;
+            }
             break;
         }
         out.push('\n');
@@ -5541,6 +5546,23 @@ mod tests {
                 .join("\n")
         };
         assert_eq!(changed(&long("a"), &long("b")), None);
+    }
+
+    #[test]
+    fn one_change_longer_than_a_listing_shows_is_left_to_the_listing() {
+        let page = |changed: &str| {
+            (0..1000)
+                .map(|n| match (400..550).contains(&n) {
+                    true => format!("- button \"{changed} {n}\" [e{n}]"),
+                    false => format!("- button \"Item {n}\" [e{n}]"),
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // Shown, the one run of changes would be cut on its way to the model.
+        assert_eq!(changed(&page("Old"), &page("New")), None);
+        let small = changed(&page("Old"), &page("Old").replace("Item 7 ", "Sold 7 ")).unwrap();
+        assert!(small.len() < PAGE_CHARS, "{small}");
     }
 
     #[test]
