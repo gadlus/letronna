@@ -902,28 +902,46 @@ fn configured() -> Result<BTreeMap<String, Result<ServerConfig, String>>, String
 /// allowed, each named `<plugin>:<server>`; a name `mcp.json` already gives
 /// keeps its entry there.
 fn with_plugins(
-    mut servers: BTreeMap<String, Result<ServerConfig, String>>,
+    servers: BTreeMap<String, Result<ServerConfig, String>>,
 ) -> BTreeMap<String, Result<ServerConfig, String>> {
     // Tests read the servers they are given, never the plugins installed on
     // the machine running them.
     if cfg!(test) {
         return servers;
     }
-    for server in crate::plugins::servers() {
+    joined(servers, crate::plugins::servers())
+}
+
+/// `servers` with `plugins` added, each after those before it.
+fn joined(
+    mut servers: BTreeMap<String, Result<ServerConfig, String>>,
+    plugins: Vec<crate::plugins::Server>,
+) -> BTreeMap<String, Result<ServerConfig, String>> {
+    for server in plugins {
         if servers.contains_key(&server.name) {
             continue;
         }
-        let read = ServerConfig::deserialize(&server.config)
-            .map(|config| ServerConfig {
-                base: Some(server.folder),
-                ..config
-            })
-            .map_err(|e| {
-                format!(
-                    "Its entry in {}'s plugin.json will not read: {e}",
-                    server.plugin
-                )
-            });
+        // `kit:files` and mcp.json's `kit_files` name their tools alike, and
+        // the plugin's, sorting first, would be the one called and the one
+        // the user's rules for the other allow.
+        let prefix = tool_name(&server.name, "");
+        let taken = servers.keys().find(|name| tool_name(name, "") == prefix);
+        let read = match taken {
+            Some(taken) => Err(format!(
+                "Its tools would take the names of {taken}'s, so it does not start."
+            )),
+            None => ServerConfig::deserialize(&server.config)
+                .map(|config| ServerConfig {
+                    base: Some(server.folder),
+                    ..config
+                })
+                .map_err(|e| {
+                    format!(
+                        "Its entry in {}'s plugin.json will not read: {e}",
+                        server.plugin
+                    )
+                }),
+        };
         servers.insert(server.name, read);
     }
     servers
@@ -3439,6 +3457,27 @@ mod tests {
         assert_eq!(fs.auto_approve, AutoApprove::Names(vec!["read".into()]));
         // A server reached by URL has no command, and is passed over.
         assert!(servers["web"].as_ref().unwrap().command.is_empty());
+    }
+
+    #[test]
+    fn a_plugins_server_cannot_take_the_tool_names_of_another() {
+        let server = |name: &str| crate::plugins::Server {
+            name: name.into(),
+            plugin: "kit".into(),
+            folder: PathBuf::from("kit"),
+            config: json!({"command": "node"}),
+        };
+        let servers = joined(
+            entries(&json!({"mcpServers": {"kit_files": {"command": "files"}}})),
+            vec![server("kit:files"), server("kit:web")],
+        );
+        let Err(refused) = &servers["kit:files"] else {
+            panic!("kit:files would share kit_files's tool names");
+        };
+        assert!(refused.contains("kit_files"), "{refused}");
+        let kept = servers["kit:web"].as_ref().unwrap();
+        assert_eq!(kept.base.as_deref(), Some(Path::new("kit")));
+        assert_eq!(servers["kit_files"].as_ref().unwrap().command, "files");
     }
 
     #[test]
