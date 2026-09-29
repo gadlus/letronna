@@ -17,6 +17,7 @@ mod doctor;
 mod edit;
 mod input;
 mod install;
+mod mcp;
 mod render;
 mod screen;
 mod session;
@@ -68,6 +69,9 @@ fn main() {
     if args.version {
         println!("letronna {}", env!("CARGO_PKG_VERSION"));
         return;
+    }
+    if let Some(words) = &args.mcp {
+        std::process::exit(mcp::run(words));
     }
     if args.gui {
         launch_window();
