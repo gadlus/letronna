@@ -62,7 +62,7 @@ impl Tool for ManageSkill {
     fn mutates(&self) -> bool {
         true
     }
-    fn preview(&self, args: &Value, _: &ToolContext) -> String {
+    fn preview(&self, args: &Value, ctx: &ToolContext) -> String {
         let text = |key: &str| args[key].as_str().unwrap_or_default();
         let head = format!("{} skill \"{}\"", text("action"), one_line(text("name")));
         match text("action") {
@@ -77,6 +77,14 @@ impl Tool for ManageSkill {
                     }
                 }
                 out
+            }
+            // What comes back is shown, or a yes would put back text unseen.
+            "undo" => {
+                let name = one_line(text("name"));
+                match earlier(&backend::data_dir(), ctx.workspace.as_deref(), &name) {
+                    Some(back) => format!("{head}, putting back:\n\n{back}"),
+                    None => head,
+                }
             }
             _ => head,
         }
@@ -264,11 +272,28 @@ fn undo(data: &Path, workspace: Option<&Path>, name: &str) -> Result<String, Str
     let file = folder.join(SKILL_FILE);
     let now = read_text(&file, SKILL_BYTES)
         .ok_or_else(|| format!("Could not read {}.", file.display()))?;
+    // The model cannot rename a skill, so another name is the user's doing
+    // on the Skills page, which undo would take back along with the rest.
+    let named = |text: &str| field(&split(text).0, "name");
+    if named(&earlier) != named(&now) {
+        return Err(format!(
+            "The user has renamed \"{name}\" since your last change, so undo would take their \
+             change back too. Patch it instead."
+        ));
+    }
+    scanned(&earlier)?;
     keep_previous(&folder, &now)?;
     write_skill(&folder, &earlier)?;
     Ok(format!(
         "Put back the earlier version of \"{name}\". Undo again to bring back the one replaced."
     ))
+}
+
+/// The SKILL.md that undoing the learned skill called `name` would put
+/// back, when there is one.
+fn earlier(data: &Path, workspace: Option<&Path>, name: &str) -> Option<String> {
+    let folder = learned(data, workspace, name).ok()?;
+    read_text(&folder.join(PREV_FILE), SKILL_BYTES)
 }
 
 /// The folder of the learned skill called `name`, or why it may not be
@@ -439,7 +464,7 @@ fn keep_previous(folder: &Path, text: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BODY_BYTES, LEARNED, PREV_FILE, manage};
+    use super::{BODY_BYTES, LEARNED, PREV_FILE, earlier, manage};
     use crate::skills::{create_in, install::install_in, list_in, set_enabled_in};
     use serde_json::json;
     use std::path::{Path, PathBuf};
@@ -735,5 +760,44 @@ mod tests {
             loaded.contains("[Letronna's note: this skill holds 1 character"),
             "{loaded}"
         );
+    }
+
+    #[test]
+    fn undo_shows_what_it_puts_back_and_leaves_a_rename_by_the_user_alone() {
+        let data = scratch("undo-shown");
+        create(&data, "deploy", "Build.\n\nPush to staging.").unwrap();
+        let args =
+            json!({"action": "patch", "name": "deploy", "old": "staging", "new": "production"});
+        manage(&data, None, &args).unwrap();
+        let back = earlier(&data, None, "deploy").unwrap();
+        assert!(back.contains("Push to staging."), "{back}");
+        // Renamed on the Skills page, with a line of the user's own.
+        crate::skills::edit_in(
+            &data,
+            "deploy",
+            "ship",
+            None,
+            "Build.\n\nPush to production, never on Fridays.",
+        )
+        .unwrap();
+        let undo = json!({"action": "undo", "name": "ship"});
+        let refused = manage(&data, None, &undo).unwrap_err();
+        assert!(refused.contains("renamed"), "{refused}");
+        assert_eq!(
+            body(&data, "ship"),
+            "Build.\n\nPush to production, never on Fridays."
+        );
+        // What comes back is scanned as what is written is.
+        let folder = crate::skills::find(&list_in(&data, None).unwrap(), "ship")
+            .unwrap()
+            .folder
+            .clone();
+        std::fs::write(
+            folder.join(PREV_FILE),
+            "---\nname: ship\n---\n\nPush\u{E0041} it.\n",
+        )
+        .unwrap();
+        let refused = manage(&data, None, &undo).unwrap_err();
+        assert!(refused.starts_with("Nothing was changed"), "{refused}");
     }
 }
