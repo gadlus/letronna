@@ -182,6 +182,10 @@ pub(crate) struct Chat {
     pub(crate) messaging: letronna_core::messaging::Config,
     /// The code the Messaging page shows for pairing a Telegram chat.
     pub(crate) pairing: Option<letronna_core::messaging::pairing::Code>,
+    /// The code the Messaging page shows for pairing a Slack member.
+    pub(crate) slack_code: Option<letronna_core::messaging::pairing::Code>,
+    /// What the Slack listener last said it was doing; none while it is off.
+    pub(crate) slack_state: Option<letronna_core::messaging::SlackState>,
     /// Sessions a schedule opened, so their result can be reported onward.
     pub(crate) scheduled: std::collections::HashSet<u64>,
     /// Sessions opened for a remote chat, so the reply goes back to it.
@@ -219,12 +223,16 @@ pub(crate) struct Chat {
     pub(crate) discord_token_input: Entity<InputState>,
     pub(crate) discord_owner_input: Entity<InputState>,
     pub(crate) discord_servers_input: Entity<InputState>,
+    pub(crate) slack_app_input: Entity<InputState>,
+    pub(crate) slack_bot_input: Entity<InputState>,
     /// The webhook's name, once it has been checked.
     pub(crate) hook_name: Option<String>,
     /// The connected bot's @name, once the token has been checked.
     pub(crate) bot_name: Option<String>,
     /// The Discord bot's name, once its token has been checked.
     pub(crate) discord_bot_name: Option<String>,
+    /// The Slack app's bot name, once its tokens have been checked.
+    pub(crate) slack_bot_name: Option<String>,
     /// Selected row on the Messaging page.
     pub(crate) channel: usize,
     pub(crate) skills: Vec<letronna_core::skills::Skill>,
@@ -400,6 +408,18 @@ impl Chat {
                 .placeholder("Server IDs, separated by commas")
                 .default_value(letronna_core::messaging::load().discord.servers.join(", "))
         });
+        let slack_app_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .masked(true)
+                .placeholder("xapp-...")
+                .default_value(letronna_core::messaging::load().slack.app_token)
+        });
+        let slack_bot_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .masked(true)
+                .placeholder("xoxb-...")
+                .default_value(letronna_core::messaging::load().slack.bot_token)
+        });
         let skill_name =
             cx.new(|cx| InputState::new(window, cx).placeholder("Review these changes"));
         let skill_prompt = cx.new(|cx| {
@@ -560,6 +580,8 @@ impl Chat {
             job_prompt,
             messaging: letronna_core::messaging::load(),
             pairing: None,
+            slack_code: None,
+            slack_state: None,
             scheduled: std::collections::HashSet::new(),
             remote: std::collections::HashMap::new(),
             remote_session: std::collections::HashMap::new(),
@@ -574,9 +596,12 @@ impl Chat {
             discord_token_input,
             discord_owner_input,
             discord_servers_input,
+            slack_app_input,
+            slack_bot_input,
             hook_name: None,
             bot_name: None,
             discord_bot_name: None,
+            slack_bot_name: None,
             channel: 0,
             skills,
             skills_error: skills_error.clone(),
@@ -1436,6 +1461,7 @@ impl Chat {
                 .is_some_and(|(_, running)| *running == slack);
         if !unchanged && let Some((stop, _)) = self.slack_listener.take() {
             stop.store(true, Ordering::Relaxed);
+            self.slack_state = None;
         }
         let open_slack = slack.ready() && !unchanged;
         let telegram = &self.messaging.telegram;
@@ -1453,10 +1479,26 @@ impl Chat {
         }
         if open_slack {
             let slack_stop = std::sync::Arc::new(AtomicBool::new(false));
-            // Nothing shows its state yet.
-            let (state, _) = async_channel::unbounded();
+            let (state, states) = async_channel::unbounded();
             letronna_core::messaging::slack_listen(slack.clone(), slack_stop.clone(), tx, state);
-            self.slack_listener = Some((slack_stop, slack));
+            self.slack_listener = Some((slack_stop.clone(), slack));
+            // The page shows what the listener says, not what the settings
+            // hope: a refused token stops it.
+            cx.spawn(async move |this, cx| {
+                while let Ok(state) = states.recv().await {
+                    let shown = this.update(cx, |this, cx| {
+                        // One since replaced may still be winding down.
+                        if !slack_stop.load(Ordering::Relaxed) {
+                            this.slack_state = Some(state);
+                            cx.notify();
+                        }
+                    });
+                    if shown.is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
         }
         self.messaging_stop = Some(stop);
         cx.spawn(async move |this, cx| {
@@ -1500,8 +1542,7 @@ impl Chat {
     /// A message arrived from a bot. A Telegram chat that is not paired is
     /// heard only as a try at the pairing code, and gets no reply unless it
     /// is right; Discord only ever delivers the owner's messages. Slack hands
-    /// on a DM from anyone until a member is paired, and those are dropped:
-    /// only the paired member is answered.
+    /// on a DM from anyone until a member is paired, heard the same way.
     fn on_remote(&mut self, message: letronna_core::messaging::Incoming, cx: &mut Context<Self>) {
         use letronna_core::gate::Mode;
         use letronna_core::messaging::{Source, pairing};
@@ -1535,10 +1576,27 @@ impl Chat {
             return;
         }
         // Slack hears only its paired member, so who may answer is who is
-        // heard at all.
+        // heard at all; before one is paired a DM is a try at the code.
         if let Source::Slack { .. } = source
             && !pairing::may_answer(&self.messaging, &message)
         {
+            let now = std::time::Instant::now();
+            match pairing::pair_slack(
+                &mut self.slack_code,
+                &mut self.messaging.slack,
+                &message,
+                now,
+            ) {
+                Some(pairing::Attempt::Paired) => {
+                    // The listener hears only the member it started with.
+                    letronna_core::messaging::save(&self.messaging);
+                    self.tell_remote(&source, "Paired. Send your message.", cx);
+                    self.restart_messaging(cx);
+                    cx.notify();
+                }
+                Some(_) => cx.notify(),
+                None => {}
+            }
             return;
         }
         // A thread reply that does not mention the app is a follow-up, or a
