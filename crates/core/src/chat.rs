@@ -228,11 +228,16 @@ pub fn validate(connection: &Connection) -> Result<String, String> {
     })
 }
 
-/// Budget for the whole conversation window, in estimated tokens: the 24,000
-/// characters it used to be, at four characters a token of English.
+/// Budget for the window of a model whose own is not known, and the least
+/// any model gets, in estimated tokens: the 24,000 characters every model
+/// had, at four characters a token of English. Ollama serves a far smaller
+/// window than a model was trained for and its list does not say how much,
+/// so this is what a local model keeps.
 const CONTEXT_TOKENS: usize = 6_000;
 /// A single tool result can be far larger than anything the model needs to
-/// read. The chat keeps the whole thing; the request gets the ends.
+/// read. The chat keeps the whole thing; the request gets the ends. This is
+/// the small window's share and the least any gets; a bigger window sends
+/// half its room in characters.
 pub(crate) const MAX_TOOL_CHARS: usize = 8_000;
 /// What a message costs beyond its text: the role and separators a chat
 /// template wraps it in, which OpenAI counts as three or four tokens.
@@ -270,13 +275,14 @@ fn tokens(text: &str) -> usize {
     wide + narrow.div_ceil(4)
 }
 
-/// About what `m` costs in a request: its text as sent, the calls it makes
-/// with their arguments, and its role.
-fn message_tokens(m: &Message) -> usize {
+/// About what `m` costs in a request that sends `tool_chars` of a tool
+/// result: its text as sent, the calls it makes with their arguments, and
+/// its role.
+fn message_tokens(m: &Message, tool_chars: usize) -> usize {
     // A long tool result goes out trimmed to its ends. A string never has
     // fewer bytes than characters, so a short one is never trimmed.
-    let content = if m.role == "tool" && m.content.len() > MAX_TOOL_CHARS {
-        tokens(&trim(&m.content, MAX_TOOL_CHARS))
+    let content = if m.role == "tool" && m.content.len() > tool_chars {
+        tokens(&trim(&m.content, tool_chars))
     } else {
         tokens(&m.content)
     };
@@ -293,13 +299,13 @@ fn message_tokens(m: &Message) -> usize {
 ///
 /// The screenshot is counted where it would go, whether or not the model
 /// takes pictures, so the window does not move when one turns out not to.
-fn token_sums(messages: &[Message]) -> Vec<usize> {
+fn token_sums(messages: &[Message], tool_chars: usize) -> Vec<usize> {
     let picture = screenshot(messages).map(|(after, _)| after);
     let mut sums = Vec::with_capacity(messages.len() + 1);
     let mut total = 0;
     sums.push(total);
     for (i, m) in messages.iter().enumerate() {
-        total += message_tokens(m);
+        total += message_tokens(m, tool_chars);
         if picture == Some(i) {
             total += PICTURE_TOKENS;
         }
@@ -308,13 +314,117 @@ fn token_sums(messages: &[Message]) -> Vec<usize> {
     sums
 }
 
-/// Messages in the window, whatever the token budget says. Guards against
-/// a long run of tiny messages.
+/// Messages in the small window, whatever the token budget says. Guards
+/// against a long run of tiny messages; a bigger window holds as many more.
 const MAX_MESSAGES: usize = 60;
-/// How much the window drops when it no longer fits, in messages. The start is
-/// always a whole number of these from the beginning, so appending a turn
-/// cannot nudge it: it either stays exactly where it was or jumps a step.
-const COMPACT_STEP: usize = 16;
+/// The most a window holds by default, in estimated tokens, however much the
+/// model could take. Until requests carry cache markers every round of a
+/// turn is billed for the whole window again, so a bigger one costs more on
+/// every round rather than once; the `context_cap` setting changes it.
+const CAP_TOKENS: usize = 64_000;
+/// The reply asked for when the model's output limit is not known: what
+/// every request asked for before any limit was, which the smallest limits
+/// in use, such as deepseek-chat's, still accept.
+const REPLY_TOKENS: usize = 8_192;
+/// The longest reply asked for, whatever the model could write: room kept
+/// for the reply is room the window cannot use, and some gateways hold
+/// credit against all of it before the reply starts. 32,000 is a long file
+/// written in one call.
+const MAX_REPLY_TOKENS: usize = 32_000;
+
+/// How much of a conversation one request carries, in estimated tokens
+/// unless said otherwise.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Budget {
+    /// What the window's messages may cost together.
+    tokens: usize,
+    /// How far apart the places are where the window may start.
+    step: usize,
+    /// The most messages the window holds, whatever they cost.
+    messages: usize,
+    /// The most characters of one tool result that are sent.
+    tool_chars: usize,
+    /// The longest reply asked for, as `max_tokens`.
+    reply: usize,
+}
+
+impl Budget {
+    /// The window every model had before its own could be known.
+    const SMALL: Self = Self {
+        tokens: CONTEXT_TOKENS,
+        step: CONTEXT_TOKENS / 2,
+        messages: MAX_MESSAGES,
+        tool_chars: MAX_TOOL_CHARS,
+        reply: REPLY_TOKENS,
+    };
+}
+
+/// The budget for the next request over `connection`: its model's window as
+/// far as it is known, the user's cap of `cap` tokens (0 for the default),
+/// and what the system prompt and the tools take.
+fn budget(connection: &Connection, cap: u64) -> Budget {
+    let facts = crate::models::facts(&connection.endpoint, connection.model.trim());
+    let cap = match cap {
+        0 => CAP_TOKENS,
+        cap => cap as usize,
+    };
+    // A request without messages is the part every request carries.
+    let fixed = tokens(&body_with(connection, &[], None, None, &Budget::SMALL, &[]).to_string());
+    sized(facts.context, facts.max_output, cap, fixed)
+}
+
+/// The budget for a model that reads `context` tokens and writes `output`,
+/// where they are known, under a cap of `cap` tokens, when `fixed` tokens of
+/// every request go to the system prompt and the tools.
+///
+/// Only what the messages may cost depends on `fixed`. The step, the message
+/// guard and the share of a tool result come from the window and the cap
+/// alone, so the places the window can start stay put when memory is
+/// written or a tool comes or goes: the window may move on a step sooner,
+/// but never to a new place, which would miss the prompt cache and be
+/// summarized again. The one exception, a prompt that takes more than half
+/// the room, halves the step, which adds places but moves none.
+fn sized(context: Option<u64>, output: Option<u64>, cap: usize, fixed: usize) -> Budget {
+    let Some(context) = context else {
+        // Without the window a longer reply than every model was asked for
+        // could be more than it holds, so a known limit only lowers it.
+        return Budget {
+            reply: output.map_or(REPLY_TOKENS, |n| (n as usize).min(REPLY_TOKENS)),
+            ..Budget::SMALL
+        };
+    };
+    // A model may list an output limit as big as its window, while the prompt
+    // and the reply asked for must fit in it together: the reply gets a
+    // quarter of it at most.
+    let reply = output
+        .map_or(REPLY_TOKENS, |n| (n as usize).min(MAX_REPLY_TOKENS))
+        .min(context as usize / 4);
+    // A quarter of what the reply leaves stays free: the estimate is no
+    // tokenizer, the summary rides on top, and the turn in progress, which
+    // is never trimmed, can run past the window by a few tool results.
+    let room = ((context as usize).saturating_sub(reply) / 4 * 3)
+        .min(cap)
+        .max(CONTEXT_TOKENS);
+    let tokens = room.saturating_sub(fixed).max(CONTEXT_TOKENS);
+    // A step longer than what the messages may cost would leave the window
+    // nowhere to start but the current turn, on every request, once the
+    // history past a place outgrew that before reaching the next one.
+    let mut step = room / 2;
+    while step > tokens {
+        step /= 2;
+    }
+    Budget {
+        tokens,
+        step,
+        messages: MAX_MESSAGES * room / CONTEXT_TOKENS,
+        // Half the room in characters, about an eighth of it in tokens: the
+        // turn in progress, which is never trimmed, still holds several
+        // results, and from a room of 48,000 up the most a tool returns,
+        // 24,000 characters, goes out whole.
+        tool_chars: (room / 2).max(MAX_TOOL_CHARS),
+        reply,
+    }
+}
 
 /// Where the context window starts.
 ///
@@ -322,8 +432,11 @@ const COMPACT_STEP: usize = 16;
 /// the window is that it stops moving. Trimming the oldest turn each time the
 /// budget is exceeded would shift the prefix on every single request and miss
 /// the cache every time — exactly in the long agent sessions that cost the
-/// most. Instead the window halves when it no longer fits, and then stays put
-/// for many turns, so requests in between are byte-identical from the front.
+/// most. Instead the window can only start at the first turn past each whole
+/// step of tokens from the beginning of the session, places that appending
+/// cannot move. When it no longer fits it jumps to the next one that does,
+/// about half the window on, and then stays put for many turns, so requests
+/// in between are byte-identical from the front.
 ///
 /// The latest user turn always goes in whatever its size: dropping it (a single
 /// huge tool result can exceed the budget by itself) would leave the model with
@@ -333,19 +446,30 @@ const COMPACT_STEP: usize = 16;
 ///
 /// This is deliberately stateless: the same message list always yields the same
 /// start, so nothing needs saving and two requests over the same history agree.
-fn window_start(messages: &[Message]) -> usize {
+fn window_start(messages: &[Message], budget: &Budget) -> usize {
     let last_user = messages.iter().rposition(opens_turn).unwrap_or(0);
-    let sums = token_sums(messages);
+    let sums = token_sums(messages, budget.tool_chars);
     let total = sums[messages.len()];
+    // Toward the steps a message counts as at least its share of a window
+    // full by the message guard, so a run of short ones, which meets the
+    // guard long before the budget, still steps on. The screenshot is left
+    // out: it is counted at the newest one, and a new one must not move the
+    // places behind it.
+    let least = CONTEXT_TOKENS / MAX_MESSAGES;
+    let mut marks = vec![0];
+    for (i, m) in messages.iter().enumerate() {
+        marks.push(marks[i] + message_tokens(m, budget.tool_chars).max(least));
+    }
     let mut start = 0;
     while start < last_user
-        && (total - sums[start] > CONTEXT_TOKENS || messages.len() - start > MAX_MESSAGES)
+        && (total - sums[start] > budget.tokens || messages.len() - start > budget.messages)
     {
-        // Drop a fixed step, then round forward to a user turn so the window
-        // never begins midway through a tool exchange.
-        let next = (start + COMPACT_STEP).min(last_user);
-        start = (next..=last_user)
-            .find(|i| opens_turn(&messages[*i]))
+        // On to the first user turn past the next whole step from the
+        // beginning, so the window never begins midway through a tool
+        // exchange and where it can begin depends on nothing after it.
+        let next = (marks[start] / budget.step + 1) * budget.step;
+        start = (start + 1..=last_user)
+            .find(|i| marks[*i] >= next && opens_turn(&messages[*i]))
             .unwrap_or(last_user);
     }
     start
@@ -365,7 +489,7 @@ fn body(
     summary: Option<&str>,
     plan: Option<&str>,
 ) -> Value {
-    body_with(connection, window, summary, plan, &[])
+    body_with(connection, window, summary, plan, &Budget::SMALL, &[])
 }
 
 /// The request, offering `extra` after every tool the connection offers.
@@ -374,6 +498,7 @@ fn body_with(
     window: &[Message],
     summary: Option<&str>,
     plan: Option<&str>,
+    budget: &Budget,
     extra: &[Value],
 ) -> Value {
     // The user's SOUL.md, when there is one, says who Letronna is instead.
@@ -448,7 +573,7 @@ fn body_with(
         .filter(|_| sees_images(&connection.model))
         .and_then(|(after, path)| Some((after, crate::media::data_url(&path)?)));
     for (i, m) in window.iter().enumerate() {
-        context.push(wire_message(m));
+        context.push(wire_message(m, budget.tool_chars));
         // A tool result carries text only, so the picture follows as the
         // user's: the one shape of it every provider takes.
         if let Some((after, picture)) = &shot
@@ -491,7 +616,7 @@ fn body_with(
         "stream": true,
         // Writing a file puts the whole body in one tool call, so a small cap
         // truncates the arguments mid-JSON.
-        "max_tokens": 8192,
+        "max_tokens": budget.reply,
         "stream_options": {"include_usage": true}
     });
     if connection.tools {
@@ -773,9 +898,9 @@ pub(crate) fn trim(text: &str, max: usize) -> String {
     format!("{head}\n… [middle trimmed] …\n{tail}")
 }
 
-fn wire_message(m: &Message) -> Value {
+fn wire_message(m: &Message, tool_chars: usize) -> Value {
     let content = if m.role == "tool" {
-        trim(&m.content, MAX_TOOL_CHARS)
+        trim(&m.content, tool_chars)
     } else {
         m.content.clone()
     };
@@ -1142,19 +1267,14 @@ pub fn start_with(
     messages: Vec<Message>,
     extra: Extra,
 ) -> async_channel::Receiver<Event> {
+    let budget = budget(&connection, crate::store::context_cap());
     // Before the reply exists, so every call it makes is stamped with it.
-    let window = window_start(&messages);
+    let window = window_start(&messages, &budget);
     crate::filestate::asked(connection.conversation, messages.len(), window);
     let (sender, receiver) = async_channel::bounded(64);
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
-        let result = stream(
-            &connection,
-            &messages,
-            window_start(&messages),
-            &extra,
-            &sender,
-        );
+        let result = stream(&connection, &messages, window, &budget, &extra, &sender);
         // The call is over by now. Letting go before saying so means whoever
         // hears `Finished` never finds the guard still held.
         drop(extra.guard);
@@ -1182,6 +1302,7 @@ fn stream(
     connection: &Connection,
     messages: &[Message],
     start: usize,
+    budget: &Budget,
     extra: &Extra,
     sender: &async_channel::Sender<Event>,
 ) -> Result<(), Failure> {
@@ -1198,12 +1319,13 @@ fn stream(
     // What the window no longer holds goes in as a summary rather than not at
     // all. It is made here, on the worker, so the wait is part of the reply's.
     let (dropped, window) = messages.split_at(start);
-    let summary = crate::compact::summary(connection, dropped);
+    let summary = crate::compact::summary(connection, dropped, budget.step);
     let sent = body_with(
         connection,
         window,
         summary.as_deref(),
         checklist(messages).as_deref(),
+        budget,
         &extra.tools,
     );
     let mut request = client()
@@ -1257,7 +1379,7 @@ fn stream(
                     && learn(connection, &sent, &error)
                     && !sender.is_closed()
                 {
-                    return stream(connection, messages, start, extra, sender);
+                    return stream(connection, messages, start, budget, extra, sender);
                 }
                 let body = serde_json::from_str::<Value>(&error).unwrap_or_default();
                 classify(Some(status.as_u16()), &headers, &body)
@@ -1623,7 +1745,7 @@ mod tests {
             .collect();
         let payload = body(
             &connection(),
-            &messages[window_start(&messages)..],
+            &messages[window_start(&messages, &Budget::SMALL)..],
             None,
             None,
         );
@@ -1660,10 +1782,10 @@ mod tests {
                 ..Default::default()
             },
         ];
-        assert!(message_tokens(&messages[2]) > CONTEXT_TOKENS);
+        assert!(message_tokens(&messages[2], MAX_TOOL_CHARS) > CONTEXT_TOKENS);
         let payload = body(
             &connection(),
-            &messages[window_start(&messages)..],
+            &messages[window_start(&messages, &Budget::SMALL)..],
             None,
             None,
         );
@@ -1728,10 +1850,10 @@ mod tests {
             messages.push(said("assistant", &"x".repeat(CONTEXT_TOKENS / 2)));
         }
         messages.push(said("user", "and now?"));
-        assert!(window_start(&messages) > 1);
+        assert!(window_start(&messages, &Budget::SMALL) > 1);
 
         // Sent as stream sends it: the window only, the plan from the whole.
-        let window = &messages[window_start(&messages)..];
+        let window = &messages[window_start(&messages, &Budget::SMALL)..];
         let payload = body(&connection(), window, None, checklist(&messages).as_deref());
         let context = payload["messages"].as_array().unwrap();
         let last = context.last().unwrap()["content"].as_str().unwrap();
@@ -1872,7 +1994,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let wired = wire_message(&reply);
+        let wired = wire_message(&reply, MAX_TOOL_CHARS);
         assert_eq!(wired["tool_calls"][0]["function"]["arguments"], "{}");
     }
 
@@ -2202,7 +2324,7 @@ mod tests {
         let mut starts = Vec::new();
         for i in 0..40 {
             messages.extend(turn(i));
-            starts.push(window_start(&messages));
+            starts.push(window_start(&messages, &Budget::SMALL));
         }
 
         // It must compact at some point, or the budget means nothing.
@@ -2219,7 +2341,7 @@ mod tests {
         for start in &starts {
             assert_eq!(messages[*start].role, "user", "start {start} is not a turn");
         }
-        let sums = token_sums(&messages);
+        let sums = token_sums(&messages, MAX_TOOL_CHARS);
         assert!(sums[messages.len()] - sums[*starts.last().unwrap()] <= CONTEXT_TOKENS);
     }
 
@@ -2269,10 +2391,10 @@ mod tests {
         messages.push(folded("leave the tests alone"));
         messages.extend((10..12).flat_map(round));
 
-        assert_eq!(window_start(&messages), 2);
+        assert_eq!(window_start(&messages, &Budget::SMALL), 2);
         let payload = body(
             &connection(),
-            &messages[window_start(&messages)..],
+            &messages[window_start(&messages, &Budget::SMALL)..],
             None,
             None,
         );
@@ -2283,7 +2405,7 @@ mod tests {
         // turn is still over: the next prompt starts one of its own, and the
         // window moves on to it rather than to the follow-ups before it.
         messages.push(said("user", "the next request"));
-        assert_eq!(window_start(&messages), messages.len() - 1);
+        assert_eq!(window_start(&messages, &Budget::SMALL), messages.len() - 1);
     }
 
     #[test]
@@ -2663,8 +2785,11 @@ mod tests {
             ..Default::default()
         };
         // What the user wrote goes out whole, a tool result as its ends.
-        assert_eq!(message_tokens(&said), MESSAGE_TOKENS + 10_000);
-        let sent = message_tokens(&result) - MESSAGE_TOKENS;
+        assert_eq!(
+            message_tokens(&said, MAX_TOOL_CHARS),
+            MESSAGE_TOKENS + 10_000
+        );
+        let sent = message_tokens(&result, MAX_TOOL_CHARS) - MESSAGE_TOKENS;
         assert!(sent.abs_diff(MAX_TOOL_CHARS / 4) < 16, "{sent}");
     }
 
@@ -2710,9 +2835,9 @@ mod tests {
         // A file written in one call goes out in full as the call's
         // arguments, however little the messages around it say.
         let messages = a_big_write();
-        assert!(message_tokens(&messages[1]) > 10_000);
+        assert!(message_tokens(&messages[1], MAX_TOOL_CHARS) > 10_000);
         // The turn that wrote it no longer fits, so the window moves on.
-        assert_eq!(window_start(&messages), 4);
+        assert_eq!(window_start(&messages, &Budget::SMALL), 4);
     }
 
     #[test]
@@ -2765,9 +2890,9 @@ mod tests {
         let messages = screenshots(&dir);
         // Counted from the conversation alone, so the files need not be there.
         std::fs::remove_dir_all(&dir).unwrap();
-        let sums = token_sums(&messages);
+        let sums = token_sums(&messages, MAX_TOOL_CHARS);
         let pictured: Vec<usize> = (0..messages.len())
-            .filter(|&i| sums[i + 1] - sums[i] != message_tokens(&messages[i]))
+            .filter(|&i| sums[i + 1] - sums[i] != message_tokens(&messages[i], MAX_TOOL_CHARS))
             .collect();
         // The newer screenshot, after the last result of its batch; the
         // older one is never sent, so it costs only its text.
@@ -2775,7 +2900,7 @@ mod tests {
         assert_eq!(pictured, [last]);
         assert_eq!(
             sums[last + 1] - sums[last],
-            message_tokens(&messages[last]) + PICTURE_TOKENS
+            message_tokens(&messages[last], MAX_TOOL_CHARS) + PICTURE_TOKENS
         );
     }
 
@@ -3038,10 +3163,10 @@ mod tests {
             messages.push(said("user", true, i));
             messages.push(said("assistant", false, i));
         }
-        let start = window_start(&messages);
+        let start = window_start(&messages, &Budget::SMALL);
         assert!(start > 0, "the window never left the user's message");
         assert!(messages[start].notice, "start {start} is not a notice");
-        let sums = token_sums(&messages);
+        let sums = token_sums(&messages, MAX_TOOL_CHARS);
         assert!(sums[messages.len()] - sums[start] <= CONTEXT_TOKENS);
     }
 
@@ -3723,5 +3848,231 @@ mod tests {
         assert_eq!(calls[0].name, "read_file");
         assert_eq!(calls[0].arguments, r#"{"path":"a.rs"}"#);
         assert!(matches!(events[2], Event::Finished(Ok(()))));
+    }
+
+    /// A plain exchange of about 300 tokens, numbered so no two are alike.
+    fn exchange(i: usize) -> [Message; 2] {
+        [
+            Message {
+                role: "user".into(),
+                content: format!("question {i} {}", "x".repeat(600)),
+                ..Default::default()
+            },
+            Message {
+                role: "assistant".into(),
+                content: format!("answer {i} {}", "y".repeat(600)),
+                ..Default::default()
+            },
+        ]
+    }
+
+    #[test]
+    fn a_bigger_model_keeps_more_history() {
+        let messages: Vec<Message> = (0..400).flat_map(exchange).collect();
+        let sums = token_sums(&messages, MAX_TOOL_CHARS);
+        let kept = |budget: &Budget| sums[messages.len()] - sums[window_start(&messages, budget)];
+        let big = sized(Some(200_000), Some(64_000), CAP_TOKENS, 4_000);
+        let (small, large) = (kept(&Budget::SMALL), kept(&big));
+        assert!(small <= CONTEXT_TOKENS, "{small}");
+        // No more than the cap leaves beside the prompt, and several times
+        // the small window even just after a step.
+        assert!(large <= CAP_TOKENS - 4_000, "{large}");
+        assert!(large > 4 * CONTEXT_TOKENS, "{large} against {small}");
+
+        // A run of short messages is not cut off at sixty.
+        let short: Vec<Message> = (0..300)
+            .map(|i| Message {
+                role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+                content: format!("ok {i}"),
+                ..Default::default()
+            })
+            .collect();
+        let start = window_start(&short, &Budget::SMALL);
+        assert!(short.len() - start <= MAX_MESSAGES, "{start}");
+        assert!(short.len() - start >= MAX_MESSAGES / 2, "{start}");
+        assert_eq!(window_start(&short, &big), 0);
+
+        // And a tool result as long as any tool returns goes out whole.
+        let result = Message {
+            role: "tool".into(),
+            content: "z".repeat(24_000),
+            ..Default::default()
+        };
+        let sent = |budget: &Budget| {
+            let wired = wire_message(&result, budget.tool_chars);
+            wired["content"].as_str().unwrap().len()
+        };
+        assert!(sent(&Budget::SMALL) < MAX_TOOL_CHARS + 64);
+        assert_eq!(sent(&big), 24_000);
+    }
+
+    #[test]
+    fn boundaries_do_not_move_when_memory_changes() {
+        // Memory written, an MCP server connected: more of every request is
+        // taken before the first message.
+        let lean = sized(Some(200_000), Some(64_000), CAP_TOKENS, 2_000);
+        let full = sized(Some(200_000), Some(64_000), CAP_TOKENS, 12_000);
+        assert!(full.tokens < lean.tokens);
+        assert_eq!((full.step, full.messages), (lean.step, lean.messages));
+
+        let starts = |budget: &Budget, turns: usize| {
+            let mut messages = Vec::new();
+            let mut starts = std::collections::BTreeSet::new();
+            for i in 0..turns {
+                messages.extend(exchange(i));
+                starts.insert(window_start(&messages, budget));
+            }
+            starts
+        };
+        // The fuller prompt moves the window sooner, but only ever to a turn
+        // the leaner one starts at too once it has grown that far, so the
+        // summaries and the cached prefixes are the same ones.
+        let fuller = starts(&full, 600);
+        let leaner = starts(&lean, 700);
+        assert!(fuller.len() > 3, "{fuller:?}");
+        assert!(fuller.is_subset(&leaner), "{fuller:?} against {leaner:?}");
+    }
+
+    #[test]
+    fn an_unknown_model_keeps_the_small_window() {
+        // However big the cap and however small the prompt.
+        assert_eq!(sized(None, None, CAP_TOKENS, 2_000), Budget::SMALL);
+        assert_eq!(sized(None, None, 1_000_000, 0), Budget::SMALL);
+        // A window known to be too small for more, or a cap below it, gets it
+        // as the least, with a reply no longer than a quarter of the window.
+        assert_eq!(
+            sized(Some(8_192), None, CAP_TOKENS, 2_000),
+            Budget {
+                reply: 2_048,
+                ..Budget::SMALL
+            }
+        );
+        assert_eq!(sized(Some(200_000), None, 1_000, 2_000), Budget::SMALL);
+        // Ollama's list says nothing and its models are in no table.
+        assert_eq!(budget(&connection(), 0), Budget::SMALL);
+    }
+
+    #[test]
+    fn a_known_model_is_sized_from_its_facts() {
+        let gpt = Connection {
+            endpoint: "https://sized.test/v1".into(),
+            model: "gpt-4o".into(),
+            ..connection()
+        };
+        // The family table's output limit, and its window under the default
+        // cap less what the prompt takes.
+        let default = budget(&gpt, 0);
+        assert_eq!(default.reply, 16_384);
+        assert_eq!(default.step, CAP_TOKENS / 2);
+        assert!(default.tokens < CAP_TOKENS, "{default:?}");
+        // Or under the user's own cap.
+        assert_eq!(budget(&gpt, 20_000).step, 10_000);
+    }
+
+    #[test]
+    fn a_prompt_over_half_the_room_still_leaves_history_in_the_window() {
+        // A 32K window whose prompt, memory and tools take 12,000 tokens has
+        // less left for the messages than half its room.
+        let budget = sized(Some(32_768), None, CAP_TOKENS, 12_000);
+        assert!(budget.step <= budget.tokens, "{budget:?}");
+        let mut messages = Vec::new();
+        for i in 0..400 {
+            messages.extend(exchange(i));
+            // The window never falls back to the current turn alone, which
+            // would drop a little more of the session on every request.
+            let start = window_start(&messages, &budget);
+            assert!(i == 0 || start < messages.len() - 2, "{i}: {start}");
+        }
+    }
+
+    #[test]
+    fn a_new_screenshot_does_not_move_where_the_window_starts() {
+        let browse = |id: &str, picture: &str| {
+            [
+                Message {
+                    role: "assistant".into(),
+                    tool_calls: vec![ToolCall {
+                        id: id.into(),
+                        name: crate::browser::BROWSE.into(),
+                        arguments: "{}".into(),
+                    }],
+                    ..Default::default()
+                },
+                Message {
+                    role: "tool".into(),
+                    tool_call_id: id.into(),
+                    name: crate::browser::BROWSE.into(),
+                    content: format!("Saved to /pictures/{picture}.jpg\nA screenshot."),
+                    ..Default::default()
+                },
+            ]
+        };
+        let said = |text: &str| Message {
+            role: "user".into(),
+            content: text.into(),
+            ..Default::default()
+        };
+        let budget = Budget::SMALL;
+        let mut held = 0;
+        for n in 20..80 {
+            // A screenshot early on, long since out of the window.
+            let mut messages = vec![said("look at it")];
+            messages.extend(browse("a", "old"));
+            messages.extend((0..n).flat_map(exchange));
+            messages.push(said("look again"));
+            let before = window_start(&messages, &budget);
+            // The next round takes a new one.
+            messages.extend(browse("b", "new"));
+            let sums = token_sums(&messages, budget.tool_chars);
+            let fits = sums[messages.len()] - sums[before] <= budget.tokens
+                && messages.len() - before <= budget.messages;
+            if fits {
+                held += 1;
+                assert_eq!(window_start(&messages, &budget), before, "{n}");
+            }
+        }
+        assert!(held > 10, "{held}");
+    }
+
+    #[test]
+    fn the_cap_limits_a_huge_window() {
+        let opus = sized(Some(1_000_000), Some(128_000), CAP_TOKENS, 5_000);
+        assert_eq!(opus.tokens, CAP_TOKENS - 5_000);
+        assert_eq!(opus.step, CAP_TOKENS / 2);
+        // A cap of the user's own lets more in.
+        let raised = sized(Some(1_000_000), Some(128_000), 300_000, 5_000);
+        assert_eq!(raised.tokens, 295_000);
+        // But no more than three quarters of what the reply leaves.
+        let gpt = sized(Some(128_000), Some(16_384), 1_000_000, 5_000);
+        assert_eq!(gpt.tokens, (128_000 - 16_384) / 4 * 3 - 5_000);
+    }
+
+    #[test]
+    fn max_tokens_rises_only_when_the_output_limit_is_known() {
+        let asked = |budget: Budget| {
+            body_with(&connection(), &[], None, None, &budget, &[])["max_tokens"].clone()
+        };
+        assert_eq!(asked(sized(Some(200_000), None, CAP_TOKENS, 0)), 8_192);
+        assert_eq!(
+            asked(sized(Some(200_000), Some(16_384), CAP_TOKENS, 0)),
+            16_384
+        );
+        assert_eq!(
+            asked(sized(Some(200_000), Some(64_000), CAP_TOKENS, 0)),
+            32_000
+        );
+        // Not without the window, which a longer reply could outgrow.
+        assert_eq!(asked(sized(None, Some(64_000), CAP_TOKENS, 0)), 8_192);
+        // A limit known to be lower than the old fixed ask lowers it.
+        assert_eq!(
+            asked(sized(Some(128_000), Some(4_096), CAP_TOKENS, 0)),
+            4_096
+        );
+        assert_eq!(asked(sized(None, Some(4_096), CAP_TOKENS, 0)), 4_096);
+        // A model listed as writing as much as it reads still has room to
+        // read, and the prompt, the messages and the reply fit together.
+        let even = sized(Some(32_768), Some(32_768), CAP_TOKENS, 3_500);
+        assert_eq!(even.reply, 8_192);
+        assert!(3_500 + even.tokens + even.reply <= 32_768, "{even:?}");
     }
 }

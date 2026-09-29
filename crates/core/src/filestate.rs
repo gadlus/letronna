@@ -727,7 +727,9 @@ mod tests {
     fn a_command_that_changes_a_file_read_before_says_which_and_leaves_it_editable() {
         let (dir, ctx) = project("command", 109);
         std::fs::write(dir.join("a.txt"), "one").unwrap();
-        std::fs::write(dir.join("b.txt"), "two").unwrap();
+        // Another length: Copy-Item keeps the time b.txt was written, which
+        // Windows may not tell from a.txt's.
+        std::fs::write(dir.join("b.txt"), "three").unwrap();
         run("read_file", r#"{"path":"a.txt"}"#, &ctx).unwrap();
         run("read_file", r#"{"path":"b.txt"}"#, &ctx).unwrap();
         reply(&ctx, 3);
@@ -747,7 +749,7 @@ mod tests {
         let write = r#"{"path":"a.txt","content":"1"}"#;
         let refused = run("write_file", write, &ctx).unwrap_err();
         assert!(refused.contains("only part"), "{refused}");
-        let edit = r#"{"path":"a.txt","old":"two","new":"2"}"#;
+        let edit = r#"{"path":"a.txt","old":"three","new":"2"}"#;
         run("edit_file", edit, &ctx).unwrap();
         assert_eq!(read_to(&dir, "a.txt"), "2");
         std::fs::remove_dir_all(dir).unwrap();

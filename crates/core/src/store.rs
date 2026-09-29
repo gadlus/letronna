@@ -182,6 +182,13 @@ pub struct Settings {
     /// the transcript, code or diffs.
     #[serde(default = "yes")]
     pub grain: bool,
+    /// The most tokens a request carries besides the reply, its system prompt
+    /// and tools included, however much the model could take; 0 keeps the
+    /// default of 64,000, and set however low the conversation still gets
+    /// 6,000. Edited by hand with Letronna closed, since an open window or
+    /// terminal saves over it.
+    #[serde(default)]
+    pub context_cap: u64,
 }
 
 // Written out rather than derived so the film grain starts on for a first
@@ -191,6 +198,7 @@ impl Default for Settings {
         Settings {
             endpoint: String::new(),
             model: String::new(),
+            context_cap: 0,
             gateway: String::new(),
             custom_endpoint: String::new(),
             presence: String::new(),
@@ -925,6 +933,11 @@ pub fn fill(conversation: &mut Conversation) {
         conversation.flushed = conversation.messages.len();
         conversation.written = Some(conversation.meta());
     }
+}
+
+/// The context cap the settings file sets, 0 for the default.
+pub(crate) fn context_cap() -> u64 {
+    settings().0.context_cap
 }
 
 /// The settings, and as JSON what the file said before a retired gateway is
