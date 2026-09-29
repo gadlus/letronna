@@ -66,7 +66,7 @@ impl Chat {
                                         .font_family(HEADING_FONT)
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .text_size(px(26.))
-                                        .child("SET UP LETRONNA"),
+                                        .child("Set up Letronna"),
                                 )
                                 .child(
                                     div()
