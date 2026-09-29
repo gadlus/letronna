@@ -70,6 +70,9 @@ fn main() {
         println!("letronna {}", env!("CARGO_PKG_VERSION"));
         return;
     }
+    // Before anything reads a key, so each comes from the vault and any
+    // still in a file is moved there.
+    letronna_core::vault::open();
     if let Some(words) = &args.mcp {
         std::process::exit(mcp::run(words));
     }
@@ -128,6 +131,10 @@ fn main() {
     };
     letronna_core::browser::share_browser(runner.store.settings.browser_shared);
     std::thread::spawn(letronna_core::browser::close_left_over);
+    // Keys the vault would not give read as missing; this says why.
+    if let Some(why) = letronna_core::vault::trouble().filter(|_| runner.human) {
+        render::line(&render::red(&why));
+    }
     // With nothing set up there is nothing to talk to, so the first run is
     // the setup -- the same one the installers hand over to. Asking a
     // question from a pipe cannot wait for answers, so that one stops here.

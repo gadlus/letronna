@@ -52,8 +52,9 @@ impl Chat {
         } else {
             self.keys.insert(slot.to_owned(), address);
         }
-        self.write_keys(slot);
-        letronna_core::browser::restart();
+        if self.write_keys(slot) {
+            letronna_core::browser::restart();
+        }
         cx.notify();
     }
 
@@ -65,11 +66,22 @@ impl Chat {
     }
 
     /// Save the window's key for `slot`, or its removal, and nothing else, so
-    /// a key the terminal saved meanwhile is kept and seen here too.
-    fn write_keys(&mut self, slot: &str) {
-        match save_key(slot, self.keys.get(slot).map(String::as_str)) {
-            Ok(keys) => self.keys = keys,
-            Err(_) => self.error = Some("Could not save the API key.".into()),
+    /// a key the terminal saved meanwhile is kept and seen here too; one that
+    /// could not be saved or removed is said, and the keys shown are the
+    /// ones there are.
+    fn write_keys(&mut self, slot: &str) -> bool {
+        let key = self.keys.get(slot).map(String::as_str);
+        let doing = if key.is_some() { "save" } else { "remove" };
+        match save_key(slot, key) {
+            Ok(keys) => {
+                self.keys = keys;
+                true
+            }
+            Err(why) => {
+                self.error = Some(format!("Could not {doing} the key: {why}."));
+                self.keys = letronna_core::store::load_keys();
+                false
+            }
         }
     }
 
@@ -198,9 +210,9 @@ impl Chat {
         };
         let mut choice = letronna_core::search::choice();
         choice.set_address(service, "");
-        if self.keys.remove(name).is_some() {
-            self.write_keys(name);
-        }
+        // Taken out even when the window could not read it.
+        self.keys.remove(name);
+        self.write_keys(name);
         if choice.service == name {
             choice.service.clear();
         }

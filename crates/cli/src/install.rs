@@ -236,8 +236,11 @@ pub fn remove() -> Result<Vec<String>, String> {
             root.display()
         )),
     }
-    auth::sign_out();
-    done.push("signed out".into());
+    done.push(match auth::sign_out() {
+        Ok(None) => "signed out".into(),
+        Ok(Some(note)) => format!("signed out here. {note}"),
+        Err(why) => format!("left     the sign-in: {why}"),
+    });
     let _ = open_in_browser;
     Ok(done)
 }

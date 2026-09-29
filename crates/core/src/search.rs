@@ -136,8 +136,13 @@ pub fn ready() -> bool {
     // frame the window's approval card is up -- so the files are only read
     // again once one has changed: the terminal and the window each save
     // them, and each has to see the other's change.
-    static SEEN: Mutex<Option<([Stamp; 2], bool)>> = Mutex::new(None);
-    remembered(&SEEN, [&choice_path(), &crate::store::keys_path()], || {
+    static SEEN: Mutex<Option<([Stamp; 3], bool)>> = Mutex::new(None);
+    let (choice_file, keys, vault) = (
+        choice_path(),
+        crate::store::keys_path(),
+        crate::vault::index_path(),
+    );
+    remembered(&SEEN, [&choice_file, &keys, &vault], || {
         usable(&choice(), &crate::store::load_keys()).is_ok()
     })
 }
@@ -152,11 +157,11 @@ fn stamp(path: &Path) -> Stamp {
     Some((meta.modified().ok()?, meta.len()))
 }
 
-/// The answer kept in `seen` while both files are as they were when it was
-/// read, or a fresh one from `read` once either has changed.
-fn remembered(
-    seen: &Mutex<Option<([Stamp; 2], bool)>>,
-    files: [&Path; 2],
+/// The answer kept in `seen` while the files are as they were when it was
+/// read, or a fresh one from `read` once one has changed.
+fn remembered<const N: usize>(
+    seen: &Mutex<Option<([Stamp; N], bool)>>,
+    files: [&Path; N],
     read: impl FnOnce() -> bool,
 ) -> bool {
     // Stamped before reading, so a save that lands during the read leaves

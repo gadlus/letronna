@@ -369,18 +369,44 @@ pub fn path() -> PathBuf {
     backend::data_dir().join("messaging.json")
 }
 
-pub fn load() -> Config {
+/// Where in `messaging.json` each token sits, and its name in the vault.
+pub(crate) const SECRETS: &[(&str, &str)] = &[
+    ("/telegram/token", "messaging.telegram.token"),
+    ("/discord/webhook", "messaging.discord.webhook"),
+    ("/discord/bot_token", "messaging.discord.bot_token"),
+    ("/slack/app_token", "messaging.slack.app_token"),
+    ("/slack/bot_token", "messaging.slack.bot_token"),
+];
+
+fn on_disk() -> Option<serde_json::Value> {
     std::fs::read(path())
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
 }
 
-pub fn save(config: &Config) {
+/// The chat apps' settings, with each token the file has no copy of from
+/// the vault; one the vault would not give reads as empty.
+pub fn load() -> Config {
+    let config: Config = on_disk()
+        .and_then(|json| serde_json::from_value(json).ok())
+        .unwrap_or_default();
+    let Ok(mut json) = serde_json::to_value(&config) else {
+        return config;
+    };
+    crate::vault::fill(&mut json, SECRETS);
+    serde_json::from_value(json).unwrap_or(config)
+}
+
+/// Save the chat apps' settings, the tokens to the vault where there is
+/// one. The rest is saved even when the vault refuses a token, which keeps
+/// its old copy, and the refusal is the error.
+pub fn save(config: &Config) -> Result<(), String> {
     let _ = std::fs::create_dir_all(backend::data_dir());
-    if let Ok(bytes) = serde_json::to_vec_pretty(config) {
-        let _ = crate::store::write_private(&path(), &bytes);
-    }
+    let mut json = serde_json::to_value(config).map_err(|e| e.to_string())?;
+    let kept = crate::vault::split(&mut json, &on_disk().unwrap_or_default(), SECRETS);
+    let bytes = serde_json::to_vec_pretty(&json).map_err(|e| e.to_string())?;
+    crate::store::write_private(&path(), &bytes).map_err(|e| e.to_string())?;
+    kept.map_err(|why| format!("Could not save a chat app's token: {why}."))
 }
 
 pub mod files;
@@ -3216,7 +3242,7 @@ mod slack_tests {
             },
             ..Default::default()
         };
-        super::save(&config);
+        super::save(&config).unwrap();
         let marker = crate::redact::MARKER;
 
         let (api, worker) = slack_api(2, false);
