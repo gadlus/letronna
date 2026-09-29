@@ -1051,9 +1051,17 @@ pub fn point_reference(pointed: &PointedElement, comment: &str) -> String {
 /// selector, an excerpt of its outer HTML, and its box. `url` is left for
 /// the caller to fill in, which already has it without asking the page.
 fn point_at_tab(tab: &mut Tab, x: f64, y: f64) -> Result<PointedElement, String> {
+    // The lookup counts from the top of the page, not of the window like the
+    // click did, and finds nothing, or the wrong thing, once it has scrolled.
+    let metrics: Value = tab.call("Page.getLayoutMetrics", json!({}))?;
+    let seen = &metrics["cssVisualViewport"];
+    let (left, top) = (
+        seen["pageX"].as_f64().unwrap_or(0.),
+        seen["pageY"].as_f64().unwrap_or(0.),
+    );
     let hit: Value = tab.call(
         "DOM.getNodeForLocation",
-        json!({"x": x.round() as i64, "y": y.round() as i64}),
+        json!({"x": (x + left).round() as i64, "y": (y + top).round() as i64}),
     )?;
     let node = hit["backendNodeId"]
         .as_i64()
@@ -2135,8 +2143,8 @@ mod tests {
     }
 
     /// A stand-in for a browser's debugging socket, in the same shape as
-    /// `cdp`'s own tests: answers each request with `reply(method)`.
-    fn fake_tab(reply: impl Fn(&str) -> Value + Send + 'static) -> String {
+    /// `cdp`'s own tests: answers each request with `reply(method, params)`.
+    fn fake_tab(reply: impl Fn(&str, &Value) -> Value + Send + 'static) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = format!("ws://{}/devtools/page/T1", listener.local_addr().unwrap());
         std::thread::spawn(move || {
@@ -2145,7 +2153,8 @@ mod tests {
             while let Ok(tungstenite::Message::Text(text)) = socket.read() {
                 let request: Value = serde_json::from_str(text.as_str()).unwrap();
                 let method = request["method"].as_str().unwrap();
-                let answer = json!({"id": request["id"], "result": reply(method)});
+                let answer =
+                    json!({"id": request["id"], "result": reply(method, &request["params"])});
                 socket
                     .send(tungstenite::Message::text(answer.to_string()))
                     .unwrap();
@@ -2156,8 +2165,13 @@ mod tests {
 
     #[test]
     fn point_at_tab_describes_the_node_under_the_click() {
-        let address = fake_tab(|method| match method {
-            "DOM.getNodeForLocation" => json!({"backendNodeId": 42}),
+        let address = fake_tab(|method, params| match method {
+            "Page.getLayoutMetrics" => {
+                json!({"cssVisualViewport": {"pageX": 0., "pageY": 1000.}})
+            }
+            // Only where the page has that point, a thousand pixels down.
+            "DOM.getNodeForLocation" if params["y"] == 1030 => json!({"backendNodeId": 42}),
+            "DOM.getNodeForLocation" => json!({}),
             "DOM.describeNode" => json!({"node": {"nodeName": "BUTTON",
                 "attributes": ["id", "submit", "class", "btn primary"]}}),
             "DOM.getOuterHTML" => {
@@ -2180,7 +2194,7 @@ mod tests {
 
     #[test]
     fn point_at_tab_says_when_nothing_is_there() {
-        let address = fake_tab(|_| json!({}));
+        let address = fake_tab(|_, _| json!({}));
         let mut tab = Tab::connect(&address, "T1").unwrap();
         let why = point_at_tab(&mut tab, 5., 5.).unwrap_err();
         assert!(why.contains("nothing there"), "{why}");
