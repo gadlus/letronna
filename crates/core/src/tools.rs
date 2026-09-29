@@ -599,11 +599,22 @@ pub fn summary(name: &str, args: &str) -> String {
             let items = v["items"].as_array().map(Vec::len).unwrap_or(0);
             format!("{items} items")
         }
-        "memory" => format!(
-            "{} {}",
-            v["action"].as_str().unwrap_or_default(),
-            v["target"].as_str().unwrap_or_default()
-        ),
+        // A batch reads as its changes in order, as in "replace, add user",
+        // read the way the tool runs it so operations sent as a string show.
+        "memory" => {
+            let v = parse_args_for(name, args).unwrap_or_default();
+            let listed = v["operations"].as_array().into_iter().flatten();
+            let actions: Vec<&str> = std::iter::once(&v)
+                .chain(listed)
+                .filter_map(|op| op["action"].as_str())
+                .filter(|action| !action.is_empty())
+                .collect();
+            format!(
+                "{} {}",
+                actions.join(", "),
+                v["target"].as_str().unwrap_or_default()
+            )
+        }
         "skill" => match v["file"].as_str() {
             Some(file) => format!("{} {file}", v["name"].as_str().unwrap_or_default()),
             None => v["name"].as_str().unwrap_or_default().to_owned(),
@@ -3378,5 +3389,21 @@ mod tests {
         let out = run("run_command", command, &ctx).unwrap();
         assert!(out.len() <= MAX_OUTPUT, "{}", out.len());
         assert!(out.contains(" left out]\n"), "{out}");
+    }
+
+    #[test]
+    fn a_memory_batch_shows_its_changes_in_order() {
+        let one = r#"{"action":"add","target":"user","content":"Likes tea."}"#;
+        assert_eq!(summary("memory", one), "add user");
+        let batch = json!({"target": "memory", "operations": [
+            {"action": "replace", "content": "a", "old_text": "b"},
+            {"action": "add", "content": "c"}
+        ]})
+        .to_string();
+        assert_eq!(summary("memory", &batch), "replace, add memory");
+        let stringed = json!({"target": "user", "action": "", "operations":
+            r#"[{"action": "remove", "old_text": "tea"}, {"action": "add", "content": "d"}]"#})
+        .to_string();
+        assert_eq!(summary("memory", &stringed), "remove, add user");
     }
 }
