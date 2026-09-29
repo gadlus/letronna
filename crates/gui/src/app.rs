@@ -1290,12 +1290,15 @@ impl Chat {
         match event {
             Event::Finished(Err(error)) => {
                 let kept = self.keep_failure(&error);
+                let on_screen =
+                    self.streaming_id == Some(self.store.conversations[self.store.active].id);
                 // `finish` reports it to a schedule or a chat app, and holds
                 // back what was queued, by this.
                 self.error = Some(error.to_string());
                 self.finish(cx);
-                // Said where the turn failed, so not again as a toast.
-                if kept {
+                // Said where the turn failed, so not again as a toast; in a
+                // session off screen the toast is all that says it happened.
+                if kept && on_screen {
                     self.error = None;
                 }
             }

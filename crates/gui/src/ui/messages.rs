@@ -464,6 +464,9 @@ impl Chat {
             self.waiting_retry = None;
         }
         self.store.conversations[ix].messages.push(message);
+        if ix != self.store.active {
+            self.unseen.insert(session);
+        }
         self.save();
         true
     }
