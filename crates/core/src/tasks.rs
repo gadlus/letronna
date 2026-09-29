@@ -144,16 +144,19 @@ pub fn list(session: u64) -> Vec<Task> {
 }
 
 /// Hand the running work of a helper that is finishing to whoever it
-/// answered to.
-pub fn reown(from: u64, to: u64) {
+/// answered to, and say which work that was.
+pub fn reown(from: u64, to: u64) -> Vec<Key> {
     let Ok(mut tasks) = registry().lock() else {
-        return;
+        return Vec::new();
     };
+    let mut handed = Vec::new();
     for task in tasks.values_mut() {
         if task.owner == from && !task.notified {
             task.owner = to;
+            handed.push(task.key);
         }
     }
+    handed
 }
 
 /// Where mail for `to` ends up: past every helper whose state `past` accepts,
