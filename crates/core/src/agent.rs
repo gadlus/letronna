@@ -44,6 +44,8 @@ pub struct Live {
     pub prompt_tokens: u64,
     pub cached_tokens: u64,
     pub calls: Vec<ToolCall>,
+    /// The try about to be made again after a failure, while it waits.
+    pub retrying: Option<crate::retry::Retry>,
 }
 
 /// One user turn in flight.
@@ -79,6 +81,8 @@ impl Turn {
 
     /// Fold a streamed event into the reply being built.
     pub fn absorb(&mut self, event: &Event) {
+        // Whatever follows a retry comes from the new try, so it is under way.
+        self.live.retrying = None;
         match event {
             Event::Delta(text) => self.live.content.push_str(text),
             Event::Reasoning(text) => self.live.reasoning.push_str(text),
@@ -94,6 +98,7 @@ impl Turn {
                 self.live.cached_tokens = *cached;
             }
             Event::ToolCalls(calls) => self.live.calls = calls.clone(),
+            Event::Retrying(retry) => self.live.retrying = Some(*retry),
             Event::Finished(_) => {}
         }
     }
@@ -205,6 +210,7 @@ mod tests {
             effort: String::new(),
             search: false,
             conversation: 0,
+            unattended: false,
         })
     }
 
@@ -242,6 +248,21 @@ mod tests {
         // The next reply must not inherit any of that.
         assert!(turn.live.content.is_empty());
         assert_eq!(turn.take_reply("some-model").tokens, 0);
+    }
+
+    #[test]
+    fn a_retry_is_shown_until_the_next_try_answers() {
+        let mut turn = turn();
+        let retry = crate::retry::Retry {
+            kind: crate::failure::FailureKind::Overloaded,
+            attempt: 2,
+            of: 6,
+            wait: std::time::Duration::from_secs(1),
+        };
+        turn.absorb(&Event::Retrying(retry));
+        assert_eq!(turn.live.retrying, Some(retry));
+        turn.absorb(&Event::Reasoning("thinking".into()));
+        assert_eq!(turn.live.retrying, None);
     }
 
     #[test]

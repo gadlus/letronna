@@ -2246,7 +2246,7 @@ mod tests {
         assert_eq!(preview("edit_file", edit, &ctx), "- two\n+ three\n");
         run("edit_file", edit, &ctx).unwrap();
         let read = run("read_file", r#"{"file_path":"a.txt"}"#, &ctx).unwrap();
-        assert!(read.starts_with("one three\n\n"), "{read}");
+        assert!(read.starts_with("1|one three\n\n"), "{read}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2287,7 +2287,7 @@ mod tests {
         );
         let (dir, ctx) = workspace_with("present", "kept");
         let both = r#"{"path":"a.txt","file_path":"missing.txt"}"#;
-        assert_eq!(run("read_file", both, &ctx).unwrap(), "kept");
+        assert_eq!(run("read_file", both, &ctx).unwrap(), "1|kept");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2296,7 +2296,7 @@ mod tests {
         let (dir, ctx) = workspace_with("note", "hello");
         assert_eq!(
             run("read_file", r#"{"file_path":"a.txt"}"#, &ctx).unwrap(),
-            "hello\n\n[Read `file_path` as `path`. Use the tool's own parameter names and types.]"
+            "1|hello\n\n[Read `file_path` as `path`. Use the tool's own parameter names and types.]"
         );
         let out = run("wait", r#"{"seconds": "0"}"#, &ctx).unwrap();
         assert!(
@@ -2315,7 +2315,7 @@ mod tests {
         // A call in the tool's own terms gets no note.
         assert_eq!(
             run("read_file", r#"{"path":"a.txt"}"#, &ctx).unwrap(),
-            "hello"
+            "1|hello"
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -2432,7 +2432,7 @@ mod tests {
         // Looking is still allowed.
         assert_eq!(
             run("read_file", r#"{"path":"a.txt"}"#, &ctx).unwrap(),
-            "hello"
+            "1|hello"
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -2489,7 +2489,7 @@ mod tests {
         }
         for name in open {
             let text = ReadFile.run(&json!({"path": name}), &ctx).unwrap();
-            assert_eq!(text, "KEY=value", "{name}");
+            assert_eq!(text, "1|KEY=value", "{name}");
         }
         std::fs::remove_dir_all(dir).unwrap();
     }

@@ -157,6 +157,10 @@ pub(crate) struct Chat {
     /// cannot be interrupted, and a tool that does not listen to `turn_stop`
     /// runs on; what they send back carries the old number and is dropped.
     pub(crate) generation: u64,
+    /// What reads the reply in flight. Kept rather than detached, so that
+    /// Stop drops the receiver at once, which is how the worker learns to
+    /// give up, even in the middle of a wait to try again.
+    pub(crate) reading: Option<Task<()>>,
     /// A remote chat that has been sent the card the turn is waiting on, and
     /// the call it is about. Its next message answers it.
     pub(crate) remote_waiting: Option<(
@@ -426,6 +430,7 @@ impl Chat {
             remote: std::collections::HashMap::new(),
             remote_session: std::collections::HashMap::new(),
             generation: 0,
+            reading: None,
             remote_waiting: None,
             messaging_stop: None,
             token_input,
@@ -632,6 +637,11 @@ impl Chat {
             plan: self.plan_mode,
             effort: self.store.settings.effort.clone(),
             search: self.store.settings.search,
+            // A schedule's run and a chat app's turn may have nobody watching.
+            unattended: remote.is_some()
+                || self
+                    .scheduled
+                    .contains(&self.store.conversations[self.store.active].id),
             remote,
             conversation: self.store.conversations[self.store.active].id,
         };
@@ -766,7 +776,7 @@ impl Chat {
         turn.live = agent::Live::default();
         cx.notify();
         let generation = self.generation;
-        cx.spawn(async move |this, cx| {
+        self.reading = Some(cx.spawn(async move |this, cx| {
             while let Ok(event) = receiver.recv().await {
                 let finished = matches!(event, Event::Finished(_));
                 let current = this.update(cx, |this, cx| {
@@ -780,8 +790,7 @@ impl Chat {
                     break;
                 }
             }
-        })
-        .detach();
+        }));
     }
 
     fn on_event(&mut self, event: Event, cx: &mut Context<Self>) {
@@ -1288,6 +1297,7 @@ impl Chat {
         // Reaches the running tool, so a wait or a command ends now rather
         // than running on unseen. Taken, so the next turn starts unstopped.
         std::mem::take(&mut self.turn_stop).set();
+        self.reading = None;
         self.remote_waiting = None;
         if let Some(id) = self.streaming_id {
             if let Some(source) = self.remote.remove(&id) {
