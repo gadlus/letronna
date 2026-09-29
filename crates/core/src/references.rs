@@ -11,7 +11,7 @@
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::tools::{self, ToolContext};
 
@@ -40,8 +40,10 @@ pub const DIFF: &str = "diff";
 /// What goes before a session's id in a reference to it.
 pub const SESSION: &str = "session:";
 
-/// How long git gets to say what changed, as long as a search gets.
-const DIFF_TIME: Duration = crate::grep::SEARCH_TIME;
+/// How long git gets, over both of its runs, to say what changed. The
+/// window expands a message on its own thread, so this is how long it can
+/// stop answering; a diff git takes longer over is better asked for.
+const DIFF_TIME: Duration = Duration::from_secs(5);
 
 /// `text` with what its `@` references name attached after it, or `text` as
 /// it is when none of them names anything there.
@@ -181,7 +183,12 @@ fn diff(ctx: &ToolContext) -> Result<String, String> {
                 .into(),
         );
     }
-    let names = git(folder, &["diff", "--name-only", "-z", "--relative", "HEAD"])?;
+    let deadline = Instant::now() + DIFF_TIME;
+    let names = git(
+        folder,
+        &["diff", "--name-only", "-z", "--relative", "HEAD"],
+        deadline,
+    )?;
     // A list cut short ends part way through a name, and a pathspec of part
     // of one can be the folder holding a file of keys, so only the names git
     // ended are taken.
@@ -211,7 +218,7 @@ fn diff(ctx: &ToolContext) -> Result<String, String> {
     let mut out = if shown.is_empty() {
         String::new()
     } else {
-        git(folder, &args)?
+        git(folder, &args, deadline)?
     };
     if !kept.is_empty() {
         out.push_str(&format!(
@@ -223,8 +230,8 @@ fn diff(ctx: &ToolContext) -> Result<String, String> {
 }
 
 /// What git prints for `args` in `folder`, with the read-only guards on, at
-/// most `ATTACHED_CHARS` of it and for at most `DIFF_TIME`.
-fn git(folder: &Path, args: &[&str]) -> Result<String, String> {
+/// most `ATTACHED_CHARS` of it and until `deadline`.
+fn git(folder: &Path, args: &[&str], deadline: Instant) -> Result<String, String> {
     let mut command = Command::new("git");
     command
         .args(["--no-pager", "--literal-pathspecs"])
@@ -258,7 +265,7 @@ fn git(folder: &Path, args: &[&str]) -> Result<String, String> {
             .map(|_| bytes);
         let _ = sender.send(read);
     });
-    let read = receiver.recv_timeout(DIFF_TIME);
+    let read = receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()));
     let whole = matches!(&read, Ok(Ok(bytes)) if bytes.len() < ATTACHED_CHARS);
     // Cut or late, the rest is not wanted and git would wait on it.
     if !whole {
@@ -605,6 +612,14 @@ mod tests {
         };
         let shown = diff(&ctx).unwrap();
         assert!(!shown.contains("sk-cut-secret"), "{shown}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn git_past_its_deadline_is_given_up_on() {
+        let dir = project("late");
+        let said = git(&dir, &["status"], Instant::now());
+        assert_eq!(said, Err("git took too long to say what changed.".into()));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
