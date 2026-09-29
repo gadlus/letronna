@@ -187,6 +187,9 @@ const COUNT_BYTES: u64 = 64 * 1024 * 1024;
 /// only this much of one is read. Such files are exports and redirected shell
 /// output, far smaller than this.
 const UTF16_BYTES: u64 = 16 * 1024 * 1024;
+/// A notebook is parsed whole, so one bigger than this, which would be
+/// mostly pictures, is read as plain text a page at a time instead.
+const NOTEBOOK_BYTES: u64 = 64 * 1024 * 1024;
 /// How long a background command gets to print something before the tool
 /// replies, so the first message can carry a port or an early crash.
 const SETTLE: std::time::Duration = std::time::Duration::from_millis(1200);
@@ -2083,7 +2086,7 @@ impl Tool for ReadFile {
         true
     }
     fn description(&self) -> &'static str {
-        "Read a text file, or look at a PNG, JPEG, GIF or WebP picture. Paths are relative to the workspace. Each line is shown as `N|text`, N being its line number; the `N|` is not part of the file. A long file comes a page at a time, and the page ends with the offset to continue from."
+        "Read a text file, or look at a PNG, JPEG, GIF or WebP picture. Paths are relative to the workspace. Each line is shown as `N|text`, N being its line number; the `N|` is not part of the file. A long file comes a page at a time, and the page ends with the offset to continue from. A Jupyter notebook (.ipynb) reads as numbered cells with short outputs, and N counts the lines of that view."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -2102,7 +2105,11 @@ impl Tool for ReadFile {
         }
         let before = crate::filestate::stat(&path);
         let (mut text, cut) = open_text(&path)?;
-        let (shown, whole) = page(&mut text, offset, limit, cut)?;
+        let (shown, whole) = if crate::notebook::is_notebook(&path) {
+            page_notebook(text, offset, limit, cut)?
+        } else {
+            page(&mut text, offset, limit, cut)?
+        };
         // A longer result loses its middle on the way to the model.
         let whole = whole && shown.chars().count() <= crate::chat::MAX_TOOL_CHARS;
         crate::filestate::read(ctx.conversation, &path, before, whole);
@@ -2258,6 +2265,42 @@ fn page(
     }
     let whole = offset == 1 && !more && !long && !lossy && !cut;
     Ok((out, whole))
+}
+
+/// A page of a notebook's cells, or of its text after a note saying why it
+/// does not read as cells; and whether that showed all of the file, as it is.
+fn page_notebook(
+    mut text: Box<dyn BufRead>,
+    offset: usize,
+    limit: usize,
+    cut: bool,
+) -> Result<(String, bool), String> {
+    let mut bytes = Vec::new();
+    // One byte past the cap tells a notebook cut there from one that fits it.
+    text.by_ref()
+        .take(NOTEBOOK_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    let cells = if bytes.len() as u64 > NOTEBOOK_BYTES {
+        Err(format!("it is over {} MB", NOTEBOOK_BYTES / (1024 * 1024)))
+    } else {
+        crate::notebook::cells(&bytes)
+    };
+    let why = match cells {
+        // Cells are not the bytes on disk, so seeing all of them is no
+        // reason to let write_file replace the file.
+        Ok(cells) => {
+            let (shown, _) = page(&mut std::io::Cursor::new(cells), offset, limit, false)?;
+            return Ok((shown, false));
+        }
+        Err(why) => why,
+    };
+    let mut raw = std::io::Cursor::new(bytes).chain(text);
+    let (shown, whole) = page(&mut raw, offset, limit, cut)?;
+    Ok((
+        format!("[Not read as a notebook: {why}. Its text follows.]\n\n{shown}"),
+        whole,
+    ))
 }
 
 /// Reads the next line into `line`, without its line break and only as much
@@ -2755,6 +2798,61 @@ mod tests {
             read(json!({"path": "big.txt", "offset": kept})).unwrap(),
             format!("{kept}|line 01")
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn read_file_pages_a_notebook_by_its_cells() {
+        let dir = std::env::temp_dir().join(format!("letronna-read-ipynb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::filestate::asked(131, 1, 0);
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            conversation: 131,
+            ..Default::default()
+        };
+        let read = |args: Value| ReadFile.run(&args, &ctx);
+        let cells: Vec<Value> = (1..=30)
+            .map(|n| {
+                let printed =
+                    json!({"output_type": "stream", "name": "stdout", "text": format!("{n}\n")});
+                json!({"cell_type": "code", "source": format!("print({n})"), "outputs": [printed]})
+            })
+            .collect();
+        let notebook = json!({"nbformat": 4, "cells": cells}).to_string();
+        std::fs::write(dir.join("run.ipynb"), notebook).unwrap();
+
+        // One line of JSON on disk; four lines a cell and a gap in the view.
+        let first = read(json!({"path": "run.ipynb"})).unwrap();
+        let start = "1|[1] code\n2|print(1)\n3|[output]\n4|1\n5|\n6|[2] code\n";
+        assert!(first.starts_with(start), "{first}");
+        assert!(first.ends_with("\n146|[30] code\n147|print(30)\n148|[output]\n149|30"));
+        assert_eq!(
+            read(json!({"path": "run.ipynb", "offset": 6, "limit": 3})).unwrap(),
+            "6|[2] code\n7|print(2)\n8|[output]\n\nLines 6-8 of 149. Continue with offset=9."
+        );
+        let past = read(json!({"path": "run.ipynb", "offset": 150})).unwrap_err();
+        assert!(past.contains("149 lines"), "{past}");
+        // Seeing every cell is not seeing the file, so it is not replaced whole.
+        crate::filestate::asked(131, 3, 0);
+        let write = r#"{"path":"run.ipynb","content":"{}"}"#;
+        let refused = run("write_file", write, &ctx).unwrap_err();
+        assert!(refused.contains("edit_file instead"), "{refused}");
+
+        // One that does not parse reads as its text, after a note saying why.
+        let broken = "{\"cells\": [\n  {\"cell_type\": \"code\"";
+        std::fs::write(dir.join("broken.ipynb"), broken).unwrap();
+        let shown = read(json!({"path": "broken.ipynb"})).unwrap();
+        let (note, text) = shown.split_once("\n\n").unwrap();
+        assert!(
+            note.starts_with("[Not read as a notebook: it is not JSON ("),
+            "{note}"
+        );
+        assert!(note.ends_with("). Its text follows.]"), "{note}");
+        assert_eq!(text, "1|{\"cells\": [\n2|  {\"cell_type\": \"code\"");
+        let rest = read(json!({"path": "broken.ipynb", "offset": 2})).unwrap();
+        assert!(rest.ends_with("follows.]\n\n2|  {\"cell_type\": \"code\""));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
