@@ -12,6 +12,8 @@
 //! otherwise: the failure mode of getting that wrong is someone else running
 //! commands on this machine.
 
+mod format;
+
 use crate::chat::{self as backend};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -25,8 +27,10 @@ const INTENTS: u64 = (1 << 9) | (1 << 12) | (1 << 15);
 const INTENTS_WITHOUT_CONTENT: u64 = (1 << 9) | (1 << 12);
 /// How long the server holds a poll open with no messages.
 const POLL_SECONDS: u32 = 25;
-/// Telegram rejects anything longer.
-const MAX_REPLY: usize = 4000;
+/// The longest message Telegram takes, counted after its HTML is read.
+const TELEGRAM_PART: usize = 4096;
+/// The longest message Discord takes.
+const DISCORD_PART: usize = 2000;
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -103,6 +107,76 @@ pub enum Source {
     Discord(String),
 }
 
+impl Source {
+    /// How often to say again that a reply is being written: a little
+    /// sooner than the service stops showing it, after 5 seconds on
+    /// Telegram and 10 on Discord.
+    pub fn typing_every(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(match self {
+            Source::Telegram(_) => 4,
+            Source::Discord(_) => 8,
+        })
+    }
+}
+
+/// A tap on an approval card's Allow or Deny.
+#[derive(Clone, Debug)]
+pub struct Press {
+    pub allow: bool,
+    /// The call the card asked about, as much of its id as a button holds.
+    call: String,
+    tap: Tap,
+}
+
+/// What answering a tap takes.
+#[derive(Clone, Debug)]
+enum Tap {
+    /// The query to answer, and the message whose buttons go.
+    Telegram {
+        query: String,
+        chat: i64,
+        message: i64,
+    },
+    /// The interaction to answer, which edits its message too.
+    Discord { id: String, token: String },
+}
+
+impl Press {
+    /// Whether the tap is on the card for the call `id`, rather than on an
+    /// older card.
+    pub fn answers(&self, id: &str) -> bool {
+        self.call == button_key(id)
+    }
+}
+
+/// A button's data: the answer, and the call it is for. The id leaves for
+/// the chat app like any text, so it is scrubbed too; one that held a key
+/// would make buttons that answer nothing, and a typed reply still would.
+fn button(allow: bool, call: &str) -> String {
+    let answer = if allow { "allow" } else { "deny" };
+    format!("{answer}:{}", button_key(&outgoing(call)))
+}
+
+/// As much of a call's id as fits in Telegram's 64 bytes of button data
+/// beside the longer answer (Discord allows 100).
+fn button_key(call: &str) -> &str {
+    let mut end = call.len().min(64 - "allow:".len());
+    while !call.is_char_boundary(end) {
+        end -= 1;
+    }
+    &call[..end]
+}
+
+/// A button's data read back, or `None` for data this app did not send.
+fn pressed(data: &str) -> Option<(bool, String)> {
+    let (answer, call) = data.split_once(':')?;
+    match answer {
+        "allow" => Some((true, call.to_owned())),
+        "deny" => Some((false, call.to_owned())),
+        _ => None,
+    }
+}
+
 /// A message that arrived from a chat service.
 pub struct Incoming {
     pub source: Source,
@@ -116,6 +190,9 @@ pub struct Incoming {
     pub said: String,
     /// Where it came from, as the session is told it.
     pub remote: backend::Remote,
+    /// A tap on a card's button rather than words, which answers the card
+    /// as a typed yes or no would.
+    pub press: Option<Press>,
 }
 
 /// A card the app would show -- a question, or a tool waiting to be
@@ -137,10 +214,12 @@ pub fn card_text(name: &str, arguments: &str, preview: &str) -> String {
         });
         return text;
     }
+    // Fenced, so what would run shows exactly as written rather than with
+    // its asterisks and underscores read as formatting.
     format!(
-        "Letronna wants to use {name}:\n{}\n\nReply yes to allow it, or no and why not. \
-         Anything else declines.",
-        quote(&trim_to(preview, 800))
+        "Letronna wants to use {name}:\n{}\n\nTap Allow or Deny, or reply yes, or no and why \
+         not. Anything else declines.",
+        format::fenced(&trim_to(preview, 800))
     )
 }
 
@@ -239,9 +318,8 @@ fn report_via(api: &str, config: &Config, title: &str, body: &str) -> Vec<String
         }
     }
     if let (true, Some(chat)) = (config.telegram.ready(), config.telegram.chat) {
-        // Sent as plain text, where Markdown asterisks would show literally.
-        let text = format!("{title}\n{body}");
-        if let Err(error) = send_via(api, &config.telegram.token, chat, &text) {
+        let text = format!("**{title}**\n{body}");
+        if let Err(error) = send_via(api, &config.telegram.token, chat, &text, None) {
             failed.push(error);
         }
     }
@@ -258,6 +336,10 @@ fn parse_updates(body: &serde_json::Value) -> (Vec<Incoming>, Option<u64>) {
         if let Some(id) = update["update_id"].as_u64() {
             highest = Some(highest.map_or(id, |seen: u64| seen.max(id)));
         }
+        if let Some(press) = telegram_press(&update["callback_query"]) {
+            messages.push(press);
+            continue;
+        }
         let message = &update["message"];
         let (Some(chat), Some(text)) = (
             message["chat"]["id"].as_i64(),
@@ -265,11 +347,7 @@ fn parse_updates(body: &serde_json::Value) -> (Vec<Incoming>, Option<u64>) {
         ) else {
             continue;
         };
-        let from = message["from"]["first_name"]
-            .as_str()
-            .or_else(|| message["from"]["username"].as_str())
-            .unwrap_or("someone")
-            .to_owned();
+        let from = sender(&message["from"]);
         // Group chats have negative IDs. Everyone in one reads the replies,
         // and the Bot API keeps no history for a bot to read back.
         let group = chat < 0;
@@ -286,9 +364,37 @@ fn parse_updates(body: &serde_json::Value) -> (Vec<Incoming>, Option<u64>) {
                 shared: group,
                 history: None,
             },
+            press: None,
         });
     }
     (messages, highest.map(|id| id + 1))
+}
+
+fn sender(from: &serde_json::Value) -> String {
+    from["first_name"]
+        .as_str()
+        .or_else(|| from["username"].as_str())
+        .unwrap_or("someone")
+        .to_owned()
+}
+
+/// A tap on one of the bot's card buttons, from a `callback_query`.
+fn telegram_press(query: &serde_json::Value) -> Option<Incoming> {
+    let (allow, call) = pressed(query["data"].as_str()?)?;
+    let chat = query["message"]["chat"]["id"].as_i64()?;
+    let tap = Tap::Telegram {
+        query: query["id"].as_str()?.to_owned(),
+        chat,
+        message: query["message"]["message_id"].as_i64()?,
+    };
+    Some(Incoming {
+        source: Source::Telegram(chat),
+        from: sender(&query["from"]),
+        text: String::new(),
+        said: String::new(),
+        remote: backend::Remote::default(),
+        press: Some(Press { allow, call, tap }),
+    })
 }
 
 fn client() -> Option<reqwest::blocking::Client> {
@@ -299,30 +405,182 @@ fn client() -> Option<reqwest::blocking::Client> {
         .ok()
 }
 
-/// Send a reply. Telegram caps message length, so long answers are trimmed
-/// rather than silently dropped.
-pub fn send(token: &str, chat: i64, text: &str) -> Result<(), String> {
-    send_via(API, token, chat, text)
+/// Send `text` to the chat `source` names, in as many messages as the
+/// service needs. `card`, the id of a call waiting for approval, puts Allow
+/// and Deny buttons under the last one; a typed yes or no still answers it.
+pub fn tell(
+    config: &Config,
+    source: &Source,
+    text: &str,
+    card: Option<&str>,
+) -> Result<(), String> {
+    match source {
+        Source::Telegram(chat) => send_via(API, &config.telegram.token, *chat, text, card),
+        Source::Discord(channel) => {
+            discord_post_via(DISCORD_API, &config.discord.bot_token, channel, text, card)
+        }
+    }
 }
 
-fn send_via(api: &str, token: &str, chat: i64, text: &str) -> Result<(), String> {
+/// Send to a Telegram chat: in parts, as HTML, and with a card's buttons
+/// under the last part.
+fn send_via(
+    api: &str,
+    token: &str,
+    chat: i64,
+    text: &str,
+    card: Option<&str>,
+) -> Result<(), String> {
     let client = client().ok_or("Cannot initialize connection.")?;
-    let text = trim_reply(&outgoing(text));
-    client
-        .post(format!("{api}/bot{}/sendMessage", token.trim()))
-        .json(&serde_json::json!({"chat_id": chat, "text": text}))
-        .send()
-        .map_err(|_| "Cannot reach Telegram.".to_owned())?
-        .error_for_status()
-        .map_err(|_| "Telegram rejected the message.".to_owned())?;
+    let url = format!("{api}/bot{}/sendMessage", token.trim());
+    let parts = format::split(&outgoing(text), TELEGRAM_PART);
+    let last = parts.len().saturating_sub(1);
+    for (i, part) in parts.iter().enumerate() {
+        let mut body = serde_json::json!({
+            "chat_id": chat,
+            "text": format::telegram_html(part),
+            "parse_mode": "HTML",
+        });
+        if let (true, Some(call)) = (i == last, card) {
+            body["reply_markup"] = serde_json::json!({"inline_keyboard": [[
+                {"text": "Allow", "callback_data": button(true, call)},
+                {"text": "Deny", "callback_data": button(false, call)},
+            ]]});
+        }
+        let response = client
+            .post(&url)
+            .json(&body)
+            .send()
+            .map_err(|_| "Cannot reach Telegram.".to_owned())?;
+        // A part Telegram will not take as HTML goes again as the text it was
+        // made from, rather than not at all. Any refusal, not only a parse
+        // error: a message refused is a message not sent, so nothing doubles.
+        let response = match response.status() == reqwest::StatusCode::BAD_REQUEST {
+            true => {
+                body["text"] = part.as_str().into();
+                if let Some(fields) = body.as_object_mut() {
+                    fields.remove("parse_mode");
+                }
+                client
+                    .post(&url)
+                    .json(&body)
+                    .send()
+                    .map_err(|_| "Cannot reach Telegram.".to_owned())?
+            }
+            false => response,
+        };
+        response
+            .error_for_status()
+            .map_err(|_| "Telegram rejected the message.".to_owned())?;
+    }
     Ok(())
 }
 
-fn trim_reply(text: &str) -> String {
-    trim_to(text, MAX_REPLY)
+/// Show the chat `source` names that a reply is being written. The service
+/// stops showing it after a few seconds, or when the next message arrives.
+pub fn typing(config: &Config, source: &Source) -> Result<(), String> {
+    typing_via((API, DISCORD_API), config, source)
 }
 
-/// Every chat service caps message length; trim rather than lose the message.
+fn typing_via(
+    (telegram, discord): (&str, &str),
+    config: &Config,
+    source: &Source,
+) -> Result<(), String> {
+    let request = match source {
+        Source::Telegram(chat) => client()
+            .ok_or("Cannot initialize connection.")?
+            .post(format!(
+                "{telegram}/bot{}/sendChatAction",
+                config.telegram.token.trim()
+            ))
+            .json(&serde_json::json!({"chat_id": chat, "action": "typing"})),
+        Source::Discord(channel) => discord_bot_via(
+            discord,
+            reqwest::Method::POST,
+            &config.discord.bot_token,
+            &format!("/channels/{channel}/typing"),
+        )?
+        .json(&serde_json::json!({})),
+    };
+    request
+        .send()
+        .map_err(|_| "Cannot reach the chat app.".to_owned())?
+        .error_for_status()
+        .map_err(|_| "The chat app refused the typing indicator.".to_owned())?;
+    Ok(())
+}
+
+/// Answer a tap on a card's button and take the buttons away, so the card
+/// cannot be answered twice. `answered` says whether the tap answered the
+/// card, or came after it had been answered some other way.
+pub fn settle(config: &Config, press: &Press, answered: bool) -> Result<(), String> {
+    settle_via((API, DISCORD_API), config, press, answered)
+}
+
+fn settle_via(
+    (telegram, discord): (&str, &str),
+    config: &Config,
+    press: &Press,
+    answered: bool,
+) -> Result<(), String> {
+    use serde_json::json;
+    let said = outgoing(match (answered, press.allow) {
+        (false, _) => "Already answered",
+        (true, true) => "Allowed",
+        (true, false) => "Denied",
+    });
+    let client = client().ok_or("Cannot initialize connection.")?;
+    let requests = match &press.tap {
+        Tap::Telegram {
+            query,
+            chat,
+            message,
+        } => {
+            let url = |method: &str| {
+                format!("{telegram}/bot{}/{method}", config.telegram.token.trim())
+            };
+            // The first stops the button's spinner and says what came of the
+            // tap; the second takes the buttons off the card.
+            vec![
+                client
+                    .post(url("answerCallbackQuery"))
+                    .json(&json!({"callback_query_id": query, "text": said})),
+                client.post(url("editMessageReplyMarkup")).json(&json!({
+                    "chat_id": chat,
+                    "message_id": message,
+                    "reply_markup": {"inline_keyboard": []}
+                })),
+            ]
+        }
+        // Answering an interaction edits its message too: the two buttons
+        // become one that cannot be pressed, saying what came of the tap.
+        Tap::Discord { id, token } => vec![
+            client
+                .post(format!("{discord}/interactions/{id}/{token}/callback"))
+                .json(&json!({"type": 7, "data": {"components": [{"type": 1, "components": [
+                    {"type": 2, "style": 2, "label": said, "custom_id": "answered", "disabled": true}
+                ]}]}})),
+        ],
+    };
+    // Each is tried whatever became of the one before: a tap too old to
+    // answer still has buttons to take away.
+    let sent: Vec<Result<(), String>> = requests
+        .into_iter()
+        .map(|request| {
+            request
+                .send()
+                .map_err(|_| "Cannot reach the chat app.".to_owned())?
+                .error_for_status()
+                .map_err(|_| "The chat app refused the answer to a tap.".to_owned())?;
+            Ok(())
+        })
+        .collect();
+    sent.into_iter().collect()
+}
+
+/// `text` cut to `max` characters, saying so: a card's preview, which is
+/// there to be glanced at on a phone.
 fn trim_to(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_owned();
@@ -363,7 +621,10 @@ pub fn poll(
         while !stop.load(Ordering::Relaxed) {
             let mut request = client
                 .get(format!("{API}/bot{}/getUpdates", token.trim()))
-                .query(&[("timeout", POLL_SECONDS.to_string())]);
+                .query(&[("timeout", POLL_SECONDS.to_string())])
+                // Said every time: Telegram keeps whatever was asked for
+                // last, and taps on a card's buttons come as callback queries.
+                .query(&[("allowed_updates", r#"["message","callback_query"]"#)]);
             if let Some(offset) = offset {
                 request = request.query(&[("offset", offset.to_string())]);
             }
@@ -394,51 +655,72 @@ pub fn poll(
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
-    use super::{Config, MAX_REPLY, discord_send, parse_updates, report, report_via, trim_reply};
+    use super::{
+        Config, Source, discord_post_via, discord_send, parse_updates, report, report_via,
+        send_via, settle_via, typing_via,
+    };
     use serde_json::{Value, json};
 
     /// Accept one request, answer it with `status`, and hand back its path and
     /// JSON body.
     fn one_request(status: &str) -> (String, std::thread::JoinHandle<(String, Value)>) {
-        use std::io::{Read, Write};
+        let (base, worker) = requests(&[status]);
+        (
+            base,
+            std::thread::spawn(move || worker.join().unwrap().remove(0)),
+        )
+    }
+
+    /// Accept a request for each of `statuses` in turn, answer it with that
+    /// status, and hand back the paths and JSON bodies in order: a fake of
+    /// the chat app's API, so nothing reaches a real one.
+    fn requests(statuses: &[&str]) -> (String, std::thread::JoinHandle<Vec<(String, Value)>>) {
         let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", server.local_addr().unwrap());
-        let status = status.to_owned();
+        let statuses: Vec<String> = statuses.iter().map(|s| s.to_string()).collect();
         let worker = std::thread::spawn(move || {
-            let (mut socket, _) = server.accept().unwrap();
-            socket
-                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                .unwrap();
-            let mut bytes = Vec::new();
-            let mut block = [0; 4096];
-            let (head, body) = loop {
-                let n = socket.read(&mut block).unwrap();
-                assert_ne!(n, 0);
-                bytes.extend_from_slice(&block[..n]);
-                let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
-                    continue;
-                };
-                let head = String::from_utf8_lossy(&bytes[..end]).to_string();
-                let len: usize = head
-                    .to_lowercase()
-                    .lines()
-                    .find_map(|l| l.strip_prefix("content-length: ").map(str::to_owned))
-                    .unwrap()
-                    .parse()
-                    .unwrap();
-                if bytes.len() >= end + 4 + len {
-                    break (head, bytes[end + 4..end + 4 + len].to_vec());
-                }
-            };
-            write!(
-                socket,
-                "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-            )
-            .unwrap();
-            let path = head.split_whitespace().nth(1).unwrap().to_owned();
-            (path, serde_json::from_slice(&body).unwrap())
+            statuses
+                .iter()
+                .map(|status| answer(&server, status))
+                .collect()
         });
         (base, worker)
+    }
+
+    fn answer(server: &std::net::TcpListener, status: &str) -> (String, Value) {
+        use std::io::{Read, Write};
+        let (mut socket, _) = server.accept().unwrap();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut bytes = Vec::new();
+        let mut block = [0; 4096];
+        let (head, body) = loop {
+            let n = socket.read(&mut block).unwrap();
+            assert_ne!(n, 0);
+            bytes.extend_from_slice(&block[..n]);
+            let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&bytes[..end]).to_string();
+            let len: usize = head
+                .to_lowercase()
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length: ").map(str::to_owned))
+                .unwrap()
+                .parse()
+                .unwrap();
+            if bytes.len() >= end + 4 + len {
+                break (head, bytes[end + 4..end + 4 + len].to_vec());
+            }
+        };
+        write!(
+            socket,
+            "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let path = head.split_whitespace().nth(1).unwrap().to_owned();
+        (path, serde_json::from_slice(&body).unwrap())
     }
 
     fn paired() -> Config {
@@ -457,8 +739,9 @@ mod tests {
         let (path, body) = worker.join().unwrap();
         assert_eq!(path, "/bot123:abc/sendMessage");
         assert_eq!(body["chat_id"], 42);
-        // Plain text: Telegram would print Markdown asterisks as they are.
-        assert_eq!(body["text"], "Nightly\nall green");
+        // HTML: Telegram would print Markdown asterisks as they are.
+        assert_eq!(body["text"], "<b>Nightly</b>\nall green");
+        assert_eq!(body["parse_mode"], "HTML");
     }
 
     #[test]
@@ -496,7 +779,7 @@ mod tests {
         let (api, worker) = one_request("200 OK");
         report_via(&api, &paired(), "Nightly", &format!("used {key}"));
         let (_, body) = worker.join().unwrap();
-        assert_eq!(body["text"], format!("Nightly\nused {marker}"));
+        assert_eq!(body["text"], format!("<b>Nightly</b>\nused {marker}"));
         // A question's card is built from the call's own arguments.
         let args = json!({ "question": format!("Use {key}?") }).to_string();
         let card = super::card_text(crate::tools::ASK_USER, &args, "");
@@ -505,6 +788,21 @@ mod tests {
         let (_, body) = worker.join().unwrap();
         let sent = body["content"].as_str().unwrap_or_default();
         assert!(sent.starts_with(&format!("Use {marker}?")), "{sent}");
+        // Hidden before the reply is cut, so a key where a part ends is
+        // not left in halves; and the plain text sent again is hidden too.
+        let long = format!("{}{key} and more", "word ".repeat(818));
+        let (api, worker) = requests(&["400 Bad Request", "200 OK", "200 OK"]);
+        send_via(&api, "123:abc", 42, &long, None).unwrap();
+        let sent = json!(worker.join().unwrap()).to_string();
+        assert!(
+            !sent.contains(&key[..12]) && sent.contains(marker),
+            "{sent}"
+        );
+        // And a card with buttons, on a bot's channel.
+        let (base, worker) = one_request("200 OK");
+        discord_post_via(&base, "t", "99", &format!("run {key}"), Some("c1")).unwrap();
+        let (_, body) = worker.join().unwrap();
+        assert_eq!(body["content"], format!("run {marker}"));
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 
@@ -579,13 +877,168 @@ mod tests {
     }
 
     #[test]
-    fn long_replies_are_trimmed_not_dropped() {
-        let short = "all good";
-        assert_eq!(trim_reply(short), short);
-        let long = "x".repeat(MAX_REPLY + 500);
-        let trimmed = trim_reply(&long);
-        assert!(trimmed.chars().count() < MAX_REPLY + 20);
-        assert!(trimmed.ends_with("… (trimmed)"));
+    fn a_long_reply_goes_in_parts_with_its_code_block_whole_in_each() {
+        let code: Vec<String> = (0..400).map(|n| format!("let x{n} = {n};")).collect();
+        let text = format!("Here it is:\n```rust\n{}\n```", code.join("\n"));
+        let (api, worker) = requests(&["200 OK", "200 OK"]);
+        send_via(&api, "123:abc", 42, &text, None).unwrap();
+        let sent = worker.join().unwrap();
+        assert!(
+            sent.iter()
+                .all(|(path, _)| path == "/bot123:abc/sendMessage")
+        );
+        let texts: Vec<&str> = sent
+            .iter()
+            .map(|(_, body)| body["text"].as_str().unwrap_or_default())
+            .collect();
+        let block = "<pre><code class=\"language-rust\">";
+        assert!(texts[0].starts_with(&format!("Here it is:\n{block}")));
+        assert!(texts[1].starts_with(block));
+        assert!(texts.iter().all(|text| text.ends_with("</code></pre>")));
+    }
+
+    #[test]
+    fn a_part_telegram_cannot_parse_goes_again_as_plain_text() {
+        let (api, worker) = requests(&["400 Bad Request", "200 OK"]);
+        send_via(&api, "123:abc", 42, "**Done** <3", None).unwrap();
+        let sent = worker.join().unwrap();
+        assert_eq!(sent[0].1["text"], "<b>Done</b> &lt;3");
+        assert_eq!(sent[0].1["parse_mode"], "HTML");
+        assert_eq!(sent[1].1, json!({"chat_id": 42, "text": "**Done** <3"}));
+        // Refused both ways is refused.
+        let (api, worker) = requests(&["400 Bad Request", "400 Bad Request"]);
+        let refused = send_via(&api, "123:abc", 42, "hi", None);
+        worker.join().unwrap();
+        assert_eq!(refused, Err("Telegram rejected the message.".into()));
+    }
+
+    #[test]
+    fn a_card_carries_allow_and_deny_and_a_tap_reads_back_as_one() {
+        let (api, worker) = one_request("200 OK");
+        send_via(&api, "123:abc", 42, "Letronna wants to", Some("call_1")).unwrap();
+        let (_, body) = worker.join().unwrap();
+        let buttons = &body["reply_markup"]["inline_keyboard"][0];
+        assert_eq!(
+            buttons[0],
+            json!({"text": "Allow", "callback_data": "allow:call_1"})
+        );
+        assert_eq!(
+            buttons[1],
+            json!({"text": "Deny", "callback_data": "deny:call_1"})
+        );
+        let (base, worker) = one_request("200 OK");
+        discord_post_via(&base, "t", "99", "Letronna wants to", Some("call_1")).unwrap();
+        let (path, body) = worker.join().unwrap();
+        assert_eq!(path, "/channels/99/messages");
+        let buttons = &body["components"][0]["components"];
+        assert_eq!(buttons[0]["custom_id"], "allow:call_1");
+        assert_eq!(buttons[1]["custom_id"], "deny:call_1");
+
+        let tap = |data: &str| {
+            json!({"ok": true, "result": [{"update_id": 5, "callback_query": {
+                "id": "q1", "from": {"first_name": "user_a"}, "data": data,
+                "message": {"message_id": 7, "chat": {"id": 42}}}}]})
+        };
+        let (taps, offset) = parse_updates(&tap("deny:call_1"));
+        assert_eq!(offset, Some(6));
+        assert_eq!(taps[0].source, Source::Telegram(42));
+        let press = taps[0].press.as_ref().unwrap();
+        // It answers its own card, not whichever card waits now.
+        assert!(!press.allow && press.answers("call_1") && !press.answers("call_2"));
+        // A long id is cut to fit the button, and still answers.
+        let long = "x".repeat(100);
+        let data = super::button(true, &long);
+        assert_eq!(data.len(), 64);
+        let (taps, _) = parse_updates(&tap(&data));
+        assert!(
+            taps[0]
+                .press
+                .as_ref()
+                .is_some_and(|p| p.allow && p.answers(&long))
+        );
+        // Data this app never sent is nothing to act on.
+        assert!(parse_updates(&tap("run:rm -rf")).0.is_empty());
+    }
+
+    #[test]
+    fn a_tap_is_answered_and_its_buttons_taken_away() {
+        let tap = json!({"ok": true, "result": [{"update_id": 1, "callback_query": {
+            "id": "q1", "from": {}, "data": "allow:c1",
+            "message": {"message_id": 7, "chat": {"id": 42}}}}]});
+        let press = parse_updates(&tap).0.remove(0).press.unwrap();
+        let (api, worker) = requests(&["200 OK", "200 OK"]);
+        settle_via((&api, "http://127.0.0.1:1"), &paired(), &press, true).unwrap();
+        let sent = worker.join().unwrap();
+        assert_eq!(sent[0].0, "/bot123:abc/answerCallbackQuery");
+        assert_eq!(
+            sent[0].1,
+            json!({"callback_query_id": "q1", "text": "Allowed"})
+        );
+        assert_eq!(sent[1].0, "/bot123:abc/editMessageReplyMarkup");
+        assert_eq!(sent[1].1["reply_markup"], json!({"inline_keyboard": []}));
+        assert_eq!(
+            (&sent[1].1["chat_id"], &sent[1].1["message_id"]),
+            (&json!(42), &json!(7))
+        );
+        // A tap too old to answer still loses its buttons.
+        let (api, worker) = requests(&["400 Bad Request", "200 OK"]);
+        let settled = settle_via((&api, "http://127.0.0.1:1"), &paired(), &press, true);
+        assert!(settled.is_err());
+        assert_eq!(
+            worker.join().unwrap()[1].0,
+            "/bot123:abc/editMessageReplyMarkup"
+        );
+
+        // On Discord, answering the interaction is what edits the card.
+        let discord = super::Discord {
+            owner: "1".into(),
+            ..Default::default()
+        };
+        let interaction = json!({"type": 3, "id": "i1", "token": "tok", "channel_id": "99",
+            "user": {"id": "1"}, "data": {"custom_id": "deny:c1"}});
+        let press = super::gateway_press(&interaction, &discord)
+            .unwrap()
+            .press
+            .unwrap();
+        let (base, worker) = one_request("204 No Content");
+        settle_via(("http://127.0.0.1:1", &base), &paired(), &press, false).unwrap();
+        let (path, body) = worker.join().unwrap();
+        assert_eq!(path, "/interactions/i1/tok/callback");
+        assert_eq!(body["type"], 7);
+        let button = &body["data"]["components"][0]["components"][0];
+        assert_eq!(
+            (&button["label"], &button["disabled"]),
+            (&json!("Already answered"), &json!(true))
+        );
+    }
+
+    #[test]
+    fn typing_shows_in_the_chat_the_turn_is_for() {
+        let (api, worker) = one_request("200 OK");
+        typing_via(
+            (&api, "http://127.0.0.1:1"),
+            &paired(),
+            &Source::Telegram(42),
+        )
+        .unwrap();
+        let (path, body) = worker.join().unwrap();
+        assert_eq!(path, "/bot123:abc/sendChatAction");
+        assert_eq!(body, json!({"chat_id": 42, "action": "typing"}));
+        let (base, worker) = one_request("204 No Content");
+        let channel = Source::Discord("99".into());
+        typing_via(("http://127.0.0.1:1", &base), &paired(), &channel).unwrap();
+        assert_eq!(worker.join().unwrap().0, "/channels/99/typing");
+    }
+
+    #[test]
+    fn discord_gets_a_long_report_in_parts_under_its_limit() {
+        let text = vec!["word ".repeat(60); 12].join("\n\n");
+        let (base, worker) = requests(&["204 No Content", "204 No Content"]);
+        discord_send(&format!("{base}/api/webhooks/1/t"), &text).unwrap();
+        for (_, body) in worker.join().unwrap() {
+            let content = body["content"].as_str().unwrap_or_default();
+            assert!((1..=2000).contains(&content.encode_utf16().count()));
+        }
     }
 }
 
@@ -599,15 +1052,15 @@ fn outgoing(text: &str) -> String {
 /// Post to a Discord channel. Send-only by nature: nothing comes back.
 pub fn discord_send(webhook: &str, text: &str) -> Result<(), String> {
     let client = client().ok_or("Cannot initialize connection.")?;
-    // Discord's own limit is 2000 characters.
-    let text = trim_to(&outgoing(text), 1900);
-    client
-        .post(webhook.trim())
-        .json(&serde_json::json!({"content": text}))
-        .send()
-        .map_err(|_| "Cannot reach Discord.".to_owned())?
-        .error_for_status()
-        .map_err(|_| "Discord rejected the message.".to_owned())?;
+    for part in format::split(&outgoing(text), DISCORD_PART) {
+        client
+            .post(webhook.trim())
+            .json(&serde_json::json!({"content": part}))
+            .send()
+            .map_err(|_| "Cannot reach Discord.".to_owned())?
+            .error_for_status()
+            .map_err(|_| "Discord rejected the message.".to_owned())?;
+    }
     Ok(())
 }
 
@@ -635,9 +1088,18 @@ fn discord_bot(
     token: &str,
     path: &str,
 ) -> Result<reqwest::blocking::RequestBuilder, String> {
+    discord_bot_via(DISCORD_API, method, token, path)
+}
+
+fn discord_bot_via(
+    api: &str,
+    method: reqwest::Method,
+    token: &str,
+    path: &str,
+) -> Result<reqwest::blocking::RequestBuilder, String> {
     let client = client().ok_or("Cannot initialize connection.")?;
     Ok(client
-        .request(method, format!("{DISCORD_API}{path}"))
+        .request(method, format!("{api}{path}"))
         .header("Authorization", format!("Bot {}", token.trim())))
 }
 
@@ -677,16 +1139,36 @@ pub fn discord_open_dm(token: &str, owner: &str) -> Result<(String, Option<Strin
 
 /// Send into a channel: the DM, or the server channel a mention came from.
 pub fn discord_post(token: &str, channel: &str, text: &str) -> Result<(), String> {
-    discord_bot(
-        reqwest::Method::POST,
-        token,
-        &format!("/channels/{channel}/messages"),
-    )?
-    .json(&serde_json::json!({"content": trim_to(&outgoing(text), 1900)}))
-    .send()
-    .map_err(|_| "Cannot reach Discord.".to_owned())?
-    .error_for_status()
-    .map_err(|_| "Discord rejected the message.".to_owned())?;
+    discord_post_via(DISCORD_API, token, channel, text, None)
+}
+
+/// Post in parts, with a card's buttons under the last part.
+fn discord_post_via(
+    api: &str,
+    token: &str,
+    channel: &str,
+    text: &str,
+    card: Option<&str>,
+) -> Result<(), String> {
+    let parts = format::split(&outgoing(text), DISCORD_PART);
+    let last = parts.len().saturating_sub(1);
+    for (i, part) in parts.into_iter().enumerate() {
+        let mut body = serde_json::json!({"content": part});
+        if let (true, Some(call)) = (i == last, card) {
+            // Green and red, as Discord colours a yes and a no.
+            body["components"] = serde_json::json!([{"type": 1, "components": [
+                {"type": 2, "style": 3, "label": "Allow", "custom_id": button(true, call)},
+                {"type": 2, "style": 4, "label": "Deny", "custom_id": button(false, call)},
+            ]}]);
+        }
+        let path = format!("/channels/{channel}/messages");
+        discord_bot_via(api, reqwest::Method::POST, token, &path)?
+            .json(&body)
+            .send()
+            .map_err(|_| "Cannot reach Discord.".to_owned())?
+            .error_for_status()
+            .map_err(|_| "Discord rejected the message.".to_owned())?;
+    }
     Ok(())
 }
 
@@ -740,6 +1222,42 @@ fn gateway_message(
                 owner: config.owner.trim().to_owned(),
             }),
         },
+        press: None,
+    })
+}
+
+/// A tap on one of the bot's card buttons, heard as its messages are: from
+/// the owner only, in a DM or a listed server.
+fn gateway_press(interaction: &serde_json::Value, config: &Discord) -> Option<Incoming> {
+    // A message component; slash commands and the rest are not this bot's.
+    if interaction["type"].as_u64() != Some(3) {
+        return None;
+    }
+    // In a server the user comes inside the member, in a DM on its own.
+    let user = match interaction["member"]["user"].is_object() {
+        true => &interaction["member"]["user"],
+        false => &interaction["user"],
+    };
+    if user["id"].as_str() != Some(config.owner.trim()) {
+        return None;
+    }
+    if let Some(server) = interaction["guild_id"].as_str()
+        && !config.servers.iter().any(|s| s.trim() == server)
+    {
+        return None;
+    }
+    let (allow, call) = pressed(interaction["data"]["custom_id"].as_str()?)?;
+    let tap = Tap::Discord {
+        id: interaction["id"].as_str()?.to_owned(),
+        token: interaction["token"].as_str()?.to_owned(),
+    };
+    Some(Incoming {
+        source: Source::Discord(interaction["channel_id"].as_str()?.to_owned()),
+        from: user["username"].as_str().unwrap_or("you").to_owned(),
+        text: String::new(),
+        said: String::new(),
+        remote: backend::Remote::default(),
+        press: Some(Press { allow, call, tap }),
     })
 }
 
@@ -986,6 +1504,16 @@ fn gateway_session(
                         }
                     }
                     if sender.send_blocking(message).is_err() {
+                        return Ended::Stopped;
+                    }
+                }
+                // Arrives here as long as the app has no interactions URL
+                // of its own set in the Developer Portal.
+                Some("INTERACTION_CREATE") => {
+                    let Some(press) = gateway_press(&payload["d"], config) else {
+                        continue;
+                    };
+                    if sender.send_blocking(press).is_err() {
                         return Ended::Stopped;
                     }
                 }
@@ -1243,7 +1771,7 @@ mod card_tests {
     #[test]
     fn only_a_plain_yes_allows_a_tool() {
         let text = card_text("run_command", r#"{"command": "ls"}"#, "ls");
-        assert!(text.starts_with("Letronna wants to use run_command:\n> ls"));
+        assert!(text.starts_with("Letronna wants to use run_command:\n```\nls\n```"));
         assert!(matches!(
             card_answer("run_command", "{}", " Yes "),
             CardAnswer::Allow
@@ -1299,6 +1827,27 @@ mod discord_tests {
 
     fn heard(message: Value) -> Option<String> {
         gateway_message(&message, &config(), BOT).map(|m| m.text)
+    }
+
+    #[test]
+    fn a_tap_counts_from_the_owner_where_the_bot_listens_and_nowhere_else() {
+        let tap = |extra: Value| {
+            let mut tap = json!({"type": 3, "id": "i1", "token": "tok", "channel_id": "c1",
+                "data": {"custom_id": "allow:call_1"}});
+            for (key, value) in extra.as_object().into_iter().flatten() {
+                tap[key] = value.clone();
+            }
+            super::gateway_press(&tap, &config())
+        };
+        let owner = json!({"id": "7"});
+        let press = tap(json!({"user": owner})).and_then(|m| m.press).unwrap();
+        assert!(press.allow && press.answers("call_1"));
+        assert!(tap(json!({"guild_id": "500", "member": {"user": owner}})).is_some());
+        // Someone else, a server not listed, or not a button at all.
+        assert!(tap(json!({"user": {"id": "8"}})).is_none());
+        assert!(tap(json!({"guild_id": "501", "member": {"user": owner}})).is_none());
+        assert!(tap(json!({"user": owner, "type": 2})).is_none());
+        assert!(tap(json!({"user": owner, "data": {"custom_id": "answered"}})).is_none());
     }
 
     #[test]

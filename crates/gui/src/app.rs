@@ -191,6 +191,8 @@ pub(crate) struct Chat {
     /// Stop drops the receiver at once, which is how the worker learns to
     /// give up, even in the middle of a wait to try again.
     pub(crate) reading: Option<Task<()>>,
+    /// What keeps a chat app's typing indicator up while its turn runs.
+    pub(crate) typing: Option<Task<()>>,
     /// Calls the turn in flight started that have not come back. The queue
     /// moves on only once none are, so a batch finishes before the next step.
     pub(crate) outstanding: usize,
@@ -539,6 +541,7 @@ impl Chat {
             remote_session: std::collections::HashMap::new(),
             generation: 0,
             reading: None,
+            typing: None,
             outstanding: 0,
             remote_waiting: None,
             messaging_stop: None,
@@ -1405,19 +1408,99 @@ impl Chat {
         text: &str,
         cx: &mut Context<Self>,
     ) {
-        use letronna_core::messaging::{self, Source};
+        self.tell_remote_card(source, text, None, cx);
+    }
+
+    /// Send to a chat, with Allow and Deny under it when `card` is the id of
+    /// the call it asks about.
+    fn tell_remote_card(
+        &self,
+        source: &letronna_core::messaging::Source,
+        text: &str,
+        card: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let config = self.messaging.clone();
         let source = source.clone();
         let text = text.to_owned();
-        let telegram = self.messaging.telegram.token.clone();
-        let discord = self.messaging.discord.bot_token.clone();
         cx.background_executor()
             .spawn(async move {
-                let _ = match source {
-                    Source::Telegram(chat) => messaging::send(&telegram, chat, &text),
-                    Source::Discord(channel) => messaging::discord_post(&discord, &channel, &text),
-                };
+                let _ = letronna_core::messaging::tell(&config, &source, &text, card.as_deref());
             })
             .detach();
+    }
+
+    /// Show `source` that its turn is at work, for as long as it runs and is
+    /// not waiting on the chat. The service drops the indicator after a few
+    /// seconds, so it is sent again on a timer that lives only as long as
+    /// the turn, and a new turn's replaces it.
+    fn keep_typing(&mut self, source: letronna_core::messaging::Source, cx: &mut Context<Self>) {
+        let every = source.typing_every();
+        self.typing = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let working = this.update(cx, |this, _| {
+                    let running = this
+                        .streaming_id
+                        .and_then(|id| this.remote.get(&id))
+                        .is_some_and(|turn| *turn == source);
+                    // A card sent is the chat's turn to answer.
+                    let asking = this
+                        .remote_waiting
+                        .as_ref()
+                        .is_some_and(|(waiting, _)| *waiting == source);
+                    running.then(|| (!asking).then(|| this.messaging.clone()))
+                });
+                let Ok(Some(config)) = working else {
+                    return;
+                };
+                if let Some(config) = config {
+                    let source = source.clone();
+                    cx.background_executor()
+                        .spawn(async move {
+                            let _ = letronna_core::messaging::typing(&config, &source);
+                        })
+                        .detach();
+                }
+                cx.background_executor().timer(every).await;
+            }
+        }));
+    }
+
+    /// A tap on a card's Allow or Deny. It answers the card only while that
+    /// card is the one waiting, as a typed yes or no would; a tap on an
+    /// older card, or a second tap, only loses its buttons.
+    fn on_press(
+        &mut self,
+        source: letronna_core::messaging::Source,
+        press: letronna_core::messaging::Press,
+        cx: &mut Context<Self>,
+    ) {
+        use letronna_core::messaging::Source;
+        if let Source::Telegram(chat) = source
+            && self.messaging.telegram.chat != Some(chat)
+        {
+            return;
+        }
+        let answers = self
+            .remote_waiting
+            .as_ref()
+            .is_some_and(|(waiting, call)| *waiting == source && press.answers(&call.id));
+        let config = self.messaging.clone();
+        let allow = press.allow;
+        cx.background_executor()
+            .spawn(async move {
+                let _ = letronna_core::messaging::settle(&config, &press, answers);
+            })
+            .detach();
+        if answers {
+            self.resolve_call(
+                match allow {
+                    true => Verdict::Allow { remember: false },
+                    false => Verdict::Deny(String::new()),
+                },
+                cx,
+            );
+        }
     }
 
     /// A message arrived from a bot. A Telegram chat the user has not
@@ -1427,6 +1510,9 @@ impl Chat {
         use letronna_core::gate::Mode;
         use letronna_core::messaging::Source;
         let source = message.source;
+        if let Some(press) = message.press {
+            return self.on_press(source, press, cx);
+        }
         if let Source::Telegram(chat) = source
             && self.messaging.telegram.chat != Some(chat)
         {
@@ -1504,7 +1590,7 @@ impl Chat {
             Source::Telegram(_) => self.messaging.telegram.allow_tools,
             Source::Discord(_) => self.messaging.discord.allow_tools,
         };
-        self.remote.insert(id, source);
+        self.remote.insert(id, source.clone());
         // Nobody on the far end can answer an approval card, so unless the
         // user has said otherwise a remote message may look but not touch.
         // With tools it gets the Default mode setting, but never above
@@ -1516,7 +1602,12 @@ impl Chat {
             Mode::Plan
         };
         self.modes.insert(id, mode);
-        let _ = self.dispatch(message.text, Some(message.remote), cx);
+        if self
+            .dispatch(message.text, Some(message.remote), cx)
+            .is_ok()
+        {
+            self.keep_typing(source, cx);
+        }
     }
 
     /// A scheduled run has no one watching, so post how it ended to every
@@ -1666,7 +1757,9 @@ impl Chat {
             .unwrap_or_default();
         let preview = letronna_core::tools::preview(&call.name, &call.arguments, &ctx);
         let text = letronna_core::messaging::card_text(&call.name, &call.arguments, &preview);
-        self.tell_remote(&source, &text, cx);
+        // A question is answered in words; a tool is allowed or not.
+        let card = (call.name != letronna_core::tools::ASK_USER).then(|| call.id.clone());
+        self.tell_remote_card(&source, &text, card, cx);
         self.remote_waiting = Some((source, call));
     }
 
@@ -1916,6 +2009,8 @@ impl Chat {
     fn finish(&mut self, cx: &mut Context<Self>) {
         let stopped = std::mem::take(&mut self.stopping);
         self.answer_remote(cx);
+        // The reply clears the indicator; nothing may raise it again.
+        self.typing = None;
         self.report_scheduled(cx);
         let session = self.streaming_id;
         // The grant is for the run, not the session: a follow-up typed there
