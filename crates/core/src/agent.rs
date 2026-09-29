@@ -73,6 +73,12 @@ pub struct Live {
     pub per_second: f32,
     pub prompt_tokens: u64,
     pub cached_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub reasoning_tokens: u64,
+    /// What OpenRouter billed for the reply, in dollars.
+    pub cost: Option<f64>,
+    /// What summarizing older turns for the request took.
+    pub summary_usage: Option<crate::usage::Usage>,
     pub calls: Vec<ToolCall>,
     /// The try about to be made again after a failure, while it waits.
     pub retrying: Option<crate::retry::Retry>,
@@ -142,12 +148,19 @@ impl Turn {
                 per_second,
                 prompt,
                 cached,
+                cache_write,
+                reasoning,
+                cost,
             } => {
                 self.live.tokens = *completion;
                 self.live.per_second = *per_second;
                 self.live.prompt_tokens = *prompt;
                 self.live.cached_tokens = *cached;
+                self.live.cache_write_tokens = *cache_write;
+                self.live.reasoning_tokens = *reasoning;
+                self.live.cost = *cost;
             }
+            Event::Summarized(usage) => self.live.summary_usage = Some(*usage),
             Event::ToolCalls(calls) => self.live.calls = calls.clone(),
             Event::Retrying(retry) => self.live.retrying = Some(*retry),
             Event::CutOff { in_call } => self.cut_off = Some(*in_call),
@@ -155,11 +168,11 @@ impl Turn {
         }
     }
 
-    /// The assistant message for the reply just finished, and a clean slate
-    /// for the next one.
+    /// The assistant message for the reply just finished, its cost settled,
+    /// and a clean slate for the next one.
     pub fn take_reply(&mut self, model: &str) -> Message {
         let live = std::mem::take(&mut self.live);
-        Message {
+        let mut reply = Message {
             role: "assistant".into(),
             content: live.content,
             model: model.to_owned(),
@@ -168,9 +181,18 @@ impl Turn {
             per_second: live.per_second,
             prompt_tokens: live.prompt_tokens,
             cached_tokens: live.cached_tokens,
+            cache_write_tokens: live.cache_write_tokens,
+            reasoning_tokens: live.reasoning_tokens,
+            cost: live.cost,
+            summary_usage: live.summary_usage,
+            at: crate::chat::now(),
             tool_calls: live.calls,
             ..Default::default()
-        }
+        };
+        let usage = crate::usage::Usage::of(&reply).priced(&self.connection.endpoint, model);
+        reply.cost = usage.cost;
+        reply.cost_estimated = usage.estimated;
+        reply
     }
 
     /// The notice asking the model to go on, when the reply just finished
@@ -361,11 +383,20 @@ mod tests {
         turn.absorb(&Event::Delta("Hel".into()));
         turn.absorb(&Event::Delta("lo".into()));
         turn.absorb(&Event::Reasoning("thinking".into()));
+        let summary = crate::usage::Usage {
+            input: 900,
+            output: 80,
+            ..Default::default()
+        };
+        turn.absorb(&Event::Summarized(summary));
         turn.absorb(&Event::Usage {
             completion: 12,
             per_second: 4.0,
             prompt: 300,
             cached: 256,
+            cache_write: 30,
+            reasoning: 5,
+            cost: None,
         });
 
         let reply = turn.take_reply("some-model");
@@ -373,9 +404,15 @@ mod tests {
         assert_eq!(reply.reasoning, "thinking");
         assert_eq!(reply.model, "some-model");
         assert_eq!(reply.cached_tokens, 256);
+        assert_eq!((reply.cache_write_tokens, reply.reasoning_tokens), (30, 5));
+        assert_eq!(reply.summary_usage, Some(summary));
+        assert!(reply.at > 0);
+        // No price is known for this model, so no cost is made up.
+        assert_eq!(reply.cost, None);
         // The next reply must not inherit any of that.
         assert!(turn.live.content.is_empty());
-        assert_eq!(turn.take_reply("some-model").tokens, 0);
+        let next = turn.take_reply("some-model");
+        assert_eq!((next.tokens, next.summary_usage), (0, None));
     }
 
     #[test]

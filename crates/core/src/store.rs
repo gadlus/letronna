@@ -118,6 +118,9 @@ fn parse_todos(arguments: &str) -> Result<Vec<Todo>, String> {
 /// A line in a session file.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
+// Made one at a time, for the line being read or written, so the size of
+// the largest costs nothing.
+#[allow(clippy::large_enum_variant)]
 enum Record {
     /// Written once, when the session is created.
     Head {
@@ -689,6 +692,108 @@ pub fn summaries() -> Vec<Summary> {
         .collect();
     out.sort_by_key(|s| std::cmp::Reverse(s.updated));
     out
+}
+
+/// The model calls saved in the sessions and their helpers' conversations
+/// written to since `since`, and all of session `session`'s. Replies a
+/// rewind took back count too, as they were paid for all the same.
+///
+/// A branch copies the replies of the session it came from, so a reply that
+/// kept its time is marked a copy wherever it is seen after its first place.
+/// Sessions are numbered as they are made, which puts the original first.
+pub fn spent(since: u64, session: u64) -> Vec<crate::usage::Spent> {
+    let mut files: Vec<(u64, PathBuf)> = session_ids()
+        .into_iter()
+        .map(|id| (id, session_path(id)))
+        .collect();
+    let helpers = std::fs::read_dir(backend::data_dir().join("agents"));
+    for dir in helpers.into_iter().flatten().filter_map(Result::ok) {
+        let Some(id) = dir.file_name().to_str().and_then(|n| n.parse().ok()) else {
+            continue;
+        };
+        let Ok(entries) = std::fs::read_dir(dir.path()) else {
+            continue;
+        };
+        let transcripts = entries.filter_map(Result::ok).map(|e| e.path());
+        files.extend(
+            transcripts
+                .filter(|path| path.extension().is_some_and(|x| x == "jsonl"))
+                .map(|path| (id, path)),
+        );
+    }
+    files.sort();
+    let mut seen = std::collections::HashSet::new();
+    files
+        .into_iter()
+        .filter(|(id, path)| *id == session || written_since(path, since))
+        .flat_map(|(id, path)| spent_in(&path, id, &mut seen))
+        .collect()
+}
+
+/// Whether the file at `path` was written to at `since` or later, or might
+/// have been. Files are only appended to, so an older one holds nothing newer.
+fn written_since(path: &std::path::Path, since: u64) -> bool {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .is_none_or(|age| age.as_secs() >= since)
+}
+
+/// The model calls saved in one conversation file of `session`, noting each
+/// reply that kept its time in `seen`. A reply saved before replies kept
+/// their time takes the session's last, and cannot be told from a copy.
+fn spent_in(
+    path: &std::path::Path,
+    session: u64,
+    seen: &mut std::collections::HashSet<(u64, String, u64, u64, u64)>,
+) -> Vec<crate::usage::Spent> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let mut updated = 0;
+    let mut spent = Vec::new();
+    for line in text.lines() {
+        // Only replies carry usage, and the role is written straight after
+        // the tag, so every other message is passed over unparsed.
+        if line.starts_with("{\"type\":\"message\"")
+            && !line.starts_with("{\"type\":\"message\",\"role\":\"assistant\"")
+        {
+            continue;
+        }
+        match serde_json::from_str::<Record>(line) {
+            Ok(Record::Head { created, .. }) => updated = updated.max(created),
+            Ok(Record::Meta(meta)) => updated = updated.max(meta.updated),
+            Ok(Record::Message(reply)) => {
+                // Two replies are not made in one second with the same model
+                // and the same counts, but a reply and its copy are.
+                let (at, model) = (reply.at, reply.model.clone());
+                let key = (
+                    at,
+                    model,
+                    reply.tokens,
+                    reply.prompt_tokens,
+                    reply.cached_tokens,
+                );
+                let copy = at > 0 && !seen.insert(key);
+                spent.extend(
+                    crate::usage::calls(&reply).map(|usage| crate::usage::Spent {
+                        session,
+                        at: reply.at,
+                        model: reply.model.clone(),
+                        usage,
+                        copy,
+                    }),
+                )
+            }
+            _ => {}
+        }
+    }
+    for call in spent.iter_mut().filter(|call| call.at == 0) {
+        call.at = updated;
+    }
+    spent
 }
 
 /// A place in an earlier session where a search found what it looked for.
@@ -2393,6 +2498,65 @@ pub(crate) mod tests {
         std::fs::remove_file(&file).unwrap();
         let first = load().settings;
         assert_eq!((first.appearance.as_str(), first.grain), ("", true));
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn spent_counts_every_reply_its_summaries_and_helpers() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("spent");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        std::fs::create_dir_all(dir.join("sessions")).unwrap();
+        std::fs::create_dir_all(dir.join("agents").join("1")).unwrap();
+        // A reply from before replies kept their time, then one with a
+        // summary made for it, which a rewind took back.
+        let lines = [
+            r#"{"type":"head","id":1,"created":100}"#,
+            r#"{"type":"message","role":"user","content":"hi"}"#,
+            r#"{"type":"message","role":"assistant","content":"old","model":"m","tokens":5,"prompt_tokens":50}"#,
+            r#"{"type":"message","role":"assistant","content":"new","model":"m","tokens":7,"prompt_tokens":70,"at":300,"summary_usage":{"input":900,"output":60}}"#,
+            r#"{"type":"rewind","to":2}"#,
+            r#"{"type":"meta","title":"t","updated":200,"pinned":false,"workspace":null,"todos":[]}"#,
+        ];
+        std::fs::write(dir.join("sessions").join("1.jsonl"), lines.join("\n")).unwrap();
+        let helper = [
+            r#"{"type":"head","id":1,"created":150}"#,
+            r#"{"type":"message","role":"assistant","content":"done","model":"h","tokens":3,"prompt_tokens":30,"at":160}"#,
+        ];
+        std::fs::write(
+            dir.join("agents").join("1").join("1.jsonl"),
+            helper.join("\n"),
+        )
+        .unwrap();
+
+        // A branch of it, made later, which copied the reply that kept its time.
+        let branch = [r#"{"type":"head","id":2,"created":400}"#, lines[3]];
+        std::fs::write(dir.join("sessions").join("2.jsonl"), branch.join("\n")).unwrap();
+
+        let (mut first, copied): (Vec<_>, Vec<_>) = super::spent(0, 1)
+            .into_iter()
+            .partition(|call| call.session == 1);
+        first.sort_by_key(|call| (call.at, call.usage.input));
+        let seen: Vec<(u64, &str, u64, bool)> = first
+            .iter()
+            .map(|call| (call.at, call.model.as_str(), call.usage.input, call.copy))
+            .collect();
+        let once = [
+            (160, "h", 30),
+            (200, "m", 50),
+            (300, "m", 70),
+            (300, "m", 900),
+        ];
+        assert_eq!(
+            seen,
+            once.map(|(at, model, input)| (at, model, input, false))
+        );
+        // The branch's reply and its summary are the same two calls again.
+        assert_eq!(copied.len(), 2);
+        assert!(copied.iter().all(|call| call.session == 2 && call.copy));
+        // Files not written to since are passed over, but for the session asked about.
+        assert_eq!(super::spent(u64::MAX, 1).len(), 4);
+        assert!(super::spent(u64::MAX, 3).is_empty());
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 }

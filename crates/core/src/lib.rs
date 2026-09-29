@@ -50,6 +50,7 @@ pub mod tasks;
 pub mod timers;
 pub mod tools;
 pub mod update;
+pub mod usage;
 pub mod wake;
 pub mod watch;
 pub mod web;

@@ -88,6 +88,8 @@ pub(crate) struct Chat {
     pub(crate) gateway_pick: Entity<String>,
     pub(crate) presence_pick: Entity<String>,
     pub(crate) settings_page: Entity<&'static str>,
+    /// The Usage page's totals, added up when it was last opened.
+    pub(crate) usage_report: Option<letronna_core::usage::Report>,
     pub(crate) settings_open: bool,
     /// Held by the settings panel while it is open, so escape reaches it.
     pub(crate) settings_focus: FocusHandle,
@@ -477,6 +479,7 @@ impl Chat {
             gateway_pick,
             presence_pick,
             settings_page,
+            usage_report: None,
             settings_open: false,
             settings_focus: cx.focus_handle(),
             page_focus: cx.focus_handle(),
@@ -2061,6 +2064,11 @@ impl Render for Chat {
                     this.open_settings(window, cx)
                 }
             }))
+            .on_action(
+                cx.listener(|this, _: &crate::ui::usage::OpenUsage, window, cx| {
+                    this.open_usage(window, cx)
+                }),
+            )
             .on_action(
                 cx.listener(|this, _: &crate::ui::panel::TogglePanel, window, cx| {
                     if !window.has_active_dialog(cx) && !this.settings_open {
