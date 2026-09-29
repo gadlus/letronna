@@ -1,7 +1,9 @@
 //! The card the chat shows when a tool needs the user: approve a write or a
-//! command, answer an `ask_user` question, or approve a plan.
+//! command, answer an `ask_user` question, or approve a plan. A helper's
+//! call gets a card of its own under the helper's name.
 
 use crate::prelude::*;
+use letronna_core::approvals::Decision;
 use letronna_core::tools;
 
 impl Chat {
@@ -15,8 +17,23 @@ impl Chat {
         self.resolve_call(Verdict::Answer(text), cx);
     }
 
-    /// The row under the messages while tools run: a progress line, or the
-    /// card waiting on the user. `None` when nothing is queued.
+    /// Denies the call on the card, with what was typed in its reason field.
+    pub(crate) fn deny_call(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let reason = self.take_reason(window, cx);
+        self.resolve_call(Verdict::Deny(reason), cx);
+    }
+
+    /// Empties the card's reason field and hands back what was in it, so a
+    /// reason typed on one card cannot go with the next.
+    fn take_reason(&mut self, window: &mut Window, cx: &mut Context<Self>) -> String {
+        let reason = self.deny_reason.read(cx).value().to_string();
+        self.deny_reason
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        reason
+    }
+
+    /// The row under the messages while tools run: a line per running call,
+    /// or the card waiting on the user. `None` when nothing is queued.
     pub(crate) fn approval_card(
         &self,
         window: &mut Window,
@@ -27,21 +44,29 @@ impl Chat {
         let ctx = tools::ToolContext::of(&turn.connection);
         let summary = tools::summary(&call.name, &call.arguments);
         if !waiting {
-            return Some(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(
-                        gpui_component::spinner::Spinner::new()
-                            .xsmall()
-                            .color(cx.theme().primary),
-                    )
-                    .child(call.name.clone())
-                    .child(div().font_family(MONO_FONT).child(summary))
-                    .into_any_element(),
-            );
+            // Calls from one reply that run together get a line each, which
+            // goes as its result comes back.
+            let lines = running_calls(turn, self.outstanding)
+                .into_iter()
+                .map(|call| {
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(
+                            gpui_component::spinner::Spinner::new()
+                                .xsmall()
+                                .color(cx.theme().primary),
+                        )
+                        .child(call.name.clone())
+                        .child(
+                            div()
+                                .font_family(MONO_FONT)
+                                .child(tools::summary(&call.name, &call.arguments)),
+                        )
+                });
+            return Some(v_flex().gap_1().children(lines).into_any_element());
         }
 
         let args = tools::parse_args_for(&call.name, &call.arguments).unwrap_or_default();
@@ -142,7 +167,7 @@ impl Chat {
                                 .small()
                                 .label("Keep planning")
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.resolve_call(Verdict::Deny, cx)
+                                    this.resolve_call(Verdict::Deny(String::new()), cx)
                                 })),
                         ),
                 )
@@ -188,9 +213,9 @@ impl Chat {
                         .plain(cx)
                         .small()
                         .label("Deny")
-                        .on_click(
-                            cx.listener(|this, _, _, cx| this.resolve_call(Verdict::Deny, cx)),
-                        ),
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.resolve_call(Verdict::Deny(String::new()), cx)
+                        })),
                 )
                 .child(
                     div()
@@ -203,12 +228,14 @@ impl Chat {
         } else {
             h_flex()
                 .gap_2()
+                .items_center()
                 .child(
                     Button::new("allow")
                         .primary()
                         .small()
                         .label("Allow")
-                        .on_click(cx.listener(|this, _, _, cx| {
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.take_reason(window, cx);
                             this.resolve_call(Verdict::Allow { remember: false }, cx)
                         })),
                 )
@@ -217,7 +244,8 @@ impl Chat {
                         .framed(cx)
                         .small()
                         .label("Allow for this session")
-                        .on_click(cx.listener(|this, _, _, cx| {
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.take_reason(window, cx);
                             this.resolve_call(Verdict::Allow { remember: true }, cx)
                         })),
                 )
@@ -230,14 +258,20 @@ impl Chat {
                             cx.listener(|this, _, _, cx| this.resolve_call(Verdict::AllowHere, cx)),
                         )
                 }))
+                // Beside Deny, which sends what is typed here; enter in the
+                // field denies too.
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(Input::new(&self.deny_reason).small().w_full()),
+                )
                 .child(
                     Button::new("deny")
                         .plain(cx)
                         .small()
                         .label("Deny")
-                        .on_click(
-                            cx.listener(|this, _, _, cx| this.resolve_call(Verdict::Deny, cx)),
-                        ),
+                        .on_click(cx.listener(|this, _, window, cx| this.deny_call(window, cx))),
                 )
         };
         Some(
@@ -285,4 +319,129 @@ impl Chat {
             .into_any_element(),
         )
     }
+
+    /// The card for the first helper's call waiting on the user in session
+    /// `root`, or `None` when no helper there is waiting.
+    pub(crate) fn helper_card(
+        &self,
+        root: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let request = self
+            .agent_asks
+            .iter()
+            .find(|request| request.root == root)?;
+        let call = &request.call;
+        let summary = tools::summary(&call.name, &call.arguments);
+        let title = wants(&format!("Helper {}", request.label), &call.name, &summary);
+        let answer = |decision: Decision| {
+            let (label, id) = (request.label.clone(), call.id.clone());
+            cx.listener(move |this, _, _, cx| {
+                this.answer_agent(root, &label, &id, decision.clone(), cx)
+            })
+        };
+        let (once, for_run, deny) = (
+            answer(Decision::Once),
+            answer(Decision::ForRun),
+            answer(Decision::Deny(String::new())),
+        );
+        let card = permission(
+            frame(cx),
+            "helper-preview",
+            title,
+            &request.preview,
+            window,
+            cx,
+        );
+        Some(
+            card.child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("helper-allow")
+                            .primary()
+                            .small()
+                            .label("Allow")
+                            .on_click(once),
+                    )
+                    .child(
+                        // Core remembers this for the tool, for the helper
+                        // and the helpers it starts, so they ask no more.
+                        Button::new("helper-allow-run")
+                            .outline()
+                            .small()
+                            .label("Allow for this run")
+                            .on_click(for_run),
+                    )
+                    .child(
+                        Button::new("helper-deny")
+                            .ghost()
+                            .small()
+                            .label("Deny")
+                            .on_click(deny),
+                    ),
+            )
+            .into_any_element(),
+        )
+    }
+}
+
+/// The box an approval card sits in.
+fn frame(cx: &App) -> Div {
+    v_flex()
+        .w_full()
+        .gap_3()
+        .p_3()
+        .rounded(cx.theme().radius_lg)
+        .border_1()
+        .border_color(cx.theme().primary.opacity(0.5))
+        .bg(cx.theme().secondary.opacity(0.3))
+}
+
+/// What a card says `who` wants to do with a call of `name`.
+fn wants(who: &str, name: &str, summary: &str) -> String {
+    match name {
+        "write_file" => format!("{who} wants to write {summary}"),
+        "edit_file" => format!("{who} wants to edit {summary}"),
+        "run_command" => format!("{who} wants to run a command"),
+        "browse" | "use_page" => format!("{who} wants to {summary}"),
+        "search_web" => format!("{who} wants to search the web"),
+        other => format!("{who} wants to use {other}"),
+    }
+}
+
+/// `card` with what a call wants and the tool's preview of it, ready for its
+/// answers; `id` keeps the preview's scrolling apart from another card's.
+fn permission(
+    card: Div,
+    id: &'static str,
+    title: String,
+    preview: &str,
+    window: &mut Window,
+    cx: &mut App,
+) -> Div {
+    card.child(
+        div()
+            .text_sm()
+            .font_family(HEADING_FONT)
+            .font_weight(FontWeight::MEDIUM)
+            .child(title),
+    )
+    .child(
+        // Scrolls only once the preview is long, so a one-line command
+        // does not sit in a tall empty panel.
+        div()
+            .p_2()
+            .min_w_0()
+            .rounded(cx.theme().radius)
+            .bg(cx.theme().background)
+            .child(crate::ui::code_block(
+                id,
+                tools::clamp_lines(preview, 400),
+                px(240.),
+                window,
+                cx,
+            )),
+    )
 }

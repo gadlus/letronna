@@ -55,12 +55,24 @@ impl Chat {
         &self.store.conversations[self.store.active].messages
     }
 
-    /// The text of your message at `at`, if that is what is there.
+    /// The text of your message at `at`, if that is what is there, with
+    /// `/init` as it was typed rather than its prompt.
     fn prompt_text(&self, at: usize) -> Option<String> {
         self.open_messages()
             .get(at)
-            .filter(|m| m.role == "user")
-            .map(|m| m.content.clone())
+            .filter(|m| m.role == "user" && !m.notice)
+            .map(|m| {
+                letronna_core::init::typed(&m.content)
+                    .map_or_else(|| m.content.clone(), str::to_owned)
+            })
+    }
+
+    /// The pictures your message at `at` carried, to go with it again.
+    fn prompt_images(&self, at: usize) -> Vec<PathBuf> {
+        self.open_messages()
+            .get(at)
+            .map(|m| m.images.clone())
+            .unwrap_or_default()
     }
 
     /// What a turn says, for copying: your message, or the reply's words
@@ -142,8 +154,9 @@ impl Chat {
             cx.notify();
             return;
         }
+        let images = self.prompt_images(at);
         self.back_to(at, window, cx);
-        self.ask_again(text, window, cx);
+        self.ask_again(text, images, window, cx);
     }
 
     /// Whether you asked anything after your message at `at`, which asking
@@ -180,14 +193,26 @@ impl Chat {
         let Some(text) = self.prompt_text(at) else {
             return;
         };
+        let images = self.prompt_images(at);
         self.back_to(at, window, cx);
-        self.ask_again(text, window, cx);
+        self.ask_again(text, images, window, cx);
     }
 
-    fn ask_again(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn ask_again(
+        &mut self,
+        text: String,
+        images: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // What had the keys, the edit box or the turn's buttons, is gone.
         self.focus_composer(window, cx);
-        if self.dispatch(text.clone(), None, cx).is_err() {
+        let Some(prompt) = self.prompt_for(text.clone(), cx) else {
+            self.composer
+                .update(cx, |input, cx| input.set_value(text, window, cx));
+            return;
+        };
+        if self.dispatch(prompt, images, None, cx).is_err() {
             // Not asked, so the text waits in the box rather than being lost.
             self.composer
                 .update(cx, |input, cx| input.set_value(text, window, cx));
@@ -386,6 +411,10 @@ impl Chat {
             updated: backend::now(),
             workspace: source.workspace.clone(),
             todos: todos_in(&messages),
+            model: source.model.clone(),
+            gateway: source.gateway.clone(),
+            effort: source.effort.clone(),
+            summary: source.summary_within(messages.len()),
             messages,
             ..Default::default()
         };
@@ -578,18 +607,21 @@ pub(crate) fn shows_bar(span: Span, messages: usize, streaming: bool, focused: b
 /// coming in to your message is a turn already, with nothing in it yet.
 pub(crate) fn turns(messages: &[Message], streaming: bool) -> Vec<Span> {
     let mut turns: Vec<Span> = Vec::new();
+    let mut replied = false;
     for (i, m) in messages.iter().enumerate() {
-        let yours = m.role == "user";
+        let said = m.role == "user";
         match turns.last_mut() {
-            Some(turn) if !yours && !turn.yours => turn.last = i,
+            Some(turn) if !said && replied => turn.last = i,
+            // A notice stands apart as your message does, but it is
+            // nobody's prompt to change or ask again.
             _ => turns.push(Span {
                 first: i,
                 last: i,
-                yours,
+                yours: said && !m.notice,
             }),
         }
+        replied = !said;
     }
-    let replied = turns.last().is_some_and(|turn| !turn.yours);
     if streaming && !replied {
         turns.push(Span {
             first: messages.len(),
@@ -684,5 +716,23 @@ mod tests {
         // ...but a reply that is already there carries on in its own.
         assert_eq!(turns(&session[..4], true).len(), 2);
         assert!(turns(&[], false).is_empty());
+        // A notice is a turn of its own too, not yours, and the reply to it
+        // another.
+        let notice = Message {
+            role: "user".into(),
+            notice: true,
+            ..Default::default()
+        };
+        let woken = [said("user"), said("assistant"), notice, said("assistant")];
+        assert_eq!(
+            turns(&woken, false),
+            [
+                span(0, 0, true),
+                span(1, 1, false),
+                span(2, 2, false),
+                span(3, 3, false)
+            ]
+        );
+        assert_eq!(turns(&woken[..3], true)[3], span(3, 3, false));
     }
 }

@@ -323,6 +323,9 @@ fn ladder(call: &ToolCall, gate: &Gate, judge: Option<&dyn Fn(&str) -> Verdict>)
     if let Some(why) = unavailable(tool.as_ref(), risk, gate.ctx, plan) {
         return Outcome::Refuse(why);
     }
+    if let Some(why) = marked(tool.as_ref(), &args) {
+        return Outcome::Refuse(why);
+    }
     // Layer 1, the floor. It comes before every setting and grant: a command
     // that is hard to take back needs a person's yes even when approvals are
     // skipped or the tool is allowed.
@@ -334,6 +337,12 @@ fn ladder(call: &ToolCall, gate: &Gate, judge: Option<&dyn Fn(&str) -> Verdict>)
     let ruling = permissions::check(gate.rules, tool.as_ref(), &args, gate.ctx);
     if let Some(rule) = &ruling.deny {
         return Outcome::Refuse(denied(rule));
+    }
+    // A hooks.json that cannot be used may hold what guards this call, so
+    // every call but a question waits for a person until it is fixed.
+    let question = [tools::ASK_USER, tools::EXIT_PLAN].contains(&tool.name());
+    if let Some(why) = crate::hooks::trouble().filter(|_| !question) {
+        return held(&why, tool.name(), gate);
     }
     // A line the floor cannot read, such as `git $(echo push)`, could be
     // what a deny rule names, so a person looks at it as at a risky one.
@@ -446,6 +455,9 @@ pub fn refusal(tool: &dyn Tool, args: &Value, ctx: &ToolContext) -> Option<Strin
     if let Some(why) = unavailable(tool, risk, ctx, ctx.plan) {
         return Some(why);
     }
+    if let Some(why) = marked(tool, args) {
+        return Some(why);
+    }
     match risk {
         Some(Risk::Hardline(why)) => Some(never(why)),
         _ => None,
@@ -462,6 +474,14 @@ fn unavailable(
     plan: bool,
 ) -> Option<String> {
     let name = tool.name();
+    // A tool the user switched off is not offered either, but the model may
+    // remember it from earlier in the conversation.
+    if tools::switched_off(name, &crate::store::disabled_tools()) {
+        return Some(format!(
+            "`{name}` is switched off: the user listed it in `disabled_tools` in \
+             Letronna's settings.json. Carry on without it."
+        ));
+    }
     // Only fitting tools are offered, but the model can name any of them;
     // refuse here too rather than trust the offer.
     if ctx.shared() && tool.machine() {
@@ -486,6 +506,16 @@ fn unavailable(
         ));
     }
     None
+}
+
+/// Why a call carrying the marker a hidden key or token became never runs,
+/// or `None`: it would write, type or send the marker in the key's place.
+/// write_file and edit_file count the file's markers instead, since a file
+/// can hold the marker's text itself.
+fn marked(tool: &dyn Tool, args: &Value) -> Option<String> {
+    let counted = matches!(tool.name(), "write_file" | "edit_file");
+    let carried = args.to_string().contains(crate::redact::MARKER);
+    (carried && !counted).then(|| crate::redact::carried(tool.name()))
 }
 
 /// What `run_command`'s line would do where the session works; `None` for
@@ -2008,5 +2038,39 @@ mod tests {
         std::fs::write(dir.join("project/notes.txt"), "a").unwrap();
         std::fs::write(dir.join("outside.txt"), "a").unwrap();
         dir
+    }
+
+    #[test]
+    fn a_call_carrying_the_secret_marker_is_refused_before_any_card() {
+        let ctx = ToolContext::default();
+        let none = Grants::new();
+        let gate = Gate {
+            ctx: &ctx,
+            mode: Mode::Bypass,
+            grants: &none,
+            rules: &[],
+            broken: None,
+            human: true,
+        };
+        let marker = crate::redact::MARKER;
+        for carrying in [
+            command(&format!("echo '{marker}' > .env")),
+            call(
+                "use_page",
+                serde_json::json!({ "action": "type", "text": marker }),
+            ),
+            call(
+                "web_fetch",
+                serde_json::json!({ "url": format!("https://x.test/?k={marker}") }),
+            ),
+        ] {
+            let Outcome::Refuse(why) = decide(&carrying, &gate) else {
+                panic!("{} was not refused", carrying.name);
+            };
+            assert!(why.contains("in the key's place"), "{why}");
+        }
+        // The two writes count the file's markers instead.
+        let kept = serde_json::json!({ "path": "notes.txt", "content": marker });
+        assert_eq!(decide(&call("write_file", kept), &gate), Outcome::Run);
     }
 }

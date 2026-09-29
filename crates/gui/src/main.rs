@@ -57,16 +57,23 @@ fn main() {
             KeyBinding::new("escape", Dismiss, Some("Chat")),
             KeyBinding::new("secondary-j", ui::panel::TogglePanel, Some("Chat")),
             KeyBinding::new("secondary-shift-l", ui::panel::BrowserTab, Some("Chat")),
+            KeyBinding::new("secondary-shift-u", ui::usage::OpenUsage, Some("Chat")),
+            KeyBinding::new("secondary-shift-a", OpenActivity, Some("Chat")),
             KeyBinding::new(
                 "shift-enter",
                 gpui_component::input::Enter { secondary: true },
                 Some("Input"),
             ),
+            // Bound after the input's own Ctrl+Enter, a new line, so it is
+            // tried first and can hand the key back when there is nothing
+            // to send now.
+            KeyBinding::new("secondary-enter", SendNow, Some("Composer > Input")),
             // On the browser's page, Tab moves through the page, not the
             // window.
             KeyBinding::new("tab", ui::browser::PageTab, Some("Browser")),
             KeyBinding::new("shift-tab", ui::browser::PageTabBack, Some("Browser")),
             KeyBinding::new("tab", ui::composer::LeaveComposer, Some("Composer > Input")),
+            KeyBinding::new("enter", ui::search::OpenHit, Some("SearchHit")),
         ]);
         platform::tray::init(cx);
         cx.on_window_closed(|cx| {
@@ -79,6 +86,7 @@ fn main() {
         // Nor does a browser with no window, which nobody could close.
         cx.on_app_quit(|_| {
             letronna_core::jobs::stop_all();
+            letronna_core::mcp::stop_all();
             letronna_core::browser::close_hidden();
             letronna_core::diag::stop();
             async {}
