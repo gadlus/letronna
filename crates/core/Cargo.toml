@@ -31,7 +31,7 @@ toml = { version = "1", default-features = false, features = ["std", "parse", "s
 # Windows, a process group elsewhere. Both are already in the lock file,
 # windows-sys at the version the window uses.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

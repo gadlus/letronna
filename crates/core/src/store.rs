@@ -288,6 +288,47 @@ impl Conversation {
             self.rewound = Some(len);
         }
     }
+
+    /// Whether the messages are on disk only: listed or let go, and not
+    /// read back in since.
+    pub fn unfilled(&self) -> bool {
+        self.counted > 0 && self.messages.is_empty()
+    }
+
+    /// Take in `messages`, read from this session's file, unless it has been
+    /// filled since the read began.
+    pub fn filled_with(&mut self, messages: Vec<Message>) {
+        if !self.unfilled() {
+            return;
+        }
+        // The file is the count from here. One the other Letronna rewound to
+        // nothing would otherwise stay counted, and read again every time.
+        self.counted = messages.len();
+        self.messages = messages;
+        // What has been written is what was just read, so a flush appends
+        // only what is said from here on rather than the whole history again.
+        // `written` stays as the listing or the last save left it, so a
+        // title changed since and not saved yet still is on the next save.
+        self.flushed = self.messages.len();
+    }
+
+    /// Let go of the messages, which `fill` reads back when they are wanted
+    /// again. Only a session with all of it on disk can; false otherwise.
+    pub fn unload(&mut self) -> bool {
+        let saved = self.flushed == self.messages.len()
+            && self.rewound.is_none()
+            && self.written.as_ref() == Some(&self.meta());
+        // Deleted by the other Letronna, it is held nowhere else.
+        if !saved || self.gone {
+            return false;
+        }
+        self.counted = self.length();
+        self.messages = Vec::new();
+        // Counted from what is held, so a save before the next fill finds
+        // nothing to append.
+        self.flushed = 0;
+        true
+    }
 }
 
 impl Store {
@@ -864,6 +905,102 @@ fn tail_hash(bytes: &[u8]) -> u64 {
         .fold(0, |hash, &byte| (hash << 8) | u64::from(byte))
 }
 
+/// A file the agent wrote, as the Artifacts page lists it.
+pub struct Artifact {
+    pub path: PathBuf,
+    /// The title of the newest session that wrote it.
+    pub session: String,
+    pub written: u64,
+    /// How many times it was written or edited across all sessions.
+    pub writes: usize,
+}
+
+/// Every file written or edited in a session with a project folder, newest
+/// first, one entry per file however often it was touched.
+///
+/// Read from the files, as most sessions are not in memory. Only sessions
+/// with a project folder are opened, and in them only the lines naming a
+/// write or an edit are parsed; the rest are counted by their tag.
+pub fn artifacts() -> Vec<Artifact> {
+    let mut found: Vec<Artifact> = Vec::new();
+    let mut at = std::collections::HashMap::new();
+    for summary in summaries() {
+        let Some(workspace) = &summary.workspace else {
+            continue;
+        };
+        for relative in written_in(&session_path(summary.id)) {
+            let path = workspace.join(relative);
+            let Some(&ix) = at.get(&path) else {
+                at.insert(path.clone(), found.len());
+                found.push(Artifact {
+                    path,
+                    session: summary.title.clone(),
+                    written: summary.updated,
+                    writes: 1,
+                });
+                continue;
+            };
+            let existing = &mut found[ix];
+            existing.writes += 1;
+            // Newest first, so a tie goes to the session already there.
+            if summary.updated > existing.written {
+                existing.written = summary.updated;
+                existing.session = summary.title.clone();
+            }
+        }
+    }
+    found.sort_by_key(|a| std::cmp::Reverse(a.written));
+    found
+}
+
+/// The paths the session file at `path` wrote or edited successfully, as
+/// the calls gave them, leaving out any a later rewind took back.
+fn written_in(path: &std::path::Path) -> Vec<String> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    // Leniently, as `replay` reads: a bad byte costs its own line only.
+    let text = String::from_utf8_lossy(&bytes);
+    let (mut count, mut writes) = (0, Vec::new());
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let message = line.starts_with("{\"type\":\"message\"");
+        if message && !line.contains("\"write_file\"") && !line.contains("\"edit_file\"") {
+            count += 1;
+            continue;
+        }
+        match serde_json::from_str::<Record>(line) {
+            Ok(Record::Message(m)) => {
+                count += 1;
+                if let Some(relative) = wrote(&m) {
+                    writes.push((count - 1, relative));
+                }
+            }
+            Ok(Record::Rewind { to }) => {
+                count = count.min(to);
+                writes.retain(|(ix, _)| *ix < to);
+            }
+            // Counted by its tag all the same, as the listing counts it.
+            Err(_) if message => count += 1,
+            _ => {}
+        }
+    }
+    writes.into_iter().map(|(_, relative)| relative).collect()
+}
+
+/// The path a successful write or edit result wrote to.
+fn wrote(message: &Message) -> Option<String> {
+    if message.role != "tool" || message.is_error {
+        return None;
+    }
+    if !matches!(message.name.as_str(), "write_file" | "edit_file") {
+        return None;
+    }
+    let mut args = crate::tools::parse_args(&message.args).ok()?;
+    // Under the name the write ran with, `file_path` included.
+    crate::tools::rename_aliases(&message.name, &mut args);
+    args["path"].as_str().map(str::to_owned)
+}
+
 /// A place in an earlier session where a search found what it looked for.
 pub struct Hit {
     pub id: u64,
@@ -1087,9 +1224,8 @@ fn session_ids() -> Vec<u64> {
 /// Every session's messages are in memory after `load`, which is most of what
 /// it costs and almost none of what is used: one conversation is open and the
 /// rest are a list of titles. This reads the head and meta of each file and
-/// leaves the messages for `fill`, which is what the terminal wants -- it
-/// starts often and opens one session. The window keeps `load`, because its
-/// sidebar searches across all of them.
+/// leaves the messages for `fill`, which is what both frontends want: the
+/// terminal opens one session, and the window a few it lets go of again.
 pub fn load_listing() -> Store {
     migrate();
     crate::history::sweep(gone);
@@ -1125,16 +1261,18 @@ pub fn load_listing() -> Store {
 
 /// Read a session's messages, if they are not already here.
 pub fn fill(conversation: &mut Conversation) {
-    if conversation.counted == 0 || !conversation.messages.is_empty() {
+    if !conversation.unfilled() {
         return;
     }
-    if let Some(full) = replay(&session_path(conversation.id)) {
-        conversation.messages = full.messages;
-        // What has been written is what was just read, so a flush appends
-        // only what is said from here on rather than the whole history again.
-        conversation.flushed = conversation.messages.len();
-        conversation.written = Some(conversation.meta());
+    if let Some(messages) = messages(conversation.id) {
+        conversation.filled_with(messages);
     }
+}
+
+/// Session `id`'s messages as its file has them, for filling it off the
+/// thread that holds it; None when the file cannot be read.
+pub fn messages(id: u64) -> Option<Vec<Message>> {
+    replay(&session_path(id)).map(|conversation| conversation.messages)
 }
 
 /// The settings as the file has them now.
@@ -2831,6 +2969,194 @@ pub(crate) mod tests {
             .filter_map(Result::ok)
             .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
         assert!(!temp);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_session_let_go_of_reads_back_what_it_had() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("unload");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let mut store = Store::default();
+        store.conversations.push(numbered(3));
+        store.save().unwrap();
+        let path = dir.join("sessions/1.jsonl");
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let open = &mut store.conversations[0];
+        assert!(open.unload());
+        assert!(open.messages.is_empty());
+        assert_eq!(open.length(), 3);
+        // Saved while let go, nothing is written, above all not a rewind.
+        store.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        let open = &mut store.conversations[0];
+        fill(open);
+        let contents: Vec<&str> = open.messages.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, ["0", "1", "2"]);
+        open.messages.push(said("user", "3"));
+        store.save().unwrap();
+        let back = replay(&path).unwrap();
+        let contents: Vec<&str> = back.messages.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, ["0", "1", "2", "3"]);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_session_with_anything_unsaved_is_kept() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("unload-unsaved");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let mut store = Store::default();
+        store.conversations.push(numbered(3));
+        // Never saved at all.
+        assert!(!store.conversations[0].unload());
+        store.save().unwrap();
+
+        let open = &mut store.conversations[0];
+        open.messages.push(said("user", "3"));
+        assert!(!open.unload(), "a message not yet written");
+        store.save().unwrap();
+        let open = &mut store.conversations[0];
+        open.rewind(1);
+        assert!(!open.unload(), "a rewind not yet written");
+        store.save().unwrap();
+        let open = &mut store.conversations[0];
+        open.title = "renamed".into();
+        assert!(!open.unload(), "a new title not yet written");
+        store.save().unwrap();
+        assert!(store.conversations[0].unload());
+        assert_eq!(store.conversations[0].length(), 1);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_rename_not_yet_saved_survives_the_session_being_read_in() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("fill-rename");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let mut store = Store::default();
+        store.conversations.push(numbered(2));
+        store.save().unwrap();
+
+        let mut listed = load_listing();
+        listed.conversations[0].title = "renamed".into();
+        fill(&mut listed.conversations[0]);
+        listed.save().unwrap();
+        let back = replay(&dir.join("sessions/1.jsonl")).unwrap();
+        assert_eq!(back.title, "renamed");
+        assert_eq!(back.messages.len(), 2);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_read_that_lands_after_the_session_moved_on_is_dropped() {
+        let mut open = Conversation {
+            id: 1,
+            counted: 2,
+            ..Default::default()
+        };
+        // Something was said before the read came back: the session now
+        // holds more than its file did, and the read would lose it.
+        open.messages.push(said("user", "new"));
+        open.filled_with(numbered(2).messages);
+        assert_eq!(open.messages.len(), 1);
+        assert_eq!(open.messages[0].content, "new");
+
+        // A file emptied meanwhile is not counted, or read again, any more.
+        let mut emptied = Conversation {
+            id: 1,
+            counted: 2,
+            ..Default::default()
+        };
+        emptied.filled_with(Vec::new());
+        assert!(!emptied.unfilled());
+        assert_eq!(emptied.length(), 0);
+    }
+
+    fn wrote(path: &str, name: &str, is_error: bool) -> Message {
+        Message {
+            role: "tool".into(),
+            name: name.into(),
+            args: format!(r#"{{"path":"{path}"}}"#),
+            is_error,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn artifacts_are_the_writes_on_disk_newest_first_with_repeats_counted() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("artifacts");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let session = |id, title: &str, updated, workspace: Option<&str>, messages| Conversation {
+            id,
+            title: title.into(),
+            updated,
+            workspace: workspace.map(std::path::PathBuf::from),
+            messages,
+            ..Default::default()
+        };
+        let mut file_path = wrote("", "write_file", false);
+        file_path.args = r#"{"file_path":"notes.md","content":"x"}"#.into();
+        let conversations = vec![
+            session(
+                1,
+                "older",
+                100,
+                Some("/work"),
+                vec![
+                    wrote("a.txt", "write_file", false),
+                    wrote("b.txt", "write_file", false),
+                    // Failures never produced a file.
+                    wrote("never.txt", "write_file", true),
+                    // Reads are not artifacts.
+                    wrote("c.txt", "read_file", false),
+                    // Under the name the model sent it with.
+                    file_path,
+                ],
+            ),
+            session(
+                2,
+                "newer",
+                200,
+                Some("/work"),
+                vec![
+                    wrote("a.txt", "edit_file", false),
+                    wrote("taken-back.txt", "write_file", false),
+                ],
+            ),
+            // No project folder means no path to resolve against.
+            session(
+                3,
+                "chat",
+                300,
+                None,
+                vec![wrote("d.txt", "write_file", false)],
+            ),
+        ];
+        let mut store = Store {
+            conversations,
+            ..Default::default()
+        };
+        store.save().unwrap();
+        // What a rewind took back was never there, as far as the session goes.
+        store.conversations[1].rewind(1);
+        store.save().unwrap();
+
+        let found = super::artifacts();
+        let names: Vec<String> = found
+            .iter()
+            .map(|a| a.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["a.txt", "b.txt", "notes.md"]);
+        // a.txt was written then edited, and reports the newer session.
+        assert_eq!(found[0].writes, 2);
+        assert_eq!(found[0].session, "newer");
+        assert_eq!(found[0].written, 200);
+        assert_eq!(found[1].writes, 1);
+        assert_eq!(found[1].path, std::path::PathBuf::from("/work/b.txt"));
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 }

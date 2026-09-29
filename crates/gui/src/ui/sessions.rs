@@ -109,6 +109,7 @@ impl Chat {
                     let id = this.store.conversations[index].id;
                     letronna_core::browser::forget(id);
                     this.drafts.remove(&id);
+                    this.open.retain(|&open| open != id);
                     this.panel.forget(id);
                     // The next new session can be given this id again, and
                     // must not start out with what was allowed here, nor in
@@ -124,6 +125,10 @@ impl Chat {
                     if this.store.active >= index && this.store.active > 0 {
                         this.store.active -= 1;
                     }
+                    // Its files leave the Artifacts page with it.
+                    if this.page == Page::Artifacts {
+                        this.read_artifacts(cx);
+                    }
                     this.save();
                     cx.notify();
                 });
@@ -137,6 +142,7 @@ impl Chat {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.fill_now(index);
         let c = &self.store.conversations[index];
         let mut text = format!("# {}\n\n", c.title);
         for m in &c.messages {

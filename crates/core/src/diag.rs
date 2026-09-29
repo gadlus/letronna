@@ -191,6 +191,71 @@ pub fn millis(started: Instant) -> Value {
         .into()
 }
 
+/// How much of the process is in RAM now, in bytes; None where the system
+/// does not say. Asked of the system rather than of `ps`, so taking it
+/// starts nothing.
+#[cfg(target_os = "macos")]
+pub fn rss_bytes() -> Option<u64> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::uninit();
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_taskinfo>()).ok()?;
+    // SAFETY: the buffer is as large as the flavor's struct and says so,
+    // and it is only read once the call reports filling all of it.
+    let filled = unsafe {
+        libc::proc_pidinfo(
+            libc::getpid(),
+            libc::PROC_PIDTASKINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if filled != size {
+        return None;
+    }
+    // SAFETY: filled in full, as just checked.
+    Some(unsafe { info.assume_init() }.pti_resident_size)
+}
+
+/// How much of the process is in RAM now, in bytes; None where the system
+/// does not say. Asked of the system rather than of `ps`, so taking it
+/// starts nothing.
+#[cfg(target_os = "linux")]
+pub fn rss_bytes() -> Option<u64> {
+    // Sizes in pages: the whole program, then what of it is resident.
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    // SAFETY: sysconf only reads a system setting.
+    let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
+    Some(pages * page)
+}
+
+/// How much of the process is in RAM now, in bytes; None where the system
+/// does not say. The working set, which is what Task Manager shows.
+#[cfg(windows)]
+pub fn rss_bytes() -> Option<u64> {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let size = u32::try_from(std::mem::size_of::<PROCESS_MEMORY_COUNTERS>()).ok()?;
+    // SAFETY: all zeroes is a valid value of this plain C struct.
+    let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    counters.cb = size;
+    // SAFETY: the pseudo handle for this process needs no closing, and
+    // `counters` is the struct the call fills, passed with its own size.
+    let read = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, size) };
+    if read == 0 {
+        return None;
+    }
+    u64::try_from(counters.WorkingSetSize).ok()
+}
+
+/// How much of the process is in RAM now: not known on this system.
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+pub fn rss_bytes() -> Option<u64> {
+    None
+}
+
 /// Whether `url` answers at all, with its HTTP status. Any status counts:
 /// this asks whether the server is there, not whether it likes us, so no
 /// key is sent.
@@ -578,5 +643,14 @@ mod tests {
         assert_eq!(class("operation timed out"), "timeout");
         assert_eq!(class("something else entirely"), "other");
         assert_eq!(outcome::<()>(&Ok(())), "ok");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn the_process_says_how_much_of_it_is_in_memory() {
+        let rss = rss_bytes().unwrap();
+        // A test binary with its libraries loaded is past a megabyte, and no
+        // test process comes near a terabyte.
+        assert!(rss > 1 << 20 && rss < 1 << 40, "{rss}");
     }
 }

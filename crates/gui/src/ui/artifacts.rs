@@ -3,67 +3,32 @@
 //! Nothing extra is stored for this. Every write already leaves a `tool`
 //! message in the session it happened in, so the list is derived from the
 //! history on the way in. That means it can never disagree with what actually
-//! happened, and deleting a session takes its artifacts with it.
+//! happened, and deleting a session takes its artifacts with it. The history
+//! is read from disk, by `store::artifacts`, as most sessions are not in
+//! memory: once each time the page opens, off the UI thread.
 
 use crate::prelude::*;
-use letronna_core::tools;
-
-pub(crate) struct Artifact {
-    pub(crate) path: PathBuf,
-    /// The session it was written in.
-    pub(crate) session: String,
-    pub(crate) written: u64,
-    /// How many times it was written or edited across all sessions.
-    pub(crate) writes: usize,
-}
-
-/// Newest first, one entry per file however often it was touched.
-pub(crate) fn collect(store: &Store) -> Vec<Artifact> {
-    let mut found: Vec<Artifact> = Vec::new();
-    for conversation in &store.conversations {
-        let Some(workspace) = &conversation.workspace else {
-            continue;
-        };
-        for message in &conversation.messages {
-            if message.role != "tool" || message.is_error {
-                continue;
-            }
-            if !matches!(message.name.as_str(), "write_file" | "edit_file") {
-                continue;
-            }
-            let Ok(mut args) = tools::parse_args(&message.args) else {
-                continue;
-            };
-            // Under the name the write ran with, `file_path` included.
-            tools::rename_aliases(&message.name, &mut args);
-            let Some(relative) = args["path"].as_str() else {
-                continue;
-            };
-            let path = workspace.join(relative);
-            match found.iter_mut().find(|a| a.path == path) {
-                Some(existing) => {
-                    existing.writes += 1;
-                    if conversation.updated >= existing.written {
-                        existing.written = conversation.updated;
-                        existing.session = conversation.title.clone();
-                    }
-                }
-                None => found.push(Artifact {
-                    path,
-                    session: conversation.title.clone(),
-                    written: conversation.updated,
-                    writes: 1,
-                }),
-            }
-        }
-    }
-    found.sort_by_key(|a| std::cmp::Reverse(a.written));
-    found
-}
 
 impl Chat {
+    /// Read the files the Artifacts page lists again, off the UI thread:
+    /// every session with a project folder is looked through.
+    pub(crate) fn read_artifacts(&mut self, cx: &mut Context<Self>) {
+        self.artifacts = None;
+        cx.spawn(async move |this, cx| {
+            let found = cx
+                .background_executor()
+                .spawn(async { letronna_core::store::artifacts() })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.artifacts = Some(found);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     pub(crate) fn artifacts_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let artifacts = collect(&self.store);
+        let artifacts = self.artifacts.as_deref().unwrap_or_default();
         let now = backend::now();
         let rows: Vec<AnyElement> = artifacts
             .iter()
@@ -177,7 +142,8 @@ impl Chat {
                         div()
                             .text_sm()
                             .text_color(cx.theme().muted_foreground)
-                            .child(if rows.is_empty() {
+                            // Not "nothing" while the sessions are still being read.
+                            .child(if self.artifacts.as_ref().is_some_and(Vec::is_empty) {
                                 "Files Letronna writes will be listed here, newest first. \
                                  Nothing yet."
                             } else {
@@ -195,90 +161,5 @@ impl Chat {
                     .overflow_y_scroll()
                     .child(v_flex().children(rows)),
             )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
-    // would shadow the built-in attribute.
-    use super::collect;
-    use letronna_core::chat::Message;
-    use letronna_core::store::{Conversation, Store};
-
-    fn wrote(path: &str, name: &str, is_error: bool) -> Message {
-        Message {
-            role: "tool".into(),
-            name: name.into(),
-            args: format!(r#"{{"path":"{path}"}}"#),
-            is_error,
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn collects_writes_and_counts_repeats() {
-        let store = Store {
-            conversations: vec![
-                Conversation {
-                    title: "older".into(),
-                    updated: 100,
-                    workspace: Some("/work".into()),
-                    messages: vec![
-                        wrote("a.txt", "write_file", false),
-                        wrote("b.txt", "write_file", false),
-                        // Failures never produced a file.
-                        wrote("never.txt", "write_file", true),
-                        // Reads are not artifacts.
-                        wrote("c.txt", "read_file", false),
-                    ],
-                    ..Default::default()
-                },
-                Conversation {
-                    title: "newer".into(),
-                    updated: 200,
-                    workspace: Some("/work".into()),
-                    messages: vec![wrote("a.txt", "edit_file", false)],
-                    ..Default::default()
-                },
-                // No project folder means no path to resolve against.
-                Conversation {
-                    title: "chat".into(),
-                    updated: 300,
-                    messages: vec![wrote("d.txt", "write_file", false)],
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
-
-        let found = collect(&store);
-        let names: Vec<String> = found
-            .iter()
-            .map(|a| a.path.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(names, ["a.txt", "b.txt"]);
-
-        // a.txt was written then edited, and reports the newer session.
-        assert_eq!(found[0].writes, 2);
-        assert_eq!(found[0].session, "newer");
-        assert_eq!(found[1].writes, 1);
-    }
-
-    #[test]
-    fn a_write_sent_with_file_path_is_listed() {
-        let mut message = wrote("", "write_file", false);
-        message.args = r#"{"file_path":"notes.md","content":"x"}"#.into();
-        let store = Store {
-            conversations: vec![Conversation {
-                workspace: Some("/work".into()),
-                messages: vec![message],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let found = collect(&store);
-        assert_eq!(found.len(), 1);
-        assert!(found[0].path.ends_with("notes.md"));
     }
 }
