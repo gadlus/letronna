@@ -167,15 +167,16 @@ impl Turn {
 
 /// Whether a call has to wait for the user.
 ///
-/// `ask_user` always does, whatever else is permitted: it is a question, not
-/// an action to allow. Everything else is a matter of who has already said
-/// yes, and how widely.
+/// `ask_user` does, whatever else is permitted: it is a question, not an
+/// action to allow. The exception is an unattended run, where nobody would
+/// ever answer and the run would wait forever, so the tool answers instead.
+/// Everything else is a matter of who has already said yes, and how widely.
 pub fn needs_user(name: &str, skip_all: bool, allowed: &HashSet<String>, unattended: bool) -> bool {
     if !tools::needs_approval(name) {
         return false;
     }
     if name == tools::ASK_USER {
-        return true;
+        return !unattended;
     }
     !(skip_all || unattended || allowed.contains(name))
 }
@@ -315,7 +316,23 @@ mod tests {
         assert!(!needs_user("write_file", false, &none, true));
         let allowed = HashSet::from(["write_file".to_owned()]);
         assert!(!needs_user("write_file", false, &allowed, false));
-        // A question is never auto-answered, however wide the permission.
-        assert!(needs_user(tools::ASK_USER, true, &allowed, true));
+        // A question is never auto-answered, however wide the permission,
+        // unless nobody is there to answer it.
+        assert!(needs_user(tools::ASK_USER, true, &allowed, false));
+        assert!(!needs_user(tools::ASK_USER, false, &none, true));
+    }
+
+    #[test]
+    fn an_unattended_question_is_answered_by_the_tool() {
+        let mut turn = turn();
+        turn.begin(vec![call(tools::ASK_USER)]);
+        let none = HashSet::new();
+        let unattended = |name: &str| needs_user(name, false, &none, true);
+        assert_eq!(turn.next(unattended), Next::Run(call(tools::ASK_USER)));
+        let answer = tools::run(tools::ASK_USER, "{}", &tools::ToolContext::default()).unwrap();
+        assert!(
+            answer.starts_with("Nobody is available to answer"),
+            "{answer}"
+        );
     }
 }
