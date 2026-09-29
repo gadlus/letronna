@@ -70,6 +70,9 @@ const MESSAGE_CHARS: usize = 200;
 /// The largest message read from a server, so a garbled header cannot ask
 /// for all the memory there is.
 const MAX_FRAME: usize = 64 << 20;
+/// The most of one line read before a message: a header takes a few dozen
+/// bytes, and a line printed with no end must not take all the memory.
+const MAX_LINE: u64 = 8 << 10;
 
 /// `lsp.json`: the servers, by a name of the user's choosing.
 #[derive(Deserialize, Default)]
@@ -967,15 +970,18 @@ fn listen(weak: &Weak<Server>, from: Box<dyn Read + Send>) {
 }
 
 /// The next message from `from`, or None at its end. What is not a header
-/// is passed over: some servers print a banner on stdout first.
+/// is passed over, text or not: some servers print a banner on stdout
+/// first.
 fn read_frame(from: &mut impl BufRead) -> std::io::Result<Option<Value>> {
     loop {
         let mut length = None;
         loop {
-            let mut line = String::new();
-            if from.read_line(&mut line)? == 0 {
+            // A longer line comes in pieces, each passed over.
+            let mut line = Vec::new();
+            if from.by_ref().take(MAX_LINE).read_until(b'\n', &mut line)? == 0 {
                 return Ok(None);
             }
+            let line = String::from_utf8_lossy(&line);
             let line = line.trim();
             if line.is_empty() && length.is_some() {
                 break;
@@ -1334,6 +1340,15 @@ mod tests {
             Some(json!({"method": "a\r\n\r\nb"}))
         );
         assert_eq!(read_frame(&mut from).unwrap(), None);
+    }
+
+    #[test]
+    fn a_line_that_is_not_text_or_never_ends_is_passed_over() {
+        let one = frame(&json!({"id": 1}));
+        let endless = vec![b'x'; 3 * MAX_LINE as usize];
+        let text = [b"\xff\xfe starting\n".as_slice(), &endless, b"\n", &one].concat();
+        let mut from = BufReader::new(text.as_slice());
+        assert_eq!(read_frame(&mut from).unwrap(), Some(json!({"id": 1})));
     }
 
     #[test]
