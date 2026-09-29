@@ -41,6 +41,10 @@ pub struct Message {
     pub args: String,
     #[serde(default)]
     pub is_error: bool,
+    /// For `role: "tool"`: the files the call wrote, so a rewind can put them
+    /// back. Left out of the saved line when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<crate::history::FileChange>,
     /// Set on a user message that went into a turn already running, such as a
     /// follow-up typed while its tools ran, rather than starting a turn.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

@@ -311,8 +311,8 @@ impl Change {
 
     /// Writes `bytes` over the file, whole or not at all, and records them
     /// as what the model has seen of it.
-    pub(crate) fn write(mut self, bytes: &[u8]) -> Result<(), String> {
-        crate::write::atomic(&self.path, bytes)?;
+    pub(crate) fn write(mut self, bytes: &[u8], log: &crate::history::Log) -> Result<(), String> {
+        crate::write::atomic(&self.path, bytes, log)?;
         let seen = Seen {
             len: bytes.len() as u64,
             print: print_of(bytes, &self.path),

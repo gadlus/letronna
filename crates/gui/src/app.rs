@@ -1281,7 +1281,7 @@ impl Chat {
     fn call_context(&self) -> letronna_core::tools::ToolContext {
         self.turn
             .as_ref()
-            .map(|turn| letronna_core::tools::ToolContext::of(&turn.connection))
+            .map(agent::Turn::tool_context)
             .unwrap_or_default()
     }
 

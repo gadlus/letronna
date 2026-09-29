@@ -323,7 +323,7 @@ impl Runner {
     ) -> bool {
         let ctx = tools::ToolContext {
             approved,
-            ..tools::ToolContext::of(&turn.connection)
+            ..turn.tool_context()
         };
         let summary = tools::summary(&call.name, &call.arguments);
         let ran = self.run_off_the_loop(&call, ctx, &summary);

@@ -24,6 +24,7 @@ mod filestate;
 pub mod gate;
 pub mod gateway;
 mod grep;
+pub mod history;
 pub mod inbox;
 pub mod jobs;
 pub mod judge;

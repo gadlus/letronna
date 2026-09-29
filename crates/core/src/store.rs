@@ -363,7 +363,8 @@ impl Store {
     }
 
     /// Forget a session and remove its file, its helpers' conversations,
-    /// and its lock file if it can take the lock.
+    /// the copies kept of the files it wrote, and its lock file if it can
+    /// take the lock.
     pub fn remove(&mut self, index: usize) {
         if index >= self.conversations.len() {
             return;
@@ -381,6 +382,7 @@ impl Store {
         let _ = std::fs::remove_dir_all(crate::tools::results_dir(gone.id));
         // A new session can be given the same id.
         crate::filestate::forget(gone.id);
+        crate::history::forget(gone.id);
     }
 }
 
@@ -862,6 +864,12 @@ impl Drop for Lock {
     }
 }
 
+/// Whether session `id` is surely not saved: a file that merely cannot be
+/// read now does not count, as its kept copies would go with the answer.
+fn gone(id: u64) -> bool {
+    std::fs::metadata(session_path(id)).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+}
+
 fn session_ids() -> Vec<u64> {
     let Ok(entries) = std::fs::read_dir(sessions_dir()) else {
         return Vec::new();
@@ -891,6 +899,7 @@ fn session_ids() -> Vec<u64> {
 /// sidebar searches across all of them.
 pub fn load_listing() -> Store {
     migrate();
+    crate::history::sweep(gone);
     let mut conversations: Vec<Conversation> = summaries()
         .into_iter()
         .map(|s| {
@@ -997,6 +1006,7 @@ mod retire_tests {
 
 pub fn load() -> Store {
     migrate();
+    crate::history::sweep(gone);
     let mut conversations: Vec<Conversation> = session_ids()
         .into_iter()
         .filter_map(|id| replay(&session_path(id)))
@@ -2315,6 +2325,25 @@ pub(crate) mod tests {
         store.remove(0);
         assert!(!mine.exists() && !dir.join("sessions/1.jsonl").exists());
         assert!(other.join("1-0.txt").is_file());
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn removing_a_session_removes_the_copies_of_its_files() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("remove-history");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        store.conversations.push(numbered(2));
+        store.save().unwrap();
+        let kept = crate::history::folder(1);
+        std::fs::create_dir_all(&kept).unwrap();
+        std::fs::write(kept.join("copy"), "old").unwrap();
+
+        store.remove(0);
+        assert!(!dir.join("sessions/1.jsonl").exists());
+        assert!(!kept.exists());
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 }

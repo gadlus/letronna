@@ -5,12 +5,16 @@
 //!
 //! Everything works by place in the session. Going back is saved as a
 //! rewind record the store appends (`Conversation::rewind`), so the terminal
-//! sees the shorter session too.
+//! sees the shorter session too. It can also put back the files the agent's
+//! tools wrote since, from the copies `history` kept of them.
 
 use crate::prelude::*;
+use gpui_component::checkbox::Checkbox;
 use gpui_component::menu::PopupMenu;
 use gpui_component::notification::Notification;
 use gpui_component::{button::ButtonVariant, dialog::DialogButtonProps};
+use letronna_core::history;
+use std::{cell::Cell, rc::Rc};
 
 /// A turn's place in its session: your message on its own, or everything
 /// the model did in reply to it.
@@ -198,30 +202,74 @@ impl Chat {
             return;
         }
         let keep = span.keep();
+        if self.open_messages().len() <= keep {
+            return;
+        }
+        let back = span.yours.then(|| self.prompt_text(span.first)).flatten();
+        let open = &self.store.conversations[self.store.active];
+        let (session, folder) = (open.id, open.workspace.clone());
+        let dropped = open.messages[keep..].to_vec();
+        // Each file the dropped turns wrote is read and hashed, which a big
+        // one makes slow, so the question waits for it off the UI thread.
+        let planned = cx.background_executor().spawn(async move {
+            let files = history::plan(session, &dropped, folder.as_deref());
+            let mut rows = history::listing(&files, folder.as_deref());
+            if !files.is_empty() && history::ran_commands(&dropped) {
+                rows.push(history::COMMANDS_NOTE.to_owned());
+            }
+            (files, rows)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let (files, rows) = planned.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.busy || this.store.conversations[this.store.active].id != session {
+                    return;
+                }
+                this.ask_rewind(keep, back, files, rows, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Ask whether to go back to `keep`, listing `files` as `rows` under the
+    /// box that puts them back too.
+    fn ask_rewind(
+        &mut self,
+        keep: usize,
+        back: Option<String>,
+        files: Vec<history::Restore>,
+        rows: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let gone = self.open_messages().len().saturating_sub(keep);
         if gone == 0 {
             return;
         }
-        let back = span.yours.then(|| self.prompt_text(span.first)).flatten();
-        let body = if back.is_some() {
+        let mut body = if back.is_some() {
             format!(
                 "This message and {} after it leave the session, and its text goes back in the \
-                 box. Files the agent changed stay as they are.",
+                 box.",
                 message_count(gone - 1)
             )
         } else {
-            format!(
-                "{} after this leave the session. Files the agent changed stay as they are.",
-                message_count(gone)
-            )
+            format!("{} after this leave the session.", message_count(gone))
         };
+        if files.is_empty() {
+            body.push_str(" Files the agent changed stay as they are.");
+        }
         let session = self.store.conversations[self.store.active].id;
+        // Unticked to start with, as the terminal's /undo needs --files:
+        // putting files back replaces what is on disk, so it is asked for.
+        let put_back = Rc::new(Cell::new(false));
         let chat = cx.entity();
         window.open_dialog(cx, move |dialog, _, cx| {
             let (chat, back) = (chat.clone(), back.clone());
+            let (files, put_back) = (files.clone(), put_back.clone());
+            let ticked = put_back.get();
             dialog
                 .title(div().font_family(HEADING_FONT).child("Rewind to here"))
-                .w(px(420.))
+                .w(px(460.))
                 .confirm()
                 .button_props(
                     DialogButtonProps::default()
@@ -234,6 +282,32 @@ impl Chat {
                         .text_color(cx.theme().muted_foreground)
                         .child(body.clone()),
                 )
+                .when(!rows.is_empty(), |dialog| {
+                    dialog.child(
+                        v_flex()
+                            .mt_3()
+                            .gap_1()
+                            .child(
+                                Checkbox::new("rewind-files")
+                                    .label("Put the files back too")
+                                    .checked(ticked)
+                                    .on_click({
+                                        let put_back = put_back.clone();
+                                        move |checked, window, _| {
+                                            put_back.set(*checked);
+                                            window.refresh();
+                                        }
+                                    }),
+                            )
+                            .children(rows.iter().map(|row| {
+                                div()
+                                    .pl_6()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(row.clone())
+                            })),
+                    )
+                })
                 .on_ok(move |_, window, cx| {
                     chat.update(cx, |this, cx| {
                         // A reply may have started, or the session changed,
@@ -242,6 +316,9 @@ impl Chat {
                             return;
                         }
                         this.cut_to(keep);
+                        if put_back.get() && !files.is_empty() {
+                            this.put_files_back(session, files.clone(), window, cx);
+                        }
                         if let Some(text) = back.clone() {
                             this.composer
                                 .update(cx, |input, cx| input.set_value(text, window, cx));
@@ -252,6 +329,36 @@ impl Chat {
                     true
                 })
         });
+    }
+
+    /// Put back the files a rewind of `session` listed, off the UI thread,
+    /// and say how it went: what could not be, and what was left alone, by
+    /// name.
+    fn put_files_back(
+        &mut self,
+        session: u64,
+        files: Vec<history::Restore>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let folder = self.store.conversations[self.store.active]
+            .workspace
+            .clone();
+        let restored = cx
+            .background_executor()
+            .spawn(async move { history::restore(session, &files, folder.as_deref()) });
+        cx.spawn_in(window, async move |this, cx| {
+            let done = restored.await;
+            let said = done.lines().join("\n");
+            let _ = this.update_in(cx, |_, window, cx| {
+                if !done.left.is_empty() {
+                    window.push_notification(Notification::warning(said), cx);
+                } else if !said.is_empty() {
+                    window.push_notification(Notification::success(said), cx);
+                }
+            });
+        })
+        .detach();
     }
 
     /// Carry on in a copy of the session up to this turn; the original stays
@@ -282,6 +389,7 @@ impl Chat {
             messages,
             ..Default::default()
         };
+        history::share(source.id, id);
         self.store.conversations.push(fork);
         self.store.active = self.store.conversations.len() - 1;
         self.page = Page::Chat;

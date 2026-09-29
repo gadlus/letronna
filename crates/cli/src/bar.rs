@@ -93,7 +93,7 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "/undo",
-        blurb: "take back the last exchange",
+        blurb: "take back the last exchange; --files puts files back too",
     },
     Command {
         name: "/retry",

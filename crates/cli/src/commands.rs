@@ -2,7 +2,7 @@
 //! than of the model.
 
 use letronna_core::skills::{Skill, Source};
-use letronna_core::store;
+use letronna_core::{history, store};
 
 use crate::banner::{banner, folder_name, footer, replay};
 use crate::bar;
@@ -138,17 +138,13 @@ pub fn command(
             Flow::Handled
         }
         "/undo" => {
-            match take_back(runner, *session, workspace) {
-                Some(prompt) => {
-                    runner.bar.say(&prompt);
-                    render::blank();
-                    render::line(&render::dim(
-                        "Took back the last exchange. Your message is back in the box.",
-                    ));
-                }
+            match with_files(rest) {
+                Some(files) => undo(runner, *session, workspace, files),
                 None => {
                     render::blank();
-                    render::line(&render::dim("Nothing to take back."));
+                    render::line(&render::red(
+                        "Usage: /undo, or /undo --files to put the files back too.",
+                    ));
                 }
             }
             Flow::Handled
@@ -800,6 +796,86 @@ pub fn resume(runner: &mut Runner, session: &mut usize, workspace: Option<&std::
     replay(runner, index);
 }
 
+/// Whether /undo's argument asks for the files too; `None` for one it does
+/// not know, which must not run a plain undo that drops the files' history.
+fn with_files(rest: &str) -> Option<bool> {
+    match rest {
+        "" => Some(false),
+        "--files" => Some(true),
+        _ => None,
+    }
+}
+
+/// Take back the last exchange. With `files`, what its tools wrote goes
+/// back too, once the list of those files is agreed to; without, the files
+/// it wrote are named as staying.
+fn undo(runner: &mut Runner, session: usize, workspace: Option<&std::path::Path>, files: bool) {
+    let conversation = &runner.store.conversations[session];
+    let id = conversation.id;
+    let folder = conversation
+        .workspace
+        .clone()
+        .or_else(|| workspace.map(std::path::Path::to_path_buf));
+    let (plan, commands) = match last_prompt(&conversation.messages) {
+        Some((at, _)) => {
+            let dropped = &conversation.messages[at..];
+            let plan = history::plan(id, dropped, folder.as_deref());
+            (plan, history::ran_commands(dropped))
+        }
+        None => (Vec::new(), false),
+    };
+    if files && !plan.is_empty() {
+        let mut detail = history::listing(&plan, folder.as_deref());
+        if commands {
+            detail.push(history::COMMANDS_NOTE.to_owned());
+        }
+        let options = [
+            "Take it back and put the files back",
+            "Leave everything as it is",
+        ];
+        let picked = runner
+            .bar
+            .choose("Put these files back too?", detail, &options);
+        if picked != Some(0) {
+            render::blank();
+            render::line(&render::dim("Nothing taken back."));
+            return;
+        }
+    }
+    let Some(prompt) = take_back(runner, session, workspace) else {
+        render::blank();
+        render::line(&render::dim("Nothing to take back."));
+        return;
+    };
+    runner.bar.say(&prompt);
+    render::blank();
+    render::line(&render::dim(
+        "Took back the last exchange. Your message is back in the box.",
+    ));
+    if plan.is_empty() {
+        return;
+    }
+    if !files {
+        let names: Vec<String> = plan
+            .iter()
+            .map(|file| history::label(&file.path, folder.as_deref()))
+            .collect();
+        render::line(&render::dim(&format!(
+            "The files it wrote stay as they are: {}.",
+            names.join(", ")
+        )));
+        return;
+    }
+    // The question above went with the redraw, so what was left alone is
+    // said again here.
+    for line in history::restore(id, &plan, folder.as_deref()).lines() {
+        render::line(&render::dim(&line));
+    }
+    if commands {
+        render::line(&render::dim(history::COMMANDS_NOTE));
+    }
+}
+
 /// Take the session back to just before the last thing you said, and the
 /// screen with it. Returns what you said, or `None` when nothing has been.
 fn take_back(
@@ -855,6 +931,7 @@ fn branch(runner: &mut Runner, session: &mut usize, name: &str) {
         todos: from.todos.clone(),
         ..Default::default()
     };
+    history::share(from.id, copy.id);
     runner.store.conversations.push(copy);
     *session = runner.store.conversations.len() - 1;
     runner.store.active = *session;
@@ -1199,7 +1276,7 @@ pub fn gateways(runner: &mut Runner) {
 
 #[cfg(test)]
 mod tests {
-    use super::last_prompt;
+    use super::{last_prompt, with_files};
     use letronna_core::chat::Message;
 
     fn said(role: &str, content: &str) -> Message {
@@ -1229,5 +1306,13 @@ mod tests {
     fn nothing_said_means_nothing_to_take_back() {
         assert_eq!(last_prompt(&[]), None);
         assert_eq!(last_prompt(&[said("assistant", "hello")]), None);
+    }
+
+    #[test]
+    fn undo_refuses_a_flag_it_does_not_know() {
+        assert_eq!(with_files(""), Some(false));
+        assert_eq!(with_files("--files"), Some(true));
+        assert_eq!(with_files("--file"), None);
+        assert_eq!(with_files("files"), None);
     }
 }

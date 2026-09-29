@@ -82,6 +82,8 @@ pub struct Turn {
     queue: VecDeque<ToolCall>,
     /// Tool results for the batch being worked through.
     results: Vec<Message>,
+    /// What the calls' file writes kept, taken onto each result.
+    files: crate::history::Log,
     /// Set when the reply being streamed stopped at the output limit: true
     /// when it stopped inside a tool call.
     cut_off: Option<bool>,
@@ -91,6 +93,7 @@ pub struct Turn {
 impl Turn {
     pub fn new(connection: Connection) -> Self {
         Self {
+            files: crate::history::Log::new(connection.conversation),
             connection,
             live: Live::default(),
             rounds: 0,
@@ -107,6 +110,15 @@ impl Turn {
         Self {
             limit: rounds,
             ..Self::new(connection)
+        }
+    }
+
+    /// What a call of this turn runs with: its folder and session, and the
+    /// log its file writes are noted in.
+    pub fn tool_context(&self) -> tools::ToolContext {
+        tools::ToolContext {
+            files: self.files.clone(),
+            ..tools::ToolContext::of(&self.connection)
         }
     }
 
@@ -219,6 +231,7 @@ impl Turn {
             name: call.name,
             args: call.arguments,
             is_error,
+            files: self.files.take(),
             ..Default::default()
         });
     }
