@@ -146,11 +146,13 @@ fn fetch(raw: &str, secrets: &[String]) -> Result<String, String> {
         let Some(next) = moved_to(&response) else {
             break response;
         };
-        previous.push(url);
-        follow(&previous, &next, &secrets)?;
+        // Before `follow`, whose address check would refuse it first in
+        // words written for the browser.
         if !matches!(next.scheme(), "http" | "https") {
             return Err("The page redirected somewhere that is not a web page.".into());
         }
+        previous.push(url);
+        follow(&previous, &next, &secrets)?;
         url = next;
     };
     let status = response.status();
@@ -529,6 +531,7 @@ mod tests {
             "/metadata" => "http://169.254.169.254/latest/meta-data/",
             "/leak" => "/?k=sk-live-0123456789abcdef",
             "/name" => "http://Sk-Live-0123456789ABCDEF.invalid/",
+            "/ftp" => "ftp://example.com/file",
             _ => {
                 return "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 7\r\n\
                         Connection: close\r\n\r\narrived"
@@ -556,6 +559,8 @@ mod tests {
         assert!(why.contains("keys or tokens"), "{why}");
         let why = fetch(&format!("{base}/loop"), &[]).unwrap_err();
         assert!(why.contains("more than five"), "{why}");
+        let why = fetch(&format!("{base}/ftp"), &[]).unwrap_err();
+        assert!(why.contains("not a web page"), "{why}");
         let asked = asked.lock().unwrap();
         assert!(!asked.iter().any(|path| path.contains(&key)), "{asked:?}");
         // The address asked for, then the five redirects that are followed.
