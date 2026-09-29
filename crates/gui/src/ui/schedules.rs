@@ -165,8 +165,10 @@ impl Chat {
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
                                     .child(
-                                        "Approve writes and commands automatically. Without this a \
-                                         job that needs approval waits until you are back.",
+                                        "Approve writes and commands automatically, except some \
+                                         commands that are hard to undo, such as recursive deletes \
+                                         and force pushes, which are skipped. Without this a job \
+                                         that needs approval waits until you are back.",
                                     ),
                             ),
                     )

@@ -45,7 +45,7 @@ impl ToolContext {
 
     /// Other people can read the replies, so nothing on this computer is in
     /// reach: what a tool finds would be posted to all of them.
-    fn shared(&self) -> bool {
+    pub(crate) fn shared(&self) -> bool {
         self.remote.as_ref().is_some_and(|r| r.shared)
     }
 }
@@ -392,7 +392,7 @@ pub fn specs(connection: &Connection) -> Vec<Value> {
 pub fn run(name: &str, args: &str, ctx: &ToolContext) -> Result<String, String> {
     let tool = find(name).ok_or_else(|| format!("Unknown tool `{name}`."))?;
     let started = Instant::now();
-    let result = run_found(tool.as_ref(), name, args, ctx);
+    let result = run_found(tool.as_ref(), args, ctx);
     crate::diag::event(
         "tool",
         &[
@@ -405,36 +405,15 @@ pub fn run(name: &str, args: &str, ctx: &ToolContext) -> Result<String, String> 
     result
 }
 
-fn run_found(tool: &dyn Tool, name: &str, args: &str, ctx: &ToolContext) -> Result<String, String> {
+fn run_found(tool: &dyn Tool, args: &str, ctx: &ToolContext) -> Result<String, String> {
     // Only fitting tools are offered, but the model can name any of them;
     // refuse here too rather than trust the offer.
-    if ctx.shared() && tool.machine() {
-        return Err(format!(
-            "`{name}` is not available here: other people can read this chat, so \
-             nothing on this computer is in reach."
-        ));
-    }
-    if ctx.plan && tool.mutates() {
-        return Err(format!(
-            "`{name}` is not available in plan mode: it changes things, and plan \
-             mode can only look and propose. Describe the change instead."
-        ));
-    }
     let mut args = parse_args(args)?;
     let note = reinterpreted(&repair(tool, &mut args));
-    // Refused however the call was approved: with approvals skipped, --yes
-    // or an unattended schedule there was no card to stop it.
-    if name == "run_command" {
-        let line = args["command"].as_str().unwrap_or_default();
-        let dialect = crate::command::Dialect::here();
-        let judged = crate::command::assess(line, dialect, ctx.workspace.as_deref());
-        if let crate::command::Risk::Hardline(why) = judged.risk {
-            return Err(format!(
-                "Refused: this command {why}. Letronna never runs that, whatever the \
-                 approval setting; if it is really meant, the user can run it \
-                 themselves, outside Letronna."
-            ));
-        }
+    // The gate refuses these before any card, but a call can get here
+    // without it; refuse again rather than trust the caller.
+    if let Some(why) = crate::gate::refusal(tool, &args, ctx) {
+        return Err(why);
     }
     let mut out = fit(tool.run(&args, ctx).map_err(|e| e + &note)?, ctx);
     // After the cut, so the note is never the part that gets lost.

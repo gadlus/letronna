@@ -13,8 +13,9 @@
 //! needs next and stops, and the caller comes back when it has it.
 
 use crate::chat::{Connection, Event, Message, ToolCall};
+use crate::gate::Outcome;
 use crate::tools;
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 
 /// Tool rounds per user message. Enough for a real investigation, small
 /// enough that a looping model stops on its own.
@@ -50,6 +51,9 @@ pub enum Next {
     Run(ToolCall),
     /// This call needs the user: an approval, or a question to answer.
     AskUser(ToolCall),
+    /// This call may not run, and the reason goes back to the model as its
+    /// result with no card shown.
+    Refuse(ToolCall, String),
     /// The turn is over.
     Done,
 }
@@ -183,13 +187,19 @@ impl Turn {
         true
     }
 
-    /// What to do next, given whether the user has to be consulted first.
-    pub fn next(&self, gate: impl Fn(&str) -> bool) -> Next {
-        match self.queue.front() {
-            None if self.results.is_empty() => Next::Done,
-            None => Next::Ask,
-            Some(call) if gate(&call.name) => Next::AskUser(call.clone()),
-            Some(call) => Next::Run(call.clone()),
+    /// What to do next, given what the gate makes of the call in front.
+    pub fn next(&self, gate: impl Fn(&ToolCall) -> Outcome) -> Next {
+        let Some(call) = self.queue.front() else {
+            return if self.results.is_empty() {
+                Next::Done
+            } else {
+                Next::Ask
+            };
+        };
+        match gate(call) {
+            Outcome::Run => Next::Run(call.clone()),
+            Outcome::Ask => Next::AskUser(call.clone()),
+            Outcome::Refuse(why) => Next::Refuse(call.clone(), why),
         }
     }
 
@@ -252,26 +262,6 @@ impl Turn {
         kept.append(&mut self.results);
         kept
     }
-}
-
-/// Whether a call has to wait for the user.
-///
-/// `ask_user` always does, whatever else is permitted: it is a question, not
-/// an action to allow. `exit_plan` does whenever someone is there to answer,
-/// since no standing permission can approve a plan on the user's behalf; with
-/// nobody there it goes on to run, and is refused. Everything else is a matter
-/// of who has already said yes, and how widely.
-pub fn needs_user(name: &str, skip_all: bool, allowed: &HashSet<String>, unattended: bool) -> bool {
-    if !tools::needs_approval(name) {
-        return false;
-    }
-    if name == tools::ASK_USER {
-        return !unattended;
-    }
-    if name == tools::EXIT_PLAN {
-        return !unattended;
-    }
-    !(skip_all || unattended || allowed.contains(name))
 }
 
 #[cfg(test)]
@@ -356,7 +346,7 @@ mod tests {
     #[test]
     fn runs_a_batch_then_asks_the_model_again() {
         let mut turn = turn();
-        let never = |_: &str| false;
+        let never = |_: &ToolCall| Outcome::Run;
         assert_eq!(turn.next(never), Next::Done);
 
         assert!(turn.begin(vec![call("read_file"), call("list_dir")]));
@@ -380,7 +370,13 @@ mod tests {
     fn stops_at_a_call_the_user_must_answer() {
         let mut turn = turn();
         turn.begin(vec![call("write_file")]);
-        let gate = |name: &str| name == "write_file";
+        let gate = |queued: &ToolCall| {
+            if queued.name == "write_file" {
+                Outcome::Ask
+            } else {
+                Outcome::Run
+            }
+        };
         assert_eq!(turn.next(gate), Next::AskUser(call("write_file")));
         // Still waiting: asking twice must not skip it.
         assert_eq!(turn.next(gate), Next::AskUser(call("write_file")));
@@ -415,50 +411,40 @@ mod tests {
     }
 
     #[test]
-    fn who_gets_asked_and_who_does_not() {
-        let none = HashSet::new();
-        // Reading never asks.
-        assert!(!needs_user("read_file", false, &none, false));
-        // Writing does, until somebody says otherwise.
-        assert!(needs_user("write_file", false, &none, false));
-        assert!(!needs_user("write_file", true, &none, false));
-        assert!(!needs_user("write_file", false, &none, true));
-        let allowed = HashSet::from(["write_file".to_owned()]);
-        assert!(!needs_user("write_file", false, &allowed, false));
-        // A question is never auto-answered, however wide the permission,
-        // unless nobody is there to answer it.
-        assert!(needs_user(tools::ASK_USER, true, &allowed, false));
-        assert!(!needs_user(tools::ASK_USER, false, &none, true));
-    }
-
-    #[test]
-    fn an_unattended_question_is_answered_by_the_tool() {
-        let mut turn = turn();
-        turn.begin(vec![call(tools::ASK_USER)]);
-        let none = HashSet::new();
-        let unattended = |name: &str| needs_user(name, false, &none, true);
-        assert_eq!(turn.next(unattended), Next::Run(call(tools::ASK_USER)));
-        let answer = tools::run(tools::ASK_USER, "{}", &tools::ToolContext::default()).unwrap();
-        assert!(
-            answer.starts_with("Nobody is available to answer"),
-            "{answer}"
-        );
-    }
-
-    #[test]
     fn approving_a_plan_ends_plan_mode_and_declining_keeps_it() {
-        let plan = HashSet::from([tools::EXIT_PLAN.to_owned()]);
+        use crate::gate::{Gate, Grants, decide};
+        use std::collections::HashSet;
+        let ctx = tools::ToolContext::default();
+        let granted = Grants::from([(0, HashSet::from([tools::EXIT_PLAN.to_owned()]))]);
+        let decided = |skip_approvals, human| {
+            let gate = Gate {
+                ctx: &ctx,
+                skip_approvals,
+                grants: &granted,
+                human,
+            };
+            decide(&call(tools::EXIT_PLAN), &gate)
+        };
         // No standing permission approves a plan; with nobody there it runs,
         // which refuses it.
-        assert!(needs_user(tools::EXIT_PLAN, true, &plan, false));
-        assert!(!needs_user(tools::EXIT_PLAN, false, &plan, true));
+        assert!(matches!(decided(true, true), Outcome::Ask));
+        assert!(matches!(decided(false, false), Outcome::Run));
 
         let offers = |turn: &Turn, name: &str| {
             tools::specs(&turn.connection)
                 .iter()
                 .any(|t| t["function"]["name"] == name)
         };
-        let gate = |name: &str| needs_user(name, false, &HashSet::new(), false);
+        let none = Grants::new();
+        let gate = |queued: &ToolCall| {
+            let gate = Gate {
+                ctx: &ctx,
+                skip_approvals: false,
+                grants: &none,
+                human: true,
+            };
+            decide(queued, &gate)
+        };
         let mut turn = turn();
         turn.connection.plan = true;
         assert!(offers(&turn, tools::EXIT_PLAN) && !offers(&turn, "write_file"));
@@ -592,6 +578,6 @@ mod tests {
         assert_eq!(answered, made);
         assert!(kept.iter().all(|m| m.role == "tool"));
         // Nothing is left to run or send.
-        assert_eq!(turn.next(|_| false), Next::Done);
+        assert_eq!(turn.next(|_| Outcome::Run), Next::Done);
     }
 }

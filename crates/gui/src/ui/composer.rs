@@ -373,8 +373,8 @@ impl Chat {
         let id = self.busy_elsewhere()?;
         let title = &self.store.conversations[self.store.index_of(id)?].title;
         let waiting = self.turn.as_ref().is_some_and(|turn| {
-            matches!(turn.next(|_| true),
-                letronna_core::agent::Next::AskUser(call) if self.needs_user(&call.name))
+            matches!(turn.next(|_| letronna_core::gate::Outcome::Ask),
+                letronna_core::agent::Next::AskUser(call) if self.decide(&call) == letronna_core::gate::Outcome::Ask)
         });
         let text = if waiting {
             format!("\u{201c}{title}\u{201d} is waiting on you. Answer it there, then send here.")

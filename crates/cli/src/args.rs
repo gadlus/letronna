@@ -18,7 +18,7 @@ Options
   -p, --print <prompt>     ask one question, print the answer, exit
   -c, --continue           resume the most recent session
   -r, --resume [id]        choose a session, or open the one with this id
-      --yes                run tools without asking (careful)
+      --yes                run tools without asking, bar some risky ones
       --plan               read and search only; never write or run
       --offline            with doctor: leave the network alone
   -h, --help               this
