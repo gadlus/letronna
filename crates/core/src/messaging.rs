@@ -69,6 +69,10 @@ pub struct Config {
     pub discord: Discord,
     #[serde(default)]
     pub slack: Slack,
+    /// Each chat's answer to whether its voice notes are transcribed, which
+    /// costs credit, so it is asked once per chat; see `files::chat_key`.
+    #[serde(default)]
+    pub voice: std::collections::BTreeMap<String, bool>,
 }
 
 /// Two-way: Telegram hands out messages over long polling, so Letronna can
@@ -267,6 +271,9 @@ pub struct Incoming {
     /// `None` for a forward, which is someone else's words, and for a post in
     /// a chat's name, which any of its admins could have sent.
     pub author: Option<String>,
+    /// Photos, documents and voice notes that came with it, fetched only
+    /// once the app has checked who sent it.
+    pub files: Vec<files::Received>,
     /// Where it came from, as the session is told it.
     pub remote: backend::Remote,
     /// A tap on a card's button rather than words, which answers the card
@@ -376,6 +383,8 @@ pub fn save(config: &Config) {
     }
 }
 
+pub mod files;
+
 /// Tell every channel that can take it how a scheduled run ended. Nobody asked
 /// for this message, so Telegram and Slack get it only once a chat or member
 /// is paired: that is the one the bot may talk to. Returns what failed to
@@ -453,6 +462,7 @@ fn parse_updates(body: &serde_json::Value) -> (Vec<Incoming>, Option<u64>) {
             text: text.to_owned(),
             said: text.to_owned(),
             author,
+            files: Vec::new(),
             remote: backend::Remote {
                 place: match group {
                     true => "a Telegram group".into(),
@@ -494,6 +504,7 @@ fn telegram_press(query: &serde_json::Value) -> Option<Incoming> {
         remote: backend::Remote::default(),
         press: Some(Press { allow, call, tap }),
         needs_session: false,
+        files: Vec::new(),
     })
 }
 
@@ -743,7 +754,8 @@ pub fn poll(
                 std::thread::sleep(std::time::Duration::from_secs(5));
                 continue;
             };
-            let (messages, next) = parse_updates(&body);
+            let (mut messages, next) = parse_updates(&body);
+            messages.extend(files::telegram_media(&body));
             if let Some(next) = next {
                 offset = Some(next);
             }
@@ -1306,12 +1318,13 @@ fn gateway_message(
         }
     }
     let channel = message["channel_id"].as_str()?.to_owned();
+    let files = files::discord_attachments(message);
     let mut message = message.clone();
     message["content"] = serde_json::Value::String(readable(&message, bot_id, ""));
     Some(Incoming {
         source: Source::Discord(channel.clone()),
         from: author["username"].as_str().unwrap_or("you").to_owned(),
-        text: message_text(&message, bot_id)?,
+        text: message_text(&message, bot_id).or_else(|| (!files.is_empty()).then(String::new))?,
         said: own_text(&message).unwrap_or_default(),
         // Only the owner gets this far, but a forward is someone else's words.
         author: match message["message_snapshots"]
@@ -1321,6 +1334,7 @@ fn gateway_message(
             true => None,
             false => author["id"].as_str().map(str::to_owned),
         },
+        files,
         remote: backend::Remote {
             // The listener names the channel once it has looked it up.
             place: match server {
@@ -1374,6 +1388,7 @@ fn gateway_press(interaction: &serde_json::Value, config: &Discord) -> Option<In
         remote: backend::Remote::default(),
         press: Some(Press { allow, call, tap }),
         needs_session: false,
+        files: Vec::new(),
     })
 }
 
@@ -1973,6 +1988,7 @@ fn slack_event(event: &serde_json::Value, config: &Slack, bot_user: &str) -> Opt
         },
         needs_session,
         press: None,
+        files: Vec::new(),
     })
 }
 

@@ -249,6 +249,7 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(ExitPlan),
         Arc::new(Todo),
         Arc::new(crate::messaging::ReadChat),
+        Arc::new(crate::messaging::files::SendFile),
         Arc::new(Sessions),
         Arc::new(crate::memory::Remember),
         Arc::new(crate::skills::UseSkill),

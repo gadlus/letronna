@@ -188,34 +188,49 @@ impl Tool for Transcribe {
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         let raw = required(args, "path")?;
         let path = crate::tools::resolve(raw, ctx)?;
-        let length = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
-        if length > UPLOAD_BYTES {
-            return Err(format!(
-                "`{raw}` is {}; files up to 25 MB can be transcribed. Cut it into parts first.",
-                size(length as usize)
-            ));
-        }
-        let audio = std::fs::read(&path).map_err(|e| e.to_string())?;
-        let token = token()?;
-        let (boundary, form) = form(&path, &audio, model_for(args, "transcription").as_deref());
-        let reply: Value = send(
-            client(MAKE_TIME)?
-                .post(endpoint("/audio/transcriptions"))
-                .bearer_auth(&token)
-                .header(
-                    reqwest::header::CONTENT_TYPE,
-                    format!("multipart/form-data; boundary={boundary}"),
-                )
-                .body(form),
-        )?
-        .json()
-        .map_err(|_| "The transcript came back in a form Letronna could not read.".to_owned())?;
-        let text = reply["text"].as_str().unwrap_or_default().trim();
+        let text = transcribe(&path, args)?;
         if text.is_empty() {
             return Ok(format!("No speech was heard in `{raw}`."));
         }
         Ok(format!("Transcript of `{raw}`:\n\n{text}"))
     }
+}
+
+/// The speech in the audio file at `path` as text, empty when none was
+/// heard, on the transcription model the user picked; paid from the
+/// signed-in account's credit, so the caller asks first.
+pub fn transcribe_path(path: &Path) -> Result<String, String> {
+    transcribe(path, &Value::Null)
+}
+
+/// `transcribe_path` on the model `args` names, if it names one.
+fn transcribe(path: &Path, args: &Value) -> Result<String, String> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let length = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
+    if length > UPLOAD_BYTES {
+        return Err(format!(
+            "`{name}` is {}; files up to 25 MB can be transcribed. Cut it into parts first.",
+            size(length as usize)
+        ));
+    }
+    let audio = std::fs::read(path).map_err(|e| e.to_string())?;
+    let token = token()?;
+    let model = model_for(args, "transcription");
+    let fields: Vec<(&str, &str)> = model.iter().map(|m| ("model", m.as_str())).collect();
+    let (boundary, form) = form(&fields, "file", path, &audio);
+    let reply: Value = send(
+        client(MAKE_TIME)?
+            .post(endpoint("/audio/transcriptions"))
+            .bearer_auth(&token)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(form),
+    )?
+    .json()
+    .map_err(|_| "The transcript came back in a form Letronna could not read.".to_owned())?;
+    Ok(reply["text"].as_str().unwrap_or_default().trim().to_owned())
 }
 
 pub struct MakeVideo;
@@ -619,10 +634,16 @@ fn slug(text: &str) -> String {
     }
 }
 
-/// The multipart form the transcription route takes, and its boundary.
-/// Written out here because reqwest's own needs a feature built into nothing
-/// else.
-fn form(path: &Path, audio: &[u8], model: Option<&str>) -> (String, Vec<u8>) {
+/// A multipart form of the text `fields` and then `bytes` as the file
+/// `field`, named as `path` is, and its boundary: what the transcription
+/// route and the chat apps' uploads take. Written out here because
+/// reqwest's own needs a feature built into nothing else.
+pub(crate) fn form(
+    fields: &[(&str, &str)],
+    field: &str,
+    path: &Path,
+    bytes: &[u8],
+) -> (String, Vec<u8>) {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -632,35 +653,35 @@ fn form(path: &Path, audio: &[u8], model: Option<&str>) -> (String, Vec<u8>) {
     let name: String = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "audio".into())
+        .unwrap_or_else(|| "file".into())
         .chars()
         .map(|c| if c == '"' || c.is_control() { '_' } else { c })
         .collect();
-    let mut body = Vec::with_capacity(audio.len() + 512);
-    if let Some(model) = model {
+    let mut body = Vec::with_capacity(bytes.len() + 512);
+    for (key, value) in fields {
         body.extend_from_slice(
             format!(
-                "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model}\r\n"
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\r\n{value}\r\n"
             )
             .as_bytes(),
         );
     }
     body.extend_from_slice(
         format!(
-            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\n\
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"; filename=\"{name}\"\r\n\
              Content-Type: {}\r\n\r\n",
-            audio_type(path)
+            file_type(path)
         )
         .as_bytes(),
     );
-    body.extend_from_slice(audio);
+    body.extend_from_slice(bytes);
     body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
     (boundary, body)
 }
 
-/// What kind of audio a file is, from its name; some models refuse a file
+/// What kind of file a file is, from its name; some models refuse audio
 /// they are not told the kind of.
-fn audio_type(path: &Path) -> &'static str {
+fn file_type(path: &Path) -> &'static str {
     let extension = path
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
@@ -672,6 +693,10 @@ fn audio_type(path: &Path) -> &'static str {
         "ogg" | "oga" | "opus" => "audio/ogg",
         "webm" => "audio/webm",
         "flac" => "audio/flac",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
         _ => "application/octet-stream",
     }
 }
@@ -889,9 +914,10 @@ mod tests {
     #[test]
     fn the_transcription_form_carries_the_file_and_the_model() {
         let (boundary, body) = form(
+            &[("model", "whisper-1")],
+            "file",
             Path::new("clips/say \"hi\".mp3"),
             b"ID3audio",
-            Some("whisper-1"),
         );
         let text = String::from_utf8_lossy(&body);
         assert!(text.starts_with(&format!("--{boundary}\r\n")), "{text}");
@@ -906,7 +932,7 @@ mod tests {
             "{text}"
         );
         assert!(text.ends_with(&format!("--{boundary}--\r\n")), "{text}");
-        let (_, bare) = form(Path::new("a.wav"), b"", None);
+        let (_, bare) = form(&[], "file", Path::new("a.wav"), b"");
         assert!(!String::from_utf8_lossy(&bare).contains("name=\"model\""));
     }
 
