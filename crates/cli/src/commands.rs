@@ -968,6 +968,7 @@ fn skills(runner: &mut Runner, rest: &str, workspace: Option<&std::path::Path>) 
             render::dim("off")
         };
         let source = match skill.source {
+            Source::User if skill.learned => "learned",
             Source::User => "yours",
             Source::Project => "project",
         };

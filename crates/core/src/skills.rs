@@ -35,7 +35,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod install;
+mod manage;
 pub use install::{Installed, install};
+pub use manage::ManageSkill;
 
 /// The file that makes a folder a skill.
 const SKILL_FILE: &str = "SKILL.md";
@@ -106,6 +108,8 @@ pub struct Skill {
     pub source: Source,
     /// Switched on. A skill switched off stays on disk and in the list.
     pub enabled: bool,
+    /// Written by the model with `skill_manage`, which may change it.
+    pub learned: bool,
 }
 
 /// The user's skills folder.
@@ -459,9 +463,11 @@ fn load(
     Ok(page(&text, offset, &skill.name, file))
 }
 
-/// How the model is told that a skill came with the project.
+/// How the model is told that a skill came with the project, or that it
+/// wrote the skill itself and may mend it.
 fn from(skill: &Skill) -> &'static str {
     match skill.source {
+        Source::User if skill.learned => " (learned)",
         Source::User => "",
         Source::Project => " (from this project)",
     }
@@ -537,7 +543,10 @@ fn support_files(folder: &Path) -> (Vec<String>, bool) {
             }
             if kind.is_dir() && depth + 1 < FILES_DEPTH {
                 folders.push((entry.path(), depth + 1));
-            } else if kind.is_file() && !(depth == 0 && name.eq_ignore_ascii_case(SKILL_FILE)) {
+            } else if kind.is_file()
+                && !(depth == 0
+                    && (name.eq_ignore_ascii_case(SKILL_FILE) || name == manage::PREV_FILE))
+            {
                 if files.len() == FILES_LISTED {
                     files.sort();
                     return (files, true);
@@ -757,6 +766,12 @@ fn parse_skill(folder: &Path, source: Source, text: &str) -> Option<Skill> {
         folder: folder.to_path_buf(),
         source,
         enabled: true,
+        // An install over it would bring the install's mark, and a project
+        // can plant any file, so only the mark alone in the user's folder
+        // counts.
+        learned: source == Source::User
+            && folder.join(manage::LEARNED).is_file()
+            && !folder.join(install::MARK).is_file(),
     })
 }
 
