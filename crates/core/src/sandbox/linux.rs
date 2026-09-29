@@ -4,13 +4,14 @@
 //!
 //! Landlock only ever allows: a rule grants rights beneath a folder, and
 //! nothing can take them back further down. So a folder is hidden by
-//! granting reads on everything around it instead, down the path from `/`,
-//! and a key file inside the project cannot be hidden at all, since the
-//! command must read back what it writes there. The gate already sends a
-//! command that names a `.env` file to a card. Listing a folder is granted
-//! everywhere, so the names in a hidden folder show though nothing in it
-//! reads; otherwise `/`, the home folder and every folder on the way to a
-//! hidden one could not be listed at all.
+//! granting reads on everything around it instead, down the path from `/`.
+//! Key files at the top of the home and the project folder are hidden so,
+//! the ones in the project because writes there are granted around them
+//! too, as below; one further down, such as `api/.env`, still reads, and
+//! the gate sends a command that names it to a card. Listing a folder is
+//! granted everywhere, so the names in a hidden folder show though nothing
+//! in it reads; otherwise `/`, the home folder and every folder on the way
+//! to a hidden one could not be listed at all.
 //!
 //! Writes are granted the same way around what an edit asks about, as
 //! macOS refuses them there: `.git`, `.letronna`, `.github/workflows` and
@@ -105,11 +106,12 @@ fn listing(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The keys `home` holds that read_file guards, with every link followed:
-/// the names in `SECRETS` and the `.env` files at its top.
-fn guarded_at_home(home: &Path) -> Vec<PathBuf> {
-    let listed = crate::tools::SECRETS.iter().map(|entry| home.join(entry));
-    let env = std::fs::read_dir(home)
+/// The keys `dir`, the home or the project folder, holds that read_file
+/// guards, with every link followed: the names in `SECRETS` and the `.env`
+/// files at its top.
+fn guarded_in(dir: &Path) -> Vec<PathBuf> {
+    let listed = crate::tools::SECRETS.iter().map(|entry| dir.join(entry));
+    let env = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
@@ -216,8 +218,11 @@ mod kernel {
                 return Err(fallback(why));
             }
             let mut hidden = policy.hidden.clone();
-            if let Some(home) = crate::tools::home() {
-                hidden.extend(super::guarded_at_home(&home));
+            // The project's own keys too, which the writes granted around
+            // them leave hidden, as a folder it may write whole would not.
+            let projects = (policy.writable.iter()).filter(|dir| **dir != policy.temp);
+            for dir in crate::tools::home().iter().chain(projects) {
+                hidden.extend(super::guarded_in(dir));
             }
             confine(command, policy, &hidden)
         }
@@ -510,6 +515,33 @@ mod kernel {
             std::fs::remove_dir_all(dir).unwrap();
         }
 
+        /// A `.env` file in the project would hand its keys to the model's
+        /// provider in the output, as it would through read_file; the
+        /// example one that projects commit still reads.
+        #[test]
+        fn an_env_file_in_the_project_does_not_read() {
+            if !usable() {
+                return;
+            }
+            let dir = tree("env");
+            std::fs::write(dir.join("project/.env"), "secret").unwrap();
+            std::fs::write(dir.join("project/.env.example"), "example").unwrap();
+            let mut command = Command::new("/bin/sh");
+            command
+                .args(["-c", "cat .env; cat .env.example"])
+                .current_dir(dir.join("project"));
+            let ran = LANDLOCK
+                .wrap(&command, &policy(&dir))
+                .unwrap()
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            let said = String::from_utf8_lossy(&ran.stdout);
+            assert!(!said.contains("secret"), "{ran:?}");
+            assert!(said.contains("example"), "{ran:?}");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
         /// Bash's `/dev/tcp` connects with no other program, to a listener
         /// on this machine, so only the sandbox can be what stops it.
         #[test]
@@ -643,7 +675,7 @@ mod tests {
         std::fs::write(home.join(".env.example"), "").unwrap();
         std::fs::write(home.join("notes.txt"), "").unwrap();
         let home = std::fs::canonicalize(home).unwrap();
-        let found = guarded_at_home(&home);
+        let found = guarded_in(&home);
         let expected = [".env", ".kube/config", ".ssh"].map(|name| home.join(name));
         assert_eq!(found, expected);
         std::fs::remove_dir_all(home).unwrap();
