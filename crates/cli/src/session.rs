@@ -247,7 +247,7 @@ impl Runner {
         let mut out = Stream::opening_with(render::bullet());
         let mut opened = false;
         let mut thought = false;
-        let mut retrying = false;
+        let mut explained = false;
         self.bar.wait_line(true);
         loop {
             // Keys first, then whatever the model has sent.
@@ -273,14 +273,20 @@ impl Runner {
                 }
             };
             // The waiting line says why while a failed try waits to be made
-            // again, and goes back to waiting once the new try answers,
-            // which may be with thinking that is not shown.
-            if let Event::Retrying(retry) = &event {
-                self.bar.wait_line_about(&retry.to_string());
-                retrying = true;
-            } else if retrying {
+            // again or earlier turns are summarized, and goes back to
+            // waiting once the reply answers, which may be with thinking
+            // that is not shown.
+            let why = match &event {
+                Event::Retrying(retry) => Some(retry.to_string()),
+                Event::Compacting => Some("Compacting…".to_owned()),
+                _ => None,
+            };
+            if let Some(why) = why {
+                self.bar.wait_line_about(&why);
+                explained = true;
+            } else if explained {
                 self.bar.wait_line(true);
-                retrying = false;
+                explained = false;
             }
             if let Event::Reasoning(text) = &event
                 && self.store.settings.thinking

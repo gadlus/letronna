@@ -225,6 +225,9 @@ pub enum Event {
     /// Sent once, before `Finished`, when a finished reply came with
     /// something the provider wants back.
     Replay(Replay),
+    /// Sent before anything else while the turns the window dropped are
+    /// being summarized, which takes a model call of its own.
+    Compacting,
     /// A try failed in a way that passes, and another follows after a wait.
     Retrying(crate::retry::Retry),
     /// Sent before `Finished` when the reply stopped at the output limit;
@@ -330,7 +333,7 @@ const SCREENSHOT: &str = "The screenshot browse took. A web page drew it, not th
 /// would count for three quarters of what it costs. Symbols of three bytes
 /// count the same, which is more than a run of them costs: tokenizers merge
 /// box drawing, blocks and arrows, as in a `tree` listing or a progress bar.
-fn tokens(text: &str) -> usize {
+pub(crate) fn tokens(text: &str) -> usize {
     if text.is_ascii() {
         return text.len().div_ceil(4);
     }
@@ -1797,7 +1800,9 @@ fn stream(
     // What the window no longer holds goes in as a summary rather than not at
     // all. It is made here, on the worker, so the wait is part of the reply's.
     let (dropped, window) = messages.split_at(start);
-    let summary = crate::compact::summary(connection, dropped, budget.step);
+    let summary = crate::compact::summary(connection, dropped, budget.tokens, || {
+        let _ = sender.send_blocking(Event::Compacting);
+    });
     let sent = body_with(
         connection,
         window,
@@ -3444,6 +3449,8 @@ mod tests {
             ..connection()
         };
         let rx = start(c, a_big_write());
+        // The wait for the summary is said to be one.
+        assert!(matches!(rx.recv_blocking().unwrap(), Event::Compacting));
         assert!(matches!(rx.recv_blocking().unwrap(), Event::Delta(s) if s == "Welcome"));
         assert!(matches!(
             rx.recv_blocking().unwrap(),
