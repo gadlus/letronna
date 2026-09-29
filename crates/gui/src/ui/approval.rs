@@ -49,7 +49,7 @@ impl Chat {
             );
         }
 
-        let args = tools::parse_args(&call.arguments).unwrap_or_default();
+        let args = tools::parse_args_for(&call.name, &call.arguments).unwrap_or_default();
         let card = v_flex()
             .w_full()
             .gap_3()

@@ -101,7 +101,7 @@ pub fn todos_in(messages: &[Message]) -> Vec<Todo> {
 
 /// The checklist a `todo` call sets, from its arguments.
 fn parse_todos(arguments: &str) -> Result<Vec<Todo>, String> {
-    let args = crate::tools::parse_args(arguments)?;
+    let args = crate::tools::parse_args_for(crate::tools::TODO, arguments)?;
     let items = args["items"]
         .as_array()
         .ok_or_else(|| "`items` is required.".to_owned())?;

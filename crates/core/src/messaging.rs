@@ -121,7 +121,7 @@ pub struct Incoming {
 /// A card the app would show -- a question, or a tool waiting to be
 /// allowed -- written out for a chat that cannot see it.
 pub fn card_text(name: &str, arguments: &str, preview: &str) -> String {
-    let args = crate::tools::parse_args(arguments).unwrap_or_default();
+    let args = crate::tools::parse_args_for(name, arguments).unwrap_or_default();
     if name == crate::tools::ASK_USER {
         let mut text = args["question"]
             .as_str()
@@ -155,7 +155,8 @@ pub enum CardAnswer {
 pub fn card_answer(name: &str, arguments: &str, reply: &str) -> CardAnswer {
     let reply = reply.trim();
     if name == crate::tools::ASK_USER {
-        let options = card_options(&crate::tools::parse_args(arguments).unwrap_or_default());
+        let options =
+            card_options(&crate::tools::parse_args_for(name, arguments).unwrap_or_default());
         let picked = reply
             .parse::<usize>()
             .ok()
