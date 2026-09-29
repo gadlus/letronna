@@ -457,7 +457,17 @@ fn answer_approvals(mode: Mode, keyboard: bool, context: tools::ToolContext, can
             let decision = if mode == Mode::Bypass {
                 Decision::Once
             } else {
-                match session::settled(&request, mode, &none, &rules, keyboard) {
+                let workspace = context.workspace.clone();
+                let settled = session::judged(
+                    &request.call,
+                    request.root,
+                    workspace,
+                    mode,
+                    &none,
+                    &rules,
+                    keyboard,
+                );
+                match settled {
                     Some(Decision::Deny(why)) if !keyboard => {
                         eprintln!(
                             "`{}` needs a yes and nobody is here to give it; run with --yes to allow it.",
