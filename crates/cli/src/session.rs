@@ -120,6 +120,7 @@ impl Runner {
                     .extend(typed.into_iter().map(|content| Message {
                         role: "user".into(),
                         content,
+                        folded: true,
                         ..Default::default()
                     }));
                 self.persist();
