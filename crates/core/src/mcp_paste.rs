@@ -379,7 +379,10 @@ fn join(words: &[String]) -> String {
     words
         .iter()
         .map(|word| {
+            // Two backslashes in a row are one to `split`, so a UNC path
+            // keeps them only quoted.
             let plain = !word.is_empty()
+                && !word.contains("\\\\")
                 && !word.contains(|c: char| c.is_whitespace() || matches!(c, '"' | '\''));
             match plain {
                 true => word.clone(),
@@ -537,7 +540,7 @@ mod tests {
 
     #[test]
     fn a_split_line_joins_back_to_the_same_words() {
-        let words: Vec<String> = ["npx", "a b", "C:\\x", "say \"hi\"", ""]
+        let words: Vec<String> = ["npx", "a b", "C:\\x", "say \"hi\"", "", "\\\\host\\share"]
             .map(str::to_owned)
             .into();
         assert_eq!(split(&join(&words)).unwrap(), words);
