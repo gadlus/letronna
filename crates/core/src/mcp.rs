@@ -17,6 +17,20 @@
 //! what its tools do. They are never offered where other people can read the
 //! replies.
 //!
+//! A call that is stopped, or runs out of time, is given up at once and the
+//! server is told, so it can stop the work too; an answer that still comes
+//! finds no one waiting and is dropped. A server run here that was given no
+//! folder may ask which folders it works in: it is given the project folder
+//! of the session that called it last, and told whenever that changes, and
+//! a server that reads them again is given a moment to before the call. One
+//! server serves every session, so the latest caller wins. A session with
+//! no project, or one whose folder is the home folder, a filesystem's root
+//! or holds Letronna's data, changes nothing: the server keeps the folder
+//! it had, since roots only ever narrow what a server may touch and must
+//! never widen it. A server given folders in its config keeps them, and one
+//! reached by URL, which cannot open local files, is told none. Sampling
+//! and elicitation are not offered, and asking for them is refused.
+//!
 //! A server that runs elsewhere is given by its `url` instead of a command,
 //! with any `headers` it needs, such as a key. It is spoken to over HTTP as
 //! the protocol now has it: each message is POSTed, and the reply -- one
@@ -72,7 +86,7 @@ use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Once, OnceLock, Weak, mpsc};
 use std::time::{Duration, Instant};
 
@@ -109,13 +123,22 @@ const CALL_TIME: Duration = Duration::from_secs(120);
 const LONGEST_CALL: Duration = Duration::from_secs(24 * 60 * 60);
 /// How much longer a POST to a server reached by URL may run than a call
 /// may take. Whoever asked gives up first, naming what went unanswered, and
-/// the POST is let go of soon after.
+/// the POST is let go of soon after -- only then even for a stopped call,
+/// since a blocking request cannot be cut off.
 const GRACE_TIME: Duration = Duration::from_secs(5);
 /// How long quitting waits for servers reached by URL to hear their
 /// sessions end: long enough for a hosted server's handshake, short enough
 /// that one gone quiet does not hold up the app; a session not ended
 /// expires on the server anyway.
 const END_TIME: Duration = Duration::from_secs(2);
+/// How long a POST of a notification, or of an answer to the server, may
+/// take: the server only has to take it, which is at once, and one that
+/// has stopped answering must not hold up every other call for long.
+const NOTE_TIME: Duration = Duration::from_secs(5);
+/// How long a call waits, after telling a server that re-reads its roots
+/// that they changed, for it to ask for them: a local server asks within
+/// milliseconds, and one slower than this gets the call anyway.
+const ROOTS_TIME: Duration = Duration::from_secs(2);
 /// The protocol revision asked for; a server answers with one it speaks.
 const PROTOCOL: &str = "2025-06-18";
 /// The words in an `env` or `headers` name that say its value is a secret.
@@ -1299,8 +1322,9 @@ fn end_sessions() {
 /// to it is POSTed, and every message in the reply is handed on as a line to
 /// read as soon as it arrives. A request is sent on a thread of its own,
 /// since its reply can take as long as a tool call and the server may want
-/// an answer meanwhile; anything else is sent at once, so the greeting comes
-/// before what follows.
+/// an answer meanwhile, and so is a cancel, which needs no order and must
+/// not hold up other calls behind a server gone quiet; anything else is
+/// sent at once, so the greeting comes before what follows.
 struct Http {
     link: Arc<Link>,
     replies: Arc<Mutex<std::io::PipeWriter>>,
@@ -1369,7 +1393,10 @@ impl Http {
             .is_some()
             .then(|| parsed.get("id").cloned())
             .flatten();
-        let waits = request.is_some();
+        let (alone, time) = match request {
+            Some(_) => (true, self.link.wait + GRACE_TIME),
+            None => (parsed["method"] == "notifications/cancelled", NOTE_TIME),
+        };
         if parsed["method"] == "initialize"
             && let Ok(mut greeting) = self.link.greeting.lock()
         {
@@ -1382,14 +1409,14 @@ impl Http {
                     let _ = writeln!(replies, "{message}");
                 }
             };
-            if let Err(why) = link.send(&message, &mut hand_on)
+            if let Err(why) = link.send(&message, time, &mut hand_on)
                 && let Some(id) = &request
             {
                 hand_on(json!({"jsonrpc": "2.0", "id": id,
                     "error": {"code": -32000, "message": format!("{}: {why}", link.name)}}));
             }
         };
-        match waits {
+        match alone {
             true => {
                 std::thread::spawn(send);
             }
@@ -1402,11 +1429,16 @@ impl Link {
     /// POST one message, handing on each message in the reply as it comes.
     /// A server that has forgotten the session, as one that restarted has,
     /// is greeted again and the message sent once more.
-    fn send(&self, message: &[u8], hand_on: &mut dyn FnMut(Value)) -> Result<(), String> {
-        match self.exchange(message, hand_on) {
+    fn send(
+        &self,
+        message: &[u8],
+        time: Duration,
+        hand_on: &mut dyn FnMut(Value),
+    ) -> Result<(), String> {
+        match self.exchange(message, time, hand_on) {
             Err(Failed::Forgot(stale)) => {
                 self.greet_again(&stale)?;
-                self.exchange(message, hand_on)
+                self.exchange(message, time, hand_on)
                     .map_err(|failed| self.said(failed))
             }
             other => other.map_err(|failed| self.said(failed)),
@@ -1432,9 +1464,10 @@ impl Link {
         }
         // The first answer went to whoever asked; this one only brings the
         // new session.
-        let initialized = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
-        self.exchange(&greeting, &mut |_| {})
-            .and_then(|()| self.exchange(initialized.to_string().as_bytes(), &mut |_| {}))
+        let initialized =
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}).to_string();
+        self.exchange(&greeting, self.wait + GRACE_TIME, &mut |_| {})
+            .and_then(|()| self.exchange(initialized.as_bytes(), NOTE_TIME, &mut |_| {}))
             .map_err(|failed| self.said(failed))
     }
 
@@ -1480,13 +1513,19 @@ impl Link {
         let _ = request.send();
     }
 
-    /// POST one message, handing on each message in the reply as it arrives.
-    fn exchange(&self, message: &[u8], hand_on: &mut dyn FnMut(Value)) -> Result<(), Failed> {
+    /// POST one message, given `time` in all, handing on each message in the
+    /// reply as it arrives.
+    fn exchange(
+        &self,
+        message: &[u8],
+        time: Duration,
+        hand_on: &mut dyn FnMut(Value),
+    ) -> Result<(), Failed> {
         let url = &self.url;
         let request = self
             .client
             .post(url)
-            .timeout(self.wait + GRACE_TIME)
+            .timeout(time)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream")
             .body(message.to_vec());
@@ -1597,7 +1636,18 @@ fn connect(
         waiting: Mutex::default(),
         next: AtomicU64::new(1),
         relisting: Mutex::default(),
+        // Roots would replace the folders a server was given, and a server
+        // elsewhere cannot open local files: they would only tell it names.
+        offers_roots: config.url.trim().is_empty()
+            && !names_a_folder(&config.args, crate::tools::home().as_deref()),
+        root: Mutex::default(),
+        rereads: AtomicBool::new(false),
+        rereading: Mutex::default(),
     });
+    let capabilities = match server.offers_roots {
+        true => json!({"roots": {"listChanged": true}}),
+        false => json!({}),
+    };
     // Held weakly, so a server let go of is dropped, closing what it
     // speaks over, rather than kept by the thread reading its replies.
     let reader = Arc::downgrade(&server);
@@ -1607,7 +1657,7 @@ fn connect(
         "initialize",
         json!({
             "protocolVersion": PROTOCOL,
-            "capabilities": {},
+            "capabilities": capabilities,
             "clientInfo": {"name": "letronna", "version": env!("CARGO_PKG_VERSION")},
         }),
         config.start_time(),
@@ -1624,6 +1674,50 @@ fn only_looks(annotations: &Value) -> bool {
         && annotations["openWorldHint"].as_bool() == Some(false)
 }
 
+/// Whether any of a server's `args` is a folder that exists, `~` standing
+/// for `home`.
+fn names_a_folder(args: &[String], home: Option<&Path>) -> bool {
+    args.iter().any(|arg| {
+        let under_home = arg
+            .strip_prefix('~')
+            .filter(|rest| rest.is_empty() || rest.starts_with(['/', '\\']));
+        let path = match (under_home, home) {
+            (Some(rest), Some(home)) => home.join(rest.trim_start_matches(['/', '\\'])),
+            _ => PathBuf::from(arg),
+        };
+        std::fs::metadata(path).is_ok_and(|m| m.is_dir())
+    })
+}
+
+/// Whether `folder` may be handed to a server as a root.
+fn may_be_root(folder: &Path) -> bool {
+    // Made real first, so a link or `..` cannot dress up the home folder.
+    let real = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let home = crate::tools::home().map(|home| real(&home));
+    // A name that is not UTF-8 cannot be read back from a URI by the
+    // reference server, which would then keep the folder it had.
+    folder.to_str().is_some()
+        && root_allowed(
+            &real(folder),
+            home.as_deref(),
+            &real(&crate::chat::data_dir()),
+        )
+}
+
+/// Whether `folder` is neither a filesystem's root nor holds the home
+/// folder or Letronna's `data`, all made real already.
+fn root_allowed(folder: &Path, home: Option<&Path>, data: &Path) -> bool {
+    // A `..` left in a folder not there to be made real could climb anywhere.
+    let climbs = folder
+        .components()
+        .any(|part| part == std::path::Component::ParentDir);
+    folder.is_absolute()
+        && !climbs
+        && folder.parent().is_some()
+        && !home.is_some_and(|home| home.starts_with(folder))
+        && !data.starts_with(folder)
+}
+
 /// One running server, as seen from this side of its pipes.
 struct Server {
     name: String,
@@ -1635,6 +1729,16 @@ struct Server {
     /// Requests sent and not yet answered, by id.
     waiting: Mutex<HashMap<u64, mpsc::Sender<Result<Value, String>>>>,
     next: AtomicU64,
+    /// Whether the server is told of roots at all.
+    offers_roots: bool,
+    /// The folder roots/list answers with: the last one a caller could
+    /// give.
+    root: Mutex<Option<PathBuf>>,
+    /// Whether the server has asked roots/list, and so reads it again when
+    /// told it changed.
+    rereads: AtomicBool,
+    /// Calls waiting for the server to ask roots/list again.
+    rereading: Mutex<Vec<mpsc::Sender<()>>>,
     relisting: Mutex<Relisting>,
 }
 
@@ -1746,22 +1850,111 @@ impl Server {
     /// The server's whole answer to `method`, its error included; an error
     /// here is Letronna's, when there is no answer.
     fn reply(&self, method: &str, params: Value, wait: Duration) -> Result<Value, String> {
+        self.reply_unless_stopped(method, params, wait, &crate::cancel::Cancel::default())
+    }
+
+    /// `reply`, given up at once when `cancel` is set, telling the server.
+    fn reply_unless_stopped(
+        &self,
+        method: &str,
+        params: Value,
+        wait: Duration,
+        cancel: &crate::cancel::Cancel,
+    ) -> Result<Value, String> {
+        let stopped = || format!("Stopped before {} answered {method}.", self.name);
+        if cancel.is_set() {
+            return Err(stopped());
+        }
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (answer, answered) = mpsc::channel();
+        // The stop only wakes the wait; the flag says it was the stop.
+        let stop = answer.clone();
+        let _waker = cancel.on_set(move || {
+            let _ = stop.send(Err(String::new()));
+        });
         if let Ok(mut waiting) = self.waiting.lock() {
             waiting.insert(id, answer);
         }
         self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))?;
-        answered.recv_timeout(wait).unwrap_or_else(|_| {
-            if let Ok(mut waiting) = self.waiting.lock() {
-                waiting.remove(&id);
-            }
-            Err(format!(
+        let why = match answered.recv_timeout(wait) {
+            Ok(Err(_)) if cancel.is_set() => stopped(),
+            Ok(outcome) => return outcome,
+            Err(_) => format!(
                 "{} did not answer {method} within {} seconds.",
                 self.name,
                 wait.as_secs()
-            ))
-        })
+            ),
+        };
+        let unanswered = self
+            .waiting
+            .lock()
+            .ok()
+            .and_then(|mut waiting| waiting.remove(&id))
+            .is_some();
+        // However it was given up, the server is told, so it can stop the
+        // work, and an answer that still comes finds no one waiting. The
+        // protocol forbids cancelling the greeting, and an answer that came
+        // meanwhile leaves nothing to stop.
+        if unanswered && method != "initialize" {
+            let cancelled = json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                "params": {"requestId": id, "reason": why}});
+            let _ = self.send(&cancelled);
+        }
+        Err(why)
+    }
+
+    /// Make `workspace` the folder roots/list answers with, telling the
+    /// server when it changed and giving one that re-reads it a moment to.
+    fn called_from(&self, workspace: Option<&Path>, cancel: &crate::cancel::Cancel) {
+        // No project, or a folder that may not be given, changes nothing:
+        // the server keeps the folder it had rather than being widened.
+        let Some(folder) = workspace.filter(|folder| self.offers_roots && may_be_root(folder))
+        else {
+            return;
+        };
+        let Ok(mut root) = self.root.lock() else {
+            return;
+        };
+        if root.as_deref() == Some(folder) {
+            return;
+        }
+        *root = Some(folder.to_path_buf());
+        drop(root);
+        let changed = json!({"jsonrpc": "2.0", "method": "notifications/roots/list_changed"});
+        if !self.rereads.load(Ordering::Relaxed) {
+            let _ = self.send(&changed);
+            return;
+        }
+        // Listening before telling, so an ask that comes at once is heard.
+        let (asked, asking) = mpsc::channel();
+        let stop = asked.clone();
+        let _waker = cancel.on_set(move || {
+            let _ = stop.send(());
+        });
+        if let Ok(mut rereading) = self.rereading.lock() {
+            rereading.push(asked);
+        }
+        // A server that did not ask again is taken not to re-read, and its
+        // next calls do not wait until it asks once more.
+        if self.send(&changed).is_ok()
+            && asking.recv_timeout(ROOTS_TIME) == Err(mpsc::RecvTimeoutError::Timeout)
+        {
+            self.rereads.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// What roots/list answers: the folder of the latest caller that could
+    /// give one, or none before any did.
+    fn roots(&self) -> Value {
+        let root = self.root.lock().ok().and_then(|root| root.clone());
+        let roots: Vec<Value> = root
+            .map(|folder| {
+                let uri = file_uri(folder.as_os_str().as_encoded_bytes(), cfg!(windows));
+                json!({ "uri": uri })
+            })
+            .into_iter()
+            .collect();
+        json!({ "roots": roots })
     }
 
     /// Read what the server says until it goes or is let go of, handing
@@ -1779,16 +1972,29 @@ impl Server {
                 continue;
             };
             match (message.get("id"), message.get("method")) {
-                // The server asking something of us: a ping is answered, and
-                // the rest -- sampling, roots -- are turned down.
+                // The server asking something of us: a ping and roots, where
+                // offered, are answered, and the rest -- sampling,
+                // elicitation -- turned down.
                 (Some(id), Some(method)) => {
+                    let roots = method == "roots/list" && server.offers_roots;
                     let reply = if method == "ping" {
                         json!({"jsonrpc": "2.0", "id": id, "result": {}})
+                    } else if roots {
+                        json!({"jsonrpc": "2.0", "id": id, "result": server.roots()})
                     } else {
                         json!({"jsonrpc": "2.0", "id": id,
                             "error": {"code": -32601, "message": "Letronna does not offer this."}})
                     };
                     let _ = server.send(&reply);
+                    // The calls waiting for this go on once it is answered.
+                    if roots {
+                        server.rereads.store(true, Ordering::Relaxed);
+                        if let Ok(mut rereading) = server.rereading.lock() {
+                            rereading.drain(..).for_each(|call| {
+                                let _ = call.send(());
+                            });
+                        }
+                    }
                 }
                 (Some(id), None) => {
                     let Some(id) = id.as_u64() else {
@@ -1845,11 +2051,17 @@ impl Tool for McpTool {
     fn parameters(&self) -> Value {
         self.schema.clone()
     }
-    fn run(&self, args: &Value, _: &ToolContext) -> Result<String, String> {
-        let reply = self.server.reply(
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
+        // A call stopped already changes no roots, and is refused below.
+        if !ctx.cancel.is_set() {
+            self.server
+                .called_from(ctx.workspace.as_deref(), &ctx.cancel);
+        }
+        let reply = self.server.reply_unless_stopped(
             "tools/call",
             json!({"name": self.own, "arguments": args}),
             self.wait,
+            &ctx.cancel,
         )?;
         // What the server says went wrong is its own words, as its results
         // are, and fenced as they are.
@@ -1922,6 +2134,52 @@ fn said(error: &Value) -> String {
         .as_str()
         .unwrap_or("The server reported an error.")
         .to_owned()
+}
+
+/// The folder at `path` as a `file://` URI, every byte but letters, digits
+/// and `-._~/:` percent-encoded, `windows` saying it is a Windows path.
+fn file_uri(path: &[u8], windows: bool) -> String {
+    // Windows paths are told apart by the caller, so both kinds can be
+    // tested anywhere: backslashes turn, a drive gets a slash before it,
+    // and a share's server becomes the host.
+    let mut path = path.to_vec();
+    let mut host = Vec::new();
+    if windows {
+        path.iter_mut()
+            .filter(|b| **b == b'\\')
+            .for_each(|b| *b = b'/');
+        // A long or device path, \\?\C:\… or \\.\UNC\server\share\…, is
+        // the same place without its prefix, whatever case UNC is in.
+        if let Some(rest) = path
+            .strip_prefix(b"//?/")
+            .or_else(|| path.strip_prefix(b"//./"))
+        {
+            path = match rest.get(..4) {
+                Some(unc) if unc.eq_ignore_ascii_case(b"UNC/") => {
+                    [b"//".as_slice(), &rest[4..]].concat()
+                }
+                _ => rest.to_vec(),
+            };
+        }
+        match path.strip_prefix(b"//") {
+            Some(share) => {
+                let end = share.iter().position(|&b| b == b'/');
+                let end = end.unwrap_or(share.len());
+                host = share[..end].to_vec();
+                path = share[end..].to_vec();
+            }
+            None => path.insert(0, b'/'),
+        }
+    }
+    let mut uri = String::from("file://");
+    for &b in host.iter().chain(&path) {
+        if b.is_ascii_alphanumeric() || b"-._~/:".contains(&b) {
+            uri.push(char::from(b));
+        } else {
+            uri.push_str(&format!("%{b:02X}"));
+        }
+    }
+    uri
 }
 
 /// The most of an MCP tool's description, and of any one string in its input
@@ -2700,6 +2958,368 @@ mod tests {
         }
     }
 
+    /// A server with one tool, `work`, that answers after the `ms` it is
+    /// given whether or not it was told to stop, or, given `ask`, puts that
+    /// request to the client and answers with the client's reply, or, given
+    /// `held`, answers with the roots it holds. Like the reference
+    /// filesystem server, it reads the roots when greeted and again when
+    /// told they changed. It hands the test every message it hears, and
+    /// says when it answered late.
+    fn patient_server(config: &ServerConfig) -> (Vec<Arc<dyn Tool>>, mpsc::Receiver<Value>) {
+        let (from_client, to_server) = std::io::pipe().unwrap();
+        let (from_server, to_client) = std::io::pipe().unwrap();
+        let (heard, log) = mpsc::channel();
+        let to_client = Arc::new(Mutex::new(to_client));
+        std::thread::spawn(move || {
+            let reply = |message: Value| writeln!(to_client.lock().unwrap(), "{message}").unwrap();
+            let mut asking = Value::Null;
+            let mut held = json!([]);
+            let reread = json!({"jsonrpc": "2.0", "id": "roots", "method": "roots/list"});
+            for line in BufReader::new(from_client).lines() {
+                let message: Value = serde_json::from_str(&line.unwrap()).unwrap();
+                let _ = heard.send(message.clone());
+                let id = message["id"].clone();
+                let args = &message["params"]["arguments"];
+                match message["method"].as_str() {
+                    Some("initialize") => reply(json!({"jsonrpc": "2.0", "id": id, "result": {
+                        "protocolVersion": PROTOCOL, "capabilities": {"tools": {}}}})),
+                    Some("tools/list") => reply(json!({"jsonrpc": "2.0", "id": id, "result": {
+                        "tools": [{"name": "work", "inputSchema": {"type": "object"}}]}})),
+                    Some("notifications/initialized" | "notifications/roots/list_changed") => {
+                        reply(reread.clone())
+                    }
+                    Some("tools/call") if args["held"] == true => {
+                        reply(json!({"jsonrpc": "2.0", "id": id, "result": {
+                            "content": [{"type": "text", "text": held.to_string()}]}}))
+                    }
+                    Some("tools/call") if args["ask"].is_string() => {
+                        asking = id;
+                        reply(json!({"jsonrpc": "2.0", "id": "asked", "method": args["ask"]}));
+                    }
+                    Some("tools/call") => {
+                        let ms = args["ms"].as_u64().unwrap_or(0);
+                        let (to_client, heard) = (to_client.clone(), heard.clone());
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_millis(ms));
+                            let text = format!("worked {ms} ms");
+                            let answer = json!({"jsonrpc": "2.0", "id": id, "result": {
+                                "content": [{"type": "text", "text": text}]}});
+                            writeln!(to_client.lock().unwrap(), "{answer}").unwrap();
+                            let _ = heard.send(json!({"method": "answered", "id": id}));
+                        });
+                    }
+                    // Roots given, or refused by a client that offers none.
+                    None if id == "roots" => held = message["result"]["roots"].clone(),
+                    // The client's reply to what was asked, handed back as
+                    // the call's text.
+                    None if id == "asked" => {
+                        let text = message.to_string();
+                        reply(json!({"jsonrpc": "2.0", "id": asking, "result": {
+                            "content": [{"type": "text", "text": text}]}}));
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let tools = connect("patient", 0, config, from_server, to_server).unwrap();
+        (tools, log)
+    }
+
+    /// The next message the server heard with `method`, passing over others.
+    fn heard_next(log: &mpsc::Receiver<Value>, method: &str) -> Value {
+        loop {
+            let message = log.recv_timeout(Duration::from_secs(5)).unwrap();
+            if message["method"] == method {
+                return message;
+            }
+        }
+    }
+
+    /// `log` passed on, and `cancel` stopped the moment the server hears a
+    /// call, as a user pressing Stop mid-call.
+    fn stop_when_called(
+        log: mpsc::Receiver<Value>,
+        cancel: &crate::cancel::Cancel,
+    ) -> mpsc::Receiver<Value> {
+        let (heard, passed) = mpsc::channel();
+        let stop = cancel.clone();
+        std::thread::spawn(move || {
+            for message in log {
+                if message["method"] == "tools/call" {
+                    stop.set();
+                }
+                let _ = heard.send(message);
+            }
+        });
+        passed
+    }
+
+    /// What the client replied when the server asked it `method`.
+    fn asked(tools: &[Arc<dyn Tool>], method: &str, ctx: &ToolContext) -> Value {
+        let said = tools[0].run(&json!({ "ask": method }), ctx).unwrap();
+        serde_json::from_str(&said).unwrap()
+    }
+
+    #[test]
+    fn a_stopped_call_tells_its_server_and_returns_at_once() {
+        let (tools, log) = patient_server(&ServerConfig::default());
+        let ctx = ToolContext::default();
+        let log = stop_when_called(log, &ctx.cancel);
+        let asked = std::time::Instant::now();
+        let failed = tools[0].run(&json!({"ms": 10_000}), &ctx).unwrap_err();
+        assert_eq!(failed, "Stopped before patient answered tools/call.");
+        assert!(
+            asked.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            asked.elapsed()
+        );
+        let call = heard_next(&log, "tools/call");
+        let cancelled = heard_next(&log, "notifications/cancelled");
+        assert_eq!(cancelled["params"]["requestId"], call["id"]);
+        assert_eq!(cancelled["params"]["reason"], failed.as_str());
+
+        // One that runs out of time is given up on the same way.
+        let quick = ServerConfig {
+            timeout_ms: Some(1_000),
+            ..ServerConfig::default()
+        };
+        let (tools, log) = patient_server(&quick);
+        let ctx = ToolContext::default();
+        let failed = tools[0].run(&json!({"ms": 10_000}), &ctx).unwrap_err();
+        assert!(failed.contains("within 1 seconds"), "{failed}");
+        let call = heard_next(&log, "tools/call");
+        let cancelled = heard_next(&log, "notifications/cancelled");
+        assert_eq!(cancelled["params"]["requestId"], call["id"]);
+    }
+
+    #[test]
+    fn an_answer_that_comes_after_a_stop_is_dropped() {
+        let (tools, log) = patient_server(&ServerConfig::default());
+        let ctx = ToolContext::default();
+        let log = stop_when_called(log, &ctx.cancel);
+        assert!(tools[0].run(&json!({"ms": 400}), &ctx).is_err());
+        heard_next(&log, "answered");
+        // The next call hears its own answer, not the one that came late.
+        let said = tools[0].run(&json!({"ms": 0}), &ToolContext::default());
+        assert_eq!(said.unwrap(), "worked 0 ms");
+    }
+
+    #[test]
+    fn roots_are_the_latest_callers_folder_and_the_server_has_them_first() {
+        let (tools, log) = patient_server(&ServerConfig::default());
+        let greeting = heard_next(&log, "initialize");
+        assert_eq!(
+            greeting["params"]["capabilities"]["roots"]["listChanged"],
+            true
+        );
+        let project = |name: &str| ToolContext {
+            workspace: Some(std::env::temp_dir().join(name)),
+            ..ToolContext::default()
+        };
+        // What the server held when the call reached it.
+        let held = |ctx: &ToolContext| -> Value {
+            let said = tools[0].run(&json!({"held": true}), ctx).unwrap();
+            serde_json::from_str(&said).unwrap()
+        };
+        let roots = held(&project("a project"));
+        let uri = roots[0]["uri"].as_str().unwrap();
+        assert!(
+            uri.starts_with("file:///") && uri.ends_with("/a%20project"),
+            "{uri}"
+        );
+        assert_eq!(roots.as_array().unwrap().len(), 1);
+        heard_next(&log, "notifications/roots/list_changed");
+        let roots = held(&project("another"));
+        assert!(roots[0]["uri"].as_str().unwrap().ends_with("/another"));
+        heard_next(&log, "notifications/roots/list_changed");
+
+        // No project, the home folder or the same folder again change
+        // nothing: the server keeps the last folder and is not told.
+        let home = ToolContext {
+            workspace: crate::tools::home(),
+            ..ToolContext::default()
+        };
+        for ctx in [ToolContext::default(), home, project("another")] {
+            assert!(held(&ctx)[0]["uri"].as_str().unwrap().ends_with("/another"));
+            let said = asked(&tools, "roots/list", &ctx);
+            let uri = said["result"]["roots"][0]["uri"].as_str().unwrap();
+            assert!(uri.ends_with("/another"), "{uri}");
+        }
+        assert!(
+            log.try_iter()
+                .all(|m| m["method"] != "notifications/roots/list_changed"),
+            "told of a change when there was none"
+        );
+    }
+
+    #[test]
+    fn a_request_the_client_does_not_offer_is_refused() {
+        let (tools, _log) = patient_server(&ServerConfig::default());
+        for method in ["sampling/createMessage", "elicitation/create"] {
+            let said = asked(&tools, method, &ToolContext::default());
+            assert_eq!(said["error"]["code"], -32601, "{said}");
+            assert_eq!(said["id"], "asked");
+        }
+    }
+
+    #[test]
+    fn a_folder_is_spelt_as_a_file_uri_on_either_system() {
+        let uri = |path: &str, windows| file_uri(path.as_bytes(), windows);
+        assert_eq!(uri("/Users/me/a b#1", false), "file:///Users/me/a%20b%231");
+        assert_eq!(uri("/tmp/café", false), "file:///tmp/caf%C3%A9");
+        assert_eq!(uri(r"C:\Users\me\a b", true), "file:///C:/Users/me/a%20b");
+        assert_eq!(uri(r"\\server\share\dir", true), "file://server/share/dir");
+        assert_eq!(uri(r"\\?\D:\deep\path", true), "file:///D:/deep/path");
+        assert_eq!(uri(r"\\?\UNC\server\share", true), "file://server/share");
+        assert_eq!(uri(r"\\?\unc\server\share", true), "file://server/share");
+        assert_eq!(uri(r"\\.\C:\x", true), "file:///C:/x");
+    }
+
+    #[test]
+    fn a_call_stopped_before_it_is_sent_sends_nothing() {
+        let (tools, log) = patient_server(&ServerConfig::default());
+        let ctx = ToolContext {
+            workspace: Some(std::env::temp_dir().join("a project")),
+            ..ToolContext::default()
+        };
+        ctx.cancel.set();
+        let failed = tools[0].run(&json!({"ms": 0}), &ctx).unwrap_err();
+        assert_eq!(failed, "Stopped before patient answered tools/call.");
+        // The next call is the first thing the server hears of either.
+        tools[0]
+            .run(&json!({"ms": 1}), &ToolContext::default())
+            .unwrap();
+        loop {
+            let message = log.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_ne!(message["method"], "notifications/roots/list_changed");
+            assert_ne!(message["method"], "notifications/cancelled");
+            if message["method"] == "tools/call" {
+                assert_eq!(message["params"]["arguments"]["ms"], 1);
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn a_root_is_never_a_filesystem_root_nor_holds_home_or_letronnas_data() {
+        #[cfg(unix)]
+        let (home, data, elsewhere, fine) = ("/Users/me", "/srv/letronna", "/srv", "/Users/me/app");
+        #[cfg(windows)]
+        let (home, data, elsewhere, fine) =
+            (r"C:\Users\me", r"D:\letronna", r"D:\", r"C:\Users\me\app");
+        let allowed =
+            |folder: &str| root_allowed(Path::new(folder), Some(Path::new(home)), Path::new(data));
+        assert!(allowed(fine));
+        assert!(!allowed(home));
+        assert!(!allowed(
+            Path::new(home).parent().unwrap().to_str().unwrap()
+        ));
+        assert!(!allowed(elsewhere));
+        assert!(!allowed(&format!("{fine}{}..", std::path::MAIN_SEPARATOR)));
+        assert!(!allowed("relative"));
+        #[cfg(unix)]
+        {
+            assert!(!allowed("/"));
+            // A name that is not UTF-8 would be skipped by the server.
+            use std::os::unix::ffi::OsStrExt;
+            let odd = std::ffi::OsStr::from_bytes(b"caf\xE9");
+            assert!(!may_be_root(&std::env::temp_dir().join(odd)));
+            assert!(may_be_root(&std::env::temp_dir().join("café")));
+        }
+    }
+
+    #[test]
+    fn a_server_given_a_folder_is_offered_no_roots() {
+        let folder = std::env::temp_dir().to_string_lossy().into_owned();
+        let config = ServerConfig {
+            args: vec!["-y".to_owned(), folder],
+            ..ServerConfig::default()
+        };
+        let (tools, log) = patient_server(&config);
+        let greeting = heard_next(&log, "initialize");
+        assert_eq!(greeting["params"]["capabilities"], json!({}));
+        let project = ToolContext {
+            workspace: Some(std::env::temp_dir().join("a project")),
+            ..ToolContext::default()
+        };
+        let said = asked(&tools, "roots/list", &project);
+        assert_eq!(said["error"]["code"], -32601, "{said}");
+        assert!(
+            log.try_iter()
+                .all(|m| m["method"] != "notifications/roots/list_changed")
+        );
+
+        // `~` is the home folder; a file or a package names no folder.
+        let home = std::env::temp_dir();
+        let names = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            names_a_folder(&args, Some(&home))
+        };
+        assert!(names(&["~"]) && names(&["-y", "~/"]));
+        let exe = std::env::current_exe().unwrap();
+        assert!(!names(&[&exe.to_string_lossy()]));
+        assert!(!names(&["-y", "@modelcontextprotocol/server-filesystem"]));
+        assert!(!names(&["~nobody"]));
+    }
+
+    #[test]
+    fn a_stopped_call_to_a_server_reached_by_url_is_cancelled_there_too() {
+        let (heard, log) = mpsc::channel();
+        let heard = Mutex::new(heard);
+        let ctx = ToolContext::default();
+        let stop = ctx.cancel.clone();
+        let url = serve(move |_, message, stream| {
+            let _ = heard.lock().unwrap().send(message.clone());
+            if let Some(reply) = usual(&message, "s-1") {
+                let _ = stream.write_all(reply.as_bytes());
+                return;
+            }
+            if message["params"]["arguments"]["hang"] == true {
+                // The call's stream opens, nothing comes down it, and the
+                // user stops it.
+                let open = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n";
+                let _ = stream.write_all(open.as_bytes());
+                stop.set();
+                std::thread::sleep(Duration::from_secs(10));
+            } else if message["method"] == "tools/call" {
+                let _ = stream.write_all(answer(&message, "done").as_bytes());
+            } else if message["method"] == "notifications/cancelled" {
+                // Taken in and never answered, as by a server gone quiet.
+                std::thread::sleep(Duration::from_secs(30));
+            }
+        });
+        let config = ServerConfig {
+            url,
+            ..ServerConfig::default()
+        };
+        let tools = reach("far", &config, 0).unwrap();
+        // It cannot open local folders, so it is told of none.
+        assert_eq!(
+            heard_next(&log, "initialize")["params"]["capabilities"],
+            json!({})
+        );
+        let asked = std::time::Instant::now();
+        assert!(tools[0].run(&json!({"hang": true}), &ctx).is_err());
+        assert!(
+            asked.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            asked.elapsed()
+        );
+        let call = heard_next(&log, "tools/call");
+        let cancelled = heard_next(&log, "notifications/cancelled");
+        assert_eq!(cancelled["params"]["requestId"], call["id"]);
+
+        // The cancel it never answers holds up no one else's call.
+        let asked = std::time::Instant::now();
+        let said = tools[0].run(&json!({}), &ToolContext::default());
+        assert_eq!(said.unwrap(), "done");
+        assert!(
+            asked.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            asked.elapsed()
+        );
+    }
+
     #[test]
     fn a_server_that_stops_fails_its_callers_at_once() {
         let (from_client, to_server) = std::io::pipe().unwrap();
@@ -3370,7 +3990,11 @@ mod tests {
         };
         let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call"});
         let error = link
-            .send(call.to_string().as_bytes(), &mut |_| {})
+            .send(
+                call.to_string().as_bytes(),
+                Duration::from_secs(10),
+                &mut |_| {},
+            )
             .unwrap_err();
         assert!(error.contains("could not reach"), "{error}");
         let lost = settled("t-drop", |_| true);
@@ -3578,6 +4202,7 @@ mod tests {
         switch_off("t-unparsed");
     }
 
+    #[cfg(unix)]
     /// The process id of a test's server run here, once it has printed.
     fn pid_of(name: &str) -> u32 {
         settled(name, |s| s.log.contains("waiting"));
