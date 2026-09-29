@@ -860,113 +860,289 @@ pub struct Hit {
     pub id: u64,
     pub title: String,
     pub updated: u64,
+    /// Who said it, "notice" for a report sent as the user's turn, or
+    /// "title" for a match in the session's title.
     pub role: String,
+    /// Which message it is, counting from 0 as the session's messages do;
+    /// None for a match in the title.
+    pub ordinal: Option<usize>,
     /// The matching words with a little of what surrounds them, on one line.
     pub snippet: String,
+}
+
+/// Which sessions a search looks through.
+#[derive(Clone, Copy, Default)]
+pub struct Within {
+    /// A session left out, such as the one asking, which already has what it
+    /// said; 0 for none.
+    pub exclude: u64,
+    /// Only sessions last used at or after this time, in seconds since 1970.
+    pub after: Option<u64>,
+    /// Only sessions last used before this time, in seconds since 1970.
+    pub before: Option<u64>,
 }
 
 /// Matches taken from any one session, so a long one cannot fill the list.
 const HITS_PER_SESSION: usize = 3;
 /// Characters of context kept either side of a match.
 const SNIPPET_SIDE: usize = 100;
+/// Words of a query searched for at most: each is another look through every
+/// session's text, and a query longer than this is a paste, not a search.
+const MAX_TERMS: usize = 16;
+/// How soon saying a word again stops adding to a match: BM25's usual k1,
+/// under which no count is worth 2.2 of one, so a word weighing that much
+/// more than another, said once, outranks any count of the other.
+const REPEATS: f64 = 1.2;
+/// Punctuation stripped from either end of a query's word, so "error:" or
+/// "(postgres)" finds the word while "c++" and "#12" keep theirs.
+const EDGES: &[char] = &[
+    ',', '.', ';', ':', '!', '?', '(', ')', '[', ']', '{', '}', '\'', '`',
+];
 
-/// What was said in past sessions that contains `query`, ignoring case,
-/// newest sessions first.
-pub fn search(query: &str, limit: usize) -> Vec<Hit> {
-    search_in(&sessions_dir(), query, limit)
+/// What was said in past sessions that holds every word of `query`,
+/// ignoring case, or failing that any of them: best first, where a match on
+/// a word few sessions use counts for more, and newest first among equals.
+pub fn search(query: &str, within: &Within, limit: usize) -> Vec<Hit> {
+    search_in(&sessions_dir(), query, within, limit)
 }
 
-fn search_in(dir: &std::path::Path, query: &str, limit: usize) -> Vec<Hit> {
-    let query = query.trim().to_lowercase();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    if query.is_empty() {
+/// Session `id` as saved, for reading back what was said around a hit.
+pub fn saved(id: u64) -> Option<Conversation> {
+    replay(&session_path(id))
+}
+
+fn search_in(dir: &std::path::Path, query: &str, within: &Within, limit: usize) -> Vec<Hit> {
+    let terms = terms(query);
+    if terms.is_empty() {
         return Vec::new();
     }
-    let mut sessions: Vec<(u64, Vec<Hit>)> = Vec::new();
-    for entry in entries.filter_map(Result::ok) {
-        let path = entry.path();
-        if path.extension().is_none_or(|e| e != "jsonl") {
-            continue;
+    let written: Vec<String> = terms.iter().map(|t| on_disk(t)).collect();
+    // Which words each session holds anywhere, told by its whole text
+    // without parsing a line: most sessions hold none, and how many hold a
+    // word says how rare it is.
+    let (mut sessions, mut holding) = (0usize, vec![0usize; terms.len()]);
+    let mut candidates: Vec<(PathBuf, bool)> = Vec::new();
+    for (path, text) in session_texts(dir) {
+        let lower = text.to_lowercase();
+        let held: Vec<bool> = written.iter().map(|t| lower.contains(t.as_str())).collect();
+        sessions += 1;
+        for (count, held) in holding.iter_mut().zip(&held) {
+            *count += usize::from(*held);
         }
-        let Ok(bytes) = std::fs::read(&path) else {
-            continue;
+        if held.contains(&true) {
+            candidates.push((path, !held.contains(&false)));
+        }
+    }
+    let weights: Vec<f64> = holding
+        .iter()
+        .map(|&n| match n {
+            0 => 0.0,
+            n => (1.0 + sessions as f64 / n as f64).ln(),
+        })
+        .collect();
+    let every = candidates.iter().filter(|(_, all)| *all).map(|(p, _)| p);
+    let mut found = ranked(every, &terms, &weights, true, within);
+    // Nothing holds every word, which a natural question often asks for, so
+    // the rare words it has still find their messages.
+    if found.is_empty() && terms.len() > 1 {
+        let any = candidates.iter().map(|(p, _)| p);
+        found = ranked(any, &terms, &weights, false, within);
+    }
+    found.into_iter().take(limit).collect()
+}
+
+/// Each session file in `dir` with its text, read one at a time and
+/// leniently, as in `replay`: a search holds one file rather than them all.
+fn session_texts(dir: &std::path::Path) -> impl Iterator<Item = (PathBuf, String)> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|e| e == "jsonl"))
+        .filter_map(|path| {
+            let bytes = std::fs::read(&path).ok()?;
+            let text = String::from_utf8(bytes)
+                .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+            Some((path, text))
+        })
+}
+
+/// The words of `query`, lowercase: "quoted words" stay together, the rest
+/// are cut at spaces and lose the punctuation at their ends. A run of CJK
+/// text has no spaces and so stays one word, found as it is written.
+fn terms(query: &str) -> Vec<String> {
+    let mut terms: Vec<String> = Vec::new();
+    for (i, part) in query.split('"').enumerate() {
+        let words: Vec<&str> = if i % 2 == 1 {
+            vec![part.trim()]
+        } else {
+            part.split_whitespace()
+                // Only punctuation, such as "->", is looked for as it is.
+                .map(|w| match w.trim_matches(EDGES) {
+                    "" => w,
+                    word => word,
+                })
+                .collect()
         };
-        let text = String::from_utf8_lossy(&bytes);
-        // Most sessions never mention it, which the whole file says at once.
-        // Quotes and backslashes are escaped on disk, so a query holding
-        // either cannot be checked that way and reads the messages instead.
-        if !query.contains(['"', '\\']) && !text.to_lowercase().contains(&query) {
-            continue;
-        }
-        // The file's name gives the id when the head line is torn, as in
-        // `replay`, so a hit still says which session to open.
-        let named = path.file_stem().and_then(|s| s.to_str()?.parse().ok());
-        let (mut id, mut title, mut updated) = (named.unwrap_or(0), String::new(), 0);
-        // Each hit keeps its message's place, and the cap waits for the end
-        // of the file: a rewind further down can take the first hits back
-        // and leave later ones standing.
-        let (mut hits, mut said) = (Vec::new(), 0);
-        for line in text.lines() {
-            match serde_json::from_str::<Record>(line) {
-                Ok(Record::Head { id: head, created }) => (id, updated) = (head, created),
-                // The last meta line wins, and it can come after messages.
-                Ok(Record::Meta(meta)) => (title, updated) = (meta.title, meta.updated),
-                Ok(Record::Message(message)) => {
-                    if let Some(snippet) = around(&message.content, &query) {
-                        // A notice has the user's role, but the snippet rarely
-                        // reaches its header, and a job's output read back as
-                        // the user's words becomes a request they never made.
-                        let role = if message.notice {
-                            "notice".into()
-                        } else {
-                            message.role
-                        };
-                        hits.push((said, role, snippet));
-                    }
-                    said += 1;
-                }
-                Ok(Record::Rewind { to }) => {
-                    hits.retain(|(at, ..)| *at < to);
-                    said = said.min(to);
-                }
-                _ => {}
+        for word in words.into_iter().map(str::to_lowercase) {
+            if !word.is_empty() && !terms.contains(&word) {
+                terms.push(word);
             }
         }
-        if hits.is_empty() {
-            continue;
-        }
-        let hits = hits
-            .into_iter()
-            .take(HITS_PER_SESSION)
-            .map(|(_, role, snippet)| Hit {
-                id,
-                title: title.clone(),
-                updated,
-                role,
-                snippet,
-            })
-            .collect();
-        sessions.push((updated, hits));
     }
-    sessions.sort_by_key(|(updated, _)| std::cmp::Reverse(*updated));
-    sessions
-        .into_iter()
-        .flat_map(|(_, hits)| hits)
-        .take(limit)
-        .collect()
+    terms.truncate(MAX_TERMS);
+    terms
 }
 
-/// The first place `query` (already lowercase) occurs in `text`, with
-/// `SNIPPET_SIDE` characters either side, on one line.
-fn around(text: &str, query: &str) -> Option<String> {
+/// How `term` is written inside a session file, where text is JSON: a tab
+/// or a quote there takes two characters.
+fn on_disk(term: &str) -> String {
+    let quoted = serde_json::to_string(term).unwrap_or_default();
+    quoted
+        .get(1..quoted.len().saturating_sub(1))
+        .unwrap_or(term)
+        .to_owned()
+}
+
+/// The best matches in each session at `paths` that `within` allows, the
+/// best session first: a match holds `every` word, or else at least one.
+fn ranked<'a>(
+    paths: impl Iterator<Item = &'a PathBuf>,
+    terms: &[String],
+    weights: &[f64],
+    every: bool,
+    within: &Within,
+) -> Vec<Hit> {
+    let mut found: Vec<(f64, u64, Vec<Hit>)> = Vec::new();
+    for path in paths {
+        // Read back as the session is loaded, so a rewind has taken back what
+        // it dropped and each message's place is its place when opened.
+        let Some(conversation) = replay(path) else {
+            continue;
+        };
+        let updated = conversation.updated;
+        if conversation.id == within.exclude
+            || within.after.is_some_and(|t| updated < t)
+            || within.before.is_some_and(|t| updated >= t)
+        {
+            continue;
+        }
+        let text_at = |ordinal: Option<usize>| match ordinal {
+            None => std::borrow::Cow::from(&conversation.title),
+            Some(i) => searched(&conversation.messages[i]),
+        };
+        let places = std::iter::once(None).chain((0..conversation.messages.len()).map(Some));
+        let mut matches: Vec<(f64, Option<usize>)> = places
+            .filter_map(|at| {
+                Some((
+                    score(&text_at(at).to_lowercase(), terms, weights, every)?,
+                    at,
+                ))
+            })
+            .collect();
+        // Best first, and in the order said among equals, the title first.
+        matches.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        matches.truncate(HITS_PER_SESSION);
+        let Some(&(best, _)) = matches.first() else {
+            continue;
+        };
+        let hits = matches
+            .into_iter()
+            .filter_map(|(_, ordinal)| {
+                let role = match ordinal.map(|i| &conversation.messages[i]) {
+                    None => "title".into(),
+                    // A notice has the user's role, but the snippet rarely
+                    // reaches its header, and a job's output read back as
+                    // the user's words becomes a request they never made.
+                    Some(m) if m.notice => "notice".into(),
+                    Some(m) => m.role.clone(),
+                };
+                Some(Hit {
+                    id: conversation.id,
+                    title: conversation.title.clone(),
+                    updated,
+                    role,
+                    ordinal,
+                    snippet: snippet(&text_at(ordinal), terms, weights)?,
+                })
+            })
+            .collect();
+        found.push((best, updated, hits));
+    }
+    found.sort_by(|a, b| b.0.total_cmp(&a.0).then(b.1.cmp(&a.1)));
+    found.into_iter().flat_map(|(_, _, hits)| hits).collect()
+}
+
+/// How well `lower` matches `terms`: each word's count, flattened so a long
+/// output repeating a word does not bury a short answer, times its weight;
+/// None when it lacks a word it needs.
+fn score(lower: &str, terms: &[String], weights: &[f64], every: bool) -> Option<f64> {
+    let mut total = None;
+    for (term, weight) in terms.iter().zip(weights) {
+        let count = lower.matches(term.as_str()).count();
+        if count == 0 {
+            if every {
+                return None;
+            }
+            continue;
+        }
+        let count = count as f64;
+        *total.get_or_insert(0.0) += count * (REPEATS + 1.0) / (count + REPEATS) * weight;
+    }
+    total
+}
+
+/// The text of `message` a search looks through: what was said and, for a
+/// turn that called tools, each tool's name and arguments.
+pub(crate) fn searched(message: &Message) -> std::borrow::Cow<'_, str> {
+    if message.tool_calls.is_empty() {
+        return std::borrow::Cow::from(&message.content);
+    }
+    let mut text = message.content.clone();
+    for call in &message.tool_calls {
+        text.push_str(&format!("\n{} {}", call.name, call.arguments));
+    }
+    std::borrow::Cow::from(text)
+}
+
+/// `text` cut around the rarest of `terms` it holds.
+fn snippet(text: &str, terms: &[String], weights: &[f64]) -> Option<String> {
+    let lower = text.to_lowercase();
+    let (term, _) = terms
+        .iter()
+        .zip(weights)
+        .filter(|(t, _)| lower.contains(t.as_str()))
+        .max_by(|a, b| a.1.total_cmp(b.1))?;
+    around(text, term, SNIPPET_SIDE)
+}
+
+/// `text` on one line, cut to about `width` characters around the first of
+/// `query`'s words it holds, or from its start when it holds none.
+pub(crate) fn excerpt(text: &str, query: &str, width: usize) -> String {
+    let lower = text.to_lowercase();
+    let first = terms(query)
+        .into_iter()
+        .filter(|t| t.chars().count() < width)
+        .filter_map(|t| Some((lower.find(t.as_str())?, t)))
+        .min();
+    let (term, side) = match &first {
+        Some((_, term)) => (term.as_str(), (width - term.chars().count()) / 2),
+        // An empty word is found at the start, with all the width after it.
+        None => ("", width),
+    };
+    around(text, term, side).unwrap_or_default()
+}
+
+/// The first place `term` (already lowercase) occurs in `text`, with `side`
+/// characters either side, on one line.
+fn around(text: &str, term: &str, side: usize) -> Option<String> {
     let lower = text.to_lowercase();
     // Counted in characters, since lowercasing can change a character's
     // length in bytes and the cut is made in the original.
-    let at = lower[..lower.find(query)?].chars().count();
-    let from = at.saturating_sub(SNIPPET_SIDE);
-    let to = at + query.chars().count() + SNIPPET_SIDE;
+    let at = lower[..lower.find(term)?].chars().count();
+    let from = at.saturating_sub(side);
+    let to = at + term.chars().count() + side;
     let cut: String = text.chars().skip(from).take(to - from).collect();
     let mut snippet = crate::tools::one_line(&cut);
     if from > 0 {
@@ -1395,8 +1571,8 @@ pub(crate) mod tests {
     #[cfg(unix)]
     use super::write_private;
     use super::{
-        Conversation, Lock, Store, Todo, Transcript, apply_todo, fill, load, load_listing, replay,
-        search, search_in, summaries, todos_in,
+        Conversation, Lock, SNIPPET_SIDE, Store, Todo, Transcript, Within, apply_todo, fill, load,
+        load_listing, replay, search, search_in, summaries, todos_in,
     };
     use crate::chat::{Message, ToolCall};
 
@@ -1638,7 +1814,10 @@ pub(crate) mod tests {
         let listed = summaries();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].title, "kept");
-        assert_eq!(search_in(&sessions, "three", 10).len(), 1);
+        assert_eq!(
+            search_in(&sessions, "three", &Within::default(), 10).len(),
+            1
+        );
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 
@@ -1657,7 +1836,7 @@ pub(crate) mod tests {
         assert_eq!(back.id, 7);
         assert_eq!(back.title, "kept");
         assert_eq!(back.messages.len(), 1);
-        let hits = search_in(&dir, "hello", 10);
+        let hits = search_in(&dir, "hello", &Within::default(), 10);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, 7);
     }
@@ -1689,13 +1868,13 @@ pub(crate) mod tests {
         session(2, "Moving", 300, &[("user", "Moving to postgres now")]);
         session(3, "Unrelated", 200, &[("user", "nothing to see")]);
 
-        let hits = search_in(&dir, "POSTGRES", 10);
+        let hits = search_in(&dir, "POSTGRES", &Within::default(), 10);
         let found: Vec<(u64, &str)> = hits.iter().map(|h| (h.id, h.role.as_str())).collect();
         assert_eq!(found, [(2, "user"), (1, "user"), (1, "assistant")]);
         assert_eq!(hits[1].title, "Database");
         assert_eq!(hits[1].snippet, "Should we use Postgres or SQLite?");
-        assert_eq!(search_in(&dir, "POSTGRES", 1).len(), 1);
-        assert!(search_in(&dir, "mysql", 10).is_empty());
+        assert_eq!(search_in(&dir, "POSTGRES", &Within::default(), 1).len(), 1);
+        assert!(search_in(&dir, "mysql", &Within::default(), 10).is_empty());
     }
 
     #[test]
@@ -1707,7 +1886,7 @@ pub(crate) mod tests {
              {\"type\":\"message\",\"role\":\"user\",\"content\":\"the tests failed\",\"notice\":true}\n",
         )
         .unwrap();
-        let roles: Vec<String> = search_in(&dir, "tests", 10)
+        let roles: Vec<String> = search_in(&dir, "tests", &Within::default(), 10)
             .into_iter()
             .map(|hit| hit.role)
             .collect();
@@ -1717,13 +1896,250 @@ pub(crate) mod tests {
     #[test]
     fn a_long_match_is_shown_with_its_surroundings_only() {
         let text = format!("{} the needle {}", "a".repeat(300), "b".repeat(300));
-        let snippet = super::around(&text, "needle").unwrap();
+        let snippet = super::around(&text, "needle", SNIPPET_SIDE).unwrap();
         assert!(
             snippet.starts_with('…') && snippet.ends_with('…'),
             "{snippet}"
         );
         assert!(snippet.contains("the needle"));
         assert!(snippet.chars().count() < 220, "{}", snippet.chars().count());
+    }
+
+    /// Writes session `id` into `dir` with `messages`, each a JSON object of
+    /// a message's fields.
+    fn session_file(
+        dir: &std::path::Path,
+        id: u64,
+        title: &str,
+        updated: u64,
+        messages: &[serde_json::Value],
+    ) {
+        let mut text = format!(
+            "{}\n{}\n",
+            serde_json::json!({"type": "head", "id": id, "created": updated}),
+            serde_json::json!({"type": "meta", "title": title, "updated": updated,
+                "pinned": false, "workspace": null, "todos": []}),
+        );
+        for message in messages {
+            let mut line = message.clone();
+            line["type"] = "message".into();
+            text.push_str(&format!("{line}\n"));
+        }
+        std::fs::write(dir.join(format!("{id}.jsonl")), text).unwrap();
+    }
+
+    fn user(text: &str) -> serde_json::Value {
+        serde_json::json!({"role": "user", "content": text})
+    }
+
+    #[test]
+    fn a_search_needs_every_word_but_in_any_order() {
+        let dir = scratch("search-every");
+        session_file(
+            &dir,
+            1,
+            "",
+            100,
+            &[user("tauri is set up"), user("the build is fine")],
+        );
+        session_file(
+            &dir,
+            2,
+            "",
+            50,
+            &[user("hi"), user("an error during the tauri build")],
+        );
+        let hits = search_in(&dir, "Tauri build error", &Within::default(), 10);
+        let found: Vec<(u64, Option<usize>)> = hits.iter().map(|h| (h.id, h.ordinal)).collect();
+        assert_eq!(found, [(2, Some(1))]);
+        assert_eq!(hits[0].snippet, "an error during the tauri build");
+    }
+
+    #[test]
+    fn when_nothing_holds_every_word_the_rarest_words_find_it() {
+        let dir = scratch("search-any");
+        // The newest sessions all say "error"; one older one names the tool.
+        for id in 1..=5 {
+            session_file(&dir, id, "", 100 + id, &[user("an error again")]);
+        }
+        session_file(&dir, 9, "", 10, &[user("wrangler would not deploy")]);
+        let hits = search_in(&dir, "wrangler error flamingo", &Within::default(), 10);
+        let ids: Vec<u64> = hits.iter().map(|h| h.id).collect();
+        assert_eq!(ids, [9, 5, 4, 3, 2, 1]);
+        // One word is looked for once, not again with any of them.
+        assert!(search_in(&dir, "flamingo", &Within::default(), 10).is_empty());
+    }
+
+    #[test]
+    fn a_rare_word_said_once_outranks_a_common_one_said_often() {
+        let dir = scratch("search-count");
+        for id in 1..=4 {
+            session_file(&dir, id, "", 100 + id, &[user("the cache")]);
+        }
+        let noisy = "cache ".repeat(50);
+        session_file(&dir, 5, "", 10, &[user(&noisy), user("the proxy")]);
+        let hits = search_in(&dir, "cache proxy", &Within::default(), 10);
+        let found: Vec<(u64, Option<usize>)> = hits.iter().map(|h| (h.id, h.ordinal)).collect();
+        assert_eq!(found[..2], [(5, Some(1)), (5, Some(0))]);
+        let ids: Vec<u64> = hits[2..].iter().map(|h| h.id).collect();
+        assert_eq!(ids, [4, 3, 2, 1]);
+    }
+
+    #[test]
+    fn titles_and_tool_arguments_are_searched() {
+        let dir = scratch("search-title-args");
+        let call = serde_json::json!({"role": "assistant", "content": "Building it.",
+            "tool_calls": [{"id": "1", "name": "run_command",
+                "arguments": "{\"command\":\"npx wrangler deploy\"}"}]});
+        session_file(&dir, 1, "Wrangler setup", 100, &[user("go"), call]);
+        let hits = search_in(&dir, "wrangler", &Within::default(), 10);
+        let found: Vec<(&str, Option<usize>)> =
+            hits.iter().map(|h| (h.role.as_str(), h.ordinal)).collect();
+        assert_eq!(found, [("title", None), ("assistant", Some(1))]);
+        assert_eq!(hits[0].snippet, "Wrangler setup");
+        assert!(
+            hits[1].snippet.contains("run_command"),
+            "{}",
+            hits[1].snippet
+        );
+        assert!(
+            hits[1].snippet.contains("npx wrangler deploy"),
+            "{}",
+            hits[1].snippet
+        );
+    }
+
+    #[test]
+    fn a_search_leaves_out_the_session_asking_and_keeps_to_its_dates() {
+        let dir = scratch("search-within");
+        for (id, updated) in [(1, 100), (2, 200), (3, 300)] {
+            session_file(&dir, id, "", updated, &[user("the fig tree")]);
+        }
+        let ids = |within: Within| -> Vec<u64> {
+            search_in(&dir, "fig", &within, 10)
+                .iter()
+                .map(|h| h.id)
+                .collect()
+        };
+        let within = Within {
+            exclude: 3,
+            ..Within::default()
+        };
+        assert_eq!(ids(within), [2, 1]);
+        let within = Within {
+            after: Some(200),
+            ..Within::default()
+        };
+        assert_eq!(ids(within), [3, 2]);
+        let within = Within {
+            before: Some(200),
+            ..Within::default()
+        };
+        assert_eq!(ids(within), [1]);
+    }
+
+    #[test]
+    fn cjk_text_and_escaped_characters_are_found() {
+        let dir = scratch("search-cjk");
+        session_file(&dir, 1, "", 100, &[user("我们用哪个数据库？迁移明天做。")]);
+        session_file(
+            &dir,
+            2,
+            "",
+            90,
+            &[user("the column\tname in C:\\Users\\me")],
+        );
+        let ids = |query: &str| -> Vec<u64> {
+            let hits = search_in(&dir, query, &Within::default(), 10);
+            hits.iter().map(|h| h.id).collect()
+        };
+        assert_eq!(ids("数据库"), [1]);
+        assert_eq!(ids("数据库 迁移"), [1]);
+        // On disk a tab and a backslash are written as two characters each.
+        assert_eq!(ids("\"column\tname\""), [2]);
+        assert_eq!(ids("c:\\users"), [2]);
+    }
+
+    #[test]
+    fn a_query_is_cut_into_words_with_quoted_words_kept_together() {
+        let words = super::terms("Why did \"cargo build\" fail? (tauri.conf.json) c++ -> WHY");
+        assert_eq!(
+            words,
+            [
+                "why",
+                "did",
+                "cargo build",
+                "fail",
+                "tauri.conf.json",
+                "c++",
+                "->"
+            ]
+        );
+        let many: String = (0..40).map(|i| format!("w{i} ")).collect();
+        assert_eq!(super::terms(&many).len(), super::MAX_TERMS);
+        assert!(super::terms("  \"\" ").is_empty());
+    }
+
+    #[test]
+    fn a_long_message_read_back_is_cut_around_the_query() {
+        let text = format!("{} the needle {}", "a ".repeat(2_000), "b ".repeat(2_000));
+        let cut = super::excerpt(&text, "haystack NEEDLE", 200);
+        assert!(cut.starts_with('…') && cut.ends_with('…'), "{cut}");
+        assert!(cut.contains("the needle"), "{cut}");
+        assert!(cut.chars().count() <= 202, "{}", cut.chars().count());
+        let start = super::excerpt(&text, "", 200);
+        assert!(start.starts_with("a a") && start.ends_with('…'), "{start}");
+        assert!(start.chars().count() <= 201, "{}", start.chars().count());
+    }
+
+    #[test]
+    fn the_tool_reads_around_a_hit_under_the_tool_result_cap() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("search-read");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let sessions = dir.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let long = |n: usize| {
+            user(&format!(
+                "{} fig {n} {}",
+                "a ".repeat(9_000),
+                "b ".repeat(9_000)
+            ))
+        };
+        let messages: Vec<serde_json::Value> = (0..12).map(long).collect();
+        session_file(&sessions, 1, &"t".repeat(5_000), 100, &messages);
+        session_file(&sessions, 2, "", 200, &[user("the fig asking")]);
+
+        let ctx = crate::tools::ToolContext {
+            conversation: 2,
+            ..Default::default()
+        };
+        let found = crate::tools::run("search_sessions", r#"{"query":"fig"}"#, &ctx).unwrap();
+        assert!(
+            found.contains("#0 user") && !found.contains("asking"),
+            "{found}"
+        );
+
+        let args = r#"{"session":1,"around":5,"query":"fig"}"#;
+        let read = crate::tools::run("search_sessions", args, &ctx).unwrap();
+        assert!(
+            read.chars().count() < crate::chat::MAX_TOOL_CHARS,
+            "{}",
+            read.len()
+        );
+        assert!(
+            read.contains("#2 user") && read.contains("#8 user"),
+            "{read}"
+        );
+        assert!(
+            !read.contains("#1 user") && !read.contains("#9 user"),
+            "{read}"
+        );
+        assert!(read.contains("fig 5") && read.contains("fig 8"), "{read}");
+        let args = r#"{"session":1,"around":12}"#;
+        let past = crate::tools::run("search_sessions", args, &ctx);
+        assert!(past.is_err_and(|e| e.contains("#0 to #11")));
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 
     #[test]
@@ -1836,10 +2252,10 @@ pub(crate) mod tests {
         store.save().unwrap();
 
         let sessions = dir.join("sessions");
-        assert!(search_in(&sessions, "three", 10).is_empty());
+        assert!(search_in(&sessions, "three", &Within::default(), 10).is_empty());
         // More hits than a session may show were taken back, which must not
         // hide the one said after them.
-        let figs: Vec<String> = search_in(&sessions, "fig", 10)
+        let figs: Vec<String> = search_in(&sessions, "fig", &Within::default(), 10)
             .into_iter()
             .map(|hit| hit.snippet)
             .collect();
@@ -2418,7 +2834,10 @@ pub(crate) mod tests {
         let loaded: Vec<String> = load().conversations.into_iter().map(|c| c.title).collect();
         assert_eq!(loaded, ["the session"]);
         assert_eq!(load_listing().conversations.len(), 1);
-        let found: Vec<String> = search("fig", 10).into_iter().map(|h| h.snippet).collect();
+        let found: Vec<String> = search("fig", &Within::default(), 10)
+            .into_iter()
+            .map(|h| h.snippet)
+            .collect();
         assert_eq!(found, ["a fig in the session"]);
 
         let ctx = crate::tools::ToolContext {
