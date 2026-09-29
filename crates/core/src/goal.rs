@@ -18,11 +18,10 @@
 //!
 //! The look runs on the headless driver with no tools and no history, the
 //! goal, the last reply and the check's output being all it reads, thinking
-//! at low effort, on the helpers' model when one is set: that
-//! setting is where to name a cheap model, since a small one answers this
-//! as well as a large one. The price of each look stays flat as the
-//! session grows.
-//! A user who stops or types meanwhile ends it where it is, and nothing it
+//! at low effort, on the helpers' model when one is set: that setting is
+//! where to name a cheap model, since a small one answers this as well as a
+//! large one. The price of each look stays flat as the session grows. A
+//! user who stops or types meanwhile ends it where it is, and nothing it
 //! found is acted on. While the session's jobs, helpers, workflows or
 //! wake-ups run there is no look at all: the agent can only poll them, and
 //! each poll would spend a continuation. Their end wakes the session, and
@@ -134,11 +133,13 @@ pub enum Step {
 pub enum Command {
     /// Say what the goal is.
     Show,
+    /// Set a new goal with these words, keeping the check command.
     Set(String),
     /// Set the check command, or drop it when empty.
     Check(String),
     /// Make a paused goal active again, with its count started over.
     Resume,
+    /// Drop the goal.
     Clear,
 }
 
