@@ -76,16 +76,51 @@ pub struct Imported {
 
 /// Sessions from Claude Code and Codex, newest first, `limit` at most.
 pub fn list(limit: usize) -> Vec<Candidate> {
-    let mut found = Vec::new();
+    let mut files = Vec::new();
     if let Some(root) = claude_code_root() {
-        found.extend(list_claude_code(&root));
+        files.extend(
+            claude_code_files(&root)
+                .into_iter()
+                .map(|p| (Tool::ClaudeCode, p)),
+        );
     }
     if let Some(root) = codex_root() {
-        found.extend(list_codex(&root));
+        files.extend(codex_files(&root).into_iter().map(|p| (Tool::Codex, p)));
     }
-    found.sort_by_key(|c| std::cmp::Reverse(c.updated));
-    found.truncate(limit);
-    found
+    newest_titled(files, limit)
+}
+
+/// The newest `limit` of `files`, each titled from its head. Sorted and cut
+/// before any head is read: a machine can hold thousands of sessions, and
+/// reading the head of every one to offer a few is what made listing slow.
+fn newest_titled(files: Vec<(Tool, PathBuf)>, limit: usize) -> Vec<Candidate> {
+    let mut files: Vec<(u64, Tool, PathBuf)> = files
+        .into_iter()
+        .map(|(tool, path)| (modified_secs(&path), tool, path))
+        .collect();
+    files.sort_by_key(|&(updated, ..)| std::cmp::Reverse(updated));
+    files.truncate(limit);
+    files
+        .into_iter()
+        .map(|(updated, tool, path)| {
+            let (session_id, title, workspace) = match tool {
+                Tool::ClaudeCode => {
+                    let (title, workspace) = claude_code_head(&path);
+                    let session_id = path.file_stem().and_then(|s| s.to_str());
+                    (session_id.unwrap_or_default().to_owned(), title, workspace)
+                }
+                Tool::Codex => codex_head(&path),
+            };
+            Candidate {
+                tool,
+                session_id,
+                path,
+                title,
+                workspace,
+                updated,
+            }
+        })
+        .collect()
 }
 
 /// Read `candidate`'s file in full and turn it into messages this app knows
@@ -169,7 +204,8 @@ fn codex_root() -> Option<PathBuf> {
 
 // -- Claude Code -------------------------------------------------------
 
-fn list_claude_code(root: &Path) -> Vec<Candidate> {
+/// Every Claude Code session file under `root`, unread.
+fn claude_code_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for project in subdirs(&root.join("projects")) {
         let Ok(files) = std::fs::read_dir(&project) else {
@@ -180,18 +216,10 @@ fn list_claude_code(root: &Path) -> Vec<Candidate> {
             if path.extension().is_none_or(|e| e != "jsonl") {
                 continue;
             }
-            let Some(session_id) = path.file_stem().and_then(|s| s.to_str()) else {
+            if path.file_stem().and_then(|s| s.to_str()).is_none() {
                 continue;
-            };
-            let (title, workspace) = claude_code_head(&path);
-            out.push(Candidate {
-                tool: Tool::ClaudeCode,
-                session_id: session_id.to_owned(),
-                updated: modified_secs(&path),
-                path,
-                title,
-                workspace,
-            });
+            }
+            out.push(path);
         }
     }
     out
@@ -439,7 +467,8 @@ fn tool_result_text(content: &Value) -> String {
 
 // -- Codex ---------------------------------------------------------------
 
-fn list_codex(root: &Path) -> Vec<Candidate> {
+/// Every Codex rollout under `root`, unread.
+fn codex_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for year in subdirs(&root.join("sessions")) {
         for month in subdirs(&year) {
@@ -456,15 +485,7 @@ fn list_codex(root: &Path) -> Vec<Candidate> {
                     if !(name.starts_with("rollout-") && name.ends_with(".jsonl")) {
                         continue;
                     }
-                    let (session_id, title, workspace) = codex_head(&path);
-                    out.push(Candidate {
-                        tool: Tool::Codex,
-                        session_id,
-                        updated: modified_secs(&path),
-                        path,
-                        title,
-                        workspace,
-                    });
+                    out.push(path);
                 }
             }
         }
@@ -990,7 +1011,13 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         write(&project, "abc123.jsonl", CLAUDE_CODE_FIXTURE);
 
-        let found = list_claude_code(&claude_root);
+        let found = newest_titled(
+            claude_code_files(&claude_root)
+                .into_iter()
+                .map(|p| (Tool::ClaudeCode, p))
+                .collect(),
+            usize::MAX,
+        );
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].session_id, "abc123");
         assert_eq!(found[0].title, "Fix the login bug");
@@ -1001,9 +1028,45 @@ mod tests {
         std::fs::create_dir_all(&day).unwrap();
         write(&day, "rollout-2024-01-01T00-00-00-abc.jsonl", CODEX_FIXTURE);
 
-        let found = list_codex(&codex_root);
+        let found = newest_titled(
+            codex_files(&codex_root)
+                .into_iter()
+                .map(|p| (Tool::Codex, p))
+                .collect(),
+            usize::MAX,
+        );
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].session_id, "codex-abc");
         assert_eq!(found[0].title, "Add a health check endpoint");
+    }
+
+    #[test]
+    fn listing_offers_the_newest_first_and_no_more_than_asked() {
+        let dir = scratch("newest");
+        let age = |path: &Path, secs: u64| {
+            let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+            let file = std::fs::File::options().write(true).open(path).unwrap();
+            file.set_modified(when).unwrap();
+        };
+        let old = write(&dir, "old.jsonl", CLAUDE_CODE_FIXTURE);
+        age(&old, 1_000);
+        let new = write(&dir, "new.jsonl", CLAUDE_CODE_FIXTURE);
+        age(&new, 3_000);
+        let middle = write(&dir, "rollout-middle.jsonl", CODEX_FIXTURE);
+        age(&middle, 2_000);
+
+        let found = newest_titled(
+            vec![
+                (Tool::ClaudeCode, old),
+                (Tool::ClaudeCode, new),
+                (Tool::Codex, middle),
+            ],
+            2,
+        );
+        let ids: Vec<&str> = found.iter().map(|c| c.session_id.as_str()).collect();
+        assert_eq!(ids, ["new", "codex-abc"]);
+        assert_eq!(found[0].title, "Fix the login bug");
+        assert_eq!(found[0].updated, 3_000);
+        assert_eq!(found[1].title, "Add a health check endpoint");
     }
 }
