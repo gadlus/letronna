@@ -1137,7 +1137,11 @@ fn system_shortcut(key: &str, held: &[Modifier]) -> Option<&'static str> {
         _ if console && has(&[Control, Alt]) => Some("switches to another console"),
         "t" if has(&[Control, Alt]) => Some("opens a terminal"),
         "l" if has(&[Control, Alt]) || has(&[Command]) => Some("locks the screen"),
-        "f2" if has(&[Alt]) => Some("opens the desktop's box for running a command"),
+        // GNOME's and most desktops' run box, KDE's KRunner, and Xfce's
+        // app finder, all of which run what is typed into them.
+        "f2" | "space" | "f3" if has(&[Alt]) => {
+            Some("opens the desktop's box for running a command")
+        }
         _ => None,
     }
 }
@@ -1707,6 +1711,8 @@ mod tests {
             ("l", &[Command]),
             ("l", &[Control, Alt]),
             ("f2", &[Alt]),
+            ("space", &[Alt]),
+            ("f3", &[Alt]),
         ] {
             assert!(system_shortcut(key, held).is_some(), "{key} {held:?}");
         }
@@ -1716,6 +1722,7 @@ mod tests {
             ("l", &[Control]),
             ("delete", &[Control]),
             ("f4", &[Alt]),
+            ("space", &[Control]),
         ] {
             assert_eq!(system_shortcut(key, held), None, "{key} {held:?}");
         }
