@@ -1133,6 +1133,20 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_c_during_a_turn_stops_it_and_leaves() {
+        let mut bar = Bar::new(String::new());
+        bar.working(true);
+        bar.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(bar.interrupted(), "the turn was not stopped");
+        assert!(bar.finished(), "the terminal stayed open");
+        // Escape stops the turn too, but stays.
+        let mut bar = Bar::new(String::new());
+        bar.working(true);
+        bar.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(bar.interrupted() && !bar.finished());
+    }
+
+    #[test]
     fn the_slider_stops_at_its_ends_and_enter_keeps_where_it_is() {
         let mut bar = Bar::new(String::new());
         bar.slider = Some(Slider {

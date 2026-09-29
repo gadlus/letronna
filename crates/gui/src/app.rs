@@ -118,6 +118,9 @@ pub(crate) struct Chat {
     pub(crate) turn: Option<agent::Turn>,
     /// Stops the tool the turn in flight is running, when set.
     pub(crate) turn_stop: letronna_core::cancel::Cancel,
+    /// Whether the call at the front of the turn is running, rather than
+    /// waiting on its card; a stop answers the two differently.
+    pub(crate) call_running: bool,
     /// The session id currently receiving a streamed reply, if any.
     pub(crate) streaming_id: Option<u64>,
     /// Tools the user allowed for the rest of this run of the app.
@@ -388,6 +391,7 @@ impl Chat {
             busy: false,
             turn: None,
             turn_stop: Default::default(),
+            call_running: false,
             streaming_id: None,
             session_allow: std::collections::HashSet::new(),
             unattended: std::collections::HashSet::new(),
@@ -838,6 +842,7 @@ impl Chat {
             .map(|turn| letronna_core::tools::ToolContext::of(&turn.connection))
             .unwrap_or_default();
         ctx.cancel = self.turn_stop.clone();
+        self.call_running = true;
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
             let _ = tx.send_blocking(letronna_core::tools::run(&call.name, &call.arguments, &ctx));
@@ -847,6 +852,7 @@ impl Chat {
             if let Ok(result) = rx.recv().await {
                 let _ = this.update(cx, |this, cx| {
                     if this.generation == generation {
+                        this.call_running = false;
                         this.record_result(result, cx)
                     }
                 });
@@ -1227,8 +1233,8 @@ impl Chat {
 
     /// End the turn in flight, from the Stop button or `/stop` in a chat.
     /// The chat or schedule that started it hears "Stopped." rather than an
-    /// error; any call left without a result is answered as interrupted when
-    /// the session next goes to the model.
+    /// error. What the turn got to is kept: the reply so far, or the batch's
+    /// results with every call left answered as stopped.
     pub(crate) fn stop_turn(&mut self, cx: &mut Context<Self>) {
         if !self.busy {
             return;
@@ -1251,7 +1257,32 @@ impl Chat {
                 self.send_report(title, "Stopped.".into(), cx);
             }
         }
+        self.keep_stopped();
         self.finish(cx);
+    }
+
+    /// Save what a stopped turn got to, so the model hears next time what ran
+    /// and what did not.
+    fn keep_stopped(&mut self) {
+        let model = self.store.settings.model.clone();
+        let running = std::mem::take(&mut self.call_running);
+        let Some(turn) = self.turn.as_mut() else {
+            return;
+        };
+        if running {
+            turn.finish_call(Err(agent::STOPPED_WHILE_RUNNING.into()));
+        }
+        let kept = turn.stop(&model);
+        let Some(ix) = self.streaming_id.and_then(|id| self.store.index_of(id)) else {
+            return;
+        };
+        if kept.is_empty() {
+            return;
+        }
+        let conversation = &mut self.store.conversations[ix];
+        conversation.updated = backend::now();
+        conversation.messages.extend(kept);
+        self.save();
     }
 
     /// Escape that nothing nearer took: close what is open over the chat,

@@ -37,6 +37,9 @@ pub struct Message {
     pub args: String,
     #[serde(default)]
     pub is_error: bool,
+    /// For `role: "assistant"`: the user stopped this reply part way.
+    #[serde(default)]
+    pub interrupted: bool,
 }
 
 impl Message {
