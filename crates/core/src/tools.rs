@@ -1719,14 +1719,7 @@ impl Tool for ReadJob {
     fn run(&self, args: &Value, _: &ToolContext) -> Result<String, String> {
         let id = job_id(args)?;
         let log = crate::jobs::log(id)?;
-        let state = if crate::jobs::running(id)? {
-            "running".to_owned()
-        } else {
-            match crate::jobs::exit_code(id)? {
-                Some(code) => format!("exited with code {code}"),
-                None => "stopped".to_owned(),
-            }
-        };
+        let state = crate::jobs::state(id)?;
         let (offset, limit) = (args["offset"].as_u64(), args["limit"].as_u64());
         if offset.is_some() || limit.is_some() {
             let lines: Vec<&str> = log.trim_end().lines().collect();
@@ -1819,8 +1812,16 @@ impl Tool for Wait {
                 ));
             }
             if !crate::jobs::running(id)? {
+                // A job waited for to the end, such as a video, has nothing
+                // it was meant to print.
+                let before = if until.is_empty() {
+                    String::new()
+                } else {
+                    format!(" before printing `{until}`")
+                };
                 return Ok(format!(
-                    "Job #{id} exited before printing `{until}`. Output:\n{}",
+                    "Job #{id} {}{before}. Output:\n{}",
+                    crate::jobs::state(id)?,
                     log.trim_end()
                 ));
             }

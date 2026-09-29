@@ -9,6 +9,8 @@
 //! What is made is saved as a file: in `media/` in the project folder, or in
 //! Letronna's own data folder when no project is attached. The result starts
 //! with `Saved to <path>`, which is how the window finds the file to show.
+//! A video renders for minutes, so make_video hands the wait to a background
+//! job and the line comes in that job's notice instead.
 //! A picture read_file opened or an MCP server sent, and one the user
 //! attached, is saved the same way but always in Letronna's own folder, as
 //! browse's screenshots are: it belongs to the session, and looking writes
@@ -29,9 +31,9 @@ pub(crate) const SAVED: &str = "Saved to ";
 const MAKE_TIME: Duration = Duration::from_secs(300);
 /// A video renders for a few minutes; it is looked at this often while it does.
 const VIDEO_POLL: Duration = Duration::from_secs(5);
-/// Past this the tool stops waiting and says how to pick the video up later,
-/// rather than holding the turn for however long the renderer takes.
-const VIDEO_WAIT: Duration = Duration::from_secs(600);
+/// Past this its job gives up and says how to pick the video up later, so a
+/// render the service has lost does not leave a job running for good.
+const VIDEO_WAIT: Duration = Duration::from_secs(1800);
 /// The largest file the API takes for transcription.
 const UPLOAD_BYTES: u64 = 25 * 1024 * 1024;
 /// The largest picture a model is sent: Anthropic refuses one over 5 MB of
@@ -250,14 +252,14 @@ impl Tool for MakeVideo {
         "make_video"
     }
     fn description(&self) -> &'static str {
-        "Make a short video from a description on Letronna's hosted video models, and save it as an MP4 file. It takes a few minutes. It is paid from the user's Letronna credit by the second of video, several cents a second, so use it only when the user asks for a video."
+        "Make a short video from a description on Letronna's hosted video models, and save it as an MP4 file. It renders for a few minutes as a background job: the call returns the job's number at once, read_job shows how far it has got, wait waits for it, stop_job cancels it, and a notice with the file's path comes when it is saved. It is paid from the user's Letronna credit by the second of video, several cents a second, so use it only when the user asks for a video."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
             "prompt": {"type": "string", "description": "What the video should show, in detail."},
             "seconds": {"type": "integer", "description": "How long, such as 4 or 8. Each model makes only certain lengths; left out, the model's own."},
             "model": {"type": "string", "description": "A hosted video model's id. Left out, the one the user picked, or the cheapest working."},
-            "job": {"type": "string", "description": "The id of a video an earlier call left still being made: wait for that one and save it, instead of starting another."}
+            "job": {"type": "string", "description": "The id of a video an earlier render left unsaved: pick that one up and save it, instead of starting another."}
         }})
     }
     fn needs_approval(&self) -> bool {
@@ -285,65 +287,166 @@ impl Tool for MakeVideo {
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         let token = token()?;
-        let id = match args["job"].as_str() {
-            Some(job) => job.to_owned(),
-            None => {
-                let mut body = json!({"prompt": required(args, "prompt")?});
-                pass(args, &mut body, &["seconds"], "video");
-                let job: Value = send(
-                    client(MAKE_TIME)?
-                        .post(endpoint("/videos"))
-                        .bearer_auth(&token)
-                        .json(&body),
-                )?
-                .json()
-                .map_err(|_| "The video was started, but its id could not be read.".to_owned())?;
-                job["id"]
-                    .as_str()
-                    .ok_or("The video could not be started.")?
-                    .to_owned()
-            }
+        start_video(Hosted { token }, args, ctx)
+    }
+}
+
+/// Where a video is rendered: Letronna's hosted models, or a stand-in when
+/// testing.
+trait Renderer: Send + 'static {
+    /// Start rendering what `body` asks for, and say the render's id.
+    fn start(&self, body: &Value) -> Result<String, String>;
+    /// Where render `id` has got to.
+    fn look(&self, id: &str) -> Result<Render, String>;
+    /// The finished video.
+    fn fetch(&self, id: &str) -> Result<Vec<u8>, String>;
+    /// How long to leave between looks.
+    fn every(&self) -> Duration {
+        VIDEO_POLL
+    }
+}
+
+/// Where a render has got to.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Render {
+    /// Still going, with how far in percent if the service says.
+    Going(Option<u64>),
+    /// Finished, with how many seconds long if the service says.
+    Done(Option<u64>),
+    Failed,
+}
+
+/// The video routes of Letronna's hosted models.
+struct Hosted {
+    token: String,
+}
+
+impl Renderer for Hosted {
+    fn start(&self, body: &Value) -> Result<String, String> {
+        let job: Value = send(
+            client(MAKE_TIME)?
+                .post(endpoint("/videos"))
+                .bearer_auth(&self.token)
+                .json(body),
+        )?
+        .json()
+        .map_err(|_| "The video was started, but its id could not be read.".to_owned())?;
+        let Some(id) = job["id"].as_str() else {
+            return Err("The video could not be started.".into());
         };
-        let look = client(Duration::from_secs(30))?;
-        let started = Instant::now();
-        let seconds = loop {
-            let job: Value = send(
-                look.get(endpoint(&format!("/videos/{id}")))
-                    .bearer_auth(&token),
-            )?
-            .json()
-            .map_err(|_| "The video's progress could not be read.".to_owned())?;
-            match job["status"].as_str() {
-                Some("completed") => break job["seconds"].as_u64(),
-                Some("failed") => {
-                    return Err("The video could not be made. It is not charged.".into());
-                }
-                _ => {}
-            }
-            if started.elapsed() >= VIDEO_WAIT {
-                return Ok(format!(
-                    "The video is still being made. Call make_video again with job \"{id}\" to \
-                     wait for it and save it; it is charged once, when it is done."
-                ));
-            }
-            std::thread::sleep(VIDEO_POLL);
-        };
+        Ok(id.to_owned())
+    }
+
+    fn look(&self, id: &str) -> Result<Render, String> {
+        let job: Value = send(
+            client(Duration::from_secs(30))?
+                .get(endpoint(&format!("/videos/{id}")))
+                .bearer_auth(&self.token),
+        )?
+        .json()
+        .map_err(|_| "The video's progress could not be read.".to_owned())?;
+        Ok(match job["status"].as_str() {
+            Some("completed") => Render::Done(job["seconds"].as_u64()),
+            Some("failed") => Render::Failed,
+            _ => Render::Going(job["progress"].as_u64()),
+        })
+    }
+
+    fn fetch(&self, id: &str) -> Result<Vec<u8>, String> {
         let bytes = send(
             client(MAKE_TIME)?
                 .get(endpoint(&format!("/videos/{id}/content")))
-                .bearer_auth(&token),
+                .bearer_auth(&self.token),
         )?
         .bytes()
         .map_err(|_| "The video was cut off on its way here.".to_owned())?;
-        let about = args["prompt"].as_str().unwrap_or("video");
-        let path = save(ctx, about, "mp4", &bytes)?;
-        let long = seconds.map(|s| format!("{s}-second ")).unwrap_or_default();
-        Ok(format!(
-            "{SAVED}{}\nA {long}video, {}.",
-            path.display(),
-            size(bytes.len())
-        ))
+        Ok(bytes.to_vec())
     }
+}
+
+/// Start the render `args` asks for, or take up the one its `job` names, and
+/// leave the waiting to a background job so the turn goes on meanwhile.
+fn start_video(renderer: impl Renderer, args: &Value, ctx: &ToolContext) -> Result<String, String> {
+    let render = match args["job"].as_str() {
+        Some(job) => job.to_owned(),
+        None => {
+            let mut body = json!({"prompt": required(args, "prompt")?});
+            pass(args, &mut body, &["seconds"], "video");
+            renderer.start(&body)?
+        }
+    };
+    let about = args["prompt"].as_str().unwrap_or("video").to_owned();
+    let label = format!("make_video: {}", crate::tools::one_line(&about));
+    let workspace = ctx.workspace.clone();
+    let id = render.clone();
+    let job = crate::jobs::start_work(&label, ctx.conversation, move |work| {
+        let ctx = ToolContext {
+            workspace,
+            ..Default::default()
+        };
+        await_video(&renderer, &id, &about, &ctx, work)
+    })?;
+    Ok(format!(
+        "Started as job #{job}: video {render} is rendering, which takes a few minutes. \
+         read_job shows how far it has got, wait with job {job} waits for it, and stop_job \
+         cancels it. A notice with the file's path comes when it is saved."
+    ))
+}
+
+/// Wait for render `id`, noting its progress in the job's log, then save it
+/// where the media tools save what they make.
+fn await_video(
+    renderer: &dyn Renderer,
+    id: &str,
+    about: &str,
+    ctx: &ToolContext,
+    work: &crate::jobs::Work,
+) -> Result<String, String> {
+    // A stop leaves the render to finish or not on the service, which has no
+    // route to cancel one, so the log says how to take it up again.
+    let stopped = || {
+        Err(format!(
+            "Stopped. The video may still finish on the hosted models; make_video \
+             with job \"{id}\" saves it then."
+        ))
+    };
+    work.say(&format!("Rendering video {id}."));
+    let started = Instant::now();
+    let mut said = None;
+    let seconds = loop {
+        match renderer.look(id)? {
+            Render::Done(seconds) => break seconds,
+            Render::Failed => return Err("The video could not be made. It is not charged.".into()),
+            Render::Going(progress) => {
+                if let Some(percent) = progress.filter(|p| said != Some(*p)) {
+                    work.say(&format!("{percent}% rendered."));
+                    said = Some(percent);
+                }
+            }
+        }
+        if started.elapsed() >= VIDEO_WAIT {
+            return Err(format!(
+                "The video is still being made after {} minutes. Call make_video again \
+                 with job \"{id}\" to wait for it and save it; it is charged once, when \
+                 it is done.",
+                VIDEO_WAIT.as_secs() / 60
+            ));
+        }
+        if !work.sleep(renderer.every()) {
+            return stopped();
+        }
+    };
+    let bytes = renderer.fetch(id)?;
+    if work.stopped() {
+        return stopped();
+    }
+    let path = save(ctx, about, "mp4", &bytes)?;
+    let long = seconds.map(|s| format!("{s}-second ")).unwrap_or_default();
+    Ok(format!(
+        "{SAVED}{}\nA {long}video, {}.",
+        path.display(),
+        size(bytes.len())
+    ))
 }
 
 /// The file a media tool's result says it saved, for the window to show.
@@ -826,6 +929,8 @@ fn to_base64(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn base64_decodes_what_the_api_sends() {
@@ -1017,6 +1122,191 @@ mod tests {
                 "$0.41 / second"
             ]
         );
+    }
+
+    /// A renderer that renders nothing: it reports 40% until `done` is set,
+    /// then what `end` says, and hands back `b"mp4"`.
+    #[derive(Clone)]
+    struct Fake {
+        done: Arc<AtomicBool>,
+        end: Render,
+        refuse: bool,
+    }
+
+    impl Fake {
+        fn new(end: Render) -> Self {
+            Self {
+                done: Arc::default(),
+                end,
+                refuse: false,
+            }
+        }
+    }
+
+    impl Renderer for Fake {
+        fn start(&self, _: &Value) -> Result<String, String> {
+            match self.refuse {
+                true => Err("Not enough credit.".into()),
+                false => Ok("vid_1".into()),
+            }
+        }
+        fn look(&self, _: &str) -> Result<Render, String> {
+            match self.done.load(Ordering::Relaxed) {
+                true => Ok(self.end),
+                false => Ok(Render::Going(Some(40))),
+            }
+        }
+        fn fetch(&self, _: &str) -> Result<Vec<u8>, String> {
+            Ok(b"mp4".to_vec())
+        }
+        fn every(&self) -> Duration {
+            Duration::from_millis(10)
+        }
+    }
+
+    /// A scratch project for a video test, and a context in it for `owner`.
+    fn project(name: &str, owner: u64) -> (PathBuf, ToolContext) {
+        let dir = std::env::temp_dir().join(format!("letronna-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            conversation: owner,
+            ..Default::default()
+        };
+        (dir, ctx)
+    }
+
+    /// The job number a started video's reply names.
+    fn job_in(reply: &str) -> u64 {
+        let (_, rest) = reply.split_once("job #").unwrap();
+        rest.split(':').next().unwrap().parse().unwrap()
+    }
+
+    /// Poll until `ready`, for at most ten seconds.
+    fn until(mut ready: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if ready() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    const ASK: &str = r#"{"prompt": "a small red lighthouse", "model": "veo-3.1"}"#;
+
+    #[test]
+    fn a_video_returns_its_job_at_once_and_its_path_when_saved() {
+        let _turn = crate::inbox::tests::DOORBELL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (dir, ctx) = project("video-done", 7_401);
+        let fake = Fake::new(Render::Done(Some(8)));
+        let args: Value = serde_json::from_str(ASK).unwrap();
+        let reply = start_video(fake.clone(), &args, &ctx).unwrap();
+        assert!(reply.starts_with("Started as job #"), "{reply}");
+        let job = job_in(&reply);
+        // The render is still going, and the job says how far it has got.
+        assert!(until(|| crate::jobs::log(job)
+            .unwrap()
+            .contains("40% rendered.")));
+        assert_eq!(crate::jobs::state(job).unwrap(), "running");
+        assert_eq!(
+            crate::jobs::log(job).unwrap().matches("40%").count(),
+            1,
+            "the same progress is said once"
+        );
+
+        fake.done.store(true, Ordering::Relaxed);
+        let wait = crate::tools::find("wait").unwrap();
+        let waited = wait.run(&json!({"job": job, "seconds": 10}), &ctx).unwrap();
+        assert!(
+            waited.starts_with(&format!("Job #{job} finished. Output:")),
+            "{waited}"
+        );
+        assert_eq!(crate::jobs::state(job).unwrap(), "finished");
+
+        let notices = crate::inbox::take(7_401, true);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        let (first, rest) = notices[0].text.split_once('\n').unwrap();
+        assert_eq!(
+            first,
+            format!("job #{job} finished (`make_video: a small red lighthouse`):")
+        );
+        let path = saved(rest).unwrap();
+        assert_eq!(path.parent().unwrap(), dir.join("media"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"mp4");
+        assert!(rest.contains("A 8-second video"), "{rest}");
+        assert!(
+            crate::jobs::log(job)
+                .unwrap()
+                .contains(&path.display().to_string())
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stopping_a_video_job_cancels_it_and_tells_nobody() {
+        let _turn = crate::inbox::tests::DOORBELL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (dir, ctx) = project("video-stopped", 7_402);
+        let fake = Fake::new(Render::Done(None));
+        let args: Value = serde_json::from_str(ASK).unwrap();
+        let job = job_in(&start_video(fake.clone(), &args, &ctx).unwrap());
+        assert!(until(|| crate::jobs::log(job)
+            .unwrap()
+            .contains("40% rendered.")));
+
+        crate::jobs::stop(job).unwrap();
+        assert!(until(|| !crate::jobs::running(job).unwrap()));
+        assert_eq!(crate::jobs::state(job).unwrap(), "stopped");
+        let log = crate::jobs::log(job).unwrap();
+        assert!(log.contains("make_video with job \"vid_1\""), "{log}");
+        // Finishing on the service afterwards saves nothing here.
+        fake.done.store(true, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(crate::inbox::take(7_402, true).is_empty());
+        assert!(!dir.join("media").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_video_that_fails_is_reported_and_one_refused_starts_no_job() {
+        let _turn = crate::inbox::tests::DOORBELL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (dir, ctx) = project("video-failed", 7_403);
+        let fake = Fake::new(Render::Failed);
+        fake.done.store(true, Ordering::Relaxed);
+        let args: Value = serde_json::from_str(ASK).unwrap();
+        let job = job_in(&start_video(fake, &args, &ctx).unwrap());
+        assert!(until(|| !crate::jobs::running(job).unwrap()));
+        assert_eq!(crate::jobs::state(job).unwrap(), "failed");
+        let notices = crate::inbox::take(7_403, true);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_eq!(
+            notices[0].text,
+            format!(
+                "job #{job} failed (`make_video: a small red lighthouse`):\n\
+                 The video could not be made. It is not charged."
+            )
+        );
+
+        // A refusal comes back from the call itself, before any job.
+        let refused = Fake {
+            refuse: true,
+            ..Fake::new(Render::Failed)
+        };
+        let args = json!({"prompt": "a refused lighthouse", "model": "veo-3.1"});
+        let error = start_video(refused, &args, &ctx).unwrap_err();
+        assert_eq!(error, "Not enough credit.");
+        let jobs = crate::jobs::list();
+        assert!(!jobs.iter().any(|job| job.command.contains("refused")));
+        assert!(!dir.join("media").exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
