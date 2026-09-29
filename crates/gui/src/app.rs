@@ -135,6 +135,9 @@ pub(crate) struct Chat {
     pub(crate) settings_closing: bool,
     pub(crate) rename: Entity<InputState>,
     pub(crate) page: Page,
+    /// The first-run setup page, shown in place of the empty chat with
+    /// nothing reachable yet, or brought back from the account menu.
+    pub(crate) show_setup: bool,
     pub(crate) sidebar_open: bool,
     pub(crate) greeting: &'static str,
     /// Who is signed in, as `account.json` last said; shared with the terminal.
@@ -558,11 +561,18 @@ impl Chat {
             Err(why) => (Vec::new(), Some(why)),
         };
         let draft_for = store.conversations[store.active].id;
+        let account = letronna_core::auth::account();
+        // Nothing reachable yet: no account, and no key or URL saved for a
+        // gateway that needs one. Ollama needs neither, so it is not asked.
+        let show_setup = account.is_none()
+            && keys.values().all(|k| k.trim().is_empty())
+            && store.settings.custom_endpoint.trim().is_empty();
         let mut this = Self {
             page: Page::Chat,
+            show_setup,
             sidebar_open: true,
             greeting,
-            account: letronna_core::auth::account(),
+            account,
             account_note: None,
             teams: Vec::new(),
             signing_in: false,
@@ -924,6 +934,8 @@ impl Chat {
         remote: Option<letronna_core::chat::Remote>,
         cx: &mut Context<Self>,
     ) -> std::result::Result<(), ()> {
+        // Asking anything at all means the setup page has done its job.
+        self.show_setup = false;
         let connection = match self.connection_for(self.store.active, remote) {
             Ok(connection) => connection,
             Err(error) => {
@@ -2778,6 +2790,8 @@ impl Render for Chat {
             self.activity_page(window, cx)
         } else if self.page != Page::Chat {
             self.page_view(self.page, cx).into_any_element()
+        } else if self.show_setup {
+            self.setup_page(window, cx).into_any_element()
         } else if conversation.messages.is_empty()
             && !streaming_here
             // A helper's card needs the chat body even with nothing said.

@@ -295,8 +295,9 @@ fn billing(chat: &Entity<Chat>, this: &Chat, account: &Account, cx: &App) -> Div
 /// What to do while the browser has the sign-in: the page may have been
 /// closed, may not have opened at all, or may have opened in a browser that
 /// is not the one in use -- carrying it across part way fails, so the link
-/// is offered to start over in the right one.
-fn waiting_card(chat: &Entity<Chat>, url: String, cx: &App) -> Div {
+/// is offered to start over in the right one. Shared with the setup page's
+/// Sign in step, which waits on the same browser round trip.
+pub(crate) fn waiting_card(chat: &Entity<Chat>, url: String, cx: &App) -> Div {
     let (again, copy, cancel) = (chat.clone(), url, chat.clone());
     v_flex()
         .gap_3()

@@ -136,7 +136,7 @@ impl Chat {
             )
             .dropdown_menu_with_anchor(gpui::Corner::TopRight, move |menu, _, _| {
                 let (settings, account, auth) = (chat.clone(), chat.clone(), chat.clone());
-                let usage = chat.clone();
+                let (usage, setup) = (chat.clone(), chat.clone());
                 menu.min_w(px(180.))
                     .item(
                         PopupMenuItem::new("Account")
@@ -157,6 +157,13 @@ impl Chat {
                             .icon(Icon::new(IconName::Settings))
                             .on_click(move |_, window, cx| {
                                 settings.update(cx, |this, cx| this.open_settings(window, cx))
+                            }),
+                    )
+                    .item(
+                        PopupMenuItem::new("Set up Letronna")
+                            .icon(Icon::new(AppIcon::Sparkles))
+                            .on_click(move |_, _, cx| {
+                                setup.update(cx, |this, cx| this.open_setup(cx))
                             }),
                     )
                     .item(
