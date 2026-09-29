@@ -1186,7 +1186,7 @@ pub fn intent(name: &str, summary: &str) -> String {
 
 /// What the session's own gate makes of a helper's call, or `None` when
 /// only the user can say: with no terminal to ask on, that is a no.
-fn settled(
+pub fn settled(
     request: &Request,
     mode: Mode,
     allowed: &Grants,
