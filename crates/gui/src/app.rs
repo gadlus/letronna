@@ -1760,7 +1760,7 @@ impl Render for Chat {
                         .w_full()
                         .gap_3()
                         .when(span.yours && n > 0, |group| {
-                            group.border_t_1().border_color(cx.theme().border).pt_6()
+                            group.border_t_1().border_color(cx.theme().border).pt_3()
                         })
                         .children(turn);
                     if live_turn == Some(n) {
@@ -1802,7 +1802,7 @@ impl Render for Chat {
                                     .flex_shrink_0()
                                     .px_6()
                                     .py_6()
-                                    .gap_6()
+                                    .gap_3()
                                     .children(rows),
                             ),
                         ),
@@ -1836,7 +1836,7 @@ impl Render for Chat {
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .font(text_font(cx))
+            .font_family(BODY_FONT)
             .text_sm()
             .relative()
             .key_context("Chat")

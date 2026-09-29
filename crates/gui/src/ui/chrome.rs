@@ -63,8 +63,15 @@ impl Chat {
             .plain(cx)
             .xsmall()
             .tooltip("Rename")
-            .text_color(cx.theme().muted_foreground)
-            .child(div().max_w(px(420.)).truncate().child(title))
+            // Set as the window's title, not as a hint beside it.
+            .child(
+                div()
+                    .max_w(px(420.))
+                    .truncate()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(title),
+            )
             .on_click(
                 cx.listener(move |this, _, window, cx| this.rename_session(index, window, cx)),
             )

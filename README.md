@@ -236,7 +236,7 @@ src/main.rs         entry point: wires plugins, tray, window
 src/app.rs          Chat state, sessions, sending, render root
 src/prelude.rs      shared imports
 src/theme.rs        fonts and palette
-src/assets.rs       embedded icons and fonts, and the AppIcon enum
+src/assets.rs       embedded icons and the AppIcon enum
 
 src/core/           domain layer (no UI, no OS)
   chat.rs           HTTP: validation, streaming, model lists, reasoning, usage
@@ -256,7 +256,7 @@ src/platform/       OS integration; same API everywhere, per-OS behind cfg
   window.rs         Win32 window helpers
   backdrop.rs       captures and blurs the window for modal backdrops
 
-assets/             icon, avatar, SVG icons and wordmark, brand fonts (OFL)
+assets/             icon, avatar, SVG icons
 scripts/            icon sync, macOS .app bundling, window capture for UI checks
 ```
 
@@ -271,7 +271,5 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Small, focused pull requests are welcome
 ## License
 
 MIT, © 2026 Gadlus Engineering. GPUI and gpui-component are Apache-2.0. Phosphor Icons are MIT.
-Barlow, Barlow Condensed and DM Mono are under the SIL Open Font License 1.1
-(`crates/gui/assets/fonts/OFL.txt`).
 
 Developed by the Gadlus Engineering team.

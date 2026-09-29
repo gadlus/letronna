@@ -262,7 +262,7 @@ mod windows_impl {
                 .border_color(cx.theme().border)
                 .rounded(cx.theme().radius_lg)
                 .text_sm()
-                .font(text_font(cx))
+                .font_family(BODY_FONT)
                 .text_color(cx.theme().foreground)
                 .child(
                     h_flex()
@@ -271,7 +271,12 @@ mod windows_impl {
                         .gap_2()
                         .items_center()
                         .child(img("images/letronna.png").size(px(16.)).rounded(px(3.)))
-                        .child(div().font_weight(FontWeight::SEMIBOLD).child(BRAND)),
+                        .child(
+                            div()
+                                .font_family(HEADING_FONT)
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(BRAND),
+                        ),
                 )
                 .child(rule())
                 .child(self.item("updates", "Check for updates", cx, |_, cx| {
@@ -281,7 +286,8 @@ mod windows_impl {
                 .child(self.item("quit", format!("Quit {BRAND}"), cx, |_, cx| cx.quit()))
                 .with_animation(
                     "tray-menu",
-                    Animation::new(std::time::Duration::from_millis(160)).with_easing(expo_out),
+                    Animation::new(std::time::Duration::from_millis(160))
+                        .with_easing(gpui::ease_out_quint()),
                     |el, delta| el.opacity(delta).mt(px(8. * (1. - delta))),
                 )
         }
