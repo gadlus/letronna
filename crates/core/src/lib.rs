@@ -8,6 +8,7 @@
 
 pub mod agent;
 pub mod agent_defs;
+pub mod approvals;
 pub mod auth;
 pub mod browser;
 pub mod budget;
