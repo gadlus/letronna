@@ -43,6 +43,19 @@ pub struct Facts {
     pub parameters: Option<Vec<String>>,
     /// The effort levels it offers, least first; an empty list offers none.
     pub efforts: Option<Vec<Effort>>,
+    /// What it costs, as its gateway's list gives it.
+    pub price: Option<Price>,
+}
+
+/// What a model costs, in US dollars a token.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Price {
+    pub input: f64,
+    pub output: f64,
+    /// A token served from the prompt cache, where the list says.
+    pub cache_read: Option<f64>,
+    /// A token written to the prompt cache, where the list says.
+    pub cache_write: Option<f64>,
 }
 
 /// One effort level a model offers.
@@ -161,6 +174,7 @@ pub fn facts(endpoint: &str, model: &str) -> Facts {
         inputs: listed.inputs,
         parameters: listed.parameters,
         efforts: listed.efforts,
+        price: listed.price,
     }
 }
 
@@ -328,7 +342,28 @@ fn read(entry: &Value) -> Facts {
                 let reasons = entry["capabilities"]["reasoning"].as_bool();
                 (reasons == Some(false)).then(Vec::new)
             }),
+        price: price(&entry["pricing"]),
     }
+}
+
+/// The price in a list entry's `pricing`, in OpenRouter's shape: dollars a
+/// token, written as strings. Its router lists -1 for a price it knows only
+/// once it has picked a model, which is no price at all.
+fn price(pricing: &Value) -> Option<Price> {
+    let rate = |key: &str| {
+        let value = &pricing[key];
+        value
+            .as_str()
+            .and_then(|text| text.trim().parse::<f64>().ok())
+            .or_else(|| value.as_f64())
+            .filter(|rate| rate.is_finite() && *rate >= 0.)
+    };
+    Some(Price {
+        input: rate("prompt")?,
+        output: rate("completion")?,
+        cache_read: rate("input_cache_read"),
+        cache_write: rate("input_cache_write"),
+    })
 }
 
 /// The window and output limit of the longest family in `FAMILIES` that
@@ -426,6 +461,20 @@ mod tests {
         assert_eq!(new.context, Some(32_768));
         assert_eq!(new.max_output, None);
         assert_eq!(new.parameters, Some(vec![]));
+    }
+
+    #[test]
+    fn a_listed_price_is_kept_and_a_price_not_known_yet_is_none() {
+        let listed = price(&json!({"prompt": "0.000003", "completion": "0.000015",
+            "input_cache_read": "0.0000003", "input_cache_write": "0.00000375"}))
+        .unwrap();
+        assert_eq!((listed.input, listed.output), (0.000003, 0.000015));
+        assert_eq!(listed.cache_read, Some(0.0000003));
+        assert_eq!(listed.cache_write, Some(0.00000375));
+        // OpenRouter's router, which knows only once it has picked a model.
+        assert_eq!(price(&json!({"prompt": "-1", "completion": "-1"})), None);
+        assert_eq!(price(&json!({"prompt": "0.000001"})), None);
+        assert_eq!(price(&Value::Null), None);
     }
 
     #[test]
