@@ -333,7 +333,7 @@ fn tell(id: u64, text: String) {
 }
 
 /// Add output to the log, dropping its oldest bytes beyond `MAX_LOG`.
-fn append(log: &mut VecDeque<u8>, bytes: &[u8]) {
+pub(crate) fn append(log: &mut VecDeque<u8>, bytes: &[u8]) {
     log.extend(bytes);
     // Keep the tail: the newest output is what matters.
     let over = log.len().saturating_sub(MAX_LOG);
@@ -341,7 +341,7 @@ fn append(log: &mut VecDeque<u8>, bytes: &[u8]) {
 }
 
 /// The log as text, starting at its first whole character.
-fn text(log: &mut VecDeque<u8>) -> String {
+pub(crate) fn text(log: &mut VecDeque<u8>) -> String {
     let bytes = log.make_contiguous();
     // Dropping bytes can leave the tail of a cut character at the front, and a
     // character is at most four bytes, so at most three of them.
