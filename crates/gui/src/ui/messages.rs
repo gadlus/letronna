@@ -307,7 +307,7 @@ impl Chat {
         let one_line = letronna_core::tools::one_line;
         // A file a media tool made, while it is still where it was saved.
         let made = (!message.is_error)
-            .then(|| letronna_core::media::saved(&message.content))
+            .then(|| letronna_core::media::saved_by(&message.name, &message.content))
             .flatten()
             .filter(|path| path.exists());
         let (status, color) = if message.is_error {
