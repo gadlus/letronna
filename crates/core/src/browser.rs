@@ -163,6 +163,14 @@ const COVERED: &str = "function(x, y) {
   const name = at.getAttribute('aria-label') || at.innerText || at.tagName;
   return String(name).trim().replace(/\\s+/g, ' ').slice(0, 80);
 }";
+/// The element focus rests on, followed into each frame whose document
+/// this one may read: it stops at a frame from another origin, which keys
+/// sent now would go into.
+const FOCUSED: &str = "(() => {
+  let at = document.activeElement;
+  for (let hops = 0; at && at.contentDocument && hops < 16; hops++) at = at.contentDocument.activeElement;
+  return at;
+})()";
 /// Picks a dropdown's option by its text or value, as choosing it by hand
 /// would, and says what went wrong otherwise.
 const CHOOSE: &str = "function(choice) {
@@ -357,7 +365,7 @@ impl Tool for UsePage {
             "x": {"type": "number", "description": "For click without a ref, or drag without `to`: the point's CSS pixels from the left of the view."},
             "y": {"type": "number", "description": "With x: the point's CSS pixels from the top of the view."},
             "to": {"type": "string", "description": "For drag: the element to drop onto, by its ref."},
-            "frame": {"type": "string", "description": "For an element in a frame from another origin than the page's: that origin, as the frame's header in the listing names it, such as https://pay.example, or opaque:https://pay.example for one whose origin is opaque, as a sandboxed frame's is. Left out otherwise."},
+            "frame": {"type": "string", "description": "For an element in a frame from another origin than the page's, or keys typed or pressed while focus is in one: that origin, as the frame's header in the listing names it, such as https://pay.example, or opaque:https://pay.example for one whose origin is opaque, as a sandboxed frame's is. Left out otherwise."},
             "text": {"type": "string", "description": "For type: what to type. For select: the option."},
             "submit": {"type": "boolean", "description": "For type: press Enter afterwards."},
             "key": {"type": "string", "description": "For press: Enter, Tab, Escape, Backspace, Delete, an arrow such as ArrowDown, Home, End, PageUp, PageDown, Space, or one character. With a ref, the element is focused first."},
@@ -481,7 +489,7 @@ impl Tool for UsePage {
                 with_downloads(&saving, |session| {
                     let node = target(session)?;
                     session.act(agree, Some(&saving), |session| {
-                        session.type_into(node, text, submit)
+                        session.type_into(node, text, submit, frame)
                     })
                 })
             }
@@ -495,6 +503,7 @@ impl Tool for UsePage {
                         if let Some(node) = node {
                             session.focus(node)?;
                         }
+                        session.keys_go_to(frame)?;
                         session.press(&key)
                     })
                 })
@@ -811,21 +820,29 @@ fn pdf_chunk(pdf: &mut Vec<u8>, chunk: &Value) -> Result<bool, String> {
 /// the approval saw who gets the action -- and is left out otherwise.
 fn framed_as(number: u32, within: Option<&Frame>, frame: Option<&str>) -> Result<(), String> {
     let foreign = within.filter(|within| within.foreign);
-    match (foreign.map(|within| within.origin.as_str()), frame) {
+    let origin = foreign.map(|within| within.origin.as_str());
+    framed_in(&format!("e{number} is"), origin, frame)
+}
+
+/// Refuses what `what` says is somewhere -- inside a frame from `origin`,
+/// as listings name it, when that is not the page's -- unless `frame`
+/// names that origin, and is left out otherwise.
+fn framed_in(what: &str, origin: Option<&str>, frame: Option<&str>) -> Result<(), String> {
+    match (origin, frame) {
         (None, None) => Ok(()),
         (Some(origin), Some(named)) if origin == named => Ok(()),
         (Some(origin), None) => Err(format!(
-            "e{number} is inside {}, another origin than the page's. Give `frame`: \"{origin}\" \
-             to act there, so the approval names who it is for.",
+            "{what} inside {}, another origin than the page's. Give `frame`: \"{origin}\" to act \
+             there, so the approval names who it is for.",
             frame_place(origin)
         )),
         (Some(origin), Some(named)) => Err(format!(
-            "e{number} is inside {}, not \"{named}\".",
+            "{what} inside {}, not \"{named}\".",
             frame_place(origin)
         )),
         (None, Some(named)) => Err(format!(
-            "e{number} is not inside a frame from another origin; leave `frame` (\"{named}\") \
-             out for it."
+            "{what} not inside a frame from another origin; leave `frame` (\"{named}\") out for \
+             it."
         )),
     }
 }
@@ -3438,10 +3455,20 @@ impl Session {
             .ok_or_else(|| "That element is no longer on the page.".to_owned())
     }
 
-    fn type_into(&mut self, node: i64, text: &str, submit: bool) -> Result<(), String> {
+    /// Replace what the field `node` holds with `text`, each round of keys
+    /// going only where `frame` says, as `keys_go_to` makes sure first: the
+    /// page may move focus as the field is focused, or at any key.
+    fn type_into(
+        &mut self,
+        node: i64,
+        text: &str,
+        submit: bool,
+        frame: Option<&str>,
+    ) -> Result<(), String> {
         // Not what is typed: it may be a password.
         self.point(node, "Typing into".into(), None);
         self.focus(node)?;
+        self.keys_go_to(frame)?;
         for kind in ["keyDown", "keyUp"] {
             let mut event = json!({"type": kind, "key": "a", "code": "KeyA",
                                    "windowsVirtualKeyCode": 65, "modifiers": SELECT_ALL});
@@ -3451,6 +3478,7 @@ impl Session {
             self.tab.call::<Ignored>("Input.dispatchKeyEvent", event)?;
         }
         let erase = key("Backspace").ok_or("There is no Backspace key.")?;
+        self.keys_go_to(frame)?;
         match text.is_empty() {
             true => self.press(&erase)?,
             false => self
@@ -3459,6 +3487,7 @@ impl Session {
                 .map(drop)?,
         }
         if submit {
+            self.keys_go_to(frame)?;
             self.press(&key("Enter").ok_or("There is no Enter key.")?)?;
         }
         Ok(())
@@ -3469,6 +3498,112 @@ impl Session {
             self.tab.call::<Ignored>("Input.dispatchKeyEvent", event)?;
         }
         Ok(())
+    }
+
+    /// Refuses sending keys while focus rests inside a frame from another
+    /// origin than the page's -- where the page, a Tab, or the frame itself
+    /// may have put it, with no ref naming the frame -- unless `frame`
+    /// names that frame, so the approval saw who they are for; and refuses
+    /// a `frame` when focus is not there. Keys go to the page's view, and
+    /// the browser hands them to whichever frame holds focus.
+    fn keys_go_to(&mut self, frame: Option<&str>) -> Result<(), String> {
+        const UNLISTED: &str = "Focus is inside a frame that is not listed, so no keys are sent \
+             there. Look again, or ask the user to type there.";
+        let tree: Value = self.tab.call("Page.getFrameTree", json!({}))?;
+        let top = tree["frameTree"]["frame"].clone();
+        let page = Found::of(&top, "", None);
+        let (mut session, mut id, mut origin) = (None, page.id.clone(), None);
+        for hops in 0..=cdp::MAX_FRAME_DEPTH {
+            let Some(shows) = self.focus_in(session.as_deref(), &id)? else {
+                break;
+            };
+            if hops == cdp::MAX_FRAME_DEPTH {
+                return Err(UNLISTED.into());
+            }
+            let (reached, named) = self.frame_named(&shows).ok_or(UNLISTED)?;
+            (session, id, origin) = (reached, shows, Some(named));
+        }
+        // The page's own origin matters only against a frame's.
+        let foreign = match origin {
+            Some(origin) => {
+                let said = self.origin_said(None, &page.id, cdp::CALL_TIME);
+                (!same_origin(&origin, &page.origin(said))).then_some(origin)
+            }
+            None => None,
+        };
+        framed_in("Focus is", foreign.as_deref(), frame)
+    }
+
+    /// The frame shown by the element focus rests on in frame `id`, reached
+    /// through `session`, when that is a frame's element whose document
+    /// `id`'s cannot read: its id.
+    fn focus_in(&mut self, session: Option<&str>, id: &str) -> Result<Option<String>, String> {
+        let stop = self.stop.clone();
+        let asked = json!({"frameId": id, "worldName": WORLD});
+        let made: Value = (self.tab).call_in(
+            session,
+            "Page.createIsolatedWorld",
+            asked,
+            cdp::CALL_TIME,
+            Some(&stop),
+        )?;
+        let context = made["executionContextId"]
+            .as_i64()
+            .ok_or("The browser would not say where focus is, so no keys are sent.")?;
+        let asked = json!({"expression": FOCUSED, "contextId": context});
+        let found: Value = (self.tab).call_in(
+            session,
+            "Runtime.evaluate",
+            asked,
+            cdp::CALL_TIME,
+            Some(&stop),
+        )?;
+        let Some(object) = found["result"]["objectId"].as_str().map(str::to_owned) else {
+            return Ok(None);
+        };
+        let described = (self.tab).call_in::<Value>(
+            session,
+            "DOM.describeNode",
+            json!({"objectId": object}),
+            cdp::CALL_TIME,
+            Some(&stop),
+        );
+        let _ = (self.tab).call_in::<Ignored>(
+            session,
+            "Runtime.releaseObject",
+            json!({"objectId": object}),
+            cdp::CALL_TIME,
+            None,
+        );
+        Ok(described?["node"]["frameId"].as_str().map(str::to_owned))
+    }
+
+    /// The session frame `id` is reached through and its origin as a
+    /// listing names it, from the page's frame tree or that of a frame
+    /// attached; `None` when none has it, as for a frame not attached.
+    fn frame_named(&mut self, id: &str) -> Option<(Option<String>, String)> {
+        let stop = self.stop.clone();
+        let attached = self
+            .tab
+            .frames
+            .iter()
+            .map(|frame| Some(frame.session.clone()));
+        let sessions: Vec<Option<String>> = [None].into_iter().chain(attached).collect();
+        let (session, found) = sessions.into_iter().find_map(|session| {
+            let tree: Value = (self.tab)
+                .call_in(
+                    session.as_deref(),
+                    "Page.getFrameTree",
+                    json!({}),
+                    FRAME_TIME,
+                    Some(&stop),
+                )
+                .ok()?;
+            let found = Found::of(frame_in(&tree["frameTree"], id)?, "", None);
+            Some((session, found))
+        })?;
+        let said = self.origin_said(session.as_deref(), id, FRAME_TIME);
+        Some((session, found.origin(said)))
     }
 
     fn upload(&mut self, node: i64, files: &[PathBuf]) -> Result<(), String> {
@@ -4825,6 +4960,83 @@ mod tests {
     }
 
     #[test]
+    fn keys_go_into_another_origins_frame_only_with_it_named() {
+        for (said, named) in [
+            ("https://bank.test", "https://bank.test"),
+            ("null", "opaque:https://bank.test"),
+        ] {
+            let into_frame = Arc::new(AtomicBool::new(true));
+            let focus = into_frame.clone();
+            let (mut session, server) = fake_session(move |method, params| {
+                let context = params["contextId"].as_i64();
+                let answer = match method {
+                    "Page.getFrameTree" => json!({"frameTree": {
+                        "frame": {"id": "TOP", "securityOrigin": "https://shop.test",
+                                  "url": "https://shop.test/"},
+                        "childFrames": [{"frame": {"id": "F1", "securityOrigin": "https://bank.test",
+                                                   "url": "https://bank.test/pay"}}]}}),
+                    "Page.createIsolatedWorld" if params["frameId"] == "TOP" => {
+                        json!({"executionContextId": 1})
+                    }
+                    "Page.createIsolatedWorld" => json!({"executionContextId": 2}),
+                    "Runtime.evaluate" if params["expression"] == "origin" => {
+                        let origin = if context == Some(1) {
+                            "https://shop.test"
+                        } else {
+                            said
+                        };
+                        json!({"result": {"value": origin}})
+                    }
+                    // The page's own focus rests on something; the frame's on
+                    // nothing that shows another frame.
+                    "Runtime.evaluate" if context == Some(1) => {
+                        json!({"result": {"type": "object", "objectId": "A"}})
+                    }
+                    "Runtime.evaluate" => json!({"result": {"type": "object", "subtype": "null"}}),
+                    "DOM.describeNode" if focus.load(Ordering::Relaxed) => {
+                        json!({"node": {"nodeName": "IFRAME", "frameId": "F1"}})
+                    }
+                    "DOM.describeNode" => json!({"node": {"nodeName": "INPUT"}}),
+                    _ => json!({}),
+                };
+                (Vec::new(), answer)
+            });
+            let refused = session.keys_go_to(None).unwrap_err();
+            assert!(refused.starts_with("Focus is inside a frame"), "{refused}");
+            let give = format!("`frame`: \"{named}\"");
+            assert!(refused.contains(&give), "{refused}");
+            assert_eq!(session.keys_go_to(Some(named)), Ok(()));
+            assert!(session.keys_go_to(Some("https://shop.test")).is_err());
+            // Back on the page's own field, a `frame` is refused.
+            into_frame.store(false, Ordering::Relaxed);
+            assert_eq!(session.keys_go_to(None), Ok(()));
+            let refused = session.keys_go_to(Some(named)).unwrap_err();
+            assert!(refused.contains("leave `frame`"), "{refused}");
+            drop(session);
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn keys_are_not_sent_where_focus_cannot_be_told() {
+        let (mut session, server) = fake_session(|method, _| {
+            let answer = match method {
+                "Page.getFrameTree" => json!({"frameTree": {"frame": {"id": "TOP"}}}),
+                "Page.createIsolatedWorld" => json!({"executionContextId": 1}),
+                "Runtime.evaluate" => json!({"result": {"type": "object", "objectId": "A"}}),
+                // A frame the page's tree does not have, as one not attached.
+                "DOM.describeNode" => json!({"node": {"nodeName": "IFRAME", "frameId": "F9"}}),
+                _ => json!({}),
+            };
+            (Vec::new(), answer)
+        });
+        let refused = session.keys_go_to(None).unwrap_err();
+        assert!(refused.contains("not listed"), "{refused}");
+        drop(session);
+        server.join().unwrap();
+    }
+
+    #[test]
     fn an_element_in_another_sites_frame_is_listed_under_its_origin_and_clicked_through_it() {
         let loader = Arc::new(Mutex::new("L1"));
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -5108,10 +5320,11 @@ mod tests {
                             "<iframe id={id} src=\"{src}\" style=\"display:block;width:300px;height:120px\"></iframe>"
                         )
                     };
-                    // Last, a frame from the page's own site whose origin its
+                    // A field to Tab from into the frame after it, and last,
+                    // a frame from the page's own site whose origin its
                     // sandbox makes opaque.
                     framed = format!(
-                        "<!doctype html><title>Frames</title>{}{}{}{}\
+                        "<!doctype html><title>Frames</title>{}{}{}<label>Email <input></label>{}\
                          <iframe sandbox=\"allow-scripts\" src=\"/boxed\"></iframe>",
                         frame("same", "/two"),
                         frame("near", &format!("http://127.0.0.1:{port}/two")),
@@ -5531,11 +5744,25 @@ mod tests {
                 let mut named = noting;
                 named["frame"] = json!(boxed);
                 act(named).unwrap();
+                // Tab from the page's field lands in the frame from another
+                // site, where a key then needs that frame named.
+                let pay = format!("http://localhost:{port}");
+                let email = ref_of(&listed, "textbox \"Email\"");
+                act(json!({"action": "type", "ref": email, "text": "me@x"})).unwrap();
+                act(json!({"action": "press", "key": "Tab"})).unwrap();
+                let press = json!({"action": "press", "key": "Backspace"});
+                let unnamed = act(press.clone()).unwrap_err();
+                let inside = format!("Focus is inside a frame from {pay}");
+                assert!(unnamed.starts_with(&inside), "{unnamed}");
+                let mut named = press;
+                named["frame"] = json!(pay);
+                act(named.clone()).unwrap();
+                named["frame"] = json!(boxed);
+                assert!(act(named).is_err());
                 let card = ref_of(&listed, "textbox \"Card\"");
                 let typing = json!({"action": "type", "ref": card, "text": "4242"});
                 let unnamed = act(typing.clone()).unwrap_err();
                 assert!(unnamed.contains("`frame`"), "{unnamed}");
-                let pay = format!("http://localhost:{port}");
                 let mut named = typing;
                 named["frame"] = json!(pay);
                 let typed = timed("type in a frame", || act(named.clone())).unwrap();
