@@ -200,6 +200,12 @@ pub(crate) struct Chat {
         letronna_core::messaging::Source,
         letronna_core::chat::ToolCall,
     )>,
+    /// Messages with a voice note, each held while its chat is asked whether
+    /// voice notes may be transcribed there. The chat's next words answer.
+    pub(crate) voice_waiting: std::collections::HashMap<
+        letronna_core::messaging::Source,
+        letronna_core::messaging::Incoming,
+    >,
     pub(crate) messaging_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub(crate) token_input: Entity<InputState>,
     pub(crate) webhook_input: Entity<InputState>,
@@ -545,6 +551,7 @@ impl Chat {
             outstanding: 0,
             remote_waiting: None,
             messaging_stop: None,
+            voice_waiting: std::collections::HashMap::new(),
             token_input,
             webhook_input,
             discord_token_input,
@@ -1475,6 +1482,17 @@ impl Chat {
             self.resolve_call(verdict, cx);
             return;
         }
+        use letronna_core::messaging::files;
+        // The chat's answer to whether its voice notes are transcribed is
+        // kept, and the message that raised it taken in again. A message
+        // with a file in it is no answer; its own voice note asks anew.
+        if message.files.is_empty()
+            && let Some(held) = self.voice_waiting.remove(&source)
+        {
+            files::choose_voice(&mut self.messaging, &source, &message.said);
+            letronna_core::messaging::save(&self.messaging);
+            return self.on_remote(held, cx);
+        }
         if self.busy {
             self.tell_remote(
                 &source,
@@ -1489,6 +1507,24 @@ impl Chat {
             self.remote_session.remove(&source);
             self.tell_remote(&source, "Started a new session.", cx);
             return;
+        }
+        let mut message = letronna_core::messaging::Incoming {
+            source: source.clone(),
+            ..message
+        };
+        // Fetched only now, from a chat allowed to talk here and with nothing
+        // running, into the folder of the session they are for.
+        if files::unfetched(&message) {
+            let config = self.messaging.clone();
+            let into = self.remote_folder(&message);
+            return self.on_remote_after(move || files::fetch(&config, message, into), cx);
+        }
+        if files::unheard(&message) {
+            match files::voice_choice(&self.messaging, &source) {
+                None => return self.ask_voice(message, cx),
+                Some(true) => return self.on_remote_after(move || files::hear(message, true), cx),
+                Some(false) => message = files::hear(message, false),
+            }
         }
         // Carry on in the chat's session unless it has since been deleted.
         match self
@@ -1529,7 +1565,8 @@ impl Chat {
             Mode::Plan
         };
         self.modes.insert(id, mode);
-        let _ = self.dispatch(message.text, Vec::new(), Some(message.remote), cx);
+        let (prompt, pictures) = files::prompt(&message);
+        let _ = self.dispatch(prompt, pictures, Some(message.remote), cx);
     }
 
     /// A scheduled run has no one watching, so post how it ended to every
@@ -1591,7 +1628,67 @@ impl Chat {
                 .map(|m| m.content.clone())
                 .unwrap_or_else(|| "That did not produce an answer.".to_owned()),
         };
-        self.tell_remote(&source, &reply, cx);
+        let made = self
+            .store
+            .index_of(id)
+            .map(|ix| letronna_core::messaging::files::made(&self.store.conversations[ix].messages))
+            .unwrap_or_default();
+        if made.is_empty() {
+            return self.tell_remote(&source, &reply, cx);
+        }
+        // One task, so the pictures and sound the turn made follow the reply.
+        let config = self.messaging.clone();
+        cx.background_executor()
+            .spawn(async move {
+                letronna_core::messaging::files::answer(&config, &source, &reply, &made);
+            })
+            .detach();
+    }
+
+    /// Do `work` on a chat's message off this thread -- fetch its files,
+    /// transcribe its voice note -- and take in what it gives back as if it
+    /// had just arrived, so it meets every check again.
+    fn on_remote_after(
+        &mut self,
+        work: impl FnOnce() -> letronna_core::messaging::Incoming + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            let message = cx.background_executor().spawn(async move { work() }).await;
+            let _ = this.update(cx, |this, cx| this.on_remote(message, cx));
+        })
+        .detach();
+    }
+
+    /// The project a chat's files are saved in: its session's, or the one a
+    /// new session would get. None where other people read the chat, whose
+    /// files are not the user's to put there.
+    fn remote_folder(&self, message: &letronna_core::messaging::Incoming) -> Option<PathBuf> {
+        if message.remote.shared {
+            return None;
+        }
+        let ix = self
+            .remote_session
+            .get(&message.source)
+            .and_then(|id| self.store.index_of(*id))
+            .unwrap_or(self.store.active);
+        self.store.conversations[ix].workspace.clone()
+    }
+
+    /// Hold a message with a voice note and ask its chat, once, whether voice
+    /// notes may be transcribed there. The price is looked up first, which
+    /// takes the network.
+    fn ask_voice(&mut self, message: letronna_core::messaging::Incoming, cx: &mut Context<Self>) {
+        let source = message.source.clone();
+        self.voice_waiting.insert(source.clone(), message);
+        cx.spawn(async move |this, cx| {
+            let question = cx
+                .background_executor()
+                .spawn(async { letronna_core::messaging::files::voice_question() })
+                .await;
+            let _ = this.update(cx, |this, cx| this.tell_remote(&source, &question, cx));
+        })
+        .detach();
     }
 
     /// The context tools of the session running now are called in.

@@ -34,6 +34,10 @@ pub struct Config {
     pub telegram: Telegram,
     #[serde(default)]
     pub discord: Discord,
+    /// Each chat's answer to whether its voice notes are transcribed, which
+    /// costs credit, so it is asked once per chat; see `files::chat_key`.
+    #[serde(default)]
+    pub voice: std::collections::BTreeMap<String, bool>,
 }
 
 /// Two-way: Telegram hands out messages over long polling, so Letronna can
@@ -114,6 +118,9 @@ pub struct Incoming {
     /// The sender's own words alone, for commands and card answers, which a
     /// quoted reply would otherwise bury.
     pub said: String,
+    /// Photos, documents and voice notes that came with it, fetched only
+    /// once the app has checked who sent it.
+    pub files: Vec<files::Received>,
     /// Where it came from, as the session is told it.
     pub remote: backend::Remote,
 }
@@ -215,6 +222,8 @@ pub fn save(config: &Config) {
     }
 }
 
+pub mod files;
+
 /// Tell every channel that can take it how a scheduled run ended. Nobody asked
 /// for this message, so Telegram gets it only once a chat is paired: that is
 /// the one chat the bot may talk to. Returns what failed to send.
@@ -278,6 +287,7 @@ fn parse_updates(body: &serde_json::Value) -> (Vec<Incoming>, Option<u64>) {
             from,
             text: text.to_owned(),
             said: text.to_owned(),
+            files: Vec::new(),
             remote: backend::Remote {
                 place: match group {
                     true => "a Telegram group".into(),
@@ -377,7 +387,8 @@ pub fn poll(
                 std::thread::sleep(std::time::Duration::from_secs(5));
                 continue;
             };
-            let (messages, next) = parse_updates(&body);
+            let (mut messages, next) = parse_updates(&body);
+            messages.extend(files::telegram_media(&body));
             if let Some(next) = next {
                 offset = Some(next);
             }
@@ -719,13 +730,15 @@ fn gateway_message(
         }
     }
     let channel = message["channel_id"].as_str()?.to_owned();
+    let files = files::discord_attachments(message);
     let mut message = message.clone();
     message["content"] = serde_json::Value::String(readable(&message, bot_id, ""));
     Some(Incoming {
         source: Source::Discord(channel.clone()),
         from: author["username"].as_str().unwrap_or("you").to_owned(),
-        text: message_text(&message, bot_id)?,
+        text: message_text(&message, bot_id).or_else(|| (!files.is_empty()).then(String::new))?,
         said: own_text(&message).unwrap_or_default(),
+        files,
         remote: backend::Remote {
             // The listener names the channel once it has looked it up.
             place: match server {
