@@ -263,7 +263,7 @@ fn work_through(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result
         }
         // A call this helper may not make runs into its refusal in `dispatch`.
         let gate = |call: &ToolCall| {
-            if refusal(&spec.allow, &call.name).is_none() && tools::needs_approval(&call.name) {
+            if call_refusal(&spec.allow, call).is_none() && tools::needs_approval(&call.name) {
                 crate::gate::Outcome::Ask
             } else {
                 crate::gate::Outcome::Run
@@ -305,7 +305,7 @@ fn dispatch(
     call: &ToolCall,
     report: &mut Report,
 ) -> Option<Result<String, String>> {
-    if let Some(refused) = refusal(&spec.allow, &call.name) {
+    if let Some(refused) = call_refusal(&spec.allow, call) {
         return Some(Err(refused));
     }
     if call.name == tools::TODO {
@@ -365,6 +365,16 @@ pub(crate) fn refusal(allow: &Allow, name: &str) -> Option<String> {
         return Some(format!("`{name}` is not available to this helper."));
     }
     None
+}
+
+/// Why this agent may not make `call`, when it may not: its tool, or for a
+/// batch of browser steps the tool of any step, which runs as that tool's.
+fn call_refusal(allow: &Allow, call: &ToolCall) -> Option<String> {
+    let steps = crate::browser::batch_calls(call).and_then(Result::ok);
+    let names = steps.iter().flatten().map(|step| step.name.as_str());
+    std::iter::once(call.name.as_str())
+        .chain(names)
+        .find_map(|name| refusal(allow, name))
 }
 
 /// What this agent's tool calls can reach, stopping when it stops.
@@ -809,6 +819,31 @@ mod tests {
                 "`write_file` is not available to this helper.",
                 "`memory` is not available to this helper."
             ]
+        );
+    }
+
+    #[test]
+    fn a_batch_step_of_a_tool_it_may_not_use_is_refused_not_asked_about() {
+        let dir = scratch("refused-step");
+        let steps = json!([
+            {"action": "click", "ref": "e1"},
+            {"action": "hover", "ref": "e2"}
+        ]);
+        let (endpoint, provider) = provider(vec![
+            reply(
+                "",
+                &[("use_page", json!({"action": "batch", "steps": steps}))],
+            ),
+            reply("I could not do that.", &[]),
+        ]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 100);
+        // A hover is browse's, which this helper was not given.
+        spec.allow = Allow::Only(vec!["use_page".into()]);
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(
+            results(&provider.sent()[1]),
+            ["`browse` is not available to this helper."]
         );
     }
 
