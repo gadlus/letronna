@@ -522,6 +522,7 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
         fork: forking,
         from,
         schema: None,
+        watch: None,
     };
     registry().helpers.push(Helper {
         id: slot.id,
@@ -1460,6 +1461,7 @@ pub fn btw(
         fork: true,
         from,
         schema: None,
+        watch: None,
     });
     // An aside is kept nowhere, its own transcript and its lock included.
     let _ = std::fs::remove_file(path.with_extension("lock"));
@@ -1983,6 +1985,7 @@ fn rerun(
         fork,
         from,
         schema: None,
+        watch: None,
     }
 }
 

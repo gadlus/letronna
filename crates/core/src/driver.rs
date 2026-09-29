@@ -9,7 +9,8 @@
 //! answer it; the checklist is kept on the agent's transcript; the browser is
 //! used unseen, with no panel to open; and messages sent meanwhile are read
 //! from the inbox after each batch of results and before the run counts as
-//! done.
+//! done. A frontend that shows the run as it goes, as an editor does over
+//! ACP, gives it a `Watch`, which hears each step as it is made.
 //!
 //! A run given a schema answers through one more tool, `structured_output`,
 //! offered after the rest so the tools before it keep their cached bytes. Its
@@ -75,6 +76,30 @@ const REMINDER: &str = "You ended without calling structured_output, so your ans
 /// usual advice to send a file in parts, which would leave an answer short.
 const CUT_OFF: &str = "Your answer was cut off before it was complete, so it was not taken. Call structured_output again with the whole answer, worded more briefly: an answer cannot be sent in parts.";
 
+/// What a run did, told as it happens to a frontend that shows the run live.
+#[derive(Clone)]
+pub enum Step {
+    /// Words of the reply, as they stream in.
+    Said(String),
+    /// Words of the model's reasoning, as they stream in.
+    Thought(String),
+    /// A call the model asked for, before anything is decided about it.
+    Asked(ToolCall),
+    /// The call with this id is starting now, approved where it needed to be.
+    Running(String),
+    /// A call's result, by the call's id.
+    Finished {
+        id: String,
+        output: String,
+        failed: bool,
+    },
+    /// The checklist as a `todo` call left it.
+    Checklist(Vec<Todo>),
+}
+
+/// Hears each step of a run on the run's own threads, so it must not block.
+pub type Watch = Arc<dyn Fn(Step) + Send + Sync>;
+
 /// Which tools an agent may call, before the deny set is taken out.
 #[derive(Clone, Default)]
 pub enum Allow {
@@ -113,6 +138,8 @@ pub struct Spec {
     /// The shape its answer must have, given through `structured_output`
     /// instead of in prose; None for an answer in prose.
     pub schema: Option<Value>,
+    /// Hears the run step by step; None when only the report is wanted.
+    pub watch: Option<Watch>,
 }
 
 /// How a run is getting on, in atomics a frontend reads while the run writes them.
@@ -169,7 +196,13 @@ pub enum Outcome {
 pub type Handle = std::thread::JoinHandle<Report>;
 
 /// Runs the agent on this thread until it answers, is stopped, or runs out of rounds or budget.
-pub fn run(mut spec: Spec) -> Report {
+pub fn run(spec: Spec) -> Report {
+    run_keeping(spec).0
+}
+
+/// Runs the agent as `run` does and hands back its transcript too, for a
+/// caller that carries on the same conversation with the next prompt.
+pub fn run_keeping(mut spec: Spec) -> (Report, Transcript) {
     let started = Instant::now();
     crate::hooks::new_turn(spec.connection.conversation);
     let mut turn = Turn::with_limit(spec.connection.clone(), spec.rounds);
@@ -189,10 +222,7 @@ pub fn run(mut spec: Spec) -> Report {
         .and_then(|status| {
             // Calls that ran before a stop keep their results, so
             // whoever resumes the transcript knows what they did.
-            spec.transcript
-                .conversation
-                .messages
-                .extend(turn.take_results());
+            keep_results(&mut spec, turn.take_results());
             save(&mut spec.transcript)?;
             Ok(status)
         })
@@ -212,7 +242,7 @@ pub fn run(mut spec: Spec) -> Report {
     let messages = &spec.transcript.conversation.messages;
     report.text = last_said(messages.get(spec.from..).unwrap_or_default());
     report.seconds = started.elapsed().as_secs();
-    report
+    (report, spec.transcript)
 }
 
 /// Runs the agent on a thread of its own, named for it, and hands its report
@@ -273,6 +303,9 @@ fn steps(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result<Outcom
         }
         let calls = reply.tool_calls.clone();
         spec.transcript.conversation.messages.push(reply);
+        for call in &calls {
+            tell(spec, Step::Asked(call.clone()));
+        }
         if calls.is_empty() {
             // Mail that came while it worked may change the answer, so it
             // carries the run on rather than going unread.
@@ -356,6 +389,9 @@ fn work_through(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result
         };
         let batch = turn.next_batch(batchable, MAX_BATCH);
         if !batch.is_empty() {
+            for call in &batch {
+                tell(spec, Step::Running(call.id.clone()));
+            }
             for (call, outcome) in batch.iter().zip(together(spec, &batch)) {
                 // One a stop kept from starting gets no result, as a lone call does.
                 if let Some(outcome) = outcome {
@@ -375,10 +411,7 @@ fn work_through(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result
         let outcome = match turn.next(gate) {
             Next::Done => return Ok(()),
             Next::Ask => {
-                spec.transcript
-                    .conversation
-                    .messages
-                    .extend(turn.take_results());
+                keep_results(spec, turn.take_results());
                 // After the results, which have to follow the calls they
                 // answer, and only if the run goes on: mail a run ending here
                 // would never read is left for its owner.
@@ -424,8 +457,12 @@ fn dispatch(
     if let Some(refused) = refusal(&spec.allow, &call.name) {
         return Some(Err(refused));
     }
+    tell(spec, Step::Running(call.id.clone()));
     if call.name == tools::TODO {
-        return Some(checklist(&mut spec.transcript, &call.arguments));
+        let outcome = checklist(&mut spec.transcript, &call.arguments);
+        let todos = spec.transcript.conversation.todos.clone();
+        tell(spec, Step::Checklist(todos));
+        return Some(outcome);
     }
     let outcome = off_thread(call, &context(spec))?;
     if outcome.is_ok() && matches!(call.name.as_str(), "write_file" | "edit_file") {
@@ -586,6 +623,13 @@ fn ask(spec: &Spec, turn: &mut Turn, permit: Permit) -> Result<Option<Message>, 
         closer.close();
     });
     while let Ok(event) = events.recv_blocking() {
+        // Told as it streams, so the words of a try a 429 cuts short stay
+        // with the watcher though the reply drops them, as on a screen.
+        match &event {
+            Event::Delta(text) => tell(spec, Step::Said(text.clone())),
+            Event::Reasoning(text) => tell(spec, Step::Thought(text.clone())),
+            _ => {}
+        }
         turn.absorb(&event);
         if let Event::Finished(result) = event {
             return match result {
@@ -748,6 +792,28 @@ pub(crate) fn last_said(messages: &[Message]) -> String {
         .unwrap_or_default()
 }
 
+/// Tells the run's watcher about `step`, if it has one.
+fn tell(spec: &Spec, step: Step) {
+    if let Some(watch) = &spec.watch {
+        watch(step);
+    }
+}
+
+/// Puts a batch's results on the transcript, telling the watcher each one.
+fn keep_results(spec: &mut Spec, results: Vec<Message>) {
+    for result in results.iter().filter(|message| message.role == "tool") {
+        tell(
+            spec,
+            Step::Finished {
+                id: result.tool_call_id.clone(),
+                output: result.content.clone(),
+                failed: result.is_error,
+            },
+        );
+    }
+    spec.transcript.conversation.messages.extend(results);
+}
+
 fn save(transcript: &mut Transcript) -> Result<(), String> {
     transcript
         .save()
@@ -820,6 +886,7 @@ mod tests {
             fork: false,
             from: 0,
             schema: None,
+            watch: None,
         }
     }
 
