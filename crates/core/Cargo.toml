@@ -36,6 +36,13 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Securit
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Computer use on macOS: the window list, pictures of windows and made-up
+# input through Core Graphics, at the versions the window already uses;
+# scroll events need "highsierra" and events sent to one app "elcapitan".
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+core-graphics = { version = "0.24", features = ["highsierra", "elcapitan"] }
+
 [features]
 default = ["workflows"]
 # Orchestration scripts that run many agents at once. On by default, so CI
