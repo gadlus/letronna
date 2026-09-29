@@ -389,6 +389,7 @@ impl Chat {
             model: source.model.clone(),
             gateway: source.gateway.clone(),
             effort: source.effort.clone(),
+            summary: source.summary_within(messages.len()),
             messages,
             ..Default::default()
         };

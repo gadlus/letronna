@@ -1092,6 +1092,12 @@ impl Chat {
                 self.finish(cx);
             }
             Event::Finished(Ok(())) => self.on_reply(cx),
+            // Kept with the session, so a restart need not ask for it again.
+            Event::Summarized { upto, text } => {
+                if let Some(ix) = self.streaming_id.and_then(|id| self.store.index_of(id)) {
+                    self.store.conversations[ix].summarized(upto, text);
+                }
+            }
             _ => {}
         }
         cx.notify();

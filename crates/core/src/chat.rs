@@ -228,6 +228,12 @@ pub enum Event {
     /// Sent before anything else while the turns the window dropped are
     /// being summarized, which takes a model call of its own.
     Compacting,
+    /// Sent after `Compacting` when the model made a summary of the first
+    /// `upto` messages, for the session to keep with them.
+    Summarized {
+        upto: usize,
+        text: String,
+    },
     /// A try failed in a way that passes, and another follows after a wait.
     Retrying(crate::retry::Retry),
     /// Sent before `Finished` when the reply stopped at the output limit;
@@ -1800,9 +1806,20 @@ fn stream(
     // What the window no longer holds goes in as a summary rather than not at
     // all. It is made here, on the worker, so the wait is part of the reply's.
     let (dropped, window) = messages.split_at(start);
-    let summary = crate::compact::summary(connection, dropped, budget.tokens, || {
-        let _ = sender.send_blocking(Event::Compacting);
-    });
+    let summary = crate::compact::summary(
+        connection,
+        dropped,
+        budget.tokens,
+        || {
+            let _ = sender.send_blocking(Event::Compacting);
+        },
+        |text| {
+            let _ = sender.send_blocking(Event::Summarized {
+                upto: dropped.len(),
+                text: text.to_owned(),
+            });
+        },
+    );
     let sent = body_with(
         connection,
         window,
@@ -3449,8 +3466,13 @@ mod tests {
             ..connection()
         };
         let rx = start(c, a_big_write());
-        // The wait for the summary is said to be one.
+        // The wait for the summary is said to be one, and the summary is
+        // handed over for the session to keep, with what it covers.
         assert!(matches!(rx.recv_blocking().unwrap(), Event::Compacting));
+        assert!(matches!(
+            rx.recv_blocking().unwrap(),
+            Event::Summarized { upto: 4, text } if text == "A big file was written."
+        ));
         assert!(matches!(rx.recv_blocking().unwrap(), Event::Delta(s) if s == "Welcome"));
         assert!(matches!(
             rx.recv_blocking().unwrap(),
@@ -3463,6 +3485,51 @@ mod tests {
         assert!(!bodies[1].contains("write the big file"));
         assert!(bodies[1].contains("A big file was written."));
         assert!(bodies[1].contains("thanks"));
+    }
+
+    #[test]
+    fn a_summary_the_model_could_not_make_is_not_handed_over() {
+        use std::io::Write;
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1", server.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            // An empty summary, then the reply.
+            let replies = [
+                (
+                    "application/json",
+                    r#"{"choices":[{"message":{"content":"  "}}]}"#,
+                ),
+                (
+                    "text/event-stream",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Welcome\"}}]}\n\ndata: [DONE]\n\n",
+                ),
+            ];
+            let mut bodies = Vec::new();
+            for (kind, reply) in replies {
+                let (mut socket, _) = server.accept().unwrap();
+                bodies.push(request_body(&mut socket));
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+            }
+            bodies
+        });
+        let c = Connection {
+            endpoint,
+            ..connection()
+        };
+        // Said apart from the other test's, which the summaries remembered
+        // in this process would otherwise answer.
+        let mut messages = a_big_write();
+        messages[0].content = "write the other big file".into();
+        let rx = start(c, messages);
+        assert!(matches!(rx.recv_blocking().unwrap(), Event::Compacting));
+        // The digest standing in is not for the session to keep.
+        assert!(matches!(rx.recv_blocking().unwrap(), Event::Delta(s) if s == "Welcome"));
+        assert!(matches!(
+            rx.recv_blocking().unwrap(),
+            Event::Finished(Ok(()))
+        ));
+        let bodies = worker.join().unwrap();
+        assert!(bodies[1].contains("No summary could be made"));
     }
 
     #[test]

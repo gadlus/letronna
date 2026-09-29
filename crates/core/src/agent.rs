@@ -195,6 +195,8 @@ impl Turn {
             Event::Replay(replay) => self.live.replay = Some(replay.clone()),
             Event::Retrying(retry) => self.live.retrying = Some(*retry),
             Event::Compacting => self.live.compacting = true,
+            // The front end keeps it with the session.
+            Event::Summarized { .. } => {}
             Event::CutOff { in_call } => self.cut_off = Some(*in_call),
             Event::Finished(_) => {}
         }

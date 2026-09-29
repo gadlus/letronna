@@ -316,6 +316,10 @@ impl Runner {
                 }
                 out.push(text);
             }
+            // Kept with the session, so a restart need not ask for it again.
+            if let Event::Summarized { upto, text } = &event {
+                self.store.conversations[session].summarized(*upto, text.clone());
+            }
             turn.absorb(&event);
             if let Event::Finished(result) = event {
                 self.bar.wait_line(false);

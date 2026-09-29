@@ -1134,6 +1134,7 @@ fn branch(runner: &mut Runner, session: &mut usize, name: &str) {
         model: from.model.clone(),
         gateway: from.gateway.clone(),
         effort: from.effort.clone(),
+        summary: from.summary.clone(),
         ..Default::default()
     };
     history::share(from.id, copy.id);
