@@ -572,8 +572,34 @@ fn body_with(
     let shot = screenshot(window)
         .filter(|_| sees_images(&connection.model))
         .and_then(|(after, path)| Some((after, crate::media::data_url(&path)?)));
+    // The window never trims the turn in progress, and a helper's whole run
+    // is one turn, so without this every round would send every result the
+    // turn has had again. The session keeps them whole; only the request
+    // is shortened.
+    let old = old_before(window, budget);
+    let stubs = stubs(window, old);
     for (i, m) in window.iter().enumerate() {
-        context.push(wire_message(m, budget.tool_chars));
+        let mut wired = wire_message(m, budget.tool_chars);
+        if let Some(stub) = &stubs[i] {
+            wired["content"] = stub.as_str().into();
+        }
+        if i < old {
+            for (at, call) in m.tool_calls.iter().enumerate() {
+                if call.name != "write_file" {
+                    continue;
+                }
+                // The round's results follow its calls, and a declined write
+                // comes back as an error too.
+                let wrote = window[i + 1..]
+                    .iter()
+                    .take_while(|r| r.role == "tool")
+                    .any(|r| r.tool_call_id == call.id && !r.is_error);
+                if let Some(counted) = written(&call.arguments, wrote) {
+                    wired["tool_calls"][at]["function"]["arguments"] = counted.into();
+                }
+            }
+        }
+        context.push(wired);
         // A tool result carries text only, so the picture follows as the
         // user's: the one shape of it every provider takes.
         if let Some((after, picture)) = &shot
@@ -927,6 +953,119 @@ fn wire_message(m: &Message, tool_chars: usize) -> Value {
             .collect();
     }
     v
+}
+
+/// Results and file bodies shorter than this, in characters, go out as they
+/// are however old or repeated: a line saying what one was costs about as
+/// much, and the model reads it without calling again.
+const STUB_CHARS: usize = 200;
+/// The newest tool results always go out whole, however full the window:
+/// the model is most likely still working from them.
+const KEEP_RESULTS: usize = 5;
+/// How many tool results the boundary of the old ones moves by at once.
+/// Each move changes messages already sent, so the prompt cache misses from
+/// the first of them on; moving every eighth result keeps the requests in
+/// between identical from the front.
+const STUB_STEP: usize = 8;
+
+/// Where the old part of `window` ends. Nothing is old until the window,
+/// with every result whole, costs more than half the budget; then what is
+/// old ends at the round holding the result on the last whole step of
+/// `STUB_STEP` results that leaves the newest `KEEP_RESULTS` out.
+///
+/// The cost is taken without stubs, so the room they free cannot turn them
+/// off again on the next request, and results are only ever added, so the
+/// boundary only moves forward until the window itself moves on. A round --
+/// a reply's calls and their results -- is never split, so the one the model
+/// has not answered yet is never old.
+fn old_before(window: &[Message], budget: &Budget) -> usize {
+    if token_sums(window, budget.tool_chars)[window.len()] <= budget.tokens / 2 {
+        return 0;
+    }
+    let results: Vec<usize> = (0..window.len())
+        .filter(|&i| window[i].role == "tool")
+        .collect();
+    let boundary = results.len().saturating_sub(KEEP_RESULTS) / STUB_STEP * STUB_STEP;
+    if boundary == 0 {
+        return 0;
+    }
+    window[..results[boundary]]
+        .iter()
+        .rposition(|m| m.role != "tool")
+        .unwrap_or(0)
+}
+
+/// What goes on the wire instead of each tool result in `window`, where
+/// something shorter will do: before `old`, a line saying what the result
+/// was and how to get it again; from there on, a pointer back to the last
+/// result of the same call when it was identical.
+///
+/// It is the newer copy that points back, so everything before it goes out
+/// as it did last time; that also covers a file read again unchanged. The
+/// pointer names the call by its tool and arguments, not by its id: a
+/// provider that sends no ids gets `call_0` in every round, and many chat
+/// templates never show ids to the model at all.
+fn stubs(window: &[Message], old: usize) -> Vec<Option<String>> {
+    // Running something the user has to approve again is not for a line of
+    // ours to suggest, so those only say what was cleared.
+    let gated: Vec<String> = if old == 0 {
+        Vec::new()
+    } else {
+        crate::tools::all()
+            .iter()
+            .filter(|t| t.needs_approval())
+            .map(|t| t.name().to_owned())
+            .collect()
+    };
+    let mut last: HashMap<(&str, &str), &str> = HashMap::new();
+    window
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            if m.role != "tool" {
+                return None;
+            }
+            let size = m.content.chars().count();
+            if i >= old {
+                let before = last.insert((m.name.as_str(), m.args.as_str()), m.content.as_str());
+                return (size >= STUB_CHARS && before == Some(m.content.as_str())).then(|| {
+                    format!(
+                        "[Same result as the last {} call with these arguments, above]",
+                        m.name
+                    )
+                });
+            }
+            // Asking again would put the question to the user again.
+            if size < STUB_CHARS || m.name == crate::tools::ASK_USER {
+                return None;
+            }
+            let again = if gated.contains(&m.name) {
+                ""
+            } else {
+                "; call it again if you need it"
+            };
+            Some(format!(
+                "[{} result of {size} chars cleared to save room{again}]",
+                m.name
+            ))
+        })
+        .collect()
+}
+
+/// A `write_file` call's arguments with the file's text as its length, still
+/// a JSON object with the path, when the text is long enough to be worth it;
+/// `wrote` says whether the write went through, so a declined or failed one
+/// is not claimed as written.
+fn written(arguments: &str, wrote: bool) -> Option<String> {
+    let mut args: Value = serde_json::from_str(arguments).ok()?;
+    let content = args.get_mut("content")?;
+    let size = content.as_str()?.chars().count();
+    if size < STUB_CHARS {
+        return None;
+    }
+    let outcome = if wrote { "written" } else { "not written" };
+    *content = format!("[{size} chars {outcome}]").into();
+    Some(args.to_string())
 }
 
 /// Gateway and edge failures that say nothing about the request itself.
@@ -4074,5 +4213,340 @@ mod tests {
         let even = sized(Some(32_768), Some(32_768), CAP_TOKENS, 3_500);
         assert_eq!(even.reply, 8_192);
         assert!(3_500 + even.tokens + even.reply <= 32_768, "{even:?}");
+    }
+
+    /// A reply calling `name` once with `arguments`, and the result it got.
+    fn round(id: &str, name: &str, arguments: String, result: String) -> [Message; 2] {
+        [
+            Message {
+                role: "assistant".into(),
+                tool_calls: vec![ToolCall {
+                    id: id.into(),
+                    name: name.into(),
+                    arguments: arguments.clone(),
+                }],
+                ..Default::default()
+            },
+            Message {
+                role: "tool".into(),
+                tool_call_id: id.into(),
+                name: name.into(),
+                args: arguments,
+                content: result,
+                ..Default::default()
+            },
+        ]
+    }
+
+    /// A turn that reads `files` files one a round, each of about `chars`
+    /// characters and numbered so no two are alike.
+    fn reads(files: usize, chars: usize) -> Vec<Message> {
+        let mut messages = vec![Message {
+            role: "user".into(),
+            content: "read them all".into(),
+            ..Default::default()
+        }];
+        for i in 0..files {
+            messages.extend(round(
+                &format!("r{i}"),
+                "read_file",
+                format!(r#"{{"path":"{i}.txt"}}"#),
+                format!("{i} {}", "x".repeat(chars)),
+            ));
+        }
+        messages
+    }
+
+    /// The tool results a request for `window` sends, in order.
+    fn results_sent(window: &[Message], budget: &Budget) -> Vec<String> {
+        body_with(&connection(), window, None, None, budget, &[])["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .map(|m| m["content"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// How many of `sent` go out as a line saying what they were.
+    fn cleared(sent: &[String]) -> usize {
+        sent.iter()
+            .filter(|s| s.contains("cleared to save room"))
+            .count()
+    }
+
+    #[test]
+    fn a_repeated_result_points_back_at_the_first() {
+        let mut messages = reads(3, 1_000);
+        let file = messages[2].content.clone();
+        let first = messages[1].tool_calls[0].arguments.clone();
+        // The first file read twice more, unchanged, and a short result twice.
+        messages.extend(round("r3", "read_file", first.clone(), file.clone()));
+        messages.extend(round("r4", "read_file", first, file.clone()));
+        messages.extend(round("e0", "edit_file", "{}".into(), "Edited.".into()));
+        messages.extend(round("e1", "edit_file", "{}".into(), "Edited.".into()));
+        let sent = results_sent(&messages, &Budget::SMALL);
+        let pointer = "[Same result as the last read_file call with these arguments, above]";
+        assert_eq!(sent[0], file);
+        assert_eq!(sent[1], messages[4].content);
+        assert_eq!(sent[3], pointer);
+        assert_eq!(sent[4], pointer);
+        // Pointing back at a result this short would save nothing.
+        assert_eq!(sent[5..], ["Edited.", "Edited."]);
+        // And the window is too small for anything to be cleared yet.
+        assert_eq!(cleared(&sent), 0);
+    }
+
+    #[test]
+    fn a_pointer_names_the_call_not_its_id() {
+        // A provider that sends no ids gets the same one in every round.
+        let read = |path: &str, text: &str| {
+            let arguments = json!({ "path": path }).to_string();
+            round("call_0", "read_file", arguments, text.repeat(300))
+        };
+        let mut messages = vec![Message {
+            role: "user".into(),
+            content: "read them".into(),
+            ..Default::default()
+        }];
+        messages.extend(read("a.rs", "a"));
+        messages.extend(read("b.rs", "b"));
+        // a.rs again, unchanged.
+        messages.extend(read("a.rs", "a"));
+        // b.rs now holds what a.rs does, but it is not the same call.
+        messages.extend(read("b.rs", "a"));
+        // a.rs changed and changed back: the last read of it differs.
+        messages.extend(read("a.rs", "c"));
+        messages.extend(read("a.rs", "a"));
+        let sent = results_sent(&messages, &Budget::SMALL);
+        assert_eq!(
+            sent[2],
+            "[Same result as the last read_file call with these arguments, above]"
+        );
+        assert_eq!(sent[3], "a".repeat(300));
+        assert_eq!(sent[5], "a".repeat(300));
+    }
+
+    #[test]
+    fn a_cleared_result_is_never_pointed_at() {
+        let mut messages = reads(20, 800);
+        let first = messages[1].tool_calls[0].arguments.clone();
+        let file = messages[2].content.clone();
+        // The first file read again, unchanged, once its first read is cleared.
+        messages.extend(round("again", "read_file", first, file.clone()));
+        let sent = results_sent(&messages, &Budget::SMALL);
+        assert_eq!(cleared(&sent[..1]), 1);
+        assert_eq!(sent[20], file);
+    }
+
+    #[test]
+    fn a_cleared_command_is_not_offered_again() {
+        let mut messages = vec![Message {
+            role: "user".into(),
+            content: "migrate it".into(),
+            ..Default::default()
+        }];
+        let command = json!({"command": "./migrate.sh"}).to_string();
+        messages.extend(round("c", "run_command", command, "done ".repeat(100)));
+        messages.extend(reads(16, 2_000).into_iter().skip(1));
+        let sent = results_sent(&messages, &Budget::SMALL);
+        // Running it again is for the user to approve, not for a stub to offer.
+        assert_eq!(
+            sent[0],
+            "[run_command result of 500 chars cleared to save room]"
+        );
+        assert!(sent[1].ends_with("; call it again if you need it]"));
+    }
+
+    #[test]
+    fn old_results_are_stubbed_only_past_half_the_budget() {
+        let budget = Budget::SMALL;
+        let cost = |window: &[Message]| token_sums(window, budget.tool_chars)[window.len()];
+        // Twenty results of 400 characters come to less than half the budget.
+        let light = reads(20, 400);
+        assert!(cost(&light) <= budget.tokens / 2, "{}", cost(&light));
+        let sent = results_sent(&light, &budget);
+        assert_eq!(cleared(&sent), 0);
+        // Twice as long they come to more: the oldest eight go out as a line
+        // each, and the twelve after them whole.
+        let heavy = reads(20, 800);
+        assert!(cost(&heavy) > budget.tokens / 2, "{}", cost(&heavy));
+        let sent = results_sent(&heavy, &budget);
+        assert_eq!(cleared(&sent[..8]), 8);
+        assert_eq!(
+            sent[0],
+            "[read_file result of 802 chars cleared to save room; call it again if you need it]"
+        );
+        for (i, result) in sent.iter().enumerate().skip(8) {
+            assert_eq!(*result, heavy[2 + 2 * i].content, "{i}");
+        }
+    }
+
+    #[test]
+    fn the_boundary_moves_in_steps_of_eight() {
+        // Past half the budget from the sixth result on.
+        let turn = reads(40, 2_000);
+        let requests: Vec<Vec<Value>> = (1..=40)
+            .map(|files| {
+                let payload = body_with(
+                    &connection(),
+                    &turn[..1 + 2 * files],
+                    None,
+                    None,
+                    &Budget::SMALL,
+                    &[],
+                );
+                payload["messages"].as_array().unwrap().clone()
+            })
+            .collect();
+        // A request goes out as the one before it did, from the front, but
+        // for when the boundary moves, which it does as the 13th, 21st, 29th
+        // and 37th result come in: always forward, and always leaving the
+        // five newest results whole at least.
+        let moved: Vec<usize> = (1..40)
+            .filter(|&n| {
+                let (before, after) = (&requests[n - 1], &requests[n]);
+                after[..before.len()] != before[..]
+            })
+            .map(|n| n + 1)
+            .collect();
+        assert_eq!(moved, [13, 21, 29, 37]);
+        let counts: Vec<usize> = requests
+            .iter()
+            .map(|messages| {
+                let sent: Vec<String> = messages
+                    .iter()
+                    .filter_map(|m| m["content"].as_str().filter(|_| m["role"] == "tool"))
+                    .map(str::to_owned)
+                    .collect();
+                cleared(&sent)
+            })
+            .collect();
+        assert_eq!(counts[11], 0);
+        assert_eq!(&counts[12..20], [8; 8]);
+        assert_eq!(counts[39], 32);
+    }
+
+    #[test]
+    fn the_round_the_model_has_not_answered_is_never_cleared() {
+        let mut messages = reads(6, 2_000);
+        // Twelve files read at once, whose results the model has not seen.
+        let calls: Vec<ToolCall> = (0..12)
+            .map(|i| ToolCall {
+                id: format!("b{i}"),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            })
+            .collect();
+        messages.push(Message {
+            role: "assistant".into(),
+            tool_calls: calls,
+            ..Default::default()
+        });
+        for i in 0..12 {
+            messages.push(Message {
+                role: "tool".into(),
+                tool_call_id: format!("b{i}"),
+                name: "read_file".into(),
+                content: format!("batch {i} {}", "z".repeat(2_000)),
+                ..Default::default()
+            });
+        }
+        // Eighteen results put the boundary at the ninth, inside the batch:
+        // it goes back to where the batch starts instead.
+        let sent = results_sent(&messages, &Budget::SMALL);
+        assert_eq!(cleared(&sent[..6]), 6);
+        assert_eq!(cleared(&sent[6..]), 0);
+    }
+
+    #[test]
+    fn an_old_answer_from_the_user_is_never_cleared() {
+        let mut messages = vec![Message {
+            role: "user".into(),
+            content: "set it up".into(),
+            ..Default::default()
+        }];
+        let answer = format!("Use the second option. {}", "Because ".repeat(40));
+        messages.extend(round(
+            "q",
+            crate::tools::ASK_USER,
+            r#"{"question":"Which one?"}"#.into(),
+            answer.clone(),
+        ));
+        messages.extend(reads(16, 2_000).into_iter().skip(1));
+        let sent = results_sent(&messages, &Budget::SMALL);
+        // As old as the seven reads after it, but sent whole.
+        assert_eq!(sent[0], answer);
+        assert_eq!(cleared(&sent[1..8]), 7);
+    }
+
+    #[test]
+    fn stored_messages_are_never_changed() {
+        let mut messages = reads(20, 800);
+        let newest = messages[messages.len() - 1].content.clone();
+        let call = messages[messages.len() - 2].tool_calls[0].arguments.clone();
+        messages.extend(round("again", "read_file", call, newest));
+        let stored = serde_json::to_string(&messages).unwrap();
+        let first = body_with(&connection(), &messages, None, None, &Budget::SMALL, &[]);
+        let wire = first.to_string();
+        assert!(wire.contains("[read_file result of 802 chars cleared to save room"));
+        assert!(wire.contains("[Same result as the last read_file call"));
+        // The session still has every result whole, so the window is placed
+        // and summarized from them, and the same history makes the same
+        // request.
+        assert_eq!(serde_json::to_string(&messages).unwrap(), stored);
+        assert_eq!(messages[2].content.len(), 802);
+        assert_eq!(
+            body_with(&connection(), &messages, None, None, &Budget::SMALL, &[]),
+            first
+        );
+    }
+
+    #[test]
+    fn old_write_file_bodies_become_a_count() {
+        let write = |id: &str, path: &str| {
+            let arguments = json!({"path": path, "content": "y".repeat(5_000)});
+            round(
+                id,
+                "write_file",
+                arguments.to_string(),
+                "Wrote 5000 bytes.".into(),
+            )
+        };
+        let mut messages = vec![Message {
+            role: "user".into(),
+            content: "write them".into(),
+            ..Default::default()
+        }];
+        messages.extend(write("w0", "old.txt"));
+        let mut declined = write("w2", "no.txt");
+        declined[1].content = crate::tools::DECLINED.into();
+        declined[1].is_error = true;
+        messages.extend(declined);
+        messages.extend(reads(13, 800).into_iter().skip(1));
+        messages.extend(write("w1", "new.txt"));
+        let payload = body_with(&connection(), &messages, None, None, &Budget::SMALL, &[]);
+        let arguments = |id: &str| -> Value {
+            let call = payload["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|m| m["tool_calls"].as_array().cloned().unwrap_or_default())
+                .find(|c| c["id"] == id)
+                .unwrap();
+            serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap()
+        };
+        // Still an object with the path, so it reads as the call it was.
+        assert_eq!(
+            arguments("w0"),
+            json!({"path": "old.txt", "content": "[5000 chars written]"})
+        );
+        // A write the user declined is not claimed as written.
+        assert_eq!(
+            arguments("w2"),
+            json!({"path": "no.txt", "content": "[5000 chars not written]"})
+        );
+        // The newest write goes out whole.
+        assert_eq!(arguments("w1")["content"].as_str().unwrap().len(), 5_000);
     }
 }
