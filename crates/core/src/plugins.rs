@@ -504,14 +504,20 @@ fn add_in(data: &Path, source: &str) -> Result<Plugin, String> {
 /// changed; else where the earlier copy went. Its switch is kept, and so is
 /// the consent unless its version or servers changed.
 pub fn update(name: &str) -> Result<Option<PathBuf>, String> {
-    let done = update_in(&backend::data_dir(), name)?;
-    if done.is_some() {
-        restart_servers(name)?;
-    }
+    let done = update_in(&backend::data_dir(), name, || crate::mcp::stop_plugin(name));
+    // Stopped or not, its servers start from whichever copy is in place.
+    let restarted = restart_servers(name);
+    let done = done?;
+    restarted?;
     Ok(done)
 }
 
-fn update_in(data: &Path, name: &str) -> Result<Option<PathBuf>, String> {
+/// `update` in `data`, calling `before_move` just before the old copy moves.
+fn update_in(
+    data: &Path,
+    name: &str,
+    before_move: impl FnOnce(),
+) -> Result<Option<PathBuf>, String> {
     let folder = installed(data, name)?;
     let saved = read_saved(data)?;
     let source = saved
@@ -533,6 +539,7 @@ fn update_in(data: &Path, name: &str) -> Result<Option<PathBuf>, String> {
         if head(&staging).is_some() && head(&staging) == head(&folder) {
             return Ok(None);
         }
+        before_move();
         let kept = archive(data, &folder)?;
         if let Err(e) = std::fs::rename(&staging, &folder) {
             let back = std::fs::rename(&kept, &folder)
@@ -558,13 +565,18 @@ fn head(folder: &Path) -> Option<String> {
 /// Take a plugin out: its folder goes into `plugins-archive`, whole, and
 /// what was kept for it is forgotten. Says where it went.
 pub fn remove(name: &str) -> Result<PathBuf, String> {
-    let kept = remove_in(&backend::data_dir(), name)?;
-    restart_servers(name)?;
+    let kept = remove_in(&backend::data_dir(), name, || crate::mcp::stop_plugin(name));
+    // Started again from the folder left in place if the move failed.
+    let restarted = restart_servers(name);
+    let kept = kept?;
+    restarted?;
     Ok(kept)
 }
 
-fn remove_in(data: &Path, name: &str) -> Result<PathBuf, String> {
+/// `remove` in `data`, calling `before_move` just before the folder moves.
+fn remove_in(data: &Path, name: &str, before_move: impl FnOnce()) -> Result<PathBuf, String> {
     let folder = installed(data, name)?;
+    before_move();
     let kept = archive(data, &folder)?;
     change_saved(data, |saved| {
         saved.plugins.remove(name);
@@ -1287,11 +1299,21 @@ mod tests {
         });
         write(&repo.join(MANIFEST), manifest.to_string().as_bytes());
         commit(&repo);
-        let kept = update_in(&data, "files").unwrap().unwrap();
+        // Its servers are stopped while the old copy is still in place.
+        let folder = data.join(PLUGINS_DIR).join("files");
+        let mut stopped_in_place = None;
+        let kept = update_in(&data, "files", || {
+            stopped_in_place = Some(folder.join(MANIFEST).is_file());
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(stopped_in_place, Some(true));
         assert!(kept.starts_with(data.join(ARCHIVE)));
         assert!(servers_in(&data).is_empty());
         assert!(!plugin_in(&data, "files").unwrap().allowed);
-        assert_eq!(update_in(&data, "files").unwrap(), None);
+        let mut stopped = false;
+        assert_eq!(update_in(&data, "files", || stopped = true).unwrap(), None);
+        assert!(!stopped, "nothing changed, so nothing stops");
     }
 
     #[test]
@@ -1333,7 +1355,10 @@ mod tests {
             "the consent outlasts the switch"
         );
 
-        let kept = remove_in(&data, "kit").unwrap();
+        let folder = data.join(PLUGINS_DIR).join("kit");
+        let mut stopped_in_place = false;
+        let kept = remove_in(&data, "kit", || stopped_in_place = folder.is_dir()).unwrap();
+        assert!(stopped_in_place);
         assert!(kept.join(MANIFEST).is_file());
         assert!(list_in(&data).unwrap().is_empty());
         assert!(set_enabled_in(&data, "kit", true).is_err());

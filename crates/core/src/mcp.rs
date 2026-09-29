@@ -850,6 +850,15 @@ fn apply(done: &Reloaded, mut servers: BTreeMap<String, Result<ServerConfig, Str
     }
 }
 
+/// Stop the servers the plugin `plugin` brings, before its folder moves:
+/// Windows will not move a folder a program is running in, and one left
+/// running would go on with the old copy's code, as `reload` finds its
+/// entry unchanged. `reload` starts them again from what is then in place.
+pub(crate) fn stop_plugin(plugin: &str) {
+    let prefix = format!("{plugin}:");
+    remove_slots(|name| name.starts_with(&prefix));
+}
+
 /// Take the slots of the servers `which` picks out, and stop them, each
 /// process tree and all.
 fn remove_slots(which: impl Fn(&str) -> bool) {
@@ -3457,6 +3466,24 @@ mod tests {
         assert_eq!(fs.auto_approve, AutoApprove::Names(vec!["read".into()]));
         // A server reached by URL has no command, and is passed over.
         assert!(servers["web"].as_ref().unwrap().command.is_empty());
+    }
+
+    #[test]
+    fn stopping_a_plugins_servers_leaves_every_other_server_running() {
+        let names = ["stopkit:files", "stopkit", "stopkit2:web", "other:stopkit"];
+        {
+            let mut slots = slots().lock().unwrap();
+            for name in names {
+                slots.insert(name.to_owned(), Slot::default());
+            }
+        }
+        stop_plugin("stopkit");
+        let slots = slots().lock().unwrap();
+        let left: Vec<&str> = names
+            .into_iter()
+            .filter(|name| slots.contains_key(*name))
+            .collect();
+        assert_eq!(left, ["stopkit", "stopkit2:web", "other:stopkit"]);
     }
 
     #[test]
