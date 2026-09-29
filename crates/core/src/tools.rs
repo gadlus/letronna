@@ -1649,6 +1649,29 @@ fn read_around(id: u64, around: usize, query: &str) -> Result<String, String> {
             count.saturating_sub(1)
         ));
     }
+    Ok(read_messages(id, &session, around, query))
+}
+
+/// The last messages of session `id`, as `search_sessions` reads them.
+pub(crate) fn read_end(id: u64) -> Result<String, String> {
+    let Some(session) = crate::store::saved(id) else {
+        return Err(format!("there is no saved session {id}."));
+    };
+    match session.messages.len() {
+        0 => Err(format!("session {id} has no messages.")),
+        count => Ok(read_messages(id, &session, count - 1, "")),
+    }
+}
+
+/// The messages of `session` either side of message `around`, which is one
+/// of them.
+fn read_messages(
+    id: u64,
+    session: &crate::store::Conversation,
+    around: usize,
+    query: &str,
+) -> String {
+    let count = session.messages.len();
     let from = around.saturating_sub(READ_SIDE);
     let to = (around + READ_SIDE).min(count - 1);
     let title = shown_title(&session.title);
@@ -1666,7 +1689,7 @@ fn read_around(id: u64, around: usize, query: &str) -> Result<String, String> {
         let said = crate::store::excerpt(&text, query, READ_CHARS);
         out.push_str(&format!("\n#{n} {who}: {said}"));
     }
-    Ok(out)
+    out
 }
 
 /// A session's title on one line and cut short, as a renamed session's

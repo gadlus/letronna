@@ -530,7 +530,7 @@ impl Chat {
 
     /// Open the list of modes with the keys in it, as the chip's popover
     /// shows it.
-    fn open_mode_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_mode_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.mode_menu.is_some() {
             return;
         }
@@ -623,7 +623,16 @@ impl Chat {
                 this.send(window, cx);
                 this.send_now(cx);
             }))
-            .child(Input::new(&self.composer).w_full().appearance(false));
+            // Around the input rather than on it, so the list's keys come
+            // before the input's own only while the list is up.
+            .child(
+                self.completion_keys(
+                    div()
+                        .w_full()
+                        .child(Input::new(&self.composer).w_full().appearance(false)),
+                    cx,
+                ),
+            );
         let controls = h_flex()
             .items_center()
             .gap_1()
@@ -732,8 +741,11 @@ impl Chat {
             frame.child(attach).child(input.flex_1()).child(controls)
         };
         v_flex()
+            .relative()
             .w_full()
             .children(self.attached_row(cx))
+            .children(self.accepted_row(cx))
             .child(frame)
+            .children(self.completion_list(cx))
     }
 }

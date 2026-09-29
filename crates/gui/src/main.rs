@@ -74,6 +74,21 @@ fn main() {
             KeyBinding::new("shift-tab", ui::browser::PageTabBack, Some("Browser")),
             KeyBinding::new("tab", ui::composer::LeaveComposer, Some("Composer > Input")),
             KeyBinding::new("enter", ui::search::OpenHit, Some("SearchHit")),
+            // Last, so they come before the input's own keys and the Tab
+            // above while the composer's list is up, and only then.
+            KeyBinding::new("up", ui::complete::ChoiceUp, Some("Completing > Input")),
+            KeyBinding::new("down", ui::complete::ChoiceDown, Some("Completing > Input")),
+            KeyBinding::new(
+                "enter",
+                ui::complete::TakeChoice,
+                Some("Completing > Input"),
+            ),
+            KeyBinding::new("tab", ui::complete::OpenChoice, Some("Completing > Input")),
+            KeyBinding::new(
+                "escape",
+                ui::complete::CloseChoices,
+                Some("Completing > Input"),
+            ),
         ]);
         platform::tray::init(cx);
         cx.on_window_closed(|cx| {

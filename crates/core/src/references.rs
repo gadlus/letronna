@@ -5,9 +5,13 @@
 //! model starts with them instead of spending a round on `read_file`. Paths go
 //! through the same checks and paging as `read_file`: a file of keys, one in
 //! Letronna's own folder or one outside the workspace and home folder is not
-//! read, and a path that is not there stays as typed.
+//! read, and a path that is not there stays as typed. `@diff` attaches the
+//! project's uncommitted changes and `@session:12` the end of that session.
 
+use std::io::Read;
 use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use crate::tools::{self, ToolContext};
 
@@ -28,6 +32,16 @@ const LISTED: usize = 500;
 
 /// Names after an `@` that mean someone rather than a path.
 const MENTIONS: &[&str] = &["crew"];
+
+/// The reference that attaches the project's uncommitted changes. It is kept
+/// by name, as `@crew` is, so a file called diff is not attached this way.
+pub const DIFF: &str = "diff";
+
+/// What goes before a session's id in a reference to it.
+pub const SESSION: &str = "session:";
+
+/// How long git gets to say what changed, as long as a search gets.
+const DIFF_TIME: Duration = crate::grep::SEARCH_TIME;
 
 /// `text` with what its `@` references name attached after it, or `text` as
 /// it is when none of them names anything there.
@@ -112,6 +126,19 @@ fn word_len(text: &str) -> usize {
 /// folder's entries, or why it is not attached. None for a path that is not
 /// there, which is left as typed text.
 fn attach(written: &str, ctx: &ToolContext) -> Option<String> {
+    let bare = written.trim_end_matches('.');
+    let named = if bare == DIFF {
+        Some(diff(ctx))
+    } else {
+        session_id(bare).map(tools::read_end)
+    };
+    if let Some(body) = named {
+        let header = format!("--- @{bare} ---");
+        return Some(match body {
+            Ok(body) => format!("{header}\n{body}"),
+            Err(why) => format!("{header}\nNot attached: {why}"),
+        });
+    }
     let (raw, lines) = split_lines(written);
     let raw = raw.replace("\\ ", " ");
     // A sentence can end on a reference, but a file can end on a dot too.
@@ -133,6 +160,118 @@ fn attach(written: &str, ctx: &ToolContext) -> Option<String> {
         Ok(body) => format!("{header}\n{body}"),
         Err(why) => format!("{header}\nNot attached: {why}"),
     })
+}
+
+/// The session a reference such as `session:12` names.
+fn session_id(written: &str) -> Option<u64> {
+    written.strip_prefix(SESSION)?.parse().ok()
+}
+
+/// The project's changes to tracked files since its last commit, as git
+/// shows them, leaving out what `read_file` would refuse to read.
+fn diff(ctx: &ToolContext) -> Result<String, String> {
+    let Some(folder) = ctx.workspace.as_deref() else {
+        return Err("the session has no project folder to compare.".into());
+    };
+    // A program named in the repository's own config would run on a diff,
+    // and nothing asked first; `git diff` as a command asks.
+    if crate::command::config_runs_programs(folder) {
+        return Err(
+            "the repository's config names programs git would run, so ask for git diff instead."
+                .into(),
+        );
+    }
+    let names = git(folder, &["diff", "--name-only", "-z", "--relative", "HEAD"])?;
+    let data = crate::chat::data_dir();
+    let (shown, kept): (Vec<&str>, Vec<&str>) = names
+        .split('\0')
+        .filter(|name| !name.is_empty())
+        // Joined, not resolved: a deleted file is a change too.
+        .partition(|name| {
+            let path = folder.join(name);
+            !tools::secret(&path) && !tools::private(&path, &data)
+        });
+    if shown.is_empty() && kept.is_empty() {
+        return Ok("No changes since the last commit.".into());
+    }
+    let mut args = vec![
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-color",
+        "--relative",
+        "HEAD",
+        "--",
+    ];
+    args.extend(&shown);
+    let mut out = if shown.is_empty() {
+        String::new()
+    } else {
+        git(folder, &args)?
+    };
+    if !kept.is_empty() {
+        out.push_str(&format!(
+            "\n[Left out, as files holding keys: {}.]",
+            kept.join(", ")
+        ));
+    }
+    Ok(out.trim_start_matches('\n').to_owned())
+}
+
+/// What git prints for `args` in `folder`, with the read-only guards on, at
+/// most `ATTACHED_CHARS` of it and for at most `DIFF_TIME`.
+fn git(folder: &Path, args: &[&str]) -> Result<String, String> {
+    let mut command = Command::new("git");
+    command
+        .args(["--no-pager", "--literal-pathspecs"])
+        .args(args)
+        .current_dir(folder)
+        .envs(crate::command::GUARDS.iter().copied())
+        .env_remove("GIT_EXTERNAL_DIFF")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("git could not be run: {e}"))?;
+    let Some(stdout) = child.stdout.take() else {
+        return Err("git gave no output to read.".into());
+    };
+    // Read on a thread, so a git that hangs is given up on rather than
+    // holding the message.
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let read = stdout
+            .take(ATTACHED_CHARS as u64)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes);
+        let _ = sender.send(read);
+    });
+    let read = receiver.recv_timeout(DIFF_TIME);
+    let whole = matches!(&read, Ok(Ok(bytes)) if bytes.len() < ATTACHED_CHARS);
+    // Cut or late, the rest is not wanted and git would wait on it.
+    if !whole {
+        let _ = child.kill();
+    }
+    let status = child.wait();
+    let bytes = match read {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(e)) => return Err(format!("git's output could not be read: {e}")),
+        Err(_) => return Err("git took too long to say what changed.".into()),
+    };
+    if whole && !status.is_ok_and(|s| s.success()) {
+        return Err(
+            "git could not compare the folder; is it in a repository with a commit?".into(),
+        );
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Whether `raw` names something on disk, as `resolve` would join it. A link
@@ -391,6 +530,48 @@ mod tests {
         assert!(expand(&named, Some(&dir)).contains("1|spaced"));
         let outside = reference(&dir.join("src/lib.rs"), None);
         assert_eq!(outside, format!("@{}", dir.join("src/lib.rs").display()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn diff_attaches_the_changes_but_not_a_file_of_keys() {
+        let dir = project("diff");
+        let git = |args: &[&str]| {
+            let done = Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(done.status.success(), "{done:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["add", "-f", "."]);
+        git(&["commit", "-q", "-m", "start"]);
+        std::fs::write(dir.join("src/lib.rs"), "pub fn changed() {}\n").unwrap();
+        std::fs::write(dir.join(".env"), "TOKEN=sk-new-secret\n").unwrap();
+        let sent = expand("review @diff.", Some(&dir));
+        assert!(sent.contains("--- @diff ---\ndiff --git"), "{sent}");
+        assert!(sent.contains("+pub fn changed() {}"), "{sent}");
+        assert!(!sent.contains("sk-new-secret"), "{sent}");
+        assert!(
+            sent.contains("[Left out, as files holding keys: .env.]"),
+            "{sent}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn diff_without_a_project_says_why_and_a_bad_session_stays_as_typed() {
+        let sent = expand("@diff", None);
+        assert!(
+            sent.contains("--- @diff ---\nNot attached: the session has no project folder"),
+            "{sent}"
+        );
+        assert_eq!(session_id("session:12"), Some(12));
+        assert_eq!(session_id("session:twelve"), None);
+        let dir = project("session");
+        assert_eq!(expand("see @session:x", Some(&dir)), "see @session:x");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

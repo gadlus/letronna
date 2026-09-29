@@ -436,6 +436,51 @@ fn walk(
     Ok(walked)
 }
 
+/// Every file and folder a search of `root` would walk, relative to it with
+/// `/` between names and a folder ending in one, in walk order, until
+/// `deadline` or `most` of them.
+pub(crate) fn entries(root: &Path, deadline: Instant, most: usize) -> Result<Vec<String>, String> {
+    let query = Query {
+        root,
+        given: ".",
+        workspace: Some(root),
+        data: std::fs::canonicalize(crate::chat::data_dir()).ok(),
+        pattern: None,
+        mode: Mode::Files,
+        glob: None,
+        kind: None,
+        context: 0,
+        case_sensitive: false,
+        limit: 0,
+        offset: 0,
+    };
+    let mut found = Vec::new();
+    for entry in walker(&query, Arc::default())?.filter_map(Result::ok) {
+        if found.len() >= most || Instant::now() >= deadline {
+            break;
+        }
+        // A link is left out, as the search leaves it: it leads elsewhere.
+        let Some(kind) = entry.file_type().filter(|t| t.is_file() || t.is_dir()) else {
+            continue;
+        };
+        let Ok(inside) = entry.path().strip_prefix(root) else {
+            continue;
+        };
+        if entry.depth() == 0 {
+            continue;
+        }
+        let mut name: Vec<String> = inside
+            .iter()
+            .map(|part| part.to_string_lossy().into_owned())
+            .collect();
+        if kind.is_dir() {
+            name.push(String::new());
+        }
+        found.push(name.join("/"));
+    }
+    Ok(found)
+}
+
 /// The walk: `.gitignore` and `.ignore` honoured, even outside a Git
 /// repository; names in order so pages are stable. What must stay out goes
 /// in the filter, which no ignore rule, type or glob outranks: Letronna's own

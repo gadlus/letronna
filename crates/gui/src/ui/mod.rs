@@ -5,6 +5,7 @@ pub(crate) mod approval;
 pub(crate) mod artifacts;
 pub(crate) mod browser;
 pub(crate) mod chrome;
+pub(crate) mod complete;
 pub(crate) mod composer;
 pub(crate) mod grain;
 pub(crate) mod mcp;
