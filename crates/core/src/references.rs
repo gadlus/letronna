@@ -162,6 +162,11 @@ fn denied(tool: &str, raw: &str, ctx: &ToolContext) -> Result<(), String> {
 /// Whether `raw` names something on disk, as `resolve` would join it. A link
 /// counts even when it leads nowhere, so a refusal says why.
 fn exists(raw: &str, ctx: &ToolContext) -> bool {
+    // Not looked up: on Windows that alone signs in to another computer.
+    // Counted as there, so `resolve` refuses it with its reason.
+    if crate::paths::unsafe_raw(raw, ctx.workspace.as_deref()).is_some() {
+        return true;
+    }
     let base = ctx
         .workspace
         .clone()
@@ -399,6 +404,14 @@ mod tests {
             "{sent}"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_share_on_another_computer_is_refused_without_opening_it() {
+        let sent = expand("@//192.0.2.1/share/notes.md", None);
+        assert!(sent.contains("Not attached:"), "{sent}");
+        assert!(sent.contains("on another computer"), "{sent}");
     }
 
     #[test]
