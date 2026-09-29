@@ -205,13 +205,16 @@ fn line_ending(file: &[u8]) -> Option<&'static str> {
 /// Refuse JSON or TOML that would no longer parse, since a broken
 /// package.json or Cargo.toml stops the whole project. A file that did not
 /// parse before -- a template, or comments its own tools allow -- is not held
-/// to it, and neither are the JSON files editors read with comments.
+/// to it, and neither are the JSON files editors read with comments. A
+/// notebook is JSON too, which read_file shows unquoted as cells, so an edit
+/// copied from that view is refused rather than left unable to open.
 pub fn check_syntax(path: &Path, before: Option<&[u8]>, after: &str) -> Result<(), String> {
     let extension = path
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase());
     let kind = match extension.as_deref() {
         Some("json") if !with_comments(path) => "JSON",
+        Some("ipynb") => "JSON",
         Some("toml") => "TOML",
         _ => return Ok(()),
     };
@@ -417,6 +420,8 @@ mod tests {
         assert!(check_syntax(Path::new("tsconfig.base.json"), None, commented).is_ok());
         assert!(check_syntax(Path::new(".vscode/settings.json"), None, commented).is_ok());
         assert!(check_syntax(Path::new(".vscode/../package.json"), None, commented).is_err());
+        let notebook = Path::new("Analysis.IPYNB");
+        assert!(check_syntax(notebook, Some(b"{}"), "{\"source\": \"print(\"7\")\"}").is_err());
 
         let cargo = Path::new("Cargo.toml");
         assert!(check_syntax(cargo, Some(b"[package]"), "[package]\nname = \"a\"").is_ok());

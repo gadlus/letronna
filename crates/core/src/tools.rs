@@ -2839,6 +2839,12 @@ mod tests {
         let write = r#"{"path":"run.ipynb","content":"{}"}"#;
         let refused = run("write_file", write, &ctx).unwrap_err();
         assert!(refused.contains("edit_file instead"), "{refused}");
+        // The view shows source unquoted; copied into the JSON it would break it.
+        let edit = r#"{"path":"run.ipynb","old":"print(7)","new":"print(\"7\")"}"#;
+        let refused = run("edit_file", edit, &ctx).unwrap_err();
+        assert!(refused.contains("invalid JSON"), "{refused}");
+        let kept = std::fs::read_to_string(dir.join("run.ipynb")).unwrap();
+        assert!(serde_json::from_str::<Value>(&kept).is_ok());
 
         // One that does not parse reads as its text, after a note saying why.
         let broken = "{\"cells\": [\n  {\"cell_type\": \"code\"";
