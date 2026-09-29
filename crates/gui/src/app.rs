@@ -350,6 +350,9 @@ pub(crate) struct Chat {
     pub(crate) revealed: Option<Pixels>,
     /// The list of modes, while the mode chip has it open.
     pub(crate) mode_menu: Option<Entity<gpui_component::menu::PopupMenu>>,
+    /// Whether a frame has been drawn, before which the window has no focus
+    /// path to ask about.
+    pub(crate) drawn: bool,
     pub(crate) _subscriptions: Vec<Subscription>,
 }
 
@@ -684,6 +687,7 @@ impl Chat {
             reveal: None,
             revealed: None,
             mode_menu: None,
+            drawn: false,
             _subscriptions: subscriptions,
         };
         let widen = this.follow_browser_layout(window, cx);
@@ -2648,6 +2652,7 @@ impl Chat {
 
 impl Render for Chat {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let drawn = std::mem::replace(&mut self.drawn, true);
         // The panel shows the browser of the session on screen.
         let on_screen = self.store.conversations[self.store.active].id;
         if self.browser_for != on_screen {
@@ -2793,10 +2798,13 @@ impl Render for Chat {
             // A menu a turn opened takes the focus from inside that turn. That
             // is not the turn being picked out: showing its full row would
             // take away the button the menu hangs from, and the menu with it.
-            let in_menu = window
-                .context_stack()
-                .iter()
-                .any(|context| context.contains("PopupMenu"));
+            // Before the first frame is drawn there is no focus path, and
+            // gpui panics if asked for one; no menu can be open yet anyway.
+            let in_menu = drawn
+                && window
+                    .context_stack()
+                    .iter()
+                    .any(|context| context.contains("PopupMenu"));
             let mut turns: Vec<(Vec<AnyElement>, Span, FocusHandle)> = Vec::new();
             let mut assistant_turn = false;
             // The message a search hit opened, marked on the first row drawn
