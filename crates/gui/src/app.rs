@@ -28,7 +28,8 @@ pub(crate) enum Verdict {
     },
     /// Allow, and keep a rule allowing calls like it in this project.
     AllowHere,
-    Deny,
+    /// With the reason the user gave, empty when they gave none.
+    Deny(String),
     /// The reply to an `ask_user` question.
     Answer(String),
 }
@@ -152,6 +153,8 @@ pub(crate) struct Chat {
     pub(crate) unattended: std::collections::HashMap<u64, letronna_core::gate::Mode>,
     /// Text field on the `ask_user` card.
     pub(crate) answer: Entity<InputState>,
+    /// Text field on a tool's card for why it was denied.
+    pub(crate) deny_reason: Entity<InputState>,
     /// Whether the footer is already polling background jobs.
     pub(crate) job_tick: bool,
     /// Whether the message box holds nothing to send.
@@ -333,6 +336,8 @@ impl Chat {
         let settings_page = cx.new(|_| "Gateways");
         let rename = cx.new(|cx| InputState::new(window, cx).placeholder("Session name"));
         let answer = cx.new(|cx| InputState::new(window, cx).placeholder("Your answer…"));
+        let deny_reason =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Why not? (optional)"));
         let job_name = cx.new(|cx| InputState::new(window, cx).placeholder("Morning check"));
         let token_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -422,6 +427,11 @@ impl Chat {
                     this.submit_answer(window, cx);
                 }
             }),
+            cx.subscribe_in(&deny_reason, window, |this, _, event, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.deny_call(window, cx);
+                }
+            }),
             cx.subscribe_in(&skill_source, window, |this, _, event, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
                     this.add_skills(window, cx);
@@ -497,6 +507,7 @@ impl Chat {
             rules_read: None,
             unattended: std::collections::HashMap::new(),
             answer,
+            deny_reason,
             job_tick: false,
             composer_empty: true,
             modes: std::collections::HashMap::new(),
@@ -1166,7 +1177,7 @@ impl Chat {
             let verdict = match card_answer(&call.name, &call.arguments, &message.said) {
                 CardAnswer::Answer(text) => Verdict::Answer(text),
                 CardAnswer::Allow => Verdict::Allow { remember: false },
-                CardAnswer::Deny => Verdict::Deny,
+                CardAnswer::Deny(reason) => Verdict::Deny(reason),
             };
             self.resolve_call(verdict, cx);
             return;
@@ -1408,7 +1419,9 @@ impl Chat {
         cx.notify();
         match verdict {
             Verdict::Answer(text) => self.record_result(Ok(text), cx),
-            Verdict::Deny => self.record_result(Err(letronna_core::tools::DECLINED.into()), cx),
+            Verdict::Deny(reason) => {
+                self.record_result(Err(letronna_core::tools::declined(&reason)), cx)
+            }
             Verdict::Allow { remember } => {
                 if remember && let Some(id) = self.streaming_id {
                     self.session_allow

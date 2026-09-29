@@ -280,12 +280,14 @@ fn work_through(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result
             Next::Run(call) => dispatch(spec, &call, report),
             Next::Refuse(_, why) => Some(Err(why)),
             Next::AskUser(call) => {
-                if approvals::ask(spec.root, spec.run, &spec.label, &call, &context(spec)) {
-                    dispatch(spec, &call, report)
-                } else if spec.cancel.is_set() {
-                    None
-                } else {
-                    Some(Err(NOT_APPROVED.into()))
+                match approvals::ask(spec.root, spec.run, &spec.label, &call, &context(spec)) {
+                    Ok(()) => dispatch(spec, &call, report),
+                    Err(_) if spec.cancel.is_set() => None,
+                    Err(reason) if reason.trim().is_empty() => Some(Err(NOT_APPROVED.into())),
+                    Err(reason) => Some(Err(format!(
+                        "{NOT_APPROVED} The user said why: {}",
+                        reason.trim()
+                    ))),
                 }
             }
         };
@@ -1010,7 +1012,7 @@ mod tests {
         });
         let request = requests.recv_timeout(WAIT).unwrap();
         request.answer(approvals::Decision::ForRun);
-        assert!(asked.join().unwrap());
+        assert!(asked.join().unwrap().is_ok());
 
         // Both requests are taken before either is answered, so fetches made
         // one after another fail: the first waits out its timeout unanswered.

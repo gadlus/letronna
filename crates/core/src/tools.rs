@@ -136,8 +136,14 @@ pub trait Tool: Send + Sync {
 pub const ASK_USER: &str = "ask_user";
 pub const TODO: &str = "todo";
 pub const EXIT_PLAN: &str = "exit_plan";
-/// The tool result the model gets when the user denies a call.
+/// The tool result the model gets when the user denies a call without saying why.
 pub const DECLINED: &str = "The user declined this action. Ask before trying a different approach.";
+/// The most of a denial's reason that reaches the model, in characters:
+/// about a paragraph, which says why; anything longer is a paste that
+/// belongs in a message of its own.
+pub const REASON_CHARS: usize = 1000;
+/// How a denial that came with a reason opens, before the reason itself.
+const DECLINED_BECAUSE: &str = "The user declined: ";
 /// The tool result the model gets when the user approves its plan.
 pub const PLAN_APPROVED: &str = "The user approved this plan. Plan mode is off; carry it out now.";
 /// The tool result the model gets when the user wants the plan changed.
@@ -619,6 +625,26 @@ pub fn clamp_lines(text: &str, max: usize) -> String {
     let mut out: String = text.lines().take(max).collect::<Vec<_>>().join("\n");
     out.push_str(&format!("\n… {} more lines", total - max));
     out
+}
+
+/// The tool result for a call the user denied, with the reason they typed.
+/// The reason is the user's own words, not a tool's output, so it goes in
+/// as written rather than fenced off; with none, the result is `DECLINED`.
+pub fn declined(reason: &str) -> String {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return DECLINED.to_owned();
+    }
+    let mut kept: String = reason.chars().take(REASON_CHARS).collect();
+    if kept.len() < reason.len() {
+        kept.push('…');
+    }
+    format!("{DECLINED_BECAUSE}{kept}")
+}
+
+/// Whether a tool result is a denial, with a reason or without.
+pub fn is_declined(result: &str) -> bool {
+    result == DECLINED || result.starts_with(DECLINED_BECAUSE)
 }
 
 /// The argument the UI shows next to a tool name.
@@ -3552,5 +3578,26 @@ mod tests {
         let out = run("run_command", command, &ctx).unwrap();
         assert!(out.len() <= MAX_OUTPUT, "{}", out.len());
         assert!(out.contains(" left out]\n"), "{out}");
+    }
+
+    #[test]
+    fn a_denial_passes_on_the_users_reason_cut_to_a_paragraph() {
+        assert_eq!(declined(""), DECLINED);
+        assert_eq!(declined("  \n "), DECLINED);
+        assert_eq!(
+            declined(" use the staging database instead\n"),
+            "The user declined: use the staging database instead"
+        );
+        let long = "é".repeat(REASON_CHARS + 5);
+        let out = declined(&long);
+        let kept = out.strip_prefix("The user declined: ").unwrap();
+        assert_eq!(kept.chars().count(), REASON_CHARS + 1);
+        assert!(kept.ends_with("é…"), "{kept}");
+        // Exactly at the cap is not cut.
+        let full = "a".repeat(REASON_CHARS);
+        assert!(!declined(&full).ends_with('…'));
+        // Either way it still reads as a denial, not a failure.
+        assert!(is_declined(DECLINED) && is_declined(&declined("not now")));
+        assert!(!is_declined("No such file or directory"));
     }
 }

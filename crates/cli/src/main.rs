@@ -407,7 +407,7 @@ fn answer_approvals(yes: bool, keyboard: bool, context: tools::ToolContext, canc
                     "`{}` needs a yes and nobody is here to give it; run with --yes to allow it.",
                     request.call.name
                 );
-                Decision::Deny
+                Decision::Deny(String::new())
             };
             request.answer(decision);
         }
@@ -441,10 +441,10 @@ fn consult(request: &Request, context: &tools::ToolContext, cancel: &Cancel) -> 
     match input::menu(&options, 0) {
         Some(0) => Decision::Once,
         Some(1) => Decision::ForRun,
-        Some(2) => Decision::Deny,
+        Some(2) => Decision::Deny(String::new()),
         _ => {
             cancel.set();
-            Decision::Deny
+            Decision::Deny(String::new())
         }
     }
 }
