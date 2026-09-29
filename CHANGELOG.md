@@ -19,6 +19,9 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — Letronna knows each model's context window and output limit.
 - **All** — Helpers can answer in a checked shape.
 - **All** — The model knows today's date.
+- **All** — Send more while Letronna works: it reaches the model at the reply's next step, in the window and the terminal.
+- **All** — Helper types, built in and from your own files, share one token budget across a whole tree of helpers.
+- **All** — Helpers' conversations are kept beside their session, out of the session list.
 
 ### Changed
 - **All** — A failed model request says what went wrong: the key, credit, a rate limit, a busy provider, a conversation too long, and so on.
@@ -31,6 +34,12 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — Commands run with no pager or editor to wait on, and colour codes are kept out of what the model reads.
 - **App** — The approval card and tool lookups no longer reread files on every frame.
 - **App** — The example plugin starts switched off.
+- **All** — Plan mode refuses tools that change things, however they are asked for.
+- **All** — Secret files such as `.env` and private keys stay out of the model's reach; `.env.example` does not.
+- **All** — Stop reaches waits and running commands, and ends them.
+- **All** — Long replies are no longer cut off at two minutes; only five minutes of silence ends one.
+- **All** — Unattended runs never stall waiting on a question.
+- **All** — Summaries reuse the chat connection, and a busy background job no longer copies its whole log on every read.
 
 ### Fixed
 - **All** — Catastrophic commands, such as deleting your home folder, are refused whatever the approval setting.
@@ -42,6 +51,8 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — Streamed tool calls are put together per call.
 - **All** — A project's AGENTS.md can no longer hang the app by linking to a device.
 - **Terminal** — `letronna -p` no longer keeps a processor core busy while a reply streams.
+- **All** — Two copies of Letronna starting at once never write into one session.
+- **Terminal** — Background jobs stop when the terminal exits.
 
 ## [0.1.0-alpha.2] - 2026-09-27
 
