@@ -18,6 +18,7 @@ pub mod mcp;
 pub mod media;
 pub mod memory;
 pub mod messaging;
+pub mod models;
 mod page;
 pub mod schedule;
 pub mod search;
