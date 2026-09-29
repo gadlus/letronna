@@ -884,7 +884,16 @@ impl Chat {
                     ),
                 None => row.child(div().text_color(muted).child(why)),
             })
-            .on_click(cx.listener(move |this, _, _, cx| this.toggle_diff(n, cx)))
+            // As on a tool row, a press leaves the keys in the composer;
+            // Tab is what picks the file out.
+            .on_any_mouse_down(|_, window, _| window.prevent_default())
+            // Enter is ToggleDiff's: gpui also clicks a focused element as
+            // the key comes up, which closed the diff straight away.
+            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                if !event.is_keyboard() {
+                    this.toggle_diff(n, cx)
+                }
+            }))
             .on_action(cx.listener(move |this, _: &ToggleDiff, _, cx| this.toggle_diff(n, cx)))
     }
 
@@ -909,8 +918,11 @@ fn diff_rows(lines: &history::Lines, cx: &Context<Chat>) -> impl IntoElement {
     let theme = cx.theme();
     let row = |mark: &str, text: &str, color: Hsla| {
         let text: String = text.chars().take(DIFF_LINE).collect();
+        // Clipped, not truncated: gpui keeps the first width a truncated
+        // line was measured at, here too narrow, and drew every line as "…".
         div()
-            .truncate()
+            .overflow_hidden()
+            .whitespace_nowrap()
             .text_color(color)
             .child(format!("{mark} {}", text.replace('\t', "    ")))
     };
