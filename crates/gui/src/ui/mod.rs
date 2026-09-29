@@ -1,20 +1,24 @@
 pub(crate) mod account;
 pub(crate) mod actions;
+pub(crate) mod activity;
 pub(crate) mod approval;
 pub(crate) mod artifacts;
 pub(crate) mod browser;
 pub(crate) mod chrome;
 pub(crate) mod composer;
 pub(crate) mod grain;
+pub(crate) mod mcp;
 pub(crate) mod messages;
 pub(crate) mod messaging;
 pub(crate) mod panel;
 pub(crate) mod schedules;
+pub(crate) mod search;
 pub(crate) mod sessions;
 pub(crate) mod settings;
 pub(crate) mod sidebar;
 pub(crate) mod skills;
 pub(crate) mod update;
+pub(crate) mod usage;
 
 use crate::prelude::*;
 use gpui_component::{

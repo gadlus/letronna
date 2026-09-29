@@ -25,12 +25,15 @@ pub fn replay(runner: &Runner, session: usize) {
     for message in &messages[from..] {
         match message.role.as_str() {
             "user" if message.notice => render::notice(&message.content),
-            // A chat app's message can quote someone else's, fenced.
-            "user" => said_over_lines(
-                &render::blue("›"),
-                &letronna_core::untrusted::shown("", &message.content).0,
-                true,
-            ),
+            "user" => {
+                // `/init` shows as typed; a chat app's message can quote someone
+                // else's, fenced.
+                let text = match letronna_core::init::typed(&message.content) {
+                    Some(typed) => typed.to_owned(),
+                    None => letronna_core::untrusted::shown("", &message.content).0,
+                };
+                said_over_lines(&render::blue("›"), &text, true)
+            }
             "assistant" if !message.content.trim().is_empty() => {
                 said_over_lines(&render::blue("●"), &message.content, false);
                 if message.interrupted {
@@ -77,7 +80,7 @@ pub fn folder_name(workspace: Option<&std::path::Path>) -> String {
 pub fn banner(runner: &Runner, folder: &str, session: usize) {
     render::blank();
 
-    let settings = &runner.store.settings;
+    let (gateway, model) = runner.store.model(session);
     let conversation = &runner.store.conversations[session];
     let mut facts = vec![
         format!(
@@ -87,8 +90,8 @@ pub fn banner(runner: &Runner, folder: &str, session: usize) {
         ),
         String::new(),
         fact("project", folder),
-        fact("model", &settings.model),
-        fact("gateway", &settings.gateway),
+        fact("model", model),
+        fact("gateway", gateway),
         fact(
             "session",
             &match conversation.messages.len() {
@@ -143,12 +146,16 @@ pub fn banner(runner: &Runner, folder: &str, session: usize) {
 /// enter.
 pub fn footer(runner: &Runner) -> String {
     let settings = &runner.store.settings;
-    let mut parts = vec![settings.model.clone(), settings.gateway.clone()];
+    // The session on screen is always the store's active one here.
+    let session = runner.store.active;
+    let (gateway, model) = runner.store.model(session);
+    let mut parts = vec![model.to_owned(), gateway.to_owned()];
     if runner.mode != Mode::Default {
         parts.push(format!("{} mode", runner.mode.label().to_lowercase()));
     }
-    if !settings.effort.is_empty() {
-        parts.push(format!("thinking {}", settings.effort));
+    let effort = runner.store.effort(session);
+    if !effort.is_empty() {
+        parts.push(format!("thinking {effort}"));
     }
     if settings.search {
         parts.push("web".into());
