@@ -43,6 +43,7 @@ const LOOKING: &[&str] = &[
     "list_sessions",
     "search_sessions",
     "read_job",
+    "list_jobs",
 ];
 
 /// A frontmatter key with its value, or with the `- item` lines under it.

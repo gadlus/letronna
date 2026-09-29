@@ -131,16 +131,32 @@ pub fn tell(key: &Key, notice: Notice) {
     }
 }
 
-/// Every piece of work a session started, its helpers' work included.
-pub fn list(session: u64) -> Vec<Task> {
+/// Every piece of work a session or helper started, its helpers' work
+/// included.
+pub fn list(by: u64) -> Vec<Task> {
     let Ok(tasks) = registry().lock() else {
         return Vec::new();
     };
     tasks
         .values()
-        .filter(|task| climb(&tasks, task.owner, |_| true) == session)
+        .filter(|task| started_under(&tasks, task.owner, by))
         .cloned()
         .collect()
+}
+
+/// Whether work owned by `owner` is `by`'s, or that of a helper it started.
+fn started_under(tasks: &BTreeMap<Key, Task>, mut owner: u64, by: u64) -> bool {
+    // One step per task at most, as in `climb`.
+    for _ in 0..=tasks.len() {
+        if owner == by {
+            return true;
+        }
+        let Some(helper) = tasks.get(&Key::Agent(owner)) else {
+            return false;
+        };
+        owner = helper.parent.unwrap_or(helper.owner);
+    }
+    false
 }
 
 /// Hand the running work of a helper that is finishing to whoever it
@@ -206,6 +222,21 @@ mod tests {
         let heard = inbox::take(7_201, true);
         assert_eq!(heard.len(), 1);
         assert_eq!(heard[0].text, "job #7204 exited with code 1");
+    }
+
+    #[test]
+    fn a_helper_lists_what_it_and_its_own_helpers_started() {
+        // Session 7501 started helper 7502, which started 7503; each started a job.
+        register(Task::new(Key::Agent(7_502), 7_501, None, "explore"));
+        register(Task::new(Key::Agent(7_503), 7_502, None, "explore-2"));
+        for (job, owner) in [(7_504, 7_501), (7_505, 7_502), (7_506, 7_503)] {
+            register(Task::new(Key::Job(job), owner, None, "npm test"));
+        }
+        let keys = |by| list(by).iter().map(|t| t.key).collect::<Vec<_>>();
+        assert_eq!(keys(7_501).len(), 5);
+        let second = [Key::Job(7_505), Key::Job(7_506), Key::Agent(7_503)];
+        assert_eq!(keys(7_502), second);
+        assert_eq!(keys(7_503), [Key::Job(7_506)]);
     }
 
     #[test]

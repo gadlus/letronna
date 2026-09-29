@@ -1309,8 +1309,8 @@ fn types(ctx: &ToolContext) -> Result<String, String> {
     Ok(lines.join("\n"))
 }
 
-/// How long a helper has run, as the list shows it: 38s, 1m12s, 2h05m.
-fn took(seconds: u64) -> String {
+/// How long a helper or job has run, as their lists show it: 38s, 1m12s, 2h05m.
+pub(crate) fn took(seconds: u64) -> String {
     match seconds {
         0..60 => format!("{seconds}s"),
         60..3_600 => format!("{}m{:02}s", seconds / 60, seconds % 60),
