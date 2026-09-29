@@ -1785,8 +1785,8 @@ impl Server {
                     schema,
                     // A server elsewhere is only its word, and a tool that
                     // reaches other machines can send what it is given there.
-                    ask: !config.auto_approve.approves(own, &tool["annotations"])
-                        && !(config.url.trim().is_empty() && only_looks(&tool["annotations"])),
+                    ask: !(config.auto_approve.approves(own, &tool["annotations"])
+                        || config.url.trim().is_empty() && only_looks(&tool["annotations"])),
                     read_only: tool["annotations"]["readOnlyHint"].as_bool() == Some(true),
                     wait: config.call_time(),
                 }));
