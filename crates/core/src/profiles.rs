@@ -74,7 +74,7 @@ pub fn switch(name: &str) -> Result<(), String> {
 
 /// A name turned into a folder name: letters, digits, spaces, `-` and `_`
 /// kept, everything else replaced so a profile's name cannot walk it out of
-/// `profiles` or land on a name Windows treats specially.
+/// `profiles`.
 fn folder_name(name: &str) -> String {
     name.trim()
         .chars()
@@ -88,21 +88,40 @@ fn folder_name(name: &str) -> String {
         .collect()
 }
 
+/// Whether Windows would treat `name` as a device rather than a folder.
+fn is_reserved(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
+    matches!(name.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ["COM", "LPT"].iter().any(|p| {
+            name.strip_prefix(p)
+                .is_some_and(|n| n.len() == 1 && n != "0" && n.chars().all(|c| c.is_ascii_digit()))
+        })
+}
+
 /// A new profile named `name`: empty, or a copy of `clone_from`'s files.
+/// The profile is named as its folder is, since that is all `list` can give
+/// back, so `Work!` becomes `Work-`.
 pub fn create(name: &str, clone_from: Option<&str>) -> Result<Profile, String> {
-    let name = name.trim();
-    if name.is_empty() {
+    let name = folder_name(name);
+    if name.trim_matches('-').trim().is_empty() {
         return Err("Name the profile.".into());
     }
+    if is_reserved(&name) {
+        return Err(format!("\"{name}\" is not a name a folder can have."));
+    }
     let existing = list();
-    if name.eq_ignore_ascii_case(DEFAULT) || existing.iter().any(|p| p.name == name) {
+    if name.eq_ignore_ascii_case(DEFAULT)
+        || existing
+            .iter()
+            .any(|p| p.name.to_lowercase() == name.to_lowercase())
+    {
         return Err(format!("There is already a profile named \"{name}\"."));
     }
-    let dir = root().join(folder_name(name));
+    let dir = root().join(&name);
     if dir.exists() {
         return Err(format!("There is already a profile named \"{name}\"."));
     }
-    match clone_from {
+    let made = match clone_from {
         Some(from) => {
             let source = existing
                 .into_iter()
@@ -111,18 +130,21 @@ pub fn create(name: &str, clone_from: Option<&str>) -> Result<Profile, String> {
             // The default profile's dir is `base_dir`, which also holds
             // `profiles` itself -- every other profile's files, none of
             // which belong inside the one being cloned.
-            copy_dir(&source.dir, &dir, &root()).map_err(|e| e.to_string())?;
+            copy_dir(&source.dir, &dir, &root())
         }
-        None => std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?,
+        None => std::fs::create_dir_all(&dir),
+    };
+    if let Err(err) = made {
+        // Half a copy would show up in `list` as a profile of its own.
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(err.to_string());
     }
-    Ok(Profile {
-        name: name.to_owned(),
-        dir,
-    })
+    Ok(Profile { name, dir })
 }
 
 /// Every file and folder under `src`, made again under `dst`, but not
-/// `exclude` itself.
+/// `exclude` itself. Links are left out: copying one would read whatever it
+/// points at, wherever that is, into the new profile.
 fn copy_dir(src: &Path, dst: &Path, exclude: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
@@ -132,9 +154,10 @@ fn copy_dir(src: &Path, dst: &Path, exclude: &Path) -> std::io::Result<()> {
             continue;
         }
         let to = dst.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
             copy_dir(&path, &to, exclude)?;
-        } else {
+        } else if kind.is_file() {
             std::fs::copy(&path, to)?;
         }
     }
@@ -233,6 +256,46 @@ mod tests {
         assert!(create("  ", None).is_err());
         create("Work", None).unwrap();
         assert!(create("Work", None).is_err());
+
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_profile_is_named_as_its_folder_so_it_can_be_switched_to() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = scratch("folder-names");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let profile = create("Work!", None).unwrap();
+        assert_eq!(profile.name, "Work-");
+        assert!(switch(&profile.name).is_ok());
+        crate::chat::set_profile_dir(None);
+        assert!(create("work-", None).is_err());
+        assert!(create("../..", None).is_err());
+        assert!(create("nul", None).is_err());
+        assert!(create("COM3", None).is_err());
+
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cloning_leaves_links_behind() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = scratch("links");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let outside = scratch("links-outside");
+        std::fs::write(outside.join("secret"), "hunter2").unwrap();
+        std::os::unix::fs::symlink(outside.join("secret"), dir.join("linked")).unwrap();
+        std::fs::write(dir.join("SOUL.md"), "Be terse.").unwrap();
+
+        let clone = create("Copy", Some(DEFAULT)).unwrap();
+        assert!(clone.dir.join("SOUL.md").exists());
+        assert!(!clone.dir.join("linked").exists());
 
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
