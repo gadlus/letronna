@@ -27,6 +27,14 @@ actions!(turn_files, [ToggleDiff]);
 /// many more rather than laying out thousands of rows.
 const DIFF_ROWS: usize = 300;
 
+/// Characters of one diff line drawn at most: a minified bundle is one line
+/// of megabytes, copied again on every frame were it drawn whole.
+const DIFF_LINE: usize = 500;
+
+/// Files the card lists at most; a turn that rewrote a tree says how many
+/// more rather than drawing a row and a tab stop for each.
+const CARD_FILES: usize = 50;
+
 /// A turn's place in its session: your message on its own, or everything
 /// the model did in reply to it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -728,6 +736,7 @@ impl Chat {
             .files
             .iter()
             .enumerate()
+            .take(CARD_FILES)
             .map(|(n, file)| {
                 let shown = card.open.contains(&n);
                 let path = &card.labels[n];
@@ -782,6 +791,18 @@ impl Chat {
                         ),
                 )
                 .children(rows)
+                .when(card.files.len() > CARD_FILES, |this| {
+                    this.child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .border_t_1()
+                            .border_color(cx.theme().border)
+                            .text_xs()
+                            .text_color(muted)
+                            .child(format!("and {} more", card.files.len() - CARD_FILES)),
+                    )
+                })
                 .when(card.ran_commands, |this| {
                     this.child(
                         div()
@@ -882,6 +903,7 @@ impl Chat {
 fn diff_rows(lines: &history::Lines, cx: &Context<Chat>) -> impl IntoElement {
     let theme = cx.theme();
     let row = |mark: &str, text: &str, color: Hsla| {
+        let text: String = text.chars().take(DIFF_LINE).collect();
         div()
             .truncate()
             .text_color(color)
