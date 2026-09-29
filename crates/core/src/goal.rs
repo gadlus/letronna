@@ -333,7 +333,10 @@ fn review_with(
 fn decide(goal: &Goal, judged: Result<String, String>) -> Step {
     let verdict = match judged.and_then(|reply| verdict(&reply)) {
         Ok(verdict) => verdict,
-        Err(why) => return pause(format!("The goal check failed: {why}"), "the check failed"),
+        Err(why) => {
+            let why = one_line_capped(&why);
+            return pause(format!("The goal check failed: {why}"), "the check failed");
+        }
     };
     let reason = verdict.reason;
     match verdict.status {
@@ -389,42 +392,56 @@ pub fn continuation(message: String) -> Message {
     }
 }
 
-/// The verdict in the judge's `reply`: one JSON object, alone or fenced,
-/// after any thinking in tags.
+/// Why a verdict is refused when it is not the one object asked for.
+const NOT_ONE: &str = "the judge's answer was not one JSON object with a status and a reason";
+
+/// The verdict in the judge's `reply`: exactly one JSON object with a
+/// status and a reason, alone or in a code fence, after any thinking in
+/// tags. Anything else is refused, and the goal pauses: a braced word in a
+/// preamble or a second object is not a verdict to act on.
 fn verdict(reply: &str) -> Result<Verdict, String> {
     #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct Raw {
         status: String,
         #[serde(default)]
         reason: String,
     }
-    let reply = match reply.trim_start().strip_prefix("<think>") {
-        Some(rest) => rest.split_once("</think>").map_or("", |(_, answer)| answer),
-        None => reply,
-    };
-    let (Some(start), Some(end)) = (reply.find('{'), reply.rfind('}')) else {
-        return Err("the judge gave no verdict".into());
-    };
-    let Some(object) = reply.get(start..=end) else {
-        return Err("the judge gave no verdict".into());
-    };
-    let raw: Raw = serde_json::from_str(object)
-        .map_err(|_| "the judge's verdict could not be read".to_owned())?;
+    let mut reply = reply.trim();
+    if let Some(rest) = reply.strip_prefix("<think>") {
+        reply = rest
+            .split_once("</think>")
+            .map_or("", |(_, answer)| answer.trim());
+    }
+    if let Some(fenced) = reply.strip_prefix("```") {
+        let (tag, body) = fenced.split_once('\n').unwrap_or(("", fenced));
+        let tag = tag.trim();
+        reply = match body.trim_end().strip_suffix("```") {
+            Some(body) if tag.is_empty() || tag.eq_ignore_ascii_case("json") => body.trim(),
+            _ => return Err(NOT_ONE.into()),
+        };
+    }
+    let raw: Raw = serde_json::from_str(reply).map_err(|_| NOT_ONE.to_owned())?;
     let status = match raw.status.trim().to_ascii_lowercase().as_str() {
         "met" => Status::Met,
         "blocked" => Status::Blocked,
         "waiting" => Status::Waiting,
         "continue" => Status::Continue,
-        _ => return Err(format!("the judge answered `{}`", raw.status.trim())),
+        _ => return Err("the judge gave a status that is not one of the four".into()),
     };
-    let mut reason: String = tools::one_line(&raw.reason)
-        .chars()
-        .take(REASON_CHARS)
-        .collect();
+    let mut reason = one_line_capped(&raw.reason);
     if reason.is_empty() {
         reason = "no reason given".into();
     }
     Ok(Verdict { status, reason })
+}
+
+/// `text` on one line, without a closing full stop, and no longer than a
+/// reason, for a notice: a gateway's error can run to pages.
+fn one_line_capped(text: &str) -> String {
+    let line = tools::one_line(text);
+    let line = line.trim().trim_end_matches('.');
+    line.chars().take(REASON_CHARS).collect()
 }
 
 /// What the judge is asked about the turn that ended with `reply`: the
@@ -708,6 +725,11 @@ mod tests {
             "Yes, the goal is met.",
             r#"{"status":"done","reason":"finished"}"#,
             r#"{"reason":"no status"}"#,
+            r#"{"status":"met","reason":"ok","confidence":0.9}"#,
+            r#"Sure: {"status":"met","reason":"ok"}"#,
+            r#"{"status":"continue","reason":"a"} {"status":"met","reason":"b"}"#,
+            "{goal} then {\"status\":\"met\"}",
+            "```text\n{\"status\":\"met\"}\n```",
             "{status: met}",
             "",
             "<think>{\"status\":\"continue\"}",
@@ -720,14 +742,25 @@ mod tests {
             );
             assert_eq!(kept.unwrap().paused.as_deref(), Some("the check failed"));
         }
+        // A thinking model's tags and a bare fence are fine.
+        let model = Scripted::new(&["<think>hm</think>\n```\n{\"status\":\"met\"}\n```"]);
+        assert_eq!(run_loop(goal(None), &model).1, None);
+        // A failed call pauses too, its error cut to one short line.
+        let long = format!(
+            "HTTP status server error (502 Bad Gateway)\n{}",
+            "x".repeat(5_000)
+        );
         let step = review_with(
             &goal(None),
             "done",
             &Cancel::default(),
             |_| String::new(),
-            |_| Err("HTTP status server error (502 Bad Gateway)".into()),
+            |_| Err(long.clone()),
         );
-        assert!(matches!(step, Step::Pause { notice, .. } if notice.contains("502")));
+        let Step::Pause { notice, .. } = step else {
+            panic!("{step:?}");
+        };
+        assert!(notice.contains("502") && notice.len() < 500, "{notice}");
     }
 
     #[test]
