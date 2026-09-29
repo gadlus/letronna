@@ -31,7 +31,13 @@ const FRESH: std::time::Duration = std::time::Duration::from_secs(30);
 /// A project's names, walked once and kept, with when they were walked.
 type Walked = (Instant, Arc<Vec<String>>);
 
-static WALKED: Mutex<Option<HashMap<PathBuf, Walked>>> = Mutex::new(None);
+/// One project's names, behind a lock held while it is walked.
+type Slot = Arc<Mutex<Option<Walked>>>;
+
+/// Each project's names, behind a lock of its own that is held while it is
+/// walked, so the keys typed during a walk wait for it rather than each
+/// starting another.
+static WALKED: Mutex<Option<HashMap<PathBuf, Slot>>> = Mutex::new(None);
 
 /// What a choice is, for the icon beside it and what taking it does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -276,26 +282,32 @@ fn matching<'a>(names: &'a [String], query: &str) -> Vec<&'a str> {
 /// The names under `root`, walked again when the last walk is older than
 /// `FRESH`. The walk stops at the search tool's time and file budget.
 pub fn walked(root: &Path) -> Arc<Vec<String>> {
-    let now = Instant::now();
-    if let Ok(kept) = WALKED.lock()
-        && let Some((when, names)) = kept.as_ref().and_then(|kept| kept.get(root))
-        && now.duration_since(*when) < FRESH
+    let walk = || {
+        let deadline = Instant::now() + crate::grep::SEARCH_TIME;
+        Arc::new(
+            crate::grep::entries(root, deadline, crate::grep::SEARCH_FILES).unwrap_or_default(),
+        )
+    };
+    // The map's lock is let go at once, so another project's list is not
+    // held up by this one's walk.
+    let slot = match WALKED.lock() {
+        Ok(mut kept) => kept
+            .get_or_insert_with(HashMap::new)
+            .entry(root.to_path_buf())
+            .or_default()
+            .clone(),
+        Err(_) => return walk(),
+    };
+    let Ok(mut kept) = slot.lock() else {
+        return walk();
+    };
+    if let Some((when, names)) = kept.as_ref()
+        && when.elapsed() < FRESH
     {
         return names.clone();
     }
-    // Outside the lock, so another project's list is not held up by this one.
-    let names = Arc::new(
-        crate::grep::entries(
-            root,
-            now + crate::grep::SEARCH_TIME,
-            crate::grep::SEARCH_FILES,
-        )
-        .unwrap_or_default(),
-    );
-    if let Ok(mut kept) = WALKED.lock() {
-        kept.get_or_insert_with(HashMap::new)
-            .insert(root.to_path_buf(), (Instant::now(), names.clone()));
-    }
+    let names = walk();
+    *kept = Some((Instant::now(), names.clone()));
     names
 }
 
@@ -400,6 +412,27 @@ mod tests {
         }
         assert!(!names.iter().any(|n| n.starts_with("target")), "{names:?}");
         assert!(!names.iter().any(|n| n == ".env"), "{names:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn keys_typed_during_a_walk_wait_for_it_rather_than_walking_again() {
+        let dir = project("once");
+        for n in 0..2_000 {
+            std::fs::write(dir.join(format!("src/file{n}.rs")), "\n").unwrap();
+        }
+        let start = Arc::new(std::sync::Barrier::new(8));
+        let lists: Vec<_> = (0..8)
+            .map(|_| {
+                let (dir, start) = (dir.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    walked(&dir)
+                })
+            })
+            .collect();
+        let lists: Vec<_> = lists.into_iter().map(|t| t.join().unwrap()).collect();
+        assert!(lists.iter().all(|l| Arc::ptr_eq(l, &lists[0])));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
