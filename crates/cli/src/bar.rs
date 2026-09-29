@@ -29,12 +29,15 @@ use std::time::Duration;
 use crate::edit::Line;
 use crate::render;
 
-pub struct Command {
-    pub name: &'static str,
-    pub blurb: &'static str,
+/// A line of the `/` menu: Letronna's own commands, or one the user, the
+/// project or a skill added.
+#[derive(Clone, Copy)]
+pub struct Command<'a> {
+    pub name: &'a str,
+    pub blurb: &'a str,
 }
 
-pub const COMMANDS: &[Command] = &[
+pub const COMMANDS: &[Command<'static>] = &[
     Command {
         name: "/help",
         blurb: "what Letronna can do here",
@@ -156,6 +159,11 @@ const PAGE: isize = 10;
 /// Commands the menu will show at once, so a long list cannot eat the window.
 const MENU_LIMIT: usize = 8;
 
+/// The most columns a name takes in the menu and `/help`: over twice the
+/// longest of Letronna's own, and an added name longer than that is cut
+/// rather than pushing every description off the row.
+const NAME_WIDTH: usize = 24;
+
 /// Rows the box will grow to before what is inside it starts to scroll.
 /// Enough for a paragraph, not so many that the conversation is squeezed out.
 const MAX_ROWS: usize = 8;
@@ -193,24 +201,52 @@ const PLAN_LEAVES: usize = 12;
 /// question takes.
 const STILL: Duration = Duration::from_millis(500);
 
-fn matches(text: &str) -> Vec<&'static Command> {
+/// The menu's lines for what is typed: the command named exactly so first,
+/// then Letronna's own, then the `added` ones, as (name, blurb).
+fn matches<'a>(text: &str, added: &'a [(String, String)]) -> Vec<Command<'a>> {
     if !text.starts_with('/') || text.contains(char::is_whitespace) {
         return Vec::new();
     }
-    COMMANDS
+    let added = added.iter().map(|(name, blurb)| Command { name, blurb });
+    let mut found: Vec<Command> = COMMANDS
         .iter()
+        .copied()
+        .chain(added)
         .filter(|c| c.name.starts_with(text))
-        .collect()
+        .collect();
+    // Enter takes the first, so an added `/u` is not lost to `/undo`.
+    found.sort_by_key(|c| c.name != text);
+    found
 }
 
-/// Columns the longest command name takes, so every blurb starts in the
-/// same place however much of the list is showing.
-pub fn name_width() -> usize {
+/// Columns the longest command name takes, the `added` ones' too, up to
+/// `NAME_WIDTH`, so every blurb starts in the same place.
+pub fn name_width(added: &[(String, String)]) -> usize {
+    let added = added.iter().map(|(name, _)| name.as_str());
     COMMANDS
         .iter()
-        .map(|c| c.name.chars().count())
+        .map(|c| c.name)
+        .chain(added)
+        .map(|name| name.chars().count())
         .max()
         .unwrap_or(0)
+        .min(NAME_WIDTH)
+}
+
+/// Whether `line` runs as a command rather than going to the model: a line
+/// starting with a path, "/usr/bin/foo is broken", is said as it is.
+pub fn is_command(line: &str) -> bool {
+    letronna_core::slash::split(line).is_some()
+}
+
+/// What a line that is not a command sends: a leading "//" stands for one
+/// slash, so "//tmp is full" says "/tmp is full".
+pub fn unescaped(line: &str) -> &str {
+    if line.starts_with("//") {
+        &line[1..]
+    } else {
+        line
+    }
 }
 
 /// Where the menu's shown rows start. It only moves as far as it has to for
@@ -233,11 +269,14 @@ fn menu_top(top: usize, picked: usize, len: usize, limit: usize) -> usize {
 
 /// The command a mistyped one was most likely meant to be, when one is
 /// within two keystrokes of it.
-pub fn closest(typed: &str) -> Option<&'static str> {
+pub fn closest<'a>(typed: &str, added: &'a [(String, String)]) -> Option<&'a str> {
     let typed = typed.to_lowercase();
+    let added = added.iter().map(|(name, _)| name.as_str());
     COMMANDS
         .iter()
-        .map(|c| (distance(&typed, c.name), c.name))
+        .map(|c| c.name)
+        .chain(added)
+        .map(|name| (distance(&typed, &name.to_lowercase()), name))
         .filter(|(edits, _)| *edits <= 2)
         .min_by_key(|(edits, _)| *edits)
         .map(|(_, name)| name)
@@ -354,6 +393,9 @@ pub struct Bar {
     /// While a question that came up on its own is open, when it came up or
     /// when a letter was last typed under it, whichever is later.
     guard: Option<std::time::Instant>,
+    /// The commands the user, the project and skills added, as the menu
+    /// offers them: (`/name`, blurb).
+    added: Vec<(String, String)>,
 }
 
 impl Bar {
@@ -389,7 +431,25 @@ impl Bar {
             asks: None,
             held: None,
             guard: None,
+            added: Vec::new(),
         }
+    }
+
+    /// Offer `added` in the `/` menu beside Letronna's own commands, as
+    /// (`/name`, blurb).
+    pub fn offer(&mut self, added: Vec<(String, String)>) {
+        self.added = added;
+    }
+
+    /// The command, Letronna's own or an added one, that the mistyped
+    /// `typed` was most likely meant to be.
+    pub fn meant(&self, typed: &str) -> Option<&str> {
+        closest(typed, &self.added)
+    }
+
+    /// What is in the box, typed and not yet sent.
+    pub fn draft(&self) -> &str {
+        self.line.text()
     }
 
     /// Take the window.
@@ -796,7 +856,11 @@ impl Bar {
     /// the order it was typed.
     pub fn take_typed(&mut self) -> Vec<String> {
         let plain = self.sendable();
-        let typed: Vec<String> = self.queued.drain(..plain).collect();
+        let typed: Vec<String> = self
+            .queued
+            .drain(..plain)
+            .map(|line| unescaped(&line).to_owned())
+            .collect();
         self.hurry = false;
         // They go in now, so this is where they join the conversation.
         if !typed.is_empty() {
@@ -813,7 +877,7 @@ impl Bar {
     fn sendable(&self) -> usize {
         self.queued
             .iter()
-            .take_while(|line| !line.starts_with('/'))
+            .take_while(|line| !is_command(line))
             .count()
     }
 
@@ -827,10 +891,8 @@ impl Bar {
     /// typed since, for a turn that was stopped. Commands stay queued to run,
     /// since they were never going to the model.
     pub fn hand_back(&mut self) {
-        let (commands, lines): (Vec<String>, Vec<String>) = self
-            .queued
-            .drain(..)
-            .partition(|line| line.starts_with('/'));
+        let (commands, lines): (Vec<String>, Vec<String>) =
+            self.queued.drain(..).partition(|line| is_command(line));
         self.queued = commands.into();
         if lines.is_empty() {
             return;
@@ -957,7 +1019,7 @@ impl Bar {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
-        let options = matches(self.line.text());
+        let options = matches(self.line.text(), &self.added);
         match key.code {
             // With something marked, this is the copy key, which is what
             // anybody pressing it over a selection meant by it. Leaving is
@@ -1062,7 +1124,7 @@ impl Bar {
             }
             _ => {}
         }
-        let shown = matches(self.line.text()).len();
+        let shown = matches(self.line.text(), &self.added).len();
         self.menu_top = menu_top(self.menu_top, self.picked, shown, MENU_LIMIT);
     }
 
@@ -1072,7 +1134,7 @@ impl Bar {
     fn send(&mut self) {
         let text = self.line.text().trim_end_matches('\n').to_owned();
         self.line.set(&text);
-        if let Some(choice) = matches(self.line.text()).get(self.picked) {
+        if let Some(choice) = matches(self.line.text(), &self.added).get(self.picked) {
             self.line.set(choice.name);
         }
         self.picked = 0;
@@ -1318,10 +1380,10 @@ impl Bar {
         ));
 
         if self.choice.is_none() {
-            let options = matches(self.line.text());
+            let options = matches(self.line.text(), &self.added);
             let top = menu_top(self.menu_top, self.picked, options.len(), MENU_LIMIT);
             let end = (top + MENU_LIMIT).min(options.len());
-            let width = name_width();
+            let width = name_width(&self.added);
             let more = |count: usize, arrow: &str| {
                 format!(
                     "{}  {}",
@@ -1334,16 +1396,19 @@ impl Bar {
             }
             for (i, option) in options.iter().enumerate().take(end).skip(top) {
                 let marker = if i == self.picked { "›" } else { " " };
-                let padded = format!("{:<width$}", option.name);
+                let padded = format!("{:<width$}", render::fit(option.name, width));
                 let name = if i == self.picked {
                     render::blue(&padded)
                 } else {
                     padded
                 };
+                // An added command's description is its writer's and can
+                // run long; a row that wrapped would push the box up.
+                let blurb_room = render::width().saturating_sub(render::GUTTER.len() + width + 4);
                 lines.push(format!(
                     "{}{marker} {name}  {}",
                     render::GUTTER,
-                    render::dim(option.blurb)
+                    render::dim(&render::fit(option.blurb, blurb_room))
                 ));
             }
             if end < options.len() {
@@ -1642,9 +1707,9 @@ fn track(stops: &[String], at: usize, room: usize) -> (String, String, usize) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Bar, Choice, MENU_LIMIT, PLAN_ROWS, QUEUED_LIMIT, RELAY_LIMIT, STILL, Slider, Waited,
-        at_work, checklist, closest, fitted, matches, menu_top, one_row, relay_line, stops_at,
-        track,
+        Bar, Choice, MENU_LIMIT, NAME_WIDTH, PLAN_ROWS, QUEUED_LIMIT, RELAY_LIMIT, STILL, Slider,
+        Waited, at_work, checklist, closest, fitted, is_command, matches, menu_top, name_width,
+        one_row, relay_line, stops_at, track, unescaped,
     };
     use crate::render::{MARGIN, plain, visible};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1784,9 +1849,9 @@ mod tests {
 
     #[test]
     fn the_menu_only_opens_for_a_slash() {
-        assert!(matches("what is this").is_empty());
-        assert!(matches("").is_empty());
-        assert!(!matches("/").is_empty());
+        assert!(matches("what is this", &[]).is_empty());
+        assert!(matches("", &[]).is_empty());
+        assert!(!matches("/", &[]).is_empty());
     }
 
     #[test]
@@ -1811,23 +1876,72 @@ mod tests {
 
     #[test]
     fn a_typo_points_at_the_command_it_meant() {
-        assert_eq!(closest("/mdoel"), Some("/model"));
-        assert_eq!(closest("/hlep"), Some("/help"));
-        assert_eq!(closest("/Models"), Some("/model"));
-        assert_eq!(closest("/xyzzy"), None);
+        assert_eq!(closest("/mdoel", &[]), Some("/model"));
+        assert_eq!(closest("/hlep", &[]), Some("/help"));
+        assert_eq!(closest("/Models", &[]), Some("/model"));
+        assert_eq!(closest("/xyzzy", &[]), None);
+        let added = [("/Review".to_owned(), String::new())];
+        assert_eq!(closest("/reviw", &added), Some("/Review"));
     }
 
     #[test]
     fn typing_narrows_the_list() {
-        let all = matches("/").len();
-        let e = matches("/e");
+        let all = matches("/", &[]).len();
+        let e = matches("/e", &[]);
         assert!(e.len() < all && !e.is_empty());
         assert!(e.iter().all(|c| c.name.starts_with("/e")));
-        assert_eq!(matches("/exit").len(), 1);
+        assert_eq!(matches("/exit", &[]).len(), 1);
         // A command that does not exist offers nothing rather than guessing.
-        assert!(matches("/nonsense").is_empty());
+        assert!(matches("/nonsense", &[]).is_empty());
         // Once it carries an argument it is no longer a name being typed.
-        assert!(matches("/model gpt").is_empty());
+        assert!(matches("/model gpt", &[]).is_empty());
+    }
+
+    #[test]
+    fn added_commands_follow_letronna_s_own_in_the_menu() {
+        let added = [("/review".to_owned(), "look over a change".to_owned())];
+        let names: Vec<&str> = matches("/re", &added).iter().map(|c| c.name).collect();
+        assert_eq!(names, ["/resume", "/retry", "/review"]);
+        let long = [("/a-long-command-name".to_owned(), String::new())];
+        assert_eq!(name_width(&long), "/a-long-command-name".len());
+        // A name past the cap is cut, not every row pushed along by it.
+        let longer = [(format!("/{}", "x".repeat(200)), String::new())];
+        assert_eq!(name_width(&longer), NAME_WIDTH);
+    }
+
+    #[test]
+    fn enter_on_an_added_name_that_starts_one_of_letronna_s_takes_the_added_one() {
+        let mut bar = Bar::new(String::new());
+        bar.offer(vec![("/u".to_owned(), "a kept prompt".to_owned())]);
+        bar.line.set("/u");
+        bar.send();
+        assert_eq!(bar.queued.pop_front().as_deref(), Some("/u"));
+        // Letronna's own exact names still win over longer ones.
+        bar.line.set("/mode");
+        bar.send();
+        assert_eq!(bar.queued.pop_front().as_deref(), Some("/mode"));
+        bar.line.set("/us");
+        bar.send();
+        assert_eq!(bar.queued.pop_front().as_deref(), Some("/usage"));
+    }
+
+    #[test]
+    fn a_line_starting_with_two_slashes_says_one() {
+        assert_eq!(unescaped("//tmp is full"), "/tmp is full");
+        assert_eq!(unescaped("/tmp/x is full"), "/tmp/x is full");
+        assert!(!is_command("//tmp is full"));
+        let mut bar = Bar::new(String::new());
+        bar.queued = ["//etc is odd".to_owned()].into();
+        assert_eq!(bar.take_typed(), ["/etc is odd"]);
+    }
+
+    #[test]
+    fn a_queued_line_starting_with_a_path_goes_to_the_model() {
+        assert!(is_command("/review 42"));
+        assert!(!is_command("/usr/bin/foo is broken"));
+        let mut bar = Bar::new(String::new());
+        bar.queued = ["/usr/bin/foo is broken".to_owned(), "/help".to_owned()].into();
+        assert_eq!(bar.sendable(), 1);
     }
 
     #[test]

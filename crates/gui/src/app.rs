@@ -27,6 +27,10 @@ actions!(
 /// that grew a little since the last look is still followed.
 const FOLLOW_SLACK: Pixels = px(48.);
 
+/// The composer's own slash commands, without the slash, which win over any
+/// the user, a project or a skill adds.
+const OWN_COMMANDS: &[&str] = &["btw", "init"];
+
 /// The chat column's widest, gutters included: about 90 characters of
 /// text, which reads as one measure. A wider window gets wider margins
 /// rather than longer lines.
@@ -819,6 +823,23 @@ impl Chat {
                 .update(cx, |input, cx| input.set_value("", window, cx));
             return self.ask_aside(question, cx);
         }
+        // An added command fills the composer, as a skill's Use does, so what
+        // it gives is read before the next send sends it.
+        match self.added_command(&prompt) {
+            Some(Ok(given)) => {
+                self.composer.update(cx, |input, cx| {
+                    input.set_value("", window, cx);
+                    input.insert(given, window, cx);
+                });
+                return;
+            }
+            Some(Err(error)) => {
+                self.error = Some(error);
+                cx.notify();
+                return;
+            }
+            None => {}
+        }
         if self.busy && !prompt.is_empty() {
             return self.queue_follow_up(prompt, window, cx);
         }
@@ -847,6 +868,19 @@ impl Chat {
         } else {
             self.attachments.remove(&session);
         }
+    }
+
+    /// What `/name args` gives, or why it was refused, when the user, the
+    /// project or a skill added a command by that name and the window has
+    /// none of its own.
+    fn added_command(&self, prompt: &str) -> Option<Result<String, String>> {
+        use letronna_core::slash;
+        let (name, args) = slash::split(prompt)?;
+        let workspace = self.store.conversations[self.store.active]
+            .workspace
+            .as_deref();
+        let commands = slash::list(workspace, OWN_COMMANDS);
+        slash::find(&commands, name).map(|command| slash::fill(command, args))
     }
 
     /// What sending `text` in the active session asks the model: `/init`

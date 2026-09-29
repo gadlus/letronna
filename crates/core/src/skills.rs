@@ -763,7 +763,7 @@ fn parse_skill(folder: &Path, source: Source, text: &str) -> Option<Skill> {
 /// A file's text, when it is a regular file of at most `cap` bytes. Checked
 /// before it is opened and bounded while it is read: a SKILL.md that links to
 /// a device such as /dev/zero would otherwise never finish.
-fn read_text(path: &Path, cap: u64) -> Option<String> {
+pub(crate) fn read_text(path: &Path, cap: u64) -> Option<String> {
     if !std::fs::metadata(path).ok()?.is_file() {
         return None;
     }
@@ -789,14 +789,14 @@ fn printable(text: &str) -> String {
 /// One top-level entry of the frontmatter: its key, and its lines as written,
 /// continuation lines included, so an edit can put back the ones it does not
 /// change.
-struct Entry {
+pub(crate) struct Entry {
     key: String,
     lines: Vec<String>,
 }
 
 /// SKILL.md split into its frontmatter entries and the body after them. Text
 /// with no frontmatter is all body.
-fn split(text: &str) -> (Vec<Entry>, String) {
+pub(crate) fn split(text: &str) -> (Vec<Entry>, String) {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let lines: Vec<&str> = text.lines().collect();
     let fenced = lines.first().is_some_and(|l| l.trim_end() == "---");
@@ -829,7 +829,7 @@ fn split(text: &str) -> (Vec<Entry>, String) {
 
 /// An entry's value on one printable line, or None when it is missing or
 /// empty.
-fn field(entries: &[Entry], key: &str) -> Option<String> {
+pub(crate) fn field(entries: &[Entry], key: &str) -> Option<String> {
     entries
         .iter()
         .find(|e| e.key.eq_ignore_ascii_case(key))
@@ -943,7 +943,7 @@ fn clean(body: &str) -> String {
 
 /// What a skill with no description is for: its first paragraph that is not
 /// a heading, cut short.
-fn summary_of(body: &str) -> String {
+pub(crate) fn summary_of(body: &str) -> String {
     let paragraphs = || body.split("\n\n").map(str::trim).filter(|p| !p.is_empty());
     let first = paragraphs()
         .find(|p| !p.starts_with('#'))

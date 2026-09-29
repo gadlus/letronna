@@ -28,7 +28,7 @@ mod title;
 
 use args::{Args, HELP, Output, Start, parse};
 use banner::{banner, folder_name, footer, replay};
-use commands::{Flow, command, resume};
+use commands::{Flow, command, offer_added, resume};
 use letronna_core::approvals::{self, Decision, Request};
 use letronna_core::budget::Budget;
 use letronna_core::cancel::Cancel;
@@ -219,6 +219,7 @@ fn main() {
     // Only a conversation that goes on hears about work that ends after its
     // turn; `-p` has left by now, with its answer.
     runner.bar.listen();
+    offer_added(&mut runner, workspace.as_deref());
     while let Some(waited) = runner.bar.wait() {
         if waited == bar::Waited::Asked {
             runner.answer_helpers(true);
@@ -241,16 +242,19 @@ fn main() {
         if line.is_empty() {
             continue;
         }
-        let mut prompt = line.as_str();
-        if line.starts_with('/') {
+        let mut prompt = bar::unescaped(&line);
+        if bar::is_command(&line) {
             let flow = command(&mut runner, &line, &mut session, workspace.as_deref());
+            // Read again after each command, so a command file made or
+            // changed meanwhile is offered without a restart.
+            offer_added(&mut runner, workspace.as_deref());
             // Every turn follows its own session's helpers; this is for the
             // footer's count once a command has opened another.
             let open = runner.store.conversations[session].id;
             runner.bar.show_helpers_of(open);
             if let Flow::Unknown = flow {
                 let name = line.split_whitespace().next().unwrap_or(&line);
-                render::line(&render::dim(&match bar::closest(name) {
+                render::line(&render::dim(&match runner.bar.meant(name) {
                     Some(meant) => format!("{name} is not a command. Did you mean {meant}?"),
                     None => format!("{line} is not a command. Type / to see what is."),
                 }));
