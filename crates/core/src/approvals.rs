@@ -130,7 +130,8 @@ pub(crate) fn ask(
         drop(lock(&ASKS));
         SETTLED.notify_all();
     });
-    let key = (run, call.name.clone());
+    // Per tool, and for a resource read per server too, as a session's grants are.
+    let key = (run, crate::gate::grant(call));
     let mut asks = lock(&ASKS);
     loop {
         if ctx.cancel.is_set() {
@@ -277,6 +278,31 @@ pub(crate) mod tests {
         assert_eq!(request.call.name, "write_file");
         request.answer(Decision::Deny(String::new()));
         assert_eq!(other_tool.recv_timeout(WAIT), Ok(false));
+    }
+
+    #[test]
+    fn allowing_one_servers_reads_for_a_run_still_asks_about_anothers() {
+        let _turn = lock(&SERVING);
+        let requests = serve();
+        let read = |id: &str, server: &str| ToolCall {
+            id: id.into(),
+            name: crate::mcp::READ_RESOURCE.into(),
+            arguments: format!(r#"{{"server": "{server}", "uri": "notes://today"}}"#),
+        };
+        let first = asking(1909, read("a", "near"), ToolContext::default());
+        let request = requests.recv_timeout(WAIT).unwrap();
+        request.answer(Decision::ForRun);
+        assert_eq!(first.recv_timeout(WAIT), Ok(true));
+
+        let again = asking(1909, read("b", "near"), ToolContext::default());
+        assert_eq!(again.recv_timeout(WAIT), Ok(true));
+        assert!(requests.try_recv().is_err(), "the same server asked again");
+
+        let far = asking(1909, read("c", "far"), ToolContext::default());
+        let request = requests.recv_timeout(WAIT).unwrap();
+        assert_eq!(request.call.id, "c");
+        request.answer(Decision::Deny(String::new()));
+        assert_eq!(far.recv_timeout(WAIT), Ok(false));
     }
 
     #[test]

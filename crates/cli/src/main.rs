@@ -222,7 +222,7 @@ fn main() {
             }
             continue;
         };
-        let line = line.trim().to_owned();
+        let mut line = line.trim().to_owned();
         if line.is_empty() {
             continue;
         }
@@ -245,6 +245,12 @@ fn main() {
             screen::settle();
             match flow {
                 Flow::Stop => break,
+                // Asked here rather than queued, where text starting with a
+                // slash would be run as a command.
+                Flow::Send(text) => {
+                    runner.bar.echo(&text);
+                    line = text;
+                }
                 _ => continue,
             }
         }

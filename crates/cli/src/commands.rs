@@ -17,6 +17,8 @@ pub enum Flow {
     Handled,
     Stop,
     Unknown,
+    /// Send this as the user's turn: an MCP server's prompt, filled in.
+    Send(String),
 }
 
 pub fn command(
@@ -27,7 +29,7 @@ pub fn command(
 ) -> Flow {
     // A command may carry a word after it: `/model gpt` narrows the list
     // rather than making you scroll it.
-    let (line, rest) = line.split_once(' ').unwrap_or((line, ""));
+    let (line, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
     let rest = rest.trim();
     match line {
         "/exit" | "/quit" => Flow::Stop,
@@ -221,8 +223,44 @@ pub fn command(
             ));
             Flow::Handled
         }
+        name if name.starts_with("/mcp__") => match mcp_prompt(runner, name, rest) {
+            Some(Ok(text)) => Flow::Send(text),
+            Some(Err(error)) => {
+                render::blank();
+                render::line(&render::red(&error));
+                Flow::Handled
+            }
+            None => Flow::Handled,
+        },
         _ => Flow::Unknown,
     }
+}
+
+/// The MCP server's prompt behind `command`, filled in with `rest`, fetched
+/// with the wheel turning; None once given up on with escape, when the
+/// request runs on to its own time limit and its answer is dropped.
+fn mcp_prompt(runner: &mut Runner, command: &str, rest: &str) -> Option<Result<String, String>> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::RecvTimeoutError;
+    let (command, rest) = (command.to_owned(), rest.to_owned());
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let given_up = stop.clone();
+    runner
+        .bar
+        .busy_cancellable("asking the MCP server · esc to cancel", stop, move || {
+            let (done, answer) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = done.send(letronna_core::mcp::expand(&command, &rest));
+            });
+            while !given_up.load(Ordering::Relaxed) {
+                match answer.recv_timeout(std::time::Duration::from_millis(100)) {
+                    Ok(outcome) => return Some(outcome),
+                    Err(RecvTimeoutError::Disconnected) => return None,
+                    Err(RecvTimeoutError::Timeout) => {}
+                }
+            }
+            None
+        })
 }
 
 /// Keys the box answers to. None of them are written down anywhere else but
