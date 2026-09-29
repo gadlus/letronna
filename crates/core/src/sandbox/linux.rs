@@ -12,6 +12,17 @@
 //! reads; otherwise `/`, the home folder and every folder on the way to a
 //! hidden one could not be listed at all.
 //!
+//! Writes are granted the same way around what an edit asks about, as
+//! macOS refuses them there: `.git`, `.letronna`, `.github/workflows` and
+//! the rest of `PROTECTED` and `SECRETS`, taken from the project folder,
+//! whose programs Git, CI and Letronna run outside the sandbox. So the
+//! project folder itself, and a folder such as `.github` on the way to one,
+//! is granted only through what it holds when the command starts: a file
+//! there is written in place, but nothing is made, renamed or removed
+//! directly in it, and such a command asks to run outside the sandbox. The
+//! names are only looked for down from the project folder, so `src/.git`
+//! stays writable.
+//!
 //! What each rule needs of the kernel's Landlock ABI: reading, writing and
 //! making files is ABI 1 (Linux 5.13), moving a file into another folder
 //! ABI 2, and truncating one ABI 3 (Linux 6.2). Before ABI 3 truncating is
@@ -52,6 +63,32 @@ fn readable(
         .iter()
         .flat_map(|child| readable(child, hidden, children))
         .collect()
+}
+
+/// The folders and files to grant writing beneath so that a command writes
+/// everything under `project` but what an edit asks about, `PROTECTED` and
+/// `SECRETS` taken from `project`, as `children` lists it. A folder on the
+/// way to one of those, `project` itself included, is granted only through
+/// what it holds now, so nothing can be made or removed in it directly.
+fn writable(project: &Path, children: &dyn Fn(&Path) -> Vec<PathBuf>) -> Vec<PathBuf> {
+    fn beneath(
+        path: &Path,
+        project: &Path,
+        children: &dyn Fn(&Path) -> Vec<PathBuf>,
+    ) -> Vec<PathBuf> {
+        let inside = path.strip_prefix(project).unwrap_or(path);
+        if crate::gate::protected(inside) {
+            return Vec::new();
+        }
+        if !crate::gate::leads_to_protected(inside) {
+            return vec![path.to_path_buf()];
+        }
+        children(path)
+            .iter()
+            .flat_map(|child| beneath(child, project, children))
+            .collect()
+    }
+    beneath(project, project, children)
 }
 
 /// What `dir` holds, less its links: a rule on a link would grant whatever
@@ -275,11 +312,26 @@ mod kernel {
     }
 
     /// The Landlock rules for `policy`: listing folders anywhere, reading
-    /// everywhere but `hidden`, everything in the folders it may write, and
-    /// `/dev/null`, which scripts write to everywhere.
+    /// everywhere but `hidden`, everything in the folders it may write but
+    /// what an edit asks about, and `/dev/null`, which scripts write to
+    /// everywhere.
     fn ruleset(policy: &Policy, hidden: &[PathBuf]) -> Result<RulesetCreated, String> {
         let failed = |e: landlock::RulesetError| format!("Landlock refused the rules: {e}");
         let reads = super::readable(Path::new("/"), hidden, &super::listing);
+        // Landlock cannot keep a command out of `.git/hooks` or `.letronna`
+        // beneath a project it may write, and Git and Letronna run what they
+        // hold outside the sandbox, so the project is granted around them.
+        // The temp folder is new and Letronna's own, and holds none.
+        let writes: Vec<PathBuf> = (policy.writable.iter())
+            .flat_map(|dir| {
+                if *dir == policy.temp {
+                    vec![dir.clone()]
+                } else {
+                    super::writable(dir, &super::listing)
+                }
+            })
+            .chain([PathBuf::from("/dev/null")])
+            .collect();
         landlock::Ruleset::default()
             .set_compatibility(CompatLevel::HardRequirement)
             .handle_access(AccessFs::from_all(NEEDED))
@@ -293,9 +345,7 @@ mod kernel {
                 ruleset.add_rules(path_beneath_rules(reads, AccessFs::from_read(LATEST)))
             })
             .and_then(|ruleset| {
-                let writable = policy.writable.iter().map(PathBuf::as_path);
-                let writable = writable.chain([Path::new("/dev/null")]);
-                ruleset.add_rules(path_beneath_rules(writable, AccessFs::from_all(LATEST)))
+                ruleset.add_rules(path_beneath_rules(writes, AccessFs::from_all(LATEST)))
             })
             .map_err(failed)
     }
@@ -351,13 +401,15 @@ mod kernel {
             }
         }
 
-        /// A scratch tree for one test: a project, a file outside it, and a
-        /// folder standing in for Letronna's own, holding a key.
+        /// A scratch tree for one test: a project with a `src` folder, its
+        /// temp folder, a file outside both, and a folder standing in for
+        /// Letronna's own, holding a key.
         fn tree(name: &str) -> PathBuf {
             let dir = std::env::temp_dir()
                 .join(format!("letronna-landlock-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(dir.join("project")).unwrap();
+            std::fs::create_dir_all(dir.join("project/src")).unwrap();
+            std::fs::create_dir_all(dir.join("tmp")).unwrap();
             std::fs::create_dir_all(dir.join("own")).unwrap();
             std::fs::write(dir.join("outside.txt"), "original").unwrap();
             std::fs::write(dir.join("own/key"), "secret").unwrap();
@@ -366,8 +418,8 @@ mod kernel {
 
         fn policy(dir: &Path) -> Policy {
             Policy {
-                writable: vec![dir.join("project")],
-                temp: dir.join("project"),
+                writable: vec![dir.join("project"), dir.join("tmp")],
+                temp: dir.join("tmp"),
                 hidden: vec![dir.join("own")],
             }
         }
@@ -389,7 +441,11 @@ mod kernel {
                 return;
             }
             let dir = tree("inside");
-            let ran = run(&dir, "/bin/sh", "echo hi > inside.txt && cat inside.txt");
+            let ran = run(
+                &dir,
+                "/bin/sh",
+                "echo hi > src/inside.txt && cat src/inside.txt",
+            );
             assert!(ran.status.success(), "{ran:?}");
             assert_eq!(String::from_utf8_lossy(&ran.stdout), "hi\n");
             std::fs::remove_dir_all(dir).unwrap();
@@ -409,6 +465,30 @@ mod kernel {
             assert!(!ran.status.success(), "{ran:?}");
             let text = std::fs::read_to_string(dir.join("outside.txt")).unwrap();
             assert_eq!(text, "original");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        /// Git runs what `.git/hooks` holds outside the sandbox, and Letronna
+        /// reads its own rules from `.letronna`, so a command confined to
+        /// the project must not change either, while `src` beside them still
+        /// takes writes.
+        #[test]
+        fn a_protected_path_in_the_project_is_refused() {
+            if !usable() {
+                return;
+            }
+            let dir = tree("protected");
+            std::fs::create_dir_all(dir.join("project/.git/hooks")).unwrap();
+            let ran = run(&dir, "/bin/sh", "echo x > .git/hooks/pre-commit");
+            assert!(!ran.status.success(), "{ran:?}");
+            assert!(!dir.join("project/.git/hooks/pre-commit").exists());
+            let ran = run(&dir, "/bin/sh", "mkdir .letronna");
+            assert!(!ran.status.success(), "{ran:?}");
+            assert!(!dir.join("project/.letronna").exists());
+            let ran = run(&dir, "/bin/sh", "echo hi > src/inside.txt");
+            assert!(ran.status.success(), "{ran:?}");
+            let ran = run(&dir, "/bin/sh", "echo hi > \"$TMPDIR/scratch.txt\"");
+            assert!(ran.status.success(), "{ran:?}");
             std::fs::remove_dir_all(dir).unwrap();
         }
 
@@ -528,6 +608,28 @@ mod tests {
         let hidden = [PathBuf::from("/elsewhere/key")];
         let reads = readable(Path::new("/a"), &hidden, &children);
         assert_eq!(reads, [PathBuf::from("/a")]);
+    }
+
+    #[test]
+    fn writable_grants_the_project_around_what_an_edit_asks_about() {
+        let children = |dir: &Path| -> Vec<PathBuf> {
+            let names: &[&str] = match dir.to_str() {
+                Some("/p") => &[
+                    "/p/.git",
+                    "/p/.github",
+                    "/p/.letronna",
+                    "/p/src",
+                    "/p/a.txt",
+                ],
+                Some("/p/.github") => &["/p/.github/workflows", "/p/.github/CODEOWNERS"],
+                Some("/p/src") => &["/p/src/.git"],
+                _ => &[],
+            };
+            names.iter().map(PathBuf::from).collect()
+        };
+        let writes = writable(Path::new("/p"), &children);
+        let expected = ["/p/.github/CODEOWNERS", "/p/src", "/p/a.txt"].map(PathBuf::from);
+        assert_eq!(writes, expected);
     }
 
     #[test]
