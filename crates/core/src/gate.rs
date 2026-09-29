@@ -281,7 +281,7 @@ impl<'a> Gate<'a> {
 
 /// Decides `call` from its tool, its arguments and `gate`, layer by layer.
 pub fn decide(call: &ToolCall, gate: &Gate) -> Outcome {
-    decide_with(call, gate, None, crate::sandbox::available())
+    decide_with(call, gate, None, confines(call, gate))
 }
 
 /// `decide` in auto mode: what would ask is put to the judge on the
@@ -293,7 +293,16 @@ pub fn settle(call: &ToolCall, gate: &Gate, connection: &Connection, typed: &[St
         return decide(call, gate);
     }
     let judge = |call: &ToolCall, why: &str| judge::judge(call, why, typed, connection, gate.ctx);
-    decide_with(call, gate, Some(&judge), crate::sandbox::available())
+    decide_with(call, gate, Some(&judge), confines(call, gate))
+}
+
+/// Whether `call` would run confined where this system can confine it. The
+/// system is asked only for a command in a mode that confines, as the first
+/// ask starts a process, and the window decides calls on its own thread.
+fn confines(call: &ToolCall, gate: &Gate) -> bool {
+    call.name == "run_command"
+        && matches!(gate.mode, Mode::AcceptEdits | Mode::Auto)
+        && crate::sandbox::available()
 }
 
 /// The judge for a call no earlier layer settles, told why.
