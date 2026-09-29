@@ -79,9 +79,9 @@ const TASK_HEADER: &str = "[Task from the agent that started you, not from the u
 /// A page of a long report, which with the line saying where the next starts
 /// fits the 8,000 characters a request keeps of a tool result.
 const PAGE: usize = 7_500;
-/// The most of a page in bytes, so the page and its line fit the 24,000 bytes
-/// a tool's output is cut to, whatever script the report is in.
-const PAGE_BYTES: usize = 20_000;
+/// The most of a page in bytes, so the page and its line fit what a tool's
+/// output is cut to, whatever script the report is in.
+const PAGE_BYTES: usize = crate::chat::MAX_TOOL_CHARS - 500;
 
 /// The helpers running now, every name given out by session, and every helper.
 struct Registry {
@@ -1943,7 +1943,7 @@ mod tests {
         // After the results of the step it was taking, as its next turn.
         let second = sent[1]["messages"].as_array().unwrap();
         let (result, mail) = (&second[second.len() - 2], &second[second.len() - 1]);
-        assert_eq!(result["content"], "hello from the notes");
+        assert_eq!(result["content"], "1|hello from the notes");
         assert_eq!(mail["role"], "user");
         assert_eq!(mail["content"], from_main("Also check the tests."));
         assert!(
@@ -2248,7 +2248,7 @@ mod tests {
             pages.push(page.to_owned());
         }
         let sizes: Vec<usize> = pages.iter().map(|page| page.chars().count()).collect();
-        assert_eq!(sizes, [7_500, 6_125, 1_375]);
+        assert_eq!(sizes, [7_500, 3_000, 1_875, 1_875, 750]);
         assert!(pages.concat() == long, "the pages are not the report");
     }
 }
