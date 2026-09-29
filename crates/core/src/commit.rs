@@ -326,6 +326,11 @@ fn apply(folder: &Path, diff: &FileDiff, at: usize, reverse: bool) -> Result<(),
         return Err("That hunk is no longer there; the diff has moved.".into());
     };
     let patch = format!("{}{hunk}", diff.header);
+    // Bytes that are not UTF-8 were read as U+FFFD, and git would write that
+    // into the index in their place.
+    if patch.contains(char::REPLACEMENT_CHARACTER) {
+        return Err("This file is not UTF-8 text, so it is staged whole, not by hunks.".into());
+    }
     // The diff names files from the top of the repository, so it is applied
     // from there: from a folder below, git apply skips what is outside it.
     let top = look(folder, &["rev-parse", "--show-toplevel"])?;
@@ -932,6 +937,28 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(folder.join("a.txt")).unwrap(),
             edited
+        );
+    }
+
+    #[test]
+    fn a_hunk_that_is_not_utf8_is_refused_rather_than_changed() {
+        let folder = repo("latin1");
+        let rest = lines(|n| (n == 10).then_some("ten"));
+        let mut edited = b"caf\xe9\n".to_vec();
+        edited.extend_from_slice(rest.split_once('\n').unwrap().1.as_bytes());
+        std::fs::write(folder.join("a.txt"), &edited).unwrap();
+        let entry = tree(&folder).unwrap().unstaged.remove(0);
+        let diff = file_diff(&folder, &entry, false).unwrap();
+        assert_eq!(diff.hunks.len(), 2, "{}", diff.text());
+        let why = stage_hunk(&folder, &diff, 0).unwrap_err();
+        assert!(why.contains("not UTF-8"), "{why}");
+        assert_eq!(setup(&folder, &["diff", "--cached"]), "");
+        // The hunk that is plain text still stages.
+        stage_hunk(&folder, &diff, 1).unwrap();
+        let staged = setup(&folder, &["diff", "--cached"]);
+        assert!(
+            staged.contains("+ten") && !staged.contains("caf"),
+            "{staged}"
         );
     }
 
