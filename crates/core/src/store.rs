@@ -536,6 +536,7 @@ impl Store {
         let path = session_path(gone.id);
         let lock = Lock::take(&path);
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(crate::prefilter::path_for(&path));
         // A lock file someone else holds stays: removed, the next writer
         // would lock a new file beside them and both would write.
         if lock.is_ok() {
@@ -570,11 +571,17 @@ impl Conversation {
         if self.gone {
             return Ok(());
         }
-        self.flush_to(&session_path(self.id))
+        self.append_to(&session_path(self.id), true)
     }
 
     /// Flush into the file at `path` rather than the session's own.
     fn flush_to(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        self.append_to(path, false)
+    }
+
+    /// Flush into the file at `path`, keeping its term set up to date with
+    /// `terms`: only sessions are searched, not helpers' conversations.
+    fn append_to(&mut self, path: &std::path::Path, terms: bool) -> std::io::Result<()> {
         let meta = self.meta();
         let meta_changed = self.written.as_ref() != Some(&meta);
         let summary_new = self.summary.is_some() && !self.summary_saved;
@@ -615,6 +622,10 @@ impl Conversation {
             .append(true)
             .read(true)
             .open(path)?;
+        let before = file
+            .metadata()
+            .ok()
+            .map(|stat| (stat.len(), modified(&stat)));
         let mut out = String::new();
         // A crash part way through a line leaves the file without its last
         // newline. Appending straight after it would glue the next record to
@@ -652,6 +663,15 @@ impl Conversation {
             );
         }
         file.write_all(out.as_bytes())?;
+        // Stamped once the file is closed, as Windows may only then settle
+        // its modification time, and still under the lock.
+        drop(file);
+        if terms
+            && let Some(before) = before
+            && let Ok(after) = std::fs::metadata(path)
+        {
+            crate::prefilter::appended(path, before, (after.len(), modified(&after)), &out);
+        }
         self.flushed = self.messages.len();
         self.written = Some(meta);
         self.rewound = None;
@@ -1231,6 +1251,18 @@ pub fn saved(id: u64) -> Option<Conversation> {
 }
 
 fn search_in(dir: &std::path::Path, query: &str, within: &Within, limit: usize) -> Vec<Hit> {
+    search_through(dir, query, within, limit, true)
+}
+
+/// As `search_in`, passing over the sessions whose term sets rule them out
+/// with `prefilter`, which changes how long it takes and never what it finds.
+fn search_through(
+    dir: &std::path::Path,
+    query: &str,
+    within: &Within,
+    limit: usize,
+    prefilter: bool,
+) -> Vec<Hit> {
     let terms = terms(query);
     if terms.is_empty() {
         return Vec::new();
@@ -1241,10 +1273,13 @@ fn search_in(dir: &std::path::Path, query: &str, within: &Within, limit: usize) 
     // word says how rare it is.
     let (mut sessions, mut holding) = (0usize, vec![0usize; terms.len()]);
     let mut candidates: Vec<(PathBuf, bool)> = Vec::new();
-    for (path, text) in session_texts(dir) {
-        let lower = text.to_lowercase();
-        let held: Vec<bool> = written.iter().map(|t| lower.contains(t.as_str())).collect();
+    for (path, lower) in session_texts(dir, &written, prefilter) {
         sessions += 1;
+        // Ruled out unread, so it holds none of the words.
+        let Some(lower) = lower else {
+            continue;
+        };
+        let held: Vec<bool> = written.iter().map(|t| lower.contains(t.as_str())).collect();
         for (count, held) in holding.iter_mut().zip(&held) {
             *count += usize::from(*held);
         }
@@ -1270,20 +1305,47 @@ fn search_in(dir: &std::path::Path, query: &str, within: &Within, limit: usize) 
     found.into_iter().take(limit).collect()
 }
 
-/// Each session file in `dir` with its text, read one at a time and
-/// leniently, as in `replay`: a search holds one file rather than them all.
-fn session_texts(dir: &std::path::Path) -> impl Iterator<Item = (PathBuf, String)> {
+/// Each session file in `dir` with its text in lowercase, read one at a time
+/// and leniently, as in `replay`: a search holds one file rather than them
+/// all. With `prefilter`, a file whose term set shows it holds none of
+/// `written` comes unread and without its text, and a file read for want of
+/// a set that fits it is given one.
+fn session_texts<'a>(
+    dir: &std::path::Path,
+    written: &'a [String],
+    prefilter: bool,
+) -> impl Iterator<Item = (PathBuf, Option<String>)> + 'a {
     std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| path.extension().is_some_and(|e| e == "jsonl"))
-        .filter_map(|path| {
+        .filter_map(move |path| {
+            // Taken before the file is read, so a set made from it covers at
+            // least what its stamp says, even if a save appends meanwhile.
+            let stat = std::fs::metadata(&path).ok()?;
+            let stamp = (stat.len(), modified(&stat));
+            let filter = prefilter
+                .then(|| crate::prefilter::read(&path, stamp))
+                .flatten();
+            if filter
+                .as_ref()
+                .is_some_and(|f| !written.iter().any(|t| f.may_hold(t)))
+            {
+                return Some((path, None));
+            }
             let bytes = std::fs::read(&path).ok()?;
             let text = String::from_utf8(bytes)
                 .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
-            Some((path, text))
+            let lower = text.to_lowercase();
+            // Saved before sets were kept, by an older build, or since a
+            // set was last made: the file is in hand, so it costs a hash.
+            if prefilter && filter.is_none() && stamp.0 > 0 {
+                let made = crate::prefilter::Filter::of(&lower);
+                crate::prefilter::write(&path, stamp, &made);
+            }
+            Some((path, Some(lower)))
         })
 }
 
@@ -1928,7 +1990,8 @@ pub(crate) mod tests {
     use super::write_private;
     use super::{
         ASIDE_STALE, Conversation, Lock, SNIPPET_SIDE, Store, Todo, Transcript, Within, apply_todo,
-        fill, load, load_listing, replay, search, search_in, summaries, todos_in,
+        fill, load, load_listing, modified, replay, search, search_in, search_through, summaries,
+        todos_in,
     };
     use crate::chat::{Message, ToolCall};
 
@@ -2616,6 +2679,202 @@ pub(crate) mod tests {
             .map(|hit| hit.snippet)
             .collect();
         assert_eq!(figs, ["one fig", "five fig"]);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    /// Each hit of a search of `dir` for `query` as its session, place, role
+    /// and snippet, with the term sets passing sessions over or without.
+    fn found_by(
+        dir: &std::path::Path,
+        query: &str,
+        prefilter: bool,
+    ) -> Vec<(u64, Option<usize>, String, String)> {
+        search_through(dir, query, &Within::default(), 50, prefilter)
+            .into_iter()
+            .map(|h| (h.id, h.ordinal, h.role, h.snippet))
+            .collect()
+    }
+
+    fn same_either_way(dir: &std::path::Path, queries: &[&str]) {
+        for query in queries {
+            let with = found_by(dir, query, true);
+            assert_eq!(with, found_by(dir, query, false), "{query}");
+        }
+    }
+
+    /// The size and time of the session file at `path`, which its term set
+    /// must have been made at to be used.
+    fn stamp(path: &std::path::Path) -> (u64, u64) {
+        let stat = std::fs::metadata(path).unwrap();
+        (stat.len(), modified(&stat))
+    }
+
+    #[test]
+    fn search_finds_the_same_with_term_sets_as_without() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("prefilter-same");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut asked = said("assistant", "PostgreSQL, for the concurrency.");
+        asked.tool_calls.push(ToolCall {
+            id: "1".into(),
+            name: "run_command".into(),
+            arguments: r#"{"command":"psql -c 'select 1'"}"#.into(),
+        });
+        let conversations = [
+            (
+                "Database choice",
+                vec![said("user", "Postgres or SQLite?"), asked],
+            ),
+            (
+                "迁移",
+                vec![
+                    said("user", "数据库迁移完成了"),
+                    said("assistant", "c++ and #12 -> done"),
+                ],
+            ),
+            (
+                "Quotes",
+                vec![said(
+                    "user",
+                    "she said \"ship it\"\tthen left for Ωmega ΣΑΣ",
+                )],
+            ),
+            (
+                "Cache",
+                (0..40)
+                    .map(|i| said("user", &format!("cache {i}")))
+                    .collect(),
+            ),
+        ];
+        let mut store = Store::default();
+        for (id, (title, messages)) in (1..).zip(conversations) {
+            store.conversations.push(Conversation {
+                id,
+                title: title.into(),
+                updated: 100 + id,
+                messages,
+                ..Default::default()
+            });
+        }
+        store.save().unwrap();
+        let sessions = dir.join("sessions");
+        // Saved before sets were kept.
+        let old = [user("postgres from long ago"), user("a cache of figs")];
+        session_file(&sessions, 9, "Old notes", 50, &old);
+        for id in 1..=4 {
+            let path = sessions.join(format!("{id}.jsonl"));
+            assert!(
+                crate::prefilter::read(&path, stamp(&path)).is_some(),
+                "{id}"
+            );
+        }
+
+        same_either_way(
+            &sessions,
+            &[
+                "postgres",
+                "POSTGRES sqlite",
+                "sql",
+                "concurrency flamingo",
+                "数据库",
+                "迁移",
+                "c++",
+                "#12",
+                "->",
+                "\"ship it\"",
+                "it\"",
+                "psql",
+                "'select",
+                "database",
+                "cache 3",
+                "cache",
+                "ωmega σας",
+                "ςας",
+                "zz",
+                "flamingo",
+                "the",
+            ],
+        );
+        assert_eq!(found_by(&sessions, "postgres", true).len(), 3);
+        assert_eq!(found_by(&sessions, "数据库", true).len(), 1);
+        assert_eq!(found_by(&sessions, "\"ship it\"", true).len(), 1);
+        let old = sessions.join("9.jsonl");
+        assert!(crate::prefilter::read(&old, stamp(&old)).is_some());
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_session_saved_before_term_sets_gets_one_when_first_searched() {
+        let dir = scratch("prefilter-lazy");
+        session_file(&dir, 1, "Old", 100, &[user("the fig tree")]);
+        let path = dir.join("1.jsonl");
+        assert!(!crate::prefilter::path_for(&path).exists());
+
+        assert_eq!(found_by(&dir, "fig", true).len(), 1);
+        assert!(crate::prefilter::read(&path, stamp(&path)).is_some());
+        assert!(found_by(&dir, "flamingo", true).is_empty());
+        // A set made from the file as it is now is taken at its word: one
+        // that says it holds nothing has the file passed over unread.
+        let nothing = crate::prefilter::Filter::of("");
+        crate::prefilter::write(&path, stamp(&path), &nothing);
+        assert!(found_by(&dir, "fig", true).is_empty());
+        // Once the file moves, the set no longer fits and is made again.
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str("{\"type\":\"message\",\"role\":\"user\",\"content\":\"more figs\"}\n");
+        std::fs::write(&path, text).unwrap();
+        assert_eq!(found_by(&dir, "fig", true).len(), 2);
+        let made = crate::prefilter::read(&path, stamp(&path)).unwrap();
+        assert!(made.may_hold("more figs"));
+    }
+
+    #[test]
+    fn term_sets_keep_up_with_edits_rewinds_and_replaced_files() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("prefilter-edits");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let sessions = dir.join("sessions");
+        let path = sessions.join("1.jsonl");
+        let queries = ["fig", "three", "orchard", "kiwi", "mango", "first"];
+
+        let mut store = Store::default();
+        store.conversations.push(Conversation {
+            id: 1,
+            title: "first".into(),
+            messages: vec![
+                said("user", "one fig"),
+                said("user", "two fig"),
+                said("user", "three fig"),
+            ],
+            ..Default::default()
+        });
+        store.save().unwrap();
+        same_either_way(&sessions, &queries);
+
+        store.conversations[0].title = "Orchard notes".into();
+        store.save().unwrap();
+        assert!(crate::prefilter::read(&path, stamp(&path)).is_some());
+        assert_eq!(found_by(&sessions, "orchard", true).len(), 1);
+        same_either_way(&sessions, &queries);
+
+        store.conversations[0].rewind(1);
+        store.conversations[0]
+            .messages
+            .push(said("user", "five kiwi"));
+        store.save().unwrap();
+        assert!(crate::prefilter::read(&path, stamp(&path)).is_some());
+        assert!(found_by(&sessions, "three", true).is_empty());
+        assert_eq!(found_by(&sessions, "kiwi", true).len(), 1);
+        same_either_way(&sessions, &queries);
+
+        // Written over by something other than a save, its set left behind.
+        session_file(&sessions, 1, "Replaced", 500, &[user("mango only")]);
+        assert_eq!(found_by(&sessions, "mango", true).len(), 1);
+        assert!(found_by(&sessions, "fig", true).is_empty());
+        same_either_way(&sessions, &queries);
+
+        store.remove(0);
+        assert!(!crate::prefilter::path_for(&path).exists());
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 
@@ -4054,5 +4313,248 @@ pub(crate) mod tests {
         assert!(running.exists() && other.exists());
         assert!(!dir.join("agents").exists());
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    /// A fixed-seed source of made-up sessions, so every run of the bench
+    /// searches the same bytes.
+    #[cfg(target_os = "linux")]
+    struct Dice(u64);
+
+    #[cfg(target_os = "linux")]
+    impl Dice {
+        fn next(&mut self) -> u64 {
+            // xorshift64*: good enough to vary text, and needs no crate.
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        /// A number from `low` up to `high`, as likely to double as to halve,
+        /// which is how message and output lengths spread.
+        fn spread(&mut self, low: usize, high: usize) -> usize {
+            let unit = (self.next() >> 11) as f64 / (1u64 << 53) as f64;
+            (low as f64 * (high as f64 / low as f64).powf(unit)) as usize
+        }
+
+        /// `n` words of `vocab`, the first words far more often than the
+        /// last, as in any text.
+        fn words(&mut self, vocab: &[String], n: usize, between: &str) -> String {
+            let picked: Vec<&str> = (0..n)
+                .map(|_| vocab[self.spread(1, vocab.len() + 1) - 1].as_str())
+                .collect();
+            picked.join(between)
+        }
+    }
+
+    /// The words the bench's sessions are written in: the everyday ones a
+    /// coding session is full of, then thousands of random letters, which
+    /// hold more runs of three than real text does and so make the term sets
+    /// no smaller, and pass no fewer sessions, than real sessions would.
+    #[cfg(target_os = "linux")]
+    fn vocab() -> Vec<String> {
+        let common = "the a to is in file error test build run fn let self return use \
+                      struct impl value string path if else match none some ok err result \
+                      config update check we it that this for with not be on";
+        let mut dice = Dice(0xC0DE);
+        let made = (0..4000).map(|_| {
+            let length = dice.spread(3, 11);
+            (0..length)
+                .map(|_| char::from(b'a' + (dice.next() % 26) as u8))
+                .collect::<String>()
+        });
+        let made: Vec<String> = made.collect();
+        common
+            .split_whitespace()
+            .map(String::from)
+            .chain(made)
+            .collect()
+    }
+
+    /// Session `id` as a coding session reads: the user asks, the model calls
+    /// tools and reads their output, and answers, over and over; a few to a
+    /// few hundred messages, with outputs up to the most a tool returns.
+    #[cfg(target_os = "linux")]
+    fn made_up(id: u64, dice: &mut Dice, vocab: &[String]) -> Conversation {
+        let length = dice.spread(4, 300);
+        let mut messages = Vec::new();
+        while messages.len() < length {
+            let n = dice.spread(5, 80);
+            messages.push(said("user", &dice.words(vocab, n, " ")));
+            for _ in 0..dice.spread(1, 8) {
+                let call = ToolCall {
+                    id: format!("call_{}", dice.next()),
+                    name: "read_file".into(),
+                    arguments: format!("{{\"path\":\"src/{}.rs\"}}", dice.words(vocab, 1, "")),
+                };
+                let n = dice.spread(5, 150);
+                messages.push(Message {
+                    role: "assistant".into(),
+                    content: dice.words(vocab, n, " "),
+                    model: "some-model".into(),
+                    tokens: dice.next() % 2000,
+                    tool_calls: vec![call.clone()],
+                    ..Default::default()
+                });
+                let n = dice.spread(40, 2400);
+                messages.push(Message {
+                    role: "tool".into(),
+                    content: dice.words(vocab, n, if n.is_multiple_of(3) { "\n" } else { " " }),
+                    tool_call_id: call.id,
+                    name: call.name,
+                    args: call.arguments,
+                    ..Default::default()
+                });
+            }
+            let n = dice.spread(20, 300);
+            messages.push(said("assistant", &dice.words(vocab, n, " ")));
+        }
+        // One session in 500 mentions the rare word, once.
+        if id % 500 == 7 {
+            messages[0].content.push_str(" flamingo");
+        }
+        Conversation {
+            id,
+            title: dice.words(vocab, 4, " "),
+            updated: 1_700_000_000 + id * 600,
+            messages,
+            ..Default::default()
+        }
+    }
+
+    /// Take the sessions' files out of the page cache, so the next search
+    /// reads them from the disk as the first one after a restart does.
+    #[cfg(target_os = "linux")]
+    fn evict(dir: &std::path::Path) {
+        use std::os::fd::AsRawFd;
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let Ok(file) = std::fs::File::open(entry.path()) else {
+                continue;
+            };
+            // Dirty pages are not dropped, so they are written first.
+            let _ = file.sync_all();
+            unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+        }
+    }
+
+    /// A figure of the process's memory from /proc, in kilobytes.
+    #[cfg(target_os = "linux")]
+    fn memory(field: &str) -> u64 {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let kb = status
+            .lines()
+            .find_map(|line| line.strip_prefix(field)?.trim().strip_suffix("kB"))
+            .and_then(|kb| kb.trim().parse::<u64>().ok());
+        kb.unwrap_or(0)
+    }
+
+    /// One search of `dir` for `query`: how long it took, its hits, and the
+    /// memory it took beyond what the process held before, in kilobytes.
+    #[cfg(target_os = "linux")]
+    fn timed(
+        dir: &std::path::Path,
+        query: &str,
+        prefilter: bool,
+    ) -> (std::time::Duration, Vec<(u64, Option<usize>)>, u64) {
+        // Resets the peak to what is held now.
+        let _ = std::fs::write("/proc/self/clear_refs", "5");
+        let before = memory("VmRSS:");
+        let started = std::time::Instant::now();
+        let hits = search_through(dir, query, &Within::default(), 10, prefilter);
+        let took = started.elapsed();
+        let hits = hits.into_iter().map(|h| (h.id, h.ordinal)).collect();
+        (took, hits, memory("VmHWM:").saturating_sub(before))
+    }
+
+    /// The count and total size of the files in `dir` named `*.{extension}`.
+    #[cfg(target_os = "linux")]
+    fn files(dir: &std::path::Path, extension: &str) -> (u64, u64) {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == extension))
+            .filter_map(|e| e.metadata().ok())
+            .fold((0, 0), |(n, bytes), m| (n + 1, bytes + m.len()))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "bench: cargo test -p letronna-core --release -- --ignored session_search_at_scale --nocapture"]
+    fn session_search_at_scale() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("bench");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let sessions = dir.join("sessions");
+        let (vocab, mut dice) = (vocab(), Dice(0x5EED));
+        let ms = |took: std::time::Duration| took.as_secs_f64() * 1000.0;
+        let mut saved = 0u64;
+        for count in [100u64, 1_000, 5_000] {
+            // Saved as the app saves them, a batch at a time so the made-up
+            // store is never all in memory at once.
+            while saved < count {
+                let mut store = Store::default();
+                let batch = (count - saved).min(100);
+                store.conversations = (saved + 1..=saved + batch)
+                    .map(|id| made_up(id, &mut dice, &vocab))
+                    .collect();
+                store.save().unwrap();
+                saved += batch;
+            }
+            let (_, bytes) = files(&sessions, "jsonl");
+            let (sets, set_bytes) = files(&sessions, "terms");
+            println!(
+                "\n{count} sessions, {:.0} MB; term sets {:.1} KB each, {:.1} MB in all",
+                bytes as f64 / 1e6,
+                set_bytes as f64 / 1e3 / sets.max(1) as f64,
+                set_bytes as f64 / 1e6,
+            );
+            println!("  term     prefilter  cold ms  warm ms  hits  peak KB");
+            for (name, query) in [
+                ("rare", "flamingo"),
+                ("common", "error"),
+                ("none", "quetzalcoatl"),
+            ] {
+                let mut found = Vec::new();
+                for prefilter in [false, true] {
+                    evict(&sessions);
+                    let (cold, hits, peak) = timed(&sessions, query, prefilter);
+                    // The best of three, once the files are in memory.
+                    let warm = (0..3)
+                        .map(|_| timed(&sessions, query, prefilter).0)
+                        .min()
+                        .unwrap();
+                    println!(
+                        "  {name:<8} {:<9} {:>8.1} {:>8.1} {:>5} {peak:>8}",
+                        if prefilter { "with" } else { "without" },
+                        ms(cold),
+                        ms(warm),
+                        hits.len(),
+                    );
+                    found.push(hits);
+                }
+                assert_eq!(found[0], found[1], "{name}");
+                if name == "rare" {
+                    assert_eq!(found[0].len() as u64, (count + 492) / 500);
+                }
+            }
+            // The first search after an update to a build that keeps sets:
+            // none yet, so it reads every file and makes each one's set.
+            for entry in std::fs::read_dir(&sessions).unwrap().flatten() {
+                if entry.path().extension().is_some_and(|x| x == "terms") {
+                    std::fs::remove_file(entry.path()).unwrap();
+                }
+            }
+            evict(&sessions);
+            let (first, _, _) = timed(&sessions, "quetzalcoatl", true);
+            evict(&sessions);
+            let (next, _, _) = timed(&sessions, "quetzalcoatl", true);
+            println!(
+                "  sets made by the first search: {:.1} ms cold, then {:.1} ms cold",
+                ms(first),
+                ms(next)
+            );
+        }
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

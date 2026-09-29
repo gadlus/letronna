@@ -43,6 +43,7 @@ pub mod models;
 mod page;
 pub mod paths;
 pub mod permissions;
+mod prefilter;
 mod redact;
 pub mod retry;
 mod scan;
