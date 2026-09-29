@@ -129,10 +129,15 @@ fn with_job<T>(id: u64, f: impl FnOnce(&Job) -> T) -> Result<T, String> {
     Ok(f(job))
 }
 
-/// Everything the job has printed so far.
+/// Everything the job has printed so far, without escape sequences.
 pub fn log(id: u64) -> Result<String, String> {
+    // Stripped here rather than as it arrives, because a sequence can
+    // straddle two reads.
     with_job(id, |job| {
-        job.log.lock().map(|l| l.clone()).unwrap_or_default()
+        job.log
+            .lock()
+            .map(|l| crate::tools::strip_escapes(&l))
+            .unwrap_or_default()
     })
 }
 
@@ -223,5 +228,21 @@ mod tests {
             "job kept running after stop"
         );
         assert!(log(999).is_err());
+    }
+
+    #[test]
+    fn a_jobs_log_comes_without_escape_sequences() {
+        let print = if cfg!(windows) {
+            r#"Write-Output "$([char]27)[32mdone$([char]27)[0m""#
+        } else {
+            r#"printf '\033[32mdone\033[0m\n'"#
+        };
+        let id = start(print, &std::env::temp_dir()).unwrap();
+        assert!(
+            until(|| log(id).unwrap().contains("done")),
+            "job never printed: {:?}",
+            log(id).unwrap()
+        );
+        assert_eq!(log(id).unwrap().trim_end(), "done");
     }
 }

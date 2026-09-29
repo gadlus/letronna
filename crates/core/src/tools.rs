@@ -304,6 +304,15 @@ fn resolve_write(raw: &str, ctx: &ToolContext) -> Result<PathBuf, String> {
     Ok(target)
 }
 
+/// Variables every command and every job starts with.
+const SHELL_ENV: [(&str, &str); 5] = [
+    ("PAGER", "cat"),
+    ("GIT_PAGER", "cat"),
+    ("GIT_EDITOR", "true"),
+    ("NO_COLOR", "1"),
+    ("TERM", "dumb"),
+];
+
 /// The platform shell, configured the way every caller needs it.
 pub fn shell(command: &str, cwd: Option<&Path>) -> std::process::Command {
     use std::process::Command;
@@ -319,6 +328,12 @@ pub fn shell(command: &str, cwd: Option<&Path>) -> std::process::Command {
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
+    // No one reads a command's output as a terminal, so a pager or an editor
+    // would wait for keys that never come until the timeout killed it, and
+    // colour would reach the model as escape codes. Git takes a pager of `cat`
+    // to mean none, and an editor of `true` keeps the message it was given,
+    // so a commit without -m fails at once instead of hanging.
+    cmd.envs(SHELL_ENV);
     // Letronna is a GUI-subsystem app, so it owns no console. Without this,
     // Windows hands the shell a brand new console window on every call and it
     // flashes up over the chat.
@@ -368,8 +383,8 @@ fn run_shell(command: &str, cwd: Option<&Path>) -> Result<String, String> {
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
-    let mut text = out.join().unwrap_or_default();
-    let err = err.join().unwrap_or_default();
+    let mut text = strip_escapes(&out.join().unwrap_or_default());
+    let err = strip_escapes(&err.join().unwrap_or_default());
     if !err.trim().is_empty() {
         text.push_str("\n[stderr]\n");
         text.push_str(&err);
@@ -378,6 +393,39 @@ fn run_shell(command: &str, cwd: Option<&Path>) -> Result<String, String> {
         text.push_str(&format!("\n[exit code {}]", status.code().unwrap_or(-1)));
     }
     Ok(text)
+}
+
+/// Removes CSI and OSC escape sequences, keeping the text between them.
+pub(crate) fn strip_escapes(text: &str) -> String {
+    // NO_COLOR and TERM=dumb stop most of these, but not every program checks,
+    // and a colour code or a window title is only noise to the model.
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        if chars.next_if_eq(&'[').is_some() {
+            while chars.next_if(|c| ('\x20'..='\x3f').contains(c)).is_some() {}
+            chars.next_if(|c| ('\x40'..='\x7e').contains(c));
+        } else if chars.next_if_eq(&']').is_some() {
+            // A terminal ends an OSC at BEL or at ST (ESC \) and reads any
+            // other escape as the start of the next sequence, so this does too.
+            // No title or link holds a newline, so one ends there too, and an
+            // OSC left open hides the rest of its line, not the whole output.
+            while chars.next_if(|c| !"\x07\x1b\n".contains(*c)).is_some() {}
+            if chars.next_if_eq(&'\x07').is_none() {
+                let mut ahead = chars.clone();
+                if ahead.next() == Some('\x1b') && ahead.next() == Some('\\') {
+                    chars = ahead;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 struct WriteFile;
@@ -508,7 +556,7 @@ impl Tool for RunCommand {
     }
     fn description(&self) -> &'static str {
         if cfg!(windows) {
-            "Run a PowerShell command in the project folder. Waits for it to finish and returns its output, with a 2 minute limit. For anything meant to keep running, such as a dev server or a watcher, pass background: true instead."
+            "Run a Windows PowerShell 5.1 command in the project folder. `&&` and `||` are syntax errors in 5.1: separate commands with `;`, or write `first; if ($?) { second }` to run the second only when the first succeeded. Waits for it to finish and returns its output, with a 2 minute limit. For anything meant to keep running, such as a dev server or a watcher, pass background: true instead."
         } else {
             "Run a shell (sh) command in the project folder. Waits for it to finish and returns its output, with a 2 minute limit. For anything meant to keep running, such as a dev server or a watcher, pass background: true instead."
         }
@@ -1351,5 +1399,52 @@ World"
         };
         let refused = run("read_file", r#"{"path": "x"}"#, &shared).unwrap_err();
         assert!(refused.contains("not available here"), "{refused}");
+    }
+
+    #[test]
+    fn commands_start_with_no_pager_no_editor_and_no_colour() {
+        let print = if cfg!(windows) {
+            r#"Write-Output "$env:PAGER $env:GIT_PAGER $env:GIT_EDITOR $env:NO_COLOR $env:TERM""#
+        } else {
+            r#"echo "$PAGER $GIT_PAGER $GIT_EDITOR $NO_COLOR $TERM""#
+        };
+        let out = shell(print, None).output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "cat cat true 1 dumb"
+        );
+    }
+
+    #[test]
+    fn escape_sequences_go_and_the_text_between_them_stays() {
+        for (raw, plain) in [
+            ("\x1b[1;31merror\x1b[0m: bad", "error: bad"),
+            ("\x1b[2K\x1b[?25lnext", "next"),
+            ("\x1b]0;a title\x07after", "after"),
+            (
+                "\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\ done",
+                "link done",
+            ),
+            ("\x1b]0;cut short\x1b[32mgreen", "green"),
+            ("ok\n\x1b]0;no end\nline2\nline3\n", "ok\n\nline2\nline3\n"),
+            ("héllo — ✓", "héllo — ✓"),
+            // An escape that starts neither kind is left for the reader to see.
+            ("a\x1bb", "a\x1bb"),
+            // A killed process can stop halfway through one.
+            ("text\x1b[3", "text"),
+        ] {
+            assert_eq!(strip_escapes(raw), plain, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn a_commands_colour_and_title_are_stripped_from_what_the_model_reads() {
+        let print = if cfg!(windows) {
+            r#"$e = [char]27; Write-Output "$e]0;title$([char]7)$e[31mred$e[0m plain""#
+        } else {
+            r#"printf '\033]0;title\007\033[31mred\033[0m plain\n'"#
+        };
+        let out = run_shell(print, None).unwrap();
+        assert_eq!(out.trim_end(), "red plain");
     }
 }
