@@ -959,9 +959,17 @@ impl Chat {
         self.store.settings.endpoint = connection.endpoint.clone();
         self.store.pin(self.store.active);
         // A new message is the user's next step, whatever a look at the goal
-        // was about to say.
-        if let Some((_, check)) = self.goal_check.take() {
+        // was about to say. Only one turn runs at a time, so a look in
+        // another session ends too, and says so rather than going quiet.
+        if let Some((id, check)) = self.goal_check.take() {
             check.set();
+            if id != self.store.conversations[self.store.active].id {
+                self.note = Some(
+                    "The goal check in another session was skipped: only one turn runs at \
+                     a time. It runs again after that session's next turn."
+                        .into(),
+                );
+            }
         }
         let conversation = &mut self.store.conversations[self.store.active];
         goal::interrupted(&mut conversation.goal);
@@ -2411,8 +2419,10 @@ impl Chat {
     /// error. What the turn got to is kept: the reply so far, or the batch's
     /// results with every call left answered as stopped.
     pub(crate) fn stop_turn(&mut self, cx: &mut Context<Self>) {
-        // A look at the goal between turns stops as a turn does.
-        if let Some((id, check)) = self.goal_check.take() {
+        // A look at the goal between turns stops as a turn does, but only
+        // the look of the session on screen, where the Stop button shows.
+        let on_screen = self.store.conversations[self.store.active].id;
+        if let Some((id, check)) = self.goal_check.take_if(|(id, _)| *id == on_screen) {
             check.set();
             if let Some(ix) = self.store.index_of(id) {
                 goal::interrupted(&mut self.store.conversations[ix].goal);
