@@ -319,8 +319,11 @@ fn tools_view(
             .label("Read only")
             .disabled(read_only || reads.is_empty())
             .on_click(move |_, _, cx| {
-                let done = letronna_core::toolset::switch(&reads, true)
-                    .and_then(|()| letronna_core::toolset::switch(&changes, false));
+                // Off first: a read tool that `disabled_tools` holds off fails
+                // the second switch, and the ones that change things must
+                // be off by then.
+                let done = letronna_core::toolset::switch(&changes, false)
+                    .and_then(|()| letronna_core::toolset::switch(&reads, true));
                 switched(done, &chat, &trouble, cx);
             })
     };
