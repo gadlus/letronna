@@ -64,6 +64,7 @@ impl Chat {
                                 cx.listener(|this, _, window, cx| this.toggle_panel(window, cx)),
                             ),
                     )
+                    .children(crate::ui::profiles::title_label(cx))
                     .child(self.account_chip(cx)),
             )
     }
@@ -134,10 +135,11 @@ impl Chat {
                             .text_color(cx.theme().muted_foreground),
                     ),
             )
-            .dropdown_menu_with_anchor(gpui::Corner::TopRight, move |menu, _, _| {
+            .dropdown_menu_with_anchor(gpui::Corner::TopRight, move |menu, window, cx| {
                 let (settings, account, auth) = (chat.clone(), chat.clone(), chat.clone());
                 let usage = chat.clone();
-                menu.min_w(px(180.))
+                let menu = menu
+                    .min_w(px(180.))
                     .item(
                         PopupMenuItem::new("Account")
                             .icon(Icon::new(IconName::CircleUser))
@@ -158,7 +160,8 @@ impl Chat {
                             .on_click(move |_, window, cx| {
                                 settings.update(cx, |this, cx| this.open_settings(window, cx))
                             }),
-                    )
+                    );
+                crate::ui::profiles::menu(menu, window, cx, chat.clone())
                     .item(
                         PopupMenuItem::new("Guide")
                             .icon(Icon::new(IconName::Info))
