@@ -59,6 +59,12 @@
 //! start, those removed stop, and those whose entry now says anything else
 //! once its variables are filled in start again; the rest run on untouched,
 //! so a long npx start or a hosted session is not thrown away for nothing.
+//!
+//! A server run here starts as the head of a process tree -- a process
+//! group of its own on Unix, a Job Object on Windows, as a background job
+//! does -- and stopping it ends the whole tree: npx leaves node running,
+//! and `cmd /C` whatever it started, where killing the server alone would
+//! end neither.
 
 use crate::tools::{Tool, ToolContext};
 use serde::Deserialize;
@@ -429,7 +435,7 @@ struct Slot {
     /// Its stderr, the newest 64 KB, kept across restarts.
     log: Arc<Mutex<VecDeque<u8>>>,
     /// The process of a server run here, held so a restart can stop it.
-    child: Option<std::process::Child>,
+    process: Option<Process>,
     /// Numbers the starts, so one that ends after a later start began is
     /// dropped rather than taken for the current one. Every server shares
     /// the count, so a start of a slot that `reload` removed is never taken
@@ -451,9 +457,8 @@ impl Slot {
     fn stop(&mut self) {
         self.tools.clear();
         self.server = None;
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Some(process) = self.process.take() {
+            process.end();
         }
         if let Some((_, timer)) = self.retry.take() {
             crate::timers::cancel(timer);
@@ -466,6 +471,24 @@ impl Slot {
             true => LOCAL_RETRIES,
             false => REMOTE_RETRIES,
         }
+    }
+}
+
+/// A server run here and everything it starts -- npx's node, cmd's children
+/// -- as one tree, so that stopping it leaves none of them running.
+struct Process {
+    child: std::process::Child,
+    tree: crate::jobs::Tree,
+}
+
+impl Process {
+    /// End the whole tree, then reap the server.
+    fn end(mut self) {
+        // Before the wait: once the server is reaped, its Unix process group
+        // id can pass to an unrelated process.
+        self.tree.kill();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -773,16 +796,28 @@ fn same(
 /// Stop the servers `done` removed, and start those it added or changed as
 /// `servers` has them.
 fn apply(done: &Reloaded, mut servers: BTreeMap<String, Result<ServerConfig, String>>) {
-    for name in &done.removed {
-        let slot = slots().lock().ok().and_then(|mut slots| slots.remove(name));
-        if let Some(mut slot) = slot {
-            slot.stop();
-        }
-    }
+    remove_slots(|name| done.removed.iter().any(|removed| removed == name));
     for name in done.added.iter().chain(&done.changed) {
         if let Some(server) = servers.remove(name) {
             open(name, server);
         }
+    }
+}
+
+/// Take the slots of the servers `which` picks out, and stop them, each
+/// process tree and all.
+fn remove_slots(which: impl Fn(&str) -> bool) {
+    let Ok(mut slots) = slots().lock() else {
+        return;
+    };
+    let (gone, kept) = std::mem::take(&mut *slots)
+        .into_iter()
+        .partition::<BTreeMap<_, _>, _>(|(name, _)| which(name));
+    *slots = kept;
+    // Stopped with the lock let go, as ending a tree waits for its server.
+    drop(slots);
+    for mut slot in gone.into_values() {
+        slot.stop();
     }
 }
 
@@ -1073,6 +1108,16 @@ fn launch(name: &str, config: &ServerConfig, run: u64) -> Result<Vec<Arc<dyn Too
         return reach(name, config, run);
     }
     let mut child = spawn(config, &crate::chat::data_dir())?;
+    // At once, so the server has had as little time as possible to start
+    // anything outside the tree.
+    let tree = match crate::jobs::Tree::of(&child) {
+        Ok(tree) => tree,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("{name}: {e}"));
+        }
+    };
     let (Some(stdin), Some(stdout), Some(stderr)) =
         (child.stdin.take(), child.stdout.take(), child.stderr.take())
     else {
@@ -1080,15 +1125,14 @@ fn launch(name: &str, config: &ServerConfig, run: u64) -> Result<Vec<Arc<dyn Too
     };
     // Held in its slot at once, so a restart while it is still starting
     // stops this one rather than leaving it to run.
-    let mut child = Some(child);
+    let mut process = Some(Process { child, tree });
     let log = with_run(name, run, |slot| {
-        slot.child = child.take();
+        slot.process = process.take();
         slot.log.clone()
     });
     let Some(log) = log else {
-        if let Some(mut child) = child {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Some(process) = process {
+            process.end();
         }
         return Err(format!("{name} was started again."));
     };
@@ -1134,6 +1178,13 @@ fn spawn(config: &ServerConfig, base: &Path) -> Result<std::process::Child, Stri
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // A group of its own, which stopping it ends whole, and which ctrl-c
+        // in the terminal that started Letronna does not reach.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
         // Letronna owns no console, so without this every server would open
         // a console window of its own.
         #[cfg(windows)]
@@ -1201,9 +1252,16 @@ fn links() -> &'static Mutex<Vec<Arc<Link>>> {
     LINKS.get_or_init(Default::default)
 }
 
-/// End the session of every server reached by URL, so it can let go of
-/// what it keeps for it. Called when the app quits.
+/// Stop every server as the app quits: one run here with all it started,
+/// and one reached by URL by ending its session.
 pub fn stop_all() {
+    remove_slots(|_| true);
+    end_sessions();
+}
+
+/// End the session of every server reached by URL, so it can let go of
+/// what it keeps for it.
+fn end_sessions() {
     let links = links()
         .lock()
         .map(|mut links| std::mem::take(&mut *links))
@@ -2432,7 +2490,7 @@ mod tests {
             ..ServerConfig::default()
         };
         launch("ends", &config, 0).unwrap();
-        stop_all();
+        end_sessions();
         let deleted = std::iter::from_fn(|| asked.recv_timeout(Duration::from_secs(5)).ok())
             .find(|head| head.starts_with("delete "))
             .unwrap();
@@ -3503,7 +3561,7 @@ mod tests {
     fn pid_of(name: &str) -> u32 {
         settled(name, |s| s.log.contains("waiting"));
         let slots = slots().lock().unwrap();
-        slots[name].child.as_ref().unwrap().id()
+        slots[name].process.as_ref().unwrap().child.id()
     }
 
     #[cfg(unix)]
@@ -3547,5 +3605,57 @@ mod tests {
         for name in ["t-r-kept", "t-r-moved", "t-r-new"] {
             switch_off(name);
         }
+    }
+
+    /// Start a test's server that says which process it left running, as
+    /// npx leaves node, and give its own id and that one's.
+    #[cfg(unix)]
+    fn start_with_child(name: &str) -> (u32, u32) {
+        let said = |log: &str| log.matches("child ").count();
+        let before = status()
+            .iter()
+            .find(|s| s.name == name)
+            .map_or(0, |s| said(&s.log));
+        open(
+            name,
+            Ok(shell("sleep 30 & echo child $! >&2; exec sleep 30")),
+        );
+        let log = settled(name, |s| said(&s.log) > before).log;
+        let child = log.rsplit("child ").next().unwrap();
+        let child = child.split_whitespace().next().unwrap().parse().unwrap();
+        let slots = slots().lock().unwrap();
+        (slots[name].process.as_ref().unwrap().child.id(), child)
+    }
+
+    /// Whether a process has ended, given a few seconds to be reaped.
+    #[cfg(unix)]
+    fn ended(pid: u32) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while alive(pid) {
+            if Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        true
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_server_stopped_by_reconnect_switch_or_quit_leaves_nothing_it_started() {
+        let (server, child) = start_with_child("t-tree");
+        assert!(alive(child));
+        // Reconnect.
+        let (again, child_again) = start_with_child("t-tree");
+        assert_ne!(again, server);
+        assert!(ended(server) && ended(child), "{server} {child}");
+        // Switched off.
+        switch_off("t-tree");
+        assert!(ended(again) && ended(child_again), "{again} {child_again}");
+        // Quitting, or a reload that finds it gone, takes its slot.
+        let (server, child) = start_with_child("t-tree");
+        remove_slots(|name| name == "t-tree");
+        assert!(ended(server) && ended(child), "{server} {child}");
+        assert!(status().iter().all(|s| s.name != "t-tree"));
     }
 }
