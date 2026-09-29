@@ -124,6 +124,11 @@ impl Runner {
         let busy = crate::title::Busy::start();
         let answer = self.work(&mut turn, session);
         drop(busy);
+        // Stopping is not a go-ahead for what was queued: it goes back in
+        // the box rather than being sent, as it does in the window.
+        if self.stopped {
+            self.bar.hand_back();
+        }
         self.bar.working(false);
         answer
     }
@@ -144,6 +149,9 @@ impl Runner {
                 self.stopped = true;
                 return Ok(String::new());
             };
+            // A reply cut short to send what was queued has nothing to run:
+            // what was typed goes in after it, and the model is asked again.
+            let hurried = self.bar.hurried();
             let empty = reply.content.is_empty();
             let continuation = turn.continuation(&mut reply);
             if empty && !reply.content.is_empty() {
@@ -179,14 +187,21 @@ impl Runner {
             }
             self.persist();
 
-            if !turn.begin(calls) {
+            if !hurried && !turn.begin(calls) {
                 if let Some(note) = turn.capped() {
                     render::blank();
                     render::said(&render::dim("●"), &render::dim(&note));
                 }
                 return Ok(answer);
             }
-            if !self.work_through(turn, session)? {
+            if !hurried && !self.work_through(turn, session)? {
+                self.stopped = true;
+                return Ok(answer);
+            }
+            // Asked to leave, by ctrl-c while a tool ran, which stopped only
+            // that tool, or by ctrl-d: the turn ends here, so nothing queued
+            // is sent and the model is not asked again.
+            if self.bar.finished() {
                 self.stopped = true;
                 return Ok(answer);
             }
@@ -196,7 +211,8 @@ impl Runner {
             self.take_notices(session, false);
             // What was typed while it worked goes in after the results, so
             // the model reads it before carrying on rather than once the turn
-            // is over. It is on the screen already, echoed when entered.
+            // is over. It waited above the box until now, and the box puts
+            // it into the conversation as it is taken.
             let typed = self.bar.take_typed();
             if !typed.is_empty() {
                 self.store.conversations[session]
@@ -230,8 +246,16 @@ impl Runner {
         self.bar.wait_line(true);
         loop {
             // Keys first, then whatever the model has sent.
-            let event = match self.wait_on(&receiver) {
+            let event = match self.wait_on_reply(&receiver) {
                 Ok(event) => event,
+                // Sent now, what was queued goes in after as much of the reply as
+                // came. Any calls it asked for were never run, so they are left out.
+                Err(Unheard::Stopped) if self.bar.hurried() => {
+                    self.bar.wait_line(false);
+                    out.end();
+                    turn.live.calls.clear();
+                    break;
+                }
                 Err(Unheard::Stopped) => {
                     // Dropping the receiver is enough: the worker finishes
                     // into a channel nobody is listening to and goes away.
@@ -468,6 +492,15 @@ impl Runner {
     /// What comes over `receiver`, pumping the keys meanwhile, or why nothing
     /// did. Between pumps it blocks on the channel for as long as the pump
     /// does not wait for keys itself, so a wait with no box up does not spin.
+    /// `wait_on` for a reply, which a "send now" also cuts short.
+    fn wait_on_reply<T>(&mut self, receiver: &mpsc::Receiver<T>) -> Result<T, Unheard> {
+        let patience = self.bar.patience();
+        wait_on(receiver, patience, || {
+            self.bar.pump();
+            self.bar.interrupted() || self.bar.hurried()
+        })
+    }
+
     fn wait_on<T>(&mut self, receiver: &mpsc::Receiver<T>) -> Result<T, Unheard> {
         let patience = self.bar.patience();
         wait_on(receiver, patience, || {

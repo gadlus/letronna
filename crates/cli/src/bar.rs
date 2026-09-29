@@ -12,6 +12,8 @@
 //! question can be typed while the current one is still being answered. A
 //! line entered while tools are at work goes to the model with their
 //! results; one entered during the last answer waits its turn instead.
+//! Until it goes in it waits above the box rather than in the conversation,
+//! where up takes it back and ctrl-s sends it at once.
 
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
@@ -131,6 +133,11 @@ const MENU_LIMIT: usize = 8;
 /// Rows the box will grow to before what is inside it starts to scroll.
 /// Enough for a paragraph, not so many that the conversation is squeezed out.
 const MAX_ROWS: usize = 8;
+
+/// Queued lines shown above the box. A few is what anyone queues; past that
+/// the oldest are counted rather than drawn, so they cannot squeeze the
+/// conversation off the screen.
+const QUEUED_LIMIT: usize = 4;
 
 /// How long a pump waits for a keystroke before handing the loop back. Short
 /// enough that typing feels immediate, long enough not to spin.
@@ -266,6 +273,9 @@ pub struct Bar {
     /// True while a turn is in flight, which is what makes escape mean stop.
     working: bool,
     interrupt: bool,
+    /// Set by the send-now key: what is queued should go in without waiting
+    /// for the reply to finish.
+    hurry: bool,
     /// Keys and pastes handled in the drain now running, an enter's place
     /// among them, and how many enters there were. Together these say whether
     /// an enter ended what you were typing or sat in the middle of something
@@ -307,6 +317,7 @@ impl Bar {
             answer: None,
             working: false,
             interrupt: false,
+            hurry: false,
             note: None,
             handled: 0,
             enter_at: None,
@@ -386,7 +397,7 @@ impl Bar {
     /// either: what the user typed goes first, and the notices it rang for
     /// go in ahead of it anyway.
     fn waited(&mut self) -> Option<Waited> {
-        if let Some(line) = self.queued.pop_front() {
+        if let Some(line) = self.next_line() {
             return Some(Waited::Line(line));
         }
         let bell = self.bell.as_ref()?;
@@ -397,7 +408,7 @@ impl Bar {
     /// the prompt: a turn it started now would cut into the question. `None`
     /// when the user is done.
     pub fn reply(&mut self) -> Option<String> {
-        if let Some(line) = self.queued.pop_front() {
+        if let Some(line) = self.next_line() {
             return Some(line);
         }
         if !self.live {
@@ -407,11 +418,22 @@ impl Bar {
             if self.done {
                 return None;
             }
-            if let Some(line) = self.queued.pop_front() {
+            if let Some(line) = self.next_line() {
                 return Some(line);
             }
             self.pump();
         }
+    }
+
+    /// The first line queued, put into the conversation now that it is taken,
+    /// unless it is a key or a question skipped.
+    fn next_line(&mut self) -> Option<String> {
+        let line = self.queued.pop_front()?;
+        if !self.secret && !line.is_empty() {
+            self.echo(&line);
+        }
+        self.settle();
+        Some(line)
     }
 
     /// Ask a question with a fixed set of answers. Returns the one picked, or
@@ -624,7 +646,6 @@ impl Bar {
     /// Send words as though they had just been typed and entered, ahead of
     /// anything already waiting, for a command that asks something again.
     pub fn send_first(&mut self, text: &str) {
-        self.echo(text);
         self.queued.push_front(text.to_owned());
         self.settle();
     }
@@ -633,12 +654,53 @@ impl Bar {
     /// command, and everything typed after it, stays for the loop to run in
     /// the order it was typed.
     pub fn take_typed(&mut self) -> Vec<String> {
-        let plain = self
-            .queued
+        let plain = self.sendable();
+        let typed: Vec<String> = self.queued.drain(..plain).collect();
+        self.hurry = false;
+        // They go in now, so this is where they join the conversation.
+        if !typed.is_empty() {
+            for line in &typed {
+                self.echo(line);
+            }
+            self.settle();
+        }
+        typed
+    }
+
+    /// How many queued lines the model's next step would take: those before
+    /// the first command.
+    fn sendable(&self) -> usize {
+        self.queued
             .iter()
             .take_while(|line| !line.starts_with('/'))
-            .count();
-        self.queued.drain(..plain).collect()
+            .count()
+    }
+
+    /// Whether the user asked for what is queued to go in now, cutting the
+    /// reply short, with something queued that can.
+    pub fn hurried(&self) -> bool {
+        self.hurry && self.sendable() > 0
+    }
+
+    /// Put the lines queued for the model back in the box, ahead of anything
+    /// typed since, for a turn that was stopped. Commands stay queued to run,
+    /// since they were never going to the model.
+    pub fn hand_back(&mut self) {
+        let (commands, lines): (Vec<String>, Vec<String>) = self
+            .queued
+            .drain(..)
+            .partition(|line| line.starts_with('/'));
+        self.queued = commands.into();
+        if lines.is_empty() {
+            return;
+        }
+        let mut text = lines.join("\n\n");
+        let typed = self.line.text().trim();
+        if !typed.is_empty() {
+            text = format!("{text}\n\n{typed}");
+        }
+        self.line.set(&text);
+        self.settle();
     }
 
     /// Do `work` without the screen going quiet: the waiting line in the
@@ -707,6 +769,7 @@ impl Bar {
         self.working = on;
         if !on {
             self.interrupt = false;
+            self.hurry = false;
         }
         // The footer says whether escape will stop anything, so it is
         // redrawn now rather than at the next key; that also brings out the
@@ -788,6 +851,11 @@ impl Bar {
                 self.enters += 1;
                 self.enter_at = Some(self.handled);
             }
+            // Not ctrl-enter, which most terminals send as a plain enter,
+            // nor alt-enter, which is the newline above and fills the screen
+            // on Windows. Ctrl-s reaches us as itself everywhere, since raw
+            // mode turns off the flow control that once took it.
+            KeyCode::Char('s') if control => self.send_now(),
             KeyCode::Tab => {
                 if let Some(choice) = options.get(self.picked) {
                     self.line.set(choice.name);
@@ -798,6 +866,13 @@ impl Bar {
                 self.picked = self.picked.checked_sub(1).unwrap_or(options.len() - 1)
             }
             KeyCode::Down if !options.is_empty() => self.picked = (self.picked + 1) % options.len(),
+            // What has not gone in yet can still be changed, so up brings the
+            // newest queued line back before it reaches for what was sent.
+            KeyCode::Up if self.line.is_empty() && !self.queued.is_empty() => {
+                if let Some(line) = self.queued.pop_back() {
+                    self.line.set(&line);
+                }
+            }
             KeyCode::Up => self.line.up(),
             KeyCode::Down => self.line.down(),
             KeyCode::Left if control => self.line.word_left(),
@@ -845,8 +920,8 @@ impl Bar {
     }
 
     /// Send what is in the box: the line ending the enter put in comes off,
-    /// a highlighted command wins over what was typed, and what is left goes
-    /// into the conversation and the queue.
+    /// a highlighted command wins over what was typed, and what is left joins
+    /// the queue, going into the conversation once it is taken from there.
     fn send(&mut self) {
         let text = self.line.text().trim_end_matches('\n').to_owned();
         self.line.set(&text);
@@ -859,11 +934,18 @@ impl Bar {
             self.settle();
             return;
         }
-        if !self.secret {
-            self.echo(&line);
-        }
         self.queued.push_back(line);
         self.settle();
+    }
+
+    /// The send-now key: what is in the box is entered as with enter, and
+    /// while a turn runs, what is queued goes to the model without waiting
+    /// for the reply to finish.
+    fn send_now(&mut self) {
+        if !self.line.is_empty() {
+            self.send();
+        }
+        self.hurry = self.working && self.sendable() > 0;
     }
 
     /// The mouse: the wheel moves the view, and dragging marks text and
@@ -1026,6 +1108,32 @@ impl Bar {
         if let Some(waiting) = &self.waiting {
             lines.push(waiting.line(render::width()));
         }
+        // Lines entered while something runs wait here rather than in the
+        // conversation, which only gets them once they go in. At the prompt
+        // a line is taken as soon as it is entered, so it never shows.
+        if (self.working || self.waiting.is_some()) && !self.queued.is_empty() {
+            lines.push(format!(
+                "{}{}",
+                render::PAD,
+                render::dim("queued · goes in after this step")
+            ));
+            let hidden = self.queued.len().saturating_sub(QUEUED_LIMIT);
+            if hidden > 0 {
+                lines.push(format!(
+                    "{}{}",
+                    render::PAD,
+                    render::dim(&format!("… {hidden} more"))
+                ));
+            }
+            for line in self.queued.iter().skip(hidden) {
+                lines.push(format!(
+                    "{}{} {}",
+                    render::GUTTER,
+                    render::dim("›"),
+                    render::dim(&one_row(line, room))
+                ));
+            }
+        }
         lines.push(format!(
             "{}{}",
             render::MARGIN,
@@ -1085,6 +1193,8 @@ impl Bar {
             "↑↓ to choose  ·  enter to take it  ·  esc to decline".to_owned()
         } else if back > 0 {
             format!("scrolled back {back} lines  ·  end to follow again")
+        } else if self.working && self.sendable() > 0 {
+            "ctrl-s to send now  ·  ↑ to take it back  ·  esc to stop".to_owned()
         } else if self.working {
             // Said while it applies rather than only after a long silence:
             // a reply going the wrong way is worth stopping early.
@@ -1245,6 +1355,18 @@ fn checklist(todos: &[Todo], room: usize) -> Vec<String> {
     lines
 }
 
+/// A queued line cut to one row `room` columns wide: its first line, with an
+/// ellipsis where anything was left off.
+fn one_row(text: &str, room: usize) -> String {
+    let first = text.lines().next().unwrap_or_default();
+    if first.chars().count() <= room && !text.trim_end().contains('\n') {
+        return first.to_owned();
+    }
+    let mut row: String = first.chars().take(room.saturating_sub(1)).collect();
+    row.push('…');
+    row
+}
+
 /// Where each stop sits on a track `width` columns wide: spread evenly, the
 /// first at the left end and the last at the right.
 fn stops_at(count: usize, width: usize) -> Vec<usize> {
@@ -1299,8 +1421,8 @@ fn track(stops: &[String], at: usize, room: usize) -> (String, String, usize) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Bar, Choice, MENU_LIMIT, PLAN_ROWS, Slider, Waited, checklist, closest, matches, menu_top,
-        stops_at, track,
+        Bar, Choice, MENU_LIMIT, PLAN_ROWS, QUEUED_LIMIT, Slider, Waited, checklist, closest,
+        matches, menu_top, one_row, stops_at, track,
     };
     use crate::render::{MARGIN, plain, visible};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1324,6 +1446,18 @@ mod tests {
 
     fn press(bar: &mut Bar, code: KeyCode) {
         bar.nudge(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn hit(bar: &mut Bar, code: KeyCode, modifiers: KeyModifiers) {
+        bar.key(KeyEvent::new(code, modifiers));
+    }
+
+    /// The rows drawn above the box's top edge.
+    fn above_the_box(bar: &Bar) -> Vec<String> {
+        bar.lines(40)
+            .into_iter()
+            .take_while(|line| !line.contains('╭'))
+            .collect()
     }
 
     #[test]
@@ -1631,5 +1765,146 @@ mod tests {
         bar.listen();
         assert!(bar.bell.is_none());
         assert!(!letronna_core::inbox::listened());
+    }
+
+    #[test]
+    fn a_line_entered_while_it_works_waits_above_the_box_until_it_goes_in() {
+        let mut bar = Bar::new(String::new());
+        // At the prompt a line is taken the moment it is entered, so it is
+        // never drawn as waiting.
+        bar.line.set("hello");
+        bar.send();
+        assert!(above_the_box(&bar).is_empty());
+        bar.queued.clear();
+
+        bar.working(true);
+        bar.line.set("check the docs too");
+        bar.send();
+        assert!(bar.line.is_empty());
+        let above = above_the_box(&bar);
+        assert!(above[0].contains("queued · goes in after this step"));
+        assert!(above[1].contains("check the docs too"));
+        assert_eq!(bar.take_typed(), ["check the docs too"]);
+        assert!(
+            above_the_box(&bar).is_empty(),
+            "it went in and still showed"
+        );
+    }
+
+    #[test]
+    fn a_long_queue_shows_its_newest_lines_and_counts_the_rest() {
+        let mut bar = Bar::new(String::new());
+        bar.working(true);
+        bar.queued = (0..QUEUED_LIMIT + 2).map(|i| format!("line {i}")).collect();
+        let above = above_the_box(&bar);
+        assert_eq!(above.len(), 2 + QUEUED_LIMIT);
+        assert!(above[1].contains("… 2 more"));
+        assert!(!above.iter().any(|row| row.contains("line 1")));
+        assert!(
+            above
+                .last()
+                .unwrap()
+                .contains(&format!("line {}", QUEUED_LIMIT + 1))
+        );
+    }
+
+    #[test]
+    fn a_queued_line_is_cut_to_one_row() {
+        assert_eq!(one_row("check the docs", 20), "check the docs");
+        assert_eq!(one_row("check the docs", 10), "check the…");
+        // A line under a first line is something left off, too.
+        assert_eq!(
+            one_row("check the docs\nand the tests", 40),
+            "check the docs…"
+        );
+        assert_eq!(one_row("check the docs\n", 40), "check the docs");
+    }
+
+    #[test]
+    fn up_on_an_empty_box_takes_the_newest_queued_line_back() {
+        let mut bar = Bar::new(String::new());
+        bar.working(true);
+        bar.queued = ["check the docs", "and the tests"].map(String::from).into();
+        hit(&mut bar, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(bar.line.text(), "and the tests");
+        assert_eq!(bar.queued, ["check the docs"]);
+        // With something in the box, up is the box's own again.
+        hit(&mut bar, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(bar.line.text(), "and the tests");
+        assert_eq!(bar.queued, ["check the docs"]);
+    }
+
+    #[test]
+    fn a_stopped_turn_puts_what_was_queued_back_in_the_box() {
+        let mut bar = Bar::new(String::new());
+        bar.queued = ["check the docs", "/where", "and the tests"]
+            .map(String::from)
+            .into();
+        bar.line.set("half typed ");
+        bar.hand_back();
+        // Ahead of what was typed since, as the window does.
+        assert_eq!(
+            bar.line.text(),
+            "check the docs\n\nand the tests\n\nhalf typed"
+        );
+        // A command was never going to the model, so it still runs.
+        assert_eq!(bar.queued, ["/where"]);
+        bar.queued.clear();
+        bar.hand_back();
+        assert_eq!(
+            bar.line.text(),
+            "check the docs\n\nand the tests\n\nhalf typed"
+        );
+    }
+
+    #[test]
+    fn the_send_now_key_hurries_only_what_can_go_in() {
+        let send_now = |bar: &mut Bar| hit(bar, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        let mut bar = Bar::new(String::new());
+        // At the prompt it is enter, with nothing to cut short.
+        bar.line.set("hello");
+        send_now(&mut bar);
+        assert_eq!(bar.queued, ["hello"]);
+        assert!(!bar.hurried());
+        bar.queued.clear();
+
+        bar.working(true);
+        // A command waits for the turn to end whatever is pressed.
+        bar.queued.push_back("/where".into());
+        send_now(&mut bar);
+        assert!(!bar.hurried());
+        bar.queued.clear();
+
+        // What is in the box is entered first and goes with the rest.
+        bar.queued.push_back("check the docs".into());
+        bar.line.set("and the tests");
+        send_now(&mut bar);
+        assert_eq!(bar.queued, ["check the docs", "and the tests"]);
+        assert!(bar.hurried());
+        assert_eq!(bar.take_typed(), ["check the docs", "and the tests"]);
+        assert!(
+            !bar.hurried(),
+            "the step that took them did not end the hurry"
+        );
+
+        // Taken back before the reply was cut, nothing is left to hurry.
+        bar.queued.push_back("one more".into());
+        send_now(&mut bar);
+        hit(&mut bar, KeyCode::Up, KeyModifiers::NONE);
+        assert!(!bar.hurried());
+        // And a turn that ends forgets it.
+        send_now(&mut bar);
+        assert!(bar.hurried());
+        bar.working(false);
+        assert!(!bar.hurried());
+    }
+
+    #[test]
+    fn the_footer_names_the_send_now_key_while_lines_wait() {
+        let mut bar = Bar::new("fake".into());
+        bar.working(true);
+        assert!(!bar.lines(40).last().unwrap().contains("ctrl-s"));
+        bar.queued.push_back("check the docs".into());
+        assert!(bar.lines(40).last().unwrap().contains("ctrl-s to send now"));
     }
 }
