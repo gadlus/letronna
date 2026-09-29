@@ -108,6 +108,10 @@ pub const COMMANDS: &[Command] = &[
         blurb: "pick up a session; a word finds it by title or what was said",
     },
     Command {
+        name: "/import",
+        blurb: "continue a session from Claude Code or Codex",
+    },
+    Command {
         name: "/undo",
         blurb: "take back the last exchange; --files puts files back too",
     },

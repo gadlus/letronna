@@ -86,6 +86,10 @@ pub struct Conversation {
     /// it is visible for the same reason as `flushed`.
     #[serde(skip)]
     pub summary_saved: bool,
+    /// Where this session came from, for one imported from Claude Code or
+    /// Codex rather than started here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported_from: Option<crate::import::Source>,
 }
 
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -103,6 +107,8 @@ pub struct Meta {
     pub gateway: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported_from: Option<crate::import::Source>,
 }
 
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -425,6 +431,16 @@ impl Store {
         self.conversations.iter().position(|c| c.id == id)
     }
 
+    /// The session already imported from this source, if any: importing it
+    /// again opens that one rather than making a second.
+    pub fn find_by_import(&self, tool: crate::import::Tool, session_id: &str) -> Option<usize> {
+        self.conversations.iter().position(|c| {
+            c.imported_from
+                .as_ref()
+                .is_some_and(|s| s.tool == tool && s.session_id == session_id)
+        })
+    }
+
     /// The gateway and model the session at `index` talks to: its own, or
     /// the settings' when it has none or its gateway is no longer offered.
     pub fn model(&self, index: usize) -> (&str, &str) {
@@ -561,6 +577,7 @@ impl Conversation {
             model: self.model.clone(),
             gateway: self.gateway.clone(),
             effort: self.effort.clone(),
+            imported_from: self.imported_from.clone(),
         }
     }
 
@@ -706,6 +723,7 @@ fn replay(path: &std::path::Path) -> Option<Conversation> {
                 conversation.model = meta.model;
                 conversation.gateway = meta.gateway;
                 conversation.effort = meta.effort;
+                conversation.imported_from = meta.imported_from;
             }
             Ok(Record::Message(message)) => conversation.messages.push(message),
             Ok(Record::Rewind { to }) => {
@@ -842,6 +860,7 @@ pub struct Summary {
     pub model: Option<String>,
     pub gateway: Option<String>,
     pub effort: Option<String>,
+    pub imported_from: Option<crate::import::Source>,
 }
 
 /// The sessions on disk, newest first, without loading what is in them.
@@ -1033,6 +1052,7 @@ fn tally(summary: &mut Summary, bytes: &[u8]) {
                 summary.model = meta.model;
                 summary.gateway = meta.gateway;
                 summary.effort = meta.effort;
+                summary.imported_from = meta.imported_from;
             }
             Ok(Record::Message(_)) => summary.messages += 1,
             Ok(Record::Rewind { to }) => summary.messages = summary.messages.min(to),
@@ -1617,6 +1637,7 @@ pub fn load_listing() -> Store {
                 model: s.model,
                 gateway: s.gateway,
                 effort: s.effort,
+                imported_from: s.imported_from,
                 counted: s.messages,
                 ..Default::default()
             };
