@@ -2286,11 +2286,15 @@ impl Chat {
     /// results or the reply cut short.
     fn fold_and_ask(&mut self, ix: usize, cx: &mut Context<Self>) {
         let conversation = &mut self.store.conversations[ix];
-        // After the results, which have to follow the calls they answer, and
-        // before what you typed, so yours is read last.
-        conversation
-            .messages
-            .extend(inbox::fold(&inbox::take(conversation.id, false)));
+        // After the results, which have to follow the calls they answer. What
+        // you sent while it worked goes in now too, before the model is asked
+        // again, so it reads it before going on.
+        // Folded into the running turn, so the window keeps its task.
+        let notices = inbox::fold(&inbox::take(conversation.id, false));
+        conversation.messages.extend(notices.map(|notice| Message {
+            folded: true,
+            ..notice
+        }));
         // What you sent while it worked goes in now, before the model is
         // asked again, so it reads it before going on, with its `@` paths
         // attached as a message sent on its own has them.

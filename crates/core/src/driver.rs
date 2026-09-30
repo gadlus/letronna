@@ -444,7 +444,12 @@ fn work_through(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result
                 // answer, and only if the run goes on: mail a run ending here
                 // would never read is left for its owner.
                 if settled(spec, report).is_none() && turn.looping().is_none() {
+                    // Folded into the run, so the window keeps its task.
                     let mail = inbox::fold(&inbox::take(spec.id, false));
+                    let mail = mail.map(|mail| Message {
+                        folded: true,
+                        ..mail
+                    });
                     spec.transcript.conversation.messages.extend(mail);
                 }
                 return save(&mut spec.transcript);
@@ -1220,6 +1225,15 @@ mod tests {
         let later = third.last().unwrap()["content"].as_str().unwrap();
         assert!(later.contains("the hour is up"), "{later}");
         assert!(inbox::take(id, true).is_empty());
+        // Mail read mid-run is folded into it, so the window keeps the task;
+        // mail that carries the run on after its answer starts a turn.
+        let saved = written(&dir.join("helper.jsonl"));
+        let folded: Vec<bool> = saved
+            .iter()
+            .filter(|message| message["notice"] == true)
+            .map(|message| message["folded"] == true)
+            .collect();
+        assert_eq!(folded, [true, false]);
     }
 
     #[test]
