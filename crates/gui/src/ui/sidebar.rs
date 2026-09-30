@@ -1,3 +1,4 @@
+use super::sessions::{self, SessionFilter, group_by_project, passes, project_label};
 use crate::prelude::*;
 
 /// The sidebar's width, its border included, which the chat column is
@@ -158,6 +159,7 @@ impl Chat {
     pub(crate) fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let now = backend::now();
         let query = self.search.read(cx).value().to_lowercase();
+        let filter = self.session_filter();
         let visible: Vec<usize> = (0..self.store.conversations.len())
             .rev()
             .filter(|&i| {
@@ -167,24 +169,24 @@ impl Chat {
                         .to_lowercase()
                         .contains(&query)
             })
+            .filter(|&i| filter.is_none_or(|f| passes(self.session_state(i), f)))
             .collect();
         let pinned: Vec<usize> = visible
             .iter()
             .copied()
             .filter(|&i| self.store.conversations[i].pinned)
             .collect();
+        let not_pinned: Vec<usize> = visible
+            .iter()
+            .copied()
+            .filter(|&i| !self.store.conversations[i].pinned)
+            .collect();
         let mut sessions = v_flex().gap_0p5();
         for &i in &pinned {
             sessions = sessions.child(self.session_row(i, now, cx));
         }
-        let mut last_bucket = "";
-        for &i in visible
-            .iter()
-            .filter(|&&i| !self.store.conversations[i].pinned)
-        {
-            let b = bucket(self.store.conversations[i].updated, now);
-            if b != last_bucket {
-                last_bucket = b;
+        if self.store.settings.group_by_project {
+            for (workspace, indices) in group_by_project(&self.store.conversations, &not_pinned) {
                 sessions = sessions.child(
                     div()
                         .mt_2()
@@ -193,10 +195,31 @@ impl Chat {
                         .text_xs()
                         .font_family(HEADING_FONT)
                         .text_color(cx.theme().muted_foreground)
-                        .child(b),
+                        .child(project_label(workspace.as_deref())),
                 );
+                for i in indices {
+                    sessions = sessions.child(self.session_row(i, now, cx));
+                }
             }
-            sessions = sessions.child(self.session_row(i, now, cx));
+        } else {
+            let mut last_bucket = "";
+            for &i in &not_pinned {
+                let b = bucket(self.store.conversations[i].updated, now);
+                if b != last_bucket {
+                    last_bucket = b;
+                    sessions = sessions.child(
+                        div()
+                            .mt_2()
+                            .mb_0p5()
+                            .px_2()
+                            .text_xs()
+                            .font_family(HEADING_FONT)
+                            .text_color(cx.theme().muted_foreground)
+                            .child(b),
+                    );
+                }
+                sessions = sessions.child(self.session_row(i, now, cx));
+            }
         }
         if visible.is_empty() {
             sessions = sessions.child(
@@ -210,6 +233,22 @@ impl Chat {
         }
 
         v_flex()
+            .key_context("Sessions")
+            .on_action(cx.listener(|this, _: &sessions::FilterNeedsYou, _, cx| {
+                this.toggle_session_filter(SessionFilter::NeedsYou, cx);
+            }))
+            .on_action(cx.listener(|this, _: &sessions::FilterWorking, _, cx| {
+                this.toggle_session_filter(SessionFilter::Working, cx);
+            }))
+            .on_action(cx.listener(|this, _: &sessions::FilterUnseen, _, cx| {
+                this.toggle_session_filter(SessionFilter::Unseen, cx);
+            }))
+            .on_action(cx.listener(|this, _: &sessions::FilterPinned, _, cx| {
+                this.toggle_session_filter(SessionFilter::Pinned, cx);
+            }))
+            .on_action(cx.listener(|this, _: &sessions::ToggleGrouping, _, cx| {
+                this.toggle_grouping(cx);
+            }))
             .w(SIDEBAR_WIDTH)
             .h_full()
             .flex_shrink_0()
@@ -284,6 +323,7 @@ impl Chat {
                         ),
                 ),
             )
+            .child(div().pt_1().child(self.session_filter_row(cx)))
             .child(
                 v_flex()
                     .id("session-list")

@@ -118,6 +118,8 @@ pub(crate) enum AppIcon {
     PopIn,
     View,
     Branch,
+    Alert,
+    Loader,
 }
 impl IconNamed for AppIcon {
     fn path(self) -> SharedString {
@@ -153,6 +155,8 @@ impl IconNamed for AppIcon {
             AppIcon::PopIn => "icons/pop-in.svg",
             AppIcon::View => "icons/view.svg",
             AppIcon::Branch => "icons/git-branch.svg",
+            AppIcon::Alert => "icons/triangle-alert.svg",
+            AppIcon::Loader => "icons/loader-circle.svg",
         }
         .into()
     }

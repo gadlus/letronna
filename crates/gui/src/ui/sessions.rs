@@ -1,5 +1,130 @@
+use crate::app::card_is_up;
 use crate::prelude::*;
-use gpui_component::menu::PopupMenu;
+use gpui_component::{Selectable, menu::PopupMenu};
+
+actions!(
+    sessions,
+    [
+        FilterNeedsYou,
+        FilterWorking,
+        FilterUnseen,
+        FilterPinned,
+        ToggleGrouping
+    ]
+);
+
+/// One of the sidebar's filters, narrowing the list to sessions in that
+/// state; only one applies at a time.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SessionFilter {
+    /// A permission prompt or an `ask_user` question is waiting on you.
+    NeedsYou,
+    /// A turn is running, here or in a helper.
+    Working,
+    /// A notice woke it while it was not on screen.
+    Unseen,
+    Pinned,
+}
+
+impl SessionFilter {
+    pub(crate) const ALL: [SessionFilter; 4] = [
+        SessionFilter::NeedsYou,
+        SessionFilter::Working,
+        SessionFilter::Unseen,
+        SessionFilter::Pinned,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            SessionFilter::NeedsYou => "needs_you",
+            SessionFilter::Working => "working",
+            SessionFilter::Unseen => "unseen",
+            SessionFilter::Pinned => "pinned",
+        }
+    }
+
+    fn parse(saved: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|f| f.as_str() == saved)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            SessionFilter::NeedsYou => "Needs you",
+            SessionFilter::Working => "Working",
+            SessionFilter::Unseen => "Unseen",
+            SessionFilter::Pinned => "Pinned",
+        }
+    }
+
+    fn icon(self) -> AppIcon {
+        match self {
+            SessionFilter::NeedsYou => AppIcon::Alert,
+            SessionFilter::Working => AppIcon::Loader,
+            SessionFilter::Unseen => AppIcon::Circle,
+            SessionFilter::Pinned => AppIcon::Pin,
+        }
+    }
+}
+
+/// A session's state as the sidebar's filters see it.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct SessionState {
+    pub(crate) needs_you: bool,
+    pub(crate) working: bool,
+    pub(crate) unseen: bool,
+    pub(crate) pinned: bool,
+}
+
+/// Whether a session in `state` passes `filter`.
+pub(crate) fn passes(state: SessionState, filter: SessionFilter) -> bool {
+    match filter {
+        SessionFilter::NeedsYou => state.needs_you,
+        SessionFilter::Working => state.working,
+        SessionFilter::Unseen => state.unseen,
+        SessionFilter::Pinned => state.pinned,
+    }
+}
+
+/// The filter after `picked` is chosen while `current` applies: picking the
+/// one already on clears it, so pressing a filter's key twice turns it off.
+fn next_filter(current: Option<SessionFilter>, picked: SessionFilter) -> Option<SessionFilter> {
+    if current == Some(picked) {
+        None
+    } else {
+        Some(picked)
+    }
+}
+
+/// `indices` into `conversations`, grouped by project folder: each group
+/// keeps the order its sessions already had, and groups are ordered by
+/// which project's session came first. Sessions with no folder share one
+/// group, keyed by `None`.
+pub(crate) fn group_by_project(
+    conversations: &[Conversation],
+    indices: &[usize],
+) -> Vec<(Option<PathBuf>, Vec<usize>)> {
+    let mut groups: Vec<(Option<PathBuf>, Vec<usize>)> = Vec::new();
+    for &i in indices {
+        let key = conversations[i].workspace.clone();
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, group)) => group.push(i),
+            None => groups.push((key, vec![i])),
+        }
+    }
+    groups
+}
+
+/// The heading a project's group shows: its folder's name, its full path
+/// when it has none, or "No project" for sessions with no folder.
+pub(crate) fn project_label(workspace: Option<&std::path::Path>) -> String {
+    match workspace {
+        Some(path) => path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string()),
+        None => "No project".to_owned(),
+    }
+}
 
 impl Chat {
     pub(crate) fn session_menu(
@@ -190,5 +315,193 @@ impl Chat {
             }
         })
         .detach();
+    }
+
+    /// Whether session `id` needs you: a helper's call is waiting on you
+    /// there, or the turn on screen is and it is this session's.
+    pub(crate) fn needs_you(&self, id: u64) -> bool {
+        self.agent_asks.iter().any(|request| request.root == id)
+            || (self.streaming_id == Some(id)
+                && self
+                    .turn
+                    .as_ref()
+                    .is_some_and(|turn| card_is_up(turn, self.asking.as_deref())))
+    }
+
+    /// The state the sidebar's filters see the session at `index` in.
+    pub(crate) fn session_state(&self, index: usize) -> SessionState {
+        let c = &self.store.conversations[index];
+        let needs_you = self.needs_you(c.id);
+        SessionState {
+            needs_you,
+            working: !needs_you
+                && ((self.busy && self.streaming_id == Some(c.id))
+                    || self.helpers_working_in(c.id)),
+            unseen: self.unseen.contains(&c.id),
+            pinned: c.pinned,
+        }
+    }
+
+    /// The sidebar's filter, as it was last saved.
+    pub(crate) fn session_filter(&self) -> Option<SessionFilter> {
+        SessionFilter::parse(&self.store.settings.session_filter)
+    }
+
+    /// Pick `filter`, or clear it when it is already the one showing.
+    pub(crate) fn toggle_session_filter(&mut self, filter: SessionFilter, cx: &mut Context<Self>) {
+        self.store.settings.session_filter = next_filter(self.session_filter(), filter)
+            .map_or(String::new(), |f| f.as_str().to_owned());
+        self.save();
+        cx.notify();
+    }
+
+    /// Clear the sidebar's filter, for Escape; true when there was one to
+    /// clear, so escape falls through to stopping a turn otherwise.
+    pub(crate) fn clear_session_filter(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.store.settings.session_filter.is_empty() {
+            return false;
+        }
+        self.store.settings.session_filter.clear();
+        self.save();
+        cx.notify();
+        true
+    }
+
+    /// Switch grouping the sidebar by project on or off.
+    pub(crate) fn toggle_grouping(&mut self, cx: &mut Context<Self>) {
+        self.store.settings.group_by_project ^= true;
+        self.save();
+        cx.notify();
+    }
+
+    /// One button per filter, and a toggle to group by project, in the row
+    /// under the sidebar's search box.
+    pub(crate) fn session_filter_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .px_2()
+            .gap_1()
+            .items_center()
+            .child(self.filter_chip(SessionFilter::NeedsYou, cx))
+            .child(self.filter_chip(SessionFilter::Working, cx))
+            .child(self.filter_chip(SessionFilter::Unseen, cx))
+            .child(self.filter_chip(SessionFilter::Pinned, cx))
+            .child(div().flex_1())
+            .child(self.group_toggle(cx))
+    }
+
+    fn filter_chip(&self, filter: SessionFilter, cx: &mut Context<Self>) -> impl IntoElement {
+        let on = self.session_filter() == Some(filter);
+        Button::new(("session-filter", filter as usize))
+            .plain(cx)
+            .xsmall()
+            .selected(on)
+            .icon(Icon::new(filter.icon()).size_3().text_color(if on {
+                cx.theme().primary
+            } else {
+                cx.theme().muted_foreground
+            }))
+            .tooltip(filter.label())
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_session_filter(filter, cx)))
+    }
+
+    fn group_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let on = self.store.settings.group_by_project;
+        Button::new("group-by-project")
+            .plain(cx)
+            .xsmall()
+            .selected(on)
+            .icon(Icon::new(AppIcon::Folder).size_3().text_color(if on {
+                cx.theme().primary
+            } else {
+                cx.theme().muted_foreground
+            }))
+            .tooltip("Group by project")
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_grouping(cx)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Conversation, SessionFilter, SessionState, group_by_project, next_filter, passes,
+        project_label,
+    };
+    use std::path::PathBuf;
+
+    fn state(needs_you: bool, working: bool, unseen: bool, pinned: bool) -> SessionState {
+        SessionState {
+            needs_you,
+            working,
+            unseen,
+            pinned,
+        }
+    }
+
+    #[test]
+    fn each_filter_passes_only_its_own_state() {
+        let waiting = state(true, false, false, false);
+        let running = state(false, true, false, false);
+        let woken = state(false, false, true, false);
+        let kept = state(false, false, false, true);
+        assert!(passes(waiting, SessionFilter::NeedsYou));
+        assert!(!passes(waiting, SessionFilter::Working));
+        assert!(passes(running, SessionFilter::Working));
+        assert!(!passes(running, SessionFilter::Unseen));
+        assert!(passes(woken, SessionFilter::Unseen));
+        assert!(!passes(woken, SessionFilter::Pinned));
+        assert!(passes(kept, SessionFilter::Pinned));
+        assert!(!passes(kept, SessionFilter::NeedsYou));
+    }
+
+    #[test]
+    fn picking_a_filter_again_clears_it() {
+        assert_eq!(
+            next_filter(None, SessionFilter::Working),
+            Some(SessionFilter::Working)
+        );
+        assert_eq!(
+            next_filter(Some(SessionFilter::Working), SessionFilter::Working),
+            None
+        );
+        assert_eq!(
+            next_filter(Some(SessionFilter::Working), SessionFilter::Pinned),
+            Some(SessionFilter::Pinned)
+        );
+    }
+
+    fn with_workspace(workspace: Option<&str>) -> Conversation {
+        Conversation {
+            workspace: workspace.map(PathBuf::from),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn sessions_group_by_project_keeping_their_order_and_no_folder_together() {
+        let conversations = vec![
+            with_workspace(Some("/code/letronna")),
+            with_workspace(None),
+            with_workspace(Some("/code/other")),
+            with_workspace(Some("/code/letronna")),
+            with_workspace(None),
+        ];
+        let groups = group_by_project(&conversations, &[0, 1, 2, 3, 4]);
+        assert_eq!(
+            groups,
+            vec![
+                (Some(PathBuf::from("/code/letronna")), vec![0, 3]),
+                (None, vec![1, 4]),
+                (Some(PathBuf::from("/code/other")), vec![2]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_project_group_is_named_for_its_folder_or_has_no_project() {
+        assert_eq!(
+            project_label(Some(&PathBuf::from("/code/letronna"))),
+            "letronna"
+        );
+        assert_eq!(project_label(None), "No project");
     }
 }

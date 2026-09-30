@@ -83,7 +83,34 @@ fn main() {
             KeyBinding::new("shift-tab", ui::browser::PageTabBack, Some("Browser")),
             KeyBinding::new("tab", ui::composer::LeaveComposer, Some("Composer > Input")),
             KeyBinding::new("enter", ui::search::OpenHit, Some("SearchHit")),
+            // The sidebar's own filters, so a shortcut typed elsewhere is
+            // never swallowed by one narrowing a list it cannot see.
+            KeyBinding::new(
+                "secondary-shift-g",
+                ui::sessions::ToggleGrouping,
+                Some("Sessions"),
+            ),
         ]);
+        // Windows hands Shift and a digit over as the character they type,
+        // Ctrl+Shift+4 as "ctrl-$", which a binding written "shift-4" never
+        // meets. The platform's keyboard mapper binds the character the
+        // layout in use puts on that key; elsewhere it leaves them as written.
+        let mapper = cx.keyboard_mapper().clone();
+        let typed = |keys: &str, action: Box<dyn Action>| {
+            let sessions = KeyBindingContextPredicate::parse("Sessions").ok();
+            let sessions = sessions.map(std::rc::Rc::new);
+            KeyBinding::load(keys, action, sessions, false, None, mapper.as_ref()).ok()
+        };
+        cx.bind_keys(
+            [
+                typed("secondary-shift-1", Box::new(ui::sessions::FilterNeedsYou)),
+                typed("secondary-shift-2", Box::new(ui::sessions::FilterWorking)),
+                typed("secondary-shift-3", Box::new(ui::sessions::FilterUnseen)),
+                typed("secondary-shift-4", Box::new(ui::sessions::FilterPinned)),
+            ]
+            .into_iter()
+            .flatten(),
+        );
         platform::tray::init(cx);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {

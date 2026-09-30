@@ -305,6 +305,14 @@ pub struct Settings {
     /// or `Gateway:model`; see `fallback`.
     #[serde(default, deserialize_with = "names")]
     pub fallbacks: Vec<String>,
+    /// The sidebar's list narrowed to one state: "needs_you", "working",
+    /// "unseen" or "pinned"; empty for no filter.
+    #[serde(default)]
+    pub session_filter: String,
+    /// Group the sidebar's sessions by their project folder instead of by
+    /// how long ago each was updated.
+    #[serde(default)]
+    pub group_by_project: bool,
 }
 
 // Written out rather than derived so the film grain and notifications start
@@ -340,6 +348,8 @@ impl Default for Settings {
             notifications: true,
             voice: false,
             verify_edits: true,
+            session_filter: String::new(),
+            group_by_project: false,
         }
     }
 }
