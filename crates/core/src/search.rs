@@ -22,8 +22,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::Mutex;
-use std::time::{Duration, SystemTime};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 /// How long a search service gets to answer.
 const SEARCH_TIME: Duration = Duration::from_secs(20);
@@ -33,6 +33,12 @@ const MOST_RESULTS: u64 = 10;
 /// A result's snippet is cut to this many characters: enough to tell what the
 /// page is, and a list of ten stays short.
 const SNIPPET: usize = 300;
+/// How many results a service that cannot narrow by site is asked for while
+/// the list is narrowed here, so a few are still left afterwards: Brave's
+/// most.
+const WIDER: u64 = 20;
+/// How long a search's answer is given again for the very same search.
+const MEMO_TIME: Duration = Duration::from_secs(10 * 60);
 
 /// A search service Letronna can use.
 pub struct Service {
@@ -263,12 +269,15 @@ impl Tool for SearchWeb {
         "search_web"
     }
     fn description(&self) -> &'static str {
-        "Search the web with the user's search service. Returns a numbered list of results, each with its title, address and a snippet; read a page in full with web_fetch."
+        "Search the web with the user's search service. Returns a numbered list of results, each with its title, address and a snippet; read a page in full with web_fetch. allowed_domains keeps only results from those sites and blocked_domains drops them, subdomains included; a site in both is blocked. Tavily and Exa narrow the search itself, while Brave and SearXNG are filtered here after they answer, so fewer results may come back. freshness keeps to pages from the last day, week, month or year. The same search again within 10 minutes gives the earlier answer."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
             "query": {"type": "string", "description": "What to search for, as you would type it into a search engine."},
-            "count": {"type": "integer", "description": "How many results, 1 to 10. Left out, 5."}
+            "count": {"type": "integer", "description": "How many results, 1 to 10. Left out, 5."},
+            "allowed_domains": {"type": "array", "items": {"type": "string"}, "description": "Only results from these sites and their subdomains, such as [\"docs.rs\"]."},
+            "blocked_domains": {"type": "array", "items": {"type": "string"}, "description": "No results from these sites or their subdomains."},
+            "freshness": {"type": "string", "enum": ["day", "week", "month", "year"], "description": "Only pages from this last stretch of time."}
         }, "required": ["query"]})
     }
     fn run(&self, args: &Value, _: &ToolContext) -> Result<String, String> {
@@ -280,11 +289,18 @@ impl Tool for SearchWeb {
             .as_u64()
             .unwrap_or(RESULTS)
             .clamp(1, MOST_RESULTS);
-        search(
-            &usable(&choice(), &crate::store::load_keys())?,
-            query,
+        let options = options(args)?;
+        let reach = usable(&choice(), &crate::store::load_keys())?;
+        let asked = Asked {
+            service: reach.service.name,
+            address: reach.address.clone(),
+            query: query.to_owned(),
             count,
-        )
+            options,
+        };
+        searched_once(memo(), asked, Instant::now(), |asked| {
+            search(&reach, query, count, &asked.options)
+        })
     }
     fn needs_approval(&self) -> bool {
         true
@@ -298,7 +314,13 @@ impl Tool for SearchWeb {
     }
     fn preview(&self, args: &Value, _: &ToolContext) -> String {
         let query = args["query"].as_str().unwrap_or_default();
-        match usable(&choice(), &crate::store::load_keys()) {
+        // Tavily and Exa are sent the sites too, so the card and the judge
+        // see every word that leaves, not just the query. Filters that do
+        // not parse stop the call before anything is sent.
+        let filters = options(args)
+            .map(|options| filters(&options))
+            .unwrap_or_default();
+        let search = match usable(&choice(), &crate::store::load_keys()) {
             Ok(reach) if reach.address == reach.service.official => {
                 format!("Search {} for \"{query}\"", reach.service.name)
             }
@@ -307,8 +329,25 @@ impl Tool for SearchWeb {
                 reach.service.name, reach.address
             ),
             Err(_) => format!("Search for \"{query}\""),
-        }
+        };
+        format!("{search}{filters}")
     }
+}
+
+/// The filters as the approval card lists them, each on a line of its own,
+/// or nothing when there are none.
+fn filters(options: &Options) -> String {
+    let mut shown = String::new();
+    if !options.allowed.is_empty() {
+        shown.push_str(&format!("\nonly from {}", options.allowed.join(", ")));
+    }
+    if !options.blocked.is_empty() {
+        shown.push_str(&format!("\nnot from {}", options.blocked.join(", ")));
+    }
+    if let Some(freshness) = options.freshness {
+        shown.push_str(&format!("\nfrom the last {}", freshness.word()));
+    }
+    shown
 }
 
 /// One result, as every service's answer comes down to.
@@ -319,8 +358,298 @@ struct Hit {
     snippet: String,
 }
 
-/// Ask the service for `query`, and list what it found.
-fn search(reach: &Reach, query: &str, count: u64) -> Result<String, String> {
+/// How far back a search reaches.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum Freshness {
+    Day,
+    Week,
+    Month,
+    Year,
+}
+
+impl Freshness {
+    /// The word Tavily and SearXNG take, and the model gives.
+    fn word(self) -> &'static str {
+        match self {
+            Freshness::Day => "day",
+            Freshness::Week => "week",
+            Freshness::Month => "month",
+            Freshness::Year => "year",
+        }
+    }
+
+    /// Brave's code for it.
+    fn brave(self) -> &'static str {
+        match self {
+            Freshness::Day => "pd",
+            Freshness::Week => "pw",
+            Freshness::Month => "pm",
+            Freshness::Year => "py",
+        }
+    }
+
+    /// The first day it reaches back to, which is how Exa takes it.
+    fn since(self, today: chrono::NaiveDate) -> chrono::NaiveDate {
+        let days = match self {
+            Freshness::Day => 1,
+            Freshness::Week => 7,
+            Freshness::Month => 30,
+            Freshness::Year => 365,
+        };
+        today - chrono::Days::new(days)
+    }
+}
+
+/// Which sites and how recent, as the model asked.
+#[derive(Clone, Default, PartialEq, Eq, Hash, Debug)]
+struct Options {
+    allowed: Vec<String>,
+    blocked: Vec<String>,
+    freshness: Option<Freshness>,
+}
+
+impl Options {
+    fn by_site(&self) -> bool {
+        !self.allowed.is_empty() || !self.blocked.is_empty()
+    }
+}
+
+/// The filters in a search_web call, checked.
+fn options(args: &Value) -> Result<Options, String> {
+    let freshness = match args["freshness"]
+        .as_str()
+        .map(|word| word.trim().to_lowercase())
+    {
+        None if args["freshness"].is_null() => None,
+        Some(word) if word.is_empty() => None,
+        Some(word) if word == "day" => Some(Freshness::Day),
+        Some(word) if word == "week" => Some(Freshness::Week),
+        Some(word) if word == "month" => Some(Freshness::Month),
+        Some(word) if word == "year" => Some(Freshness::Year),
+        _ => return Err("freshness is one of day, week, month or year.".into()),
+    };
+    Ok(Options {
+        allowed: domains(&args["allowed_domains"], "allowed_domains")?,
+        blocked: domains(&args["blocked_domains"], "blocked_domains")?,
+        freshness,
+    })
+}
+
+/// A list of sites, each made a bare domain; sorted, so the same sites in
+/// another order are the same search to the memo.
+fn domains(value: &Value, field: &str) -> Result<Vec<String>, String> {
+    // A model asked for a list sometimes sends the one site on its own.
+    let listed: Vec<&str> = match value {
+        Value::Null => return Ok(Vec::new()),
+        Value::String(one) => vec![one],
+        Value::Array(items) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .ok_or_else(|| format!("{field} is a list of domains, each a string."))
+            })
+            .collect::<Result<_, _>>()?,
+        _ => {
+            return Err(format!(
+                "{field} is a list of domains, such as [\"example.com\"]."
+            ));
+        }
+    };
+    let mut found = listed
+        .into_iter()
+        .map(domain)
+        .collect::<Result<Vec<_>, _>>()?;
+    found.sort();
+    found.dedup();
+    Ok(found)
+}
+
+/// A site as the model wrote it -- perhaps with its scheme, a path or a
+/// leading `*.` -- as the bare domain it names.
+fn domain(written: &str) -> Result<String, String> {
+    let lower = written.trim().to_lowercase();
+    let bare = lower
+        .split_once("://")
+        .map_or(lower.as_str(), |(_, rest)| rest);
+    let bare = bare.split(['/', '?', '#']).next().unwrap_or_default();
+    let bare = bare
+        .trim_start_matches("*.")
+        .trim_start_matches('.')
+        .trim_end_matches('.');
+    let fits = bare.contains('.')
+        && bare.split('.').all(|label| {
+            !label.is_empty()
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        });
+    if !fits {
+        return Err(format!(
+            "\"{}\" is not a domain: give one such as example.com.",
+            written.trim()
+        ));
+    }
+    Ok(bare.to_owned())
+}
+
+/// Whether a result at `url` is one the filters keep: from an allowed site
+/// if any are given, and never from a blocked one, subdomains included.
+fn wanted(url: &str, options: &Options) -> bool {
+    if !options.by_site() {
+        return true;
+    }
+    let Some(host) = reqwest::Url::parse(url).ok().and_then(|url| {
+        url.host_str()
+            .map(|host| host.trim_end_matches('.').to_lowercase())
+    }) else {
+        return false;
+    };
+    let under = |domain: &String| {
+        host == *domain
+            || host
+                .strip_suffix(domain.as_str())
+                .is_some_and(|rest| rest.ends_with('.'))
+    };
+    if options.blocked.iter().any(under) {
+        return false;
+    }
+    options.allowed.is_empty() || options.allowed.iter().any(under)
+}
+
+/// Whether a service narrows a search by site itself; the others are
+/// narrowed here, once they answer.
+fn narrows_by_site(service: &str) -> bool {
+    matches!(service, "Tavily" | "Exa")
+}
+
+/// What the services asked with a GET are sent: Brave and SearXNG.
+fn parameters(
+    service: &str,
+    query: &str,
+    count: u64,
+    options: &Options,
+) -> Vec<(&'static str, String)> {
+    let mut sent = vec![("q", query.to_owned())];
+    if service == "Brave" {
+        let count = match options.by_site() {
+            true => WIDER,
+            false => count,
+        };
+        sent.push(("count", count.to_string()));
+        if let Some(freshness) = options.freshness {
+            sent.push(("freshness", freshness.brave().to_owned()));
+        }
+    } else {
+        sent.push(("format", "json".to_owned()));
+        if let Some(freshness) = options.freshness {
+            sent.push(("time_range", freshness.word().to_owned()));
+        }
+    }
+    sent
+}
+
+/// What the services asked with a POST are sent: Tavily and Exa.
+fn payload(
+    service: &str,
+    query: &str,
+    count: u64,
+    options: &Options,
+    today: chrono::NaiveDate,
+) -> Value {
+    if service == "Tavily" {
+        let mut sent = json!({"query": query, "max_results": count});
+        if !options.allowed.is_empty() {
+            sent["include_domains"] = json!(options.allowed);
+        }
+        if !options.blocked.is_empty() {
+            sent["exclude_domains"] = json!(options.blocked);
+        }
+        if let Some(freshness) = options.freshness {
+            sent["time_range"] = freshness.word().into();
+        }
+        return sent;
+    }
+    let mut sent = json!({"query": query, "numResults": count, "contents": {"highlights": {"maxCharacters": SNIPPET}}});
+    // Exa turns down both lists at once; the allowed one narrows the most,
+    // and a blocked subdomain of it is still dropped here.
+    if !options.allowed.is_empty() {
+        sent["includeDomains"] = json!(options.allowed);
+    } else if !options.blocked.is_empty() {
+        sent["excludeDomains"] = json!(options.blocked);
+    }
+    if let Some(freshness) = options.freshness {
+        sent["startPublishedDate"] = format!(
+            "{}T00:00:00.000Z",
+            freshness.since(today).format("%Y-%m-%d")
+        )
+        .into();
+    }
+    sent
+}
+
+/// A search as the memo knows it: the same service at the same address,
+/// asked the same thing.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct Asked {
+    service: &'static str,
+    address: String,
+    query: String,
+    count: u64,
+    options: Options,
+}
+
+/// Searches answered in the last `MEMO_TIME`, kept only in memory: a model
+/// that asks again a moment later gets the same list without spending
+/// another search of the user's plan.
+#[derive(Default)]
+struct Memo {
+    kept: HashMap<Asked, (Instant, String)>,
+}
+
+impl Memo {
+    fn recall(&self, asked: &Asked, now: Instant) -> Option<String> {
+        let (at, listing) = self.kept.get(asked)?;
+        (now.saturating_duration_since(*at) < MEMO_TIME).then(|| listing.clone())
+    }
+
+    fn keep(&mut self, asked: Asked, listing: String, now: Instant) {
+        self.kept
+            .retain(|_, (at, _)| now.saturating_duration_since(*at) < MEMO_TIME);
+        self.kept.insert(asked, (now, listing));
+    }
+}
+
+fn memo() -> &'static Mutex<Memo> {
+    static MEMO: OnceLock<Mutex<Memo>> = OnceLock::new();
+    MEMO.get_or_init(Default::default)
+}
+
+/// The answer to `asked` from the memo, with a note that it is, or from
+/// `search` when there is none still fresh. A failed search is not kept, so
+/// asking again tries again.
+fn searched_once(
+    memo: &Mutex<Memo>,
+    asked: Asked,
+    now: Instant,
+    search: impl FnOnce(&Asked) -> Result<String, String>,
+) -> Result<String, String> {
+    // Not held across the search, so searches running side by side wait
+    // only for each other's lookups.
+    let recalled = memo.lock().ok().and_then(|memo| memo.recall(&asked, now));
+    if let Some(listing) = recalled {
+        return Ok(format!(
+            "(The same search was made a few minutes ago; this is its answer again.)\n\n{listing}"
+        ));
+    }
+    let listing = search(&asked)?;
+    if let Ok(mut memo) = memo.lock() {
+        memo.keep(asked, listing.clone(), now);
+    }
+    Ok(listing)
+}
+
+/// Ask the service for `query`, and list what it found that the filters keep.
+fn search(reach: &Reach, query: &str, count: u64, options: &Options) -> Result<String, String> {
     let Reach {
         service,
         key,
@@ -331,23 +660,33 @@ fn search(reach: &Reach, query: &str, count: u64) -> Result<String, String> {
         .user_agent(concat!("Letronna/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|e| e.to_string())?;
+    let today = chrono::Utc::now().date_naive();
     let request = match service.name {
         "Brave" => client
             .get(address)
-            .query(&[("q", query), ("count", &count.to_string())])
+            .query(&parameters(service.name, query, count, options))
             .header("Accept", "application/json")
             .header("X-Subscription-Token", key),
-        "Tavily" => client
-            .post(address)
-            .bearer_auth(key)
-            .json(&json!({"query": query, "max_results": count})),
-        "Exa" => client
-            .post(address)
-            .header("x-api-key", key)
-            .json(&json!({"query": query, "numResults": count, "contents": {"highlights": {"maxCharacters": SNIPPET}}})),
-        _ => client
-            .get(format!("{address}/search"))
-            .query(&[("q", query), ("format", "json")]),
+        "Tavily" => client.post(address).bearer_auth(key).json(&payload(
+            service.name,
+            query,
+            count,
+            options,
+            today,
+        )),
+        "Exa" => client.post(address).header("x-api-key", key).json(&payload(
+            service.name,
+            query,
+            count,
+            options,
+            today,
+        )),
+        _ => client.get(format!("{address}/search")).query(&parameters(
+            service.name,
+            query,
+            count,
+            options,
+        )),
     };
     let reply = request.send().map_err(|e| match e.is_timeout() {
         true => format!(
@@ -368,8 +707,38 @@ fn search(reach: &Reach, query: &str, count: u64) -> Result<String, String> {
             service.name
         )
     })?;
-    let hits = hits(service.name, &body, count as usize);
-    Ok(listing(service.name, query, &hits))
+    // Every answer goes through the filters, a service that narrowed by
+    // site too: it may not count subdomains the same way, and only Tavily
+    // takes both lists at once.
+    let wider = match options.by_site() && !narrows_by_site(service.name) {
+        true => usize::MAX,
+        false => count as usize,
+    };
+    Ok(kept(
+        service.name,
+        query,
+        hits(service.name, &body, wider),
+        count,
+        options,
+    ))
+}
+
+/// The listing of the hits the filters keep, up to `count`. When the filters
+/// drop every one, it says so, so the model does not take a narrowed search
+/// for a subject nobody has written about.
+fn kept(service: &str, query: &str, found: Vec<Hit>, count: u64, options: &Options) -> String {
+    let any = !found.is_empty();
+    let hits: Vec<Hit> = found
+        .into_iter()
+        .filter(|hit| wanted(&hit.url, options))
+        .take(count as usize)
+        .collect();
+    if any && hits.is_empty() {
+        return format!(
+            "{service} found results for \"{query}\", but none from the sites allowed and not blocked."
+        );
+    }
+    listing(service, query, &hits)
 }
 
 /// Why a service turned a search down, in words the user can act on.
@@ -696,7 +1065,7 @@ mod tests {
             key: "secret".into(),
             address: format!("http://127.0.0.1:{port}/brave/search"),
         };
-        let found = search(&reach, "cats", 3).unwrap();
+        let found = search(&reach, "cats", 3, &Options::default()).unwrap();
         assert!(
             found.contains("1. Here\n   https://here.example/\n   found"),
             "{found}"
@@ -712,6 +1081,231 @@ mod tests {
         );
     }
 
+    #[test]
+    fn each_service_is_asked_to_filter_in_its_own_words() {
+        let options = Options {
+            allowed: vec!["docs.rs".into()],
+            blocked: vec!["spam.docs.rs".into()],
+            freshness: Some(Freshness::Week),
+        };
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 3, 4).unwrap();
+        let brave = parameters("Brave", "rust", 5, &options);
+        // Brave cannot narrow by site, so it is asked for more to filter here.
+        assert_eq!(
+            brave,
+            vec![
+                ("q", "rust".to_owned()),
+                ("count", WIDER.to_string()),
+                ("freshness", "pw".to_owned())
+            ]
+        );
+        assert_eq!(
+            parameters("Brave", "rust", 5, &Options::default()),
+            vec![("q", "rust".to_owned()), ("count", "5".to_owned())]
+        );
+        assert_eq!(
+            parameters("SearXNG", "rust", 5, &options),
+            vec![
+                ("q", "rust".to_owned()),
+                ("format", "json".to_owned()),
+                ("time_range", "week".to_owned())
+            ]
+        );
+        assert_eq!(
+            payload("Tavily", "rust", 5, &options, today),
+            json!({"query": "rust", "max_results": 5, "include_domains": ["docs.rs"],
+                   "exclude_domains": ["spam.docs.rs"], "time_range": "week"})
+        );
+        let exa = payload("Exa", "rust", 5, &options, today);
+        assert_eq!(exa["includeDomains"], json!(["docs.rs"]));
+        assert!(exa.get("excludeDomains").is_none(), "Exa takes one list");
+        assert_eq!(exa["startPublishedDate"], "2026-02-25T00:00:00.000Z");
+        let blocked_only = Options {
+            blocked: vec!["spam.example".into()],
+            ..Options::default()
+        };
+        assert_eq!(
+            payload("Exa", "rust", 5, &blocked_only, today)["excludeDomains"],
+            json!(["spam.example"])
+        );
+        assert_eq!(
+            payload("Tavily", "rust", 5, &Options::default(), today),
+            json!({"query": "rust", "max_results": 5})
+        );
+    }
+
+    #[test]
+    fn the_card_and_the_judge_see_the_sites_that_are_sent() {
+        let call = json!({
+            "query": "rust",
+            "allowed_domains": ["docs.rs", "secret-word.example.org"],
+            "blocked_domains": ["spam.example"],
+            "freshness": "week"
+        });
+        let ctx = ToolContext::default();
+        let card = SearchWeb.preview(&call, &ctx);
+        assert!(
+            card.ends_with(
+                "for \"rust\"\nonly from docs.rs, secret-word.example.org\nnot from spam.example\nfrom the last week"
+            ),
+            "{card}"
+        );
+        assert_eq!(SearchWeb.judge_input(&call, &ctx), card);
+        let plain = SearchWeb.preview(&json!({"query": "rust"}), &ctx);
+        assert!(plain.ends_with("for \"rust\""), "{plain}");
+    }
+
+    #[test]
+    fn results_are_kept_by_site_with_subdomains_and_blocked_wins() {
+        let options = Options {
+            allowed: vec!["example.com".into()],
+            blocked: vec!["ads.example.com".into()],
+            freshness: None,
+        };
+        assert!(wanted("https://example.com/a", &options));
+        assert!(wanted("https://docs.EXAMPLE.com./b", &options));
+        assert!(!wanted("https://ads.example.com/c", &options));
+        assert!(!wanted("https://x.ads.example.com/c", &options));
+        // A name that only ends the same way is another site.
+        assert!(!wanted("https://notexample.com/", &options));
+        assert!(!wanted("https://example.com.evil.net/", &options));
+        assert!(!wanted("not an address", &options));
+        // A site in both lists is blocked.
+        let both = Options {
+            allowed: vec!["example.com".into()],
+            blocked: vec!["example.com".into()],
+            freshness: None,
+        };
+        assert!(!wanted("https://example.com/", &both));
+        let blocked_only = Options {
+            blocked: vec!["example.com".into()],
+            ..Options::default()
+        };
+        assert!(wanted("https://other.org/", &blocked_only));
+        assert!(!wanted("https://www.example.com/", &blocked_only));
+        assert!(wanted("anything at all", &Options::default()));
+    }
+
+    #[test]
+    fn a_search_the_filters_empty_does_not_read_as_finding_nothing() {
+        let found = || {
+            vec![Hit {
+                title: "Elsewhere".into(),
+                url: "https://other.example/".into(),
+                snippet: String::new(),
+            }]
+        };
+        let docs = Options {
+            allowed: vec!["docs.rs".into()],
+            ..Options::default()
+        };
+        assert_eq!(
+            kept("Brave", "rust", found(), 5, &docs),
+            "Brave found results for \"rust\", but none from the sites allowed and not blocked."
+        );
+        assert_eq!(
+            kept("Brave", "rust", Vec::new(), 5, &docs),
+            "Brave found nothing for \"rust\"."
+        );
+        assert!(kept("Brave", "rust", found(), 5, &Options::default()).contains("1. Elsewhere"));
+    }
+
+    #[test]
+    fn filters_are_read_from_the_call_and_bad_ones_refused() {
+        let read = options(&json!({
+            "allowed_domains": ["https://Docs.rs/std/", "*.example.org", "docs.rs"],
+            "blocked_domains": "spam.example.org",
+            "freshness": "Month"
+        }))
+        .unwrap();
+        assert_eq!(read.allowed, vec!["docs.rs", "example.org"]);
+        assert_eq!(read.blocked, vec!["spam.example.org"]);
+        assert_eq!(read.freshness, Some(Freshness::Month));
+        assert_eq!(
+            options(&json!({"freshness": ""})).unwrap(),
+            Options::default()
+        );
+        assert_eq!(options(&json!({})).unwrap(), Options::default());
+
+        for bad in [
+            json!({"allowed_domains": ["localhost"]}),
+            json!({"allowed_domains": ["exa mple.com"]}),
+            json!({"allowed_domains": [""]}),
+            json!({"blocked_domains": ["example.com:8080"]}),
+            json!({"blocked_domains": ["-bad.example.com"]}),
+            json!({"blocked_domains": [42]}),
+            json!({"blocked_domains": {"site": "example.com"}}),
+            json!({"freshness": "fortnight"}),
+            json!({"freshness": 7}),
+        ] {
+            assert!(options(&bad).is_err(), "{bad}");
+        }
+        assert_eq!(
+            options(&json!({"allowed_domains": ["localhost"]})).unwrap_err(),
+            "\"localhost\" is not a domain: give one such as example.com."
+        );
+    }
+
+    #[test]
+    fn the_same_search_again_is_answered_from_the_memo_until_it_expires() {
+        let memo = Mutex::new(Memo::default());
+        let asked = Asked {
+            service: "Brave",
+            address: "https://brave.example/".into(),
+            query: "cats".into(),
+            count: 5,
+            options: Options::default(),
+        };
+        let searches = std::cell::Cell::new(0);
+        let search = |_: &Asked| {
+            searches.set(searches.get() + 1);
+            Ok(format!("listing {}", searches.get()))
+        };
+        let start = Instant::now();
+        assert_eq!(
+            searched_once(&memo, asked.clone(), start, search).unwrap(),
+            "listing 1"
+        );
+        let again = searched_once(
+            &memo,
+            asked.clone(),
+            start + Duration::from_secs(60),
+            search,
+        )
+        .unwrap();
+        assert!(again.ends_with("\n\nlisting 1"), "{again}");
+        assert!(again.starts_with("(The same search"), "{again}");
+        assert_eq!(searches.get(), 1);
+        // Other filters are another search.
+        let recent = Asked {
+            options: Options {
+                freshness: Some(Freshness::Day),
+                ..Options::default()
+            },
+            ..asked.clone()
+        };
+        assert_eq!(
+            searched_once(&memo, recent, start, search).unwrap(),
+            "listing 2"
+        );
+        // Past its time, it is searched again.
+        let later = start + MEMO_TIME + Duration::from_secs(1);
+        assert_eq!(
+            searched_once(&memo, asked.clone(), later, search).unwrap(),
+            "listing 3"
+        );
+        // A failure is not kept.
+        let failed = Asked {
+            query: "dogs".into(),
+            ..asked
+        };
+        assert!(searched_once(&memo, failed.clone(), later, |_| Err("down".into())).is_err());
+        assert_eq!(
+            searched_once(&memo, failed, later, search).unwrap(),
+            "listing 4"
+        );
+    }
+
     /// Needs a SearXNG with the json format on, at the address in
     /// `LETRONNA_SEARXNG`.
     #[test]
@@ -722,7 +1316,7 @@ mod tests {
             key: String::new(),
             address: web_address(&std::env::var("LETRONNA_SEARXNG").unwrap(), true),
         };
-        let found = search(&reach, "rust programming language", 3).unwrap();
+        let found = search(&reach, "rust programming language", 3, &Options::default()).unwrap();
         assert!(found.contains("1. "), "{found}");
     }
 
@@ -745,7 +1339,8 @@ mod tests {
                 key,
                 address: service.official.to_owned(),
             };
-            let found = search(&reach, "rust programming language", 3).unwrap();
+            let found =
+                search(&reach, "rust programming language", 3, &Options::default()).unwrap();
             assert!(found.contains("1. "), "{name}: {found}");
         }
     }
