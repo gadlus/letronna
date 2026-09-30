@@ -1503,6 +1503,16 @@ impl Chat {
             })
             .collect()
     }
+
+    /// The gateways that take a key or a URL, for the setup page's "Use my
+    /// own key" step: Letronna is the Sign in step there, and Ollama the
+    /// Local model one, so neither belongs in this list too.
+    pub(crate) fn key_gateway_rows(&self) -> Vec<GatewayRow> {
+        self.gateway_rows()
+            .into_iter()
+            .filter(|row| row.name != LETRONNA && row.name != "Ollama")
+            .collect()
+    }
 }
 
 /// One search service as the settings list shows it.
@@ -1736,7 +1746,10 @@ fn shortcuts_page(hotkey: &Entity<InputState>, chat: &Entity<Chat>, cx: &App) ->
         )
 }
 
-fn gateway_page(
+/// The gateway rows alone, each open to set up or close on click: the
+/// Gateways settings page around it, and the setup page's "Use my own key"
+/// step, which shows the same rows filtered to the ones that take a key.
+pub(crate) fn gateway_list(
     rows: Vec<GatewayRow>,
     pick: &Entity<String>,
     endpoint: &Entity<InputState>,
@@ -1884,6 +1897,18 @@ fn gateway_page(
         }
         list = list.child(item);
     }
+    list
+}
+
+fn gateway_page(
+    rows: Vec<GatewayRow>,
+    pick: &Entity<String>,
+    endpoint: &Entity<InputState>,
+    key: &Entity<InputState>,
+    page: &Entity<&'static str>,
+    chat: &Entity<Chat>,
+    cx: &App,
+) -> Div {
     v_flex()
         .gap_5()
         .child(heading(
@@ -1891,5 +1916,5 @@ fn gateway_page(
             "Every gateway you set up is used at once: its models join the model list, and each message goes to the gateway of the model you pick. Keys stay in keys.json on this machine.",
             cx,
         ))
-        .child(list)
+        .child(gateway_list(rows, pick, endpoint, key, page, chat, cx))
 }

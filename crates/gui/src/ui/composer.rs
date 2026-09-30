@@ -8,9 +8,15 @@ impl Chat {
     /// The (gateway, model) pairs the picker shows for what is typed in its
     /// search box.
     pub(crate) fn model_matches(&self, cx: &App) -> Vec<(String, String)> {
+        self.models_named(&self.model_search.read(cx).value())
+    }
+
+    /// The pairs whose gateway or id contains `query`, the model in use
+    /// kept on the list.
+    pub(crate) fn models_named(&self, query: &str) -> Vec<(String, String)> {
         let (on, current) = self.store.model(self.store.active);
         let (on, current) = (on.to_owned(), current.to_owned());
-        let query = self.model_search.read(cx).value().to_lowercase();
+        let query = query.to_lowercase();
         let mut ids = self.models.clone();
         // The model in use stays on the list even when its gateway did not
         // offer it, or the picker could not show what is picked.

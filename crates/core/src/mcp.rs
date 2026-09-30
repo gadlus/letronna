@@ -2073,16 +2073,18 @@ impl Server {
                     continue;
                 };
                 let (description, schema) = vetted(name, own, tool);
+                // A server elsewhere is only its word, and a tool that
+                // reaches other machines can send what it is given there.
+                #[allow(clippy::nonminimal_bool)]
+                let ask = !config.auto_approve.approves(own, &tool["annotations"])
+                    && !(config.url.trim().is_empty() && only_looks(&tool["annotations"]));
                 tools.push(Arc::new(McpTool {
                     server: self.clone(),
                     own: own.to_owned(),
                     name: keep(tool_name(name, own)),
                     description: keep(description),
                     schema,
-                    // A server elsewhere is only its word, and a tool that
-                    // reaches other machines can send what it is given there.
-                    ask: !(config.auto_approve.approves(own, &tool["annotations"])
-                        || config.url.trim().is_empty() && only_looks(&tool["annotations"])),
+                    ask,
                     read_only: tool["annotations"]["readOnlyHint"].as_bool() == Some(true),
                     wait: config.call_time(),
                 }));
