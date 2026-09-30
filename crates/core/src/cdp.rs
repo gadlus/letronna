@@ -1076,6 +1076,10 @@ impl Tab {
         limit: Duration,
         cancel: Option<&Cancel>,
     ) -> Result<T, String> {
+        let attached = |frames: &[Attached]| {
+            session.is_some_and(|session| frames.iter().any(|frame| frame.session == session))
+        };
+        let in_frame = attached(&self.frames);
         let id = self.send_in(session, method, params)?;
         let deadline = Instant::now() + limit;
         loop {
@@ -1103,6 +1107,12 @@ impl Tab {
             if envelope.id != Some(id) {
                 self.close_late_stream(envelope.id, &text);
                 self.heard(envelope);
+                // The browser drops, rather than answers, what a frame that
+                // went was asked.
+                if in_frame && !attached(&self.frames) {
+                    self.forget(id);
+                    return Err(FRAME_GONE.into());
+                }
                 continue;
             }
             // Read a second time, into the shape asked for: a page's whole
@@ -1134,6 +1144,16 @@ impl Tab {
         self.attaching = true;
         self.answer::<Ignored>(None, "Target.setAutoAttach", auto_attach(), limit, cancel)
             .map(drop)
+    }
+
+    /// Stop waiting for the answer to `id`, which will not come: on a
+    /// browser elsewhere, the one socket no longer keeps its way here.
+    fn forget(&self, id: u64) {
+        if let Wire::Session { link, .. } = &self.wire
+            && let Ok(mut waiting) = link.waiting.lock()
+        {
+            waiting.remove(&id);
+        }
     }
 
     /// Have the one socket to a browser elsewhere hand this tab what the
@@ -1387,6 +1407,8 @@ impl Drop for Tab {
 }
 
 const GONE: &str = "The browser tab was closed.";
+/// What a call to a frame that went while it waited comes to.
+const FRAME_GONE: &str = "The frame went away. Look again.";
 
 /// Handed to a session's tab when the browser lets the session go. Not
 /// JSON, so nothing takes it for the browser's word.
@@ -1716,6 +1738,10 @@ pub(crate) mod tests {
                 for event in events {
                     socket.send(Frame::text(event.to_string())).unwrap();
                 }
+                // Dropped, as a browser drops what a frame that went was asked.
+                if result.get("unanswered").is_some() {
+                    continue;
+                }
                 let mut answer = if result.get("error").is_some() {
                     json!({"id": request["id"], "error": result["error"]})
                 } else {
@@ -1926,6 +1952,124 @@ pub(crate) mod tests {
         assert_eq!(drop_frame(&mut frames, "1"), ["1", "2", "3"]);
         assert_eq!(frames.len(), MAX_FRAMES - 3);
         assert_eq!(frames[0].frame, "Fx3");
+    }
+
+    #[test]
+    fn a_call_to_a_frame_that_goes_while_it_waits_is_answered_at_once() {
+        let (address, server) = fake_frames(|session, method, _| match (session, method) {
+            (None, "Target.setAutoAttach") => (
+                vec![json!({"method": "Target.attachedToTarget",
+                            "params": attached("S1", "F1", "iframe")})],
+                json!({}),
+            ),
+            (Some("S1"), "DOM.focus") => (
+                vec![json!({"method": "Target.detachedFromTarget",
+                            "params": {"sessionId": "S1"}})],
+                json!({"unanswered": true}),
+            ),
+            _ => (vec![], json!({})),
+        });
+        let mut tab = Tab::connect(&address, "T1").unwrap();
+        tab.attach_frames(Duration::from_secs(2), None).unwrap();
+        let started = Instant::now();
+        let limit = Duration::from_secs(20);
+        let gone = tab.call_in::<Value>(Some("S1"), "DOM.focus", json!({}), limit, None);
+        assert_eq!(gone, Err(FRAME_GONE.to_owned()));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(tab.frames.is_empty());
+        drop(tab);
+        let heard = server.join().unwrap();
+        assert_eq!(
+            heard,
+            [
+                "Target.setAutoAttach",
+                "S1 Target.setAutoAttach",
+                "S1 DOM.focus"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_frame_going_on_a_browser_elsewhere_leaves_nothing_waiting() {
+        let (outgoing, sent) = mpsc::channel();
+        let link = Arc::new(Link {
+            outgoing: Mutex::new(outgoing),
+            waiting: Mutex::default(),
+            sessions: Mutex::default(),
+            frames: Mutex::default(),
+            next: AtomicU64::new(0),
+            open: AtomicBool::new(true),
+            contexts: Mutex::default(),
+        });
+        let mut tab = Tab::over(&link, Some("S".into()), "T1");
+        tab.attaching = true;
+        let told = |method: &str, params: Value| {
+            link.hand_on(json!({"method": method, "sessionId": "S", "params": params}).to_string());
+        };
+        told("Target.attachedToTarget", attached("C", "F1", "iframe"));
+        tab.wait(Duration::from_millis(50), |_| false).unwrap();
+        let answered = {
+            let link = link.clone();
+            std::thread::spawn(move || {
+                // Once the call is out, the frame goes instead of answering.
+                while !sent
+                    .try_iter()
+                    .any(|text: String| text.contains("DOM.focus"))
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let gone = json!({"method": "Target.detachedFromTarget", "sessionId": "S",
+                                  "params": {"sessionId": "C"}});
+                link.hand_on(gone.to_string());
+            })
+        };
+        // What was asked of the frame as it came is never answered here.
+        let waiting = link.waiting.lock().unwrap().len();
+        let limit = Duration::from_secs(20);
+        let gone = tab.call_in::<Value>(Some("C"), "DOM.focus", json!({}), limit, None);
+        answered.join().unwrap();
+        assert_eq!(gone, Err(FRAME_GONE.to_owned()));
+        assert_eq!(link.waiting.lock().unwrap().len(), waiting);
+        assert!(link.frames.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn frames_coming_and_going_in_a_loop_leave_nothing_held() {
+        let (outgoing, _sent) = mpsc::channel();
+        let link = Arc::new(Link {
+            outgoing: Mutex::new(outgoing),
+            waiting: Mutex::default(),
+            sessions: Mutex::default(),
+            frames: Mutex::default(),
+            next: AtomicU64::new(0),
+            open: AtomicBool::new(true),
+            contexts: Mutex::default(),
+        });
+        let mut tab = Tab::over(&link, Some("S".into()), "T1");
+        tab.attaching = true;
+        let told = |method: &str, params: Value| {
+            link.hand_on(json!({"method": method, "sessionId": "S", "params": params}).to_string());
+        };
+        for round in 0..3 {
+            for n in 0..40 {
+                let frame = format!("F{round}-{n}");
+                told(
+                    "Target.attachedToTarget",
+                    attached(&frame, &frame, "iframe"),
+                );
+            }
+            tab.wait(Duration::from_millis(50), |_| false).unwrap();
+            assert_eq!(tab.frames.len(), MAX_FRAMES);
+            assert_eq!(link.frames.lock().unwrap().len(), MAX_FRAMES);
+            for n in 0..40 {
+                let gone = json!({"sessionId": format!("F{round}-{n}")});
+                told("Target.detachedFromTarget", gone);
+            }
+            tab.wait(Duration::from_millis(50), |_| false).unwrap();
+            assert!(tab.frames.is_empty());
+            assert!(link.frames.lock().unwrap().is_empty());
+        }
+        assert!(!tab.broken);
     }
 
     #[test]
