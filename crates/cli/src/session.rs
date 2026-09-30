@@ -907,14 +907,16 @@ impl Runner {
         let question = format!("Letronna wants to {}", intent(&call.name, &summary));
         // Offered only where a rule could cover the call, as the third
         // choice, so the others keep their places.
-        let rule = permissions::suggest(&call, &ctx);
+        // A call asked about each time, as a sign-in is, offers neither.
+        let each_time = tools::asked_each_time(&call.name);
+        let rule = permissions::suggest(&call, &ctx).filter(|_| !each_time);
         let here = rule
             .as_ref()
             .map(|rule| format!("Yes, and always allow `{}` here", rule.pattern));
         let mut choices = vec!["Yes"];
         // An upload is asked about each time, so there is no stopping that.
         let args = tools::parse_args_for(&call.name, &call.arguments).unwrap_or_default();
-        if gate::grants_for_session(&call.name, &args) {
+        if gate::grants_for_session(&call.name, &args) && !each_time {
             choices.push("Yes, and stop asking for this");
         }
         choices.extend(here.as_deref());

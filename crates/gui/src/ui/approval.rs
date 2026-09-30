@@ -239,18 +239,22 @@ impl Chat {
                             this.resolve_call(Verdict::Allow { remember: false }, cx)
                         })),
                 )
-                // An upload is asked about each time, so there is no
-                // allowing it for the session.
-                .children(gate::grants_for_session(&call.name, &args).then(|| {
-                    Button::new("allow-session")
-                        .framed(cx)
-                        .small()
-                        .label("Allow for this session")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.take_reason(window, cx);
-                            this.resolve_call(Verdict::Allow { remember: true }, cx)
-                        }))
-                }))
+                // An upload, or a sign-in, is asked about each time, so there
+                // is no allowing it for the session.
+                .children(
+                    (gate::grants_for_session(&call.name, &args)
+                        && !tools::asked_each_time(&call.name))
+                    .then(|| {
+                        Button::new("allow-session")
+                            .framed(cx)
+                            .small()
+                            .label("Allow for this session")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.take_reason(window, cx);
+                                this.resolve_call(Verdict::Allow { remember: true }, cx)
+                            }))
+                    }),
+                )
                 .children(self.offer.as_ref().map(|rule| {
                     Button::new("allow-here")
                         .framed(cx)

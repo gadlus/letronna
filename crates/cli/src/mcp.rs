@@ -3,8 +3,9 @@
 //!
 //! The flags are Claude Code's own, so a server's README that says `claude
 //! mcp add ...` works with `letronna` in its place. Letronna keeps one list
-//! for every folder, so `user` is the only scope it takes, and it signs in to
-//! no server yet, so the OAuth flags are refused rather than dropped.
+//! for every folder, so `user` is the only scope it takes. An app's secret
+//! is refused as a flag, where it would sit in the shell's history; it goes
+//! in mcp.json as a `${VAR}`.
 
 use crate::bar::Bar;
 use crate::render;
@@ -32,6 +33,8 @@ Manage the MCP servers in mcp.json
   letronna mcp list              every server, started to see it answer
   letronna mcp get <name>        one server in full
   letronna mcp remove <name>     take one out
+  letronna mcp login <name>      sign in to one reached by URL, in the browser
+  letronna mcp logout <name>     forget that sign-in
   letronna mcp serve [options]   offer the browser, media and search tools
                                  to another agent over stdio
 
@@ -44,6 +47,8 @@ Options for add
   -e, --env <KEY=value>    an environment variable for the command
   -H, --header <\"K: v\">    a header sent to a server reached by URL
   -s, --scope user         the only scope: one list for every folder
+  --client-id <id>         the app id a server that registers no apps gave you
+  --callback-port <port>   the port that app id was registered with
 
 Examples
   letronna mcp add files -- npx -y @modelcontextprotocol/server-filesystem ~/notes
@@ -80,6 +85,14 @@ pub fn run(words: &[String]) -> i32 {
         "list" => list(),
         "get" => named(rest).and_then(get),
         "remove" => named(rest).and_then(remove),
+        "login" => named(rest).and_then(|name| {
+            login(name, &mut |question| {
+                crate::input::secret(&format!("{question}: "))
+            })?;
+            render::line(&format!("Signed in to {}.", render::bold(name)));
+            Ok(())
+        }),
+        "logout" => named(rest).and_then(logout),
         other => Err(format!(
             "`letronna mcp {other}` is not a command; `letronna mcp` lists them."
         )),
@@ -100,8 +113,22 @@ pub fn health(server: &ServerStatus) -> String {
         State::Connected => format!(
             "{} {}",
             render::green("✓ connected"),
-            render::dim(&format!("· {} tools", server.tools))
+            render::dim(&format!(
+                "· {} tools{}",
+                server.tools,
+                if server.signed_in {
+                    " · signed in"
+                } else {
+                    ""
+                }
+            ))
         ),
+        // Why, as a sign-in the model started and that failed says there.
+        State::NeedsAuth => {
+            let why = server.error.as_deref().unwrap_or_default();
+            let why = why.lines().next().unwrap_or(why);
+            format!("{} {}", render::amber("needs sign-in"), render::dim(why))
+        }
         State::Starting => render::dim("… still starting"),
         State::Retrying => {
             let why = server.error.as_deref().unwrap_or("stopped");
@@ -153,6 +180,60 @@ fn remove(name: &str) -> Result<(), String> {
     render::line(&render::dim(
         "A session already open stops it with /mcp reload.",
     ));
+    Ok(())
+}
+
+/// Sign in to the server `name` in the browser. `ask` puts a question to
+/// the user and reads a line: Enter once the browser says so, or the address
+/// it ended on, pasted where the browser cannot reach this computer.
+pub fn login(name: &str, ask: &mut dyn FnMut(&str) -> Option<String>) -> Result<(), String> {
+    use letronna_core::mcp_auth;
+    render::line(&render::dim(&format!("Finding where {name} signs in…")));
+    let sign_in = mcp_auth::begin(name, &|| false)?;
+    render::said(
+        &render::blue("●"),
+        &render::bold(&format!("Sign in to {name}")),
+    );
+    render::line(&sign_in.url);
+    if !mcp_auth::open_browser(&sign_in.url) {
+        render::line(&render::dim(
+            "Could not open a browser; open the address above.",
+        ));
+    }
+    let (done, finished) = std::sync::mpsc::channel();
+    let waiting = sign_in.clone();
+    std::thread::spawn(move || done.send(waiting.finish()));
+    let question =
+        "Press Enter once the browser says you are signed in, or paste the address it ended on";
+    loop {
+        if let Ok(outcome) = finished.try_recv() {
+            return outcome;
+        }
+        let Some(line) = ask(question) else {
+            sign_in.cancel();
+            return Err(mcp_auth::CANCELLED.into());
+        };
+        if !line.trim().is_empty()
+            && let Err(error) = sign_in.paste(&line)
+        {
+            render::line(&render::red(&error));
+            continue;
+        }
+        if sign_in.answered() {
+            return finished
+                .recv()
+                .unwrap_or_else(|_| Err("The sign-in stopped.".into()));
+        }
+        render::line(&render::dim(
+            "Not signed in yet: finish in the browser, or paste the address it ended on.",
+        ));
+    }
+}
+
+/// Forget the sign-in to the server `name`.
+pub fn logout(name: &str) -> Result<(), String> {
+    letronna_core::mcp_auth::sign_out(name)?;
+    render::line(&format!("Signed out of {}.", render::bold(name)));
     Ok(())
 }
 
@@ -379,6 +460,7 @@ fn entry(words: &[String]) -> Result<(String, Value), String> {
                  @modelcontextprotocol/server-filesystem ~/notes`.";
     let mut words = words.iter().peekable();
     let (mut transport, mut env, mut headers) = (None, Map::new(), Map::new());
+    let mut oauth = Map::new();
     let mut plain: Vec<String> = Vec::new();
     while let Some(word) = words.next() {
         match word.as_str() {
@@ -412,11 +494,23 @@ fn entry(words: &[String]) -> Result<(String, Value), String> {
                 }
             }
             "-s" | "--scope" => scope(words.next())?,
-            "--callback-port" | "--client-id" | "--client-secret" => {
-                return Err(format!(
-                    "{word}: Letronna does not sign in to MCP servers yet; give the server \
-                     a key with --header instead."
-                ));
+            "--client-id" => {
+                let id = words
+                    .next()
+                    .ok_or("--client-id takes the id the server gave you.")?;
+                oauth.insert("clientId".into(), json!(id));
+            }
+            "--callback-port" => {
+                let port = words.next().and_then(|port| port.parse::<u16>().ok());
+                let port = port.ok_or("--callback-port takes a port number, like 8080.")?;
+                oauth.insert("callbackPort".into(), json!(port));
+            }
+            "--client-secret" => {
+                return Err(
+                    "--client-secret: a secret here stays in the shell's history. Put it in \
+                     mcp.json under oauth as \"clientSecret\": \"${VAR}\" instead."
+                        .into(),
+                );
             }
             // Past the name and the command, a dash is the command's own.
             flag if flag.starts_with('-') && plain.len() < 2 => {
@@ -443,6 +537,9 @@ fn entry(words: &[String]) -> Result<(String, Value), String> {
         "stdio" if !headers.is_empty() => {
             return Err("--header is for a server reached by URL; a command takes -e.".into());
         }
+        "stdio" if !oauth.is_empty() => {
+            return Err("Only a server reached by URL signs in.".into());
+        }
         "stdio" => {
             let mut entry = json!({"command": first, "args": rest});
             if !env.is_empty() {
@@ -462,6 +559,9 @@ fn entry(words: &[String]) -> Result<(String, Value), String> {
             let mut entry = json!({"type": "http", "url": first});
             if !headers.is_empty() {
                 entry["headers"] = Value::Object(headers);
+            }
+            if !oauth.is_empty() {
+                entry["oauth"] = Value::Object(oauth);
             }
             entry
         }
@@ -572,6 +672,19 @@ mod tests {
             json!({"type": "http", "url": "https://mcp.example.com/mcp",
                    "headers": {"Authorization": "Bearer t", "X-Key": "k"}})
         );
+        let (_, app) = read(&[
+            "--client-id",
+            "abc",
+            "--callback-port",
+            "8080",
+            "linear",
+            "https://mcp.example.com/mcp",
+        ])
+        .unwrap();
+        assert_eq!(
+            app["oauth"],
+            json!({"clientId": "abc", "callbackPort": 8080})
+        );
         // An address alone is taken as one to reach, and --scope user is fine.
         let (_, inferred) = read(&["-s", "user", "s", "https://mcp.example.com/mcp"]).unwrap();
         assert_eq!(inferred["type"], "http");
@@ -585,7 +698,18 @@ mod tests {
         };
         refused(&["-t", "sse", "s", "https://x/sse"], "SSE");
         refused(&["-s", "project", "s", "--", "npx"], "one list");
-        refused(&["--client-id", "abc", "s", "https://x/mcp"], "sign in");
+        refused(
+            &["--client-secret", "abc", "s", "https://x/mcp"],
+            "clientSecret",
+        );
+        refused(
+            &["--client-id", "abc", "s", "--", "npx"],
+            "Only a server reached by URL",
+        );
+        refused(
+            &["--callback-port", "port", "s", "https://x/mcp"],
+            "port number",
+        );
         refused(&["only-a-name"], "Give a name");
         refused(&["my server", "npx"], "letters, digits");
         refused(&["s", "-H", "A: b", "--", "npx"], "--header is for");

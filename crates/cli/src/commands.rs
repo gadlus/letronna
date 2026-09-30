@@ -229,7 +229,7 @@ pub fn command(
             Flow::Handled
         }
         "/mcp" => {
-            mcp_servers(rest);
+            mcp_servers(runner, rest);
             Flow::Handled
         }
         "/resume" => {
@@ -1331,9 +1331,9 @@ fn send_to_helper(helpers: &[Seen], rest: &str) {
     }
 }
 
-/// The MCP servers and how each is doing, or reconnect, enable, disable or
-/// read the log of one, or read mcp.json again.
-fn mcp_servers(rest: &str) {
+/// The MCP servers and how each is doing, or reconnect, enable, disable,
+/// sign in to or out of or read the log of one, or read mcp.json again.
+fn mcp_servers(runner: &mut Runner, rest: &str) {
     use letronna_core::mcp;
     let (verb, name) = rest.split_once(' ').unwrap_or((rest, ""));
     let name = name.trim();
@@ -1352,8 +1352,12 @@ fn mcp_servers(rest: &str) {
         "reconnect" => mcp::reconnect(name),
         "enable" => mcp::set_enabled(name, true),
         "disable" => mcp::set_enabled(name, false),
+        // The pasted address carries a code, so it is typed as a secret.
+        "login" => crate::mcp::login(name, &mut |question| runner.bar.ask(question, true))
+            .map(|()| render::line(&render::dim(&format!("Signed in to {name}.")))),
+        "logout" => crate::mcp::logout(name),
         _ => Err(format!(
-            "/mcp {verb} is not one of reconnect, enable, disable, log or reload."
+            "/mcp {verb} is not one of reconnect, enable, disable, login, logout, log or reload."
         )),
     };
     if let Err(error) = done {
@@ -1361,7 +1365,7 @@ fn mcp_servers(rest: &str) {
         return;
     }
     // One just started gets as long to answer as a question asked once waits.
-    if matches!(verb, "reconnect" | "enable" | "reload") {
+    if matches!(verb, "reconnect" | "enable" | "reload" | "login" | "logout") {
         mcp::ready(crate::MCP_WAIT);
     }
     if let Some(error) = mcp::unreadable() {
@@ -1383,7 +1387,7 @@ fn mcp_servers(rest: &str) {
         ));
     }
     render::line(&render::dim(
-        "/mcp reconnect|enable|disable|log <name>, or /mcp reload after editing mcp.json",
+        "/mcp reconnect|enable|disable|login|logout|log <name>, or /mcp reload after editing mcp.json",
     ));
 }
 

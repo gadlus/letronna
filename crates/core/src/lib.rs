@@ -45,6 +45,7 @@ pub mod limits;
 mod login_env;
 pub mod lsp;
 pub mod mcp;
+pub mod mcp_auth;
 mod mcp_find;
 pub mod mcp_serve;
 pub mod media;
