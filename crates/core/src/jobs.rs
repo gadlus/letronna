@@ -15,7 +15,13 @@
 //! printed, and is then cleared: a long session would otherwise keep every
 //! log it ever made. Job numbers are never reused, so a cleared one still
 //! answers that it finished rather than that it never was.
+//!
+//! A job can also be work on a thread of Letronna's own rather than a
+//! process, such as a video that renders for minutes: it writes to the same
+//! log, is read, waited for and stopped the same way, and its end reaches the
+//! owner as a process's exit does.
 
+use crate::cancel::Cancel;
 use crate::inbox::{Notice, When};
 use crate::tasks::{Key, State, Task};
 use std::collections::{BTreeMap, VecDeque};
@@ -77,8 +83,9 @@ pub struct Job {
     pub id: u64,
     pub command: String,
     log: Arc<Mutex<Log>>,
-    tree: Tree,
-    /// Set once the process has exited and the reader threads are done.
+    ends: Ends,
+    /// Set once the process has exited and the reader threads are done, or
+    /// the work has returned.
     finished: Arc<AtomicBool>,
     exit_code: Arc<Mutex<Option<i32>>>,
     watch: Option<Arc<Mutex<Watch>>>,
@@ -102,6 +109,13 @@ impl Log {
         self.written += bytes.len() as u64;
         append(&mut self.tail, bytes);
     }
+}
+
+/// What stops a job: the process tree it started, or the token its work
+/// listens to.
+enum Ends {
+    Tree(Tree),
+    Token(Cancel),
 }
 
 /// What the UI needs to draw a chip, and the agent to list jobs. Cloned out
@@ -595,7 +609,7 @@ pub fn start_watching(
             id,
             command: command.to_owned(),
             log,
-            tree,
+            ends: Ends::Tree(tree),
             finished,
             exit_code,
             watch,
@@ -614,8 +628,12 @@ fn prune(jobs: &mut BTreeMap<u64, Job>, now: Instant) {
         .map(|job| (job.id, job.ended.get().copied()))
         .collect();
     for id in stale(ended, now) {
-        if let Some(job) = jobs.remove(&id) {
-            job.tree.leave();
+        if let Some(Job {
+            ends: Ends::Tree(tree),
+            ..
+        }) = jobs.remove(&id)
+        {
+            tree.leave();
         }
     }
 }
@@ -666,6 +684,99 @@ fn report_exit(id: u64, command: &str, code: Option<i32>, log: &Mutex<Log>) {
         text,
     };
     crate::tasks::finish(&Key::Job(id), state, Some(notice));
+}
+
+/// A job that is work on a thread: what it writes to its log, and the token
+/// a stop sets.
+pub struct Work {
+    log: Arc<Mutex<Log>>,
+    token: Cancel,
+}
+
+impl Work {
+    /// Add a line to the job's log, for read_job and wait to see.
+    pub fn say(&self, line: &str) {
+        if let Ok(mut log) = self.log.lock() {
+            log.add(format!("{line}\n").as_bytes());
+        }
+    }
+
+    /// Whether the job has been stopped.
+    pub fn stopped(&self) -> bool {
+        self.token.is_set()
+    }
+
+    /// Wait for `time`, or less if the job is stopped meanwhile; false when
+    /// it was.
+    pub fn sleep(&self, time: Duration) -> bool {
+        self.token.sleep(time)
+    }
+}
+
+/// Run `work` on a thread as a job labelled `label`, telling `owner` how it
+/// ended as a process's exit is told: what it returned is the end of its log
+/// and the notice. 0 tells nobody.
+pub fn start_work(
+    label: &str,
+    owner: u64,
+    work: impl FnOnce(&Work) -> Result<String, String> + Send + 'static,
+) -> Result<u64, String> {
+    let id = next_id();
+    let log = Arc::new(Mutex::new(Log::default()));
+    let token = Cancel::default();
+    let ended = Arc::new(OnceLock::new());
+    let finished = Arc::new(AtomicBool::new(false));
+    let exit_code = Arc::new(Mutex::new(None));
+    crate::tasks::register(Task::new(Key::Job(id), owner, None, label));
+    // In the list before the work starts, so a stop or a read never finds
+    // it missing however soon it comes.
+    registry()
+        .lock()
+        .map_err(|_| "Job list is poisoned.")?
+        .insert(
+            id,
+            Job {
+                id,
+                command: label.to_owned(),
+                log: log.clone(),
+                ends: Ends::Token(token.clone()),
+                finished: finished.clone(),
+                exit_code: exit_code.clone(),
+                watch: None,
+                started: Instant::now(),
+                ended: ended.clone(),
+            },
+        );
+    let label = crate::tools::one_line(label);
+    std::thread::spawn(move || {
+        let job = Work { log, token };
+        let (code, how, said) = match work(&job) {
+            Ok(said) => (0, "finished", said),
+            Err(said) => (1, "failed", said),
+        };
+        job.say(said.trim_end());
+        // A stopped job has no code, which is how read_job tells it apart.
+        if !job.stopped()
+            && let Ok(mut exit) = exit_code.lock()
+        {
+            *exit = Some(code);
+        }
+        finished.store(true, Ordering::Relaxed);
+        let _ = ended.set(Instant::now());
+        let state = if code == 0 {
+            State::Done(how.to_owned())
+        } else {
+            State::Failed(how.to_owned())
+        };
+        let notice = Notice {
+            from: format!("job {id}"),
+            when: When::Next,
+            text: format!("job #{id} {how} (`{label}`):\n{}", said.trim_end()),
+        };
+        // After a stop this tells nobody: whoever stopped it already knows.
+        crate::tasks::finish(&Key::Job(id), state, Some(notice));
+    });
+    Ok(id)
 }
 
 fn with_job<T>(id: u64, f: impl FnOnce(&Job) -> T) -> Result<T, String> {
@@ -737,20 +848,47 @@ pub fn exit_code(id: u64) -> Result<Option<i32>, String> {
     with_job(id, |job| job.exit_code.lock().ok().and_then(|c| *c))
 }
 
+/// Where the job has got to, in a few words: running, how it exited or
+/// ended, or stopped.
+pub fn state(id: u64) -> Result<String, String> {
+    with_job(id, |job| {
+        if !job.finished.load(Ordering::Relaxed) {
+            return "running".to_owned();
+        }
+        let code = job.exit_code.lock().ok().and_then(|c| *c);
+        match (&job.ends, code) {
+            (_, None) => "stopped".to_owned(),
+            (Ends::Tree(_), Some(code)) => format!("exited with code {code}"),
+            (Ends::Token(_), Some(0)) => "finished".to_owned(),
+            (Ends::Token(_), Some(_)) => "failed".to_owned(),
+        }
+    })
+}
+
 pub fn stop(id: u64) -> Result<(), String> {
     with_job(id, |job| {
         // Recorded before the kill, so the exit it causes tells nobody: whoever
         // stopped it already knows.
         crate::tasks::finish(&Key::Job(id), State::Stopped, None);
+        end(job);
+    })?;
+    Ok(())
+}
+
+/// End a job's process tree, or tell its work to stop.
+fn end(job: &Job) {
+    match &job.ends {
         // Once the shell is reaped, its Unix process group id can pass to an
         // unrelated process, so there a finished job is left alone, as it
         // always was. A Job Object stays Letronna's for the life of the job,
         // so on Windows stopping still ends what an exited shell left running.
-        if cfg!(windows) || !job.finished.load(Ordering::Relaxed) {
-            job.tree.kill();
+        Ends::Tree(tree) => {
+            if cfg!(windows) || !job.finished.load(Ordering::Relaxed) {
+                tree.kill();
+            }
         }
-    })?;
-    Ok(())
+        Ends::Token(token) => token.set(),
+    }
 }
 
 /// Every job kept, oldest first, clearing those due to go first.
@@ -781,9 +919,7 @@ pub fn stop_all() {
     let Ok(jobs) = registry().lock() else { return };
     for job in jobs.values() {
         crate::tasks::finish(&Key::Job(job.id), State::Stopped, None);
-        if cfg!(windows) || !job.finished.load(Ordering::Relaxed) {
-            job.tree.kill();
-        }
+        end(job);
     }
 }
 
@@ -1009,7 +1145,9 @@ mod tests {
         // Cleared as `prune` does, but alone: pruning the shared list would
         // clear other tests' jobs.
         let job = registry().lock().unwrap().remove(&id).unwrap();
-        job.tree.leave();
+        if let Ends::Tree(tree) = job.ends {
+            tree.leave();
+        }
         let cleared = format!("Job #{id} finished and was cleared, with its output.");
         assert_eq!(log(id).unwrap_err(), cleared);
         assert!(!list().iter().any(|job| job.id == id));

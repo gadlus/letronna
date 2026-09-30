@@ -1757,7 +1757,7 @@ impl Tool for ReadJob {
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         let id = own_job(job_id(args)?, ctx)?;
         let log = crate::jobs::log(id)?;
-        let state = job_state(crate::jobs::running(id)?, crate::jobs::exit_code(id)?);
+        let state = crate::jobs::state(id)?;
         let (offset, limit) = (args["offset"].as_u64(), args["limit"].as_u64());
         if offset.is_some() || limit.is_some() {
             let lines: Vec<&str> = log.trim_end().lines().collect();
@@ -1928,7 +1928,8 @@ impl Tool for Wait {
             };
             if !crate::jobs::running(id)? {
                 return Ok(format!(
-                    "Job #{id} exited{without}.{earlier} Output since the wait began:\n{new}"
+                    "Job #{id} {}{without}.{earlier} Output since the wait began:\n{new}",
+                    crate::jobs::state(id)?
                 ));
             }
             if started.elapsed() >= limit {
@@ -3564,7 +3565,7 @@ mod tests {
         assert_eq!(
             out,
             format!(
-                "Job #{id} exited without printing `ready`. It had printed `ready` before the \
+                "Job #{id} exited with code 0 without printing `ready`. It had printed `ready` before the \
                  wait began. Output since the wait began:\ndone"
             )
         );
