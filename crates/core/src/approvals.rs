@@ -471,6 +471,18 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_yes_for_the_run_to_using_pages_does_not_cover_uploads() {
+        let page = |action: &str| ToolCall {
+            id: "p".into(),
+            name: "use_page".into(),
+            arguments: format!(r#"{{"action": "{action}", "ref": "e1"}}"#),
+        };
+        assert_eq!(crate::gate::grant(&page("click")), "use_page");
+        assert_eq!(crate::gate::grant(&page("upload")), "use_page upload");
+        assert_eq!(crate::gate::grant(&call("a", "write_file")), "write_file");
+    }
+
+    #[test]
     fn a_no_carries_the_reason_the_user_gave() {
         let _turn = lock(&SERVING);
         let requests = serve();

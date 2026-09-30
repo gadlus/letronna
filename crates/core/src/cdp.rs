@@ -232,11 +232,36 @@ fn http() -> Result<&'static reqwest::blocking::Client, String> {
 }
 
 /// A call's parameters, in a browser context if one is named.
-fn in_context(mut params: Value, context: Option<&str>) -> Value {
+pub(crate) fn in_context(mut params: Value, context: Option<&str>) -> Value {
     if let Some(context) = context {
         params["browserContextId"] = json!(context);
     }
     params
+}
+
+/// What a browser context does with a download.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Rule<'a> {
+    /// Save it into this folder, named by its id rather than by anything a
+    /// page chose.
+    Save(&'a Path),
+    /// Refuse it.
+    Refuse,
+    /// The browser's own way: with a window, the user's Downloads folder.
+    Own,
+}
+
+/// What `Browser.setDownloadBehavior` is sent to put `rule` in place in a
+/// context, with the download events on, as whoever reads them needs them.
+pub(crate) fn download_rule(rule: Rule, context: Option<&str>) -> Value {
+    let mut params = match rule {
+        Rule::Save(folder) => json!({"behavior": "allowAndName",
+                                     "downloadPath": folder.to_string_lossy()}),
+        Rule::Refuse => json!({"behavior": "deny"}),
+        Rule::Own => json!({"behavior": "default"}),
+    };
+    params["eventsEnabled"] = json!(true);
+    in_context(params, context)
 }
 
 /// The user agent of the browser whose debugging port this is, if it is up.
@@ -486,6 +511,22 @@ impl Reach {
             Some(link) => link.open.load(Ordering::Relaxed),
             None => running(self.port).is_some(),
         }
+    }
+
+    /// Whether the browser is on another machine, reached by address.
+    pub fn elsewhere(&self) -> bool {
+        self.link.is_some()
+    }
+
+    /// A connection to the browser that has put `rule` in place for a
+    /// context's downloads -- a private one, or with `None` the browser's
+    /// own -- and hears of every download from then on. The rule holds while
+    /// the connection is kept: once it closes the browser goes back to its
+    /// own way, which with a window is the user's Downloads folder.
+    pub(crate) fn keep_downloads(&self, rule: Rule, context: Option<&str>) -> Result<Tab, String> {
+        let mut browser = self.connect()?;
+        browser.call::<Ignored>("Browser.setDownloadBehavior", download_rule(rule, context))?;
+        Ok(browser)
     }
 
     /// A connection to the browser itself, rather than to one of its tabs.
@@ -1357,6 +1398,22 @@ mod tests {
         );
         assert!(note("confirm", "Delete this?", true).contains("answered OK"));
         assert!(note("beforeunload", "", false).contains("stayed"));
+    }
+
+    #[test]
+    fn downloads_are_saved_under_their_ids_in_the_sessions_own_context() {
+        let folder = Path::new("/data/browser/downloads/7");
+        let private = download_rule(Rule::Save(folder), Some("C1"));
+        assert_eq!(
+            private,
+            json!({"behavior": "allowAndName", "downloadPath": folder.to_string_lossy(),
+                   "eventsEnabled": true, "browserContextId": "C1"})
+        );
+        // The browser's own context is the one named by none.
+        let refused = download_rule(Rule::Refuse, None);
+        assert_eq!(refused, json!({"behavior": "deny", "eventsEnabled": true}));
+        let own = download_rule(Rule::Own, None);
+        assert_eq!(own, json!({"behavior": "default", "eventsEnabled": true}));
     }
 
     /// A stand-in for a browser's debugging socket: answers each request

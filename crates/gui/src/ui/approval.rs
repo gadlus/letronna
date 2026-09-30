@@ -4,7 +4,7 @@
 
 use crate::prelude::*;
 use letronna_core::approvals::Decision;
-use letronna_core::tools;
+use letronna_core::{gate, tools};
 
 impl Chat {
     pub(crate) fn submit_answer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -239,7 +239,9 @@ impl Chat {
                             this.resolve_call(Verdict::Allow { remember: false }, cx)
                         })),
                 )
-                .child(
+                // An upload is asked about each time, so there is no
+                // allowing it for the session.
+                .children(gate::grants_for_session(&call.name, &args).then(|| {
                     Button::new("allow-session")
                         .framed(cx)
                         .small()
@@ -247,8 +249,8 @@ impl Chat {
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.take_reason(window, cx);
                             this.resolve_call(Verdict::Allow { remember: true }, cx)
-                        })),
-                )
+                        }))
+                }))
                 .children(self.offer.as_ref().map(|rule| {
                     Button::new("allow-here")
                         .framed(cx)

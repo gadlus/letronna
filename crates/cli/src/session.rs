@@ -732,7 +732,12 @@ impl Runner {
         let here = rule
             .as_ref()
             .map(|rule| format!("Yes, and always allow `{}` here", rule.pattern));
-        let mut choices = vec!["Yes", "Yes, and stop asking for this"];
+        let mut choices = vec!["Yes"];
+        // An upload is asked about each time, so there is no stopping that.
+        let args = tools::parse_args_for(&call.name, &call.arguments).unwrap_or_default();
+        if gate::grants_for_session(&call.name, &args) {
+            choices.push("Yes, and stop asking for this");
+        }
         choices.extend(here.as_deref());
         choices.extend(["No, tell it why not", "No, and stop here"]);
         let picked = self.bar.choose(&question, detail, &choices);

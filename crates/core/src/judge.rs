@@ -675,10 +675,14 @@ mod tests {
             "use_page",
             json!({ "action": "type", "ref": "e12", "text": "hunter2", "submit": true }),
         );
-        assert_eq!(
-            typed,
-            "Browser: type into e12\nTyped: hunter2\nThen Enter is pressed\n\
-             On a page whose address is not known"
+        // Where a download it lets the page start would be saved comes last.
+        let saves = "\nMay save what the page downloads into ";
+        assert!(
+            typed.starts_with(
+                "Browser: type into e12\nTyped: hunter2\nThen Enter is pressed\n\
+                 On a page whose address is not known"
+            ) && typed.contains(saves),
+            "{typed}"
         );
         let script = "document.cookie";
         let eval = shown("use_page", json!({ "action": "eval", "script": script }));
@@ -687,7 +691,7 @@ mod tests {
             "browse",
             json!({ "action": "open", "url": "https://example.com/a" }),
         );
-        assert_eq!(open, "Browser: open https://example.com/a");
+        assert!(open.starts_with(&format!("Browser: open https://example.com/a{saves}")));
     }
 
     #[test]

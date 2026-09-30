@@ -19,6 +19,7 @@ pub mod chat;
 pub mod command;
 pub mod compact;
 pub mod diag;
+mod downloads;
 pub mod driver;
 mod edit;
 pub mod failure;
