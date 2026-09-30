@@ -322,6 +322,10 @@ pub struct Settings {
     /// "ctrl+shift+space". Empty until the window fills in its default.
     #[serde(default)]
     pub quick_entry_hotkey: String,
+    /// How big a workflow Crew suggests: small, medium or large; empty for
+    /// medium.
+    #[serde(default)]
+    pub crew: String,
 }
 
 // Written out rather than derived so the film grain and notifications start
@@ -360,6 +364,7 @@ impl Default for Settings {
             session_filter: String::new(),
             group_by_project: false,
             quick_entry_hotkey: String::new(),
+            crew: String::new(),
         }
     }
 }

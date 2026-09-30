@@ -24,6 +24,8 @@ pub mod commit;
 pub mod compact;
 pub mod complete;
 pub mod computer;
+#[cfg(feature = "workflows")]
+pub mod crew;
 pub mod diag;
 mod downloads;
 pub mod driver;
