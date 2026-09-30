@@ -115,6 +115,8 @@ pub struct Live {
     pub cost: Option<f64>,
     /// What summarizing older turns for the request took.
     pub summary_usage: Option<crate::usage::Usage>,
+    /// Why the cache served far less of the request than of the last one.
+    pub cache_miss: Option<crate::cache_miss::Reason>,
     pub calls: Vec<ToolCall>,
     pub replay: Option<Replay>,
     /// The try about to be made again after a failure, while it waits.
@@ -227,6 +229,7 @@ impl Turn {
                 self.live.cost = *cost;
             }
             Event::SummaryUsage(usage) => self.live.summary_usage = Some(*usage),
+            Event::CacheMiss(reason) => self.live.cache_miss = Some(*reason),
             Event::ToolCalls(calls) => self.live.calls = calls.clone(),
             Event::Replay(replay) => self.live.replay = Some(replay.clone()),
             Event::Retrying(retry) => self.live.retrying = Some(*retry),
@@ -256,6 +259,7 @@ impl Turn {
             reasoning_tokens: live.reasoning_tokens,
             cost: live.cost,
             summary_usage: live.summary_usage,
+            cache_miss: live.cache_miss,
             at: crate::chat::now(),
             tool_calls: live.calls,
             replay: live.replay.map(Box::new),
@@ -622,6 +626,7 @@ mod tests {
             reasoning: 5,
             cost: None,
         });
+        turn.absorb(&Event::CacheMiss(crate::cache_miss::Reason::Memory));
 
         let reply = turn.take_reply("some-model");
         assert_eq!(reply.content, "Hello");
@@ -630,6 +635,7 @@ mod tests {
         assert_eq!(reply.cached_tokens, 256);
         assert_eq!((reply.cache_write_tokens, reply.reasoning_tokens), (30, 5));
         assert_eq!(reply.summary_usage, Some(summary));
+        assert_eq!(reply.cache_miss, Some(crate::cache_miss::Reason::Memory));
         assert!(reply.at > 0);
         // No price is known for this model, so no cost is made up.
         assert_eq!(reply.cost, None);
@@ -637,6 +643,7 @@ mod tests {
         assert!(turn.live.content.is_empty());
         let next = turn.take_reply("some-model");
         assert_eq!((next.tokens, next.summary_usage), (0, None));
+        assert_eq!(next.cache_miss, None);
     }
 
     #[test]

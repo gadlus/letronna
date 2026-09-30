@@ -48,6 +48,10 @@ pub struct Message {
     /// longer held took, a model call of its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary_usage: Option<crate::usage::Usage>,
+    /// For `role: "assistant"`: why the prompt cache served far less of its
+    /// request than of the one before, when it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_miss: Option<crate::cache_miss::Reason>,
     /// For `role: "assistant"`: when the reply finished, in seconds since
     /// 1970, so its usage counts on the right day.
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -257,6 +261,9 @@ pub enum Event {
     /// What summarizing the turns the request no longer holds took, sent
     /// before the reply when a summary had to be asked for.
     SummaryUsage(crate::usage::Usage),
+    /// Sent after `Usage` when the cache served far less of this request
+    /// than of the session's last one, with the likely reason.
+    CacheMiss(crate::cache_miss::Reason),
     /// Sent once, before `Finished`, when the model asked for tools.
     ToolCalls(Vec<ToolCall>),
     /// Sent once, before `Finished`, when a finished reply came with
@@ -663,6 +670,20 @@ fn body_with(
     budget: &Budget,
     extra: &[Value],
 ) -> Value {
+    body_hashed(connection, window, summary, plan, budget, extra, None)
+}
+
+/// `body_with`, keeping the hashes of its cached prefix in `prefix` when
+/// given one: only a request that is sent needs them.
+fn body_hashed(
+    connection: &Connection,
+    window: &[Message],
+    summary: Option<&str>,
+    plan: Option<&str>,
+    budget: &Budget,
+    extra: &[Value],
+    mut prefix: Option<&mut crate::cache_miss::Prefix>,
+) -> Value {
     let mut system = identity(crate::styles::chosen());
     let shared = connection.remote.as_ref().is_some_and(|r| r.shared);
     if connection.tools && !shared {
@@ -706,8 +727,12 @@ fn body_with(
     // Memory and skills first: they change rarely, so the prompt's start
     // stays cacheable; the summary of dropped turns changes as the
     // conversation grows.
-    system.push_str(&crate::memory::context(connection));
-    system.push_str(&crate::skills::context(connection));
+    let identity = system.len();
+    let memory = crate::memory::context(connection);
+    let skills = crate::skills::context(connection);
+    system.push_str(&memory);
+    system.push_str(&skills);
+    let tail = system.len();
     // Models reckon "today" from their training and guess who they are. The
     // date alone changes once a day, so the prefix above stays cached; the OS
     // says something about this computer, so a shared chat goes without it.
@@ -723,6 +748,18 @@ fn body_with(
             other => other,
         };
         system.push_str(&format!(" This computer runs {os}."));
+    }
+    // Hashed apart from the model line, so that a switch of model is named
+    // as that rather than as the system prompt.
+    if let Some(prefix) = prefix.as_deref_mut() {
+        use crate::cache_miss::Reason;
+        prefix.set(Reason::System, (&system[..identity], &system[tail..]));
+        prefix.set(Reason::Memory, &memory);
+        prefix.set(Reason::Skills, &skills);
+        prefix.set(Reason::Summary, summary);
+        // Another gateway holds no cache of this one's, whatever the model.
+        let route = (connection.endpoint.trim(), connection.model.trim());
+        prefix.set(Reason::Model, route);
     }
     system.push_str(&format!(" The model behind you is {}.", connection.model));
     if let Some(summary) = summary {
@@ -898,6 +935,10 @@ fn body_with(
     }
     if crate::usage::asks_cost(&connection.endpoint) {
         body["usage"] = json!({"include": true});
+    }
+    if let Some(prefix) = prefix {
+        let tools = body.get("tools").map(Value::to_string);
+        prefix.set(crate::cache_miss::Reason::Tools, tools);
     }
     body
 }
@@ -2046,14 +2087,17 @@ fn stream(
         .chain(lsp.map(str::to_owned))
         .collect();
     let ending = ending.join("\n\n");
-    let sent = body_with(
+    let mut prefix = crate::cache_miss::Prefix::default();
+    let sent = body_hashed(
         connection,
         window,
         summary.as_deref(),
         Some(ending.as_str()).filter(|ending| !ending.is_empty()),
         budget,
         &extra.tools,
+        Some(&mut prefix),
     );
+    let ticket = crate::cache_miss::sent(connection.conversation, prefix);
     let mut request = client()
         .map_err(|e| Failure::new(FailureKind::Unknown, e))?
         .post(endpoint)
@@ -2087,7 +2131,15 @@ fn stream(
                 )
             }
             Ok(response) if response.status().is_success() => {
-                match read(response, connection, extra, sender, &mut stands, &mut slow) {
+                match read(
+                    response,
+                    connection,
+                    extra,
+                    ticket,
+                    sender,
+                    &mut stands,
+                    &mut slow,
+                ) {
                     Ok(()) => return Ok(()),
                     Err(failure) => failure,
                 }
@@ -2165,11 +2217,12 @@ fn ran_out_reading(e: &std::io::Error) -> bool {
 
 /// Pass a successful reply on as it arrives, setting `stands` once the model
 /// has begun it or when it is no event stream, and `slow` if it runs out of
-/// time.
+/// time. `ticket` is the one `cache_miss::sent` gave for the request.
 fn read(
     response: reqwest::blocking::Response,
     connection: &Connection,
     extra: &Extra,
+    ticket: u64,
     sender: &async_channel::Sender<Event>,
     stands: &mut bool,
     slow: &mut bool,
@@ -2186,7 +2239,7 @@ fn read(
         let began = std::time::Instant::now();
         let mut reply = Reply::default();
         reply.absorb(parse_chunk(&value)?, stands, sender)?;
-        return reply.end(true, began, connection, &extra.tools, sender);
+        return reply.end(true, began, connection, &extra.tools, ticket, sender);
     }
     // An event stream can end early for a reason that passes, as when a
     // gateway keeps it open with comments and then gives up on the model.
@@ -2227,7 +2280,7 @@ fn read(
         }
         reply.absorb(parse_event(data)?, stands, sender)?;
     }
-    reply.end(done, began, connection, &extra.tools, sender)
+    reply.end(done, began, connection, &extra.tools, ticket, sender)
 }
 
 /// Add streamed reasoning details to those so far. OpenRouter streams a
@@ -2352,6 +2405,7 @@ impl Reply {
         began: std::time::Instant,
         connection: &Connection,
         extra_tools: &[Value],
+        ticket: u64,
         sender: &async_channel::Sender<Event>,
     ) -> Result<(), Failure> {
         let held = self.think.finish();
@@ -2367,6 +2421,20 @@ impl Reply {
                 reasoning: self.reasoning_tokens,
                 cost: self.cost,
             });
+            if let Some(miss) =
+                crate::cache_miss::answered(connection.conversation, ticket, self.cached_tokens)
+            {
+                crate::diag::event(
+                    "cache_miss",
+                    &[
+                        ("model", connection.model.as_str().into()),
+                        ("reason", miss.reason.id().into()),
+                        ("before", miss.before.into()),
+                        ("cached", miss.cached.into()),
+                    ],
+                );
+                let _ = sender.send_blocking(Event::CacheMiss(miss.reason));
+            }
         }
         if !done && self.finish.is_none() {
             return Err(Failure::new(
@@ -5238,6 +5306,23 @@ mod tests {
     }
 
     #[test]
+    fn another_gateway_for_the_same_model_changes_the_prefix() {
+        let hashed = |connection: &Connection| {
+            let mut prefix = crate::cache_miss::Prefix::default();
+            let budget = Budget::SMALL;
+            body_hashed(connection, &[], None, None, &budget, &[], Some(&mut prefix));
+            prefix
+        };
+        let here = connection();
+        let elsewhere = Connection {
+            endpoint: "http://localhost:8080/v1/".into(),
+            ..connection()
+        };
+        assert_eq!(hashed(&here), hashed(&connection()));
+        assert_ne!(hashed(&here), hashed(&elsewhere));
+    }
+
+    #[test]
     fn max_tokens_rises_only_when_the_output_limit_is_known() {
         let asked = |budget: Budget| {
             body_with(&connection(), &[], None, None, &budget, &[])["max_tokens"].clone()
@@ -6281,7 +6366,9 @@ mod tests {
         }
         reply.finish = Some(FinishReason::Stop);
         let began = std::time::Instant::now();
-        reply.end(true, began, &connection(), &[], &sender).unwrap();
+        reply
+            .end(true, began, &connection(), &[], 0, &sender)
+            .unwrap();
         let (mut answer, mut thought) = (String::new(), String::new());
         while let Ok(event) = events.try_recv() {
             match event {
