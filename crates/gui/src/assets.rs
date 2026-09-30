@@ -76,7 +76,8 @@ impl AssetSource for Assets {
                 "list-filter",
                 "envelope",
                 "eye",
-                "keyboard"
+                "keyboard",
+                "cursor-click"
             ),
             ("telegram", "discord", "slack", "whatsapp")
         ))
@@ -122,6 +123,7 @@ pub(crate) enum AppIcon {
     Alert,
     Loader,
     Keyboard,
+    Point,
 }
 impl IconNamed for AppIcon {
     fn path(self) -> SharedString {
@@ -160,6 +162,7 @@ impl IconNamed for AppIcon {
             AppIcon::Alert => "icons/triangle-alert.svg",
             AppIcon::Loader => "icons/loader-circle.svg",
             AppIcon::Keyboard => "icons/keyboard.svg",
+            AppIcon::Point => "icons/cursor-click.svg",
         }
         .into()
     }

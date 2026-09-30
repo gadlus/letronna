@@ -41,6 +41,7 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **Chat apps** — Whole, formatted replies with Allow/Deny buttons; files, photos and voice notes go both ways.
 - **Terminal** — Notices show and are taken mid-turn and between prompts; lines typed while it works show as queued and can be taken back.
 - **All** — Send now: a queued message goes in without waiting for the step.
+- **App** — Point mode in the browser panel: click a spot on the page, comment on it, and the reference goes in the composer.
 
 ### Changed
 - **All** — A failed model request says what went wrong: the key, credit, a rate limit, a busy provider, a conversation too long, and so on.

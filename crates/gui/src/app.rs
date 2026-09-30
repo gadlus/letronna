@@ -872,6 +872,8 @@ impl Chat {
             this.in_front = window.is_window_active();
         });
         this._subscriptions.push(front);
+        let point_comment = this.follow_point_comments(window, cx);
+        this._subscriptions.push(point_comment);
         this.load_models(window, cx);
         // Directly, not through `focus_composer`: the window's root does
         // not exist yet to ask about dialogs, and there can be none.

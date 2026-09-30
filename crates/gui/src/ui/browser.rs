@@ -12,11 +12,13 @@
 //! where the page shows smaller.
 
 use crate::prelude::*;
+use gpui_component::Selectable;
+use letronna_core::browser::PointedElement;
 use letronna_core::watch::{self, Control, Held, Layout, Room, Sight, Watching};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-actions!(browser, [PageTab, PageTabBack]);
+actions!(browser, [PageTab, PageTabBack, CancelPoint]);
 
 /// How far a notch of the wheel scrolls the page: a browser's own hundred
 /// pixels, where the window counts three lines.
@@ -90,6 +92,9 @@ pub(crate) struct BrowserView {
     zoom: f64,
     /// How far the wheel has turned with Ctrl held, towards the next zoom.
     zoom_wheel: f32,
+    /// Point mode: off, waiting for a click, or an element chosen with its
+    /// comment being typed.
+    pointing: Option<Pointing>,
     _typing: Subscription,
 }
 
@@ -102,11 +107,28 @@ struct Pointer {
     doing: String,
 }
 
+/// Point mode's state: armed, waiting for a click on the page, or an
+/// element chosen, its box highlighted while its comment is written.
+enum Pointing {
+    Armed,
+    Chosen {
+        element: PointedElement,
+        comment: Entity<InputState>,
+        _submit: Subscription,
+    },
+}
+
 /// Asks the panel to widen for a page laid out as a desktop's, or to go
 /// back to its width before.
 pub(crate) struct Widen(pub(crate) bool);
 
 impl EventEmitter<Widen> for BrowserView {}
+
+/// A reference to something pointed at on the page, with the user's comment
+/// on it, ready to go in the composer.
+pub(crate) struct PointComment(pub(crate) String);
+
+impl EventEmitter<PointComment> for BrowserView {}
 
 impl BrowserView {
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -141,6 +163,7 @@ impl BrowserView {
             layout: Layout::Portrait,
             zoom: 1.,
             zoom_wheel: 0.,
+            pointing: None,
             _typing: typing,
         }
     }
@@ -189,13 +212,14 @@ impl BrowserView {
         match sight {
             Sight::Pointer { x, y, area, doing } => self.point((x, y), area, doing),
             Sight::Page { url, .. } => {
-                // The box drawn, and why an address did not open, were about
-                // the page before.
+                // The box drawn, why an address did not open, and what was
+                // pointed at were about the page before.
                 if self.url != url {
                     if let Some(pointer) = self.pointer.as_mut() {
                         pointer.area = None;
                     }
                     self.note = None;
+                    self.pointing = None;
                 }
                 self.url = url;
             }
@@ -214,6 +238,7 @@ impl BrowserView {
             Sight::Closed => {
                 self.show(None, cx);
                 self.pointer = None;
+                self.pointing = None;
                 self.url.clear();
                 self.loading = None;
                 self.history = (false, false);
@@ -282,6 +307,7 @@ impl BrowserView {
         self.asked = false;
         self.area = None;
         self.pressed = None;
+        self.pointing = None;
         self.show(None, cx);
         cx.notify();
     }
@@ -537,13 +563,119 @@ impl BrowserView {
         });
     }
 
+    /// Turn Point mode on -- click a spot on the page to point at what is
+    /// there and comment on it, for the composer -- or off.
+    fn toggle_point(&mut self, cx: &mut Context<Self>) {
+        if self.pointing.is_none() && (self.url.is_empty() || self.url == "about:blank") {
+            return;
+        }
+        self.pointing = match self.pointing {
+            None => Some(Pointing::Armed),
+            Some(_) => None,
+        };
+        cx.notify();
+    }
+
+    fn cancel_point(&mut self, cx: &mut Context<Self>) {
+        self.pointing = None;
+        cx.notify();
+    }
+
+    /// Escape while pointing cancels it here, before it reaches Chat's own
+    /// Escape; otherwise it is nothing nearer took, and goes on to Chat's.
+    fn on_cancel_point_key(&mut self, cx: &mut Context<Self>) {
+        match self.pointing {
+            Some(_) => self.cancel_point(cx),
+            None => cx.propagate(),
+        }
+    }
+
+    /// A click on the page while Point mode is armed: look up what is there,
+    /// mapped the same way a real click on the page is, and ask for a
+    /// comment on it.
+    fn point_click(&mut self, at: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((x, y)) = self.on_page(at) else {
+            return;
+        };
+        cx.spawn_in(window, async move |view, cx| {
+            let found = cx
+                .background_executor()
+                .spawn(async move { letronna_core::browser::point_at(x, y) })
+                .await;
+            let _ = view.update_in(cx, |view, window, cx| {
+                // Only while still waiting for it: Escape, or a first click's
+                // answer, may have come in the meantime.
+                match found {
+                    Ok(element) if matches!(view.pointing, Some(Pointing::Armed)) => {
+                        view.choose_point(element, window, cx)
+                    }
+                    Ok(_) => {}
+                    Err(why) => view.note = Some(why),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// What was pointed at: highlight its box, and ask for a comment on it.
+    fn choose_point(
+        &mut self,
+        element: PointedElement,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let comment = cx.new(|cx| InputState::new(window, cx).placeholder("Comment on this…"));
+        let submit = cx.subscribe_in(&comment, window, |view, _, event, _, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                view.submit_point(cx);
+            }
+        });
+        comment.update(cx, |input, cx| input.focus(window, cx));
+        self.pointing = Some(Pointing::Chosen {
+            element,
+            comment,
+            _submit: submit,
+        });
+        cx.notify();
+    }
+
+    /// Add what was pointed at, with the comment, to the composer.
+    fn submit_point(&mut self, cx: &mut Context<Self>) {
+        let Some(Pointing::Chosen {
+            element, comment, ..
+        }) = &self.pointing
+        else {
+            return;
+        };
+        let text = comment.read(cx).value().trim().to_owned();
+        if text.is_empty() {
+            return;
+        }
+        let reference = letronna_core::browser::point_reference(element, &text);
+        self.pointing = None;
+        cx.emit(PointComment(reference));
+        cx.notify();
+    }
+
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // The comment box sits inside the page: held here, what is typed
+        // into it would never reach it.
+        if let Some(Pointing::Chosen { comment, .. }) = &self.pointing
+            && comment.focus_handle(cx).is_focused(window)
+        {
+            return;
+        }
         let stroke = &event.keystroke;
         let shortcut = stroke.modifiers.secondary();
         match stroke.key.as_str() {
             "=" | "+" if shortcut => self.set_zoom(zoom_step(self.zoom, true), window, cx),
             "-" if shortcut => self.set_zoom(zoom_step(self.zoom, false), window, cx),
             "0" if shortcut => self.set_zoom(1., window, cx),
+            "p" if shortcut => self.toggle_point(cx),
+            // Clicks are held back while pointing, so keys are too: Enter on
+            // a focused page button would click it all the same.
+            _ if self.pointing.is_some() => {}
             "c" if shortcut => watch::control(Control::Copy),
             "x" if shortcut => {
                 watch::control(Control::Copy);
@@ -643,6 +775,14 @@ impl BrowserView {
                 .tooltip("Back to actual size")
                 .on_click(cx.listener(|view, _, window, cx| view.set_zoom(1., window, cx)))
         });
+        let point_button = Button::new("page-point")
+            .plain(cx)
+            .xsmall()
+            .icon(Icon::new(AppIcon::Point))
+            .selected(self.pointing.is_some())
+            .tooltip(format!("Point at something and comment  {SHORTCUT}P"))
+            .disabled(self.url.is_empty() || self.url == "about:blank")
+            .on_click(cx.listener(|view, _, _, cx| view.toggle_point(cx)));
         let own_window = Button::new("page-window")
             .plain(cx)
             .xsmall()
@@ -691,6 +831,7 @@ impl BrowserView {
                     .when(!typing, |bar| bar.child(self.shown_address(cx))),
             )
             .children(zoomed)
+            .child(point_button)
             .child(view_menu)
             .child(own_window)
     }
@@ -727,6 +868,10 @@ impl BrowserView {
                 };
                 press("tab", None, shift);
             }))
+            .on_action(cx.listener(|view, _: &CancelPoint, _, cx| view.on_cancel_point_key(cx)))
+            .when(matches!(self.pointing, Some(Pointing::Armed)), |screen| {
+                screen.cursor(CursorStyle::Crosshair)
+            })
             .on_scroll_wheel(cx.listener(|view, event: &ScrollWheelEvent, window, cx| {
                 let delta = event.delta.pixel_delta(WHEEL_LINE);
                 if event.modifiers.secondary() {
@@ -784,26 +929,34 @@ impl BrowserView {
                     button,
                     cx.listener(|view, event: &MouseDownEvent, window, cx| {
                         window.focus(&view.focus);
-                        view.mouse(
-                            watch::Mouse::Down,
-                            event.button,
-                            event.position,
-                            event.click_count,
-                            event.modifiers,
-                        );
+                        if event.button == MouseButton::Left
+                            && matches!(view.pointing, Some(Pointing::Armed))
+                        {
+                            view.point_click(event.position, window, cx);
+                        } else if view.pointing.is_none() {
+                            view.mouse(
+                                watch::Mouse::Down,
+                                event.button,
+                                event.position,
+                                event.click_count,
+                                event.modifiers,
+                            );
+                        }
                         cx.stop_propagation();
                     }),
                 )
                 .on_mouse_up(
                     button,
                     cx.listener(|view, event: &MouseUpEvent, _, _| {
-                        view.mouse(
-                            watch::Mouse::Up,
-                            event.button,
-                            event.position,
-                            event.click_count,
-                            event.modifiers,
-                        );
+                        if view.pointing.is_none() {
+                            view.mouse(
+                                watch::Mouse::Up,
+                                event.button,
+                                event.position,
+                                event.click_count,
+                                event.modifiers,
+                            );
+                        }
                     }),
                 );
         }
@@ -829,6 +982,7 @@ impl BrowserView {
                     .w(px((width * scale) as f32))
                     .h(px((height * scale) as f32))
                     .child(img(frame).size_full())
+                    .children(self.point_area().map(|area| self.point_box(area, cx)))
                     .children(
                         self.pointer
                             .as_ref()
@@ -933,17 +1087,115 @@ impl BrowserView {
                 .text_color(cx.theme().muted_foreground)
                 .child(pointer.doing.clone())
         });
-        if asked.is_none() && note.is_none() && doing.is_none() {
+        let hint = matches!(self.pointing, Some(Pointing::Armed)).then(|| {
+            div()
+                .px_3()
+                .py_1()
+                .truncate()
+                .text_xs()
+                .bg(cx.theme().background.opacity(0.88))
+                .text_color(cx.theme().muted_foreground)
+                .child("Click something on the page to point at it.")
+        });
+        let commenting = match &self.pointing {
+            Some(Pointing::Chosen {
+                element, comment, ..
+            }) => Some(
+                card()
+                    .items_start()
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("Pointing at {}", element.selector)),
+                            )
+                            .child(Input::new(comment).xsmall()),
+                    )
+                    .child(
+                        Button::new("point-submit")
+                            .primary()
+                            .xsmall()
+                            .icon(Icon::new(IconName::Check))
+                            .tooltip("Add to the composer")
+                            .on_click(cx.listener(|view, _, _, cx| view.submit_point(cx))),
+                    )
+                    .child(
+                        Button::new("point-cancel")
+                            .plain(cx)
+                            .xsmall()
+                            .icon(Icon::new(IconName::Close))
+                            .tooltip("Cancel")
+                            .on_click(cx.listener(|view, _, _, cx| view.cancel_point(cx))),
+                    ),
+            ),
+            _ => None,
+        };
+        if asked.is_none()
+            && note.is_none()
+            && doing.is_none()
+            && hint.is_none()
+            && commenting.is_none()
+        {
             return None;
         }
+        // At the top the card would cover what it is about when that sits
+        // in the page's upper half, as headings and menus do.
+        let low = self
+            .point_area()
+            .is_some_and(|[_, y, _, h]| y + h / 2. < self.size.1 / 2.);
+        let (above, below) = if low {
+            (None, commenting)
+        } else {
+            (commenting, None)
+        };
         Some(
             v_flex()
                 .absolute()
                 .inset_0()
                 .justify_between()
-                .child(v_flex().p_2().gap_2().children(asked).children(note))
-                .children(doing),
+                .child(
+                    v_flex()
+                        .p_2()
+                        .gap_2()
+                        .children(asked)
+                        .children(note)
+                        .children(above),
+                )
+                .children(below.map(|card| div().p_2().child(card)))
+                .children(doing)
+                .children(hint),
         )
+    }
+
+    /// The box of what was pointed at, in CSS pixels, while its comment is
+    /// being written.
+    fn point_area(&self) -> Option<[f64; 4]> {
+        match &self.pointing {
+            Some(Pointing::Chosen { element, .. }) => Some(element.area),
+            _ => None,
+        }
+    }
+
+    /// A static highlight over what was pointed at, until the comment is
+    /// done or cancelled.
+    fn point_box(&self, area: [f64; 4], cx: &mut Context<Self>) -> impl IntoElement {
+        let (width, height) = self.size;
+        let [x, y, w, h] = area;
+        div()
+            .absolute()
+            .left(relative((x / width) as f32))
+            .top(relative((y / height) as f32))
+            .w(relative((w / width) as f32))
+            .h(relative((h / height) as f32))
+            .rounded(px(4.))
+            .border_2()
+            .border_color(cx.theme().primary)
+            .bg(cx.theme().primary.opacity(0.12))
     }
 
     /// The pointer, the ring its click leaves, and the box of what it acts

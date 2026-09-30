@@ -11,7 +11,7 @@
 //! it covers the least.
 
 use crate::prelude::*;
-use crate::ui::browser::Widen;
+use crate::ui::browser::{PointComment, Widen};
 use gpui_component::tab::{Tab, TabBar};
 use std::collections::HashMap;
 
@@ -349,6 +349,30 @@ impl Chat {
             this.panel.widen(*wide, window.viewport_size().width);
             cx.notify();
         })
+    }
+
+    /// Put what Point mode found, with its comment, in the composer.
+    pub(crate) fn follow_point_comments(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        cx.subscribe_in(
+            &self.browser,
+            window,
+            |this, _, PointComment(text), window, cx| {
+                this.insert(text, window, cx);
+                this.focus_composer(window, cx);
+                // Setting a many-line box's text puts its cursor at the
+                // start, and what is typed next goes on after the reference.
+                this.composer.update(cx, |input, cx| {
+                    use gpui_component::input::RopeExt;
+                    let end = input.text().offset_to_position(input.value().len());
+                    input.set_cursor_position(end, window, cx);
+                });
+                cx.notify();
+            },
+        )
     }
 }
 
