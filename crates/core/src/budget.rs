@@ -72,7 +72,7 @@ impl Budget {
 
 /// A token count the way a person says it: 512k, 3.0M, or the count itself
 /// below a thousand.
-fn short(tokens: u64) -> String {
+pub fn short(tokens: u64) -> String {
     if tokens < 1_000 {
         tokens.to_string()
     } else if tokens < 1_000_000 {

@@ -716,7 +716,9 @@ fn clip(line: &[u8], regex: Option<&Regex>) -> String {
         String::from_utf8_lossy(&line[..m.start()]).chars().count()
     });
     let start = at.saturating_sub(LEAD_CHARS);
-    let mut out: String = text.chars().skip(start).take(LINE_CHARS).collect();
+    let out: String = text.chars().skip(start).take(LINE_CHARS).collect();
+    // Either end may be partway through a key, which can be told only here.
+    let mut out = crate::redact::scrub_cut(&out, false);
     if start > 0 {
         out.insert(0, '…');
     }

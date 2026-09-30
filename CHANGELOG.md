@@ -22,6 +22,25 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — Send more while Letronna works: it reaches the model at the reply's next step, in the window and the terminal.
 - **All** — Helper types, built in and from your own files, share one token budget across a whole tree of helpers.
 - **All** — Helpers' conversations are kept beside their session, out of the session list.
+- **All** — See, steer and stop helpers at work, and answer their approvals, in the window and the terminal.
+- **All** — Fork a helper from the conversation, and ask something aside with `/btw`.
+- **All** — Kept helpers wait idle for more work and wake on a message.
+- **All** — A session's agents share a task list with owners and blockers.
+- **All** — Helpers can answer through a checked schema, even at their round limit.
+- **All** — Workflow runs keep a journal and replay what already finished.
+- **All** — Letronna keeps notes on each project in a memory of its own, which refuses keys and planted instructions.
+- **All** — `/init` has the model write the project's AGENTS.md, and AGENTS.md or CLAUDE.md can pull in other files with `@path`.
+- **All** — `/usage` adds up tokens and cost per session, day and model; the usage line says how full the model's window was.
+- **All** — Each session keeps its own model and effort.
+- **All** — Your own hook commands can block a call or keep a turn going.
+- **All** — The model sees pictures you attach and those its tools open.
+- **All** — MCP over HTTP; servers take variables, tool filters and their own start time, restart after they stop, and reload when mcp.json changes. `letronna mcp` adds them.
+- **All** — Many MCP tools are looked up on demand instead of sent with every request.
+- **All** — Any tool can be switched off, and tools that cannot work are not offered.
+- **Chat apps** — Talk to Letronna from Slack. A Telegram chat pairs by a code, and only its owner answers.
+- **Chat apps** — Whole, formatted replies with Allow/Deny buttons; files, photos and voice notes go both ways.
+- **Terminal** — Notices show and are taken mid-turn and between prompts; lines typed while it works show as queued and can be taken back.
+- **All** — Send now: a queued message goes in without waiting for the step.
 
 ### Changed
 - **All** — A failed model request says what went wrong: the key, credit, a rate limit, a busy provider, a conversation too long, and so on.
@@ -34,6 +53,12 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — Commands run with no pager or editor to wait on, and colour codes are kept out of what the model reads.
 - **App** — The approval card and tool lookups no longer reread files on every frame.
 - **App** — The example plugin starts switched off.
+- **All** — Batches of calls run at once.
+- **All** — Session search finds words in any order, in the sidebar and `/resume`; the terminal lists sessions without reading every file.
+- **All** — Earlier turns survive a failed summary, a summary survives a restart, and compacting shows.
+- **All** — A project folder inside a repository keeps the repository's rules.
+- **All** — Commands and MCP servers start with the login shell's variables.
+- **All** — Stopping an MCP call tells its server, and stopping a server ends everything it started.
 - **All** — Plan mode refuses tools that change things, however they are asked for.
 - **All** — Secret files such as `.env` and private keys stay out of the model's reach; `.env.example` does not.
 - **All** — Stop reaches waits and running commands, and ends them.

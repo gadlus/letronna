@@ -6,8 +6,10 @@
 //! `ask_user` is answered by the user, and only runs here when nobody is there
 //! to answer it.
 
+use crate::budget::Budget;
 use crate::cancel::Cancel;
 use crate::chat::{Connection, Remote};
+use crate::driver::{AgentId, Allow};
 use crate::grep::{SEARCH_FILES, SEARCH_TIME};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read};
@@ -24,7 +26,7 @@ pub struct ToolContext {
     /// and whether other people can see the replies.
     pub remote: Option<Remote>,
     /// The conversation the call is made in, which keeps a browser of its
-    /// own; 0 for none in particular.
+    /// own and hears when its jobs exit; 0 for none in particular.
     pub conversation: u64,
     /// Where the file tools note what they write, for a rewind to put back.
     pub files: crate::history::Log,
@@ -35,6 +37,33 @@ pub struct ToolContext {
     /// The user said yes to this very call on its card, which lets a read
     /// the gate asked about reach a file of keys.
     pub approved: bool,
+    /// Who is calling, for tools that start other agents. Crate-private, so
+    /// a plugin's tool never sees the connection's key.
+    pub(crate) caller: Caller,
+}
+
+/// Who is making a call, as a tool that starts another agent needs to know.
+#[derive(Clone, Default)]
+pub(crate) struct Caller {
+    /// What the calling agent talks to the model on, which a helper's is made from.
+    pub connection: Option<Arc<Connection>>,
+    /// The helper making the call, or None for a session's own agent.
+    pub agent: Option<AgentId>,
+    /// The session the work is for.
+    pub root: u64,
+    /// How many helpers deep the calling agent is: 0 for a session's own.
+    pub depth: u8,
+    /// What the calling helper's tree spends from, or None outside a helper.
+    pub budget: Option<Arc<Budget>>,
+    /// The tree of helpers the call is made in, which an approval for the run covers.
+    pub run: Option<u64>,
+    /// The tools the calling helper may use, or None when it may use all;
+    /// `find_tools` finds it no others.
+    pub allowed: Option<Arc<[String]>>,
+    /// Whether the calling agent is a fork, which may start no agent of its own.
+    pub fork: bool,
+    /// What the calling agent may call, which a fork of it is held to.
+    pub allow: Allow,
 }
 
 impl ToolContext {
@@ -47,6 +76,11 @@ impl ToolContext {
             cancel: Cancel::default(),
             plan: connection.plan,
             approved: false,
+            caller: Caller {
+                connection: Some(Arc::new(connection.clone())),
+                root: connection.conversation,
+                ..Caller::default()
+            },
         }
     }
 
@@ -82,6 +116,33 @@ pub trait Tool: Send + Sync {
     fn needs_history(&self) -> bool {
         false
     }
+    /// Whether to offer the tool in this session; a call is re-checked with
+    /// only the workspace, chat, plan mode and session id it carries.
+    fn offered(&self, _: &Connection) -> bool {
+        true
+    }
+
+    /// Whether it may run at the same time as other such calls from one reply,
+    /// off unless a tool opts in so one that writes, waits or drives the
+    /// browser never runs beside another.
+    fn concurrent(&self) -> bool {
+        false
+    }
+
+    /// Whether what it returns is words someone other than the user wrote,
+    /// which reach the model fenced and without invisible characters. Its
+    /// errors are Letronna's: one quoting a page or a server fences the quote
+    /// itself, with `untrusted::quoted`.
+    fn untrusted(&self) -> bool {
+        false
+    }
+
+    /// Whether the output comes from outside the user's files -- a command,
+    /// a page, a server -- so words shaped like any vendor's key are hidden
+    /// in it too, not only the keys Letronna holds.
+    fn hides_key_shapes(&self) -> bool {
+        false
+    }
     /// What the approval card shows: a diff, the file body, the command line.
     fn preview(&self, args: &Value, ctx: &ToolContext) -> String {
         let _ = ctx;
@@ -97,8 +158,14 @@ pub trait Tool: Send + Sync {
 pub const ASK_USER: &str = "ask_user";
 pub const TODO: &str = "todo";
 pub const EXIT_PLAN: &str = "exit_plan";
-/// The tool result the model gets when the user denies a call.
+/// The tool result the model gets when the user denies a call without saying why.
 pub const DECLINED: &str = "The user declined this action. Ask before trying a different approach.";
+/// The most of a denial's reason that reaches the model, in characters:
+/// about a paragraph, which says why; anything longer is a paste that
+/// belongs in a message of its own.
+pub const REASON_CHARS: usize = 1000;
+/// How a denial that came with a reason opens, before the reason itself.
+const DECLINED_BECAUSE: &str = "The user declined: ";
 /// The tool result the model gets when the user approves its plan.
 pub const PLAN_APPROVED: &str = "The user approved this plan. Plan mode is off; carry it out now.";
 /// The tool result the model gets when the user wants the plan changed.
@@ -177,10 +244,12 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(ReadJob),
         Arc::new(StopJob),
         Arc::new(Wait),
+        Arc::new(crate::wake::WakeMe),
         Arc::new(AskUser),
         Arc::new(ExitPlan),
         Arc::new(Todo),
         Arc::new(crate::messaging::ReadChat),
+        Arc::new(crate::messaging::files::SendFile),
         Arc::new(Sessions),
         Arc::new(crate::memory::Remember),
         Arc::new(crate::skills::UseSkill),
@@ -192,7 +261,13 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(crate::media::MakeVideo),
         Arc::new(crate::browser::Browse),
         Arc::new(crate::browser::UsePage),
+        Arc::new(crate::agents::Agent),
+        Arc::new(crate::agents::Agents),
+        Arc::new(crate::tasklist::Board),
     ];
+    // In place of the MCP tools when those are too many to send; see
+    // `specs`. Here, so that no plugin can take their names.
+    tools.extend(crate::mcp_find::tools());
     // The user's own search service, once one is set up.
     if crate::search::ready() {
         tools.push(Arc::new(crate::search::SearchWeb));
@@ -208,6 +283,8 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
     // MCP servers' tools, once they have answered. Their names all start
     // with `mcp__`, so they cannot shadow one of the above either.
     tools.extend(crate::mcp::tools());
+    #[cfg(test)]
+    tools.extend(crate::mcp::served());
     tools
 }
 
@@ -232,7 +309,7 @@ pub fn parse_args(args: &str) -> Result<Value, String> {
 }
 
 /// The file tools, which other agents' models all call with a file path.
-const FILE_TOOLS: &[&str] = &["read_file", "write_file", "edit_file"];
+pub(crate) const FILE_TOOLS: &[&str] = &["read_file", "write_file", "edit_file"];
 
 /// Parameter names other agents use, as (theirs, ours, the tools it applies
 /// to), since a model used to one of them reaches for its names first.
@@ -278,6 +355,22 @@ pub fn rename_aliases(name: &str, args: &mut Value) -> Vec<String> {
         changed.push(format!("`{theirs}` as `{ours}`"));
     }
     changed
+}
+
+/// Copies the parameters of tool `name` under those of other agents' names
+/// for them that are in `wanted`, for a script written for that agent.
+pub(crate) fn add_aliases(name: &str, args: &mut Value, wanted: &[&str]) {
+    let Some(object) = args.as_object_mut() else {
+        return;
+    };
+    for (theirs, ours, tools) in ALIASES {
+        if !wanted.contains(theirs) || !tools.contains(&name) || object.contains_key(*theirs) {
+            continue;
+        }
+        if let Some(value) = object.get(*ours).cloned() {
+            object.insert((*theirs).to_owned(), value);
+        }
+    }
 }
 
 /// Parses a top-level string the schema wants as another type, such as
@@ -354,15 +447,22 @@ pub fn needs_approval(name: &str) -> bool {
     find(name).is_some_and(|t| t.needs_approval())
 }
 
+/// Whether a call to `name` may run beside the other such calls from its reply.
+pub fn concurrent(name: &str) -> bool {
+    find(name).is_some_and(|t| t.concurrent())
+}
+
 pub fn preview(name: &str, args: &str, ctx: &ToolContext) -> String {
-    match (find(name), parse_args(args)) {
+    let shown = match (find(name), parse_args(args)) {
         (Some(t), Ok(mut v)) => {
             // The card shows what will run, under the names the tool reads.
             repair(&*t, &mut v);
             t.preview(&v, ctx)
         }
         _ => args.to_owned(),
-    }
+    };
+    // A card can go to a chat app as well as to the screen.
+    crate::redact::scrub(&shown, false)
 }
 
 /// The plan an `exit_plan` call puts to the user, or why the call cannot be
@@ -387,32 +487,59 @@ pub fn offers_plan(connection: &Connection) -> bool {
 /// where other people read the replies, so is everything that touches this
 /// computer; `read_chat` exists only where there is a chat to read, and
 /// `exit_plan` only where there is a plan to hand over and someone to take it.
+/// The tools the user switched off are never offered.
+/// MCP tools too many to send go out on demand, through `find_tools` and
+/// `call_mcp_tool` (see `mcp_find`).
 pub fn specs(connection: &Connection) -> Vec<Value> {
+    let tools = all();
+    let on_demand = crate::mcp_find::on_demand(&tools);
+    specs_of(&tools, connection, on_demand)
+}
+
+/// `specs` of `tools`, with the MCP tools among them `on_demand` or not.
+pub(crate) fn specs_of(
+    tools: &[Arc<dyn Tool>],
+    connection: &Connection,
+    on_demand: bool,
+) -> Vec<Value> {
     let shared = connection.remote.as_ref().is_some_and(|r| r.shared);
     let history = connection
         .remote
         .as_ref()
         .is_some_and(|r| r.history.is_some());
-    all()
+    let disabled = crate::store::disabled_tools();
+    tools
         .iter()
+        .filter(|t| !switched_off(t.name(), &disabled))
+        .filter(|t| crate::mcp_find::in_array(t.name(), on_demand))
         .filter(|t| !connection.plan || !t.mutates() || t.name() == "run_command")
         .filter(|t| t.name() != EXIT_PLAN || offers_plan(connection))
         .filter(|t| !shared || !t.machine())
         .filter(|t| history || !t.needs_history())
-        .map(|t| {
-            json!({"type": "function", "function": {
-                "name": t.name(),
-                "description": t.description(),
-                "parameters": t.parameters(),
-            }})
-        })
+        .filter(|t| t.offered(connection))
+        .map(|t| spec(t.as_ref()))
         .collect()
+}
+
+/// Whether `disabled`, the settings' `disabled_tools`, names the tool `name`.
+pub(crate) fn switched_off(name: &str, disabled: &[String]) -> bool {
+    disabled.iter().any(|off| off.trim() == name)
+}
+
+/// How `tool` is offered in a request's `tools` array.
+pub(crate) fn spec(tool: &dyn Tool) -> Value {
+    json!({"type": "function", "function": {
+        "name": tool.name(),
+        "description": tool.description(),
+        "parameters": tool.parameters(),
+    }})
 }
 
 pub fn run(name: &str, args: &str, ctx: &ToolContext) -> Result<String, String> {
     let tool = find(name).ok_or_else(|| format!("Unknown tool `{name}`."))?;
     let started = Instant::now();
-    let result = run_found(tool.as_ref(), args, ctx);
+    let hooks = crate::hooks::current();
+    let result = run_found(tool.as_ref(), args, ctx, &hooks);
     crate::diag::event(
         "tool",
         &[
@@ -425,9 +552,28 @@ pub fn run(name: &str, args: &str, ctx: &ToolContext) -> Result<String, String> 
     result
 }
 
-fn run_found(tool: &dyn Tool, args: &str, ctx: &ToolContext) -> Result<String, String> {
+/// `run` for a tool already found: what every call goes through.
+pub(crate) fn run_found(
+    tool: &dyn Tool,
+    args: &str,
+    ctx: &ToolContext,
+    hooks: &Result<crate::hooks::Hooks, String>,
+) -> Result<String, String> {
     // Only fitting tools are offered, but the model can name any of them;
     // refuse here too rather than trust the offer.
+    let connection = Connection {
+        workspace: ctx.workspace.clone(),
+        remote: ctx.remote.clone(),
+        conversation: ctx.conversation,
+        plan: ctx.plan,
+        ..Default::default()
+    };
+    if !tool.offered(&connection) {
+        return Err(format!(
+            "`{}` is not available in this session.",
+            tool.name()
+        ));
+    }
     let mut args = parse_args(args)?;
     let note = reinterpreted(&repair(tool, &mut args));
     // The gate refuses these before any card, but a call can get here
@@ -435,10 +581,49 @@ fn run_found(tool: &dyn Tool, args: &str, ctx: &ToolContext) -> Result<String, S
     if let Some(why) = crate::gate::refusal(tool, &args, ctx) {
         return Err(why);
     }
-    let mut out = fit(tool.run(&args, ctx).map_err(|e| e + &note)?, ctx);
-    // After the cut, so the note is never the part that gets lost.
+    // After the gate, so a hook sees only a call that would run, and can
+    // only add a block to what the rules, the mode and the card allowed.
+    let heard = crate::hooks::before(hooks, tool.name(), &args, ctx).map_err(|e| e + &note)?;
+    // A stop while a hook ran came after the card: the call must not run.
+    if ctx.cancel.is_set() {
+        return Err(crate::agent::STOPPED_BEFORE_START.into());
+    }
+    // Hidden before the cut, which could split a key and leave half of it
+    // showing, and before anything is wrapped around the result.
+    let shapes = tool.hides_key_shapes();
+    let ran = tool
+        .run(&args, ctx)
+        .map_err(|e| crate::redact::scrub(&e, shapes) + &note + &heard)?;
+    let ran = crate::redact::scrub(&ran, shapes);
+    // The note goes after the cut and outside any fence: it is Letronna's,
+    // and never the part that gets lost. An untrusted tool's result is never
+    // saved aside to page through: read back, it would come unfenced.
+    let mut out = if tool.untrusted() {
+        fenced(tool.name(), &args, &ran)?
+    } else {
+        fit(ran, ctx)
+    };
     out.push_str(&note);
+    out.push_str(&heard);
+    let said = crate::hooks::after(hooks, tool.name(), &args, &out, ctx);
+    out.push_str(&said);
     Ok(out)
+}
+
+/// What an untrusted tool returned, fenced. A browse screenshot's first line
+/// is Letronna's own, naming the file it saved, as is an MCP result's that
+/// names a picture its server sent; it stays above the fence, where the
+/// window looks for it and nothing a page or server writes can reach.
+fn fenced(name: &str, args: &Value, text: &str) -> Result<String, String> {
+    let shot = name == crate::browser::BROWSE && args["action"] == "screenshot";
+    let saves = shot || crate::mcp::is_tool(name);
+    match text.split_once('\n') {
+        Some((own, rest)) if saves && crate::media::saved(own).is_some() => {
+            let room = MAX_OUTPUT.saturating_sub(own.len() + 1);
+            Ok(format!("{own}\n{}", crate::untrusted::fence(rest, room)?))
+        }
+        _ => crate::untrusted::fence(text, MAX_OUTPUT),
+    }
 }
 
 /// `out` as it is when it fits; otherwise cut, with the whole of it saved
@@ -496,7 +681,7 @@ fn spill(text: &str, ctx: &ToolContext) -> Option<PathBuf> {
 /// `text` as it is when it fits in `max` bytes; otherwise its first and last
 /// whole lines, with a line between them saying how much was left out and
 /// ending in `note`.
-fn keep_ends(text: String, max: usize, note: &str) -> String {
+pub(crate) fn keep_ends(text: String, max: usize, note: &str) -> String {
     keep_ends_around(text, &[], max, note)
 }
 
@@ -560,12 +745,39 @@ pub fn clamp_lines(text: &str, max: usize) -> String {
     out
 }
 
+/// The tool result for a call the user denied, with the reason they typed.
+/// The reason is the user's own words, not a tool's output, so it goes in
+/// as written rather than fenced off; with none, the result is `DECLINED`.
+pub fn declined(reason: &str) -> String {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return DECLINED.to_owned();
+    }
+    let mut kept: String = reason.chars().take(REASON_CHARS).collect();
+    if kept.len() < reason.len() {
+        kept.push('…');
+    }
+    format!("{DECLINED_BECAUSE}{kept}")
+}
+
+/// Whether a tool result is a denial, with a reason or without.
+pub fn is_declined(result: &str) -> bool {
+    result == DECLINED || result.starts_with(DECLINED_BECAUSE)
+}
+
 /// The argument the UI shows next to a tool name.
 pub fn summary(name: &str, args: &str) -> String {
     let mut v: Value = serde_json::from_str(args).unwrap_or(Value::Null);
     rename_aliases(name, &mut v);
     let text = match name {
-        "search" | "search_sessions" => v["pattern"]
+        "search_sessions" if v["session"].is_u64() => {
+            format!(
+                "session {} #{}",
+                v["session"],
+                v["around"].as_u64().unwrap_or(0)
+            )
+        }
+        "search" | "search_sessions" | crate::mcp_find::FIND_TOOLS => v["pattern"]
             .as_str()
             .or(v["query"].as_str())
             .map(|q| format!("\"{q}\""))
@@ -594,6 +806,20 @@ pub fn summary(name: &str, args: &str) -> String {
             .unwrap_or_default()
             .to_owned(),
         "speak" => v["text"].as_str().unwrap_or_default().to_owned(),
+        "agent" => v["description"].as_str().unwrap_or_default().to_owned(),
+        "agents" => format!(
+            "{} {}",
+            v["action"].as_str().unwrap_or_default(),
+            v["to"].as_str().unwrap_or_default()
+        ),
+        "board" => match v["id"].as_u64() {
+            Some(id) => format!("{} #{id}", v["action"].as_str().unwrap_or_default()),
+            None => format!(
+                "{} {}",
+                v["action"].as_str().unwrap_or_default(),
+                v["title"].as_str().unwrap_or_default()
+            ),
+        },
         crate::browser::BROWSE | "use_page" => crate::browser::summary(&v),
         TODO => {
             let items = v["items"].as_array().map(Vec::len).unwrap_or(0);
@@ -731,6 +957,16 @@ fn own_program(path: &Path, me: &Path) -> bool {
 
 /// The platform shell, configured the way every caller needs it.
 pub fn shell(command: &str, cwd: Option<&Path>) -> std::process::Command {
+    shell_over(crate::login_env::vars(), command, cwd)
+}
+
+/// `shell` starting from the login shell's variables `login`, which every
+/// variable set here wins over.
+fn shell_over(
+    login: &[(std::ffi::OsString, std::ffi::OsString)],
+    command: &str,
+    cwd: Option<&Path>,
+) -> std::process::Command {
     use std::process::Command;
     let mut cmd = if cfg!(windows) {
         let mut c = Command::new("powershell");
@@ -742,6 +978,7 @@ pub fn shell(command: &str, cwd: Option<&Path>) -> std::process::Command {
         c.args(["-c", command]);
         c
     };
+    cmd.envs(login.iter().map(|(name, value)| (name, value)));
     // Output is read back as UTF-8, and Python writes to a pipe in the
     // locale's encoding, which on Windows is not. An encoding on its own
     // would make Python strict, and a file name holding bytes that are not
@@ -908,7 +1145,7 @@ pub(crate) fn strip_escapes(text: &str) -> String {
 /// there was in all, so the middle of a chatty command's output costs
 /// nothing to hold.
 #[derive(Default)]
-struct Captured {
+pub(crate) struct Captured {
     head: Vec<u8>,
     tail: std::collections::VecDeque<u8>,
     bytes: usize,
@@ -918,7 +1155,7 @@ struct Captured {
 /// Bytes and line breaks printed but not kept, and where in the text they
 /// would have been.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Gap {
+pub(crate) struct Gap {
     at: usize,
     bytes: usize,
     lines: usize,
@@ -939,8 +1176,13 @@ impl Captured {
 
     /// What was kept, as text without escape sequences, and the gap in it
     /// when anything between the start and the end was dropped.
-    fn into_text(mut self) -> (String, Option<Gap>) {
-        let text = |bytes: &[u8]| strip_escapes(&String::from_utf8_lossy(bytes));
+    pub(crate) fn into_text(mut self) -> (String, Option<Gap>) {
+        // A pipe cut short, by the kill or by what is kept, can end partway
+        // through a key, and what is left of it can be told only while the
+        // cut is still the end.
+        let text = |bytes: &[u8]| {
+            crate::redact::scrub_cut(&strip_escapes(&String::from_utf8_lossy(bytes)), true)
+        };
         if self.bytes == self.head.len() + self.tail.len() {
             self.head.extend(self.tail);
             return (text(&self.head), None);
@@ -972,7 +1214,7 @@ fn line_breaks(bytes: &[u8]) -> usize {
 
 /// Keep what `pipe` yields in the returned capture until it closes or the
 /// capture is taken, then drop `open`.
-fn forward(
+pub(crate) fn forward(
     mut pipe: impl std::io::Read + Send + 'static,
     open: std::sync::mpsc::Sender<()>,
 ) -> Arc<Mutex<Option<Captured>>> {
@@ -1004,14 +1246,14 @@ fn forward(
 
 /// Whether every reader's pipe closed within `PIPE_GRACE`, which each marks
 /// by dropping its sender of `open`.
-fn pipes_closed(open: &std::sync::mpsc::Receiver<()>) -> bool {
+pub(crate) fn pipes_closed(open: &std::sync::mpsc::Receiver<()>) -> bool {
     use std::sync::mpsc::RecvTimeoutError;
     let closed = open.recv_timeout(PIPE_GRACE);
     matches!(closed, Err(RecvTimeoutError::Disconnected))
 }
 
 /// What a reader kept so far, which also stops it keeping more.
-fn take(kept: &Mutex<Option<Captured>>) -> Captured {
+pub(crate) fn take(kept: &Mutex<Option<Captured>>) -> Captured {
     kept.lock()
         .ok()
         .and_then(|mut kept| kept.take())
@@ -1051,6 +1293,9 @@ impl Tool for WriteFile {
         let change = crate::filestate::overwrite(ctx.conversation, &path, path_arg(args))?;
         let before = change.before().map(str::as_bytes);
         let text = crate::write::keep_format(before.unwrap_or_default(), content);
+        if crate::redact::rewrites_marker(change.before().unwrap_or_default(), &text) {
+            return Err(crate::redact::refused("`content`"));
+        }
         crate::write::check_syntax(&path, before, &text)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -1113,9 +1358,20 @@ impl Tool for EditFile {
         let edits = edits(args)?;
         let change = crate::filestate::edit(ctx.conversation, &path, path_arg(args))?;
         let text = change.before().unwrap_or_default();
+        let marker = crate::redact::MARKER;
+        if !text.contains(marker) && edits.iter().any(|edit| edit.old.contains(marker)) {
+            return Err(format!(
+                "`old` has {marker} in it, which stands for a key or token the file holds \
+                 and you were not shown, so it matches nothing. Match the text around it \
+                 instead."
+            ));
+        }
         let done = crate::edit::apply(text, &edits)?;
         if done.replaced == 0 {
             return Ok("Already applied; nothing changed.".into());
+        }
+        if crate::redact::adds_marker(text, &done.text) {
+            return Err(crate::redact::refused("`new`"));
         }
         crate::write::check_syntax(&path, Some(text.as_bytes()), &done.text)?;
         change.write(done.text.as_bytes(), &ctx.files)?;
@@ -1151,6 +1407,9 @@ fn edits(args: &Value) -> Result<Vec<crate::edit::Edit<'_>>, String> {
 
 struct RunCommand;
 impl Tool for RunCommand {
+    fn hides_key_shapes(&self) -> bool {
+        true
+    }
     fn mutates(&self) -> bool {
         true
     }
@@ -1167,7 +1426,8 @@ impl Tool for RunCommand {
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
             "command": {"type": "string"},
-            "background": {"type": "boolean", "description": "Leave the command running and return a job number straight away. Read its output later with read_job, and end it with stop_job."}
+            "background": {"type": "boolean", "description": "Leave the command running and return a job number straight away. A notice comes when it exits; read its output meanwhile with read_job, and end it with stop_job."},
+            "notify_on": {"type": "array", "items": {"type": "string"}, "description": "With background: a notice when an output line contains one of these, such as \"ready\" or \"error\". At most one notice every 15 s; exiting always sends one."}
         }, "required": ["command"]})
     }
     fn needs_approval(&self) -> bool {
@@ -1196,7 +1456,13 @@ impl Tool for RunCommand {
             .workspace
             .as_deref()
             .ok_or("No project folder is attached. Ask the user to attach one first.")?;
+        let notify_on = notify_on(args)?;
         if !args["background"].as_bool().unwrap_or(false) {
+            if !notify_on.is_empty() {
+                return Err("`notify_on` needs background: true. A command that runs \
+                            in the foreground returns all of its output anyway."
+                    .into());
+            }
             let before = crate::filestate::before(ctx.conversation);
             let out = run_shell(command, Some(cwd), &ctx.cancel);
             let note = crate::filestate::note(ctx.conversation, before, cwd);
@@ -1206,19 +1472,29 @@ impl Tool for RunCommand {
                 Err(e) => Err(note + &e),
             };
         }
-        let id = crate::jobs::start(command, cwd)?;
+        let id = crate::jobs::start_watching(command, cwd, ctx.conversation, &notify_on)?;
         // Give it a moment to fail or announce a port, so the first reply says
         // something more useful than "started". A stop cuts the moment short,
         // but the job runs on either way, so it is still reported.
         ctx.cancel.sleep(SETTLE);
-        let log = crate::jobs::log(id).unwrap_or_default();
+        // Read this way, what the reply shows never comes again as a notice.
+        let log = crate::jobs::first_output(id).unwrap_or_default();
         let state = if crate::jobs::running(id).unwrap_or(false) {
             "running"
         } else {
             "already exited"
         };
+        let watching = if notify_on.is_empty() {
+            String::new()
+        } else {
+            let quoted: Vec<String> = notify_on.iter().map(|text| format!("\"{text}\"")).collect();
+            format!(
+                "\nWatching for {}: a notice comes on a matching line, and when it exits.",
+                quoted.join(", ")
+            )
+        };
         Ok(format!(
-            "Started as job #{id} ({state}). First output:\n{}",
+            "Started as job #{id} ({state}). First output:\n{}{watching}",
             if log.trim().is_empty() {
                 "[nothing yet]"
             } else {
@@ -1239,6 +1515,9 @@ struct Sessions;
 impl Tool for Sessions {
     fn name(&self) -> &'static str {
         "list_sessions"
+    }
+    fn concurrent(&self) -> bool {
+        true
     }
     fn description(&self) -> &'static str {
         "List the user's earlier Letronna sessions: id, title, when they were last used, how many messages, and which project folder. Use this when asked about past sessions or which one to pick up. It returns no conversation text. The user opens one with the /resume command, or `letronna --resume <id>`."
@@ -1301,57 +1580,151 @@ impl Tool for SearchSessions {
     fn name(&self) -> &'static str {
         "search_sessions"
     }
+    fn concurrent(&self) -> bool {
+        true
+    }
     fn description(&self) -> &'static str {
-        "Search what was said in the user's earlier Letronna sessions for a word or phrase, ignoring case. Returns the matching lines with each session's id, title and age, newest sessions first. Use it when the user refers to something from an earlier conversation, or when an earlier session may already hold the answer."
+        "Search what was said in the user's earlier Letronna sessions, ignoring case. A match holds every word of the query (\"quoted words\" stay together), or when nothing does, some of them; matches on rarer words come first. Titles and tool call arguments are searched too; the current session is left out. Each match gives the session's id, title and age and the message's #. To read the messages around a match, call again with session and around. Use it when the user refers to something from an earlier conversation, or when an earlier session may already hold the answer."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
-            "query": {"type": "string"},
-            "limit": {"type": "integer", "description": "How many matches at most. Default 20."}
-        }, "required": ["query"]})
+            "query": {"type": "string", "description": "The words to find. With session, the words to center long messages on."},
+            "limit": {"type": "integer", "description": "How many matches at most. Default 20."},
+            "after": {"type": "string", "description": "Only sessions last used on or after this date, such as 2026-09-01, or this many days ago, such as 7d."},
+            "before": {"type": "string", "description": "Only sessions last used before this date, or this many days ago."},
+            "session": {"type": "integer", "description": "Read the messages of this session around one message instead of searching."},
+            "around": {"type": "integer", "description": "With session: the # of the message to read, with the three either side of it. Default 0."}
+        }})
     }
-    fn run(&self, args: &Value, _: &ToolContext) -> Result<String, String> {
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         let query = args["query"].as_str().unwrap_or_default().trim();
+        if let Some(id) = args["session"].as_u64() {
+            let around = args["around"].as_u64().unwrap_or(0) as usize;
+            return read_around(id, around, query);
+        }
         if query.is_empty() {
             return Err("Query is empty.".into());
         }
         let limit = args["limit"].as_u64().unwrap_or(20).clamp(1, 50) as usize;
-        let hits = crate::store::search(query, limit);
+        let now = crate::chat::now();
+        let date = |key: &str| {
+            args[key]
+                .as_str()
+                .map(|text| day_or_days(text, now))
+                .transpose()
+        };
+        let within = crate::store::Within {
+            exclude: ctx.conversation,
+            after: date("after")?,
+            before: date("before")?,
+        };
+        let hits = crate::store::search(query, &within, limit);
         if hits.is_empty() {
             return Ok(format!("No earlier session mentions \"{query}\"."));
         }
         let lines: Vec<String> = hits
             .iter()
             .map(|hit| {
-                let title = match hit.title.trim() {
-                    "" => "untitled",
-                    title => title,
-                };
+                let title = shown_title(&hit.title);
                 let when = crate::chat::ago(hit.updated);
+                let place = hit.ordinal.map(|n| format!("#{n} ")).unwrap_or_default();
                 format!(
-                    "{}  {title}  ({when}) {}: {}",
+                    "{}  {title}  ({when}) {place}{}: {}",
                     hit.id, hit.role, hit.snippet
                 )
             })
             .collect();
         Ok(format!(
-            "id  title  (when) who: what was said\n{}\n\nThe user opens one with /resume, or `letronna --resume <id>`.",
+            "id  title  (when) #message who: what was said\n{}\n\nRead around a match with session and around. The user opens one with /resume, or `letronna --resume <id>`.",
             lines.join("\n")
         ))
     }
 }
 
+/// Messages read either side of the one asked for.
+const READ_SIDE: usize = 3;
+/// Characters shown of each message read: seven of them with their labels
+/// stay under the chat's cap on a tool result, which would cut their middle.
+const READ_CHARS: usize = 1_000;
+
+/// The messages of session `id` either side of message `around`, each cut
+/// around the words of `query` when it is long.
+fn read_around(id: u64, around: usize, query: &str) -> Result<String, String> {
+    let Some(session) = crate::store::saved(id) else {
+        return Err(format!("There is no saved session {id}."));
+    };
+    let count = session.messages.len();
+    if around >= count {
+        return Err(format!(
+            "Session {id} has {count} messages, #0 to #{}.",
+            count.saturating_sub(1)
+        ));
+    }
+    let from = around.saturating_sub(READ_SIDE);
+    let to = (around + READ_SIDE).min(count - 1);
+    let title = shown_title(&session.title);
+    let mut out = format!(
+        "Session {id}  {title}  ({}), messages #{from} to #{to} of {count}:",
+        crate::chat::ago(session.updated)
+    );
+    for (n, message) in session.messages.iter().enumerate().take(to + 1).skip(from) {
+        let who = if message.notice {
+            "notice"
+        } else {
+            &message.role
+        };
+        let text = crate::store::searched(message);
+        let said = crate::store::excerpt(&text, query, READ_CHARS);
+        out.push_str(&format!("\n#{n} {who}: {said}"));
+    }
+    Ok(out)
+}
+
+/// A session's title on one line and cut short, as a renamed session's
+/// title can be any length and is shown on every line that names it.
+fn shown_title(title: &str) -> String {
+    match one_line(title) {
+        title if title.is_empty() => "untitled".into(),
+        title if title.chars().count() > 100 => title.chars().take(100).chain(['…']).collect(),
+        title => title,
+    }
+}
+
+/// Seconds since 1970 for an `after` or `before` argument: a date such as
+/// 2026-09-01, from the start of that day here, or days ago such as 7d.
+fn day_or_days(text: &str, now: u64) -> Result<u64, String> {
+    let text = text.trim();
+    if let Some(days) = text.strip_suffix('d').and_then(|d| d.parse::<u64>().ok()) {
+        return Ok(now.saturating_sub(days.saturating_mul(86_400)));
+    }
+    let wrong = || format!("\"{text}\" is not a date such as 2026-09-01, nor days ago such as 7d.");
+    let day = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").map_err(|_| wrong())?;
+    let start = day
+        .and_hms_opt(0, 0, 0)
+        .and_then(|t| t.and_local_timezone(chrono::Local).earliest())
+        .ok_or_else(wrong)?;
+    Ok(start.timestamp().max(0) as u64)
+}
+
 struct ReadJob;
 impl Tool for ReadJob {
+    fn hides_key_shapes(&self) -> bool {
+        true
+    }
     fn name(&self) -> &'static str {
         "read_job"
     }
+    fn concurrent(&self) -> bool {
+        true
+    }
     fn description(&self) -> &'static str {
-        "Read what a background job has printed so far, and whether it is still running."
+        "Read what a background job has printed so far, and whether it is still running. Pass offset and limit to read a long log a page of lines at a time."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
-            "id": {"type": "integer"}
+            "id": {"type": "integer"},
+            "offset": {"type": "integer", "description": "How many lines to skip, counting from the oldest line still kept."},
+            "limit": {"type": "integer", "description": "How many lines to read from there."}
         }, "required": ["id"]})
     }
     fn run(&self, args: &Value, _: &ToolContext) -> Result<String, String> {
@@ -1365,6 +1738,26 @@ impl Tool for ReadJob {
                 None => "stopped".to_owned(),
             }
         };
+        let (offset, limit) = (args["offset"].as_u64(), args["limit"].as_u64());
+        if offset.is_some() || limit.is_some() {
+            let lines: Vec<&str> = log.trim_end().lines().collect();
+            let total = lines.len();
+            let start = (offset.unwrap_or(0) as usize).min(total);
+            let end = limit.map_or(total, |limit| {
+                start.saturating_add(limit as usize).min(total)
+            });
+            if start == end {
+                return Ok(format!(
+                    "Job #{id} is {state}. No lines from line {}; the log has {total}.",
+                    offset.unwrap_or(0).saturating_add(1)
+                ));
+            }
+            return Ok(format!(
+                "Job #{id} is {state}. Lines {} to {end} of {total}:\n{}",
+                start + 1,
+                lines[start..end].join("\n")
+            ));
+        }
         Ok(format!(
             "Job #{id} is {state}.\n{}",
             if log.trim().is_empty() {
@@ -1401,11 +1794,14 @@ impl Tool for StopJob {
 
 struct Wait;
 impl Tool for Wait {
+    fn hides_key_shapes(&self) -> bool {
+        true
+    }
     fn name(&self) -> &'static str {
         "wait"
     }
     fn description(&self) -> &'static str {
-        "Pause before continuing: for a number of seconds, or until a background job prints something. Use it to let a server come up before calling it."
+        "Pause before continuing: for a number of seconds, or until a background job prints something. Use it to let a server come up before calling it; waiting for a job's `until` ends as soon as it prints. If you have wake_me, use it instead of a plain pause over 30 seconds."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -1461,6 +1857,25 @@ fn job_id(args: &Value) -> Result<u64, String> {
     args["id"]
         .as_u64()
         .ok_or_else(|| "`id` is required and must be a job number.".to_owned())
+}
+
+/// The text a background command's output is watched for, from `notify_on`.
+fn notify_on(args: &Value) -> Result<Vec<String>, String> {
+    let bad = "`notify_on` must be a list of text to look for, such as [\"ready\", \"error\"].";
+    let list = match &args["notify_on"] {
+        Value::Null => return Ok(Vec::new()),
+        Value::Array(list) => list,
+        _ => return Err(bad.into()),
+    };
+    // An empty string is in every line, so it would watch for nothing in particular.
+    list.iter()
+        .map(|text| {
+            text.as_str()
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| bad.to_owned())
+        })
+        .collect()
 }
 
 /// Answered in the chat, and run only in an unattended session to say nobody will.
@@ -1675,8 +2090,11 @@ impl Tool for ReadFile {
     fn name(&self) -> &'static str {
         "read_file"
     }
+    fn concurrent(&self) -> bool {
+        true
+    }
     fn description(&self) -> &'static str {
-        "Read a text file. Paths are relative to the workspace. Each line is shown as `N|text`, N being its line number; the `N|` is not part of the file. A long file comes a page at a time, and the page ends with the offset to continue from."
+        "Read a text file, or look at a PNG, JPEG, GIF or WebP picture. Paths are relative to the workspace. Each line is shown as `N|text`, N being its line number; the `N|` is not part of the file. A long file comes a page at a time, and the page ends with the offset to continue from."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -1690,6 +2108,9 @@ impl Tool for ReadFile {
         let path = resolve(raw, ctx).map_err(|e| e + &similar(raw, ctx))?;
         let offset = args["offset"].as_u64().unwrap_or(1).max(1) as usize;
         let limit = args["limit"].as_u64().unwrap_or(u64::MAX).max(1) as usize;
+        if let Some(copy) = open_picture(&path, raw)? {
+            return Ok(copy);
+        }
         let before = crate::filestate::stat(&path);
         let (mut text, cut) = open_text(&path)?;
         let (shown, whole) = page(&mut text, offset, limit, cut)?;
@@ -1698,6 +2119,36 @@ impl Tool for ReadFile {
         crate::filestate::read(ctx.conversation, &path, before, whole);
         Ok(shown)
     }
+}
+
+/// A picture read_file was pointed at, copied as it is now into Letronna's
+/// own `media/`, from where the next request shows it to the model; None
+/// for a file that is not a picture every provider takes.
+fn open_picture(path: &Path, raw: &str) -> Result<Option<String>, String> {
+    let mut start = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|file| file.take(12).read_to_end(&mut start))
+        .map_err(|e| e.to_string())?;
+    let Some(kind) = crate::media::picture_kind(&start) else {
+        return Ok(None);
+    };
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let size = crate::media::size(bytes.len());
+    if bytes.len() > crate::media::PICTURE_BYTES {
+        return Err(format!(
+            "`{raw}` is a picture of {size}, more than the {} a model is sent. A smaller copy of it can be read.",
+            crate::media::size(crate::media::PICTURE_BYTES)
+        ));
+    }
+    let about = path.file_stem().unwrap_or_default().to_string_lossy();
+    // Not into the project, as a media tool's are: looking at a picture
+    // leaves the user's files as they were, in plan mode too.
+    let copy = crate::media::save(&ToolContext::default(), &about, kind, &bytes)?;
+    Ok(Some(format!(
+        "{}{}\nA copy of the picture `{raw}`, {size}. It follows the results when this model takes pictures.",
+        crate::media::SAVED,
+        copy.display()
+    )))
 }
 
 /// A file's text as UTF-8, without a byte order mark and with UTF-16 decoded,
@@ -1756,8 +2207,15 @@ fn page(
         }
         let text = String::from_utf8_lossy(&line);
         let shown = match text.char_indices().nth(LINE_CHARS) {
-            Some((at, _)) => {
+            Some(_) => {
                 long = true;
+                // Hidden before the cut, which could leave part of a key
+                // showing; `next_line` may have cut the line already.
+                let text = crate::redact::scrub_cut(&text, false);
+                let at = text
+                    .char_indices()
+                    .nth(LINE_CHARS)
+                    .map_or(text.len(), |(at, _)| at);
                 format!("{n}|{} … [line cut]\n", &text[..at])
             }
             None => format!("{n}|{text}\n"),
@@ -1902,6 +2360,9 @@ impl Tool for ListDir {
     fn name(&self) -> &'static str {
         "list_dir"
     }
+    fn concurrent(&self) -> bool {
+        true
+    }
     fn description(&self) -> &'static str {
         "List the entries of a folder. Folders end with a slash."
     }
@@ -1929,6 +2390,9 @@ struct Search;
 impl Tool for Search {
     fn name(&self) -> &'static str {
         "search"
+    }
+    fn concurrent(&self) -> bool {
+        true
     }
     fn description(&self) -> &'static str {
         "Search file contents under a folder with a regex (Rust syntax), matched line by \
@@ -1985,6 +2449,21 @@ impl Tool for Search {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_session_search_date_is_a_day_here_or_days_ago() {
+        let now = 1_800_000_000;
+        assert_eq!(day_or_days("7d", now), Ok(now - 7 * 86_400));
+        assert_eq!(day_or_days(" 0d ", now), Ok(now));
+        let day = day_or_days("2026-09-01", now).unwrap();
+        let local = chrono::TimeZone::timestamp_opt(&chrono::Local, day as i64, 0).unwrap();
+        assert_eq!(local.format("%F %T").to_string(), "2026-09-01 00:00:00");
+        for wrong in ["yesterday", "7", "2026-13-01", "-3d"] {
+            let refused = day_or_days(wrong, now);
+            assert!(refused.is_err_and(|e| e.contains("7d")), "{wrong}");
+        }
+    }
+
     #[test]
     fn reads_lists_searches_within_workspace() {
         let dir = std::env::temp_dir().join("letronna-tools");
@@ -2320,6 +2799,45 @@ mod tests {
     }
 
     #[test]
+    fn read_file_saves_a_copy_of_a_picture_and_names_it() {
+        let (_turn, data) = data_folder("picture");
+        // Outside the data folder, whose files read_file refuses.
+        let dir = std::env::temp_dir().join(format!("letronna-picture-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+        std::fs::write(dir.join("chart.png"), png).unwrap();
+        std::fs::write(dir.join(".env"), png).unwrap();
+        std::fs::write(dir.join("big.gif"), b"GIF89a").unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("big.gif"));
+        file.unwrap()
+            .set_len(crate::media::PICTURE_BYTES as u64 + 1)
+            .unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let read = run("read_file", r#"{"path":"chart.png"}"#, &ctx).unwrap();
+        let copy = crate::media::saved_by("read_file", &read).unwrap();
+        assert!(copy.starts_with(data.join("media")) && copy.to_string_lossy().ends_with(".png"));
+        assert_eq!(std::fs::read(&copy).unwrap(), png);
+        assert!(!read.contains("PNG") && read.contains("`chart.png`, 1 KB"));
+        // A secret-named file is refused whatever it holds, one too big to
+        // send is refused with its size, and other bytes are still no text.
+        let refused = run("read_file", r#"{"path":".env"}"#, &ctx).unwrap_err();
+        assert!(refused.contains("out of reach"), "{refused}");
+        let big = run("read_file", r#"{"path":"big.gif"}"#, &ctx).unwrap_err();
+        assert!(big.contains("a picture of 3.8 MB"), "{big}");
+        std::fs::write(dir.join("blob.bin"), b"\0\x01\x02").unwrap();
+        let blob = run("read_file", r#"{"path":"blob.bin"}"#, &ctx).unwrap_err();
+        assert_eq!(blob, "Not a text file.");
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[test]
     fn edit_file_makes_every_edit_or_none_and_keeps_the_file_as_it_was_written() {
         let dir = std::env::temp_dir().join(format!("letronna-edit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2510,6 +3028,29 @@ mod tests {
         assert_eq!(
             String::from_utf8_lossy(&out.stdout).trim(),
             "cat cat true 1 dumb"
+        );
+    }
+
+    #[test]
+    fn the_login_shell_gives_commands_its_variables_but_not_a_pager_or_colour() {
+        let login: Vec<(std::ffi::OsString, std::ffi::OsString)> = [
+            ("PAGER", "less"),
+            ("GIT_PAGER", "delta"),
+            ("TERM", "xterm-256color"),
+            ("FROM_PROFILE", "yes"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.into(), value.into()))
+        .collect();
+        let print = if cfg!(windows) {
+            r#"Write-Output "$env:PAGER $env:GIT_PAGER $env:TERM $env:FROM_PROFILE""#
+        } else {
+            r#"echo "$PAGER $GIT_PAGER $TERM $FROM_PROFILE""#
+        };
+        let out = shell_over(&login, print, None).output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "cat cat dumb yes"
         );
     }
 
@@ -2747,6 +3288,37 @@ mod tests {
         crate::jobs::stop(id).unwrap();
         let out = out.unwrap_err();
         assert!(out.contains("still running"), "{out}");
+    }
+
+    #[test]
+    fn read_job_pages_through_a_long_log() {
+        let count = if cfg!(windows) {
+            "1..300 | ForEach-Object { \"line $_\" }"
+        } else {
+            "i=1; while [ $i -le 300 ]; do echo line $i; i=$((i+1)); done"
+        };
+        let id = crate::jobs::start(count, &std::env::temp_dir()).unwrap();
+        // Read once it has all been printed, so no page moves while it is read.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !crate::jobs::log(id).unwrap().contains("line 300") && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let read = |args: Value| ReadJob.run(&args, &ToolContext::default()).unwrap();
+        let page = read(json!({"id": id, "offset": 100, "limit": 3}));
+        assert!(
+            page.ends_with(" Lines 101 to 103 of 300:\nline 101\nline 102\nline 103"),
+            "{page}"
+        );
+        let end = read(json!({"id": id, "offset": 298}));
+        assert!(
+            end.ends_with(" Lines 299 to 300 of 300:\nline 299\nline 300"),
+            "{end}"
+        );
+        let past = read(json!({"id": id, "offset": 400, "limit": 10}));
+        assert!(
+            past.ends_with(" No lines from line 401; the log has 300."),
+            "{past}"
+        );
     }
 
     #[test]
@@ -3405,5 +3977,220 @@ mod tests {
             r#"[{"action": "remove", "old_text": "tea"}, {"action": "add", "content": "d"}]"#})
         .to_string();
         assert_eq!(summary("memory", &stringed), "remove, add user");
+    }
+
+    #[test]
+    fn a_denial_passes_on_the_users_reason_cut_to_a_paragraph() {
+        assert_eq!(declined(""), DECLINED);
+        assert_eq!(declined("  \n "), DECLINED);
+        assert_eq!(
+            declined(" use the staging database instead\n"),
+            "The user declined: use the staging database instead"
+        );
+        let long = "é".repeat(REASON_CHARS + 5);
+        let out = declined(&long);
+        let kept = out.strip_prefix("The user declined: ").unwrap();
+        assert_eq!(kept.chars().count(), REASON_CHARS + 1);
+        assert!(kept.ends_with("é…"), "{kept}");
+        // Exactly at the cap is not cut.
+        let full = "a".repeat(REASON_CHARS);
+        assert!(!declined(&full).ends_with('…'));
+        // Either way it still reads as a denial, not a failure.
+        assert!(is_declined(DECLINED) && is_declined(&declined("not now")));
+        assert!(!is_declined("No such file or directory"));
+    }
+
+    #[test]
+    fn only_tools_that_bring_in_other_peoples_words_are_fenced() {
+        let fenced: Vec<&str> = all()
+            .iter()
+            .filter(|t| t.untrusted())
+            .map(|t| t.name())
+            .filter(|name| !name.starts_with("mcp__"))
+            .collect();
+        // read_chat fences other people's lines itself, and not the user's.
+        assert_eq!(fenced, ["web_fetch", "browse", "use_page"]);
+        assert!(crate::search::SearchWeb.untrusted());
+    }
+
+    #[test]
+    fn letronnas_own_error_stays_outside_any_fence() {
+        let refused = run("read_chat", "{}", &ToolContext::default()).unwrap_err();
+        assert_eq!(refused, "There is no chat to read in this session.");
+    }
+
+    #[test]
+    fn a_screenshot_keeps_its_file_above_the_fence_and_a_page_cannot_forge_one() {
+        let shot = format!(
+            "{}/data/media/page-1.jpg\nA screenshot of https://example.com/, 800×600.",
+            crate::media::SAVED
+        );
+        let args = json!({"action": "screenshot"});
+        let out = fenced(crate::browser::BROWSE, &args, &shot).unwrap();
+        assert_eq!(
+            crate::media::saved_by(crate::browser::BROWSE, &out),
+            Some(PathBuf::from("/data/media/page-1.jpg"))
+        );
+        assert!(out.contains("800×600.\n</untrusted-content-"), "{out}");
+        // A page titled like the line, looked at rather than photographed.
+        let look = fenced(crate::browser::BROWSE, &json!({"action": "look"}), &shot).unwrap();
+        assert_eq!(crate::media::saved_by(crate::browser::BROWSE, &look), None);
+        // An MCP result naming the picture its server sent keeps it too; the
+        // server's own words shaped like it start with a space, so they don't.
+        let sent = format!("{}/p/media/mcp-1.png\nHere it is.", crate::media::SAVED);
+        let out = fenced("mcp__demo__shoot", &json!({}), &sent).unwrap();
+        assert!(crate::media::saved_by("mcp__demo__shoot", &out).is_some());
+        let forged = fenced("mcp__demo__shoot", &json!({}), &format!(" {sent}")).unwrap();
+        assert_eq!(crate::media::saved_by("mcp__demo__shoot", &forged), None);
+    }
+
+    #[test]
+    fn no_write_puts_the_secret_marker_where_a_key_was() {
+        let dir = std::env::temp_dir().join(format!("letronna-marker-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = "url = \"https://example.com\"\nkey = \"sk-real-0123456789abcdef\"\n";
+        std::fs::write(dir.join("app.toml"), config).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let on_disk = || std::fs::read_to_string(dir.join("app.toml")).unwrap();
+        let marker = crate::redact::MARKER;
+        // What the model saw, written back whole.
+        let seen = config.replace("sk-real-0123456789abcdef", marker);
+        let write = json!({"path": "app.toml", "content": seen});
+        let refused = WriteFile.run(&write, &ctx).unwrap_err();
+        assert!(refused.contains(marker), "{refused}");
+        let fresh = json!({"path": "new.toml", "content": format!("key = \"{marker}\"")});
+        assert!(WriteFile.run(&fresh, &ctx).is_err());
+        assert!(!dir.join("new.toml").exists());
+
+        let line = format!("key = \"{marker}\"");
+        let edit = json!({"path": "app.toml", "old": line, "new": "key = \"\""});
+        let refused = EditFile.run(&edit, &ctx).unwrap_err();
+        assert!(refused.contains("matches nothing"), "{refused}");
+        let edit = json!({"path": "app.toml", "old": "https://example.com", "new": marker});
+        assert!(EditFile.run(&edit, &ctx).is_err());
+        assert_eq!(on_disk(), config);
+        // The lines around it can still be changed.
+        let edit = json!({"path": "app.toml", "old": "example.com", "new": "example.org"});
+        EditFile.run(&edit, &ctx).unwrap();
+        assert!(on_disk().contains("sk-real-"));
+
+        let command = json!({"command": format!("echo '{marker}' > app.toml")}).to_string();
+        let refused = run("run_command", &command, &ctx).unwrap_err();
+        assert!(refused.starts_with("Refused"), "{refused}");
+        assert!(on_disk().contains("sk-real-"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The names of the tools a plain local session is offered.
+    fn offered_names() -> Vec<String> {
+        specs(&Connection {
+            tools: true,
+            ..Default::default()
+        })
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap().to_owned())
+        .collect()
+    }
+
+    #[test]
+    fn media_tools_are_offered_only_while_signed_in() {
+        let (_turn, dir) = data_folder("media-offered");
+        let media = ["make_image", "speak", "transcribe", "make_video"];
+        let signed_out = offered_names();
+        assert!(signed_out.contains(&"read_file".to_owned()));
+        assert!(
+            media.iter().all(|m| !signed_out.contains(&m.to_string())),
+            "{signed_out:?}"
+        );
+        // One the model remembers is refused before it reaches the API.
+        let args = r#"{"prompt":"a lighthouse"}"#;
+        let refused = run("make_image", args, &ToolContext::default()).unwrap_err();
+        assert!(refused.contains("not available"), "{refused}");
+
+        let account = crate::auth::Account {
+            token: "t-1".into(),
+            ..Default::default()
+        };
+        let account = serde_json::to_string(&account).unwrap();
+        std::fs::write(dir.join("account.json"), account).unwrap();
+        let signed_in = offered_names();
+        assert!(
+            media.iter().all(|m| signed_in.contains(&m.to_string())),
+            "{signed_in:?}"
+        );
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    /// A tool of any name that answers "ran", for what is decided by name.
+    struct Named(&'static str);
+    impl Tool for Named {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn description(&self) -> &'static str {
+            "Answers ran."
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn run(&self, _: &Value, _: &ToolContext) -> Result<String, String> {
+            Ok("ran".into())
+        }
+    }
+
+    #[test]
+    fn a_switched_off_tool_is_neither_offered_nor_run_and_other_names_are_passed_over() {
+        use crate::gate::{Gate, Grants, Mode, Outcome, decide};
+        let (_turn, dir) = data_folder("switched-off");
+        let off = ["search_sessions", " mcp__demo__echo ", "no_such_tool"];
+        let settings = json!({"endpoint": "", "model": "", "disabled_tools": off});
+        std::fs::write(dir.join("settings.json"), settings.to_string()).unwrap();
+        let names = offered_names();
+        assert!(!names.contains(&"search_sessions".to_owned()), "{names:?}");
+        assert!(names.contains(&"list_sessions".to_owned()), "{names:?}");
+
+        // One the model remembers from earlier is refused, saying why, before
+        // any card and whatever the mode.
+        let ctx = ToolContext::default();
+        let args = r#"{"query":"fig"}"#;
+        let refused = run("search_sessions", args, &ctx).unwrap_err();
+        assert!(refused.contains("`disabled_tools`"), "{refused}");
+        let call = crate::chat::ToolCall {
+            id: "c-1".into(),
+            name: "search_sessions".into(),
+            arguments: args.into(),
+        };
+        let gate = Gate {
+            ctx: &ctx,
+            mode: Mode::Bypass,
+            grants: &Grants::new(),
+            rules: &[],
+            broken: None,
+            human: true,
+        };
+        assert!(
+            matches!(decide(&call, &gate), Outcome::Refuse(why) if why.contains("switched off"))
+        );
+
+        // An MCP server's tool goes by its full name, and only that one.
+        let refused = run_found(
+            &Named("mcp__demo__echo"),
+            "{}",
+            &ctx,
+            &Ok(Default::default()),
+        )
+        .unwrap_err();
+        assert!(refused.contains("switched off"), "{refused}");
+        let other = run_found(
+            &Named("mcp__demo__other"),
+            "{}",
+            &ctx,
+            &Ok(Default::default()),
+        );
+        assert_eq!(other.as_deref(), Ok("ran"));
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 }

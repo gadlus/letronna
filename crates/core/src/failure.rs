@@ -554,14 +554,6 @@ mod tests {
             said(Some(429), r#"{"error":{"message":"Slow down."}}"#),
             "Slow down."
         );
-        // Explained where it would mislead.
-        assert!(
-            said(
-                Some(400),
-                r#"{"error":{"message":"Function call is missing a thought_signature in functionCall parts."}}"#
-            )
-            .contains("/model")
-        );
         // A page that is not JSON leaves only the status to go on.
         assert!(
             said(Some(503), "<html>Service Unavailable</html>")

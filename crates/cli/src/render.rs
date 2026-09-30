@@ -551,6 +551,20 @@ pub fn fit(text: &str, width: usize) -> String {
     cut
 }
 
+/// Plain text cut to `width` columns, ending in an ellipsis where it was
+/// cut, for a row that must not wrap.
+pub fn clip(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_owned();
+    }
+    let Some(room) = width.checked_sub(1) else {
+        return String::new();
+    };
+    let mut cut: String = text.chars().take(room).collect();
+    cut.push('…');
+    cut
+}
+
 /// A tool call: what ran and on what, then how it went on the line under it.
 /// Two lines rather than one because the second is where its output goes, and
 /// a result that hangs off the end of the first line is easy to miss.
@@ -582,6 +596,32 @@ pub fn detail(text: &str, max_lines: usize) {
             true,
         );
     }
+}
+
+/// Lines shown under each notice, as many as under a tool's output: enough
+/// for a failing test's summary, where a helper's report of a page would
+/// bury the conversation.
+const NOTICE_LINES: usize = 12;
+
+/// Notices drawn dim with a mark of their own, one for each thing that
+/// happened meanwhile, since the model reads them as the user's turn but
+/// neither side said them.
+pub fn notice(text: &str) {
+    blank();
+    let mut body = String::new();
+    // The first line is the header telling the model what a notice is not,
+    // which the mark says here. Each notice after it opens with a dash, and
+    // the lines it brought are indented under it.
+    for line in text.lines().skip(1) {
+        let Some(first) = line.strip_prefix("- ") else {
+            body.push_str(line.strip_prefix("    ").unwrap_or(line));
+            body.push('\n');
+            continue;
+        };
+        detail(&std::mem::take(&mut body), NOTICE_LINES);
+        said(&dim("◆"), &dim(first));
+    }
+    detail(&body, NOTICE_LINES);
 }
 
 #[cfg(test)]

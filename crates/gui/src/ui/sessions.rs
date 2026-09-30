@@ -116,6 +116,9 @@ impl Chat {
                     this.session_allow
                         .remove(&this.store.conversations[index].id);
                     this.modes.remove(&this.store.conversations[index].id);
+                    // Nor show its helpers' cards; dropped, they are declined.
+                    let id = this.store.conversations[index].id;
+                    this.agent_asks.retain(|request| request.root != id);
                     this.store.remove(index);
                     if this.store.conversations.is_empty() {
                         this.new_chat(window, cx);
@@ -140,7 +143,9 @@ impl Chat {
         let c = &self.store.conversations[index];
         let mut text = format!("# {}\n\n", c.title);
         for m in &c.messages {
-            let who = if m.role == "user" {
+            let who = if m.notice {
+                "Notice".to_string()
+            } else if m.role == "user" {
                 "You".to_string()
             } else if m.model.is_empty() {
                 "Assistant".to_string()

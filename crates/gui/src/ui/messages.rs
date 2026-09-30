@@ -44,6 +44,9 @@ impl Chat {
                 .children(bar)
                 .into_any_element();
         }
+        if message.notice {
+            return self.notice_row(index, message, window, cx);
+        }
         let is_user = message.role == "user";
         let session = self.store.conversations[self.store.active].id;
         let editing = is_user && self.editing_message == Some((session, index));
@@ -60,7 +63,7 @@ impl Chat {
         // A reply that only asked for tools: its tool rows say what happened.
         let tool_only = !is_user && message.content.is_empty() && !message.tool_calls.is_empty();
         let label: String = if message.model.is_empty() {
-            self.store.settings.model.clone()
+            self.store.model(self.store.active).1.to_owned()
         } else {
             message.model.clone()
         };
@@ -114,7 +117,13 @@ impl Chat {
                 )
                 .into_any_element()
         } else if is_user {
-            TextView::markdown(md, message.content.clone(), window, cx)
+            // `/init` shows as typed, not as the prompt it sent; a chat app's
+            // message can quote someone else's, fenced.
+            let said = match letronna_core::init::typed(&message.content) {
+                Some(typed) => typed.to_owned(),
+                None => letronna_core::untrusted::shown("", &message.content).0,
+            };
+            TextView::markdown(md, said, window, cx)
                 .selectable(selectable)
                 .text_size(px(15.))
                 .font_weight(FontWeight::MEDIUM)
@@ -130,13 +139,17 @@ impl Chat {
                         .xsmall()
                         .color(cx.theme().primary),
                 )
-                .child(
-                    self.turn
-                        .as_ref()
-                        .and_then(|turn| turn.live.retrying)
-                        .filter(|_| streaming)
-                        .map_or_else(|| "Thinking…".to_owned(), |retry| retry.to_string()),
-                )
+                .child({
+                    let live = self.turn.as_ref().filter(|_| streaming).map(|t| &t.live);
+                    match (
+                        live.and_then(|l| l.retrying),
+                        live.is_some_and(|l| l.compacting),
+                    ) {
+                        (Some(retry), _) => retry.to_string(),
+                        (None, true) => "Compacting…".to_owned(),
+                        (None, false) => "Thinking…".to_owned(),
+                    }
+                })
                 .into_any_element()
         } else {
             TextView::markdown(md, message.content.clone(), window, cx)
@@ -237,6 +250,9 @@ impl Chat {
             .when(!tool_only, |this| {
                 this.child(div().w_full().overflow_hidden().pb_1().child(body))
             })
+            .when(is_user && !message.images.is_empty(), |this| {
+                this.child(crate::ui::pictures::sent_row(&message.images, cx))
+            })
             // A reply is often wanted whole, and selecting it across
             // paragraphs and code blocks is fiddly.
             .when(usage_row, |this| {
@@ -270,6 +286,17 @@ impl Chat {
     /// A message sent while the reply runs, waiting for the reply's next
     /// step: your card, faded, with a way to take it back first.
     pub(crate) fn queued_row(&self, n: usize, text: &str, cx: &mut Context<Self>) -> AnyElement {
+        let key = if cfg!(target_os = "macos") {
+            "⌘Enter"
+        } else {
+            "Ctrl+Enter"
+        };
+        // Sending now never stops a running tool, so then it waits for it.
+        let now = if self.turn.as_ref().is_some_and(cuts_in) {
+            format!("Send now, stopping the reply where it is ({key})")
+        } else {
+            format!("Send as soon as the tool is done ({key})")
+        };
         v_flex()
             .w_full()
             .gap_1()
@@ -284,6 +311,14 @@ impl Chat {
                     .child(
                         h_flex()
                             .gap_0p5()
+                            .child(
+                                Button::new(("queued-now", n))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(Icon::new(IconName::ArrowUp))
+                                    .tooltip(now)
+                                    .on_click(cx.listener(|this, _, _, cx| this.send_now(cx))),
+                            )
                             .child(
                                 Button::new(("queued-back", n))
                                     .ghost()
@@ -320,6 +355,156 @@ impl Chat {
             .into_any_element()
     }
 
+    /// The side question on show for `session`, under the conversation and
+    /// in no turn of it, since the session does not keep it.
+    pub(crate) fn aside_row(
+        &self,
+        session: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let aside = self
+            .aside
+            .as_ref()
+            .filter(|aside| aside.session == session)?;
+        let muted = cx.theme().muted_foreground;
+        // Rendered and selectable as a reply is, since it is the only copy.
+        let answer = match &aside.answer {
+            None => div()
+                .text_color(muted)
+                .child("Thinking…")
+                .into_any_element(),
+            Some(Ok(reply)) => v_flex()
+                .gap_1()
+                .text_color(muted)
+                .child(
+                    TextView::markdown(self.row_id("aside", 0), reply.content.clone(), window, cx)
+                        .selectable(!window.has_active_dialog(cx))
+                        .line_height(px(26.)),
+                )
+                .child(div().text_xs().child(usage_line(reply)))
+                .into_any_element(),
+            Some(Err(error)) => div()
+                .text_color(cx.theme().danger)
+                .child(error.clone())
+                .into_any_element(),
+        };
+        let row = v_flex()
+            .w_full()
+            .gap_1()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .text_xs()
+                    .font_family(HEADING_FONT)
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Aside · not kept in the session")
+                    .child(
+                        Button::new("aside-close")
+                            .ghost()
+                            .xsmall()
+                            .icon(Icon::new(IconName::Close))
+                            .tooltip_with_action("Close", &Dismiss, None)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(aside) = this.aside.take() {
+                                    aside.cancel.set();
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .w_full()
+                    .gap_2()
+                    .px_4()
+                    .py_3()
+                    .rounded(cx.theme().radius_lg)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .child(aside.question.clone())
+                    .child(answer),
+            );
+        Some(row.into_any_element())
+    }
+
+    /// Something that happened meanwhile, such as a job exiting: one quiet
+    /// line rather than a card, since nobody here said it; click to read it.
+    fn notice_row(
+        &self,
+        index: usize,
+        message: &Message,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let key = self.open_key(index);
+        let open = self.thinking_open.contains(&key);
+        // The first line tells the model what a notice is not; here the row's
+        // look says so, and it starts at what happened.
+        let body = message
+            .content
+            .split_once('\n')
+            .map_or("", |(_, rest)| rest)
+            .to_owned();
+        let first = body.lines().next().unwrap_or_default();
+        let headline = letronna_core::tools::one_line(first.strip_prefix("- ").unwrap_or(first));
+        v_flex()
+            .w_full()
+            .gap_1()
+            .child(
+                h_flex()
+                    .id(("notice", index))
+                    .h(px(26.))
+                    .min_w_0()
+                    .w_full()
+                    .px_2()
+                    .gap_1p5()
+                    .items_center()
+                    .rounded(cx.theme().radius)
+                    .cursor_pointer()
+                    .text_xs()
+                    .font_family(HEADING_FONT)
+                    .text_color(cx.theme().muted_foreground)
+                    .hover(|s| s.bg(cx.theme().secondary.opacity(0.5)))
+                    .child(
+                        Icon::new(if open {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size_3(),
+                    )
+                    .child("Notice")
+                    .child(div().min_w_0().truncate().child(headline))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.thinking_open.remove(&key) {
+                            this.thinking_open.insert(key);
+                        }
+                        cx.notify();
+                    })),
+            )
+            .when(open, |this| {
+                this.child(
+                    div()
+                        .ml_2()
+                        .pl_3()
+                        .min_w_0()
+                        .border_l_2()
+                        .border_color(cx.theme().border)
+                        .text_color(cx.theme().muted_foreground)
+                        .child(crate::ui::code_block(
+                            ("notice-out", index),
+                            body,
+                            px(220.),
+                            window,
+                            cx,
+                        )),
+                )
+            })
+            .into_any_element()
+    }
+
     /// A tool result: one quiet line, click to see the output.
     fn tool_row(
         &self,
@@ -331,11 +516,13 @@ impl Chat {
         let key = self.open_key(index);
         // A failure is the output you need to read, so it starts open, in
         // full. One you declined yourself is no news, so it stays shut.
-        let failed = message.is_error && message.content != letronna_core::tools::DECLINED;
+        let failed = message.is_error && !letronna_core::tools::is_declined(&message.content);
         let open = self.thinking_open.contains(&key) != failed;
         let summary = letronna_core::tools::summary(&message.name, &message.args);
-        let lines = message.content.lines().count();
-        let content = message.content.clone();
+        // The fences' tags are for the model; here a few words say where the
+        // text came from.
+        let (content, from) = letronna_core::untrusted::shown(&message.name, &message.content);
+        let lines = content.lines().count();
         let one_line = letronna_core::tools::one_line;
         // A file a media tool made, while it is still where it was saved.
         let made = (!message.is_error)
@@ -408,6 +595,14 @@ impl Chat {
                             .child(summary),
                     )
                     .child(div().min_w_0().text_color(color).truncate().child(status))
+                    .when_some(from, |row, from| {
+                        row.child(
+                            div()
+                                .flex_none()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(from),
+                        )
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if !this.thinking_open.remove(&key) {
                             this.thinking_open.insert(key);
@@ -514,7 +709,11 @@ impl Chat {
             })
     }
 
-    pub(crate) fn empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn empty_state(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         // Without a project folder the tools have nowhere to read or write,
         // and the only other place that says so is a chip in the status bar.
         let no_project = self.store.conversations[self.store.active]
@@ -561,6 +760,11 @@ impl Chat {
                     .child("Enter to send  ·  Shift+Enter for a new line  ·  Esc to stop"),
             )
             .children(self.grain(&self.grains.empty_chat))
+            // A side question asked before anything else still needs somewhere to show.
+            .children(
+                self.aside_row(self.store.conversations[self.store.active].id, window, cx)
+                    .map(|row| div().w_full().max_w(COLUMN).px_6().mt_6().child(row)),
+            )
     }
 
     pub(crate) fn page_view(&self, page: Page, cx: &mut Context<Self>) -> impl IntoElement {
@@ -648,6 +852,7 @@ fn usage_line(message: &Message) -> String {
     let input = message.input_tokens();
     if input > 0 {
         parts.push(format!("{input} in"));
+        parts.extend(message.fullness());
         if message.cached_tokens > 0 {
             let share = 100 * message.cached_tokens / input;
             parts.push(format!("{share}% cached"));
@@ -865,5 +1070,20 @@ mod tests {
             ..message.clone()
         };
         assert_eq!(usage_line(&uncached), "16 out · 18.4 tok/s · 3291 in");
+    }
+
+    #[test]
+    fn usage_line_says_how_full_the_window_was_after_the_prompt() {
+        let message = Message {
+            tokens: 16,
+            prompt_tokens: 76_000,
+            cached_tokens: 72_200,
+            window: 200_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            usage_line(&message),
+            "16 out · 76000 in · 38% of 200K · 95% cached"
+        );
     }
 }

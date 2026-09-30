@@ -105,7 +105,7 @@ impl Chat {
                         state => state,
                     };
                     if fresh {
-                        this.update_note = Some(this.update_status());
+                        this.note = Some(this.update_status());
                     }
                     cx.notify();
                 });

@@ -294,10 +294,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("letronna-preview-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("old.txt"), "unread_before").unwrap();
-        let ctx = letronna_core::tools::ToolContext {
-            workspace: Some(dir.clone()),
-            ..Default::default()
-        };
+        let mut ctx = letronna_core::tools::ToolContext::default();
+        ctx.workspace = Some(dir.clone());
         let shown = |path: String| {
             let args = serde_json::json!({"path": path, "content": "new"}).to_string();
             super::of("write_file", &args, &ctx).unwrap().join("\n")
