@@ -280,6 +280,8 @@ pub enum Event {
     },
     /// A try failed in a way that passes, and another follows after a wait.
     Retrying(crate::retry::Retry),
+    /// The request went to a fallback model rather than the session's.
+    Switched(crate::fallback::Switch),
     /// Sent before `Finished` when the reply stopped at the output limit;
     /// `in_call` when it stopped inside a tool call, which is then dropped
     /// rather than run half written.
@@ -1932,13 +1934,25 @@ pub fn start_with(
         // Taken once for the call, as each error is told once: a resend
         // after a failure or at a smaller window carries it again.
         let lsp = crate::lsp::note(connection.conversation);
-        let result = send_window(
-            &connection,
-            &messages,
-            &budget,
-            &extra,
-            lsp.as_deref(),
-            &sender,
+        let chain = fallbacks(&connection);
+        let result = crate::fallback::run(
+            &chain,
+            |connection| {
+                let budget = budget_for(connection, &chain[0], budget);
+                send_window(
+                    connection,
+                    &messages,
+                    &budget,
+                    &extra,
+                    lsp.as_deref(),
+                    &sender,
+                )
+            },
+            |switch| {
+                sender
+                    .send_blocking(Event::Switched(switch))
+                    .map_err(|_| Failure::new(FailureKind::Stopped, "Chat closed."))
+            },
         );
         // The call is over by now. Letting go before saying so means whoever
         // hears `Finished` never finds the guard still held.
@@ -1963,6 +1977,32 @@ pub fn start_with(
     receiver
 }
 
+/// The session's connection, then the fallbacks Settings names. The file is
+/// read on each call, as the context cap is, so a change made in the window
+/// counts in the terminal from its next request.
+fn fallbacks(connection: &Connection) -> Vec<Connection> {
+    let settings = crate::store::current_settings();
+    // Entries that do not read are passed over here; the frontends say why
+    // when they are written.
+    let fallbacks: Vec<_> = (settings.fallbacks.iter())
+        .filter_map(|text| crate::fallback::Fallback::parse(text).ok())
+        .collect();
+    if fallbacks.is_empty() {
+        return vec![connection.clone()];
+    }
+    let keys = crate::store::load_keys();
+    crate::fallback::chain(connection, &fallbacks, &keys, &settings.custom_endpoint)
+}
+
+/// The budget for a request to `connection`: the session's own for its model,
+/// and one of its own for a fallback, whose window may differ.
+fn budget_for(connection: &Connection, primary: &Connection, own: Budget) -> Budget {
+    if connection.endpoint == primary.endpoint && connection.model == primary.model {
+        return own;
+    }
+    budget(connection, crate::store::context_cap())
+}
+
 /// Send `messages` in the window `budget` gives, unless what no window
 /// leaves out is already more than the model reads at once. `lsp` is the
 /// language servers' note to end the request with.
@@ -1978,6 +2018,9 @@ fn send_window(
         return Err(failure);
     }
     let start = window_start(messages, budget);
+    // A fallback or a refit can start later than the window stamped before
+    // the call, and a read it leaves out must not let an edit through.
+    crate::filestate::asked(connection.conversation, messages.len(), start);
     stream(connection, messages, start, budget, extra, lsp, sender)
 }
 
@@ -2182,6 +2225,8 @@ fn stream(
         // stands. A reply that ran out of time may well run out again, each
         // try perhaps billed, so it gets one more go and no more.
         if stands || timeouts > 1 {
+            let mut failure = failure;
+            failure.stands = stands;
             return Err(failure);
         }
         let Some(retry) = crate::retry::after(&failure, tried, connection.unattended) else {
@@ -6089,6 +6134,60 @@ mod tests {
         assert!(next.squeezed);
         // Once squeezed, a request is not sent again.
         assert!(refit(&c, &failure, &next).is_none());
+    }
+
+    #[test]
+    fn a_read_a_narrower_window_leaves_out_no_longer_lets_an_edit_through() {
+        let answer = r#"{"choices":[{"message":{"role":"assistant","content":"Done."}}]}"#;
+        // The summary of what the narrower window leaves out, then the reply.
+        let (endpoint, worker) = serve(vec![
+            ("200 OK", "application/json", answer),
+            ("200 OK", "application/json", answer),
+        ]);
+        let dir = std::env::temp_dir().join(format!("letronna-narrower-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "one").unwrap();
+        let conversation = 259_001;
+        let ctx = crate::tools::ToolContext {
+            workspace: Some(dir.clone()),
+            conversation,
+            ..Default::default()
+        };
+        // The first reply reads the file.
+        crate::filestate::asked(conversation, 1, 0);
+        crate::tools::run("read_file", r#"{"path":"a.txt"}"#, &ctx).unwrap();
+        let said = |role: &str, content: &str| Message {
+            role: role.into(),
+            content: content.into(),
+            ..Default::default()
+        };
+        let messages = vec![
+            said("user", "Read a.txt."),
+            said("assistant", "It says one."),
+            said("user", "Now make it two."),
+        ];
+        // Stamped as start_with does, with the session model's roomy window.
+        crate::filestate::asked(conversation, messages.len(), 0);
+        // A fallback's window that holds only the newest turn.
+        let narrow = Budget {
+            step: 1,
+            messages: 1,
+            ..Budget::SMALL
+        };
+        let c = Connection {
+            endpoint,
+            model: "reads-little".into(),
+            conversation,
+            ..connection()
+        };
+        let (sender, _receiver) = async_channel::unbounded();
+        send_window(&c, &messages, &narrow, &Extra::default(), None, &sender).unwrap();
+        assert_eq!(worker.join().unwrap().len(), 2);
+        let edit = r#"{"path":"a.txt","old":"one","new":"two"}"#;
+        let refused = crate::tools::run("edit_file", edit, &ctx).unwrap_err();
+        assert!(refused.contains("has left the part"), "{refused}");
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "one");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

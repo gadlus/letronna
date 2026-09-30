@@ -273,7 +273,7 @@ pub struct Settings {
     pub helper_budget: u64,
     /// Tools never offered to the model nor run, by name, an MCP server's by
     /// its full `mcp__server__tool` name; a name no tool has is passed over.
-    #[serde(default, deserialize_with = "tool_names")]
+    #[serde(default, deserialize_with = "names")]
     pub disabled_tools: Vec<String>,
     /// Offers the `computer` tool, which sees and uses other apps' windows,
     /// asking once for each app; only where Letronna has a backend for the
@@ -295,6 +295,11 @@ pub struct Settings {
     /// it is about to finish with no command run since.
     #[serde(default = "yes")]
     pub verify_edits: bool,
+    /// Models to carry a task on with, in order, when the chosen one is
+    /// overloaded, out of credit or gone: `model` on the session's gateway,
+    /// or `Gateway:model`; see `fallback`.
+    #[serde(default, deserialize_with = "names")]
+    pub fallbacks: Vec<String>,
 }
 
 // Written out rather than derived so the film grain and notifications start
@@ -312,6 +317,7 @@ impl Default for Settings {
             disabled_tools: Vec::new(),
             computer_use: false,
             keys_in: String::new(),
+            fallbacks: Vec::new(),
             gateway: String::new(),
             custom_endpoint: String::new(),
             presence: String::new(),
@@ -345,10 +351,10 @@ fn yes() -> bool {
     true
 }
 
-/// `disabled_tools` as written by hand: one name alone is a list of one, and
-/// any other shape switches nothing off rather than failing the whole file,
+/// A list of names as written by hand: one name alone is a list of one, and
+/// any other shape is an empty list rather than failing the whole file,
 /// which would be moved aside as unreadable.
-fn tool_names<'de, D: serde::Deserializer<'de>>(names: D) -> Result<Vec<String>, D::Error> {
+fn names<'de, D: serde::Deserializer<'de>>(names: D) -> Result<Vec<String>, D::Error> {
     Ok(match serde_json::Value::deserialize(names)? {
         serde_json::Value::String(name) => vec![name],
         serde_json::Value::Array(names) => names

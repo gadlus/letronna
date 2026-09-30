@@ -2,6 +2,7 @@
 //! than of the model.
 
 use letronna_core::agents::Seen;
+use letronna_core::fallback::Fallback;
 use letronna_core::gate::Mode;
 use letronna_core::skills::{Skill, Source};
 use letronna_core::slash::{self, Origin};
@@ -100,6 +101,10 @@ pub fn command(
         }
         "/model" => {
             switch_model(runner, Some(*session), rest);
+            Flow::Handled
+        }
+        "/fallback" => {
+            fallback(runner, rest);
             Flow::Handled
         }
         "/gateways" => {
@@ -431,6 +436,54 @@ fn listed(workspace: Option<&std::path::Path>) -> Vec<slash::Command> {
         .chain(["quit"])
         .collect();
     slash::list(workspace, &own)
+}
+
+/// The models a task carries on with when its own cannot answer: listed,
+/// one added to the end, or all cleared.
+fn fallback(runner: &mut Runner, rest: &str) {
+    const USAGE: &str = "Usage: /fallback, /fallback add <model> (or Gateway:model for one on another gateway), or /fallback clear.";
+    render::blank();
+    let (verb, text) = rest.split_once(' ').unwrap_or((rest, ""));
+    let fallbacks = &mut runner.store.settings.fallbacks;
+    match (verb, text.trim()) {
+        ("", "") => {}
+        ("add", "") => return render::line(&render::red(USAGE)),
+        ("add", text) => {
+            let fallback = match Fallback::parse(text) {
+                Ok(fallback) => fallback.to_string(),
+                Err(error) => return render::line(&render::red(&error)),
+            };
+            if fallbacks.contains(&fallback) {
+                render::line(&render::dim(&format!("{fallback} is a fallback already.")));
+            } else {
+                fallbacks.push(fallback);
+                runner.persist();
+            }
+        }
+        ("clear", "") => {
+            fallbacks.clear();
+            runner.persist();
+        }
+        _ => return render::line(&render::red(USAGE)),
+    }
+    let fallbacks = &runner.store.settings.fallbacks;
+    if fallbacks.is_empty() {
+        render::line(&render::dim(
+            "No fallbacks: a task stops when its model is overloaded or out of credit. Add one with /fallback add <model>.",
+        ));
+        return;
+    }
+    render::said(&render::blue("●"), &render::bold("Fallbacks"));
+    for (n, fallback) in fallbacks.iter().enumerate() {
+        render::line(&format!(
+            "{}  {fallback}",
+            render::dim(&(n + 1).to_string())
+        ));
+    }
+    render::line(&render::dim(&format!(
+        "Asked in order once your model's own tries are spent. One that fails is passed over for {} minutes.",
+        letronna_core::fallback::COOLDOWN.as_secs() / 60
+    )));
 }
 
 /// What the model calls took: this session's, each recent day's and each

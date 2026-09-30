@@ -461,6 +461,14 @@ impl Runner {
             if let Event::Summarized { upto, text } = &event {
                 self.store.conversations[session].summarized(*upto, text.clone());
             }
+            // Only the switch a failure caused: the requests after it go to
+            // the same fallback until the cooldown ends, and say nothing new.
+            if let Event::Switched(switch) = &event
+                && switch.after.is_some()
+            {
+                render::blank();
+                render::said(&render::dim("●"), &render::dim(&switch.to_string()));
+            }
             turn.absorb(&event);
             if let Event::Finished(result) = event {
                 self.bar.wait_line(false);

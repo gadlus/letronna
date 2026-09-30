@@ -229,6 +229,23 @@ impl Chat {
     /// The Model page's Save: the default model, and the session on screen's
     /// when it was changed here, as a pick from the composer changes both.
     pub(crate) fn apply_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let listed = self.fallbacks.read(cx).value().to_string();
+        let listed: Vec<String> = (listed.split(','))
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+            .collect();
+        // Nothing is saved while one of them does not read, so the page stays
+        // open on what was typed, with the error saying which.
+        let fallbacks = match letronna_core::fallback::Fallback::parse_all(&listed) {
+            Ok(fallbacks) => fallbacks,
+            Err(error) => {
+                self.error = Some(error);
+                cx.notify();
+                return;
+            }
+        };
+        self.store.settings.fallbacks = fallbacks.iter().map(ToString::to_string).collect();
         let typed = self.model.read(cx).value().to_string();
         if typed != self.store.settings.model {
             let gateway = self.store.settings.gateway.clone();
@@ -411,7 +428,7 @@ impl Chat {
             },
         );
         let body: AnyElement = match current_page {
-            "Model" => model_page(&model, &chat, cx).into_any_element(),
+            "Model" => model_page(&model, &self.fallbacks, &chat, cx).into_any_element(),
             "Appearance" => {
                 appearance_page(&chat, &self.store.settings, window, cx).into_any_element()
             }
@@ -1153,7 +1170,12 @@ fn appearance_page(
         .child(grain)
 }
 
-fn model_page(model: &Entity<InputState>, chat: &Entity<Chat>, cx: &App) -> Div {
+fn model_page(
+    model: &Entity<InputState>,
+    fallbacks: &Entity<InputState>,
+    chat: &Entity<Chat>,
+    cx: &App,
+) -> Div {
     let save = chat.clone();
     v_flex()
         .gap_4()
@@ -1167,6 +1189,23 @@ fn model_page(model: &Entity<InputState>, chat: &Entity<Chat>, cx: &App) -> Div 
                 .gap_1()
                 .child(label("Default model", cx))
                 .child(Input::new(model)),
+        )
+        .child(
+            v_flex()
+                .gap_1()
+                .child(label("Fallbacks", cx))
+                .child(Input::new(fallbacks))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!(
+                            "Asked in order when the model is overloaded, out of credit or gone. \
+                             Gateway:model for one on another gateway. One that fails is passed \
+                             over for {} minutes.",
+                            letronna_core::fallback::COOLDOWN.as_secs() / 60
+                        )),
+                ),
         )
         .child(
             h_flex().justify_end().child(

@@ -27,6 +27,7 @@ mod downloads;
 pub mod driver;
 mod edit;
 pub mod failure;
+pub mod fallback;
 mod filestate;
 pub mod gate;
 pub mod gateway;
