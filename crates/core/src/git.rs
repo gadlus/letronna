@@ -139,8 +139,11 @@ impl Status {
 }
 
 /// Where `folder`'s repository stands. Git is told to take no optional
-/// locks, so a look while the user commits never gets in their way.
+/// locks, so a look while the user commits never gets in their way, and
+/// the repository's own filters are off, as status reads changed files
+/// through them.
 pub fn status(folder: &Path) -> Result<Status, String> {
+    let off = filters_off(folder)?;
     let args = [
         "--no-optional-locks",
         "status",
@@ -149,7 +152,7 @@ pub fn status(folder: &Path) -> Result<Status, String> {
         "-z",
         "--untracked-files=normal",
     ];
-    let (out, _) = git(folder, &args, STAT_CAP)?;
+    let (out, _) = run(folder, &args, STAT_CAP, &[0], &off)?;
     Ok(parse_status(&out))
 }
 
@@ -198,6 +201,7 @@ pub struct ChangedFile {
 pub fn changed_files(folder: &Path) -> Result<Vec<ChangedFile>, String> {
     in_repository(folder)?;
     let base = base(folder)?;
+    let off = filters_off(folder)?;
     let args = [
         "diff",
         "--no-ext-diff",
@@ -210,7 +214,7 @@ pub fn changed_files(folder: &Path) -> Result<Vec<ChangedFile>, String> {
         "--",
         ".",
     ];
-    let (numstat, _) = git(folder, &args, STAT_CAP)?;
+    let (numstat, _) = run(folder, &args, STAT_CAP, &[0], &off)?;
     let mut files: Vec<ChangedFile> = numstat
         .split('\0')
         .filter_map(|record| {
@@ -598,6 +602,13 @@ mod tests {
         let diff = working_diff(&folder, None).unwrap();
         assert!(diff.patch.contains("+three"), "{}", diff.patch);
         assert!(diff.patch.contains("+fresh"), "{}", diff.patch);
+        // The Changes tab's list and the status bar read the same files.
+        let files = changed_files(&folder).unwrap();
+        assert!(
+            files.iter().any(|f| f.path == Path::new("a.txt")),
+            "{files:?}"
+        );
+        assert!(status(&folder).unwrap().changed > 0);
         let markers = [
             "ran-command",
             "ran-textconv",
