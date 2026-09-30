@@ -27,6 +27,8 @@
 //! as the browser's refs hold for a page, and are never given to another
 //! element, so a stale id is refused rather than landing somewhere else.
 
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 
@@ -73,6 +75,9 @@ const PROMPTS: &[&str] = &[
     "gcr-prompter",
     "pinentry*",
     "ssh-askpass*",
+    "x11-ssh-askpass",
+    "gnome-ssh-askpass*",
+    "lxqt-openssh-askpass",
     "ksshaskpass",
 ];
 
@@ -321,7 +326,11 @@ fn backend() -> Option<Arc<dyn Backend>> {
     {
         macos::backend()
     }
-    #[cfg(all(not(test), not(target_os = "macos")))]
+    #[cfg(all(not(test), target_os = "linux"))]
+    {
+        linux::backend()
+    }
+    #[cfg(all(not(test), not(any(target_os = "macos", target_os = "linux"))))]
     {
         None
     }
