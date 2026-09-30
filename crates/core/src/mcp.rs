@@ -288,7 +288,7 @@ impl ServerConfig {
     /// This config with every `${VAR}` in its command, args, cwd, url, env
     /// and headers filled in from `var`.
     fn expanded(&self, var: &dyn Fn(&str) -> Option<String>) -> Result<Self, String> {
-        let one = |text: &String| expand(text, var);
+        let one = |text: &String| fill_vars(text, var);
         let values = |map: &HashMap<String, String>| {
             map.iter()
                 .map(|(name, value)| Ok((name.clone(), one(value)?)))
@@ -317,7 +317,7 @@ fn within_a_day(ms: Option<u64>, usual: Duration) -> Duration {
 /// `${VAR:-default}` by its value or, when it is unset or empty, the
 /// default. A `$` without braces, or braces never closed, stay as written;
 /// a variable unset with no default is an error naming it.
-fn expand(text: &str, var: &dyn Fn(&str) -> Option<String>) -> Result<String, String> {
+fn fill_vars(text: &str, var: &dyn Fn(&str) -> Option<String>) -> Result<String, String> {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find("${") {
@@ -649,7 +649,7 @@ fn secret_values(
         .flat_map(|server| server.env.iter().chain(&server.headers))
         .filter(|(name, _)| secret(name))
         // A server with a variable unset never starts, so none of it goes out.
-        .filter_map(|(_, value)| expand(value, var).ok())
+        .filter_map(|(_, value)| fill_vars(value, var).ok())
         .filter_map(|value| value.split_whitespace().last().map(str::to_owned))
         // A path named for a key, as SSH_KEY_PATH is, is no secret, and hiding
         // it would hide the file wherever it is named.
@@ -4594,13 +4594,13 @@ mod tests {
             ("${HOME}/work, ${HOME}", "/home/someone/work, /home/someone"),
             ("$TOKEN and ${never closed", "$TOKEN and ${never closed"),
         ] {
-            assert_eq!(expand(text, &var).unwrap(), filled, "{text}");
+            assert_eq!(fill_vars(text, &var).unwrap(), filled, "{text}");
         }
     }
 
     #[test]
     fn a_variable_unset_with_no_default_keeps_its_server_from_starting_and_is_named() {
-        let error = expand("--token=${GITHUB_TOKEN}", &var).unwrap_err();
+        let error = fill_vars("--token=${GITHUB_TOKEN}", &var).unwrap_err();
         assert!(error.starts_with("${GITHUB_TOKEN} is not set"), "{error}");
         let config = ServerConfig {
             command: "never-run".into(),
