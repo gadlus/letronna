@@ -9,17 +9,20 @@ curl -sL -o "$tmp/p.tgz" https://registry.npmjs.org/@phosphor-icons/core/-/core-
 tar -xzf "$tmp/p.tgz" -C "$tmp"
 src="$tmp/package/assets/light"
 mkdir -p assets/icons
-map="plus:plus close:x window-close:x window-minimize:minus window-maximize:square window-restore:browsers
+map="plus:plus close:x window-close:x window-minimize:minus window-maximize:square window-restore:browsers ellipsis:dots-three
 minus:minus settings:gear arrow-up:arrow-up arrow-down:arrow-down copy:copy panel-left-close:sidebar-simple panel-left-open:sidebar-simple
 chevron-down:caret-down chevron-right:caret-right check:check loader-circle:circle-notch loader:circle-notch bot:robot mic:microphone chevrons-up-down:caret-up-down
 inbox:tray send:paper-plane-tilt sparkles:sparkle message-square:chat-teardrop file:file file-text:file-text clock:clock
 search:magnifying-glass pin:push-pin folder:folder image:image square-pen:note-pencil list-filter:funnel-simple
 info:info plugs:plugs palette:palette trash:trash export:export pencil:pencil-simple envelope:envelope-simple play:play stop:stop
-circle:circle list-checks:list-checks globe:globe arrow-left:arrow-left arrow-right:arrow-right rotate-cw:arrow-clockwise pop-out:arrow-square-out pop-in:arrow-square-in view:sliders-horizontal eye:eye redo:arrow-clockwise undo:arrow-counter-clockwise git-branch:git-branch
+circle:circle list-checks:list-checks arrow-left:arrow-left arrow-right:arrow-right rotate-cw:arrow-clockwise pop-out:arrow-square-out pop-in:arrow-square-in view:sliders-horizontal eye:eye redo:arrow-clockwise undo:arrow-counter-clockwise git-branch:git-branch
 circle-x:x-circle circle-check:check-circle triangle-alert:warning shield:shield-check puzzle:puzzle-piece circle-user:user-circle"
 for pair in $map; do
   cp "$src/${pair#*:}-light.svg" "assets/icons/${pair%%:*}.svg"
 done
+# Phosphor has no right-hand sidebar: the right panel's toggle is the left
+# one, mirrored.
+sed 's|<path |<path transform="matrix(-1 0 0 1 256 0)" |' assets/icons/panel-left-open.svg >assets/icons/panel-right.svg
 
 # Brand marks for the Messaging channels, from Simple Icons (the SVGs are CC0;
 # the brands remain their owners' trademarks). Single-path and monochrome, so

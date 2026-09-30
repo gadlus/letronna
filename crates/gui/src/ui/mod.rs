@@ -1,23 +1,67 @@
 pub(crate) mod account;
 pub(crate) mod actions;
+pub(crate) mod activity;
 pub(crate) mod approval;
 pub(crate) mod artifacts;
 pub(crate) mod browser;
 pub(crate) mod chrome;
 pub(crate) mod composer;
+pub(crate) mod grain;
+pub(crate) mod mcp;
 pub(crate) mod messages;
 pub(crate) mod messaging;
+pub(crate) mod panel;
+pub(crate) mod pictures;
 pub(crate) mod schedules;
+pub(crate) mod search;
 pub(crate) mod sessions;
 pub(crate) mod settings;
 pub(crate) mod sidebar;
 pub(crate) mod skills;
 pub(crate) mod update;
+pub(crate) mod usage;
 
 use crate::prelude::*;
-use gpui_component::{button::ButtonVariant, dialog::DialogButtonProps};
+use gpui_component::{
+    button::{ButtonCustomVariant, ButtonVariant},
+    dialog::DialogButtonProps,
+};
 
 const CODE_LINE: Pixels = px(18.);
+
+/// Button looks that stay still under the pointer and fill only while
+/// pressed. gpui-component works a ghost button's hover out from `secondary`
+/// and fills an outline one with `secondary_hover` over the page, so no theme
+/// token can hold either still; as custom variants they can.
+pub(crate) trait NoHover: ButtonVariants {
+    /// No fill and no edge, in place of `ghost`.
+    fn plain(self, cx: &App) -> Self {
+        self.custom(pressed_only(
+            cx.theme().transparent,
+            cx.theme().transparent,
+            cx,
+        ))
+    }
+
+    /// A hairline edge on the page colour, in place of `outline`.
+    fn framed(self, cx: &App) -> Self {
+        self.custom(pressed_only(cx.theme().background, cx.theme().border, cx))
+    }
+}
+
+impl NoHover for Button {}
+
+/// A custom look whose hover is its resting fill, pressed and selected
+/// showing `secondary_active` as an outline button does (a ghost one
+/// pressed to a lighter `secondary`).
+fn pressed_only(ground: Hsla, edge: Hsla, cx: &App) -> ButtonCustomVariant {
+    ButtonCustomVariant::new(cx)
+        .color(ground)
+        .hover(ground)
+        .border(edge)
+        .foreground(cx.theme().secondary_foreground)
+        .active(cx.theme().secondary_active)
+}
 
 /// Ask before something is removed for good. The button says what it does
 /// and is red, where a plain "OK" read as agreeing to carry on.

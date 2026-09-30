@@ -7,9 +7,9 @@
 //! the page, which it sends only when the page changes -- at most twelve a
 //! second, and none once the panel is closed -- drawn as images. A browser
 //! with no window of its own lays the page out in the panel, at the
-//! screen's sharpness. A wide window docks the panel beside the chat, where
-//! its edge drags it wider or narrower; a narrow one floats it in the
-//! corner, where it covers the least, and the page shows smaller there.
+//! screen's sharpness. It is a tab of the right panel (panel.rs), which
+//! docks it beside the chat or, in a narrow window, floats it in the corner,
+//! where the page shows smaller.
 
 use crate::prelude::*;
 use letronna_core::watch::{self, Control, Held, Layout, Room, Sight, Watching};
@@ -18,20 +18,6 @@ use std::time::{Duration, Instant};
 
 actions!(browser, [PageTab, PageTabBack]);
 
-/// A window at least this wide docks the panel beside the chat -- Letronna's
-/// own window opens this wide -- and a narrower one floats it in a corner.
-const DOCK_WIDTH: Pixels = px(1100.);
-/// How much of the window the docked panel takes until its edge is dragged,
-/// and its bounds: less, and a page's words are too small to follow; more,
-/// and the chat's composer is squeezed.
-const DOCK_SHARE: f32 = 0.34;
-const DOCK_MIN: Pixels = px(340.);
-const DOCK_MAX: Pixels = px(640.);
-/// What the sidebar and the chat keep however wide the panel is dragged:
-/// room enough for the composer.
-const CHAT_ROOM: Pixels = px(560.);
-/// How wide the floating panel is.
-const FLOAT_WIDTH: Pixels = px(320.);
 /// How far a notch of the wheel scrolls the page: a browser's own hundred
 /// pixels, where the window counts three lines.
 const WHEEL_LINE: Pixels = px(100. / 3.);
@@ -67,7 +53,7 @@ pub(crate) struct BrowserView {
     /// Closed by the user during this turn, so it stays closed until the
     /// next one.
     pub(crate) dismissed: bool,
-    /// Opened from the menu, so it shows even before there is a page.
+    /// Asked for by the user, so it shows even before there is a page.
     asked: bool,
     frame: Option<Arc<RenderImage>>,
     /// The page's size in CSS pixels, which pointers are given in.
@@ -100,10 +86,6 @@ pub(crate) struct BrowserView {
     dialog: Option<String>,
     /// Why the address typed did not open.
     note: Option<String>,
-    /// The docked panel's width, once its edge has been dragged, and what
-    /// it was before the page was turned on its side.
-    width: Option<Pixels>,
-    upright_width: Option<Pixels>,
     layout: Layout,
     zoom: f64,
     /// How far the wheel has turned with Ctrl held, towards the next zoom.
@@ -120,8 +102,11 @@ struct Pointer {
     doing: String,
 }
 
-/// The docked panel's edge, being dragged.
-struct Edge;
+/// Asks the panel to widen for a page laid out as a desktop's, or to go
+/// back to its width before.
+pub(crate) struct Widen(pub(crate) bool);
+
+impl EventEmitter<Widen> for BrowserView {}
 
 impl BrowserView {
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -153,8 +138,6 @@ impl BrowserView {
             switching: false,
             dialog: None,
             note: None,
-            width: None,
-            upright_width: None,
             layout: Layout::Portrait,
             zoom: 1.,
             zoom_wheel: 0.,
@@ -162,7 +145,7 @@ impl BrowserView {
         }
     }
 
-    /// Open the panel, unless it was closed this turn, and start watching.
+    /// Start watching the browser, unless the panel was hidden this turn.
     pub(crate) fn open(&mut self, cx: &mut Context<Self>) {
         if self.watching.is_some() || self.dismissed {
             return;
@@ -239,33 +222,21 @@ impl BrowserView {
         }
     }
 
-    /// Whether the panel is open and docked beside the chat, which then
-    /// needs its full width.
-    pub(crate) fn docked(&self, window: &Window) -> bool {
-        self.watching.is_some() && window.viewport_size().width >= DOCK_WIDTH
+    /// Whether the browser has something for its tab: while it is open,
+    /// docked at once, but floating over the chat only once there is a page
+    /// or the user asked for it.
+    pub(crate) fn has_content(&self, docked: bool) -> bool {
+        self.watching.is_some() && (docked || self.frame.is_some() || self.asked)
     }
 
-    /// How wide the docked panel is, by the same rule its layout uses; zero
-    /// when it is not docked. The chat's column is sized from what is left.
-    pub(crate) fn docked_width(&self, window: &Window) -> Pixels {
-        if !self.docked(window) {
-            return px(0.);
-        }
-        let whole = window.viewport_size().width;
-        let most = (whole - CHAT_ROOM).max(DOCK_MIN);
-        let (width, most) = match self.width {
-            Some(width) => (width, most),
-            None => (whole * DOCK_SHARE, most.min(DOCK_MAX)),
-        };
-        width.max(DOCK_MIN).min(most)
+    /// How many of the page's questions wait on the user.
+    pub(crate) fn waiting(&self) -> usize {
+        usize::from(self.dialog.is_some())
     }
 
-    /// Show the panel, or hide it, as the menu asks. Shown with no page
-    /// yet, it is ready for an address.
-    pub(crate) fn toggle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.watching.is_some() {
-            return self.close(cx);
-        }
+    /// Show the browser as the user asks for it: at once, even with no page
+    /// yet, and then ready for an address.
+    pub(crate) fn ask(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.dismissed = false;
         self.asked = true;
         self.open(cx);
@@ -305,7 +276,7 @@ impl BrowserView {
         self.watching.is_some()
     }
 
-    fn close(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn close(&mut self, cx: &mut Context<Self>) {
         self.watching = None;
         self.dismissed = true;
         self.asked = false;
@@ -517,13 +488,7 @@ impl BrowserView {
         if layout == self.layout {
             return;
         }
-        match layout {
-            Layout::Landscape => {
-                self.upright_width = self.width;
-                self.width = Some(window.viewport_size().width - CHAT_ROOM);
-            }
-            Layout::Portrait => self.width = self.upright_width.take(),
-        }
+        cx.emit(Widen(layout == Layout::Landscape));
         self.layout = layout;
         self.fit_page(window);
         cx.notify();
@@ -598,7 +563,7 @@ impl BrowserView {
         // A way to go somewhere, which shows the page loading at once.
         let go = |id: &'static str, icon: Icon, tooltip: &'static str, to: fn() -> Control| {
             Button::new(id)
-                .ghost()
+                .plain(cx)
                 .xsmall()
                 .icon(icon)
                 .tooltip(tooltip)
@@ -610,7 +575,7 @@ impl BrowserView {
         let (back, forward) = self.history;
         let reload = match self.loading {
             Some(_) => Button::new("page-stop")
-                .ghost()
+                .plain(cx)
                 .xsmall()
                 .icon(Icon::new(IconName::Close))
                 .tooltip("Stop loading")
@@ -623,7 +588,7 @@ impl BrowserView {
         let view = cx.entity();
         let (layout, zoom) = (self.layout, self.zoom);
         let view_menu = Button::new("page-view")
-            .ghost()
+            .plain(cx)
             .xsmall()
             .icon(Icon::new(AppIcon::View))
             .dropdown_menu_with_anchor(gpui::Corner::TopRight, move |menu, _, _| {
@@ -672,14 +637,14 @@ impl BrowserView {
         // The zoom, while it is not the page's own size; clicked, it is again.
         let zoomed = ((self.zoom - 1.).abs() > 0.001).then(|| {
             Button::new("page-zoom")
-                .ghost()
+                .plain(cx)
                 .xsmall()
                 .label(format!("{:.0}%", self.zoom * 100.))
                 .tooltip("Back to actual size")
                 .on_click(cx.listener(|view, _, window, cx| view.set_zoom(1., window, cx)))
         });
         let own_window = Button::new("page-window")
-            .ghost()
+            .plain(cx)
             .xsmall()
             .map(|button| match self.own_window {
                 true => button
@@ -728,14 +693,6 @@ impl BrowserView {
             .children(zoomed)
             .child(view_menu)
             .child(own_window)
-            .child(
-                Button::new("hide-browser")
-                    .ghost()
-                    .xsmall()
-                    .icon(Icon::new(IconName::Close))
-                    .tooltip("Hide the browser")
-                    .on_click(cx.listener(|view, _, _, cx| view.close(cx))),
-            )
     }
 
     /// The page, with the pointer over it, which takes the user's clicks,
@@ -929,7 +886,6 @@ impl BrowserView {
                 .bg(cx.theme().popover)
                 .border_1()
                 .border_color(cx.theme().border)
-                .shadow_md()
                 .text_xs()
         };
         let asked = self.dialog.as_ref().map(|asked| {
@@ -956,7 +912,7 @@ impl BrowserView {
                 )
                 .child(
                     Button::new("page-cancel")
-                        .ghost()
+                        .plain(cx)
                         .xsmall()
                         .label("Cancel")
                         .on_click(answer(false)),
@@ -1039,7 +995,6 @@ impl BrowserView {
             .bg(colour)
             .border_2()
             .border_color(gpui::white())
-            .shadow_md()
             .with_animation(("dot", id), animation(), move |dot, t| {
                 let way = travelled(t);
                 dot.left(relative(from.0 + (to.0 - from.0) * way))
@@ -1054,81 +1009,16 @@ impl BrowserView {
             .child(ring)
             .child(dot)
     }
-
-    /// The docked panel's left edge, which drags it wider or narrower, and
-    /// back to its own width when clicked twice.
-    fn edge(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .id("browser-edge")
-            .absolute()
-            .top_0()
-            .bottom_0()
-            .left(px(-3.))
-            .w(px(6.))
-            .cursor(CursorStyle::ResizeLeftRight)
-            .on_drag(Edge, |_, _, _, cx| cx.new(|_| Empty))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|view, event: &MouseDownEvent, _, cx| {
-                    if event.click_count == 2 {
-                        view.width = None;
-                        cx.notify();
-                    }
-                }),
-            )
-    }
 }
 
 impl Render for BrowserView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let docked = self.docked(window);
-        // Floating, it covers the chat, so unless it was asked for it waits
-        // for a page to show.
-        if self.watching.is_none() || (!docked && self.frame.is_none() && !self.asked) {
-            return div().into_any_element();
-        }
-        let panel = v_flex()
-            .bg(cx.theme().background)
-            .border_color(cx.theme().border)
+        let docked = crate::ui::panel::docks(window.viewport_size().width);
+        v_flex()
+            // Docked, the page fills what the panel has left under the bar.
+            .when(docked, |view| view.flex_1().min_h_0())
             .child(self.header(window, cx))
-            .child(self.screen(docked, window, cx));
-        if docked {
-            let most = (window.viewport_size().width - CHAT_ROOM).max(DOCK_MIN);
-            let (width, most): (Length, Pixels) = match self.width {
-                Some(width) => (width.into(), most),
-                None => (relative(DOCK_SHARE).into(), most.min(DOCK_MAX)),
-            };
-            panel
-                .relative()
-                .h_full()
-                .w(width)
-                .min_w(DOCK_MIN)
-                .max_w(most)
-                .flex_shrink_0()
-                .border_l_1()
-                .on_drag_move(
-                    cx.listener(|view, event: &DragMoveEvent<Edge>, window, cx| {
-                        let right = window.viewport_size().width;
-                        view.width = Some(right - event.event.position.x);
-                        cx.notify();
-                    }),
-                )
-                .child(self.edge(cx))
-                .into_any_element()
-        } else {
-            panel
-                .absolute()
-                // Top right, clear of the composer and the newest messages.
-                .top(px(48.))
-                .right(px(16.))
-                .w(FLOAT_WIDTH)
-                .rounded(cx.theme().radius_lg)
-                .border_1()
-                .shadow_lg()
-                .overflow_hidden()
-                .occlude()
-                .into_any_element()
-        }
+            .child(self.screen(docked, window, cx))
     }
 }
 
@@ -1230,30 +1120,6 @@ fn picture(bytes: &[u8]) -> Option<RenderImage> {
         pixel.0.swap(0, 2);
     }
     Some(RenderImage::new([image::Frame::new(image)]))
-}
-
-impl Chat {
-    /// The browser in the menu: shows it beside the chat, or hides it, and
-    /// is lit while it shows.
-    pub(crate) fn browser_item(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let open = self.browser.read(cx).is_open();
-        self.nav_item("browser", AppIcon::Globe, "Browser", None, cx)
-            .when(open, |item| item.bg(cx.theme().sidebar_accent))
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.page = Page::Chat;
-                this.browser.update(cx, |view, cx| view.toggle(window, cx));
-                cx.notify();
-            }))
-    }
-
-    /// Show the browser when a call is about to use it: before it runs, or
-    /// while it waits to be allowed, so the page can be seen first -- unless
-    /// the agent is to browse unseen.
-    pub(crate) fn show_browser(&mut self, tool: &str, cx: &mut Context<Self>) {
-        if matches!(tool, "browse" | "use_page") && !self.store.settings.browse_unseen {
-            self.browser.update(cx, |view, cx| view.open(cx));
-        }
-    }
 }
 
 #[cfg(test)]

@@ -72,6 +72,9 @@ struct Inbox {
     mailboxes: BTreeMap<u64, Mailbox>,
     /// Counts every arrival, so the mailbox waiting longest can be found.
     arrivals: u64,
+    /// What the next notice for a mailbox sets going, once: how a kept helper
+    /// that is idle wakes, with nothing looking in on it meanwhile.
+    wakes: BTreeMap<u64, Box<dyn FnOnce() + Send>>,
 }
 
 fn inbox() -> &'static Mutex<Inbox> {
@@ -93,6 +96,7 @@ static LISTENED: AtomicBool = AtomicBool::new(false);
 /// Leave a notice for a session or helper and ring the doorbell, merging it
 /// into a waiting one from the same source.
 pub fn push(to: u64, notice: Notice) {
+    let mut wake = None;
     if let Ok(mut inbox) = inbox().lock() {
         inbox.arrivals += 1;
         let arrival = inbox.arrivals;
@@ -111,8 +115,34 @@ pub fn push(to: u64, notice: Notice) {
                 mailbox.dropped += 1;
             }
         }
+        wake = inbox.wakes.remove(&to);
     }
     let _ = doorbell().0.try_send(());
+    // Unlocked, since what it wakes may take or leave mail of its own.
+    if let Some(wake) = wake {
+        wake();
+    }
+}
+
+/// Have the next notice for `to` run `wake` on the thread that leaves it, in
+/// place of any wake set before; it must be quick, as a push is.
+pub(crate) fn wake_on(to: u64, wake: Box<dyn FnOnce() + Send>) {
+    let replaced = inbox()
+        .lock()
+        .ok()
+        .and_then(|mut inbox| inbox.wakes.insert(to, wake));
+    // Dropped unlocked, as in `unwake`.
+    drop(replaced);
+}
+
+/// Take back what `wake_on` set for `to`, if no notice has run it yet.
+pub(crate) fn unwake(to: u64) {
+    let wake = inbox()
+        .lock()
+        .ok()
+        .and_then(|mut inbox| inbox.wakes.remove(&to));
+    // Dropped unlocked, since what it holds may push as it goes.
+    drop(wake);
 }
 
 /// Take what a session or helper should hear now: only what cannot wait while
@@ -360,6 +390,35 @@ pub(crate) mod tests {
             ["job #1 exited", "look at the logs too", "job #2 exited"]
         );
         assert_eq!(texts(&take(22, true)), ["job #9 exited"]);
+    }
+
+    #[test]
+    fn a_wake_runs_once_on_the_next_notice_unless_taken_back() {
+        let _turn = DOORBELL.lock().unwrap_or_else(|e| e.into_inner());
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+        let woke = Arc::new(AtomicUsize::new(0));
+        let count = |woke: &Arc<AtomicUsize>| {
+            let woke = woke.clone();
+            Box::new(move || {
+                woke.fetch_add(1, Ordering::Relaxed);
+                // Pushing from a wake takes no lock the push that ran it holds.
+                push(31, notice("tester", When::Next, "awake"));
+            })
+        };
+        wake_on(31, count(&woke));
+        push(32, notice("main", When::Next, "not for 31"));
+        assert_eq!(woke.load(Ordering::Relaxed), 0);
+        push(31, notice("main", When::Next, "more work"));
+        push(31, notice("main", When::Next, "and more"));
+        assert_eq!(woke.load(Ordering::Relaxed), 1);
+        assert_eq!(texts(&take(31, true)), ["more work\nand more", "awake"]);
+        wake_on(31, count(&woke));
+        unwake(31);
+        push(31, notice("main", When::Next, "after it was taken back"));
+        assert_eq!(woke.load(Ordering::Relaxed), 1);
+        take(31, true);
+        take(32, true);
     }
 
     #[test]

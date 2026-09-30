@@ -4,13 +4,18 @@
 //! that differ in a terminal: waiting on a blocking channel rather than a
 //! frame, and asking the user by reading a line rather than drawing a card.
 
-use letronna_core::agent::{self, Next, Turn};
-use letronna_core::chat::{self, Connection, Event, Message};
+use letronna_core::agent::{Next, Turn};
+use letronna_core::agents;
+use letronna_core::approvals::{self, Decision, Request};
+use letronna_core::cancel::Cancel;
+use letronna_core::chat::{self, Connection, Event, Message, ToolCall};
+use letronna_core::gate::{self, Gate, Grants, Mode};
 use letronna_core::inbox;
 use letronna_core::store::{Conversation, Store};
-use letronna_core::tools;
 use letronna_core::wake;
-use std::collections::HashSet;
+use letronna_core::{hooks, permissions, tools};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use crate::bar::Bar;
 
@@ -21,41 +26,55 @@ const DETAIL_LINES: usize = 12;
 
 pub struct Runner {
     pub store: Store,
-    /// Tools approved for the rest of this run.
-    pub allowed: HashSet<String>,
-    /// Approve everything, for `--yes`.
-    pub yes: bool,
-    /// Read and search only; no writing, no running.
-    pub plan: bool,
+    /// Tools approved for the rest of this run, by session.
+    pub allowed: Grants,
+    /// How much runs without asking: `--mode`, `--yes` or `--plan`, then
+    /// `/mode` and `/plan`.
+    pub mode: Mode,
+    /// Someone can see a card and answer it; false for `-p` with no
+    /// terminal on either end.
+    pub human: bool,
+    /// The rules file error last shown, so that one is shown once.
+    pub trouble: Option<String>,
     /// The box at the foot of the window, pumped while a reply streams so
     /// that typing carries on through an answer.
     pub bar: Bar,
     /// Whether the user stopped the last turn, which keeps a ring from
     /// starting another before they say something.
     pub stopped: bool,
+    /// Pictures `/image` attached, which go with the next message.
+    pub images: Vec<std::path::PathBuf>,
 }
 
 impl Runner {
-    fn connection(&self, session: usize) -> Connection {
-        let workspace = self.store.conversations[session].workspace.clone();
-        let settings = &self.store.settings;
+    /// Where a session's requests go and the key or sign-in token they carry.
+    pub fn route(&self, session: usize) -> (String, String) {
+        let (gateway, _) = self.store.model(session);
         let saved = letronna_core::store::load_keys()
-            .get(letronna_core::gateway::key_slot(&settings.gateway))
+            .get(letronna_core::gateway::key_slot(gateway))
             .cloned()
             .unwrap_or_default();
-        let (endpoint, key) =
-            letronna_core::gateway::resolve(&settings.gateway, &settings.custom_endpoint, &saved);
+        let custom = &self.store.settings.custom_endpoint;
+        letronna_core::gateway::resolve(gateway, custom, &saved)
+    }
+
+    pub fn connection(&self, session: usize) -> Connection {
+        let workspace = self.store.conversations[session].workspace.clone();
+        let settings = &self.store.settings;
+        let (endpoint, key) = self.route(session);
         Connection {
             endpoint,
-            model: settings.model.clone(),
+            model: self.store.model(session).1.to_owned(),
             key,
             tools: true,
             workspace,
-            plan: self.plan,
+            plan: self.mode == Mode::Plan,
             remote: None,
-            effort: settings.effort.clone(),
+            effort: self.store.effort(session).to_owned(),
             search: settings.search,
             conversation: self.store.conversations[session].id,
+            unattended: false,
+            wrap_up: false,
         }
     }
 
@@ -64,11 +83,13 @@ impl Runner {
     pub fn ask(&mut self, session: usize, prompt: &str) -> Result<String, String> {
         let connection = self.connection(session);
         chat::validate(&connection)?;
+        self.store.pin(session);
 
         {
             let conversation = &mut self.store.conversations[session];
             if conversation.messages.is_empty() && conversation.title.is_empty() {
-                conversation.title = prompt.chars().take(40).collect();
+                let shown = letronna_core::init::typed(prompt).unwrap_or(prompt);
+                conversation.title = shown.chars().take(40).collect();
             }
             conversation.updated = chat::now();
         }
@@ -78,6 +99,7 @@ impl Runner {
         self.store.conversations[session].messages.push(Message {
             role: "user".into(),
             content: prompt.to_owned(),
+            images: std::mem::take(&mut self.images),
             ..Default::default()
         });
         self.persist();
@@ -102,8 +124,45 @@ impl Runner {
         self.run(connection, session)
     }
 
+    /// Ask a side question about the session on a fork of it, with no tools
+    /// and one request, waiting where escape can stop it. Nothing of it is kept.
+    pub fn btw(&mut self, session: usize, question: &str) -> Result<Message, String> {
+        let connection = self.connection(session);
+        chat::validate(&connection)?;
+        let messages = self.store.conversations[session].messages.clone();
+        let cancel = Cancel::default();
+        let (stop, question) = (cancel.clone(), question.to_owned());
+        let (sender, receiver) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let _ = sender.send_blocking(agents::btw(&connection, messages, &question, stop));
+        });
+        self.bar.working(true);
+        self.bar.wait_line_about("btw");
+        let answer = loop {
+            self.bar.pump();
+            if self.bar.interrupted() {
+                cancel.set();
+                break Err("Stopped.".to_owned());
+            }
+            match receiver.try_recv() {
+                Ok(answer) => break answer,
+                Err(async_channel::TryRecvError::Empty) => continue,
+                Err(async_channel::TryRecvError::Closed) => {
+                    break Err("The side question stopped without an answer.".to_owned());
+                }
+            }
+        };
+        self.bar.wait_line(false);
+        self.bar.working(false);
+        answer
+    }
+
     /// Run the agent to completion on the conversation as it stands.
     fn run(&mut self, connection: Connection, session: usize) -> Result<String, String> {
+        self.bar.show_helpers_of(connection.conversation);
+        // What the session's kept helpers wake on from now on.
+        agents::connected(&connection);
+        hooks::new_turn(connection.conversation);
         let mut turn = Turn::new(connection);
         self.stopped = false;
         self.bar.working(true);
@@ -112,6 +171,11 @@ impl Runner {
         let busy = crate::title::Busy::start();
         let answer = self.work(&mut turn, session);
         drop(busy);
+        // Stopping is not a go-ahead for what was queued: it goes back in
+        // the box rather than being sent, as it does in the window.
+        if self.stopped {
+            self.bar.hand_back();
+        }
         self.bar.working(false);
         // The session's loop goes round again from the turn that took its
         // tick, and a stop ends it.
@@ -127,8 +191,13 @@ impl Runner {
     }
 
     fn work(&mut self, turn: &mut Turn, session: usize) -> Result<String, String> {
+        // A reply cut off at the output limit goes on in the next one, and
+        // the answer is both.
+        let mut answer = String::new();
+        let mut sent_back = 0;
         loop {
-            let Some(reply) = self.stream_once(turn, session)? else {
+            let Some(mut reply) = self.stream_once(turn, session)? else {
+                self.keep_stopped(turn, session);
                 // Ctrl-C stops the turn and leaves; escape only stops the
                 // turn, so say so in the one case where you stay.
                 if !self.bar.finished() {
@@ -138,16 +207,81 @@ impl Runner {
                 self.stopped = true;
                 return Ok(String::new());
             };
-            let answer = reply.content.clone();
+            // A reply cut short to send what was queued has nothing to run:
+            // what was typed goes in after it, and the model is asked again.
+            let hurried = self.bar.hurried();
+            let empty = reply.content.is_empty();
+            let continuation = turn.continuation(&mut reply);
+            if empty && !reply.content.is_empty() {
+                // Taken from its thinking, which was never shown as the answer.
+                render::blank();
+                let mut out = Stream::opening_with(render::bullet());
+                out.push(&reply.content);
+                out.end();
+            }
+            answer.push_str(&reply.content);
             let calls = reply.tool_calls.clone();
             self.store.conversations[session].updated = chat::now();
-            self.store.conversations[session].messages.push(reply);
+            // A reply with nothing in it -- empty, or cut off inside a tool
+            // call with no text before it -- leaves nothing to keep.
+            if !reply.content.is_empty() || !calls.is_empty() {
+                self.store.conversations[session].messages.push(reply);
+            }
+            match continuation {
+                Ok(Some(nudge)) => {
+                    render::blank();
+                    render::said(&render::dim("●"), &render::dim(nudge.why));
+                    self.store.conversations[session]
+                        .messages
+                        .push(nudge.notice);
+                    self.persist();
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.persist();
+                    return Err(error);
+                }
+            }
             self.persist();
 
-            if !turn.begin(calls) {
+            if !hurried && !turn.begin(calls) {
+                // Past the limit on rounds the turn ends as it always did; a
+                // Stop hook sending the model back would undo the limit.
+                if let Some(note) = turn.capped() {
+                    render::blank();
+                    render::said(&render::dim("●"), &render::dim(&note));
+                    return Ok(answer);
+                }
+                if sent_back >= hooks::STOP_BLOCKS {
+                    render::blank();
+                    render::said(&render::dim("●"), &render::dim(hooks::STOP_CAPPED));
+                    return Ok(answer);
+                }
+                let Some(feedback) = self.stop_hooks(turn, &answer, sent_back > 0) else {
+                    return Ok(answer);
+                };
+                sent_back += 1;
+                render::blank();
+                render::said(&render::dim("●"), &render::dim(&tools::one_line(&feedback)));
+                self.store.conversations[session].messages.push(Message {
+                    role: "user".into(),
+                    content: feedback,
+                    folded: true,
+                    ..Default::default()
+                });
+                self.persist();
+                answer.clear();
+                continue;
+            }
+            if !hurried && !self.work_through(turn, session)? {
+                self.stopped = true;
                 return Ok(answer);
             }
-            if !self.work_through(turn, session)? {
+            // Asked to leave, by ctrl-c while a tool ran, which stopped only
+            // that tool, or by ctrl-d: the turn ends here, so nothing queued
+            // is sent and the model is not asked again.
+            if self.bar.finished() {
                 self.stopped = true;
                 return Ok(answer);
             }
@@ -157,7 +291,8 @@ impl Runner {
             self.take_notices(session, false);
             // What was typed while it worked goes in after the results, so
             // the model reads it before carrying on rather than once the turn
-            // is over. It is on the screen already, echoed when entered.
+            // is over. It waited above the box until now, and the box puts
+            // it into the conversation as it is taken.
             let typed = self.bar.take_typed();
             if !typed.is_empty() {
                 self.store.conversations[session]
@@ -165,10 +300,12 @@ impl Runner {
                     .extend(typed.into_iter().map(|content| Message {
                         role: "user".into(),
                         content,
+                        folded: true,
                         ..Default::default()
                     }));
                 self.persist();
             }
+            answer.clear();
         }
     }
 
@@ -176,35 +313,56 @@ impl Runner {
     /// One model call, printed as it streams. `None` when the user stopped
     /// waiting for it.
     fn stream_once(&mut self, turn: &mut Turn, session: usize) -> Result<Option<Message>, String> {
-        let receiver = chat::start(
+        let receiver = waitable(chat::start(
             turn.connection.clone(),
             self.store.conversations[session].messages.clone(),
-        );
+        ));
         // The model's name lives under the input box, so an answer only needs
         // its bullet here.
         let mut out = Stream::opening_with(render::bullet());
         let mut opened = false;
         let mut thought = false;
+        let mut explained = false;
         self.bar.wait_line(true);
         loop {
-            // Keys first, then whatever the model has sent: the pump waits a
-            // few milliseconds for a keystroke, which is also what keeps this
-            // loop from spinning.
-            self.bar.pump();
-            if self.bar.interrupted() {
-                // Dropping the receiver is enough: the worker finishes into a
-                // channel nobody is listening to and goes away.
-                self.bar.wait_line(false);
-                out.end();
-                return Ok(None);
-            }
-            let event = match receiver.try_recv() {
+            // Keys first, then whatever the model has sent.
+            let event = match self.wait_on_reply(&receiver) {
                 Ok(event) => event,
-                Err(async_channel::TryRecvError::Empty) => continue,
-                Err(async_channel::TryRecvError::Closed) => {
+                // Sent now, what was queued goes in after as much of the reply as
+                // came. Any calls it asked for were never run, so they are left out.
+                Err(Unheard::Stopped) if self.bar.hurried() => {
+                    self.bar.wait_line(false);
+                    out.end();
+                    turn.live.calls.clear();
+                    break;
+                }
+                Err(Unheard::Stopped) => {
+                    // Dropping the receiver is enough: the worker finishes
+                    // into a channel nobody is listening to and goes away.
+                    self.bar.wait_line(false);
+                    out.end();
+                    return Ok(None);
+                }
+                Err(Unheard::Gone) => {
                     return Err("The model connection closed unexpectedly.".to_owned());
                 }
             };
+            // The waiting line says why while a failed try waits to be made
+            // again or earlier turns are summarized, and goes back to
+            // waiting once the reply answers, which may be with thinking
+            // that is not shown.
+            let why = match &event {
+                Event::Retrying(retry) => Some(retry.to_string()),
+                Event::Compacting => Some("Compacting…".to_owned()),
+                _ => None,
+            };
+            if let Some(why) = why {
+                self.bar.wait_line_about(&why);
+                explained = true;
+            } else if explained {
+                self.bar.wait_line(true);
+                explained = false;
+            }
             if let Event::Reasoning(text) = &event
                 && self.store.settings.thinking
             {
@@ -233,17 +391,21 @@ impl Runner {
                 }
                 out.push(text);
             }
+            // Kept with the session, so a restart need not ask for it again.
+            if let Event::Summarized { upto, text } = &event {
+                self.store.conversations[session].summarized(*upto, text.clone());
+            }
             turn.absorb(&event);
             if let Event::Finished(result) = event {
                 self.bar.wait_line(false);
                 out.end();
                 // Catch up on anything a throttled paint skipped.
                 crate::screen::settle();
-                result?;
+                result.map_err(|failure| failure.to_string())?;
                 break;
             }
         }
-        let model = self.store.settings.model.clone();
+        let model = turn.connection.model.clone();
         let reply = turn.take_reply(&model);
         // A reply that only asked for a tool has nothing to caption; the tool
         // line below speaks for it.
@@ -254,21 +416,62 @@ impl Runner {
     }
 
     /// Run the queued calls, asking first where the rules say to. False when
-    /// the user stopped the turn.
+    /// the user stopped the turn, whose finished results are kept.
     fn work_through(&mut self, turn: &mut Turn, session: usize) -> Result<bool, String> {
         loop {
-            let gate = |name: &str| agent::needs_user(name, self.yes, &self.allowed, false);
-            match turn.next(gate) {
+            let ctx = turn.tool_context();
+            // Read afresh each time, since the window may have added one.
+            let rules = permissions::load(&permissions::user_file());
+            let trouble = permissions::trouble(&rules, ctx.workspace.as_deref());
+            if trouble != self.trouble {
+                if let Some(error) = &trouble {
+                    render::line(&render::red(error));
+                }
+                self.trouble = trouble;
+            }
+            let gate = Gate::for_terminal(&ctx, &self.allowed, &rules, self.mode, self.human);
+            // Calls that may go together run at once; one the gate would not
+            // simply run ends the batch, and is dealt with below on its own.
+            let batch = turn.next_batch(
+                |call| gate::decide(call, &gate) != gate::Outcome::Run,
+                letronna_core::agent::MAX_BATCH,
+            );
+            if !batch.is_empty() {
+                self.run_batch(turn, batch);
+                continue;
+            }
+            match turn.next(|call| gate::decide(call, &gate)) {
                 Next::Done => return Ok(true),
                 Next::Ask => {
                     let results = turn.take_results();
                     self.store.conversations[session].messages.extend(results);
                     self.persist();
-                    return Ok(true);
+                    // A hook's `continue: false`, shown with the results.
+                    return Ok(!hooks::halted(turn.connection.conversation));
                 }
-                Next::Run(call) => self.run_call(turn, call),
+                Next::Run(call) if call.name == tools::TODO => self.apply_todo(turn, session, call),
+                Next::Run(call) => {
+                    if !self.run_call(turn, call, false) {
+                        self.keep_stopped(turn, session);
+                        return Ok(false);
+                    }
+                }
+                Next::Refuse(call, why) => {
+                    let summary = tools::summary(&call.name, &call.arguments);
+                    render::blank();
+                    render::tool(&call.name, &summary, &tools::one_line(&why), true);
+                    turn.finish_call(Err(why));
+                }
                 Next::AskUser(call) => {
-                    if !self.consult(turn, call)? {
+                    // What holds every call for a yes, beside each card.
+                    if let Some(error) = hooks::trouble() {
+                        render::line(&render::red(&error));
+                    }
+                    hooks::card(ctx, &call.name);
+                    let consulted = self.consult(turn, call)?;
+                    show_hook_problems();
+                    if !consulted {
+                        self.keep_stopped(turn, session);
                         return Ok(false);
                     }
                 }
@@ -276,30 +479,122 @@ impl Runner {
         }
     }
 
-    fn run_call(&mut self, turn: &mut Turn, call: letronna_core::chat::ToolCall) {
-        let ctx = tools::ToolContext::of(&turn.connection);
+    /// Save what a stopped turn got to, so the model hears next time what ran
+    /// and what did not.
+    fn keep_stopped(&mut self, turn: &mut Turn, session: usize) {
+        let model = turn.connection.model.clone();
+        let kept = turn.stop(&model);
+        if kept.is_empty() {
+            return;
+        }
+        let conversation = &mut self.store.conversations[session];
+        conversation.updated = chat::now();
+        conversation.messages.extend(kept);
+        self.persist();
+    }
+
+    /// Runs `call` and shows what came of it; `approved` when the user said
+    /// yes to it just now. False when the user stopped it, which ends the turn.
+    fn run_call(
+        &mut self,
+        turn: &mut Turn,
+        call: letronna_core::chat::ToolCall,
+        approved: bool,
+    ) -> bool {
+        let mut ctx = turn.tool_context();
+        ctx.approved = approved;
         let summary = tools::summary(&call.name, &call.arguments);
-        let outcome = self.run_off_the_loop(&call, ctx, &summary);
-        // Every turn of the conversation opens with a blank line, whoever is
-        // speaking; a tool result that butts up against the question it came
-        // from reads as part of it.
+        let ran = self.run_off_the_loop(&call, ctx, &summary);
+        let stopped = ran.is_none();
+        let outcome =
+            ran.unwrap_or_else(|| Err(letronna_core::agent::STOPPED_WHILE_RUNNING.into()));
+        print_call(&call.name, &summary, &outcome);
+        show_hook_problems();
+        turn.finish_call(outcome);
+        !stopped
+    }
+
+    /// Let the Stop hooks look at the finished turn, whose reply was `last`,
+    /// off the loop so escape still works: what one says is left to do, if
+    /// anything. `again` when one already sent the model back this turn.
+    fn stop_hooks(&mut self, turn: &Turn, last: &str, again: bool) -> Option<String> {
+        if !hooks::wanted(hooks::Event::Stop) {
+            return None;
+        }
+        let ctx = turn.tool_context();
+        let stop = ctx.cancel.clone();
+        let last = last.to_owned();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = sender.send(hooks::stop(&ctx, &last, again));
+        });
+        self.bar.wait_line_about("Stop hooks");
+        let feedback = match self.wait_on(&receiver) {
+            Ok(feedback) => feedback,
+            Err(Unheard::Stopped) => {
+                stop.set();
+                None
+            }
+            Err(Unheard::Gone) => None,
+        };
+        self.bar.wait_line(false);
+        show_hook_problems();
+        feedback
+    }
+
+    /// Keep the model's checklist on the session, as the window does, and
+    /// show it over the box.
+    fn apply_todo(&mut self, turn: &mut Turn, session: usize, call: letronna_core::chat::ToolCall) {
+        let todos = &mut self.store.conversations[session].todos;
+        let outcome = letronna_core::store::apply_todo(todos, &call.arguments);
+        self.bar.set_plan(&self.store.conversations[session].todos);
+        let summary = tools::summary(&call.name, &call.arguments);
         render::blank();
         match &outcome {
-            Ok(text) => {
-                let lines = text.lines().count();
-                let count = if lines == 1 {
-                    "1 line".to_owned()
-                } else {
-                    format!("{lines} lines")
-                };
-                render::tool(&call.name, &summary, &count, false);
-                if !text.trim().is_empty() {
-                    render::detail(text, DETAIL_LINES);
-                }
-            }
+            Ok(said) => render::tool(&call.name, &summary, said, false),
             Err(error) => render::tool(&call.name, &summary, &tools::one_line(error), true),
         }
         turn.finish_call(outcome);
+    }
+
+    /// Run calls that may go together at once, printing each one's lines in
+    /// the order the model made them.
+    ///
+    /// A call's lines wait for those of every call before it, so the output
+    /// reads as though they ran one after another, only sooner. Escape stops
+    /// waiting for all of them: what finished keeps its result, and the rest
+    /// are told they were stopped, as a lone call is.
+    fn run_batch(&mut self, turn: &mut Turn, calls: Vec<ToolCall>) {
+        let ctx = turn.tool_context();
+        let mut batch = Batch::start(calls, &ctx, tools::run);
+        let mut about = batch.waiting();
+        self.bar.wait_line_about(&about);
+        while !batch.done() {
+            self.bar.pump();
+            let ready = if self.bar.interrupted() {
+                batch.stop()
+            } else {
+                batch.ready()
+            };
+            for (call, outcome) in ready {
+                print_call(
+                    &call.name,
+                    &tools::summary(&call.name, &call.arguments),
+                    &outcome,
+                );
+                show_hook_problems();
+                turn.finish_id(&call.id, outcome);
+            }
+            // The line names the first call still running, which changes as
+            // the ones ahead of it finish; its clock keeps going, since every
+            // call in the batch started when it did.
+            let now = batch.waiting();
+            if !batch.done() && now != about {
+                self.bar.rename_wait(&now);
+                about = now;
+            }
+        }
+        self.bar.wait_line(false);
     }
 
     /// Run a tool on a thread of its own, so the loop keeps reading keys and
@@ -311,42 +606,63 @@ impl Runner {
     /// included -- so the one moment you most want to call something off was
     /// the one moment nothing was listening.
     ///
-    /// Stopping stops waiting. The thread is left to finish into a channel
-    /// nobody is reading; what it was doing to the disk it will still do, and
-    /// a command it started keeps running under `list_jobs` where it can be
-    /// stopped by name.
+    /// Stopping sets the call's token, which ends a wait or a running command
+    /// at once. Anything else is left to finish into a channel nobody is
+    /// reading; what it was doing to the disk it will still do, and a
+    /// background command it started keeps running under `list_jobs` where it
+    /// can be stopped by name. `None` when the user stopped it.
     fn run_off_the_loop(
         &mut self,
         call: &letronna_core::chat::ToolCall,
         ctx: tools::ToolContext,
         summary: &str,
-    ) -> Result<String, String> {
+    ) -> Option<Result<String, String>> {
         let (name, arguments) = (call.name.clone(), call.arguments.clone());
-        let (sender, receiver) = async_channel::bounded(1);
+        let stop = ctx.cancel.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
-            let _ = sender.send_blocking(tools::run(&name, &arguments, &ctx));
+            let _ = sender.send(tools::run(&name, &arguments, &ctx));
         });
 
         self.bar
             .wait_line_about(&format!("{}({summary})", call.name));
-        let outcome = loop {
-            self.bar.pump();
-            if self.bar.interrupted() {
-                break Err(format!(
-                    "The user stopped `{}` while it was running. Ask before starting it again.",
-                    call.name
-                ));
+        let outcome = match self.wait_on(&receiver) {
+            Ok(outcome) => Some(outcome),
+            Err(Unheard::Stopped) => {
+                stop.set();
+                None
             }
-            match receiver.try_recv() {
-                Ok(outcome) => break outcome,
-                Err(async_channel::TryRecvError::Empty) => continue,
-                Err(async_channel::TryRecvError::Closed) => {
-                    break Err(format!("`{}` stopped without finishing.", call.name));
-                }
-            }
+            Err(Unheard::Gone) => Some(Err(format!("`{}` stopped without finishing.", call.name))),
         };
         self.bar.wait_line(false);
         outcome
+    }
+
+    /// What comes over `receiver`, pumping the keys meanwhile, or why nothing
+    /// did. Between pumps it blocks on the channel for as long as the pump
+    /// does not wait for keys itself, so a wait with no box up does not spin.
+    /// `wait_on` for a reply, which a "send now" also cuts short.
+    fn wait_on_reply<T>(&mut self, receiver: &mpsc::Receiver<T>) -> Result<T, Unheard> {
+        let patience = self.bar.patience();
+        wait_on(receiver, patience, || {
+            self.bar.pump();
+            // Helpers working in the background ask while the model talks
+            // too. Only the rules answer here: a question left open would
+            // hold up the reply, which has a deadline of its own.
+            self.answer_helpers(false);
+            self.bar.interrupted() || self.bar.hurried()
+        })
+    }
+
+    fn wait_on<T>(&mut self, receiver: &mpsc::Receiver<T>) -> Result<T, Unheard> {
+        let patience = self.bar.patience();
+        wait_on(receiver, patience, || {
+            self.bar.pump();
+            // A helper started by this call asks for its yes while the call
+            // waits on it, so unanswered here the two would wait on each other.
+            self.answer_helpers(true);
+            self.bar.interrupted()
+        })
     }
 
     /// Ask the user about a call. False means they ended the turn.
@@ -356,7 +672,7 @@ impl Runner {
         call: letronna_core::chat::ToolCall,
     ) -> Result<bool, String> {
         if call.name == tools::ASK_USER {
-            let args = tools::parse_args(&call.arguments).unwrap_or_default();
+            let args = tools::parse_args_for(&call.name, &call.arguments).unwrap_or_default();
             let question = args["question"].as_str().unwrap_or("").to_owned();
             let options: Vec<String> = args["options"]
                 .as_array()
@@ -389,8 +705,11 @@ impl Runner {
             turn.finish_call(Ok(reply));
             return Ok(true);
         }
+        if call.name == tools::EXIT_PLAN {
+            return Ok(self.put_plan(turn, &call));
+        }
 
-        let ctx = tools::ToolContext::of(&turn.connection);
+        let ctx = turn.tool_context();
         let summary = tools::summary(&call.name, &call.arguments);
 
         // A change to a file is shown as a diff above the question, where
@@ -418,38 +737,155 @@ impl Runner {
         }
 
         let question = format!("Letronna wants to {}", intent(&call.name, &summary));
-        let picked = self.bar.choose(
-            &question,
-            detail,
-            &[
-                "Yes",
-                "Yes, and stop asking for this",
-                "No, tell it why not",
-                "No, and stop here",
-            ],
-        );
+        // Offered only where a rule could cover the call, as the third
+        // choice, so the others keep their places.
+        let rule = permissions::suggest(&call, &ctx);
+        let here = rule
+            .as_ref()
+            .map(|rule| format!("Yes, and always allow `{}` here", rule.pattern));
+        let mut choices = vec!["Yes", "Yes, and stop asking for this"];
+        choices.extend(here.as_deref());
+        choices.extend(["No, tell it why not", "No, and stop here"]);
+        let picked = self.bar.choose(&question, detail, &choices);
 
-        match picked {
-            Some(0) => {
-                self.run_call(turn, call);
-                Ok(true)
+        match picked.and_then(|at| choices.get(at).copied()) {
+            Some("Yes") => Ok(self.run_call(turn, call, true)),
+            Some("Yes, and stop asking for this") => {
+                self.allowed
+                    .entry(turn.connection.conversation)
+                    .or_default()
+                    .insert(call.name.clone());
+                Ok(self.run_call(turn, call, true))
             }
-            Some(1) => {
-                self.allowed.insert(call.name.clone());
-                self.run_call(turn, call);
-                Ok(true)
-            }
-            Some(3) | None => Ok(false),
-            _ => {
+            Some("No, and stop here") | None => Ok(false),
+            Some("No, tell it why not") => {
                 render::tool(&call.name, &summary, "declined", true);
-                turn.finish_call(Err(tools::DECLINED.into()));
+                // None when the user left instead, which ends the turn as
+                // stopping here does.
+                let Some(reason) = self.bar.reason("Why not?") else {
+                    return Ok(false);
+                };
+                turn.finish_call(Err(tools::declined(&reason)));
+                Ok(true)
+            }
+            Some(_) => {
+                // Into the user's own rules, held to this project: the
+                // project's file may not allow anything.
+                let kept = rule.map(|rule| permissions::keep(&permissions::user_file(), rule));
+                if let Some(Err(error)) = kept {
+                    render::line(&render::red(&error));
+                }
+                self.run_call(turn, call, true);
                 Ok(true)
             }
         }
     }
 
+    /// Print the plan made in plan mode and ask whether to carry it out.
+    /// False means the user ended the turn.
+    fn put_plan(&mut self, turn: &mut Turn, call: &letronna_core::chat::ToolCall) -> bool {
+        // A plan that did not come through whole goes back to the model;
+        // approving it would lift plan mode for nothing.
+        let plan = match tools::plan_of(&call.arguments) {
+            Ok(plan) => plan,
+            Err(error) => {
+                render::blank();
+                render::tool(&call.name, "", &tools::one_line(&error), true);
+                turn.finish_call(Err(error));
+                return true;
+            }
+        };
+        render::blank();
+        let mut shown = Stream::opening_with(render::bullet());
+        shown.push(&plan);
+        shown.end();
+        let picked = self.bar.choose(
+            "Carry out this plan?",
+            Vec::new(),
+            &[
+                "Yes, carry it out",
+                "No, keep planning",
+                "No, and stop here",
+            ],
+        );
+        let approved = match picked {
+            Some(0) => true,
+            Some(1) => false,
+            _ => return false,
+        };
+        // Off for the session, not only this turn: the next prompt's
+        // connection is built from it, and the footer says so.
+        if approved {
+            self.mode = letronna_core::gate::Mode::Default;
+            let note = crate::banner::footer(self);
+            self.bar.set_footer(note);
+        }
+        turn.answer_plan(approved);
+        render::blank();
+        let outcome = if approved {
+            "approved; plan mode is off"
+        } else {
+            "keep planning"
+        };
+        render::tool(&call.name, "", outcome, false);
+        true
+    }
+
+    /// Start answering helpers' requests for a yes: in the box's loops when it
+    /// is up, and otherwise on a thread of its own, so that a helper is heard
+    /// however the main thread waits on the call it runs under. `terminal`
+    /// says whether there is someone to ask without the box.
+    pub fn serve_helpers(&mut self, terminal: bool) {
+        if self.bar.serve() {
+            return;
+        }
+        let mode = self.mode;
+        let rules = letronna_core::permissions::load(&letronna_core::permissions::user_file());
+        let requests = approvals::serve();
+        std::thread::spawn(move || {
+            // The session's grants are kept on the main thread, so here only
+            // the mode and the rules answer for the user.
+            let none = Grants::new();
+            for request in requests {
+                let decision = match settled(&request, mode, &none, &rules, terminal) {
+                    Some(Decision::Deny(why)) => {
+                        declined(&request, &why);
+                        Decision::Deny(why)
+                    }
+                    Some(decision) => decision,
+                    // A bar that was never installed asks on the line, as the
+                    // session's own cards are asked without the box.
+                    None => ask_about(&mut Bar::new(String::new()), &request),
+                };
+                request.answer(decision);
+            }
+        });
+    }
+
+    /// Answer every helper waiting on a yes that the session's own rules
+    /// settle, and ask the user about the rest -- or, when `ask` is false,
+    /// keep the first of those back for a later call to ask.
+    pub fn answer_helpers(&mut self, ask: bool) {
+        while let Some(request) = self.bar.asked() {
+            let rules = letronna_core::permissions::load(&letronna_core::permissions::user_file());
+            let decision = match settled(&request, self.mode, &self.allowed, &rules, true) {
+                Some(decision) => decision,
+                None if ask => ask_about(&mut self.bar, &request),
+                None => {
+                    self.bar.hold(request);
+                    return;
+                }
+            };
+            request.answer(decision);
+        }
+    }
+
     pub fn persist(&mut self) {
-        if self.store.save().is_err() {
+        if let Err(error) = self.store.save() {
+            letronna_core::diag::event(
+                "save_failed",
+                &[("error", error.kind().to_string().into())],
+            );
             render::line(&render::red("Could not write the session to disk."));
         }
     }
@@ -491,13 +927,17 @@ impl Runner {
         self.store.active = index;
         if let Some(conversation) = self.store.conversations.get_mut(index) {
             letronna_core::store::fill(conversation);
+            self.bar.set_plan(&conversation.todos);
         }
+        // Each session has its own model, and the footer names it.
+        let note = crate::banner::footer(self);
+        self.bar.set_footer(note);
     }
 
     /// A session of its own.
     pub fn start(&mut self, workspace: Option<std::path::PathBuf>) -> usize {
         self.store.conversations.push(Conversation {
-            id: self.store.next_id(),
+            id: self.store.reserve_id(),
             title: String::new(),
             updated: chat::now(),
             workspace,
@@ -505,7 +945,230 @@ impl Runner {
         });
         let index = self.store.conversations.len() - 1;
         self.store.active = index;
+        self.bar.set_plan(&[]);
+        let note = crate::banner::footer(self);
+        self.bar.set_footer(note);
         index
+    }
+}
+
+/// Why a wait on another thread ended with nothing from it.
+#[derive(Debug, PartialEq)]
+enum Unheard {
+    /// The user stopped waiting.
+    Stopped,
+    /// The thread went away without sending anything.
+    Gone,
+}
+
+/// What comes over `receiver`, asking `stopped` before each look at it; a
+/// look blocks up to `patience`.
+fn wait_on<T>(
+    receiver: &mpsc::Receiver<T>,
+    patience: Duration,
+    mut stopped: impl FnMut() -> bool,
+) -> Result<T, Unheard> {
+    loop {
+        if stopped() {
+            return Err(Unheard::Stopped);
+        }
+        match receiver.recv_timeout(patience) {
+            Ok(value) => return Ok(value),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(Unheard::Gone),
+        }
+    }
+}
+
+/// `events` passed on to a channel a wait can block on for a while, which
+/// an `async_channel` cannot do outside an executor. The thread passing
+/// them on ends when either side goes away.
+fn waitable<T: Send + 'static>(events: async_channel::Receiver<T>) -> mpsc::Receiver<T> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        while let Ok(event) = events.recv_blocking() {
+            if sender.send(event).is_err() {
+                return;
+            }
+        }
+    });
+    receiver
+}
+
+/// Calls from one reply running at once, each on a thread of its own, their
+/// outcomes handed back in the order the model made the calls however their
+/// threads finish, so what is printed and what the model reads keep that order.
+struct Batch {
+    calls: Vec<ToolCall>,
+    /// Each call's outcome once its thread has sent it, until it is handed back.
+    outcomes: Vec<Option<Result<String, String>>>,
+    /// How many calls from the front have been handed back.
+    shown: usize,
+    /// Each outcome as it comes, with the place of the call it answers.
+    arrivals: async_channel::Receiver<(usize, Result<String, String>)>,
+    /// Set when the batch is stopped, for a tool that listens for it.
+    cancel: Cancel,
+}
+
+impl Batch {
+    /// Start every call on a thread of its own, running it with `run`.
+    ///
+    /// That is `tools::run` but in tests, where reaching the tool registry
+    /// would start the MCP servers configured on the machine running them.
+    fn start(
+        calls: Vec<ToolCall>,
+        ctx: &tools::ToolContext,
+        run: fn(&str, &str, &tools::ToolContext) -> Result<String, String>,
+    ) -> Self {
+        let (sender, arrivals) = async_channel::unbounded();
+        for (at, call) in calls.iter().enumerate() {
+            let (name, arguments) = (call.name.clone(), call.arguments.clone());
+            let (sender, ctx) = (sender.clone(), ctx.clone());
+            std::thread::spawn(move || {
+                let _ = sender.send_blocking((at, run(&name, &arguments, &ctx)));
+            });
+        }
+        Self {
+            outcomes: vec![None; calls.len()],
+            calls,
+            shown: 0,
+            arrivals,
+            cancel: ctx.cancel.clone(),
+        }
+    }
+
+    /// Whether every call has been handed back.
+    fn done(&self) -> bool {
+        self.shown == self.calls.len()
+    }
+
+    /// The calls at the front whose outcomes are in, in order, and not yet handed back.
+    fn ready(&mut self) -> Vec<(ToolCall, Result<String, String>)> {
+        self.collect();
+        let finished = self.outcomes[self.shown..]
+            .iter()
+            .take_while(|outcome| outcome.is_some())
+            .count();
+        self.hand_back(finished)
+    }
+
+    /// Every call not yet handed back, at once: those that finished with
+    /// their outcomes, the rest told they were stopped.
+    fn stop(&mut self) -> Vec<(ToolCall, Result<String, String>)> {
+        // Taken in before the stop, so a call that finished keeps its result.
+        self.collect();
+        self.cancel.set();
+        self.hand_back(self.calls.len() - self.shown)
+    }
+
+    /// The first call still running as the waiting line names it, and how
+    /// many others are; empty once none is.
+    fn waiting(&self) -> String {
+        let mut running = self
+            .calls
+            .iter()
+            .zip(&self.outcomes)
+            .skip(self.shown)
+            .filter(|(_, outcome)| outcome.is_none())
+            .map(|(call, _)| call);
+        let Some(first) = running.next() else {
+            return String::new();
+        };
+        let label = format!(
+            "{}({})",
+            first.name,
+            tools::summary(&first.name, &first.arguments)
+        );
+        match running.count() {
+            0 => label,
+            more => format!("{label} and {more} more"),
+        }
+    }
+
+    /// Take in the outcomes that have arrived.
+    fn collect(&mut self) {
+        loop {
+            match self.arrivals.try_recv() {
+                Ok((at, outcome)) => {
+                    if let Some(slot) = self.outcomes.get_mut(at) {
+                        *slot = Some(outcome);
+                    }
+                }
+                Err(async_channel::TryRecvError::Empty) => return,
+                Err(async_channel::TryRecvError::Closed) => {
+                    // Every thread has ended, so one that sent nothing died first.
+                    let unsent = self.calls.iter().zip(&mut self.outcomes).skip(self.shown);
+                    for (call, outcome) in unsent {
+                        outcome.get_or_insert_with(|| {
+                            Err(format!("`{}` stopped without finishing.", call.name))
+                        });
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Hand back the next `count` calls with their outcomes, telling any
+    /// still running that it was stopped.
+    fn hand_back(&mut self, count: usize) -> Vec<(ToolCall, Result<String, String>)> {
+        let from = self.shown;
+        self.shown += count;
+        self.calls[from..self.shown]
+            .iter()
+            .zip(&mut self.outcomes[from..])
+            .map(|(call, outcome)| {
+                let outcome = outcome.take().unwrap_or_else(|| Err(stopped(&call.name)));
+                (call.clone(), outcome)
+            })
+            .collect()
+    }
+}
+
+/// Print a call that has run: what it was and on what, then how it went and
+/// the first lines of what it gave back.
+fn print_call(name: &str, summary: &str, outcome: &Result<String, String>) {
+    // Every turn of the conversation opens with a blank line, whoever is
+    // speaking; a tool result that butts up against the question it came
+    // from reads as part of it.
+    render::blank();
+    // The fences' tags are for the model; here a few words say where the
+    // text came from.
+    let (text, from) = match outcome {
+        Ok(text) | Err(text) => letronna_core::untrusted::shown(name, text),
+    };
+    let from = from.map(|from| format!(", {from}")).unwrap_or_default();
+    match outcome {
+        Ok(_) => {
+            let lines = text.lines().count();
+            let count = if lines == 1 {
+                "1 line".to_owned()
+            } else {
+                format!("{lines} lines")
+            };
+            render::tool(name, summary, &format!("{count}{from}"), false);
+            if !text.trim().is_empty() {
+                render::detail(&text, DETAIL_LINES);
+            }
+        }
+        Err(_) => render::tool(
+            name,
+            summary,
+            &format!("{}{from}", tools::one_line(&text)),
+            true,
+        ),
+    }
+}
+
+/// What the model is told about a call the user stopped while it ran.
+fn stopped(name: &str) -> String {
+    format!("The user stopped `{name}` while it was running. Ask before starting it again.")
+}
+
+/// Shows the hook failures since the last look, each once.
+fn show_hook_problems() {
+    for problem in hooks::problems() {
+        render::line(&render::red(&problem));
     }
 }
 
@@ -521,7 +1184,7 @@ fn bold_question(text: &str) -> String {
     render::bold(text)
 }
 
-fn intent(name: &str, summary: &str) -> String {
+pub fn intent(name: &str, summary: &str) -> String {
     match name {
         "write_file" => format!("write {summary}"),
         "edit_file" => format!("edit {summary}"),
@@ -532,7 +1195,80 @@ fn intent(name: &str, summary: &str) -> String {
     }
 }
 
-fn usage(reply: &Message) -> String {
+/// What the session's own gate makes of a helper's call, or `None` when
+/// only the user can say: with no terminal to ask on, that is a no.
+fn settled(
+    request: &Request,
+    mode: Mode,
+    allowed: &Grants,
+    rules: &Result<Vec<letronna_core::permissions::Rule>, String>,
+    terminal: bool,
+) -> Option<Decision> {
+    let mut ctx = tools::ToolContext::default();
+    ctx.conversation = request.root;
+    ctx.workspace = std::env::current_dir().ok();
+    let gate = Gate::for_terminal(&ctx, allowed, rules, mode, terminal);
+    match gate::decide(&request.call, &gate) {
+        gate::Outcome::Run => Some(Decision::Once),
+        gate::Outcome::Refuse(why) => Some(Decision::Deny(why)),
+        gate::Outcome::Ask => (!terminal).then(|| Decision::Deny(String::new())),
+    }
+}
+
+/// Put a helper's request to the user: in the box when `bar` is up, on the
+/// line when not.
+fn ask_about(bar: &mut Bar, request: &Request) -> Decision {
+    let call = &request.call;
+    let mut ctx = tools::ToolContext::default();
+    ctx.conversation = request.root;
+    hooks::card(ctx, &call.name);
+    let summary = tools::summary(&call.name, &call.arguments);
+    let question = format!(
+        "Helper {} wants to {}",
+        request.label,
+        intent(&call.name, &summary)
+    );
+    let detail = request
+        .preview
+        .lines()
+        .take(DETAIL_LINES)
+        .map(str::to_owned)
+        .collect();
+    let picked = bar.interject(
+        &question,
+        detail,
+        &["Yes", "Yes, and stop asking it for this", "No"],
+    );
+    match picked {
+        Some(0) => Decision::Once,
+        Some(1) => Decision::ForRun,
+        _ => Decision::Deny(String::new()),
+    }
+}
+
+/// Say under the tool that a helper's call was declined, for `why` or for
+/// want of anyone to ask, since nothing else would show why the helper came
+/// back without what it went for.
+fn declined(request: &Request, why: &str) {
+    let call = &request.call;
+    let summary = tools::summary(&call.name, &call.arguments);
+    let why = if why.is_empty() {
+        format!(
+            "declined for helper {}: nobody is here to ask (a mode that allows it would)",
+            request.label
+        )
+    } else {
+        format!(
+            "declined for helper {}: {}",
+            request.label,
+            tools::one_line(why)
+        )
+    };
+    render::blank();
+    render::tool(&call.name, &summary, &why, true);
+}
+
+pub(crate) fn usage(reply: &Message) -> String {
     let mut parts = vec![format!("{} out", reply.tokens)];
     if reply.per_second > 0. {
         parts.push(format!("{:.1} tok/s", reply.per_second));
@@ -540,9 +1276,248 @@ fn usage(reply: &Message) -> String {
     let input = reply.input_tokens();
     if input > 0 {
         parts.push(format!("{input} in"));
+        parts.extend(reply.fullness());
         if reply.cached_tokens > 0 {
             parts.push(format!("{}% cached", 100 * reply.cached_tokens / input));
         }
     }
     parts.join(" · ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::{Unheard, wait_on, waitable};
+    use serde_json::json;
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_wait_returns_what_was_sent() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender.send("done").unwrap();
+        let waited = wait_on(&receiver, Duration::from_secs(5), || false);
+        assert_eq!(waited, Ok("done"));
+    }
+
+    #[test]
+    fn a_look_that_times_out_hands_back_to_the_keys() {
+        let (_sender, receiver) = mpsc::sync_channel::<&str>(1);
+        let started = Instant::now();
+        let looks = Cell::new(0);
+        let waited = wait_on(&receiver, Duration::from_millis(20), || {
+            looks.set(looks.get() + 1);
+            looks.get() > 1
+        });
+        // One look found nothing, waited out its patience and asked again.
+        assert_eq!(waited, Err(Unheard::Stopped));
+        assert_eq!(looks.get(), 2);
+        assert!(started.elapsed() >= Duration::from_millis(20));
+    }
+
+    #[test]
+    fn a_thread_that_goes_away_unheard_is_gone() {
+        let (sender, receiver) = mpsc::sync_channel::<&str>(1);
+        drop(sender);
+        let waited = wait_on(&receiver, Duration::from_millis(20), || false);
+        assert_eq!(waited, Err(Unheard::Gone));
+    }
+
+    #[test]
+    fn a_wait_with_no_keys_to_read_blocks_rather_than_spins() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let late = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            let _ = sender.send("done");
+        });
+        let started = std::time::Instant::now();
+        let looks = Cell::new(0u128);
+        let waited = wait_on(&receiver, Duration::from_millis(20), || {
+            looks.set(looks.get() + 1);
+            false
+        });
+        assert_eq!(waited, Ok("done"));
+        // Each look but the last waits its 20 ms; a spinning wait would
+        // look millions of times.
+        let most = started.elapsed().as_millis() / 20 + 2;
+        assert!(looks.get() <= most, "{} looks, at most {most}", looks.get());
+        late.join().unwrap();
+    }
+
+    #[test]
+    fn the_models_events_come_through_in_order_and_then_it_is_gone() {
+        let (sender, events) = async_channel::bounded(64);
+        let receiver = waitable(events);
+        sender.send_blocking(1).unwrap();
+        sender.send_blocking(2).unwrap();
+        drop(sender);
+        let patience = Duration::from_millis(20);
+        assert_eq!(wait_on(&receiver, patience, || false), Ok(1));
+        assert_eq!(wait_on(&receiver, patience, || false), Ok(2));
+        assert_eq!(wait_on(&receiver, patience, || false), Err(Unheard::Gone));
+    }
+
+    #[test]
+    fn a_reply_nobody_waits_for_lets_the_models_worker_go() {
+        let (sender, events) = async_channel::bounded(64);
+        drop(waitable(events));
+        // The thread passing events on notices on the next one and lets go
+        // of the model's channel, so the worker's sends start failing.
+        let _ = sender.send_blocking(1);
+        let started = Instant::now();
+        while !sender.is_closed() {
+            assert!(started.elapsed() < Duration::from_secs(5), "still open");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    static MET: AtomicUsize = AtomicUsize::new(0);
+
+    type Outcome = Result<String, String>;
+
+    /// Reads of `a`, `b` and `c`.
+    fn reads() -> Vec<ToolCall> {
+        ["a", "b", "c"]
+            .into_iter()
+            .map(|path| ToolCall {
+                id: path.into(),
+                name: "read_file".into(),
+                arguments: json!({"path": path}).to_string(),
+            })
+            .collect()
+    }
+
+    /// Reads of `a`, `b` and `c`, whose outcomes the test sends rather than threads.
+    fn fed() -> (Batch, async_channel::Sender<(usize, Outcome)>) {
+        let calls = reads();
+        let (sender, arrivals) = async_channel::unbounded();
+        let batch = Batch {
+            outcomes: vec![None; calls.len()],
+            calls,
+            shown: 0,
+            arrivals,
+            cancel: Cancel::default(),
+        };
+        (batch, sender)
+    }
+
+    /// Each call handed back as its id and outcome.
+    fn ids(handed: Vec<(ToolCall, Outcome)>) -> Vec<(String, Outcome)> {
+        handed
+            .into_iter()
+            .map(|(call, outcome)| (call.id, outcome))
+            .collect()
+    }
+
+    fn ok(id: &str, text: &str) -> (String, Outcome) {
+        (id.to_owned(), Ok(text.to_owned()))
+    }
+
+    fn failed(id: &str, error: &str) -> (String, Outcome) {
+        (id.to_owned(), Err(error.to_owned()))
+    }
+
+    #[test]
+    fn outcomes_come_back_in_call_order_however_they_finish() {
+        let (mut batch, sender) = fed();
+        sender.send_blocking((2, Ok("c".into()))).unwrap();
+        // The last is in, but nothing before it is, so nothing can be printed yet.
+        assert!(batch.ready().is_empty());
+        sender.send_blocking((0, Ok("a".into()))).unwrap();
+        assert_eq!(ids(batch.ready()), [ok("a", "a")]);
+        sender
+            .send_blocking((1, Err("No such file.".into())))
+            .unwrap();
+        assert_eq!(
+            ids(batch.ready()),
+            [failed("b", "No such file."), ok("c", "c")]
+        );
+        assert!(batch.done());
+    }
+
+    #[test]
+    fn stopping_keeps_what_finished_and_stops_the_rest() {
+        let (mut batch, sender) = fed();
+        sender.send_blocking((0, Ok("a".into()))).unwrap();
+        assert_eq!(ids(batch.ready()), [ok("a", "a")]);
+        // Finished, but not yet taken in when the stop comes.
+        sender.send_blocking((2, Ok("c".into()))).unwrap();
+        let cancel = batch.cancel.clone();
+
+        assert_eq!(
+            ids(batch.stop()),
+            [failed("b", &stopped("read_file")), ok("c", "c")]
+        );
+        assert!(batch.done());
+        assert!(cancel.is_set());
+        // What the stopped call says later goes nowhere.
+        let _ = sender.send_blocking((1, Ok("b".into())));
+        assert!(batch.ready().is_empty());
+    }
+
+    #[test]
+    fn a_call_whose_thread_died_says_so() {
+        let (mut batch, sender) = fed();
+        sender.send_blocking((0, Ok("a".into()))).unwrap();
+        drop(sender);
+        let died = "`read_file` stopped without finishing.";
+        assert_eq!(
+            ids(batch.ready()),
+            [ok("a", "a"), failed("b", died), failed("c", died)]
+        );
+        assert!(batch.done());
+    }
+
+    #[test]
+    fn the_waiting_line_names_the_first_call_still_running() {
+        let (mut batch, sender) = fed();
+        assert_eq!(batch.waiting(), "read_file(a) and 2 more");
+        sender.send_blocking((1, Ok("b".into()))).unwrap();
+        assert!(batch.ready().is_empty());
+        assert_eq!(batch.waiting(), "read_file(a) and 1 more");
+        sender.send_blocking((0, Ok("a".into()))).unwrap();
+        assert_eq!(batch.ready().len(), 2);
+        assert_eq!(batch.waiting(), "read_file(c)");
+        sender.send_blocking((2, Ok("c".into()))).unwrap();
+        assert_eq!(batch.ready().len(), 1);
+        assert_eq!(batch.waiting(), "");
+    }
+
+    /// Waits for all three reads to be running and gives back its arguments,
+    /// or gives up after five seconds.
+    fn meet(_: &str, arguments: &str, _: &tools::ToolContext) -> Outcome {
+        MET.fetch_add(1, Ordering::SeqCst);
+        let give_up = Instant::now() + Duration::from_secs(5);
+        while MET.load(Ordering::SeqCst) < 3 {
+            if Instant::now() >= give_up {
+                return Err(format!("{arguments} ran alone"));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Ok(arguments.to_owned())
+    }
+
+    #[test]
+    fn the_calls_in_a_batch_run_at_once() {
+        // Each call waits for the others to be running, so calls run one
+        // after another would give up.
+        let mut batch = Batch::start(reads(), &tools::ToolContext::default(), meet);
+        let mut handed = Vec::new();
+        let give_up = Instant::now() + Duration::from_secs(30);
+        while !batch.done() && Instant::now() < give_up {
+            handed.extend(batch.ready());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let path = |path: &str| json!({"path": path}).to_string();
+        assert_eq!(
+            ids(handed),
+            [
+                ok("a", &path("a")),
+                ok("b", &path("b")),
+                ok("c", &path("c"))
+            ]
+        );
+    }
 }

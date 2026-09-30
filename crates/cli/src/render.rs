@@ -537,6 +537,34 @@ pub fn visible(text: &str) -> usize {
     width
 }
 
+/// Plain text on a single row, its line breaks made spaces, cut to `width`
+/// columns with an ellipsis where it was cut.
+pub fn fit(text: &str, width: usize) -> String {
+    let text = letronna_core::tools::one_line(text);
+    if text.chars().count() <= width {
+        return text;
+    }
+    let mut cut: String = text.chars().take(width.saturating_sub(1)).collect();
+    if width > 0 {
+        cut.push('…');
+    }
+    cut
+}
+
+/// Plain text cut to `width` columns, ending in an ellipsis where it was
+/// cut, for a row that must not wrap.
+pub fn clip(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_owned();
+    }
+    let Some(room) = width.checked_sub(1) else {
+        return String::new();
+    };
+    let mut cut: String = text.chars().take(room).collect();
+    cut.push('…');
+    cut
+}
+
 /// A tool call: what ran and on what, then how it went on the line under it.
 /// Two lines rather than one because the second is where its output goes, and
 /// a result that hangs off the end of the first line is easy to miss.
@@ -598,12 +626,20 @@ pub fn notice(text: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{fold, visible};
+    use super::{fit, fold, visible};
 
     #[test]
     fn colour_takes_no_room() {
         assert_eq!(visible("hello"), 5);
         assert_eq!(visible("\x1b[1mhello\x1b[0m"), 5);
+    }
+
+    #[test]
+    fn fitting_keeps_to_one_row_of_the_width() {
+        assert_eq!(fit("one\ntwo", 20), "one two");
+        assert_eq!(fit("abcdef", 4), "abc…");
+        assert_eq!(fit("abcd", 4), "abcd");
+        assert_eq!(fit("abcd", 0), "");
     }
 
     #[test]

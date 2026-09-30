@@ -3680,12 +3680,17 @@ version = "0.1.0-alpha.2"
 dependencies = [
  "async-channel 2.5.0",
  "chrono",
+ "ignore",
+ "libc",
+ "regex",
  "reqwest",
  "ring",
  "semver",
  "serde",
  "serde_json",
+ "toml 1.1.6+spec-1.1.0",
  "tungstenite",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

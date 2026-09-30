@@ -26,7 +26,7 @@ impl Chat {
             .font_weight(FontWeight::MEDIUM)
             .text_color(cx.theme().sidebar_foreground)
             .when(active, |this| this.bg(cx.theme().sidebar_accent))
-            .hover(|s| s.bg(cx.theme().sidebar_accent.opacity(0.6)))
+            .active(|s| s.bg(cx.theme().sidebar_accent.opacity(0.6)))
             .child(
                 Icon::new(icon)
                     .size_4()
@@ -34,8 +34,14 @@ impl Chat {
             )
             .child(div().flex_1().child(label))
             .when_some(page, |this, page| {
-                this.on_click(cx.listener(move |this, _, _, cx| {
+                this.on_click(cx.listener(move |this, _, window, cx| {
                     this.page = page;
+                    // The terminal or the session's project may have brought
+                    // skills since the list was read.
+                    if page == Page::Skills {
+                        this.reload_skills();
+                    }
+                    this.focus_composer(window, cx);
                     cx.notify();
                 }))
             })
@@ -72,7 +78,7 @@ impl Chat {
             .cursor_pointer()
             .text_sm()
             .when(active, |this| this.bg(cx.theme().sidebar_accent))
-            .hover(|s| s.bg(cx.theme().sidebar_accent.opacity(0.6)))
+            .active(|s| s.bg(cx.theme().sidebar_accent.opacity(0.6)))
             .child(if c.pinned {
                 Icon::new(AppIcon::Pin)
                     .size_3()
@@ -105,12 +111,30 @@ impl Chat {
                         .bg(cx.theme().primary),
                 )
             })
-            .child(
+            // Green, as a running job's chip is: a helper works for it.
+            .when(self.helpers_working_in(c.id), |this| {
+                this.child(
+                    div()
+                        .size(px(6.))
+                        .rounded_full()
+                        .flex_shrink_0()
+                        .bg(cx.theme().green),
+                )
+            })
+            // The session a reply is running in says so, on screen or not.
+            .child(if self.busy && self.streaming_id == Some(c.id) {
+                // In the age's colour: the primary is lost on the sidebar.
+                gpui_component::spinner::Spinner::new()
+                    .xsmall()
+                    .color(cx.theme().muted_foreground)
+                    .into_any_element()
+            } else {
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(age_label(c.updated, now)),
-            )
+                    .child(age_label(c.updated, now))
+                    .into_any_element()
+            })
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 if event.modifiers().shift {
                     this.store.conversations[index].pinned ^= true;
@@ -186,6 +210,7 @@ impl Chat {
             .w(SIDEBAR_WIDTH)
             .h_full()
             .flex_shrink_0()
+            .relative()
             .bg(cx.theme().sidebar)
             .text_color(cx.theme().sidebar_foreground)
             .border_r(px(3.))
@@ -207,26 +232,13 @@ impl Chat {
                         Some(Page::Skills),
                         cx,
                     ))
-                    .child(
-                        self.nav_item(
-                            "messaging",
-                            AppIcon::MessageSquare,
-                            "Messaging",
-                            Some(Page::Messaging),
-                            cx,
-                        )
-                        // A chat asking to be allowed waits on that page,
-                        // which nobody has reason to open; this is the knock.
-                        .when(self.pairing.is_some(), |this| {
-                            this.child(div().size(px(6.)).rounded_full().bg(cx.theme().primary))
-                                .tooltip(|window, cx| {
-                                    gpui_component::tooltip::Tooltip::new(
-                                        "A Telegram chat is asking to be allowed",
-                                    )
-                                    .build(window, cx)
-                                })
-                        }),
-                    )
+                    .child(self.nav_item(
+                        "messaging",
+                        AppIcon::MessageSquare,
+                        "Messaging",
+                        Some(Page::Messaging),
+                        cx,
+                    ))
                     .child(self.nav_item(
                         "artifacts",
                         AppIcon::File,
@@ -234,7 +246,19 @@ impl Chat {
                         Some(Page::Artifacts),
                         cx,
                     ))
-                    .child(self.browser_item(cx))
+                    .child(
+                        self.nav_item(
+                            "activity",
+                            AppIcon::Robot,
+                            "Activity",
+                            Some(Page::Activity),
+                            cx,
+                        )
+                        // To the list, as the pill goes, even from a transcript.
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.open_activity(window, cx)),
+                        ),
+                    )
                     .child(self.nav_item(
                         "jobs",
                         AppIcon::Clock,
@@ -265,7 +289,9 @@ impl Chat {
                     .overflow_y_scroll()
                     .px_2()
                     .child(self.section("Sessions", cx))
-                    .child(sessions),
+                    .child(sessions)
+                    .children(self.message_hits(cx)),
             )
+            .children(self.grain(&self.grains.sidebar))
     }
 }
