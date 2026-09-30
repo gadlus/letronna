@@ -36,6 +36,7 @@ use crate::inbox::{self, LINE_BREAKS, Notice, When};
 use crate::store::{Conversation, Transcript};
 use crate::timers::{self, TimerId};
 use crate::tools;
+use crate::worktree::{self, Worktree};
 use async_channel::{Receiver, Sender};
 use journal::{Journal, Line};
 use serde_json::Value;
@@ -72,9 +73,8 @@ const STALE: Duration = Duration::from_secs(120);
 /// starts the agents, and nesting goes only through the script's own call.
 const NOT_FOR_AGENTS: [&str; 3] = ["agent", "agents", "workflow"];
 /// Options the changes that honour them will let through: until then a call
-/// naming one is refused, rather than run writing straight into the workspace
-/// or answering in text where a shape was asked for.
-const NOT_YET: [&str; 2] = ["schema", "isolation"];
+/// naming one is refused, rather than answer in text where a shape was asked for.
+const NOT_YET: [&str; 1] = ["schema"];
 /// Opens a workflow agent's task, which reaches it as the user's turn but is
 /// not the user's.
 const TASK_HEADER: &str =
@@ -128,6 +128,9 @@ pub struct Run {
     /// Answers earlier launches of the run left, by key, with the launch each
     /// came from.
     answers: HashMap<String, (Value, usize)>,
+    /// Worktrees earlier launches' agents started in, by key, for a rerun to
+    /// carry on in.
+    worktrees: HashMap<String, Worktree>,
     /// How many calls so far had each prompt and options.
     seen: HashMap<(String, String), u64>,
     calls: usize,
@@ -168,6 +171,8 @@ struct Options {
     effort: Option<String>,
     label: String,
     phase: String,
+    /// Whether it works in a git worktree of its own.
+    isolated: bool,
 }
 
 /// What comes in on a run's channel.
@@ -176,6 +181,8 @@ enum Arrival {
         slot: Slot,
         key: String,
         ended: Ended,
+        /// The line saying where its worktree was kept, if it was.
+        kept: Option<String>,
     },
     /// Time to touch the lock.
     Beat,
@@ -240,6 +247,7 @@ impl Run {
             permits: permits(),
             spawn: Box::new(|spec, then| driver::spawn(spec, then).map(drop)),
             answers: journal::answers(&lines),
+            worktrees: journal::worktrees(&lines),
             seen: HashMap::new(),
             calls: 0,
             live: false,
@@ -362,7 +370,7 @@ impl Run {
             let (slot, key) = (queued.slot, queued.key.clone());
             match self.start(queued) {
                 Ok(()) => self.running += 1,
-                Err(error) => self.record(slot, key, Ended::Failed(error)),
+                Err(error) => self.record(slot, key, Ended::Failed(error), None),
             }
         }
     }
@@ -379,7 +387,7 @@ impl Run {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let (settings, _) = crate::store::settings();
         let helper_model = (!settings.helper_model.is_empty()).then_some(settings.helper_model);
-        let connection = Connection {
+        let mut connection = Connection {
             model: (asked.model.or(def.model.clone()).or(helper_model))
                 .unwrap_or_else(|| self.connection.model.clone()),
             effort: (asked.effort.or(def.effort.clone()))
@@ -410,11 +418,39 @@ impl Run {
                 ..Default::default()
             },
         };
-        self.journal.write(&Line::Started {
+        // A rerun carries on in the worktree its earlier run kept.
+        let worktree = match (asked.isolated, self.connection.workspace.as_deref()) {
+            (false, _) => None,
+            (true, Some(workspace)) => Some(match self.worktrees.remove(&key) {
+                Some(earlier) => earlier.reopen(Some(workspace))?,
+                None => worktree::create(workspace, &format!("{}-{}", self.name, slot + 1))?,
+            }),
+            (true, None) => {
+                return Err("A worktree needs a project folder, and none is attached.".into());
+            }
+        };
+        // Finished when it cannot start, which leaves it unless it holds work.
+        let unstarted = |worktree: &Option<Worktree>| {
+            if let Some(tree) = worktree {
+                tree.finish(&[]);
+            }
+        };
+        let started = self.journal.write(&Line::Started {
             key: key.clone(),
             label: asked.label,
             phase: asked.phase,
-        })?;
+            worktree: worktree.clone(),
+        });
+        if started.is_err() {
+            unstarted(&worktree);
+        }
+        started?;
+        if let Some(tree) = &worktree {
+            connection.workspace = Some(tree.workspace());
+        }
+        let at_top = (worktree.as_ref())
+            .zip(connection.workspace.as_deref())
+            .and_then(|(tree, given)| tree.at_top(given));
         let agent_budget = match settings.helper_budget {
             0 => AGENT_BUDGET,
             n => n,
@@ -445,8 +481,11 @@ impl Run {
             slot,
             key: Some(key),
             charged,
+            worktree: worktree.clone(),
+            at_top,
         };
         (self.spawn)(spec, Box::new(move |report| owed.pay(report)))
+            .inspect_err(|_| unstarted(&worktree))
     }
 
     /// Waits for what comes next on the run's channel and deals with it.
@@ -461,18 +500,28 @@ impl Run {
                 self.lock.touch();
                 self.beat = timers::at(Instant::now() + BEAT, ring(&self.arrivals.0));
             }
-            Arrival::Ended { slot, key, ended } => {
+            Arrival::Ended {
+                slot,
+                key,
+                ended,
+                kept,
+            } => {
                 self.running -= 1;
-                self.record(slot, key, ended);
+                self.record(slot, key, ended, kept);
             }
         }
     }
 
-    /// Writes how an agent ended into the journal, readies its answer, and
-    /// pauses the run at the third failure in a row with one error.
-    fn record(&mut self, slot: Slot, key: String, ended: Ended) {
+    /// Writes how an agent ended, and where its worktree was `kept`, into the
+    /// journal, readies its answer, and pauses the run at the third failure in
+    /// a row with one error.
+    fn record(&mut self, slot: Slot, key: String, ended: Ended, kept: Option<String>) {
         // A line that cannot be written costs only a rerun on the next resume,
         // so the answer still goes to the script.
+        if let Some(line) = kept {
+            let key = key.clone();
+            let _ = self.journal.write(&Line::Kept { key, line });
+        }
         let value = match ended {
             Ended::Answered(text, tokens) => {
                 self.streak = None;
@@ -587,6 +636,7 @@ impl Options {
             effort: text("effort")?,
             label: text("label")?.unwrap_or_default(),
             phase: text("phase")?.unwrap_or_default(),
+            isolated: worktree::asked(&options["isolation"])?,
         })
     }
 }
@@ -737,20 +787,40 @@ struct Owed {
     key: Option<String>,
     /// The agent's own budget, charged as budget.rs charges, cache and all.
     charged: Arc<Budget>,
+    /// The worktree it works in, finished as it ends.
+    worktree: Option<Worktree>,
+    /// The line saying it works at the worktree's top, put before a kept one.
+    at_top: Option<String>,
 }
 
 impl Owed {
-    /// Sends how the agent's `report` says it ended.
+    /// Sends how the agent's `report` says it ended, with the line saying
+    /// where its worktree was kept, if it was, after an answer too.
     fn pay(mut self, report: &Report) {
-        let ended = ended(report, self.charged.spent());
-        self.send(ended);
+        let mut ended = ended(report, self.charged.spent());
+        let kept = (self.worktree.take()).and_then(|tree| tree.finish(&report.jobs));
+        let kept = kept.map(|line| match self.at_top.take() {
+            Some(at_top) => format!("{at_top} {line}"),
+            None => line,
+        });
+        if let (Ended::Answered(text, _), Some(kept)) = (&mut ended, &kept) {
+            text.push_str("\n\n");
+            text.push_str(kept);
+        }
+        self.send(ended, kept);
     }
 
     /// Sends `ended`, unless word has gone already.
-    fn send(&mut self, ended: Ended) {
+    fn send(&mut self, ended: Ended, kept: Option<String>) {
         if let Some(key) = self.key.take() {
             let slot = self.slot;
-            let _ = self.arrivals.try_send(Arrival::Ended { slot, key, ended });
+            let arrival = Arrival::Ended {
+                slot,
+                key,
+                ended,
+                kept,
+            };
+            let _ = self.arrivals.try_send(arrival);
         }
     }
 }
@@ -760,9 +830,10 @@ impl Drop for Owed {
         // An agent whose thread panics never reports, and `step` would wait
         // for it for good; a start that failed is recorded where it failed.
         if std::thread::panicking() {
-            self.send(Ended::Failed(
-                "The helper stopped without finishing.".into(),
-            ));
+            self.send(
+                Ended::Failed("The helper stopped without finishing.".into()),
+                None,
+            );
         }
     }
 }
@@ -1372,8 +1443,8 @@ mod tests {
         let mut run = data.run(None, answering(&asked_for, done));
         // Refused before it is counted: one that cannot run is no call.
         assert_eq!(
-            run.agent("Count to three.", &json!({"isolation": "worktree"})),
-            Err("agent() option `isolation` is not supported yet.".into())
+            run.agent("Count to three.", &json!({"schema": {"type": "object"}})),
+            Err("agent() option `schema` is not supported yet.".into())
         );
         for n in 0..1_000 {
             assert_eq!(run.agent("Count to three.", &Value::Null), Ok(n));
@@ -1384,6 +1455,93 @@ mod tests {
         );
         // Queued, not started: nothing ran before the host asked for an answer.
         assert!(asked_for.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_isolated_agent_works_in_a_worktree_that_goes_when_it_changed_nothing() {
+        let data = Data::new("isolated");
+        let work = data.dir.join("work");
+        crate::worktree::tests::repo(&work);
+        let top = std::fs::canonicalize(&work).unwrap();
+        let spawn: Spawn = Box::new(|spec, then| {
+            let task = asked(&spec);
+            let inside = spec.connection.workspace.clone().unwrap();
+            std::thread::spawn(move || {
+                if task.starts_with("Write") {
+                    std::fs::write(inside.join("new.txt"), "work").unwrap();
+                }
+                then(&done(&task))
+            });
+            Ok(())
+        });
+        let mut run = data.run(None, spawn);
+        let isolated = json!({"isolation": "worktree"});
+        run.agent("Read the readme.", &isolated).unwrap();
+        run.agent("Write new.txt.", &isolated).unwrap();
+        let (_run, steps) = steps(run, 2);
+        let answers = by_slot(&steps);
+
+        let kept = top.join(".letronna/worktrees/wf-1-2");
+        assert_eq!(answers[0], text("Read the readme. -> done"));
+        let said = format!(
+            "Write new.txt. -> done\n\nIts worktree is kept at {} on branch letronna/wf-1-2 (no \
+             commits, uncommitted changes).",
+            kept.display()
+        );
+        assert_eq!(answers[1], text(&said));
+        assert!(!top.join(".letronna/worktrees/wf-1-1").exists());
+        assert!(kept.join("new.txt").is_file());
+        assert!(!work.join("new.txt").exists());
+    }
+
+    #[test]
+    fn a_failed_isolated_agent_keeps_its_worktree_for_its_rerun() {
+        let data = Data::new("isolated-rerun");
+        let work = data.dir.join("work");
+        crate::worktree::tests::repo(&work);
+        let kept = std::fs::canonicalize(&work)
+            .unwrap()
+            .join(".letronna/worktrees/wf-1-1");
+        let failing: Spawn = Box::new(|spec, then| {
+            let inside = spec.connection.workspace.clone().unwrap();
+            std::thread::spawn(move || {
+                std::fs::write(inside.join("half.txt"), "part").unwrap();
+                then(&report(Outcome::Failed("No key.".into()), ""))
+            });
+            Ok(())
+        });
+        let isolated = json!({"isolation": "worktree"});
+        let mut run = data.run(None, failing);
+        run.agent("Write half.txt.", &isolated).unwrap();
+        let (run, first) = steps(run, 1);
+        drop(run);
+
+        assert_eq!(by_slot(&first), [None]);
+        let lines = data.journal("wf-1");
+        let said = (lines.iter())
+            .find(|line| line["type"] == "kept")
+            .and_then(|line| line["line"].as_str());
+        let at = kept.display().to_string();
+        assert!(said.is_some_and(|said| said.contains(&at)), "{lines:?}");
+
+        let seen = Arc::new(Mutex::new(None));
+        let saw = seen.clone();
+        let spawn: Spawn = Box::new(move |spec, then| {
+            *saw.lock().unwrap() = spec.connection.workspace.clone();
+            std::thread::spawn(move || then(&done("Carry on")));
+            Ok(())
+        });
+        let mut run = data.run(Some("wf-1"), spawn);
+        run.agent("Write half.txt.", &isolated).unwrap();
+        let (_run, again) = steps(run, 1);
+
+        assert_eq!(*seen.lock().unwrap(), Some(kept.clone()));
+        let Some(Value::String(answer)) = &by_slot(&again)[0] else {
+            panic!("{again:?}");
+        };
+        assert!(answer.contains(&at), "{answer}");
+        assert!(kept.join("half.txt").is_file());
+        assert!(!kept.with_file_name("wf-1-1-2").exists());
     }
 
     #[test]

@@ -17,6 +17,7 @@
 //! through a character: it is skipped on reading, and the next line starts on
 //! a line of its own.
 
+use crate::worktree::Worktree;
 use ring::digest;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -40,6 +41,9 @@ pub(super) enum Line {
         key: String,
         label: String,
         phase: String,
+        /// The worktree it works in, which a rerun carries on in.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worktree: Option<Worktree>,
     },
     /// An agent answered, with what that took.
     Result {
@@ -49,6 +53,8 @@ pub(super) enum Line {
     },
     /// An agent ended without an answer.
     Failed { key: String },
+    /// An agent's worktree was kept as it ended, as this line says.
+    Kept { key: String, line: String },
     /// The run paused, and why.
     Paused { reason: String },
 }
@@ -108,10 +114,26 @@ pub(super) fn answers(lines: &[Line]) -> HashMap<String, (Value, usize)> {
             Line::Started { key, .. } | Line::Failed { key } => {
                 answers.remove(key);
             }
-            Line::Paused { .. } => {}
+            Line::Kept { .. } | Line::Paused { .. } => {}
         }
     }
     answers
+}
+
+/// The worktree each agent in `lines` last started in, by key.
+pub(super) fn worktrees(lines: &[Line]) -> HashMap<String, Worktree> {
+    let mut worktrees = HashMap::new();
+    for line in lines {
+        if let Line::Started {
+            key,
+            worktree: Some(tree),
+            ..
+        } = line
+        {
+            worktrees.insert(key.clone(), tree.clone());
+        }
+    }
+    worktrees
 }
 
 /// The tokens every answer in `lines` took, over all the run's launches.
