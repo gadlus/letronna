@@ -326,6 +326,17 @@ fn ladder(call: &ToolCall, gate: &Gate, judge: Option<&dyn Fn(&str) -> Verdict>)
     if let Some(why) = marked(tool.as_ref(), &args) {
         return Outcome::Refuse(why);
     }
+    // Computer use acts on the one app its call names, found here so that
+    // the grants below see the app rather than what was typed; Letronna's
+    // own windows and the system's password prompts are refused outright.
+    let target = if tool.name() == crate::computer::COMPUTER {
+        match crate::computer::gated(&args) {
+            Ok(target) => Some(target),
+            Err(why) => return Outcome::Refuse(why),
+        }
+    } else {
+        None
+    };
     // Layer 1, the floor. It comes before every setting and grant: a command
     // that is hard to take back needs a person's yes even when approvals are
     // skipped or the tool is allowed.
@@ -389,10 +400,14 @@ fn ladder(call: &ToolCall, gate: &Gate, judge: Option<&dyn Fn(&str) -> Verdict>)
     // Layer 4: what the user allowed in this session or by rule. A yes to
     // using pages is not one to send this computer's files to them, so each
     // upload is asked about, or judged, on its own.
-    let granted = gate
-        .grants
-        .get(&gate.ctx.conversation)
-        .is_some_and(|tools| tools.contains(&grant(call)));
+    // A yes for computer use covers its app alone, not the tool's name.
+    let granted = match &target {
+        Some(target) => crate::computer::granted(gate.ctx.conversation, target),
+        None => gate
+            .grants
+            .get(&gate.ctx.conversation)
+            .is_some_and(|tools| tools.contains(&grant(call))),
+    };
     if !opaque && !uploads(tool.name(), &args) && (granted || ruling.allow) {
         return Outcome::Run;
     }
@@ -452,6 +467,9 @@ pub(crate) fn cleared(call: &ToolCall, ctx: &ToolContext) -> bool {
 /// `read_mcp_resource`, which reads from every MCP server, the server too,
 /// so a yes to one server's reads is not a yes to another's.
 pub fn grant(call: &ToolCall) -> String {
+    if call.name == crate::computer::COMPUTER {
+        return crate::computer::grant_key(call);
+    }
     let args = tools::parse_args(&call.arguments).unwrap_or_default();
     // Uploads only cover other uploads: a yes to using pages is not one to
     // send this computer's files to them.

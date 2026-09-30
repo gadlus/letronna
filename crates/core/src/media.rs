@@ -357,12 +357,13 @@ pub fn saved(result: &str) -> Option<PathBuf> {
 
 /// The tools whose results start with `SAVED` and the file they wrote; an
 /// MCP tool's too, which saves the pictures its server sends.
-const SAVERS: [&str; 5] = [
+const SAVERS: [&str; 6] = [
     "make_image",
     "speak",
     "make_video",
     "read_file",
     crate::browser::BROWSE,
+    crate::computer::COMPUTER,
 ];
 
 /// The file `tool`'s result says it saved, believed only from `SAVERS`, and

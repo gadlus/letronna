@@ -271,6 +271,7 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(crate::media::MakeVideo),
         Arc::new(crate::browser::Browse),
         Arc::new(crate::browser::UsePage),
+        Arc::new(crate::computer::Computer),
         Arc::new(crate::agents::Agent),
         Arc::new(crate::agents::Agents),
         Arc::new(crate::tasklist::Board),
@@ -620,12 +621,13 @@ pub(crate) fn run_found(
     Ok(out)
 }
 
-/// What an untrusted tool returned, fenced. A browse screenshot's first line
-/// is Letronna's own, naming the file it saved, as is an MCP result's that
+/// What an untrusted tool returned, fenced. A browse or computer screenshot's
+/// first line is Letronna's own, naming the file it saved, as is an MCP result's that
 /// names a picture its server sent; it stays above the fence, where the
 /// window looks for it and nothing a page or server writes can reach.
 fn fenced(name: &str, args: &Value, text: &str) -> Result<String, String> {
-    let shot = name == crate::browser::BROWSE && args["action"] == "screenshot";
+    let shot = [crate::browser::BROWSE, crate::computer::COMPUTER].contains(&name)
+        && args["action"] == "screenshot";
     let saves = shot || crate::mcp::is_tool(name);
     match text.split_once('\n') {
         Some((own, rest)) if saves && crate::media::saved(own).is_some() => {
@@ -831,6 +833,7 @@ pub fn summary(name: &str, args: &str) -> String {
             ),
         },
         crate::browser::BROWSE | "use_page" => crate::browser::summary(&v),
+        crate::computer::COMPUTER => crate::computer::summary(&v),
         TODO => {
             let items = v["items"].as_array().map(Vec::len).unwrap_or(0);
             format!("{items} items")
@@ -4410,7 +4413,7 @@ mod tests {
             .filter(|name| !name.starts_with("mcp__") && !name.contains("_mcp_"))
             .collect();
         // read_chat fences other people's lines itself, and not the user's.
-        assert_eq!(fenced, ["web_fetch", "browse", "use_page"]);
+        assert_eq!(fenced, ["web_fetch", "browse", "use_page", "computer"]);
         assert!(crate::search::SearchWeb.untrusted());
     }
 
