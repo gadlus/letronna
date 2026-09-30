@@ -539,12 +539,23 @@ fn telegram_press(query: &serde_json::Value) -> Option<Incoming> {
     })
 }
 
-fn client() -> Option<reqwest::blocking::Client> {
-    reqwest::blocking::Client::builder()
-        // Comfortably longer than the long-poll, or every poll would time out.
-        .timeout(std::time::Duration::from_secs(POLL_SECONDS as u64 + 15))
-        .build()
-        .ok()
+/// The one HTTP client every chat-app call goes through.
+///
+/// A client per call meant a fresh TCP and TLS handshake for every message,
+/// typing indicator and tap, all to the same few hosts; this one keeps the
+/// connection open between them.
+fn client() -> Option<&'static reqwest::blocking::Client> {
+    static CLIENT: std::sync::OnceLock<Option<reqwest::blocking::Client>> =
+        std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                // Comfortably longer than the long-poll, or every poll would time out.
+                .timeout(std::time::Duration::from_secs(POLL_SECONDS as u64 + 15))
+                .build()
+                .ok()
+        })
+        .as_ref()
 }
 
 /// Send `text` to the chat `source` names, in as many messages as the
@@ -808,6 +819,13 @@ mod tests {
         send_via, settle_via, typing_via,
     };
     use serde_json::{Value, json};
+
+    #[test]
+    fn every_chat_app_call_shares_one_client() {
+        let first = super::client().expect("the client builds");
+        let second = super::client().expect("the client builds");
+        assert!(std::ptr::eq(first, second));
+    }
 
     /// Accept one request, answer it with `status`, and hand back its path and
     /// JSON body.

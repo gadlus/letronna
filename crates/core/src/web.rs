@@ -31,6 +31,7 @@ use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::io::Read;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 /// The most of a page that is read, in bytes. What the model is shown is cut
@@ -52,6 +53,9 @@ const MEMO_PAGES: usize = 64;
 /// The most text remembered at once, in bytes: four of the largest pages that
 /// are read, or hundreds of ordinary ones.
 const MEMO_BYTES: usize = 8 * 1024 * 1024;
+
+/// How long a fetch may take, redirects and all.
+const FETCH_TIME: Duration = Duration::from_secs(20);
 
 /// Elements that hold nothing a reader sees on the page. Not `head`: its
 /// closing tag may be left out, which would hide the page along with it.
@@ -175,26 +179,37 @@ fn fetch(raw: &str, secrets: &[String], fresh: bool) -> Result<Page, String> {
         .iter()
         .flat_map(|secret| [secret.clone(), secret.to_lowercase()])
         .collect();
-    let policy = reqwest::redirect::Policy::custom(move |hop| {
-        match follow(hop.previous(), hop.url(), &secrets) {
-            Ok(()) => hop.follow(),
-            Err(why) => hop.error(why),
+    // Redirects are followed here rather than by a policy on the client,
+    // which could not see this fetch's keys without a client of its own.
+    // A request's own timeout is a deadline for its whole reply, where the
+    // client's bounds only each wait on it, so a page trickled out a byte at
+    // a time still ends when the deadline for every hop and the page does.
+    let client = client()?;
+    let deadline = Instant::now() + FETCH_TIME;
+    let mut url = url;
+    let mut previous = Vec::new();
+    let response = loop {
+        let mut request = client
+            .get(url.clone())
+            .timeout(deadline.saturating_duration_since(Instant::now()));
+        if let Some(from) = previous.last().and_then(|from| referer(from, &url)) {
+            request = request.header(reqwest::header::REFERER, from);
         }
-    });
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .redirect(policy)
-        .user_agent(concat!("Letronna/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let response = client.get(url).send().map_err(|e| {
-        // reqwest's own words for a refused redirect only say that one failed;
-        // why is in its source.
-        match std::error::Error::source(&e) {
-            Some(why) if e.is_redirect() => why.to_string(),
-            _ => format!("Could not fetch the page: {e}"),
+        let response = request
+            .send()
+            .map_err(|e| format!("Could not fetch the page: {e}"))?;
+        let Some(next) = moved_to(&response) else {
+            break response;
+        };
+        // Before `follow`, whose address check would refuse it first in
+        // words written for the browser.
+        if !matches!(next.scheme(), "http" | "https") {
+            return Err("The page redirected somewhere that is not a web page.".into());
         }
-    })?;
+        previous.push(url);
+        follow(&previous, &next, &secrets)?;
+        url = next;
+    };
     let status = response.status();
     if !status.is_success() {
         return Err(format!("The page answered HTTP {}.", status.as_u16()));
@@ -378,6 +393,49 @@ fn memo_key(url: &reqwest::Url) -> String {
     let mut url = url.clone();
     url.set_fragment(None);
     url.into()
+}
+
+/// The one HTTP client every fetch goes through, kept open between fetches.
+/// It follows no redirect itself: `fetch` checks each one first.
+fn client() -> Result<&'static reqwest::blocking::Client, String> {
+    static CLIENT: OnceLock<Result<reqwest::blocking::Client, String>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .timeout(FETCH_TIME)
+                .redirect(reqwest::redirect::Policy::none())
+                .user_agent(concat!("Letronna/", env!("CARGO_PKG_VERSION")))
+                .build()
+                .map_err(|e| e.to_string())
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+/// Where `response` sends the fetch on to, when it is a redirect reqwest
+/// would have followed.
+fn moved_to(response: &reqwest::blocking::Response) -> Option<reqwest::Url> {
+    if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+        return None;
+    }
+    let to = response.headers().get(reqwest::header::LOCATION)?;
+    response
+        .url()
+        .join(std::str::from_utf8(to.as_bytes()).ok()?)
+        .ok()
+}
+
+/// The Referer a redirect from `from` on to `next` carries, as reqwest sent
+/// it: none from https down to http, and never a password.
+fn referer(from: &reqwest::Url, next: &reqwest::Url) -> Option<String> {
+    if next.scheme() == "http" && from.scheme() == "https" {
+        return None;
+    }
+    let mut from = from.clone();
+    let _ = from.set_username("");
+    let _ = from.set_password(None);
+    from.set_fragment(None);
+    Some(from.into())
 }
 
 /// Whether a redirect from the addresses in `previous` on to `next` is
@@ -977,6 +1035,7 @@ or <a data-href="/x" href=/top#part>the top</a>.</p>
             "/metadata" => "http://169.254.169.254/latest/meta-data/",
             "/leak" => "/?k=sk-live-0123456789abcdef",
             "/name" => "http://Sk-Live-0123456789ABCDEF.invalid/",
+            "/ftp" => "ftp://example.com/file",
             _ => {
                 return "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 7\r\n\
                         Connection: close\r\n\r\narrived"
@@ -1004,6 +1063,8 @@ or <a data-href="/x" href=/top#part>the top</a>.</p>
         assert!(why.contains("keys or tokens"), "{why}");
         let why = fetch(&format!("{base}/loop"), &[], false).unwrap_err();
         assert!(why.contains("more than five"), "{why}");
+        let why = fetch(&format!("{base}/ftp"), &[], false).unwrap_err();
+        assert!(why.contains("not a web page"), "{why}");
         let asked = asked.lock().unwrap();
         assert!(!asked.iter().any(|path| path.contains(&key)), "{asked:?}");
         // The address asked for, then the five redirects that are followed.
@@ -1161,6 +1222,47 @@ or <a data-href="/x" href=/top#part>the top</a>.</p>
             assert_eq!(page, Page::Text(format!("{base}/local\n\narrived")));
         }
         assert_eq!(asked.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn every_fetch_shares_one_client() {
+        let first = client().expect("the client builds");
+        let second = client().expect("the client builds");
+        assert!(std::ptr::eq(first, second));
+    }
+
+    #[test]
+    fn a_second_fetch_rides_the_first_ones_connection() {
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.local_addr().unwrap());
+        let connections = Arc::new(Mutex::new(0));
+        let counted = connections.clone();
+        std::thread::spawn(move || {
+            for mut socket in server.incoming().flatten() {
+                *counted.lock().unwrap() += 1;
+                std::thread::spawn(move || {
+                    let _ = socket.set_read_timeout(Some(Duration::from_secs(10)));
+                    let mut block = [0; 4096];
+                    // Every request is answered on the socket it came in on,
+                    // which stays open for the next.
+                    while matches!(socket.read(&mut block), Ok(n) if n > 0) {
+                        let reply = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
+                                     Content-Length: 7\r\n\r\narrived";
+                        if socket.write_all(reply.as_bytes()).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        for _ in 0..2 {
+            let page = fetch(&format!("{base}/"), &[], true).unwrap();
+            assert_eq!(page, Page::Text(format!("{base}/\n\narrived")));
+            // Time for the pool to take the connection back once its reply
+            // has been read.
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        assert_eq!(*connections.lock().unwrap(), 1);
     }
 
     #[test]

@@ -564,11 +564,20 @@ fn own_media(raw: &str, ctx: &ToolContext) -> Option<PathBuf> {
     path.starts_with(&media).then_some(path)
 }
 
-fn client() -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
-        .timeout(TRANSFER_TIME)
-        .build()
-        .map_err(|_| "Cannot initialize connection.".to_owned())
+/// The one HTTP client every file sent or fetched goes through, kept apart
+/// from messages' own for its longer timeout, and kept open between files.
+fn client() -> Result<&'static reqwest::blocking::Client, String> {
+    static CLIENT: std::sync::OnceLock<Result<reqwest::blocking::Client, String>> =
+        std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .timeout(TRANSFER_TIME)
+                .build()
+                .map_err(|_| "Cannot initialize connection.".to_owned())
+        })
+        .as_ref()
+        .map_err(Clone::clone)
 }
 
 /// Send the file at `path` to `to`, with `caption` under it. Text leaves
@@ -1360,5 +1369,12 @@ mod tests {
         let declined = super::hear_with(incoming("", vec![]), false, |_| Ok("hi".into()));
         assert!(!declined.spoken);
         assert!(!incoming("typed", vec![]).spoken);
+    }
+
+    #[test]
+    fn every_file_transfer_shares_one_client() {
+        let first = super::client().expect("the client builds");
+        let second = super::client().expect("the client builds");
+        assert!(std::ptr::eq(first, second));
     }
 }
