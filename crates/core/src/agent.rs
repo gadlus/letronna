@@ -300,11 +300,13 @@ impl Turn {
     }
 
     /// Queue the calls the model asked for. False when the turn should stop
-    /// instead: nothing to run, or the wrap-up asked for at the round cap has
-    /// come. At the cap the calls are answered as not run instead, and a
-    /// notice after them asks for that wrap-up with no tools.
+    /// instead: nothing to run, no round allowed at all, or the wrap-up asked
+    /// for at the round cap has come. At the cap the calls are answered as not
+    /// run instead, and a notice after them asks for that wrap-up with no tools.
     pub fn begin(&mut self, calls: Vec<ToolCall>) -> bool {
-        if calls.is_empty() || self.connection.wrap_up {
+        // With no round allowed nothing was done to sum up, so a call ends
+        // the turn there: /btw makes one request.
+        if calls.is_empty() || self.connection.wrap_up || self.limit == 0 {
             return false;
         }
         self.order = calls.iter().map(|call| call.id.clone()).collect();
@@ -719,6 +721,15 @@ mod tests {
     #[test]
     fn a_new_turn_still_stops_at_twenty_five() {
         assert_eq!(rounds_before_stopping(turn()), 25);
+    }
+
+    #[test]
+    fn a_turn_allowed_no_rounds_ends_at_a_call_without_asking_for_a_wrap_up() {
+        let mut turn = Turn::with_limit(turn().connection, 0);
+        assert!(!turn.begin(vec![call("read_file")]));
+        assert!(turn.take_results().is_empty());
+        assert!(!turn.connection.wrap_up);
+        assert_eq!(turn.capped(), None);
     }
 
     #[test]
