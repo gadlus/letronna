@@ -52,6 +52,9 @@ const MCP_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 const PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
 /// Lines of a call's preview shown above the question, as the conversation shows.
 const PREVIEW_LINES: usize = 12;
+/// How long a new version runs before it counts as working and is kept, as
+/// in the window.
+const SETTLED: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn main() {
     rescue_terminal();
@@ -69,6 +72,18 @@ fn main() {
     if args.version {
         println!("letronna {}", env!("CARGO_PKG_VERSION"));
         return;
+    }
+    // An update downloaded last time goes in now, before anything is running,
+    // and so does the old version when a new one keeps failing to start.
+    // After `--version`, which the updater runs a new binary with before it
+    // is trusted, and which must not count as a start.
+    if let Some(program) = update::on_start() {
+        std::process::exit(start_instead(&program));
+    }
+    let keep = Keep::new(confirm_update);
+    // `-p` exits as soon as it has answered, so only an answer proves it.
+    if args.prompt.is_none() {
+        keep.after(SETTLED);
     }
     if let Some(words) = &args.mcp {
         std::process::exit(mcp::run(words));
@@ -173,6 +188,9 @@ fn main() {
         // It goes out at once, so the MCP servers' tools would miss it.
         letronna_core::mcp::ready(MCP_WAIT);
         let finished = ask_once(&mut runner, session, prompt, &args);
+        if finished {
+            keep.now();
+        }
         // A browser with no window, or a job started in the background, would
         // outlive this run unseen.
         letronna_core::browser::close_hidden();
@@ -266,12 +284,15 @@ fn main() {
                 _ => continue,
             }
         }
-        if let Err(error) = runner.ask(session, prompt) {
-            render::blank();
-            render::line(&render::red(&error));
-            // Nothing is painted after this until the next key, so without
-            // it a failed turn looks like one that ended with no answer.
-            screen::settle();
+        match runner.ask(session, prompt) {
+            Ok(_) => keep.now(),
+            Err(error) => {
+                render::blank();
+                render::line(&render::red(&error));
+                // Nothing is painted after this until the next key, so without
+                // it a failed turn looks like one that ended with no answer.
+                screen::settle();
+            }
         }
         runner.persist();
         if runner.bar.finished() {
@@ -634,6 +655,73 @@ fn rescue_terminal() {
     }));
 }
 
+/// Run `program`, the version put in place of this one, with this run's
+/// arguments, and give back how it ended.
+fn start_instead(program: &std::path::Path) -> i32 {
+    let mut command = std::process::Command::new(program);
+    command.args(std::env::args_os().skip(1));
+    // It takes this terminal over rather than starting beside it as the
+    // window does: were this one to leave, the shell would take the terminal
+    // back while the new version was still reading from it.
+    #[cfg(unix)]
+    let error = {
+        use std::os::unix::process::CommandExt;
+        command.exec()
+    };
+    #[cfg(not(unix))]
+    let error = match command.status() {
+        Ok(status) => return status.code().unwrap_or(1),
+        Err(error) => error,
+    };
+    render::line(&render::red(&format!(
+        "Letronna changed version but could not start {}: {error}",
+        program.display()
+    )));
+    1
+}
+
+/// Says this version works once a run, when the timer or the first turn to
+/// finish comes, whichever is first.
+#[derive(Clone)]
+struct Keep {
+    once: Arc<std::sync::Once>,
+    confirm: fn(),
+}
+
+impl Keep {
+    fn new(confirm: fn()) -> Keep {
+        Keep {
+            once: Arc::new(std::sync::Once::new()),
+            confirm,
+        }
+    }
+
+    /// Say it now, unless it was said already.
+    fn now(&self) {
+        self.once.call_once(self.confirm);
+    }
+
+    /// Say it once `delay` has passed.
+    fn after(&self, delay: std::time::Duration) {
+        let keep = self.clone();
+        // One sleep and done, so nothing wakes while the terminal sits idle.
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            keep.now();
+        });
+    }
+}
+
+/// Keep the version that is running, when this build updates itself.
+fn confirm_update() {
+    // As in the window: a development build is not the Letronna someone
+    // installed, and settling that one's update would stop a bad release
+    // being put back.
+    if update::enabled() {
+        update::confirm();
+    }
+}
+
 /// `letronna update`: download the newest version, check it, and put it in
 /// place of this one. The window, when it is installed, is replaced with it.
 fn update_now() {
@@ -787,5 +875,48 @@ mod tests {
         ];
         assert_eq!(said_last(&session[2..]), "");
         assert_eq!(said_last(&session), "The notes say hello.");
+    }
+
+    /// Waits up to a second for `kept` to reach `times`.
+    fn kept_by_then(kept: &std::sync::atomic::AtomicUsize, times: usize) -> usize {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while kept.load(Ordering::SeqCst) < times && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        kept.load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn the_first_turn_keeps_the_version_before_the_timer_does() {
+        static KEPT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let keep = Keep::new(|| {
+            KEPT.fetch_add(1, Ordering::SeqCst);
+        });
+        keep.after(std::time::Duration::from_millis(50));
+        keep.now();
+        assert_eq!(KEPT.load(Ordering::SeqCst), 1);
+        keep.now();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(
+            KEPT.load(Ordering::SeqCst),
+            1,
+            "kept again by a later turn or the timer"
+        );
+    }
+
+    #[test]
+    fn the_timer_keeps_the_version_when_no_turn_has_finished() {
+        static KEPT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let keep = Keep::new(|| {
+            KEPT.fetch_add(1, Ordering::SeqCst);
+        });
+        keep.after(std::time::Duration::from_millis(10));
+        assert_eq!(kept_by_then(&KEPT, 1), 1);
+        keep.now();
+        assert_eq!(
+            KEPT.load(Ordering::SeqCst),
+            1,
+            "kept again by the turn after it"
+        );
     }
 }

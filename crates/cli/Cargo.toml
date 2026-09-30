@@ -25,3 +25,8 @@ crossterm = { version = "0.29", default-features = false, features = [
     # so a pasted paragraph is one message and not one message per line.
     "bracketed-paste",
 ] }
+
+[dev-dependencies]
+# The SHA-256 of an update staged by hand, which the updater checks before it
+# installs one. Already in the build for core.
+ring = "0.17"
