@@ -23,6 +23,9 @@ regex = "1"
 # Discord's Gateway, for hearing server mentions as they happen. Blocking
 # like reqwest here, and on the same rustls.
 tungstenite = { version = "0.30", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
+# Runs workflow scripts: QuickJS, in C built by cc, which ring already
+# needs. It can be stopped from outside and held to a heap and a stack.
+rquickjs = { version = "0.14", optional = true }
 # Refusing a Cargo.toml or pyproject.toml a write would break; toml 1 is
 # already in the lock file, and only its parser is needed.
 toml = { version = "1", default-features = false, features = ["std", "parse", "serde"] }
@@ -65,4 +68,4 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 default = ["workflows"]
 # Orchestration scripts that run many agents at once. On by default, so CI
 # builds, lints and tests it; a build without it leaves the runtime out.
-workflows = []
+workflows = ["dep:rquickjs"]
