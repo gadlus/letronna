@@ -102,6 +102,7 @@ pub fn run() -> i32 {
         images: Vec::new(),
         notices: letronna_core::notify::Notices::new(Box::new(crate::notify::Silent)),
         ended: None,
+        voice: None,
     };
     let open: Open = Box::new(move |cwd| open_session(&mut runner, cwd));
     let stdin = std::io::stdin();

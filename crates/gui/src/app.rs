@@ -264,6 +264,11 @@ pub(crate) struct Chat {
         letronna_core::messaging::Source,
         letronna_core::messaging::Incoming,
     >,
+    /// Sessions whose turn in flight answers a voice note.
+    pub(crate) speak_back: std::collections::HashSet<u64>,
+    /// What reads replies aloud, there only while the Voice setting is on, so
+    /// the sound device is held open only then.
+    pub(crate) voice: Option<letronna_core::speech::Voice>,
     pub(crate) messaging_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// The Slack listener's own off switch and the settings it runs with:
     /// reopening its socket costs a call Slack limits, so a save that leaves
@@ -726,6 +731,8 @@ impl Chat {
             messaging_stop: None,
             slack_listener: None,
             voice_waiting: std::collections::HashMap::new(),
+            speak_back: std::collections::HashSet::new(),
+            voice: None,
             token_input,
             webhook_input,
             discord_token_input,
@@ -1252,6 +1259,15 @@ impl Chat {
         };
         self.store.settings.endpoint = connection.endpoint.clone();
         self.store.pin(self.store.active);
+        // What is still being said of the last answer is not wanted now, but
+        // only the user asking again says so: a chat's or a schedule's turn
+        // is not read aloud, and would cut off the answer they are hearing.
+        self.match_voice();
+        let session = self.store.conversations[self.store.active].id;
+        let own = !self.remote.contains_key(&session) && !self.scheduled.contains(&session);
+        if let (Some(voice), true) = (&mut self.voice, own) {
+            voice.hush();
+        }
         let conversation = &mut self.store.conversations[self.store.active];
         // Name an untitled session after its first prompt, but leave a name
         // that was set deliberately, such as a scheduled job's.
@@ -1734,6 +1750,18 @@ impl Chat {
             return;
         };
         turn.absorb(&event);
+        // Read aloud only for whoever is at the window: a chat's or a
+        // schedule's run is answered where it came from.
+        let aloud = self
+            .streaming_id
+            .is_some_and(|id| !self.remote.contains_key(&id) && !self.scheduled.contains(&id));
+        if let (Some(voice), true) = (&mut self.voice, aloud) {
+            match &event {
+                Event::Delta(text) => voice.hear(text),
+                Event::Finished(_) => voice.end(),
+                _ => {}
+            }
+        }
         match event {
             Event::Finished(Err(error)) => {
                 self.error = Some(error.to_string());
@@ -2456,6 +2484,13 @@ impl Chat {
             Source::Slack { .. } => self.messaging.slack.allow_tools,
         };
         self.remote.insert(id, source.clone());
+        // The message itself says it was a voice note: a flag kept per chat
+        // would outlive a message held for its transcript or turned away
+        // while busy, and give a later typed one a paid spoken answer.
+        self.speak_back.remove(&id);
+        if message.spoken {
+            self.speak_back.insert(id);
+        }
         // Nobody on the far end can answer an approval card, so unless the
         // user has said otherwise a remote message may look but not touch.
         // With tools it gets the Default mode setting, but never above
@@ -2540,14 +2575,28 @@ impl Chat {
             .index_of(id)
             .map(|ix| letronna_core::messaging::files::made(&self.store.conversations[ix].messages))
             .unwrap_or_default();
-        if made.is_empty() {
+        // Files cannot go to Slack, so a voice note is only for the others.
+        let voiced = self.speak_back.remove(&id)
+            && self.store.settings.voice
+            && self.error.is_none()
+            && !matches!(source, letronna_core::messaging::Source::Slack { .. });
+        if made.is_empty() && !voiced {
             return self.tell_remote(&source, &reply, cx);
         }
         // One task, so the pictures and sound the turn made follow the reply.
         let config = self.messaging.clone();
         cx.background_executor()
             .spawn(async move {
+                let mut made = made;
+                let note = voiced.then(|| letronna_core::speech::voice_note(&reply));
+                if let Some(Ok(note)) = &note {
+                    made.push(note.clone());
+                }
                 letronna_core::messaging::files::answer(&config, &source, &reply, &made);
+                if let Some(Err(why)) = note {
+                    let line = format!("Not read aloud: {why}");
+                    let _ = letronna_core::messaging::tell(&config, &source, &line, None);
+                }
             })
             .detach();
     }
@@ -3096,6 +3145,9 @@ impl Chat {
         std::mem::take(&mut self.turn_stop).set();
         self.reading = None;
         self.remote_waiting = None;
+        if let Some(voice) = &mut self.voice {
+            voice.hush();
+        }
         if let Some(id) = self.streaming_id {
             if let Some(source) = self.remote.remove(&id) {
                 self.tell_remote(&source, "Stopped.", cx);
@@ -3205,7 +3257,22 @@ impl Chat {
         if !stopped && self.error.is_none() {
             self.wake_idle(cx);
         }
+        if self.error.is_none()
+            && let Some(why) = self.voice.as_ref().and_then(|v| v.trouble())
+        {
+            self.error = Some(format!("Not read aloud: {why}"));
+        }
         cx.notify();
+    }
+
+    /// Open or close what reads replies aloud to match the Voice setting.
+    pub(crate) fn match_voice(&mut self) {
+        let wanted = self.store.settings.voice;
+        if wanted == self.voice.is_some() {
+            return;
+        }
+        self.voice =
+            wanted.then(|| letronna_core::speech::Voice::start(crate::platform::audio::speaker()));
     }
 
     /// Start a turn for notices that came while nothing ran: in the session

@@ -281,6 +281,10 @@ pub struct Settings {
     /// switch for it.
     #[serde(default)]
     pub computer_use: bool,
+    /// Read replies aloud as they stream and answer a chat app's voice note
+    /// with one, off by default because the speech is paid from credit.
+    #[serde(default)]
+    pub voice: bool,
 }
 
 // Written out rather than derived so the film grain and notifications start
@@ -312,6 +316,7 @@ impl Default for Settings {
             appearance: String::new(),
             grain: true,
             notifications: true,
+            voice: false,
         }
     }
 }

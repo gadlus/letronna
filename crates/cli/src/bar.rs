@@ -99,6 +99,10 @@ pub const COMMANDS: &[Command<'static>] = &[
         blurb: "say when a reply ends or needs you while you are away, or stop",
     },
     Command {
+        name: "/voice",
+        blurb: "read replies aloud as they stream, paid from your credit",
+    },
+    Command {
         name: "/jobs",
         blurb: "commands still running in the background",
     },

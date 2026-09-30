@@ -4,7 +4,12 @@
 //! opened for each and closed with it, so an idle window holds none open.
 //! Everything here runs on the UI thread, which is where the chat asks from;
 //! the device handle is not safe to send anywhere else on every platform.
+//!
+//! Spoken replies are the exception: `speaker` opens a device of its own on
+//! the thread that plays them, and it stays open while voice mode is on so
+//! sentences follow each other without a device opened for each.
 
+use letronna_core::speech::{Audio, Open, Output};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
@@ -54,4 +59,43 @@ pub(crate) fn playing(path: &Path) -> bool {
         }
         now.as_ref().is_some_and(|p| p.path == path)
     })
+}
+
+/// The sound device spoken replies play on, opened when voice mode starts.
+pub(crate) fn speaker() -> Open {
+    Box::new(|| {
+        let mut device = rodio::DeviceSinkBuilder::open_default_sink()
+            .map_err(|_| "There is no sound output to read replies aloud on.".to_owned())?;
+        device.log_on_drop(false);
+        let player = rodio::Player::connect_new(device.mixer());
+        Ok(Box::new(Speaker {
+            player,
+            _device: device,
+        }) as Box<dyn Output>)
+    })
+}
+
+struct Speaker {
+    player: rodio::Player,
+    // Sound stops when the device goes, so it lives as long as the player.
+    _device: rodio::MixerDeviceSink,
+}
+
+impl Output for Speaker {
+    fn play(&mut self, audio: &Audio, stopped: &dyn Fn() -> bool) -> Result<(), String> {
+        let sound = rodio::Decoder::try_from(std::io::Cursor::new(audio.bytes.clone()))
+            .map_err(|_| "The speech came in a form Letronna cannot play.".to_owned())?;
+        self.player.append(sound);
+        while !self.player.empty() {
+            if stopped() {
+                // Clearing pauses the player too, and the next sentence
+                // must not be left waiting on it.
+                self.player.clear();
+                self.player.play();
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        Ok(())
+    }
 }

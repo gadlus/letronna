@@ -136,8 +136,10 @@ fn main() {
         notices: letronna_core::notify::Notices::new(Box::new(notify::Terminal::here())),
         ended: None,
         images: Vec::new(),
+        voice: None,
     };
     letronna_core::diag::mark("listed");
+    runner.match_voice();
     letronna_core::browser::share_browser(runner.store.settings.browser_shared);
     std::thread::spawn(letronna_core::browser::close_left_over);
     // With nothing set up there is nothing to talk to, so the first run is

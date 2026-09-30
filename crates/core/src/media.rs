@@ -27,6 +27,9 @@ pub(crate) const SAVED: &str = "Saved to ";
 /// An image or a long reading can take minutes, and the API holds the reply
 /// open until it is done.
 const MAKE_TIME: Duration = Duration::from_secs(300);
+/// A spoken sentence is short; one that takes longer than this would be
+/// heard too late to follow the reply.
+const SPEECH_TIME: Duration = Duration::from_secs(60);
 /// A video renders for a few minutes; it is looked at this often while it does.
 const VIDEO_POLL: Duration = Duration::from_secs(5);
 /// Past this the tool stops waiting and says how to pick the video up later,
@@ -136,25 +139,10 @@ impl Tool for Speak {
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         let text = required(args, "text")?;
-        let token = token()?;
         let mut body = json!({"input": text});
         pass(args, &mut body, &["voice"], "speech");
-        let reply = send(
-            client(MAKE_TIME)?
-                .post(endpoint("/audio/speech"))
-                .bearer_auth(&token)
-                .json(&body),
-        )?;
-        let kind = reply
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
-            .to_owned();
-        let bytes = reply
-            .bytes()
-            .map_err(|_| "The audio was cut off on its way here.".to_owned())?;
-        let path = save(ctx, text, audio_extension(&kind), &bytes)?;
+        let (bytes, extension) = read_aloud(&body, MAKE_TIME)?;
+        let path = save(ctx, text, extension, &bytes)?;
         Ok(format!(
             "{SAVED}{}\n{} characters read aloud, {}.",
             path.display(),
@@ -162,6 +150,34 @@ impl Tool for Speak {
             size(bytes.len())
         ))
     }
+}
+
+/// Read `text` aloud as `format` (wav, opus, mp3) with the picked speech model, for spoken replies.
+pub fn speech(text: &str, format: &str) -> Result<(Vec<u8>, &'static str), String> {
+    let mut body = json!({"input": text, "response_format": format});
+    pass(&Value::Null, &mut body, &[], "speech");
+    read_aloud(&body, SPEECH_TIME)
+}
+
+/// Send a speech request, and hand back the audio and its file type.
+fn read_aloud(body: &Value, timeout: Duration) -> Result<(Vec<u8>, &'static str), String> {
+    let token = token()?;
+    let reply = send(
+        client(timeout)?
+            .post(endpoint("/audio/speech"))
+            .bearer_auth(&token)
+            .json(body),
+    )?;
+    let kind = reply
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let bytes = reply
+        .bytes()
+        .map_err(|_| "The audio was cut off on its way here.".to_owned())?;
+    Ok((bytes.to_vec(), audio_extension(&kind)))
 }
 
 pub struct Transcribe;

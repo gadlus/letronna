@@ -160,6 +160,9 @@ pub fn footer(runner: &Runner) -> String {
     if settings.search {
         parts.push("web".into());
     }
+    if settings.voice {
+        parts.push("voice".into());
+    }
     parts.join("  ·  ")
 }
 

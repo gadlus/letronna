@@ -137,6 +137,7 @@ pub(super) fn telegram_media(body: &Value) -> Vec<Incoming> {
                 false => None,
             },
             needs_session: false,
+            spoken: false,
             press: None,
             remote: crate::chat::Remote {
                 place: match group {
@@ -450,6 +451,7 @@ fn hear_with(
             }
         };
         note(&mut message.text, &line);
+        message.spoken = true;
     }
     message
 }
@@ -637,7 +639,8 @@ fn multipart(boundary: &str) -> String {
 }
 
 /// The Bot API method and field a file goes by: a picture Telegram can show
-/// as a photo, audio it plays as a track, and anything else as a document.
+/// as a photo, audio it plays as a track or a voice note, and anything else
+/// as a document.
 fn telegram_method(path: &Path, size: u64) -> (&'static str, &'static str) {
     let extension = path
         .extension()
@@ -646,6 +649,9 @@ fn telegram_method(path: &Path, size: u64) -> (&'static str, &'static str) {
     match extension.as_str() {
         "png" | "jpg" | "jpeg" | "webp" if size <= TELEGRAM_PHOTO_BYTES => ("sendPhoto", "photo"),
         "mp3" | "m4a" => ("sendAudio", "audio"),
+        // A spoken reply comes as Opus in Ogg, which Telegram shows as a
+        // voice note to play in place rather than a track.
+        "ogg" | "oga" | "opus" => ("sendVoice", "voice"),
         _ => ("sendDocument", "document"),
     }
 }
@@ -856,6 +862,7 @@ mod tests {
             files,
             author: None,
             needs_session: false,
+            spoken: false,
             press: None,
             remote: Default::default(),
         }
@@ -1150,6 +1157,10 @@ mod tests {
             super::telegram_method(Path::new("a.PNG"), 1),
             ("sendPhoto", "photo")
         );
+        assert_eq!(
+            super::telegram_method(Path::new("reply.ogg"), 1),
+            ("sendVoice", "voice")
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1338,5 +1349,16 @@ mod tests {
                 .text
                 .ends_with("it could not be transcribed: Sign in first.)")
         );
+    }
+
+    #[test]
+    fn only_a_message_that_brought_a_voice_note_is_marked_spoken() {
+        let mut voice = file(Kind::Voice, Origin::Telegram("v".into()), "note.ogg", 4);
+        voice.saved = Some(PathBuf::from("/m/note.ogg"));
+        let heard = super::hear_with(incoming("", vec![voice]), true, |_| Ok("hi".into()));
+        assert!(heard.spoken);
+        let declined = super::hear_with(incoming("", vec![]), false, |_| Ok("hi".into()));
+        assert!(!declined.spoken);
+        assert!(!incoming("typed", vec![]).spoken);
     }
 }

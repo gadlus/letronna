@@ -290,6 +290,7 @@ fn turn(prompt: &str, yes: bool) -> Result<String, String> {
         images: Vec::new(),
         notices: letronna_core::notify::Notices::new(Box::new(crate::notify::Silent)),
         ended: None,
+        voice: None,
     };
     let session = runner.start(std::env::current_dir().ok());
     let connection = runner.connection(session);
