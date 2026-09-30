@@ -68,6 +68,10 @@ pub(crate) fn toggle(cx: &mut App) {
     ) else {
         return;
     };
+    // gpui on Windows opens a window without the keys, whatever `focus`
+    // says, so typing would go on in the app behind the bar. The shortcut's
+    // press lets this process take the front, and the bar asks for it.
+    let _ = handle.update(cx, |_, window, _| window.activate_window());
     cx.set_global(Open(handle));
 }
 
