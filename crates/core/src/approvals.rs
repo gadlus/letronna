@@ -36,6 +36,12 @@ pub enum Decision {
     ForRun,
     /// Do not run it, for the reason the user typed, empty when they gave none.
     Deny(String),
+    /// Run this call with these arguments in place of the model's, as the
+    /// program driving the run changed them.
+    Changed(String),
+    /// Do not run it, for the reason the program driving the run gave, empty
+    /// when it gave none.
+    Declined(String),
 }
 
 /// A call waiting for a yes, as the frontend that serves receives it.
@@ -117,14 +123,15 @@ pub(crate) fn granted(run: u64, name: &str) -> bool {
 }
 
 /// Whether `call` may run, waiting for the frontend's answer unless the
-/// agent is stopped first; a no carries the user's reason, empty without one.
+/// agent is stopped first: a yes may carry changed arguments to run instead,
+/// and a no the reason given, after who gave it, empty without one.
 pub(crate) fn ask(
     root: u64,
     run: u64,
     label: &str,
     call: &ToolCall,
     ctx: &ToolContext,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     let (reply, answer) = mpsc::channel();
     let stop = reply.clone();
     // Set up before taking the lock, since a stopped token runs it at once.
@@ -147,7 +154,7 @@ pub(crate) fn ask(
             return Err(String::new());
         }
         if clears && asks.granted.contains(&key) {
-            return Ok(());
+            return Ok(None);
         }
         if asks.asking.insert(key.clone()) {
             break;
@@ -173,14 +180,28 @@ pub(crate) fn ask(
         return Err(String::new());
     }
     match answer.recv() {
-        Ok(Decision::Once) => Ok(()),
+        Ok(Decision::Once) => Ok(None),
+        Ok(Decision::Changed(arguments)) => Ok(Some(arguments)),
         Ok(Decision::ForRun) => {
             lock(&ASKS).granted.insert(key);
-            Ok(())
+            Ok(None)
         }
-        Ok(Decision::Deny(reason)) => Err(reason),
+        Ok(Decision::Deny(reason)) => Err(why("The user said why", &reason)),
+        // Not the user's words, so the agent is not told they are.
+        Ok(Decision::Declined(reason)) => {
+            Err(why("The program driving this run said why", &reason))
+        }
         Err(_) => Err(String::new()),
     }
+}
+
+/// `reason` as the agent is told it, after who gave it, or nothing without one.
+fn why(who: &str, reason: &str) -> String {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return String::new();
+    }
+    format!("{who}: {reason}")
 }
 
 #[cfg(test)]
@@ -495,7 +516,7 @@ pub(crate) mod tests {
         request.answer(Decision::Deny("not on the main branch".into()));
         assert_eq!(
             said.recv_timeout(WAIT),
-            Ok(Err("not on the main branch".to_owned()))
+            Ok(Err("The user said why: not on the main branch".to_owned()))
         );
     }
 
@@ -521,5 +542,33 @@ pub(crate) mod tests {
         assert_eq!(request.call.id, "c");
         request.answer(Decision::Deny(String::new()));
         assert_eq!(far.recv_timeout(WAIT), Ok(false));
+    }
+
+    #[test]
+    fn a_program_can_change_the_call_or_say_why_not_as_itself() {
+        let _turn = lock(&SERVING);
+        let requests = serve();
+        let declined = "The program driving this run said why: not now";
+        let answers = [
+            (
+                1950,
+                Decision::Changed("{}".into()),
+                Ok(Some("{}".to_owned())),
+            ),
+            (
+                1951,
+                Decision::Declined(" not now ".into()),
+                Err(declined.to_owned()),
+            ),
+        ];
+        for (run, decision, expected) in answers {
+            let (tx, said) = mpsc::channel();
+            std::thread::spawn(move || {
+                let call = call("a", "run_command");
+                let _ = tx.send(ask(7, run, "helper", &call, &ToolContext::default()));
+            });
+            requests.recv_timeout(WAIT).unwrap().answer(decision);
+            assert_eq!(said.recv_timeout(WAIT), Ok(expected));
+        }
     }
 }
