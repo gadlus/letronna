@@ -535,7 +535,11 @@ impl Chat {
             return;
         }
         let (chat, mode) = (cx.entity(), self.active_mode());
+        // Closed, the menu hands the keys back to the composer, where /mode
+        // was typed; otherwise they would go nowhere.
+        let back = self.composer.focus_handle(cx);
         let menu = PopupMenu::build(window, cx, move |menu, _, _| {
+            let menu = menu.action_context(back);
             Mode::OFFERED.into_iter().fold(menu, |menu, choice| {
                 let chat = chat.clone();
                 menu.item(
