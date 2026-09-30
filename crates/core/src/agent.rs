@@ -15,7 +15,8 @@
 use crate::chat::{Connection, Event, Message, Replay, ToolCall};
 use crate::gate::Outcome;
 use crate::tools;
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{DefaultHasher, Hash, Hasher};
 
 /// Tool rounds per user message. Enough for a real investigation, small
 /// enough that a looping model stops on its own.
@@ -68,6 +69,18 @@ pub const STOPPED_WHILE_RUNNING: &str = "Stopped while it ran; check before retr
 
 /// The answer a call gets when the turn is stopped before it starts.
 pub const STOPPED_BEFORE_START: &str = "Not run: stopped before it started.";
+
+/// Times the same call gets the same result before the model is told to
+/// change approach: twice can be a check that something held.
+const REPEATS_NOTED: usize = 3;
+
+/// Times the same call gets the same result before an unattended turn ends,
+/// since nobody is there to notice it going round in circles.
+const REPEATS_STOPPED: usize = 5;
+
+/// Tools made to be called again for news, where the same answer means only
+/// that nothing has happened yet.
+const POLLING: [&str; 4] = ["wait", "read_job", crate::messaging::READ_CHAT, "agents"];
 
 /// Calls from one reply run at once. Enough for a model reading around a
 /// project in one go, few enough that a reply of dozens never starts dozens
@@ -153,12 +166,23 @@ pub struct Turn {
     edited: bool,
     /// Unchecked edits were sent back this turn.
     asked_to_verify: bool,
+    /// How often each call, by tool, arguments and result, has come back
+    /// the same this turn.
+    repeats: HashMap<(String, u64, u64), usize>,
+    /// Each change made this turn, by tool and arguments, so only a new one
+    /// starts the counts again.
+    changes: HashSet<(String, u64)>,
+    /// Nobody is watching, so a call repeated without end stops the turn.
+    unattended: bool,
+    /// Why an unattended turn stopped going round in circles.
+    looped: Option<String>,
 }
 
 impl Turn {
     pub fn new(connection: Connection) -> Self {
         Self {
             files: crate::history::Log::new(connection.conversation),
+            unattended: connection.unattended,
             connection,
             live: Live::default(),
             rounds: 0,
@@ -173,7 +197,25 @@ impl Turn {
             verify: false,
             edited: false,
             asked_to_verify: false,
+            repeats: HashMap::new(),
+            changes: HashSet::new(),
+            looped: None,
         }
+    }
+
+    /// The same turn, ended by a call it keeps repeating whatever its
+    /// connection says, for a run nobody watches.
+    pub fn unattended(self) -> Self {
+        Self {
+            unattended: true,
+            ..self
+        }
+    }
+
+    /// Why an unattended turn must end: it made the same call with the same
+    /// result `REPEATS_STOPPED` times.
+    pub fn looping(&self) -> Option<&str> {
+        self.looped.as_deref()
     }
 
     /// This turn, sending back once an answer that follows file edits with
@@ -423,7 +465,7 @@ impl Turn {
         let Some(call) = self.queue.pop_front() else {
             return;
         };
-        let (content, is_error) = match outcome {
+        let (mut content, is_error) = match outcome {
             Ok(out) => (out, false),
             Err(error) => (error, true),
         };
@@ -433,6 +475,20 @@ impl Turn {
             self.edited = false;
         } else if !is_error && EDITS.contains(&call.name.as_str()) {
             self.edited = true;
+        }
+        let times = self.repeated(&call, &content, is_error);
+        if times >= REPEATS_NOTED {
+            content.push_str(&format!(
+                "\n\n[You have made this exact call {times} times this turn and got the same \
+                 result each time. Change your approach instead of repeating it.]"
+            ));
+        }
+        if times >= REPEATS_STOPPED && self.unattended && self.looped.is_none() {
+            self.looped = Some(format!(
+                "Stopped going round in circles: it called `{}` {times} times with the same \
+                 arguments and got the same result each time.",
+                call.name
+            ));
         }
         self.results.push(Message {
             role: "tool".into(),
@@ -444,6 +500,34 @@ impl Turn {
             files: self.files.take(),
             ..Default::default()
         });
+    }
+
+    /// How many times this turn the call has now come back with this result;
+    /// 0 for a tool made to be polled.
+    fn repeated(&mut self, call: &ToolCall, content: &str, is_error: bool) -> usize {
+        if POLLING.contains(&call.name.as_str()) {
+            return 0;
+        }
+        // Parsed first, so spacing or key order does not make a call new.
+        let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments)
+            .map(|args| sorted(args).to_string())
+            .unwrap_or_else(|_| call.arguments.clone());
+        let key = (
+            call.name.clone(),
+            hash(&arguments),
+            hash(&(content, is_error)),
+        );
+        // A change not made before this turn is progress, so the same answer
+        // to a call made before it, such as a `git add` saying nothing, is no
+        // sign of a loop.
+        if tools::find(&call.name).is_some_and(|tool| tool.mutates())
+            && self.changes.insert((key.0.clone(), key.1))
+        {
+            self.repeats.clear();
+        }
+        let times = self.repeats.entry(key).or_default();
+        *times += 1;
+        *times
     }
 
     /// Record the outcome of the call with this id, wherever it sits in the queue.
@@ -509,6 +593,32 @@ impl Turn {
         }
         kept.append(&mut self.results);
         kept
+    }
+}
+
+/// A digest of `value`, for counting repeats without keeping whole results.
+fn hash(value: &impl Hash) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// `value` with every object's keys in order, so it is written out the same
+/// whatever order they came in.
+fn sorted(value: serde_json::Value) -> serde_json::Value {
+    // Done by hand: with serde_json's `preserve_order`, which the window's
+    // dependencies turn on, an object keeps the order it was read in.
+    match value {
+        serde_json::Value::Object(object) => {
+            let mut fields: Vec<_> = object.into_iter().collect();
+            fields.sort_by(|a, b| a.0.cmp(&b.0));
+            fields
+                .into_iter()
+                .map(|(key, value)| (key, sorted(value)))
+                .collect()
+        }
+        serde_json::Value::Array(items) => items.into_iter().map(sorted).collect(),
+        other => other,
     }
 }
 
@@ -1259,5 +1369,117 @@ mod tests {
         let mut turn = verifying_after(&["edit_file"]).verifying(false);
         let mut done = answer(&mut turn, "Done.");
         assert!(matches!(turn.continuation(&mut done), Ok(None)));
+    }
+
+    #[test]
+    fn a_changed_argument_or_result_starts_the_count_again() {
+        let mut turn = turn();
+        let mut other = call("read_file");
+        other.arguments = r#"{"path": "b.rs"}"#.into();
+        repeat(&mut turn, &call("read_file"), "same", 2);
+        assert_eq!(repeat(&mut turn, &other, "same", 2), ["same", "same"]);
+        assert_eq!(
+            repeat(&mut turn, &call("read_file"), "changed", 1),
+            ["changed"]
+        );
+        // Only spacing differs, so it is the same call and its third time.
+        other.arguments = r#"{ "path":"b.rs" }"#.into();
+        assert!(repeat(&mut turn, &other, "same", 1)[0].contains("3 times"));
+    }
+
+    #[test]
+    fn a_new_change_between_repeats_starts_the_count_again() {
+        let mut turn = turn().unattended();
+        let mut stage = call("run_command");
+        stage.arguments = r#"{"command": "git add -A"}"#.into();
+        let mut edit = call("edit_file");
+        for step in 0..6 {
+            edit.arguments = format!(r#"{{"path": "a.rs", "old": "{step}", "new": "x"}}"#);
+            repeat(&mut turn, &edit, "Edited a.rs.", 1);
+            // `git add` says nothing when it works, so it answers the same every time.
+            assert_eq!(repeat(&mut turn, &stage, "", 1), [""]);
+        }
+        assert_eq!(turn.looping(), None);
+        // Making the same change again is no news, so it is still counted.
+        for _ in 0..4 {
+            repeat(&mut turn, &edit, "Edited a.rs.", 1);
+            repeat(&mut turn, &stage, "", 1);
+        }
+        assert!(turn.looping().is_some());
+    }
+
+    #[test]
+    fn an_unattended_turn_stops_at_the_fifth_repeat() {
+        let mut turn = turn().unattended();
+        repeat(&mut turn, &call("read_file"), "same", 4);
+        assert_eq!(turn.looping(), None);
+        repeat(&mut turn, &call("read_file"), "same", 1);
+        assert_eq!(
+            turn.looping(),
+            Some(
+                "Stopped going round in circles: it called `read_file` 5 times with the same \
+                 arguments and got the same result each time."
+            )
+        );
+        // A schedule's connection says so itself.
+        let mut connection = self::turn().connection;
+        connection.unattended = true;
+        let mut scheduled = Turn::new(connection);
+        repeat(&mut scheduled, &call("read_file"), "same", 5);
+        assert!(scheduled.looping().is_some());
+    }
+
+    #[test]
+    fn arguments_in_another_key_order_are_the_same_call() {
+        let mut turn = turn();
+        let mut read = call("read_file");
+        read.arguments = r#"{"path": "a.rs", "range": {"from": 1, "to": 9}}"#.into();
+        repeat(&mut turn, &read, "same", 2);
+        read.arguments = r#"{"range": {"to": 9, "from": 1}, "path": "a.rs"}"#.into();
+        assert!(repeat(&mut turn, &read, "same", 1)[0].contains("3 times"));
+    }
+
+    #[test]
+    fn polling_tools_are_never_counted_as_repeats() {
+        for polled in POLLING {
+            assert!(tools::find(polled).is_some(), "{polled} is not a tool");
+            let mut turn = turn().unattended();
+            let sent = repeat(&mut turn, &call(polled), "still running", 8);
+            assert!(sent.iter().all(|s| s == "still running"), "{polled}");
+            assert_eq!(turn.looping(), None, "{polled}");
+        }
+    }
+
+    /// Makes `call` in a round of its own, `times` times, each coming back
+    /// `result`, and gives what the model was sent back each time.
+    fn repeat(turn: &mut Turn, call: &ToolCall, result: &str, times: usize) -> Vec<String> {
+        (0..times)
+            .map(|_| {
+                turn.begin(vec![call.clone()]);
+                turn.finish_call(Ok(result.into()));
+                turn.take_results().remove(0).content
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_third_identical_result_tells_the_model_to_change_approach() {
+        let mut turn = turn();
+        let sent = repeat(&mut turn, &call("read_file"), "same", 4);
+        assert_eq!(sent[..2], ["same", "same"]);
+        assert_eq!(
+            sent[2],
+            "same\n\n[You have made this exact call 3 times this turn and got the same \
+             result each time. Change your approach instead of repeating it.]"
+        );
+        assert!(sent[3].contains("made this exact call 4 times"));
+        // Someone is watching, so it is told but never stopped.
+        repeat(&mut turn, &call("read_file"), "same", 4);
+        assert_eq!(turn.looping(), None);
+        // The counts are the turn's own: the next starts from nothing.
+        assert_eq!(
+            repeat(&mut self::turn(), &call("read_file"), "same", 1),
+            ["same"]
+        );
     }
 }
