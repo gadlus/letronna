@@ -103,6 +103,10 @@ pub const COMMANDS: &[Command<'static>] = &[
         blurb: "read replies aloud as they stream, paid from your credit",
     },
     Command {
+        name: "/verify",
+        blurb: "ask the model to build or test after it changes files, or not",
+    },
+    Command {
         name: "/jobs",
         blurb: "commands still running in the background",
     },

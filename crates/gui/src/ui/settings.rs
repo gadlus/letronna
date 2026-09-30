@@ -1319,6 +1319,16 @@ fn thinking_page(chat: &Entity<Chat>, store: &Store, window: &mut Window, cx: &m
             this.match_voice();
         }),
     );
+    let verifying = settings.verify_edits;
+    let verify = toggle_row(
+        "verify-edits",
+        "Check changes before finishing",
+        "After changing files, ask the model once to build or test before it says the work is done.",
+        verifying,
+        chat,
+        cx,
+        std::rc::Rc::new(move |this: &mut Chat| this.store.settings.verify_edits = !verifying),
+    );
 
     v_flex()
         .gap_4()
@@ -1332,6 +1342,7 @@ fn thinking_page(chat: &Entity<Chat>, store: &Store, window: &mut Window, cx: &m
         .child(show)
         .child(search)
         .child(voice)
+        .child(verify)
 }
 
 /// A switch with a name and a line about what it does.

@@ -4,7 +4,7 @@
 //! that differ in a terminal: waiting on a blocking channel rather than a
 //! frame, and asking the user by reading a line rather than drawing a card.
 
-use letronna_core::agent::{Next, Turn};
+use letronna_core::agent::{Next, Nudge, Turn};
 use letronna_core::agents;
 use letronna_core::approvals::{self, Decision, Request};
 use letronna_core::cancel::Cancel;
@@ -187,7 +187,7 @@ impl Runner {
         // What the session's kept helpers wake on from now on.
         agents::connected(&connection);
         hooks::new_turn(connection.conversation);
-        let mut turn = Turn::new(connection);
+        let mut turn = Turn::new(connection).verifying(self.store.settings.verifies_edits());
         self.stopped = false;
         // What is still being said of the last answer is not wanted now.
         if let Some(voice) = &mut self.voice {
@@ -266,7 +266,7 @@ impl Runner {
             // what was typed goes in after it, and the model is asked again.
             let hurried = self.bar.hurried();
             let empty = reply.content.is_empty();
-            let continuation = turn.continuation(&mut reply);
+            let continuation = continuation(turn, &mut reply, hurried);
             if empty && !reply.content.is_empty() {
                 // Taken from its thinking, which was never shown as the answer.
                 render::blank();
@@ -1046,6 +1046,25 @@ enum Unheard {
 
 /// What comes over `receiver`, asking `stopped` before each look at it; a
 /// look blocks up to `patience`.
+/// The notice sending the model back after `reply`, if it needs one, and
+/// never for a reply `hurried` cut short: what was typed goes in next, and
+/// a notice would be answered by a reply that the same hurry cuts short at
+/// once, empty, until the turn ends saying the model returned no text.
+fn continuation(
+    turn: &mut Turn,
+    reply: &mut Message,
+    hurried: bool,
+) -> Result<Option<Nudge>, String> {
+    if !hurried {
+        return turn.continuation(reply);
+    }
+    // Some routes turn down an assistant message with no content.
+    if reply.content.trim().is_empty() {
+        reply.content.clear();
+    }
+    Ok(None)
+}
+
 fn wait_on<T>(
     receiver: &mpsc::Receiver<T>,
     patience: Duration,
@@ -1606,6 +1625,42 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         Ok(arguments.to_owned())
+    }
+
+    #[test]
+    fn a_reply_cut_short_to_send_what_was_typed_is_never_sent_back() {
+        let edited = || {
+            let mut turn = Turn::new(Connection {
+                tools: true,
+                workspace: Some("project".into()),
+                ..Default::default()
+            })
+            .verifying(true);
+            turn.begin(vec![ToolCall {
+                id: "edit-1".into(),
+                name: "edit_file".into(),
+                arguments: "{}".into(),
+            }]);
+            turn.finish_call(Ok("edited".into()));
+            turn.take_results();
+            turn
+        };
+        let reply = |turn: &mut Turn, text: &str| {
+            turn.absorb(&Event::Delta(text.into()));
+            turn.take_reply("some-model")
+        };
+        let mut turn = edited();
+        let mut cut = reply(&mut turn, "Now I will run the tes");
+        assert!(matches!(continuation(&mut turn, &mut cut, true), Ok(None)));
+        let mut blank = reply(&mut turn, " ");
+        assert!(matches!(
+            continuation(&mut turn, &mut blank, true),
+            Ok(None)
+        ));
+        assert!(blank.content.is_empty());
+        // Nor did being cut short use up the check for the answer that comes.
+        let mut done = reply(&mut turn, "Fixed it.");
+        assert!(continuation(&mut turn, &mut done, false).unwrap().is_some());
     }
 
     #[test]
