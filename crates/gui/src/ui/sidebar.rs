@@ -41,6 +41,9 @@ impl Chat {
                     if page == Page::Skills {
                         this.reload_skills();
                     }
+                    if page == Page::Artifacts {
+                        this.read_artifacts(cx);
+                    }
                     this.focus_composer(window, cx);
                     cx.notify();
                 }))

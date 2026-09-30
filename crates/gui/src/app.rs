@@ -32,6 +32,17 @@ const FOLLOW_SLACK: Pixels = px(48.);
 /// rather than longer lines.
 pub(crate) const COLUMN: Pixels = px(816.);
 
+/// How far past the top and bottom of the chat turns are measured ahead:
+/// about a screen, so scrolling does not show a turn being sized, while a
+/// long session is still never laid out whole.
+const OVERDRAW: Pixels = px(800.);
+
+/// Sessions kept with their messages read in, the one on screen among them.
+/// Switching between a handful is instant; beyond that the least recently
+/// opened is let go and read again from disk, a few milliseconds, when it is
+/// next opened. Running, chat-app and scheduled sessions come on top.
+const OPEN_SESSIONS: usize = 8;
+
 pub(crate) enum Verdict {
     Allow {
         remember: bool,
@@ -340,17 +351,31 @@ pub(crate) struct Chat {
     pub(crate) hook_note: Option<String>,
     /// How many times this turn a Stop hook has sent the model back to work.
     pub(crate) stop_blocks: u32,
-    pub(crate) scroll: ScrollHandle,
+    /// The chat's turns, laid out only where they are on screen.
+    pub(crate) list: ListState,
+    /// The turns of the session on screen, as the list shows them.
+    pub(crate) turns: Vec<crate::ui::actions::Span>,
+    /// The session and the number of turns the list was last told of, so
+    /// that only what changed since is measured again.
+    pub(crate) listed: (u64, usize),
     /// Whether the chat keeps to its newest message as more arrives.
     pub(crate) following: bool,
     /// Where the chat was scrolled to at the last draw, to tell which way
     /// it has moved since.
     pub(crate) followed_offset: Pixels,
+    /// Sessions with their messages read in, the one opened last first.
+    pub(crate) open: std::collections::VecDeque<u64>,
+    /// What the Artifacts page lists, read from the sessions on disk each
+    /// time it opens; None while that is under way.
+    pub(crate) artifacts: Option<Vec<letronna_core::store::Artifact>>,
     /// The session and message a search hit opened, which the chat is held
     /// at until it is scrolled by hand or another session is shown.
     pub(crate) reveal: Option<(u64, usize)>,
     /// Where holding it last put the chat, to tell a scroll by hand from it.
-    pub(crate) revealed: Option<Pixels>,
+    pub(crate) revealed: Option<ListOffset>,
+    /// Where the message it opened was last drawn, and whether the chat has
+    /// yet to be moved for it since.
+    pub(crate) hit_at: Option<(Pixels, bool)>,
     /// The list of modes, while the mode chip has it open.
     pub(crate) mode_menu: Option<Entity<gpui_component::menu::PopupMenu>>,
     /// Whether a frame has been drawn, before which the window has no focus
@@ -362,8 +387,24 @@ pub(crate) struct Chat {
 impl Chat {
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         // Sessions are separate files now, so a damaged one costs that
-        // session rather than the history.
-        let (mut store, error) = (letronna_core::store::load(), None);
+        // session rather than the history. Only listed: each is read in
+        // when it is opened, so starting costs the same however much was
+        // said before.
+        let started = std::time::Instant::now();
+        let (mut store, error) = (letronna_core::store::load_listing(), None);
+        store.active = store
+            .conversations
+            .iter()
+            .position(|c| c.id == store.settings.active_id)
+            .unwrap_or(store.conversations.len().saturating_sub(1));
+        letronna_core::diag::event(
+            "listed",
+            &[
+                ("sessions", store.conversations.len().into()),
+                ("ms", letronna_core::diag::millis(started)),
+                ("rss", letronna_core::diag::rss_bytes().into()),
+            ],
+        );
         crate::theme::apply(&store.settings.appearance, window, cx);
         letronna_core::browser::share_browser(store.settings.browser_shared);
         std::thread::spawn(letronna_core::browser::close_left_over);
@@ -685,11 +726,16 @@ impl Chat {
             note: None,
             hook_note: None,
             stop_blocks: 0,
-            scroll: ScrollHandle::new(),
+            list: ListState::new(0, ListAlignment::Top, OVERDRAW),
+            turns: Vec::new(),
+            listed: (0, 0),
             following: true,
             followed_offset: px(0.),
+            open: std::collections::VecDeque::new(),
+            artifacts: None,
             reveal: None,
             revealed: None,
+            hit_at: None,
             mode_menu: None,
             drawn: false,
             _subscriptions: subscriptions,
@@ -794,6 +840,84 @@ impl Chat {
             );
             self.error =
                 Some("Could not save chat history. Your current chat remains in memory.".into());
+        }
+    }
+
+    /// Read in the session on screen, off the UI thread, the first time it
+    /// is shown since it was listed or let go of; and let go of the sessions
+    /// opened longest ago.
+    fn open_on_screen(&mut self, cx: &mut Context<Self>) {
+        let id = self.store.conversations[self.store.active].id;
+        if self.open.front() == Some(&id) {
+            return;
+        }
+        let known = self.open.iter().position(|&o| o == id);
+        if let Some(at) = known {
+            self.open.remove(at);
+        }
+        self.open.push_front(id);
+        self.let_go();
+        if known.is_some() || !self.store.conversations[self.store.active].unfilled() {
+            return;
+        }
+        let read = cx
+            .background_executor()
+            .spawn(async move { letronna_core::store::messages(id) });
+        cx.spawn(async move |this, cx| {
+            let Some(messages) = read.await else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                // Let go of again before the read came back: it stays out.
+                let Some(ix) = this.store.index_of(id).filter(|_| this.open.contains(&id)) else {
+                    return;
+                };
+                this.store.conversations[ix].filled_with(messages);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Read in session `ix` now, for what cannot wait for the read.
+    pub(crate) fn fill_now(&mut self, ix: usize) {
+        let conversation = &mut self.store.conversations[ix];
+        if !conversation.unfilled() {
+            return;
+        }
+        letronna_core::store::fill(conversation);
+        // First in line to be let go of again, unless it is opened.
+        let id = conversation.id;
+        if !self.open.contains(&id) {
+            self.open.push_back(id);
+        }
+    }
+
+    /// Let go of the messages of the sessions opened longest ago, beyond
+    /// `OPEN_SESSIONS`. Never the one on screen, nor one a reply, a chat app
+    /// or a schedule is writing to: added to while let go of, it would hold
+    /// only the new messages, and the next step would be sent those alone.
+    fn let_go(&mut self) {
+        let mut at = self.open.len();
+        // The front is the session on screen.
+        while self.open.len() > OPEN_SESSIONS && at > 1 {
+            at -= 1;
+            let id = self.open[at];
+            let busy = self.streaming_id == Some(id)
+                || self.scheduled.contains(&id)
+                || self.remote.contains_key(&id)
+                || self.remote_session.values().any(|&s| s == id);
+            if busy {
+                continue;
+            }
+            // Deleted since, it has nothing to let go of.
+            let gone = self
+                .store
+                .index_of(id)
+                .is_none_or(|ix| self.store.conversations[ix].unload());
+            if gone {
+                self.open.remove(at);
+            }
         }
     }
 
@@ -950,6 +1074,7 @@ impl Chat {
     /// shows under the conversation and never goes into it.
     fn ask_aside(&mut self, question: String, cx: &mut Context<Self>) {
         let ix = self.store.active;
+        self.fill_now(ix);
         let mut connection = match self.connection_for(ix, None) {
             Ok(connection) => connection,
             Err(error) => {
@@ -1003,6 +1128,9 @@ impl Chat {
         remote: Option<letronna_core::chat::Remote>,
         cx: &mut Context<Self>,
     ) -> std::result::Result<(), ()> {
+        // What is said goes after what was said before, and the model is
+        // sent all of it.
+        self.fill_now(self.store.active);
         let connection = match self.connection_for(self.store.active, remote) {
             Ok(connection) => connection,
             Err(error) => {
@@ -2384,8 +2512,8 @@ impl Chat {
     }
 
     /// How far above the bottom of the chat, in pixels.
-    fn distance_from_bottom(&self) -> Pixels {
-        self.scroll.max_offset().height + self.scroll.offset().y
+    pub(crate) fn distance_from_bottom(&self) -> Pixels {
+        self.list.max_offset_for_scrollbar().height + self.list.scroll_px_offset_for_scrollbar().y
     }
 
     /// Go to the newest message and stay with it as more arrives.
@@ -2393,7 +2521,222 @@ impl Chat {
         self.following = true;
         self.reveal = None;
         self.revealed = None;
-        self.scroll.scroll_to_bottom();
+        self.hit_at = None;
+        self.scroll_to_bottom();
+    }
+
+    /// Put the end of the last turn at the bottom of the chat.
+    fn scroll_to_bottom(&self) {
+        self.list.scroll_to(ListOffset {
+            item_ix: self.list.item_count(),
+            offset_in_item: px(0.),
+        });
+    }
+
+    /// Group the session on screen into turns, tell the list which of them
+    /// changed since the last draw, and keep to the bottom while following.
+    fn lay_out_turns(&mut self) {
+        let conversation = &self.store.conversations[self.store.active];
+        let streaming_here = self.busy && self.streaming_id == Some(conversation.id);
+        let turns = crate::ui::actions::turns(&conversation.messages, streaming_here);
+        // The turns that start where they did. What the window says changes
+        // at the end, but what another Letronna wrote there is taken in
+        // whole, and can differ from any turn on.
+        let kept = (self.turns.iter().zip(&turns))
+            .take_while(|(was, now)| (was.first, was.yours) == (now.first, now.yours))
+            .count();
+        self.turns = turns;
+        let (id, count) = (conversation.id, self.turns.len());
+        let (listed, before) = self.listed;
+        if listed != id {
+            // Another session opens at its latest message, however it was
+            // switched to, unless a search hit opened it. One more item
+            // follows the turns, for what waits under them.
+            self.list.reset(count + 1);
+            self.following = !self.holding_hit();
+        } else if before != count || kept < before {
+            // Only those from the first that changed are measured again. One
+            // that grows in place is on screen while it does, and what is
+            // on screen is measured again at every draw.
+            self.list.splice(kept..before, count - kept);
+        }
+        self.listed = (id, count);
+        self.keep_following();
+    }
+
+    /// Turn `n` of the session on screen, as the list draws it. The turn a
+    /// reply is coming in to also has the reply so far, the card it waits
+    /// on and what was queued behind it.
+    fn turn_row(
+        &self,
+        n: usize,
+        column: Pixels,
+        in_menu: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use crate::ui::actions::shows_bar;
+        let Some(&span) = self.turns.get(n) else {
+            return self.under_turns(column, window, cx);
+        };
+        let conversation = &self.store.conversations[self.store.active];
+        let messages = &conversation.messages;
+        let streaming_here = self.busy && self.streaming_id == Some(conversation.id);
+        // The turn a reply is still coming in to has no buttons or menu:
+        // it is not finished, and it owns the session until it is.
+        let live = streaming_here && n + 1 == self.turns.len();
+        let focus = self.turn_focus(span.first, window, cx);
+        let mut rows = Vec::new();
+        // The message a search hit opened, marked on the first row drawn
+        // from it on: a reply that only called tools has none of its own.
+        let mut hit = self
+            .reveal
+            .filter(|&(id, at)| id == conversation.id && (span.first..=span.last).contains(&at));
+        let said = messages.iter().enumerate();
+        for (i, m) in said.skip(span.first).take(span.last + 1 - span.first) {
+            let labeled = i == span.first;
+            // A reply that only asked for tools has nothing to show of its
+            // own; the tool rows speak for it. Kept only when it carries
+            // the turn's label or visible thinking, so it adds no empty gap.
+            let thinking = self.store.settings.thinking && !m.reasoning.is_empty();
+            if m.role == "assistant"
+                && m.content.is_empty()
+                && !m.tool_calls.is_empty()
+                && !labeled
+                && !thinking
+            {
+                continue;
+            }
+            // A turn is finished at its last message, unless the reply to
+            // it is still coming in.
+            let ends = messages.get(i + 1).is_none_or(|next| next.role == "user")
+                && !(streaming_here && i + 1 == messages.len());
+            let bar = (!m.notice && (span.yours || ends)).then(|| {
+                let focused = focus.contains_focused(window, cx) && !in_menu;
+                let shown = shows_bar(span, messages.len(), streaming_here, focused);
+                self.turn_bar(span, shown, cx)
+            });
+            let row = self.message_row(i, m, labeled, false, bar, window, cx);
+            rows.push(if hit.take_if(|&mut (_, at)| i >= at).is_some() {
+                self.mark_hit(row, cx)
+            } else {
+                row
+            });
+        }
+        // Past the last row drawn, the last row stands for it.
+        if let Some(row) = rows.pop_if(|_| hit.is_some()) {
+            rows.push(self.mark_hit(row, cx));
+        }
+        if live {
+            // While tools are queued the card below speaks for the turn;
+            // showing a half-built reply as well would be two spinners.
+            let idle = self.turn.as_ref().is_some_and(|turn| {
+                let next = turn.next(|_| letronna_core::gate::Outcome::Run);
+                matches!(next, agent::Next::Done)
+            });
+            if let Some(reply) = self.turn.as_ref().filter(|_| idle).map(|turn| Message {
+                role: "assistant".into(),
+                content: turn.live.content.clone(),
+                model: turn.connection.model.clone(),
+                reasoning: turn.live.reasoning.clone(),
+                tokens: turn.live.tokens,
+                per_second: turn.live.per_second,
+                prompt_tokens: turn.live.prompt_tokens,
+                cached_tokens: turn.live.cached_tokens,
+                window: turn.live.window,
+                ..Default::default()
+            }) {
+                // Keyed by the place the reply will have once it is stored,
+                // so finishing does not start its markdown or its fade-in
+                // over again. Labelled when it opens the turn.
+                let opens = span.first == messages.len();
+                rows.push(self.message_row(messages.len(), &reply, opens, true, None, window, cx));
+            }
+            if let Some(card) = self.approval_card(window, cx) {
+                rows.push(card);
+            }
+            for (k, text) in self.follow_ups.iter().enumerate() {
+                rows.push(self.queued_row(k, text, cx));
+            }
+        }
+        // No min_w_0 or clipping here: both break list layout in the
+        // markdown renderer, which sizes items against this width. Long
+        // lines are held in by the row and code-block widths.
+        let group = v_flex()
+            .w_full()
+            .gap_3()
+            // A hairline before each of your prompts but the first parts the
+            // exchanges, where a card used to.
+            .when(span.yours && n > 0, |group| {
+                group.border_t_1().border_color(cx.theme().border).pt_3()
+            })
+            .children(rows);
+        // A notice has no menu either: it is no place to go back to.
+        let body = if live || messages.get(span.first).is_some_and(|m| m.notice) {
+            group.into_any_element()
+        } else {
+            // Its own id, so each turn's menu keeps its own state. Tab picks
+            // a turn out; a press on it does not, or opening a tool's output
+            // would take the keys from the composer (text inside still takes
+            // focus to select).
+            div()
+                .id(self.row_id("turn", span.first))
+                .w_full()
+                .track_focus(&focus)
+                .on_any_mouse_down(|_, window, _| window.prevent_default())
+                .child(group.context_menu(self.turn_menu(span, cx)))
+                .into_any_element()
+        };
+        h_flex()
+            .w_full()
+            .justify_center()
+            .child(
+                // The chat's margin above the first turn and below the last
+                // is theirs: as the list's own padding, it is left out of the
+                // scroll range the following works from.
+                v_flex()
+                    .w(column)
+                    .flex_shrink_0()
+                    .px_6()
+                    .map(|this| if n == 0 { this.pt_6() } else { this.pt_3() })
+                    .child(body),
+            )
+            .into_any_element()
+    }
+
+    /// The list's last item, under the turns: last, where the eye is, a
+    /// helper's card and the answer to a question asked aside, which do not
+    /// wait on a turn; and the chat's margin below the last turn.
+    fn under_turns(
+        &self,
+        column: Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let session = self.store.conversations[self.store.active].id;
+        let mut rows: Vec<AnyElement> = Vec::new();
+        rows.extend(self.helper_card(session, window, cx));
+        rows.extend(self.aside_row(session, window, cx));
+        h_flex()
+            .w_full()
+            .justify_center()
+            .child(
+                v_flex()
+                    .w(column)
+                    .flex_shrink_0()
+                    .px_6()
+                    .gap_3()
+                    .when(!rows.is_empty(), |this| {
+                        if self.turns.is_empty() {
+                            this.pt_6()
+                        } else {
+                            this.pt_3()
+                        }
+                    })
+                    .pb_6()
+                    .children(rows),
+            )
+            .into_any_element()
     }
 
     /// Stay at the bottom while following, and stop following once the user
@@ -2403,11 +2746,12 @@ impl Chat {
     /// move the view up and away from the bottom. Content that shrinks also
     /// moves it up, but pinned to the bottom, and that must not count.
     fn keep_following(&mut self) {
-        let offset = self.scroll.offset().y;
+        let offset = self.list.scroll_px_offset_for_scrollbar().y;
         // Held at a search hit, the chat stays put. Where it is still counts,
         // so a scroll by hand after it lets go is told the right way round.
         if self.holding_hit() {
             self.followed_offset = offset;
+            self.place_hit();
             return;
         }
         let near_bottom = self.distance_from_bottom() <= FOLLOW_SLACK;
@@ -2419,7 +2763,7 @@ impl Chat {
         }
         self.followed_offset = offset;
         if self.following {
-            self.scroll.scroll_to_bottom();
+            self.scroll_to_bottom();
         }
     }
 
@@ -2606,7 +2950,9 @@ impl Chat {
             return;
         };
         // Kept even when no turn can start, so the next prompt there reads
-        // it rather than it being lost.
+        // it rather than it being lost. After what was said before, which a
+        // session let go of has to be read back for.
+        self.fill_now(ix);
         let conversation = &mut self.store.conversations[ix];
         conversation.updated = backend::now();
         conversation.messages.push(notice);
@@ -2740,7 +3086,8 @@ impl Render for Chat {
         if self.page == Page::Chat {
             self.unseen.remove(&on_screen);
         }
-        self.keep_following();
+        self.open_on_screen(cx);
+        self.lay_out_turns();
         // What a stopped or failed reply did not take goes back in the box,
         // ahead of anything typed since.
         if let Some(text) = self.returned_follow_ups.take() {
@@ -2863,13 +3210,14 @@ impl Render for Chat {
             // A helper's card needs the chat body even with nothing said.
             && !self.agent_asks.iter().any(|ask| ask.root == conversation.id)
         {
-            self.empty_state(window, cx).into_any_element()
+            if conversation.unfilled() {
+                // Still being read in, which takes a moment: blank rather
+                // than the greeting of a new session.
+                div().flex_1().into_any_element()
+            } else {
+                self.empty_state(window, cx).into_any_element()
+            }
         } else {
-            // One turn per prompt, like Claude Code: the user's message, then
-            // everything the model did in reply under a single label. Each
-            // turn knows its place, which its buttons and menu work from.
-            use crate::ui::actions::{Span, shows_bar};
-            let messages = &conversation.messages;
             // A menu a turn opened takes the focus from inside that turn. That
             // is not the turn being picked out: showing its full row would
             // take away the button the menu hangs from, and the menu with it.
@@ -2880,178 +3228,21 @@ impl Render for Chat {
                     .context_stack()
                     .iter()
                     .any(|context| context.contains("PopupMenu"));
-            let mut turns: Vec<(Vec<AnyElement>, Span, FocusHandle)> = Vec::new();
-            let mut assistant_turn = false;
-            // The message a search hit opened, marked on the first row drawn
-            // from it on: a reply that only called tools has none of its own.
-            let mut marking = false;
-            for (i, m) in messages.iter().enumerate() {
-                marking |= self.reveal == Some((conversation.id, i));
-                let is_user = m.role == "user";
-                if is_user || !assistant_turn {
-                    // A notice stands apart as your message does, but it is
-                    // nobody's prompt to change or ask again.
-                    let span = Span {
-                        first: i,
-                        last: i,
-                        yours: is_user && !m.notice,
-                    };
-                    turns.push((Vec::new(), span, self.turn_focus(i, window, cx)));
-                }
-                let labeled = is_user || !assistant_turn;
-                assistant_turn = !is_user;
-                let (rows, span, focus) = turns.last_mut().unwrap();
-                span.last = i;
-                // A reply that only asked for tools has nothing to show of
-                // its own; the tool rows speak for it. Kept only when it
-                // carries the turn's label or visible thinking, so it adds
-                // no empty gap.
-                let thinking = self.store.settings.thinking && !m.reasoning.is_empty();
-                if m.role == "assistant"
-                    && m.content.is_empty()
-                    && !m.tool_calls.is_empty()
-                    && !labeled
-                    && !thinking
-                {
-                    continue;
-                }
-                // A turn is finished at its last message, unless the reply
-                // to it is still coming in.
-                let ends = messages.get(i + 1).is_none_or(|next| next.role == "user")
-                    && !(streaming_here && i + 1 == messages.len());
-                let bar = (!m.notice && (is_user || ends)).then(|| {
-                    let focused = focus.contains_focused(window, cx) && !in_menu;
-                    let shown = shows_bar(*span, messages.len(), streaming_here, focused);
-                    self.turn_bar(*span, shown, cx)
-                });
-                let row = self.message_row(i, m, labeled, false, bar, window, cx);
-                rows.push(if std::mem::take(&mut marking) {
-                    self.mark_hit(row, cx)
-                } else {
-                    row
-                });
-            }
-            // The turn a reply is still coming in to has no buttons or menu:
-            // it is not finished, and it owns the session until it is.
-            let live_turn = streaming_here.then(|| {
-                if !assistant_turn {
-                    turns.push((
-                        Vec::new(),
-                        Span {
-                            first: messages.len(),
-                            last: messages.len(),
-                            yours: false,
-                        },
-                        self.turn_focus(messages.len(), window, cx),
-                    ));
-                }
-                turns.len() - 1
+            let row = cx.processor(move |this, n: usize, window, cx| {
+                this.turn_row(n, column, in_menu, window, cx)
             });
-            if streaming_here {
-                let (rows_here, _, _) = turns.last_mut().unwrap();
-                // While tools are queued the card below speaks for the turn;
-                // showing a half-built reply as well would be two spinners.
-                let idle = self.turn.as_ref().is_some_and(|turn| {
-                    let next = turn.next(|_| letronna_core::gate::Outcome::Run);
-                    matches!(next, agent::Next::Done)
-                });
-                if let Some(live) = self.turn.as_ref().filter(|_| idle).map(|turn| Message {
-                    role: "assistant".into(),
-                    content: turn.live.content.clone(),
-                    model: turn.connection.model.clone(),
-                    reasoning: turn.live.reasoning.clone(),
-                    tokens: turn.live.tokens,
-                    per_second: turn.live.per_second,
-                    prompt_tokens: turn.live.prompt_tokens,
-                    cached_tokens: turn.live.cached_tokens,
-                    window: turn.live.window,
-                    ..Default::default()
-                }) {
-                    // Keyed by the place the reply will have once it is
-                    // stored, so finishing does not start its markdown or
-                    // its fade-in over again.
-                    rows_here.push(self.message_row(
-                        conversation.messages.len(),
-                        &live,
-                        !assistant_turn,
-                        true,
-                        None,
-                        window,
-                        cx,
-                    ));
-                }
-                if let Some(card) = self.approval_card(window, cx) {
-                    rows_here.push(card);
-                }
-                for (n, text) in self.follow_ups.iter().enumerate() {
-                    rows_here.push(self.queued_row(n, text, cx));
-                }
-            }
-            let mut rows: Vec<AnyElement> = turns
-                .into_iter()
-                .enumerate()
-                // No min_w_0 or clipping here: both break list layout in the
-                // markdown renderer, which sizes items against this width.
-                // Long lines are held in by the row and code-block widths.
-                .map(|(n, (turn, span, focus))| {
-                    // A hairline before each of your prompts but the first
-                    // parts the exchanges, where a card used to.
-                    let group = v_flex()
-                        .w_full()
-                        .gap_3()
-                        .when(span.yours && n > 0, |group| {
-                            group.border_t_1().border_color(cx.theme().border).pt_3()
-                        })
-                        .children(turn);
-                    // A notice has no menu either: it is no place to go back to.
-                    if live_turn == Some(n) || messages.get(span.first).is_some_and(|m| m.notice) {
-                        return group.into_any_element();
-                    }
-                    // Its own id, so each turn's menu keeps its own state.
-                    // Tab picks a turn out; a press on it does not, or
-                    // opening a tool's output would take the keys from the
-                    // composer (text inside still takes focus to select).
-                    div()
-                        .id(self.row_id("turn", span.first))
-                        .w_full()
-                        .track_focus(&focus)
-                        .on_any_mouse_down(|_, window, _| window.prevent_default())
-                        .child(group.context_menu(self.turn_menu(span, cx)))
-                        .into_any_element()
-                })
-                .collect();
-            // Last, where the eye is: a helper does not wait on a turn.
-            rows.extend(self.helper_card(conversation.id, window, cx));
-            rows.extend(self.aside_row(conversation.id, window, cx));
-            // The scrollbar must sit outside the scrolling element, or it
-            // scrolls away with the content. The scrolling box spans the
-            // pane, so the bar is at its edge and the wheel works over the
-            // margins too; only the column inside it is narrow.
+            // The scrollbar must sit outside the list, or it scrolls away
+            // with the content. The list spans the pane, so the bar is at
+            // its edge and the wheel works over the margins too; only the
+            // column each turn is drawn in is narrow.
             div()
                 .relative()
                 .flex_1()
                 .min_h_0()
                 .min_w_0()
                 .w_full()
-                .child(
-                    div()
-                        .id("messages")
-                        .size_full()
-                        .overflow_y_scroll()
-                        .track_scroll(&self.scroll)
-                        .child(
-                            h_flex().w_full().justify_center().child(
-                                v_flex()
-                                    .w(column)
-                                    .flex_shrink_0()
-                                    .px_6()
-                                    .py_6()
-                                    .gap_3()
-                                    .children(rows),
-                            ),
-                        ),
-                )
-                .vertical_scrollbar(&self.scroll)
+                .child(list(self.list.clone(), row).size_full())
+                .vertical_scrollbar(&self.list)
                 .children(self.jump_to_latest(cx))
                 .into_any_element()
         };

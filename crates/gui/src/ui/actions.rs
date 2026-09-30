@@ -602,6 +602,36 @@ pub(crate) fn shows_bar(span: Span, messages: usize, streaming: bool, focused: b
     focused || (!streaming && span.last + 1 == messages)
 }
 
+/// The session's turns, one per prompt as in Claude Code: your message on
+/// its own, then everything the model did in reply to it. A reply still
+/// coming in to your message is a turn already, with nothing in it yet.
+pub(crate) fn turns(messages: &[Message], streaming: bool) -> Vec<Span> {
+    let mut turns: Vec<Span> = Vec::new();
+    let mut replied = false;
+    for (i, m) in messages.iter().enumerate() {
+        let said = m.role == "user";
+        match turns.last_mut() {
+            Some(turn) if !said && replied => turn.last = i,
+            // A notice stands apart as your message does, but it is
+            // nobody's prompt to change or ask again.
+            _ => turns.push(Span {
+                first: i,
+                last: i,
+                yours: said && !m.notice,
+            }),
+        }
+        replied = !said;
+    }
+    if streaming && !replied {
+        turns.push(Span {
+            first: messages.len(),
+            last: messages.len(),
+            yours: false,
+        });
+    }
+    turns
+}
+
 /// "1 message" or "N messages".
 fn message_count(n: usize) -> String {
     if n == 1 {
@@ -615,7 +645,8 @@ fn message_count(n: usize) -> String {
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
-    use super::{Span, message_count, shows_bar};
+    use super::{Span, message_count, shows_bar, turns};
+    use letronna_core::chat::Message;
 
     #[test]
     fn a_turn_keeps_what_comes_before_your_message_or_up_to_its_reply() {
@@ -660,5 +691,48 @@ mod tests {
     fn counts_read_as_words() {
         assert_eq!(message_count(1), "1 message");
         assert_eq!(message_count(3), "3 messages");
+    }
+
+    #[test]
+    fn a_turn_is_your_message_or_everything_the_model_did_after_it() {
+        let said = |role: &str| Message {
+            role: role.into(),
+            ..Default::default()
+        };
+        let session = [
+            said("user"),
+            said("assistant"),
+            said("tool"),
+            said("assistant"),
+            said("user"),
+        ];
+        let span = |first, last, yours| Span { first, last, yours };
+        assert_eq!(
+            turns(&session, false),
+            [span(0, 0, true), span(1, 3, false), span(4, 4, true)]
+        );
+        // The reply coming in to the last prompt is a turn of its own...
+        assert_eq!(turns(&session, true)[3], span(5, 5, false));
+        // ...but a reply that is already there carries on in its own.
+        assert_eq!(turns(&session[..4], true).len(), 2);
+        assert!(turns(&[], false).is_empty());
+        // A notice is a turn of its own too, not yours, and the reply to it
+        // another.
+        let notice = Message {
+            role: "user".into(),
+            notice: true,
+            ..Default::default()
+        };
+        let woken = [said("user"), said("assistant"), notice, said("assistant")];
+        assert_eq!(
+            turns(&woken, false),
+            [
+                span(0, 0, true),
+                span(1, 1, false),
+                span(2, 2, false),
+                span(3, 3, false)
+            ]
+        );
+        assert_eq!(turns(&woken[..3], true)[3], span(3, 3, false));
     }
 }

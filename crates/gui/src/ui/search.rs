@@ -149,10 +149,12 @@ impl Chat {
         self.store.active = index;
         self.error = None;
         self.page = Page::Chat;
-        if ordinal < self.store.conversations[index].messages.len() {
+        // Counted from the file for a session not read in yet.
+        if ordinal < self.store.conversations[index].length() {
             self.following = false;
             self.reveal = Some((id, ordinal));
             self.revealed = None;
+            self.hit_at = None;
         } else {
             self.follow();
         }
@@ -160,13 +162,13 @@ impl Chat {
         cx.notify();
     }
 
-    /// `row` with a marker that scrolls the chat to it, for the message a
+    /// `row` with a marker that notes where it is drawn, for the message a
     /// search hit opened.
     pub(crate) fn mark_hit(&self, row: AnyElement, cx: &mut Context<Self>) -> AnyElement {
         let chat = cx.entity();
         let marker = canvas(
             move |bounds, window, cx| {
-                chat.update(cx, |chat, _| chat.place_hit(bounds.top(), window));
+                chat.update(cx, |chat, _| chat.hit_drawn(bounds.top(), window));
             },
             |_, _, _, _| {},
         )
@@ -182,22 +184,48 @@ impl Chat {
             .into_any_element()
     }
 
-    /// Scroll the chat so the message drawn at `top` sits near the top of
-    /// the view, or as near as the end of the chat lets it.
-    fn place_hit(&mut self, top: Pixels, window: &mut Window) {
-        let offset = self.scroll.offset();
-        let max = self.scroll.max_offset().height;
-        let wanted = top - self.scroll.bounds().top() - HIT_ABOVE;
-        let y = (offset.y - wanted).clamp(-max, px(0.));
-        // Within a pixel is there; moving again would ask for frames
+    /// Note that the message a search hit opened was drawn at `top`, and draw
+    /// again if that moved it: the list is being laid out as this runs, so
+    /// the chat is scrolled at the next draw rather than here.
+    fn hit_drawn(&mut self, top: Pixels, window: &mut Window) {
+        // Within a pixel is where it was; drawing again would ask for frames
         // forever over a rounding difference.
-        if (y - offset.y).abs() < px(1.) {
-            self.revealed = Some(offset.y);
+        if self.hit_at.is_some_and(|(at, _)| (at - top).abs() < px(1.)) {
             return;
         }
-        self.scroll.set_offset(point(offset.x, y));
-        self.revealed = Some(y);
+        self.hit_at = Some((top, true));
         window.request_animation_frame();
+    }
+
+    /// Scroll the chat so the message a search hit opened sits near the top
+    /// of the view, or as near as the ends of the chat let it. Until it has
+    /// been drawn, its turn is brought to the top, as one far off is not.
+    pub(crate) fn place_hit(&mut self) {
+        let Some((_, ordinal)) = self.reveal else {
+            return;
+        };
+        let Some((top, true)) = self.hit_at else {
+            // Not drawn yet: its turn to the top, once it is read in.
+            let turn = self.turns.iter().position(|span| span.last >= ordinal);
+            if let Some(item_ix) = turn.filter(|_| self.hit_at.is_none()) {
+                self.list.scroll_to(ListOffset {
+                    item_ix,
+                    offset_in_item: px(0.),
+                });
+            }
+            return;
+        };
+        // The list measures only what it has drawn, so this can fall short
+        // of the ends; drawn there, the rest is measured and moved next.
+        let above = -self.list.scroll_px_offset_for_scrollbar().y;
+        let by = (top - self.list.viewport_bounds().top() - HIT_ABOVE)
+            .min(self.distance_from_bottom())
+            .max(-above);
+        if by.abs() >= px(1.) {
+            self.list.scroll_by(by);
+        }
+        self.hit_at = Some((top, false));
+        self.revealed = Some(self.list.logical_scroll_top());
     }
 
     /// Let go of a message opened from a search once the chat has been
@@ -205,10 +233,16 @@ impl Chat {
     /// while it is still held.
     pub(crate) fn holding_hit(&mut self) -> bool {
         let shown = self.store.conversations[self.store.active].id;
-        let scrolled = self.revealed.is_some_and(|y| y != self.scroll.offset().y);
+        // Kept as a turn and a place in it, the list's top moves only when
+        // it is scrolled, not when turns above it are measured again.
+        let now = self.list.logical_scroll_top();
+        let scrolled = self.revealed.is_some_and(|at| {
+            at.item_ix != now.item_ix || (at.offset_in_item - now.offset_in_item).abs() >= px(1.)
+        });
         if scrolled || self.reveal.is_some_and(|(id, _)| id != shown) {
             self.reveal = None;
             self.revealed = None;
+            self.hit_at = None;
         }
         self.reveal.is_some()
     }
