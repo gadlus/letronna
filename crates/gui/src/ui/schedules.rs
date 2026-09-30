@@ -1,6 +1,7 @@
 //! The Scheduled jobs page: prompts that run on a timer.
 
 use crate::prelude::*;
+use letronna_core::gate::Mode;
 use letronna_core::schedule::{self, Schedule, Trigger};
 
 /// The intervals offered for "every so often". A free-form number would need
@@ -28,7 +29,7 @@ impl Chat {
             },
             enabled: false,
             last_run: 0,
-            unattended: false,
+            mode: Mode::Default,
         };
         schedule::armed_now(&mut fresh);
         self.editing = Some(fresh.id);
@@ -41,7 +42,10 @@ impl Chat {
         let job = &self.schedules[index];
         let id = job.id;
         let trigger = job.trigger.clone();
-        let unattended = job.unattended;
+        // Until Auto is offered the switch is "Run everything" or "Wait
+        // for me"; a mode set in the file by hand reads as off, since only
+        // Bypass runs everything.
+        let unattended = job.mode == Mode::Bypass;
 
         let every: Vec<_> = INTERVALS
             .iter()
@@ -51,7 +55,7 @@ impl Chat {
                 Button::new(("every", minutes as usize))
                     .xsmall()
                     .when(picked, |b| b.primary())
-                    .when(!picked, |b| b.outline())
+                    .when(!picked, |b| b.framed(cx))
                     .label(Trigger::Every { minutes }.label())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.set_trigger(id, Trigger::Every { minutes }, cx)
@@ -67,7 +71,7 @@ impl Chat {
             Button::new(("at", hour as usize))
                 .xsmall()
                 .when(picked, |b| b.primary())
-                .when(!picked, |b| b.outline())
+                .when(!picked, |b| b.framed(cx))
                 .label(format!("{hour:02}:00"))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.set_trigger(
@@ -93,6 +97,8 @@ impl Chat {
 
         v_flex()
             .w_full()
+            // Clear of the hairlines of the rows either side.
+            .my_2()
             .gap_3()
             .p_3()
             .rounded(cx.theme().radius)
@@ -118,7 +124,7 @@ impl Chat {
                             Button::new("weekdays")
                                 .xsmall()
                                 .when(weekdays_only && is_daily, |b| b.primary())
-                                .when(!(weekdays_only && is_daily), |b| b.outline())
+                                .when(!(weekdays_only && is_daily), |b| b.framed(cx))
                                 .label("Weekdays only")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     if let Trigger::DailyAt {
@@ -163,8 +169,10 @@ impl Chat {
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
                                     .child(
-                                        "Approve writes and commands automatically. Without this a \
-                                         job that needs approval waits until you are back.",
+                                        "Approve writes and commands automatically, except some \
+                                         commands that are hard to undo, such as recursive deletes \
+                                         and force pushes, which are skipped. Without this a job \
+                                         that needs approval waits until you are back.",
                                     ),
                             ),
                     )
@@ -176,7 +184,11 @@ impl Chat {
                                     if let Some(job) =
                                         this.schedules.iter_mut().find(|s| s.id == id)
                                     {
-                                        job.unattended = !unattended;
+                                        job.mode = if unattended {
+                                            Mode::Default
+                                        } else {
+                                            Mode::Bypass
+                                        };
                                     }
                                     this.save_schedules(cx);
                                 })),
@@ -197,7 +209,7 @@ impl Chat {
                     )
                     .child(
                         Button::new("cancel-job")
-                            .ghost()
+                            .plain(cx)
                             .small()
                             .label("Cancel")
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -287,9 +299,9 @@ impl Chat {
             .items_center()
             .justify_between()
             .gap_3()
-            .p_3()
-            .rounded(cx.theme().radius)
-            .bg(cx.theme().secondary.opacity(0.3))
+            .py_3()
+            .border_b_1()
+            .border_color(cx.theme().border)
             .child(
                 v_flex()
                     .flex_1()
@@ -318,7 +330,7 @@ impl Chat {
                     .items_center()
                     .child(
                         Button::new(("run", index))
-                            .ghost()
+                            .plain(cx)
                             .xsmall()
                             .label("Run now")
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -335,7 +347,7 @@ impl Chat {
                     )
                     .child(
                         Button::new(("edit", index))
-                            .ghost()
+                            .plain(cx)
                             .xsmall()
                             .icon(Icon::new(AppIcon::Pencil))
                             .tooltip("Edit")
@@ -345,7 +357,7 @@ impl Chat {
                     )
                     .child(
                         Button::new(("delete", index))
-                            .ghost()
+                            .plain(cx)
                             .xsmall()
                             .icon(Icon::new(AppIcon::Trash))
                             .tooltip("Delete")
@@ -433,7 +445,7 @@ impl Chat {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .child(v_flex().gap_2().children(rows)),
+                    .child(v_flex().children(rows)),
             )
     }
 }

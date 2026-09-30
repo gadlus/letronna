@@ -43,6 +43,12 @@ impl Plugin for Hello {
 
     fn init(&self, _cx: &mut App) {}
 
+    // Only an example: switched on by default, its tool would ride along in
+    // every request for nothing.
+    fn default_enabled(&self) -> bool {
+        false
+    }
+
     /// The tool hook. The agent sees this only while the plugin is enabled.
     /// It shares the plugin's own counter, so the tool reports live state.
     fn tools(&self) -> Vec<Arc<dyn Tool>> {

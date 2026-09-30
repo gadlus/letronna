@@ -23,7 +23,10 @@ const MAX_ROWS: usize = 28;
 
 /// The diff for a call, or `None` for a tool that does not change a file.
 pub fn of(name: &str, args: &str, ctx: &ToolContext) -> Option<Vec<String>> {
-    let args: Value = serde_json::from_str(args).ok()?;
+    let mut args: Value = serde_json::from_str(args).ok()?;
+    // Read under the names the tool runs with, or an edit sent as
+    // `old_string` would be approved as an empty diff.
+    letronna_core::tools::rename_aliases(name, &mut args);
     let path = args["path"].as_str().unwrap_or_default();
     match name {
         "write_file" => {
@@ -33,15 +36,27 @@ pub fn of(name: &str, args: &str, ctx: &ToolContext) -> Option<Vec<String>> {
             let old = ctx
                 .workspace
                 .as_ref()
+                // Read before the user answers, so a path Windows would take
+                // to another computer is shown as new rather than read.
+                .filter(|root| letronna_core::paths::unsafe_raw(path, Some(root)).is_none())
                 .map(|root| root.join(path))
                 .and_then(|full| std::fs::read_to_string(full).ok())
                 .unwrap_or_default();
             Some(render_diff(&old, new))
         }
         "edit_file" => {
-            let old = args["old"].as_str().unwrap_or_default();
-            let new = args["new"].as_str().unwrap_or_default();
-            Some(render_diff(old, new))
+            // Edits sent as a list are shown too, or they would be approved
+            // unseen.
+            let listed = args["edits"].as_array().into_iter().flatten();
+            let mut rows = Vec::new();
+            for edit in std::iter::once(&args).chain(listed) {
+                let Some(old) = edit["old"].as_str() else {
+                    continue;
+                };
+                let new = edit["new"].as_str().unwrap_or_default();
+                rows.extend(render_diff(old, new));
+            }
+            Some(rows)
         }
         _ => None,
     }
@@ -202,7 +217,7 @@ fn clip(text: &str, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Row, compare, fold};
+    use super::{Row, ToolContext, compare, fold, of};
 
     fn rows(text: &[&str]) -> Vec<String> {
         text.iter().map(|t| (*t).to_owned()).collect()
@@ -234,6 +249,20 @@ mod tests {
     }
 
     #[test]
+    fn every_edit_in_a_list_is_shown() {
+        let args = r#"{"path": "a.rs", "edits": [
+            {"old": "one", "new": "two"},
+            {"old": "three", "new": "four"}
+        ]}"#;
+        let shown = of("edit_file", args, &ToolContext::default())
+            .unwrap()
+            .join("\n");
+        for text in ["- one", "+ two", "- three", "+ four"] {
+            assert!(shown.contains(text), "{shown}");
+        }
+    }
+
+    #[test]
     fn long_runs_of_untouched_lines_are_folded_away() {
         let mut rows = vec![Row::Same("x".into()); 20];
         rows.push(Row::New("here".into()));
@@ -247,5 +276,34 @@ mod tests {
                 .iter()
                 .any(|r| matches!(r, Row::Same(text) if text.contains("unchanged")))
         );
+    }
+
+    #[test]
+    fn an_edit_sent_with_other_names_shows_its_diff() {
+        let edit = r#"{"file_path": "a.txt", "old_string": "two", "new_string": "three"}"#;
+        let rows = of("edit_file", edit, &ToolContext::default())
+            .unwrap()
+            .join("\n");
+        assert!(rows.contains("- two"), "{rows}");
+        assert!(rows.contains("+ three"), "{rows}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_device_path_is_not_read_for_the_preview() {
+        let dir = std::env::temp_dir().join(format!("letronna-preview-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("old.txt"), "unread_before").unwrap();
+        let mut ctx = letronna_core::tools::ToolContext::default();
+        ctx.workspace = Some(dir.clone());
+        let shown = |path: String| {
+            let args = serde_json::json!({"path": path, "content": "new"}).to_string();
+            super::of("write_file", &args, &ctx).unwrap().join("\n")
+        };
+        // Named plainly the file is read, so only the check leaves it unread.
+        assert!(shown("old.txt".into()).contains("unread_before"));
+        let device = format!(r"\\?\{}", dir.join("old.txt").display());
+        assert!(!shown(device).contains("unread_before"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

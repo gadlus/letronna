@@ -9,6 +9,13 @@ impl Chat {
         (SharedString::from(format!("{name}-{session}")), index).into()
     }
 
+    /// A row id for a text view that also names the theme it is drawn in:
+    /// the view keeps the syntax colours of its first draw, so a new theme
+    /// takes a new view.
+    fn text_id(&self, name: &str, index: usize) -> ElementId {
+        self.row_id(&format!("{name}-{}", crate::theme::generation()), index)
+    }
+
     /// Whether a thought or a tool's output is shown open, by session and
     /// place, so opening one does not open its twin in another session.
     fn open_key(&self, index: usize) -> (u64, usize) {
@@ -43,12 +50,12 @@ impl Chat {
         let is_user = message.role == "user";
         let session = self.store.conversations[self.store.active].id;
         let editing = is_user && self.editing_message == Some((session, index));
-        // Where the turn's buttons go: over your card's corner, in a reply's
-        // copy-and-usage line, or under a reply that has neither. Over and
-        // in, they take no room of their own while hidden.
+        // Where the turn's buttons go: at the end of your prompt's label, in
+        // a reply's copy-and-usage line, or under a reply that has neither.
+        // In the two lines they take no room of their own.
         let usage_row =
             !is_user && !message.content.is_empty() && (!streaming || message.tokens > 0);
-        let (on_card, in_usage, under) = match (is_user, usage_row) {
+        let (on_label, in_usage, under) = match (is_user, usage_row) {
             (true, _) => (bar.filter(|_| !editing), None, None),
             (false, true) => (None, bar, None),
             (false, false) => (None, None, bar),
@@ -56,28 +63,42 @@ impl Chat {
         // A reply that only asked for tools: its tool rows say what happened.
         let tool_only = !is_user && message.content.is_empty() && !message.tool_calls.is_empty();
         let label: String = if message.model.is_empty() {
-            self.store.settings.model.clone()
+            self.store.model(self.store.active).1.to_owned()
         } else {
             message.model.clone()
         };
-        let leading = px(26.);
+        let leading = px(24.);
         let cx_muted = cx.theme().muted_foreground;
-        let md = self.row_id("md", index);
+        let md = self.text_id("md", index);
         // Not while a dialog is up: the text view starts a selection on any
         // press inside it, even one on a dialog drawn over it, and that press
         // never ends -- confirming a rewind left the reply half selected.
         let selectable = !window.has_active_dialog(cx);
         let body: AnyElement = if editing {
+            // Sending takes back what followed, unless more was asked: that
+            // stays, and the edit goes to a fork, which Send says first.
+            let forks = self.asked_after(index);
             v_flex()
                 .gap_2()
                 .child(Input::new(&self.edit_message).appearance(false))
                 .child(
                     h_flex()
                         .gap_2()
+                        .items_center()
                         .justify_end()
+                        .when(forks, |row| {
+                            row.child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_xs()
+                                    .text_color(cx_muted)
+                                    .child("What you asked after this stays here."),
+                            )
+                        })
                         .child(
                             Button::new("edit-cancel")
-                                .ghost()
+                                .plain(cx)
                                 .small()
                                 .label("Cancel")
                                 .on_click(
@@ -88,7 +109,7 @@ impl Chat {
                             Button::new("edit-send")
                                 .primary()
                                 .small()
-                                .label("Send")
+                                .label(if forks { "Send in a fork" } else { "Send" })
                                 .on_click(
                                     cx.listener(|this, _, window, cx| this.send_edit(window, cx)),
                                 ),
@@ -96,8 +117,16 @@ impl Chat {
                 )
                 .into_any_element()
         } else if is_user {
-            TextView::markdown(md, message.content.clone(), window, cx)
+            // `/init` shows as typed, not as the prompt it sent; a chat app's
+            // message can quote someone else's, fenced.
+            let said = match letronna_core::init::typed(&message.content) {
+                Some(typed) => typed.to_owned(),
+                None => letronna_core::untrusted::shown("", &message.content).0,
+            };
+            TextView::markdown(md, said, window, cx)
                 .selectable(selectable)
+                .text_size(px(15.))
+                .font_weight(FontWeight::MEDIUM)
                 .line_height(leading)
                 .into_any_element()
         } else if message.content.is_empty() {
@@ -110,7 +139,17 @@ impl Chat {
                         .xsmall()
                         .color(cx.theme().primary),
                 )
-                .child("Thinking…")
+                .child({
+                    let live = self.turn.as_ref().filter(|_| streaming).map(|t| &t.live);
+                    match (
+                        live.and_then(|l| l.retrying),
+                        live.is_some_and(|l| l.compacting),
+                    ) {
+                        (Some(retry), _) => retry.to_string(),
+                        (None, true) => "Compacting…".to_owned(),
+                        (None, false) => "Thinking…".to_owned(),
+                    }
+                })
                 .into_any_element()
         } else {
             TextView::markdown(md, message.content.clone(), window, cx)
@@ -140,8 +179,30 @@ impl Chat {
         };
         v_flex()
             .w_full()
-            .gap_2p5()
-            // Your own messages carry no label: the card says whose they are.
+            // Closer to its own text than the turn's rows are to each other,
+            // so a label reads as the head of what follows it.
+            .gap_1p5()
+            // Your prompt is a plain row under its own label, its buttons at
+            // the label's end; the line keeps their height so nothing moves
+            // when they show.
+            .when(is_user, |this| {
+                this.child(
+                    h_flex()
+                        .h_5()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_family(HEADING_FONT)
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(cx.theme().link)
+                                .child("You"),
+                        )
+                        .children(on_label),
+                )
+            })
             .when(labeled && !is_user, |this| {
                 this.child(
                     h_flex()
@@ -152,7 +213,7 @@ impl Chat {
                         .child(
                             div()
                                 .font_weight(FontWeight::MEDIUM)
-                                .text_color(cx.theme().primary)
+                                .text_color(cx.theme().link)
                                 .child(label),
                         )
                         .when(streaming, |this| {
@@ -187,27 +248,10 @@ impl Chat {
             // which pushes the whole chat past the composer. Clipping here
             // clamps it; min_w_0 would instead collapse list layout.
             .when(!tool_only, |this| {
-                this.child(
-                    div()
-                        .w_full()
-                        .overflow_hidden()
-                        .pb_1()
-                        // Your prompt sits in a card, so a long exchange
-                        // reads as turns rather than one run of text.
-                        .when(is_user, |card| {
-                            card.relative()
-                                .px_4()
-                                .py_3()
-                                .rounded(cx.theme().radius_lg)
-                                .bg(cx.theme().secondary.opacity(0.5))
-                                .border_1()
-                                .border_color(cx.theme().border)
-                        })
-                        .child(body)
-                        .when_some(on_card, |card, bar| {
-                            card.child(div().absolute().top_1().right_1().child(bar))
-                        }),
-                )
+                this.child(div().w_full().overflow_hidden().pb_1().child(body))
+            })
+            .when(is_user && !message.images.is_empty(), |this| {
+                this.child(crate::ui::pictures::sent_row(&message.images, cx))
             })
             // A reply is often wanted whole, and selecting it across
             // paragraphs and code blocks is fiddly.
@@ -225,6 +269,7 @@ impl Chat {
                             )
                         })
                         .when(message.tokens > 0, |row| row.child(usage_line(message)))
+                        .when(message.interrupted, |row| row.child("(stopped)"))
                         .children(in_usage),
                 )
             })
@@ -241,6 +286,17 @@ impl Chat {
     /// A message sent while the reply runs, waiting for the reply's next
     /// step: your card, faded, with a way to take it back first.
     pub(crate) fn queued_row(&self, n: usize, text: &str, cx: &mut Context<Self>) -> AnyElement {
+        let key = if cfg!(target_os = "macos") {
+            "⌘Enter"
+        } else {
+            "Ctrl+Enter"
+        };
+        // Sending now never stops a running tool, so then it waits for it.
+        let now = if self.turn.as_ref().is_some_and(cuts_in) {
+            format!("Send now, stopping the reply where it is ({key})")
+        } else {
+            format!("Send as soon as the tool is done ({key})")
+        };
         v_flex()
             .w_full()
             .gap_1()
@@ -249,12 +305,20 @@ impl Chat {
                     .justify_between()
                     .items_center()
                     .text_xs()
-                    .font_family(HEADING_FONT)
+                    .font_family(BODY_FONT)
                     .text_color(cx.theme().muted_foreground)
                     .child("Queued · goes in after this step")
                     .child(
                         h_flex()
                             .gap_0p5()
+                            .child(
+                                Button::new(("queued-now", n))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(Icon::new(IconName::ArrowUp))
+                                    .tooltip(now)
+                                    .on_click(cx.listener(|this, _, _, cx| this.send_now(cx))),
+                            )
                             .child(
                                 Button::new(("queued-back", n))
                                     .ghost()
@@ -289,6 +353,80 @@ impl Chat {
                     .child(text.to_owned()),
             )
             .into_any_element()
+    }
+
+    /// The side question on show for `session`, under the conversation and
+    /// in no turn of it, since the session does not keep it.
+    pub(crate) fn aside_row(
+        &self,
+        session: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let aside = self
+            .aside
+            .as_ref()
+            .filter(|aside| aside.session == session)?;
+        let muted = cx.theme().muted_foreground;
+        // Rendered and selectable as a reply is, since it is the only copy.
+        let answer = match &aside.answer {
+            None => div()
+                .text_color(muted)
+                .child("Thinking…")
+                .into_any_element(),
+            Some(Ok(reply)) => v_flex()
+                .gap_1()
+                .text_color(muted)
+                .child(
+                    TextView::markdown(self.row_id("aside", 0), reply.content.clone(), window, cx)
+                        .selectable(!window.has_active_dialog(cx))
+                        .line_height(px(26.)),
+                )
+                .child(div().text_xs().child(usage_line(reply)))
+                .into_any_element(),
+            Some(Err(error)) => div()
+                .text_color(cx.theme().danger)
+                .child(error.clone())
+                .into_any_element(),
+        };
+        let row = v_flex()
+            .w_full()
+            .gap_1()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .text_xs()
+                    .font_family(HEADING_FONT)
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Aside · not kept in the session")
+                    .child(
+                        Button::new("aside-close")
+                            .ghost()
+                            .xsmall()
+                            .icon(Icon::new(IconName::Close))
+                            .tooltip_with_action("Close", &Dismiss, None)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(aside) = this.aside.take() {
+                                    aside.cancel.set();
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .w_full()
+                    .gap_2()
+                    .px_4()
+                    .py_3()
+                    .rounded(cx.theme().radius_lg)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .child(aside.question.clone())
+                    .child(answer),
+            );
+        Some(row.into_any_element())
     }
 
     /// Something that happened meanwhile, such as a job exiting: one quiet
@@ -376,18 +514,25 @@ impl Chat {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let key = self.open_key(index);
-        let open = self.thinking_open.contains(&key);
+        // A failure is the output you need to read, so it starts open, in
+        // full. One you declined yourself is no news, so it stays shut.
+        let failed = message.is_error && !letronna_core::tools::is_declined(&message.content);
+        let open = self.thinking_open.contains(&key) != failed;
         let summary = letronna_core::tools::summary(&message.name, &message.args);
-        let lines = message.content.lines().count();
-        let content = message.content.clone();
+        // The fences' tags are for the model; here a few words say where the
+        // text came from.
+        let (content, from) = letronna_core::untrusted::shown(&message.name, &message.content);
+        let lines = content.lines().count();
         let one_line = letronna_core::tools::one_line;
         // A file a media tool made, while it is still where it was saved.
         let made = (!message.is_error)
-            .then(|| letronna_core::media::saved(&message.content))
+            .then(|| letronna_core::media::saved_by(&message.name, &message.content))
             .flatten()
             .filter(|path| path.exists());
-        let (status, color) = if message.is_error {
-            (one_line(&message.content), cx.theme().danger)
+        let (status, color) = if failed {
+            ("failed".to_owned(), cx.theme().danger)
+        } else if message.is_error {
+            ("declined".to_owned(), cx.theme().muted_foreground)
         } else if message.name == letronna_core::tools::ASK_USER {
             (
                 format!("→ {}", one_line(&message.content)),
@@ -427,7 +572,7 @@ impl Chat {
                     .text_xs()
                     .font_family(HEADING_FONT)
                     .text_color(cx.theme().muted_foreground)
-                    .hover(|s| s.bg(cx.theme().secondary.opacity(0.5)))
+                    .active(|s| s.bg(cx.theme().secondary.opacity(0.5)))
                     .child(
                         Icon::new(if open {
                             IconName::ChevronDown
@@ -450,6 +595,14 @@ impl Chat {
                             .child(summary),
                     )
                     .child(div().min_w_0().text_color(color).truncate().child(status))
+                    .when_some(from, |row, from| {
+                        row.child(
+                            div()
+                                .flex_none()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(from),
+                        )
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if !this.thinking_open.remove(&key) {
                             this.thinking_open.insert(key);
@@ -470,7 +623,11 @@ impl Chat {
                         .min_w_0()
                         .border_l_2()
                         .border_color(cx.theme().border)
-                        .text_color(cx.theme().muted_foreground)
+                        .text_color(if failed {
+                            cx.theme().danger
+                        } else {
+                            cx.theme().muted_foreground
+                        })
                         .child(crate::ui::code_block(
                             ("tool-out", index),
                             letronna_core::tools::clamp_lines(&content, 400),
@@ -508,7 +665,7 @@ impl Chat {
                     .text_xs()
                     .font_family(HEADING_FONT)
                     .text_color(cx.theme().muted_foreground)
-                    .hover(|s| s.bg(cx.theme().secondary.opacity(0.5)))
+                    .active(|s| s.bg(cx.theme().secondary.opacity(0.5)))
                     .child(
                         Icon::new(if open {
                             IconName::ChevronDown
@@ -539,21 +696,31 @@ impl Chat {
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
                         .child(
-                            TextView::markdown(self.row_id("reason", index), reasoning, window, cx)
-                                .selectable(!window.has_active_dialog(cx))
-                                .line_height(px(21.)),
+                            TextView::markdown(
+                                self.text_id("reason", index),
+                                reasoning,
+                                window,
+                                cx,
+                            )
+                            .selectable(!window.has_active_dialog(cx))
+                            .line_height(px(21.)),
                         ),
                 )
             })
     }
 
-    pub(crate) fn empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn empty_state(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         // Without a project folder the tools have nowhere to read or write,
         // and the only other place that says so is a chip in the status bar.
         let no_project = self.store.conversations[self.store.active]
             .workspace
             .is_none();
         v_flex()
+            .relative()
             .flex_1()
             .items_center()
             .justify_center()
@@ -575,7 +742,7 @@ impl Chat {
             .when(no_project, |this| {
                 this.child(
                     Button::new("choose-project")
-                        .outline()
+                        .framed(cx)
                         .small()
                         .mt_4()
                         .icon(Icon::new(AppIcon::Folder))
@@ -591,6 +758,12 @@ impl Chat {
                     .text_xs()
                     .text_color(cx.theme().muted_foreground.opacity(0.7))
                     .child("Enter to send  ·  Shift+Enter for a new line  ·  Esc to stop"),
+            )
+            .children(self.grain(&self.grains.empty_chat))
+            // A side question asked before anything else still needs somewhere to show.
+            .children(
+                self.aside_row(self.store.conversations[self.store.active].id, window, cx)
+                    .map(|row| div().w_full().max_w(COLUMN).px_6().mt_6().child(row)),
             )
     }
 
@@ -679,6 +852,7 @@ fn usage_line(message: &Message) -> String {
     let input = message.input_tokens();
     if input > 0 {
         parts.push(format!("{input} in"));
+        parts.extend(message.fullness());
         if message.cached_tokens > 0 {
             let share = 100 * message.cached_tokens / input;
             parts.push(format!("{share}% cached"));
@@ -816,14 +990,14 @@ fn made_file(
                 })
                 .child(
                     Button::new(("open-made", index))
-                        .ghost()
+                        .plain(cx)
                         .xsmall()
                         .label("Open")
                         .on_click(move |_, _, cx| cx.open_with_system(&open)),
                 )
                 .child(
                     Button::new(("reveal-made", index))
-                        .ghost()
+                        .plain(cx)
                         .xsmall()
                         .icon(Icon::new(AppIcon::Folder))
                         .tooltip("Show in folder")
@@ -837,7 +1011,7 @@ fn made_file(
 fn sound_button(index: usize, path: PathBuf, cx: &mut Context<Chat>) -> Button {
     let playing = crate::platform::audio::playing(&path);
     Button::new(("play-made", index))
-        .ghost()
+        .plain(cx)
         .xsmall()
         .icon(Icon::new(if playing {
             AppIcon::Stop
@@ -896,5 +1070,20 @@ mod tests {
             ..message.clone()
         };
         assert_eq!(usage_line(&uncached), "16 out · 18.4 tok/s · 3291 in");
+    }
+
+    #[test]
+    fn usage_line_says_how_full_the_window_was_after_the_prompt() {
+        let message = Message {
+            tokens: 16,
+            prompt_tokens: 76_000,
+            cached_tokens: 72_200,
+            window: 200_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            usage_line(&message),
+            "16 out · 76000 in · 38% of 200K · 95% cached"
+        );
     }
 }

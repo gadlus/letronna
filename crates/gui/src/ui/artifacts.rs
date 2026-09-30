@@ -31,9 +31,11 @@ pub(crate) fn collect(store: &Store) -> Vec<Artifact> {
             if !matches!(message.name.as_str(), "write_file" | "edit_file") {
                 continue;
             }
-            let Ok(args) = tools::parse_args(&message.args) else {
+            let Ok(mut args) = tools::parse_args(&message.args) else {
                 continue;
             };
+            // Under the name the write ran with, `file_path` included.
+            tools::rename_aliases(&message.name, &mut args);
             let Some(relative) = args["path"].as_str() else {
                 continue;
             };
@@ -87,9 +89,9 @@ impl Chat {
                     .items_center()
                     .justify_between()
                     .gap_3()
-                    .p_3()
-                    .rounded(cx.theme().radius)
-                    .bg(cx.theme().secondary.opacity(0.3))
+                    .py_3()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
                     .child(
                         v_flex()
                             .flex_1()
@@ -135,7 +137,7 @@ impl Chat {
                             .items_center()
                             .child(
                                 Button::new(("open", index))
-                                    .ghost()
+                                    .plain(cx)
                                     .xsmall()
                                     .label("Open")
                                     .disabled(!exists)
@@ -143,7 +145,7 @@ impl Chat {
                             )
                             .child(
                                 Button::new(("reveal", index))
-                                    .ghost()
+                                    .plain(cx)
                                     .xsmall()
                                     .icon(Icon::new(AppIcon::Folder))
                                     .tooltip("Show in folder")
@@ -191,7 +193,7 @@ impl Chat {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .child(v_flex().gap_2().children(rows)),
+                    .child(v_flex().children(rows)),
             )
     }
 }
@@ -261,5 +263,22 @@ mod tests {
         assert_eq!(found[0].writes, 2);
         assert_eq!(found[0].session, "newer");
         assert_eq!(found[1].writes, 1);
+    }
+
+    #[test]
+    fn a_write_sent_with_file_path_is_listed() {
+        let mut message = wrote("", "write_file", false);
+        message.args = r#"{"file_path":"notes.md","content":"x"}"#.into();
+        let store = Store {
+            conversations: vec![Conversation {
+                workspace: Some("/work".into()),
+                messages: vec![message],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let found = collect(&store);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].path.ends_with("notes.md"));
     }
 }

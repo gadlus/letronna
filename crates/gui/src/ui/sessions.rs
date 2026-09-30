@@ -105,12 +105,20 @@ impl Chat {
                         return;
                     }
                     // Through the store, so the session's file goes too,
-                    // and its private browser with it.
-                    letronna_core::browser::forget(this.store.conversations[index].id);
+                    // and its private browser and draft with it.
+                    let id = this.store.conversations[index].id;
+                    letronna_core::browser::forget(id);
+                    this.drafts.remove(&id);
+                    this.panel.forget(id);
                     // The next new session can be given this id again, and
-                    // must not start out with what was allowed here.
+                    // must not start out with what was allowed here, nor in
+                    // this one's mode.
                     this.session_allow
                         .remove(&this.store.conversations[index].id);
+                    this.modes.remove(&this.store.conversations[index].id);
+                    // Nor show its helpers' cards; dropped, they are declined.
+                    let id = this.store.conversations[index].id;
+                    this.agent_asks.retain(|request| request.root != id);
                     this.store.remove(index);
                     if this.store.conversations.is_empty() {
                         this.new_chat(window, cx);

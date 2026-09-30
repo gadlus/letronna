@@ -1,5 +1,7 @@
 //! What `letronna` was asked for on the command line.
 
+use letronna_core::gate::Mode;
+
 pub const HELP: &str = "\
 Letronna — a small agent in your terminal
 
@@ -11,16 +13,31 @@ Letronna — a small agent in your terminal
   letronna gui             open the window instead
   letronna setup           name, sign in, provider, model, install
   letronna update          install the newest version
+  letronna doctor          check the setup, the disk and the gateway
+  letronna mcp             add, list, get or remove MCP servers
   letronna --uninstall     take it off again
 
 Options
   -p, --print <prompt>     ask one question, print the answer, exit
   -c, --continue           resume the most recent session
   -r, --resume [id]        choose a session, or open the one with this id
-      --yes                run tools without asking (careful)
-      --plan               read and search only; never write or run
+      --mode <mode>        how much runs without asking: default, accept-edits,
+                           plan, dont-ask or bypass
+      --yes                --mode bypass: run tools without asking, bar risky ones
+      --plan               --mode plan: read and search only; never write or run
+      --model <id>         this session's model, leaving the default as it is
+      --gateway <name>     the gateway that model is on
+      --effort <level>     how hard it thinks in this session, or auto
+      --offline            with doctor: leave the network alone
   -h, --help               this
   -V, --version            which version this is
+
+With -p
+      --output <form>      text (the answer), json, or stream-json
+      --max-rounds <n>     tool rounds before it stops (25)
+      --model <name>       use this model instead of the one set up
+      --tools <a,b>        only these tools, by name
+      --budget <tokens>    stop once this many tokens are spent
 ";
 
 /// What to open with.
@@ -36,37 +53,87 @@ pub enum Start {
     Named(u64),
 }
 
+/// How `-p` gives its answer.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Output {
+    /// The answer alone, as it would read in a conversation.
+    Text,
+    /// One JSON object with the answer and what it took.
+    Json,
+    /// A JSON line each time the run moves on, then that object as the last line.
+    StreamJson,
+}
+
 pub struct Args {
     pub prompt: Option<String>,
     pub start: Start,
-    pub yes: bool,
-    pub plan: bool,
+    /// The mode from `--mode`, `--yes` or `--plan`, or why `--mode` named
+    /// none.
+    pub mode: Result<Mode, String>,
+    /// The session's own model, gateway and effort, for this run and after.
+    pub model: Option<String>,
+    pub gateway: Option<String>,
+    pub effort: Option<String>,
     pub help: bool,
     pub version: bool,
     pub gui: bool,
     pub install: bool,
     pub uninstall: bool,
     pub update: bool,
+    pub doctor: bool,
+    pub offline: bool,
+    pub output: Output,
+    pub max_rounds: Option<usize>,
+    pub tools: Option<Vec<String>>,
+    pub budget: Option<u64>,
+    /// The words after `letronna mcp`, which manage MCP servers.
+    pub mcp: Option<Vec<String>>,
 }
 
-pub fn parse(mut raw: impl Iterator<Item = String>) -> Args {
+pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
+    let mut raw = raw.peekable();
+    let mut print = false;
+    let (mut mode, mut yes, mut plan) = (None, false, false);
     let mut args = Args {
         prompt: None,
         start: Start::Fresh,
-        yes: false,
-        plan: false,
+        mode: Ok(Mode::Default),
+        model: None,
+        gateway: None,
+        effort: None,
         help: false,
         version: false,
         gui: false,
         install: false,
         uninstall: false,
         update: false,
+        doctor: false,
+        offline: false,
+        output: Output::Text,
+        max_rounds: None,
+        tools: None,
+        budget: None,
+        mcp: None,
     };
+    // Only as the first word, so `-p mcp` still asks about it.
+    if raw.next_if(|first| first == "mcp").is_some() {
+        args.mcp = Some(raw.collect());
+        return Ok(args);
+    }
     while let Some(arg) = raw.next() {
         match arg.as_str() {
             "gui" => args.gui = true,
             "update" => args.update = true,
-            "-p" | "--print" => args.prompt = raw.next(),
+            "doctor" => args.doctor = true,
+            "--offline" => args.offline = true,
+            // A flag straight after is not the question, so `-p --output
+            // json "what is this"` takes the bare word after it.
+            "-p" | "--print" => {
+                print = true;
+                if raw.peek().is_some_and(|next| !next.starts_with("--")) {
+                    args.prompt = raw.next();
+                }
+            }
             "-c" | "--continue" => args.start = Start::Last,
             // `--resume` on its own offers the recent sessions; with an id it
             // opens that one, which is what the id in `/where` is for.
@@ -76,8 +143,38 @@ pub fn parse(mut raw: impl Iterator<Item = String>) -> Args {
                     _ => Start::Choose,
                 }
             }
-            "--yes" => args.yes = true,
-            "--plan" => args.plan = true,
+            "--mode" => mode = Some(Mode::parse(&raw.next().unwrap_or_default())),
+            "--yes" => yes = true,
+            "--plan" => plan = true,
+            "--output" => {
+                args.output = match raw.next().as_deref() {
+                    Some("text") => Output::Text,
+                    Some("json") => Output::Json,
+                    Some("stream-json") => Output::StreamJson,
+                    _ => return Err("--output takes text, json or stream-json.".into()),
+                }
+            }
+            "--max-rounds" => {
+                args.max_rounds = Some(above_zero(
+                    raw.next(),
+                    "--max-rounds takes a number of tool rounds above 0, like --max-rounds 10.",
+                )?)
+            }
+            "--model" => {
+                let name = raw
+                    .next()
+                    .filter(|name| !name.is_empty() && !name.starts_with('-'));
+                args.model = Some(name.ok_or("--model takes the name of a model.")?);
+            }
+            "--tools" => args.tools = Some(tool_names(raw.next())?),
+            "--budget" => {
+                args.budget = Some(above_zero(
+                    raw.next(),
+                    "--budget takes a number of tokens above 0, like --budget 200000.",
+                )?)
+            }
+            "--gateway" => args.gateway = raw.next(),
+            "--effort" => args.effort = raw.next(),
             "setup" | "--install" => args.install = true,
             "--uninstall" => args.uninstall = true,
             "-h" | "--help" => args.help = true,
@@ -89,21 +186,83 @@ pub fn parse(mut raw: impl Iterator<Item = String>) -> Args {
             _ => {}
         }
     }
-    args
+    args.mode = picked(mode, yes, plan);
+    if print && args.prompt.is_none() {
+        return Err("-p takes the question, like -p \"what is this\".".into());
+    }
+    let shaped = args.output != Output::Text
+        || args.max_rounds.is_some()
+        || args.tools.is_some()
+        || args.budget.is_some();
+    if shaped && args.prompt.is_none() {
+        return Err("--output, --max-rounds, --tools and --budget only work with -p.".into());
+    }
+    Ok(args)
+}
+
+/// The number after a flag, which has to be a whole one above zero.
+fn above_zero<T: std::str::FromStr + PartialOrd + From<u8>>(
+    value: Option<String>,
+    error: &str,
+) -> Result<T, String> {
+    value
+        .and_then(|value| value.parse::<T>().ok())
+        .filter(|n| *n > T::from(0))
+        .ok_or_else(|| error.to_owned())
+}
+
+/// The tool names after `--tools`, split at the commas.
+fn tool_names(value: Option<String>) -> Result<Vec<String>, String> {
+    let names: Vec<String> = value
+        .filter(|value| !value.starts_with('-'))
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if names.is_empty() {
+        return Err(
+            "--tools takes tool names split by commas, like --tools read_file,search.".into(),
+        );
+    }
+    Ok(names)
+}
+
+/// The mode the flags pick, or which flag to drop when `--mode` and a
+/// shorthand for one both pick it.
+fn picked(mode: Option<Result<Mode, String>>, yes: bool, plan: bool) -> Result<Mode, String> {
+    let drop = |flag: &str, name: &str| {
+        Err(format!(
+            "`--mode` and `{flag}` both pick the mode; drop `{flag}`, which is `--mode {name}`."
+        ))
+    };
+    match mode {
+        Some(_) if yes => drop("--yes", "bypass"),
+        Some(_) if plan => drop("--plan", "plan"),
+        Some(mode) => mode,
+        // Before modes, `--plan --yes` planned with no cards; it never
+        // wrote, so it does not become a mode that does.
+        None if plan => Ok(Mode::Plan),
+        None if yes => Ok(Mode::Bypass),
+        None => Ok(Mode::Default),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse;
+    use super::{Output, parse};
+    use letronna_core::gate::Mode;
 
     fn args(words: &[&str]) -> super::Args {
-        parse(words.iter().map(|w| w.to_string()))
+        parse(words.iter().map(|w| w.to_string())).unwrap()
     }
 
     #[test]
     fn reads_the_forms_people_actually_type() {
         let bare = args(&[]);
-        assert!(bare.prompt.is_none() && bare.start == super::Start::Fresh && !bare.yes);
+        assert!(bare.prompt.is_none() && bare.start == super::Start::Fresh);
+        assert_eq!(bare.mode, Ok(Mode::Default));
 
         assert_eq!(args(&["-p", "hello"]).prompt.as_deref(), Some("hello"));
         assert_eq!(args(&["--print", "hello"]).prompt.as_deref(), Some("hello"));
@@ -114,7 +273,7 @@ mod tests {
         );
         // A flag after it must not be swallowed as the prompt.
         let mixed = args(&["--plan", "look around"]);
-        assert!(mixed.plan);
+        assert_eq!(mixed.mode, Ok(Mode::Plan));
         assert_eq!(mixed.prompt.as_deref(), Some("look around"));
 
         assert_eq!(args(&["-c"]).start, super::Start::Last);
@@ -127,8 +286,99 @@ mod tests {
         assert_eq!(worded.start, super::Start::Choose);
         assert!(args(&["gui"]).gui);
         assert!(args(&["update"]).update && args(&["update"]).prompt.is_none());
-        assert!(args(&["--yes"]).yes);
+        assert_eq!(args(&["--yes"]).mode, Ok(Mode::Bypass));
+        let edits = args(&["--mode", "accept-edits", "tidy up"]);
+        assert_eq!(edits.mode, Ok(Mode::AcceptEdits));
+        assert_eq!(edits.prompt.as_deref(), Some("tidy up"));
+        assert!(args(&["--mode", "auto"]).mode.is_err());
+        assert!(args(&["--mode"]).mode.is_err());
         assert!(args(&["-h"]).help);
         assert!(args(&["--version"]).version && args(&["-V"]).version);
+        // `mcp` first hands every word after it on, flags and all.
+        let mcp = args(&["mcp", "add", "fs", "-e", "K=V", "--", "npx", "-y"]);
+        assert_eq!(
+            mcp.mcp.unwrap(),
+            ["add", "fs", "-e", "K=V", "--", "npx", "-y"]
+        );
+        assert_eq!(args(&["-p", "mcp"]).prompt.as_deref(), Some("mcp"));
+    }
+
+    #[test]
+    fn plan_with_yes_stays_plan_and_mode_with_a_shorthand_says_which_to_drop() {
+        assert_eq!(args(&["--plan", "--yes"]).mode, Ok(Mode::Plan));
+        assert_eq!(args(&["--yes", "--plan", "look"]).mode, Ok(Mode::Plan));
+        let yes = args(&["--mode", "plan", "--yes"]).mode.unwrap_err();
+        assert!(yes.contains("drop `--yes`"), "{yes}");
+        let plan = args(&["--plan", "--mode", "bypass"]).mode.unwrap_err();
+        assert!(plan.contains("drop `--plan`"), "{plan}");
+    }
+
+    /// What parsing `words` refused them with.
+    fn refused(words: &[&str]) -> String {
+        match parse(words.iter().map(|w| w.to_string())) {
+            Ok(_) => panic!("{words:?} parsed"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn the_new_flags_parse() {
+        let run = args(&[
+            "-p",
+            "tidy up",
+            "--output",
+            "stream-json",
+            "--max-rounds",
+            "40",
+            "--model",
+            "local-model",
+            "--tools",
+            "read_file, search,,list_dir",
+            "--budget",
+            "200000",
+        ]);
+        assert_eq!(run.prompt.as_deref(), Some("tidy up"));
+        assert_eq!(run.output, Output::StreamJson);
+        assert_eq!(run.max_rounds, Some(40));
+        assert_eq!(run.model.as_deref(), Some("local-model"));
+        assert_eq!(
+            run.tools,
+            Some(vec!["read_file".into(), "search".into(), "list_dir".into()])
+        );
+        assert_eq!(run.budget, Some(200_000));
+        // Before the prompt counts too, and none of them is taken for it.
+        let json = args(&["--output", "json", "what is this"]);
+        assert_eq!(json.output, Output::Json);
+        assert_eq!(json.prompt.as_deref(), Some("what is this"));
+        // So does a flag between -p and the question.
+        let between = args(&["-p", "--output", "json", "what is this"]);
+        assert_eq!(between.output, Output::Json);
+        assert_eq!(between.prompt.as_deref(), Some("what is this"));
+        let plain = args(&["-p", "hello"]);
+        assert_eq!(plain.output, Output::Text);
+        assert!(plain.max_rounds.is_none() && plain.tools.is_none() && plain.budget.is_none());
+
+        assert_eq!(
+            refused(&["-p", "x", "--output", "yaml"]),
+            "--output takes text, json or stream-json."
+        );
+        assert_eq!(
+            refused(&["-p", "x", "--max-rounds", "0"]),
+            "--max-rounds takes a number of tool rounds above 0, like --max-rounds 10."
+        );
+        assert!(refused(&["-p", "x", "--max-rounds", "many"]).starts_with("--max-rounds takes"));
+        assert!(refused(&["-p", "x", "--budget", "-5"]).starts_with("--budget takes"));
+        // A flag where the value should be is a missing value, not a name.
+        assert_eq!(
+            refused(&["-p", "x", "--model", "--yes"]),
+            "--model takes the name of a model."
+        );
+        assert!(refused(&["-p", "x", "--tools", ","]).starts_with("--tools takes"));
+        assert!(refused(&["-p", "x", "--budget"]).starts_with("--budget takes"));
+        assert!(refused(&["-p", "--output", "json"]).starts_with("-p takes the question"));
+        assert_eq!(
+            refused(&["--budget", "1000"]),
+            "--output, --max-rounds, --tools and --budget only work with -p."
+        );
     }
 }

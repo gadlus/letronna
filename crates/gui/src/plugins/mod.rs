@@ -52,6 +52,10 @@ pub(crate) trait Plugin: 'static {
     fn builtin(&self) -> bool {
         true
     }
+    /// Whether the plugin is on before the user has switched it either way.
+    fn default_enabled(&self) -> bool {
+        true
+    }
     /// Optional settings UI, shown under the plugin on the Plugins page. This is
     /// the hook a plugin uses to add its own controls. Read-only `cx` is enough
     /// to build elements; interactive closures act later with `&mut App`.
@@ -108,7 +112,12 @@ fn save_enabled(map: &HashMap<String, bool>) {
 pub(crate) fn init(cx: &mut App, plugins: Vec<Box<dyn Plugin>>) {
     let saved = load_enabled();
     for plugin in &plugins {
-        plugin.set_enabled(*saved.get(plugin.id()).unwrap_or(&true));
+        plugin.set_enabled(
+            saved
+                .get(plugin.id())
+                .copied()
+                .unwrap_or_else(|| plugin.default_enabled()),
+        );
         plugin.init(cx);
     }
     refresh_tools(&plugins);

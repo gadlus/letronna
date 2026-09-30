@@ -36,7 +36,7 @@ const TOO_LONG: u64 = 120;
 
 /// The wait, in the units a person would use. Ninety seconds is a minute and
 /// a half to everyone except a computer.
-fn spell(seconds: u64) -> String {
+pub fn spell(seconds: u64) -> String {
     match (seconds / 60, seconds % 60) {
         (0, s) => format!("{s}s"),
         (m, 0) => format!("{m}m"),
@@ -45,7 +45,7 @@ fn spell(seconds: u64) -> String {
 }
 
 /// What to say and how loudly, given how long it has been.
-fn mood(word: &'static str, seconds: u64) -> (String, fn(&str) -> String) {
+fn mood(word: &str, seconds: u64) -> (String, fn(&str) -> String) {
     if seconds >= TOO_LONG {
         (
             format!("{word} — still nothing back, esc to stop"),
@@ -87,6 +87,9 @@ pub struct Waiting {
     /// the model is "Thinking"; waiting on a tool says which tool, because
     /// "Thinking" over a two-minute command is a lie.
     about: Option<String>,
+    /// The step of its plan the model is on, said after the word: it is the
+    /// one thing this line can tell about what the wait is for.
+    step: Option<String>,
 }
 
 impl Default for Waiting {
@@ -103,6 +106,7 @@ impl Waiting {
             // thing, and the same one every time reads as a frozen screen.
             word: WORDS[Instant::now().elapsed().subsec_nanos() as usize % WORDS.len()],
             about: None,
+            step: None,
         }
     }
 
@@ -114,19 +118,44 @@ impl Waiting {
         }
     }
 
-    /// The line as it should look now.
-    pub fn line(&self) -> String {
+    /// A wait on the model while it works on a step of its plan.
+    pub fn during(step: &str) -> Self {
+        Self {
+            step: Some(step.to_owned()),
+            ..Self::new()
+        }
+    }
+
+    /// The same wait under another name, its clock still running.
+    pub fn renamed(self, what: &str) -> Self {
+        Self {
+            about: Some(what.to_owned()),
+            ..self
+        }
+    }
+
+    /// The line as it should look now, in a window `width` columns wide.
+    pub fn line(&self, width: usize) -> String {
         let elapsed = self.began.elapsed();
         let seconds = elapsed.as_secs();
         let frame = FRAMES[(elapsed.as_millis() / FRAME_MS) as usize % FRAMES.len()];
-        let (say, paint) = match &self.about {
-            Some(what) => mood_about(what, seconds),
-            None => mood(self.word, seconds),
-        };
         let since = if seconds > 0 {
             format!(" {}", spell(seconds))
         } else {
             String::new()
+        };
+        let (say, paint) = match (&self.about, &self.step) {
+            (Some(what), _) => mood_about(what, seconds),
+            (None, Some(step)) => {
+                // The step gives way before the word, a warning or the clock,
+                // and stops short of the edge: past it the terminal wraps the
+                // line and pushes the box out of the window.
+                let (bare, _) = mood(&format!("{} · ", self.word), seconds);
+                let taken = format!("{}{frame} {bare}{since}{}", render::INSIDE, render::MARGIN);
+                let step = render::fit(step, width.saturating_sub(taken.chars().count()));
+                mood(&format!("{} · {step}", self.word), seconds)
+            }
+            (None, None) => mood(self.word, seconds),
         };
         format!(
             "{}{} {}{}",
@@ -141,6 +170,7 @@ impl Waiting {
 #[cfg(test)]
 mod tests {
     use super::{LONG, TOO_LONG, Waiting, spell};
+    use crate::render::{MARGIN, visible};
 
     #[test]
     fn the_wait_is_spelled_the_way_people_say_it() {
@@ -158,6 +188,27 @@ mod tests {
 
     #[test]
     fn the_line_says_something_from_the_first_moment() {
-        assert!(!Waiting::new().line().trim().is_empty());
+        assert!(!Waiting::new().line(80).trim().is_empty());
+    }
+
+    #[test]
+    fn the_wait_names_the_step_and_still_fits_a_narrow_window() {
+        let step = "Write the parser for every format the importer has to read";
+        let wide = Waiting::during(step).line(200);
+        assert!(wide.contains(&format!(" · {step}")), "{wide}");
+        for width in [30, 40, 60] {
+            let line = Waiting::during(step).line(width);
+            assert!(visible(&line) <= width - MARGIN.len(), "{line}");
+            assert!(line.contains(" · Wri"), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_renamed_wait_keeps_its_clock() {
+        let wait = Waiting::about("read_file(a) and 1 more");
+        let began = wait.began;
+        let wait = wait.renamed("read_file(b)");
+        assert_eq!(wait.began, began);
+        assert_eq!(wait.about.as_deref(), Some("read_file(b)"));
     }
 }
