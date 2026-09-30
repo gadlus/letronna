@@ -142,7 +142,7 @@ pub(crate) fn ask(
         SETTLED.notify_all();
     });
     // Per tool, and for a resource read per server too, as a session's grants are.
-    let key = (run, crate::gate::grant(call));
+    let key = (run, crate::gate::run_grant(call));
     // The grant answers for this tool from whichever call first asked about
     // it, so it covers this one only if this one clears on its own. Worked
     // out before the lock, since letting go of it between the check and the
@@ -498,9 +498,36 @@ pub(crate) mod tests {
             name: "use_page".into(),
             arguments: format!(r#"{{"action": "{action}", "ref": "e1"}}"#),
         };
-        assert_eq!(crate::gate::grant(&page("click")), "use_page");
-        assert_eq!(crate::gate::grant(&page("upload")), "use_page upload");
-        assert_eq!(crate::gate::grant(&call("a", "write_file")), "write_file");
+        assert_eq!(crate::gate::run_grant(&page("click")), "use_page");
+        assert_eq!(crate::gate::run_grant(&page("upload")), "use_page upload");
+        assert_eq!(
+            crate::gate::run_grant(&call("a", "write_file")),
+            "write_file"
+        );
+    }
+
+    #[test]
+    fn a_yes_for_the_run_to_a_batch_covers_only_batches_of_the_same_steps() {
+        let batch = |steps: &str| ToolCall {
+            id: "b".into(),
+            name: "use_page".into(),
+            arguments: format!(r#"{{"action": "batch", "steps": {steps}}}"#),
+        };
+        let hovers =
+            batch(r#"[{"action": "hover", "ref": "e1"}, {"action": "click", "ref": "e2"}]"#);
+        assert_eq!(
+            crate::gate::run_grant(&hovers),
+            "use_page batch of browse, use_page"
+        );
+        // Neither a yes to use_page nor one to browse is a yes to it, nor it
+        // to them, and one with an upload among its steps is apart again.
+        let sends =
+            batch(r#"[{"action": "click", "ref": "e2"}, {"action": "upload", "ref": "e3"}]"#);
+        assert_eq!(
+            crate::gate::run_grant(&sends),
+            "use_page batch of use_page, use_page upload"
+        );
+        assert_eq!(crate::gate::run_grant(&batch("[]")), "use_page batch");
     }
 
     #[test]

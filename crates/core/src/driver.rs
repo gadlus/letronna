@@ -432,7 +432,7 @@ fn work_through(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result
             continue;
         }
         let gate = |call: &ToolCall| match decide(call) {
-            Some(outcome) if refusal(&spec.allow, &call.name).is_none() => outcome,
+            Some(outcome) if call_refusal(&spec.allow, call).is_none() => outcome,
             // A call this agent may not make runs into its refusal in `dispatch`.
             _ => gated(spec, call, &rules),
         };
@@ -486,7 +486,7 @@ fn dispatch(
     {
         return Some(answer(schema, &call.arguments, report));
     }
-    if let Some(refused) = refusal(&spec.allow, &call.name) {
+    if let Some(refused) = call_refusal(&spec.allow, call) {
         return Some(Err(refused));
     }
     tell(spec, Step::Running(call.id.clone()));
@@ -566,7 +566,7 @@ fn gated(spec: &Spec, call: &ToolCall, rules: &Result<Vec<Rule>, String>) -> cra
     // A call this agent may not make runs into its refusal in `dispatch`,
     // and its answer is no tool the gate knows.
     let answer = call.name == STRUCTURED_OUTPUT && spec.schema.is_some();
-    if answer || refusal(&spec.allow, &call.name).is_some() {
+    if answer || call_refusal(&spec.allow, call).is_some() {
         return crate::gate::Outcome::Run;
     }
     let ctx = context(spec);
@@ -586,6 +586,16 @@ fn gated(spec: &Spec, call: &ToolCall, rules: &Result<Vec<Rule>, String>) -> cra
         crate::gate::Outcome::Run if tools::needs_approval(&call.name) => crate::gate::Outcome::Ask,
         outcome => outcome,
     }
+}
+
+/// Why this agent may not make `call`, when it may not: its tool, or for a
+/// batch of browser steps the tool of any step, which runs as that tool's.
+fn call_refusal(allow: &Allow, call: &ToolCall) -> Option<String> {
+    let steps = crate::browser::batch_calls(call).and_then(Result::ok);
+    let names = steps.iter().flatten().map(|step| step.name.as_str());
+    std::iter::once(call.name.as_str())
+        .chain(names)
+        .find_map(|name| refusal(allow, name))
 }
 
 /// What this agent's tool calls can reach, stopping when it stops.
@@ -1165,6 +1175,31 @@ mod tests {
                 "`write_file` is not available to this helper.",
                 "`memory` is not available to this helper."
             ]
+        );
+    }
+
+    #[test]
+    fn a_batch_step_of_a_tool_it_may_not_use_is_refused_not_asked_about() {
+        let dir = scratch("refused-step");
+        let steps = json!([
+            {"action": "click", "ref": "e1"},
+            {"action": "hover", "ref": "e2"}
+        ]);
+        let (endpoint, provider) = provider(vec![
+            reply(
+                "",
+                &[("use_page", json!({"action": "batch", "steps": steps}))],
+            ),
+            reply("I could not do that.", &[]),
+        ]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 100);
+        // A hover is browse's, which this helper was not given.
+        spec.allow = Allow::Only(vec!["use_page".into()]);
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(
+            results(&provider.sent()[1]),
+            ["`browse` is not available to this helper."]
         );
     }
 
