@@ -1,15 +1,18 @@
 use crate::prelude::*;
+use letronna_core::gate::Mode;
 
 type ApplyMode = std::rc::Rc<dyn Fn(plugins::PresenceMode, &mut App)>;
 
 const PAGES: &[(&str, AppIcon)] = &[
     ("Account", AppIcon::User),
+    ("Usage", AppIcon::Clock),
     ("Gateways", AppIcon::Plugs),
     ("Search", AppIcon::Search),
     ("Model", AppIcon::Robot),
     ("Appearance", AppIcon::Palette),
     ("Thinking", AppIcon::Sparkles),
     ("Privacy", AppIcon::Shield),
+    ("MCP", AppIcon::PlugsConnected),
     ("Plugins", AppIcon::Puzzle),
     ("About", AppIcon::Info),
 ];
@@ -49,7 +52,7 @@ impl Chat {
         } else {
             self.keys.insert(slot.to_owned(), address);
         }
-        self.write_keys();
+        self.write_keys(slot);
         letronna_core::browser::restart();
         cx.notify();
     }
@@ -61,14 +64,12 @@ impl Chat {
         self.save_browser_address(cx);
     }
 
-    fn write_keys(&mut self) {
-        if std::fs::create_dir_all(backend::data_dir())
-            .and_then(|_| {
-                std::fs::write(keys_path(), serde_json::to_vec_pretty(&self.keys).unwrap())
-            })
-            .is_err()
-        {
-            self.error = Some("Could not save the API key.".into());
+    /// Save the window's key for `slot`, or its removal, and nothing else, so
+    /// a key the terminal saved meanwhile is kept and seen here too.
+    fn write_keys(&mut self, slot: &str) {
+        match save_key(slot, self.keys.get(slot).map(String::as_str)) {
+            Ok(keys) => self.keys = keys,
+            Err(_) => self.error = Some("Could not save the API key.".into()),
         }
     }
 
@@ -89,7 +90,7 @@ impl Chat {
         } else {
             self.keys.insert(slot, key);
         }
-        self.write_keys();
+        self.write_keys(key_slot(&editing));
         self.save();
         self.gateway_pick.update(cx, |g, cx| {
             g.clear();
@@ -109,7 +110,7 @@ impl Chat {
         if gateway(name).base.is_empty() {
             self.store.settings.custom_endpoint.clear();
         }
-        self.write_keys();
+        self.write_keys(key_slot(name));
         self.save();
         self.gateway_pick.update(cx, |g, cx| {
             g.clear();
@@ -176,7 +177,7 @@ impl Chat {
             } else {
                 self.keys.insert(service.name.to_owned(), key);
             }
-            self.write_keys();
+            self.write_keys(service.name);
         }
         choice.service = service.name.to_owned();
         if let Err(error) = letronna_core::search::choose(&choice) {
@@ -198,7 +199,7 @@ impl Chat {
         let mut choice = letronna_core::search::choice();
         choice.set_address(service, "");
         if self.keys.remove(name).is_some() {
-            self.write_keys();
+            self.write_keys(name);
         }
         if choice.service == name {
             choice.service.clear();
@@ -213,9 +214,14 @@ impl Chat {
         cx.notify();
     }
 
-    /// The Model page's Save: the default model.
+    /// The Model page's Save: the default model, and the session on screen's
+    /// when it was changed here, as a pick from the composer changes both.
     pub(crate) fn apply_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.store.settings.model = self.model.read(cx).value().to_string();
+        let typed = self.model.read(cx).value().to_string();
+        if typed != self.store.settings.model {
+            let gateway = self.store.settings.gateway.clone();
+            self.store.choose_model(self.store.active, &gateway, &typed);
+        }
         // Cleared before saving, not after: clearing last threw away the very
         // error that says the save failed.
         self.error = None;
@@ -236,6 +242,9 @@ impl Chat {
         self.settings_focus.focus(window);
         // The terminal may have signed in or out since this last looked.
         self.refresh_account(cx);
+        if *self.settings_page.read(cx) == "Usage" {
+            self.load_usage(cx);
+        }
         cx.notify();
     }
 
@@ -325,6 +334,7 @@ impl Chat {
                 .justify_center()
                 .children(blur)
                 .child(scrim)
+                .children(self.grain(&self.grains.settings))
                 .child(panel)
                 .into_any_element(),
         )
@@ -354,6 +364,7 @@ impl Chat {
                 .border_color(cx.theme().border),
             |nav, (name, icon)| {
                 let page = page.clone();
+                let chat = chat.clone();
                 let active = *name == current_page;
                 nav.child(
                     h_flex()
@@ -368,7 +379,7 @@ impl Chat {
                         .font_family(HEADING_FONT)
                         .font_weight(FontWeight::MEDIUM)
                         .when(active, |this| this.bg(cx.theme().sidebar_accent))
-                        .hover(|s| s.bg(cx.theme().sidebar_accent.opacity(0.6)))
+                        .active(|s| s.bg(cx.theme().sidebar_accent.opacity(0.6)))
                         .child(
                             Icon::new(*icon)
                                 .size_4()
@@ -379,19 +390,19 @@ impl Chat {
                             page.update(cx, |p, cx| {
                                 *p = name;
                                 cx.notify();
-                            })
+                            });
+                            if *name == "Usage" {
+                                chat.update(cx, |this, cx| this.load_usage(cx));
+                            }
                         }),
                 )
             },
         );
         let body: AnyElement = match current_page {
             "Model" => model_page(&model, &chat, cx).into_any_element(),
-            "Appearance" => text_page(
-                "Appearance",
-                "Dark theme with the Letronna palette. Theme and font options land here later.",
-                cx,
-            )
-            .into_any_element(),
+            "Appearance" => {
+                appearance_page(&chat, &self.store.settings, window, cx).into_any_element()
+            }
             "Privacy" => privacy_page(
                 &chat,
                 &presence,
@@ -401,8 +412,10 @@ impl Chat {
             )
             .into_any_element(),
             "Account" => super::account::account_page(&chat, self, cx).into_any_element(),
-            "Thinking" => thinking_page(&chat, &self.store.settings, cx).into_any_element(),
+            "Usage" => super::usage::usage_page(self.usage_report.as_ref(), cx).into_any_element(),
+            "Thinking" => thinking_page(&chat, &self.store, cx).into_any_element(),
             "Plugins" => plugins_page(&chat, cx).into_any_element(),
+            "MCP" => super::mcp::mcp_page(&chat, window, cx).into_any_element(),
             "About" => about_page(&chat, self, cx).into_any_element(),
             "Search" => search_page(self.search_rows(), &pick, &endpoint, &key, &chat, cx)
                 .into_any_element(),
@@ -424,7 +437,6 @@ impl Chat {
             .border_1()
             .border_color(cx.theme().border)
             .rounded(cx.theme().radius_lg)
-            .shadow_lg()
             .child(
                 h_flex()
                     .h(height)
@@ -457,7 +469,7 @@ impl Chat {
                             .child(
                                 div().absolute().top_3().right_3().child(
                                     Button::new("close-settings")
-                                        .ghost()
+                                        .plain(cx)
                                         .xsmall()
                                         .icon(Icon::new(IconName::Close))
                                         .on_click(cx.listener(|this, _, window, cx| {
@@ -471,7 +483,7 @@ impl Chat {
 }
 
 fn plugins_page(chat: &Entity<Chat>, cx: &App) -> Div {
-    let mut list = v_flex().gap_2();
+    let mut list = v_flex();
     for info in plugins::list(cx) {
         let chat = chat.clone();
         let id = info.id;
@@ -530,9 +542,9 @@ fn plugins_page(chat: &Entity<Chat>, cx: &App) -> Div {
         list = list.child(
             v_flex()
                 .gap_2()
-                .p_3()
-                .rounded(cx.theme().radius)
-                .bg(cx.theme().secondary.opacity(0.3))
+                .py_3()
+                .border_b_1()
+                .border_color(cx.theme().border)
                 .child(row)
                 .children(settings),
         );
@@ -609,7 +621,7 @@ fn elsewhere_row(chat: &Entity<Chat>, address: &Entity<InputState>, cx: &App) ->
                 .child(div().flex_1().child(Input::new(address)))
                 .child(
                     Button::new("browser-elsewhere-clear")
-                        .ghost()
+                        .plain(cx)
                         .small()
                         .label("This computer")
                         .on_click(move |_, window, cx| {
@@ -635,7 +647,7 @@ fn privacy_page(
     settings: &Settings,
     cx: &App,
 ) -> Div {
-    let (skip, shared) = (settings.skip_approvals, settings.browser_shared);
+    let (default_mode, shared) = (settings.mode, settings.browser_shared);
     let unseen = settings.browse_unseen;
     let current = plugins::PresenceMode::from_str(presence.read(cx));
     let enabled = plugins::list(cx)
@@ -684,7 +696,7 @@ fn privacy_page(
         )
         .child(
             Button::new("presence-level")
-                .ghost()
+                .plain(cx)
                 .small()
                 .child(
                     h_flex()
@@ -727,32 +739,50 @@ fn privacy_page(
                 .flex_1()
                 .min_w_0()
                 .gap_0p5()
-                .child(div().text_sm().child("Skip tool approvals"))
+                .child(div().text_sm().child("Default mode"))
                 .child(
                     div()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
                         .child(
-                            "Let the agent write files and run commands without asking each time.",
+                            "The mode a session starts in; its chip by the message box changes \
+                             it for that session. Bypass writes files and runs commands without \
+                             asking, but some commands that are hard to undo, such as recursive \
+                             deletes and force pushes, still ask.",
                         ),
                 ),
         )
         .child(
-            div().flex_shrink_0().cursor_pointer().child(
-                gpui_component::switch::Switch::new("skip-approvals")
-                    .checked(skip)
-                    .on_click({
-                        let chat = chat.clone();
-                        move |_, _, cx| {
-                            chat.update(cx, |this, cx| {
-                                this.store.settings.skip_approvals = !skip;
-                                this.save();
-                                this.approvals_changed(cx);
-                                cx.notify();
-                            })
-                        }
-                    }),
-            ),
+            Button::new("default-mode")
+                .ghost()
+                .small()
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(default_mode.label())
+                        .child(Icon::new(IconName::ChevronDown).size_3()),
+                )
+                .dropdown_menu({
+                    let chat = chat.clone();
+                    move |menu, _, _| {
+                        Mode::OFFERED.into_iter().fold(menu, |menu, choice| {
+                            let chat = chat.clone();
+                            menu.item(
+                                PopupMenuItem::new(choice.label())
+                                    .checked(choice == default_mode)
+                                    .on_click(move |_, _, cx| {
+                                        chat.update(cx, |this, cx| {
+                                            this.store.settings.mode = choice;
+                                            this.save();
+                                            this.approvals_changed(cx);
+                                            cx.notify();
+                                        })
+                                    }),
+                            )
+                        })
+                    }
+                }),
         );
 
     let browser = h_flex()
@@ -994,8 +1024,99 @@ fn updates(chat: &Entity<Chat>, this: &Chat, cx: &App) -> Div {
         )))
 }
 
-fn text_page(title: &'static str, blurb: &'static str, cx: &App) -> Div {
-    v_flex().gap_4().child(heading(title, blurb, cx))
+/// Night, Paper or the computer's own, and the film grain on or off.
+fn appearance_page(
+    chat: &Entity<Chat>,
+    settings: &Settings,
+    window: &mut Window,
+    cx: &mut App,
+) -> Div {
+    const LOOKS: [(&str, &str, &str); 3] = [
+        ("", "night", "Night — deep blue around a near-black page"),
+        (
+            "paper",
+            "paper",
+            "Paper — ink on a light page, for daylight",
+        ),
+        (
+            "system",
+            "system",
+            "Follow system — Night or Paper as the computer is set",
+        ),
+    ];
+
+    let mut looks = v_flex().gap_2();
+    for (value, id, text) in LOOKS {
+        let active = settings.appearance == value;
+        // A tab stop of its own, so Tab reaches each choice and Enter or
+        // Space takes it.
+        let focus = window
+            .use_keyed_state(SharedString::from(format!("look-{id}")), cx, |_, cx| {
+                cx.focus_handle()
+            })
+            .read(cx)
+            .clone();
+        let chat = chat.clone();
+        looks = looks.child(
+            h_flex()
+                .id(id)
+                .track_focus(&focus.tab_stop(true))
+                .cursor_pointer()
+                .items_center()
+                .gap_2p5()
+                .p_2p5()
+                .rounded(cx.theme().radius)
+                .border_1()
+                .border_color(if active {
+                    cx.theme().primary
+                } else {
+                    cx.theme().border
+                })
+                .focus(|s| s.border_color(cx.theme().ring))
+                .child(div().flex_1().min_w_0().text_sm().child(text))
+                // Paper's focus ring is its primary blue, so the chosen row
+                // is told apart by its tick.
+                .when(active, |row| {
+                    row.child(
+                        Icon::new(IconName::Check)
+                            .small()
+                            .text_color(cx.theme().primary),
+                    )
+                })
+                .on_click(move |_, window, cx| {
+                    chat.update(cx, |this, cx| {
+                        this.store.settings.appearance = value.to_string();
+                        this.save();
+                        // The blurred snapshot behind settings still wears
+                        // the old colours; the live window shows through.
+                        this.settings_backdrop = None;
+                        crate::theme::apply(value, window, cx);
+                        cx.notify();
+                    })
+                }),
+        );
+    }
+
+    let grain = settings.grain;
+    let grain = toggle_row(
+        "grain",
+        "Film grain",
+        "A faint grain on the frame and the empty pages, as letronna.ai has. Never over the conversation, code or diffs.",
+        grain,
+        chat,
+        cx,
+        std::rc::Rc::new(move |this: &mut Chat| this.store.settings.grain = !grain),
+    );
+
+    v_flex()
+        .gap_4()
+        .child(heading(
+            "Appearance",
+            "How the window looks. Paper suits daylight; following the system switches with the computer.",
+            cx,
+        ))
+        .child(v_flex().gap_1().child(label("Theme", cx)).child(looks))
+        .child(grain)
 }
 
 fn model_page(model: &Entity<InputState>, chat: &Entity<Chat>, cx: &App) -> Div {
@@ -1026,27 +1147,30 @@ fn model_page(model: &Entity<InputState>, chat: &Entity<Chat>, cx: &App) -> Div 
         )
 }
 
-/// How hard the model thinks, whether that thinking is shown, and whether it
-/// may look things up.
+/// How hard the model thinks in the session on screen and new ones, whether
+/// that thinking is shown, and whether it may look things up.
 ///
-/// A model that cannot be told how hard to think ignores the setting, so
-/// there is nothing here that has to be matched against a capability list --
-/// and no list to match against, since the gateway does not publish one.
-fn thinking_page(chat: &Entity<Chat>, settings: &Settings, cx: &App) -> Div {
-    const LEVELS: [(&str, &str); 4] = [
-        ("", "Whatever the model likes"),
-        ("low", "Low — quick answers"),
-        ("medium", "Medium"),
-        ("high", "High — slower, and it shows"),
-    ];
+/// The effort levels are the ones the session's model offers, from its
+/// gateway's model list, or low, medium and high when the list does not say.
+/// The one marked is what the next request sends, which for a level picked on
+/// another model is the nearest this one offers.
+fn thinking_page(chat: &Entity<Chat>, store: &Store, cx: &App) -> Div {
+    let settings = &store.settings;
+    let (gateway, model) = store.model(store.active);
+    let endpoint = base_url(gateway, &settings.custom_endpoint);
+    let offered = letronna_core::models::efforts(&endpoint, model);
+    let effort = store.effort(store.active);
+    let sent = letronna_core::models::clamp(&offered, effort).map(|level| &*level.id);
+    let auto = ("", "Whatever the model likes");
+    let choices = offered.iter().map(|level| (&*level.id, &*level.label));
 
     let mut levels = v_flex().gap_2();
-    for (value, text) in LEVELS {
-        let active = settings.effort == value;
-        let chat = chat.clone();
+    for (at, (value, text)) in std::iter::once(auto).chain(choices).enumerate() {
+        let active = sent.unwrap_or_default() == value;
+        let (chat, value) = (chat.clone(), value.to_owned());
         levels = levels.child(
             h_flex()
-                .id(if value.is_empty() { "auto" } else { value })
+                .id(("effort", at))
                 .cursor_pointer()
                 .items_center()
                 .gap_2p5()
@@ -1058,10 +1182,10 @@ fn thinking_page(chat: &Entity<Chat>, settings: &Settings, cx: &App) -> Div {
                 } else {
                     cx.theme().border
                 })
-                .child(div().text_sm().child(text))
+                .child(div().text_sm().child(text.to_owned()))
                 .on_click(move |_, _, cx| {
                     chat.update(cx, |this, cx| {
-                        this.store.settings.effort = value.to_string();
+                        this.store.choose_effort(this.store.active, &value);
                         this.save();
                         cx.notify();
                     })
@@ -1119,7 +1243,11 @@ fn toggle_row(
         .items_center()
         .gap_4()
         .child(
+            // Shrinks and wraps, so a long line never pushes the switch
+            // off the page.
             v_flex()
+                .flex_1()
+                .min_w_0()
                 .gap_0p5()
                 .child(div().text_sm().child(title))
                 .child(
@@ -1258,7 +1386,7 @@ fn search_page(
             Button::new(("search-action", i))
                 .small()
                 .when(!row.set_up, |b| b.primary())
-                .when(row.set_up, |b| b.ghost())
+                .when(row.set_up, |b| b.plain(cx))
                 .label(if editing { "Close" } else { action })
                 .on_click(move |_, window, cx| {
                     chat.update(cx, |this, cx| this.select_search(name, window, cx))
@@ -1324,7 +1452,7 @@ fn search_page(
                         .child(div().flex_1().child(Input::new(endpoint)))
                         .child(
                             Button::new("search-reset")
-                                .ghost()
+                                .plain(cx)
                                 .small()
                                 .label("Reset")
                                 .on_click(move |_, window, cx| {
@@ -1356,7 +1484,7 @@ fn search_page(
                             .when(row.set_up, |d| {
                                 d.child(
                                     Button::new("search-remove")
-                                        .ghost()
+                                        .plain(cx)
                                         .small()
                                         .label("Remove")
                                         .on_click(move |_, _, cx| {
@@ -1417,7 +1545,7 @@ fn gateway_page(
             Button::new(("gw-action", i))
                 .small()
                 .when(!row.set_up, |b| b.primary())
-                .when(row.set_up, |b| b.ghost())
+                .when(row.set_up, |b| b.plain(cx))
                 .label(if editing { "Close" } else { action })
                 .on_click(move |_, window, cx| {
                     if action == "Sign in" {
@@ -1513,7 +1641,7 @@ fn gateway_page(
                             .when(row.set_up, |d| {
                                 d.child(
                                     Button::new("gw-remove")
-                                        .ghost()
+                                        .plain(cx)
                                         .small()
                                         .label("Remove")
                                         .on_click(move |_, window, cx| {

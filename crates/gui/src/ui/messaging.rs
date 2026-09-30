@@ -1,7 +1,7 @@
 //! The Messaging page: a channel list beside the setup for the selected one.
 
 use crate::prelude::*;
-use letronna_core::messaging;
+use letronna_core::messaging::{self, pairing};
 
 struct Channel {
     name: &'static str,
@@ -111,7 +111,7 @@ impl Chat {
                     .when(selected, |this| this.bg(cx.theme().sidebar_accent))
                     .when(*ready, |this| {
                         this.cursor_pointer()
-                            .hover(|s| s.bg(cx.theme().sidebar_accent.opacity(0.6)))
+                            .active(|s| s.bg(cx.theme().sidebar_accent.opacity(0.6)))
                     })
                     .child(badge(channel))
                     .child(
@@ -168,7 +168,7 @@ impl Chat {
         let enabled = config.telegram.enabled;
         let allow_tools = config.telegram.allow_tools;
 
-        let mut pills = h_flex().gap_1p5().items_center();
+        let mut pills = h_flex().flex_wrap().gap_1p5().items_center();
         pills = pills.child(pill(
             if enabled && has_token {
                 "Enabled"
@@ -190,66 +190,97 @@ impl Chat {
             pills = pills.child(pill("Listening", cx.theme().green, cx));
         }
 
-        let chat_block = match (self.pairing.clone(), config.telegram.chat) {
-            (Some((chat, from)), _) => v_flex()
-                .gap_2()
-                .child(help(
-                    &format!("{from} messaged your bot from chat {chat}."),
-                    cx,
-                ))
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .child(
-                            Button::new("allow-chat")
-                                .primary()
-                                .small()
-                                .label("Allow this chat")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.messaging.telegram.chat = Some(chat);
-                                    this.pairing = None;
-                                    this.save_messaging(cx);
-                                })),
-                        )
-                        .child(
-                            Button::new("ignore-chat")
-                                .ghost()
-                                .small()
-                                .label("Ignore")
+        let now = std::time::Instant::now();
+        let chat_block = match (self.pairing.as_ref(), config.telegram.chat) {
+            (Some(code), _) if code.live(now) => {
+                let mut said = format!(
+                    "Send this code to your bot from the chat it should answer; in a \
+                     group, mention the bot first. It works for {} minutes.",
+                    pairing::LIFE.as_secs() / 60
+                );
+                if code.wrong() > 0 {
+                    said.push_str(&format!(" Wrong codes so far: {}.", code.wrong()));
+                }
+                v_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xl()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(code.code.clone()),
+                    )
+                    .child(help(&said, cx))
+                    .child(
+                        h_flex().child(
+                            Button::new("cancel-code")
+                                .plain(cx)
+                                .xsmall()
+                                .label("Cancel")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.pairing = None;
                                     cx.notify();
                                 })),
                         ),
-                )
-                .into_any_element(),
+                    )
+                    .into_any_element()
+            }
             (None, Some(chat)) => h_flex()
                 .gap_2()
                 .items_center()
                 .child(help(
-                    &format!("Answering chat {chat}, and nothing else."),
+                    &match pairing::owner(&config.telegram) {
+                        Some(_) => format!(
+                            "Answering chat {chat}, and nothing else. Only the person who \
+                             paired it answers what Letronna asks there."
+                        ),
+                        None => format!(
+                            "Answering chat {chat}, and nothing else. It was paired before \
+                             owners were kept, so what Letronna asks there is answered here; \
+                             forget it and pair again to answer from the chat."
+                        ),
+                    },
                     cx,
                 ))
                 .child(
                     Button::new("forget-chat")
-                        .ghost()
+                        .plain(cx)
                         .xsmall()
                         .label("Forget")
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.messaging.telegram.chat = None;
+                            this.messaging.telegram.owner = None;
                             this.save_messaging(cx);
                         })),
                 )
                 .into_any_element(),
-            (None, None) => help(
-                if has_token {
-                    "Send your bot a message and it will appear here to allow."
-                } else {
-                    "Add a bot token first."
-                },
-                cx,
-            )
-            .into_any_element(),
+            _ if !has_token => help("Add a bot token first.", cx).into_any_element(),
+            (spent, _) => h_flex()
+                .gap_2()
+                .items_center()
+                .child(help(
+                    match spent {
+                        Some(_) => "That code ran out or was guessed at too often.",
+                        None => "Pair the chat Letronna should answer with a code sent from it.",
+                    },
+                    cx,
+                ))
+                .child(
+                    Button::new("pair-chat")
+                        .primary()
+                        .small()
+                        .label(match spent {
+                            Some(_) => "New code",
+                            None => "Pair a chat",
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            match pairing::Code::new() {
+                                Ok(code) => this.pairing = Some(code),
+                                Err(error) => this.error = Some(error),
+                            }
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
         };
 
         v_flex()
@@ -274,6 +305,7 @@ impl Chat {
                                     .gap_1p5()
                                     .child(
                                         h_flex()
+                                            .flex_wrap()
                                             .gap_2p5()
                                             .items_center()
                                             .child(badge(&CHANNELS[0]))
@@ -302,7 +334,7 @@ impl Chat {
                                     .child(
                                         h_flex().child(
                                             Button::new("botfather")
-                                                .outline()
+                                                .framed(cx)
                                                 .xsmall()
                                                 .label("Open @BotFather")
                                                 .on_click(|_, _, cx| {
@@ -354,15 +386,17 @@ impl Chat {
                                             .items_center()
                                             .justify_between()
                                             .gap_4()
-                                            .child(field(
+                                            // The hint takes what the switch leaves, or
+                                            // it shrinks to a letter per line.
+                                            .child(div().flex_1().min_w_0().child(field(
                                                 "Let messages use tools",
                                                 "Off, a message can read and search but not write \
                                                  or run anything, because nobody on the other end \
                                                  can answer an approval card.",
                                                 cx,
-                                            ))
+                                            )))
                                             .child(
-                                                div().cursor_pointer().child(
+                                                div().flex_shrink_0().cursor_pointer().child(
                                                     gpui_component::switch::Switch::new(
                                                         "allow-remote-tools",
                                                     )
@@ -383,18 +417,21 @@ impl Chat {
             .child(
                 h_flex()
                     .w_full()
+                    .flex_wrap()
                     .items_center()
                     .justify_between()
+                    .gap_2()
                     .px_6()
                     .py_3()
                     .border_t_1()
                     .border_color(cx.theme().border)
                     .child(
                         h_flex()
+                            .min_w_0()
                             .gap_2p5()
                             .items_center()
                             .child(
-                                div().cursor_pointer().child(
+                                div().flex_shrink_0().cursor_pointer().child(
                                     gpui_component::switch::Switch::new("messaging-enabled")
                                         .checked(enabled)
                                         .disabled(!has_token)
@@ -406,6 +443,7 @@ impl Chat {
                             )
                             .child(
                                 div()
+                                    .min_w_0()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
                                     .child(if has_token {
@@ -441,11 +479,37 @@ impl Chat {
             "Discord" => self.discord_pane(cx).into_any_element(),
             _ => self.telegram_pane(cx).into_any_element(),
         };
-        h_flex()
+        v_flex()
             .flex_1()
             .min_h_0()
-            .child(self.channel_list(cx))
-            .child(pane)
+            .child(
+                v_flex()
+                    .px_8()
+                    .py_6()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xl()
+                            .font_family(HEADING_FONT)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(Page::Messaging.title()),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(Page::Messaging.blurb()),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .child(self.channel_list(cx))
+                    .child(pane),
+            )
     }
 }
 
@@ -468,7 +532,7 @@ fn badge(channel: &Channel) -> impl IntoElement {
         )
 }
 
-fn pill(text: &'static str, colour: Hsla, cx: &App) -> impl IntoElement {
+pub(crate) fn pill(text: &'static str, colour: Hsla, cx: &App) -> impl IntoElement {
     h_flex()
         .gap_1p5()
         .items_center()
@@ -589,6 +653,7 @@ impl Chat {
         let allow_tools = config.allow_tools;
 
         let pills = h_flex()
+            .flex_wrap()
             .gap_1p5()
             .items_center()
             .child(pill(
@@ -630,6 +695,7 @@ impl Chat {
                                     .gap_1p5()
                                     .child(
                                         h_flex()
+                                            .flex_wrap()
                                             .gap_2p5()
                                             .items_center()
                                             .child(badge(channel))
@@ -671,7 +737,7 @@ impl Chat {
                                     .child(
                                         h_flex().child(
                                             Button::new("discord-portal")
-                                                .outline()
+                                                .framed(cx)
                                                 .xsmall()
                                                 .label("Open the Developer Portal")
                                                 .on_click(|_, _, cx| {
@@ -727,15 +793,17 @@ impl Chat {
                                             .items_center()
                                             .justify_between()
                                             .gap_4()
-                                            .child(field(
+                                            // The hint takes what the switch leaves, or
+                                            // it shrinks to a letter per line.
+                                            .child(div().flex_1().min_w_0().child(field(
                                                 "Let messages use tools",
                                                 "Off, a message can read and search but not write \
                                                  or run anything, because nobody on the other end \
                                                  can answer an approval card.",
                                                 cx,
-                                            ))
+                                            )))
                                             .child(
-                                                div().cursor_pointer().child(
+                                                div().flex_shrink_0().cursor_pointer().child(
                                                     gpui_component::switch::Switch::new(
                                                         "discord-allow-tools",
                                                     )
@@ -776,18 +844,21 @@ impl Chat {
             .child(
                 h_flex()
                     .w_full()
+                    .flex_wrap()
                     .items_center()
                     .justify_between()
+                    .gap_2()
                     .px_6()
                     .py_3()
                     .border_t_1()
                     .border_color(cx.theme().border)
                     .child(
                         h_flex()
+                            .min_w_0()
                             .gap_2p5()
                             .items_center()
                             .child(
-                                div().cursor_pointer().child(
+                                div().flex_shrink_0().cursor_pointer().child(
                                     gpui_component::switch::Switch::new("discord-enabled")
                                         .checked(enabled)
                                         .disabled(!has_hook && !has_bot)
@@ -799,6 +870,7 @@ impl Chat {
                             )
                             .child(
                                 div()
+                                    .min_w_0()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
                                     .child(if has_bot {
@@ -816,7 +888,7 @@ impl Chat {
                             .when(live, |this| {
                                 this.child(
                                     Button::new("test-discord")
-                                        .outline()
+                                        .framed(cx)
                                         .small()
                                         .label("Send a test")
                                         .on_click(cx.listener(|this, _, _, cx| {

@@ -109,6 +109,28 @@ pub fn finish(key: &Key, state: State, notice: Option<Notice>) {
     }
 }
 
+/// Pass on news from work that is still going to whoever hears from it now;
+/// once it has finished, or been stopped, there is nothing more to tell.
+pub fn tell(key: &Key, notice: Notice) {
+    let to = {
+        let Ok(tasks) = registry().lock() else {
+            return;
+        };
+        let Some(task) = tasks.get(key) else {
+            return;
+        };
+        if task.notified {
+            return;
+        }
+        climb(&tasks, task.owner, |state| {
+            !matches!(state, State::Running | State::Idle)
+        })
+    };
+    if to != 0 {
+        inbox::push(to, notice);
+    }
+}
+
 /// Every piece of work a session started, its helpers' work included.
 pub fn list(session: u64) -> Vec<Task> {
     let Ok(tasks) = registry().lock() else {

@@ -105,7 +105,7 @@ impl Chat {
                         state => state,
                     };
                     if fresh {
-                        this.update_note = Some(this.update_status());
+                        this.note = Some(this.update_status());
                     }
                     cx.notify();
                 });
@@ -210,7 +210,7 @@ impl Chat {
         let out = matches!(self.updating, Updating::Out(_));
         Some(
             Button::new("update-chip")
-                .ghost()
+                .plain(cx)
                 .xsmall()
                 .label(label)
                 .disabled(self.busy)

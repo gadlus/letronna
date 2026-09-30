@@ -3,15 +3,22 @@
 //! These always go to the account API, whichever gateway the chat itself
 //! uses: only Letronna sells them, and they are paid from the signed-in
 //! account's credit. So every one of them asks first -- it spends money --
-//! and its card says so.
+//! and its card says so. None is offered while signed out, when it could
+//! only fail.
 //!
 //! What is made is saved as a file: in `media/` in the project folder, or in
 //! Letronna's own data folder when no project is attached. The result starts
 //! with `Saved to <path>`, which is how the window finds the file to show.
+//! A picture read_file opened or an MCP server sent, and one the user
+//! attached, is saved the same way but always in Letronna's own folder, as
+//! browse's screenshots are: it belongs to the session, and looking writes
+//! nothing into the project. The chat shows the newest few to the model.
 
+use crate::chat::Connection;
 use crate::tools::{Tool, ToolContext};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -27,6 +34,9 @@ const VIDEO_POLL: Duration = Duration::from_secs(5);
 const VIDEO_WAIT: Duration = Duration::from_secs(600);
 /// The largest file the API takes for transcription.
 const UPLOAD_BYTES: u64 = 25 * 1024 * 1024;
+/// The largest picture a model is sent: Anthropic refuses one over 5 MB of
+/// base64, which is four thirds of the file.
+pub const PICTURE_BYTES: usize = 5 * 1024 * 1024 / 4 * 3;
 
 pub struct MakeImage;
 impl Tool for MakeImage {
@@ -45,6 +55,9 @@ impl Tool for MakeImage {
     }
     fn needs_approval(&self) -> bool {
         true
+    }
+    fn offered(&self, _: &Connection) -> bool {
+        crate::auth::signed_in()
     }
     fn mutates(&self) -> bool {
         true
@@ -108,6 +121,9 @@ impl Tool for Speak {
     fn needs_approval(&self) -> bool {
         true
     }
+    fn offered(&self, _: &Connection) -> bool {
+        crate::auth::signed_in()
+    }
     fn mutates(&self) -> bool {
         true
     }
@@ -165,6 +181,9 @@ impl Tool for Transcribe {
     fn needs_approval(&self) -> bool {
         true
     }
+    fn offered(&self, _: &Connection) -> bool {
+        crate::auth::signed_in()
+    }
     // It changes nothing on disk, but it spends credit, which plan mode is
     // not for.
     fn mutates(&self) -> bool {
@@ -180,34 +199,49 @@ impl Tool for Transcribe {
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         let raw = required(args, "path")?;
         let path = crate::tools::resolve(raw, ctx)?;
-        let length = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
-        if length > UPLOAD_BYTES {
-            return Err(format!(
-                "`{raw}` is {}; files up to 25 MB can be transcribed. Cut it into parts first.",
-                size(length as usize)
-            ));
-        }
-        let audio = std::fs::read(&path).map_err(|e| e.to_string())?;
-        let token = token()?;
-        let (boundary, form) = form(&path, &audio, model_for(args, "transcription").as_deref());
-        let reply: Value = send(
-            client(MAKE_TIME)?
-                .post(endpoint("/audio/transcriptions"))
-                .bearer_auth(&token)
-                .header(
-                    reqwest::header::CONTENT_TYPE,
-                    format!("multipart/form-data; boundary={boundary}"),
-                )
-                .body(form),
-        )?
-        .json()
-        .map_err(|_| "The transcript came back in a form Letronna could not read.".to_owned())?;
-        let text = reply["text"].as_str().unwrap_or_default().trim();
+        let text = transcribe(&path, args)?;
         if text.is_empty() {
             return Ok(format!("No speech was heard in `{raw}`."));
         }
         Ok(format!("Transcript of `{raw}`:\n\n{text}"))
     }
+}
+
+/// The speech in the audio file at `path` as text, empty when none was
+/// heard, on the transcription model the user picked; paid from the
+/// signed-in account's credit, so the caller asks first.
+pub fn transcribe_path(path: &Path) -> Result<String, String> {
+    transcribe(path, &Value::Null)
+}
+
+/// `transcribe_path` on the model `args` names, if it names one.
+fn transcribe(path: &Path, args: &Value) -> Result<String, String> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let length = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
+    if length > UPLOAD_BYTES {
+        return Err(format!(
+            "`{name}` is {}; files up to 25 MB can be transcribed. Cut it into parts first.",
+            size(length as usize)
+        ));
+    }
+    let audio = std::fs::read(path).map_err(|e| e.to_string())?;
+    let token = token()?;
+    let model = model_for(args, "transcription");
+    let fields: Vec<(&str, &str)> = model.iter().map(|m| ("model", m.as_str())).collect();
+    let (boundary, form) = form(&fields, "file", path, &audio);
+    let reply: Value = send(
+        client(MAKE_TIME)?
+            .post(endpoint("/audio/transcriptions"))
+            .bearer_auth(&token)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(form),
+    )?
+    .json()
+    .map_err(|_| "The transcript came back in a form Letronna could not read.".to_owned())?;
+    Ok(reply["text"].as_str().unwrap_or_default().trim().to_owned())
 }
 
 pub struct MakeVideo;
@@ -228,6 +262,9 @@ impl Tool for MakeVideo {
     }
     fn needs_approval(&self) -> bool {
         true
+    }
+    fn offered(&self, _: &Connection) -> bool {
+        crate::auth::signed_in()
     }
     fn mutates(&self) -> bool {
         true
@@ -316,6 +353,35 @@ pub fn saved(result: &str) -> Option<PathBuf> {
         .next()?
         .strip_prefix(SAVED)
         .map(PathBuf::from)
+}
+
+/// The tools whose results start with `SAVED` and the file they wrote; an
+/// MCP tool's too, which saves the pictures its server sends.
+const SAVERS: [&str; 5] = [
+    "make_image",
+    "speak",
+    "make_video",
+    "read_file",
+    crate::browser::BROWSE,
+];
+
+/// The file `tool`'s result says it saved, believed only from `SAVERS`, and
+/// from browse only when Windows would open it as a plain file.
+pub fn saved_by(tool: &str, result: &str) -> Option<PathBuf> {
+    // Any other result -- a file read out, a command's output -- can start
+    // with the same words, and the window would then open that path.
+    if !SAVERS.contains(&tool) && !crate::mcp::is_tool(tool) {
+        return None;
+    }
+    let path = saved(result)?;
+    // A page's title heads browse's listing, so a page can write this line
+    // and name any share. The media tools write theirs themselves, into the
+    // project, which may sit on a share of its own.
+    let named_by_page = tool == crate::browser::BROWSE;
+    if named_by_page && crate::paths::unsafe_raw(&path.to_string_lossy(), None).is_some() {
+        return None;
+    }
+    Some(path)
 }
 
 /// What the hosted models make besides text, as the model menus name each
@@ -501,6 +567,22 @@ fn card(what: String, args: &Value, kind: &str) -> String {
     format!("{what}\n\nMade by {model}, paid from your Letronna credit.")
 }
 
+/// Save a picture the user attached, in Letronna's own `media/` as browse's
+/// screenshots are: it belongs to the session, not the project. `name` is
+/// what it was called.
+pub fn attach(name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    let kind =
+        picture_kind(bytes).ok_or("Only a PNG, JPEG, GIF or WebP picture can be attached.")?;
+    if bytes.len() > PICTURE_BYTES {
+        return Err(format!(
+            "The picture is {}; the most a model is sent is {}.",
+            size(bytes.len()),
+            size(PICTURE_BYTES)
+        ));
+    }
+    save(&ToolContext::default(), name, kind, bytes)
+}
+
 /// Save what was made under `media/`, named after what it shows and when.
 pub(crate) fn save(
     ctx: &ToolContext,
@@ -520,14 +602,27 @@ pub(crate) fn save(
         chrono::Local::now().format("%Y%m%d-%H%M%S")
     );
     let mut path = dir.join(format!("{name}.{extension}"));
-    // Two made in the same second must not overwrite each other.
+    // Two made in the same second must not overwrite each other, even when
+    // made at once, as two pictures read_file opens side by side can be.
     let mut n = 2;
-    while path.exists() {
-        path = dir.join(format!("{name}-{n}.{extension}"));
-        n += 1;
+    loop {
+        let created = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path);
+        match created {
+            Ok(mut file) => {
+                file.write_all(bytes)
+                    .map_err(|e| format!("Cannot save {}: {e}", path.display()))?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                path = dir.join(format!("{name}-{n}.{extension}"));
+                n += 1;
+            }
+            Err(e) => return Err(format!("Cannot save {}: {e}", path.display())),
+        }
     }
-    std::fs::write(&path, bytes).map_err(|e| format!("Cannot save {}: {e}", path.display()))?;
-    Ok(path)
 }
 
 /// The first words of a description, as a file name carries them anywhere.
@@ -553,10 +648,16 @@ fn slug(text: &str) -> String {
     }
 }
 
-/// The multipart form the transcription route takes, and its boundary.
-/// Written out here because reqwest's own needs a feature built into nothing
-/// else.
-fn form(path: &Path, audio: &[u8], model: Option<&str>) -> (String, Vec<u8>) {
+/// A multipart form of the text `fields` and then `bytes` as the file
+/// `field`, named as `path` is, and its boundary: what the transcription
+/// route and the chat apps' uploads take. Written out here because
+/// reqwest's own needs a feature built into nothing else.
+pub(crate) fn form(
+    fields: &[(&str, &str)],
+    field: &str,
+    path: &Path,
+    bytes: &[u8],
+) -> (String, Vec<u8>) {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -566,35 +667,35 @@ fn form(path: &Path, audio: &[u8], model: Option<&str>) -> (String, Vec<u8>) {
     let name: String = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "audio".into())
+        .unwrap_or_else(|| "file".into())
         .chars()
         .map(|c| if c == '"' || c.is_control() { '_' } else { c })
         .collect();
-    let mut body = Vec::with_capacity(audio.len() + 512);
-    if let Some(model) = model {
+    let mut body = Vec::with_capacity(bytes.len() + 512);
+    for (key, value) in fields {
         body.extend_from_slice(
             format!(
-                "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n{model}\r\n"
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\r\n{value}\r\n"
             )
             .as_bytes(),
         );
     }
     body.extend_from_slice(
         format!(
-            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\n\
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"; filename=\"{name}\"\r\n\
              Content-Type: {}\r\n\r\n",
-            audio_type(path)
+            file_type(path)
         )
         .as_bytes(),
     );
-    body.extend_from_slice(audio);
+    body.extend_from_slice(bytes);
     body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
     (boundary, body)
 }
 
-/// What kind of audio a file is, from its name; some models refuse a file
+/// What kind of file a file is, from its name; some models refuse audio
 /// they are not told the kind of.
-fn audio_type(path: &Path) -> &'static str {
+fn file_type(path: &Path) -> &'static str {
     let extension = path
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
@@ -606,19 +707,42 @@ fn audio_type(path: &Path) -> &'static str {
         "ogg" | "oga" | "opus" => "audio/ogg",
         "webm" => "audio/webm",
         "flac" => "audio/flac",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
         _ => "application/octet-stream",
     }
 }
 
 /// The file type an image's first bytes say it is.
 fn image_extension(bytes: &[u8]) -> &'static str {
-    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
-        "jpg"
+    picture_kind(bytes).unwrap_or("png")
+}
+
+/// The file type of a picture every provider takes -- PNG, JPEG, GIF or
+/// WebP -- as its first bytes say; None for anything else.
+pub fn picture_kind(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("jpg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("gif")
     } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(&b"WEBP"[..]) {
-        "webp"
+        Some("webp")
     } else {
-        "png"
+        None
     }
+}
+
+/// Whether `path` is named as a picture a model can be shown.
+pub fn is_picture(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| {
+        ["png", "jpg", "jpeg", "gif", "webp"]
+            .iter()
+            .any(|kind| extension.eq_ignore_ascii_case(kind))
+    })
 }
 
 /// The file type audio came back as, from its content type.
@@ -632,7 +756,7 @@ fn audio_extension(content_type: &str) -> &'static str {
     }
 }
 
-fn size(bytes: usize) -> String {
+pub(crate) fn size(bytes: usize) -> String {
     if bytes >= 1024 * 1024 {
         format!("{:.1} MB", bytes as f64 / (1024. * 1024.))
     } else {
@@ -667,10 +791,14 @@ pub(crate) fn base64(text: &str) -> Option<Vec<u8>> {
 }
 
 /// An image file as a `data:` address, which is how a chat request carries
-/// a picture. None when the file cannot be read.
+/// a picture. None when the file cannot be read, is not a picture every
+/// provider takes, or is larger than `PICTURE_BYTES`.
 pub(crate) fn data_url(path: &Path) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
-    let kind = match image_extension(&bytes) {
+    if bytes.len() > PICTURE_BYTES {
+        return None;
+    }
+    let kind = match picture_kind(&bytes)? {
         "jpg" => "jpeg",
         other => other,
     };
@@ -774,11 +902,36 @@ mod tests {
     }
 
     #[test]
+    fn a_saved_file_is_believed_only_from_a_tool_that_saves_and_from_a_page_never_on_a_share() {
+        let result = "Saved to media/a-cat.png\nA 1 KB image.";
+        for name in SAVERS {
+            assert!(crate::tools::find(name).is_some(), "{name} missing");
+            assert_eq!(
+                saved_by(name, result),
+                Some(PathBuf::from("media/a-cat.png"))
+            );
+        }
+        assert!(saved_by("mcp__demo__shoot", result).is_some());
+        for name in ["edit_file", "run_command", "web_fetch", "transcribe"] {
+            assert_eq!(saved_by(name, result), None, "{name}");
+        }
+        let share = r"Saved to \\nowhere.invalid\s\a.png — https://example.com";
+        assert_eq!(saved_by("browse", share).is_none(), cfg!(windows));
+        // What the media tools made in a project on a share is still shown.
+        let made = r"Saved to \\nas\p\app\media\a-cat.png";
+        assert_eq!(
+            saved_by("make_image", made),
+            Some(PathBuf::from(r"\\nas\p\app\media\a-cat.png"))
+        );
+    }
+
+    #[test]
     fn the_transcription_form_carries_the_file_and_the_model() {
         let (boundary, body) = form(
+            &[("model", "whisper-1")],
+            "file",
             Path::new("clips/say \"hi\".mp3"),
             b"ID3audio",
-            Some("whisper-1"),
         );
         let text = String::from_utf8_lossy(&body);
         assert!(text.starts_with(&format!("--{boundary}\r\n")), "{text}");
@@ -793,7 +946,7 @@ mod tests {
             "{text}"
         );
         assert!(text.ends_with(&format!("--{boundary}--\r\n")), "{text}");
-        let (_, bare) = form(Path::new("a.wav"), b"", None);
+        let (_, bare) = form(&[], "file", Path::new("a.wav"), b"");
         assert!(!String::from_utf8_lossy(&bare).contains("name=\"model\""));
     }
 

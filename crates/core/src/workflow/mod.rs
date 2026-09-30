@@ -377,7 +377,7 @@ impl Run {
             asked,
         } = queued;
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let settings = crate::store::settings();
+        let (settings, _) = crate::store::settings();
         let helper_model = (!settings.helper_model.is_empty()).then_some(settings.helper_model);
         let connection = Connection {
             model: (asked.model.or(def.model.clone()).or(helper_model))
@@ -434,6 +434,9 @@ impl Run {
             budget: Some(charged.clone()),
             status: Arc::default(),
             depth: 1,
+            fork: false,
+            from: 0,
+            schema: None,
         };
         let owed = Owed {
             arrivals: self.arrivals.0.clone(),
@@ -941,6 +944,7 @@ mod tests {
             seconds: 0,
             files: Vec::new(),
             jobs: Vec::new(),
+            value: None,
         }
     }
 

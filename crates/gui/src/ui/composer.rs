@@ -1,18 +1,21 @@
 use crate::prelude::*;
-use gpui_component::Selectable;
+use gpui_component::{Selectable, menu::PopupMenu, popover::Popover};
+use letronna_core::gate::Mode;
+
+actions!(composer, [LeaveComposer]);
 
 impl Chat {
     /// The (gateway, model) pairs the picker shows for what is typed in its
     /// search box.
     pub(crate) fn model_matches(&self, cx: &App) -> Vec<(String, String)> {
-        let current = self.model.read(cx).value().to_string();
+        let (on, current) = self.store.model(self.store.active);
+        let (on, current) = (on.to_owned(), current.to_owned());
         let query = self.model_search.read(cx).value().to_lowercase();
-        let on = &self.store.settings.gateway;
         let mut ids = self.models.clone();
         // The model in use stays on the list even when its gateway did not
         // offer it, or the picker could not show what is picked.
-        if !current.is_empty() && !ids.iter().any(|(g, m)| g == on && *m == current) {
-            ids.insert(0, (on.clone(), current));
+        if !current.is_empty() && !ids.iter().any(|(g, m)| *g == on && *m == current) {
+            ids.insert(0, (on, current));
         }
         ids.retain(|(gw, id)| {
             query.is_empty()
@@ -23,7 +26,8 @@ impl Chat {
     }
 
     pub(crate) fn model_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let current = self.model.read(cx).value().to_string();
+        let (on, current) = self.store.model(self.store.active);
+        let (on, current) = (on.to_owned(), current.to_owned());
         let short = current.rsplit('/').next().unwrap_or(&current).to_string();
         let mut list = v_flex()
             .id("model-list")
@@ -31,7 +35,6 @@ impl Chat {
             .overflow_y_scroll()
             .p_1()
             .gap_0p5();
-        let on = self.store.settings.gateway.clone();
         // The chat models, unless a media tab is showing instead.
         let chat = self.model_kind == "chat";
         let matches = if chat {
@@ -60,7 +63,7 @@ impl Chat {
             let (pick_gw, pick) = (gw.clone(), id.clone());
             list = list.child(
                 Button::new(("model", i))
-                    .ghost()
+                    .plain(cx)
                     .xsmall()
                     .w_full()
                     .justify_start()
@@ -72,7 +75,7 @@ impl Chat {
                             .child(
                                 div()
                                     .truncate()
-                                    .when(active, |d| d.text_color(cx.theme().primary))
+                                    .when(active, |d| d.text_color(cx.theme().link))
                                     .child(id),
                             )
                             .child(
@@ -96,14 +99,15 @@ impl Chat {
             .flex_shrink_0()
             .child(
                 Button::new("model-trigger")
-                    .ghost()
+                    .plain(cx)
                     .xsmall()
                     .text_color(cx.theme().muted_foreground)
                     .child(
                         h_flex()
                             .gap_1()
                             .items_center()
-                            .child(short)
+                            // A long model name gives way before the text does.
+                            .child(div().max_w(px(160.)).truncate().child(short))
                             .child(Icon::new(IconName::ChevronDown).size_3()),
                     )
                     .on_click(cx.listener(|this, _, window, cx| {
@@ -135,7 +139,6 @@ impl Chat {
                                                 .border_1()
                                                 .border_color(cx.theme().border)
                                                 .rounded(cx.theme().radius_lg)
-                                                .shadow_md()
                                                 .child(
                                                     div()
                                                         .p_1()
@@ -189,7 +192,7 @@ impl Chat {
         for (i, (kind, label)) in kinds.enumerate() {
             tabs = tabs.child(
                 Button::new(("model-kind", i))
-                    .ghost()
+                    .plain(cx)
                     .xsmall()
                     .label(label)
                     .selected(self.model_kind == kind)
@@ -229,7 +232,7 @@ impl Chat {
             list =
                 list.child(
                     Button::new(("media-model", i))
-                        .ghost()
+                        .plain(cx)
                         .xsmall()
                         .w_full()
                         .justify_start()
@@ -241,7 +244,7 @@ impl Chat {
                                 .child(
                                     div()
                                         .truncate()
-                                        .when(active, |d| d.text_color(cx.theme().primary))
+                                        .when(active, |d| d.text_color(cx.theme().link))
                                         .child(name),
                                 )
                                 .child(
@@ -298,7 +301,14 @@ impl Chat {
             if let Ok(Ok(Some(paths))) = receiver.await {
                 let _ = this.update(cx, |this, cx| {
                     if let Some(ix) = this.store.index_of(id) {
-                        this.store.conversations[ix].workspace = paths.into_iter().next();
+                        let folder = paths.into_iter().next();
+                        // A call already waiting in this session runs there too.
+                        if this.streaming_id == Some(id)
+                            && let Some(turn) = this.turn.as_mut()
+                        {
+                            turn.connection.workspace = folder.clone();
+                        }
+                        this.store.conversations[ix].workspace = folder;
                         this.save();
                         cx.notify();
                     }
@@ -314,8 +324,36 @@ impl Chat {
         if window.has_active_dialog(cx) {
             return;
         }
+        // A page without the composer takes the keys instead; a composer
+        // that is not drawn would take them nowhere, shortcuts included.
+        if self.page != Page::Chat {
+            window.focus(&self.page_focus);
+            return;
+        }
         self.composer
             .update(cx, |input, cx| input.focus(window, cx));
+    }
+
+    /// Keep what was typed for the session the composer was showing, and
+    /// bring back what was typed for the one on screen now.
+    pub(crate) fn swap_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let on_screen = self.store.conversations[self.store.active].id;
+        if self.draft_for == on_screen {
+            return;
+        }
+        let draft = self.composer.read(cx).value().to_string();
+        // Unless that session was just deleted.
+        if !draft.trim().is_empty() && self.store.index_of(self.draft_for).is_some() {
+            self.drafts.insert(self.draft_for, draft);
+        }
+        self.draft_for = on_screen;
+        let draft = self.drafts.remove(&on_screen).unwrap_or_default();
+        self.composer.update(cx, |input, cx| {
+            // Inserted rather than set, so the caret is after it and typing
+            // carries on where it left off.
+            input.set_value("", window, cx);
+            input.insert(draft, window, cx);
+        });
     }
 
     pub(crate) fn insert(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -324,6 +362,56 @@ impl Chat {
             value.push_str(text);
             input.set_value(value, window, cx);
         });
+    }
+
+    /// The session a reply is running in, when that is not the one on screen.
+    pub(crate) fn busy_elsewhere(&self) -> Option<u64> {
+        let on_screen = self.store.conversations[self.store.active].id;
+        self.streaming_id.filter(|&id| self.busy && id != on_screen)
+    }
+
+    /// While a reply runs in another session this one cannot send, so say
+    /// where it is and whether it waits on the user, with a way there.
+    pub(crate) fn busy_note(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let id = self.busy_elsewhere()?;
+        let title = &self.store.conversations[self.store.index_of(id)?].title;
+        let waiting = self.turn.as_ref().is_some_and(|turn| {
+            matches!(turn.next(|_| letronna_core::gate::Outcome::Ask),
+                letronna_core::agent::Next::AskUser(call) if self.decide(&call, &self.rules) == letronna_core::gate::Outcome::Ask)
+        });
+        let text = if waiting {
+            format!("\u{201c}{title}\u{201d} is waiting on you. Answer it there, then send here.")
+        } else {
+            format!("Letronna is replying in \u{201c}{title}\u{201d}. Send here once it is done.")
+        };
+        Some(
+            h_flex()
+                .gap_2()
+                .items_center()
+                .pb_2()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(div().flex_1().min_w_0().truncate().child(text))
+                .child(
+                    Button::new("open-busy")
+                        .plain(cx)
+                        .xsmall()
+                        .label("Open it")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            // Looked up again: sessions may have moved since.
+                            let Some(index) = this.store.index_of(id) else {
+                                return;
+                            };
+                            this.store.active = index;
+                            this.error = None;
+                            this.page = Page::Chat;
+                            this.follow();
+                            this.focus_composer(window, cx);
+                            this.save();
+                            cx.notify();
+                        })),
+                ),
+        )
     }
 
     /// The model's checklist, above the composer while work is outstanding.
@@ -378,10 +466,96 @@ impl Chat {
         )
     }
 
-    pub(crate) fn composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The session's mode, which opens the list of modes to pick from on a
+    /// click, or on Enter or Space while it has the focus.
+    fn mode_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (chat, mode) = (cx.entity(), self.active_mode());
+        let icon = if mode == Mode::Plan {
+            AppIcon::Checklist
+        } else {
+            AppIcon::Shield
+        };
+        let chip = Button::new("mode")
+            .ghost()
+            .xsmall()
+            .tooltip(format!(
+                "{} mode: {}. Click to change.",
+                mode.label(),
+                mode.about()
+            ))
+            .text_color(if mode == Mode::Default {
+                cx.theme().muted_foreground
+            } else {
+                cx.theme().primary
+            })
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(Icon::new(icon).size_3())
+                    .child(mode.label()),
+            )
+            // The popover opens on a mouse press only, so a key opens it here.
+            .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
+                if event.is_keyboard() {
+                    this.open_mode_menu(window, cx);
+                }
+            }));
+        Popover::new("mode-menu")
+            .appearance(false)
+            .overlay_closable(false)
+            .open(self.mode_menu.is_some())
+            .on_open_change(move |open, window, cx| {
+                chat.update(cx, |this, cx| {
+                    if *open {
+                        this.open_mode_menu(window, cx);
+                    } else {
+                        this.mode_menu = None;
+                        cx.notify();
+                    }
+                })
+            })
+            .trigger(chip)
+            .when_some(self.mode_menu.clone(), |popover, menu| {
+                popover.content(move |_, _, _| menu.clone())
+            })
+    }
+
+    /// Open the list of modes with the keys in it, as the chip's popover
+    /// shows it.
+    fn open_mode_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mode_menu.is_some() {
+            return;
+        }
+        let (chat, mode) = (cx.entity(), self.active_mode());
+        let menu = PopupMenu::build(window, cx, move |menu, _, _| {
+            Mode::OFFERED.into_iter().fold(menu, |menu, choice| {
+                let chat = chat.clone();
+                menu.item(
+                    PopupMenuItem::new(choice.label())
+                        .checked(choice == mode)
+                        .on_click(move |_, _, cx| {
+                            chat.update(cx, |this, cx| this.set_mode(choice, cx))
+                        }),
+                )
+            })
+        });
+        menu.focus_handle(cx).focus(window);
+        cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| {
+            this.mode_menu = None;
+            cx.notify();
+        })
+        .detach();
+        self.mode_menu = Some(menu);
+        cx.notify();
+    }
+
+    /// The box a message is written in, with its controls. `compact` puts
+    /// the controls under the text, for a narrow pane.
+    pub(crate) fn composer(&self, compact: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let chat = cx.entity();
         let attach = Button::new("attach")
-            .ghost()
+            .plain(cx)
             .xsmall()
             .icon(Icon::new(IconName::Plus))
             .disabled(self.busy)
@@ -409,7 +583,7 @@ impl Chat {
                         PopupMenuItem::new("Images")
                             .icon(Icon::new(AppIcon::Image))
                             .on_click(move |_, window, cx| {
-                                images.update(cx, |this, cx| this.attach(false, window, cx))
+                                images.update(cx, |this, cx| this.pick_pictures(window, cx))
                             }),
                     )
                     .separator()
@@ -427,65 +601,43 @@ impl Chat {
                             }),
                     )
             });
-        h_flex()
-            .w_full()
+        // Open while a reply streams, so the next message can be written
+        // in the meantime; `send` holds it until the reply is done.
+        let input = div()
+            .min_w_0()
+            .key_context("Composer")
+            .capture_action(cx.listener(Self::paste_picture))
+            // Ctrl+Enter sends now what Enter would queue for the next step.
+            // With nothing running it stays the new line it always was.
+            .on_action(cx.listener(|this, _: &SendNow, window, cx| {
+                if !this.busy {
+                    return cx.propagate();
+                }
+                this.send(window, cx);
+                this.send_now(cx);
+            }))
+            .child(Input::new(&self.composer).w_full().appearance(false));
+        let controls = h_flex()
             .items_center()
             .gap_1()
-            .rounded(cx.theme().radius)
-            .border_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().secondary.opacity(0.4))
-            .px_2()
-            .py_1()
-            .child(attach)
-            // Open while a reply streams, so the next message can be written
-            // in the meantime; `send` holds it until the reply is done.
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(Input::new(&self.composer).w_full().appearance(false)),
-            )
-            .child(
-                Button::new("plan-mode")
-                    .ghost()
-                    .xsmall()
-                    .tooltip(if self.plan_mode {
-                        "Plan mode on: reads and asks only. Click to let it act."
-                    } else {
-                        "Plan mode off. Click to stop it writing or running anything."
-                    })
-                    .text_color(if self.plan_mode {
-                        cx.theme().primary
-                    } else {
-                        cx.theme().muted_foreground
-                    })
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .items_center()
-                            .child(Icon::new(AppIcon::Checklist).size_3())
-                            .child("Plan"),
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.plan_mode = !this.plan_mode;
-                        cx.notify();
-                    })),
-            )
+            // The session's mode sits where the message is written, since it
+            // decides what the reply may do without asking.
+            .child(self.mode_chip(cx))
             // Searching is a setting, but it changes what an answer is made
             // of, so it belongs where the answer is asked for rather than
             // three clicks away in a dialog.
             .child(
                 Button::new("web-search")
-                    .ghost()
+                    .plain(cx)
                     .xsmall()
                     .tooltip(if self.store.settings.search {
                         "Web search on: it may look things up and cite them. Click to stop."
                     } else {
                         "Web search off. Click to let it look things up."
                     })
+                    .selected(self.store.settings.search)
                     .text_color(if self.store.settings.search {
-                        cx.theme().primary
+                        cx.theme().link
                     } else {
                         cx.theme().muted_foreground
                     })
@@ -505,12 +657,15 @@ impl Chat {
             .child(self.model_picker(cx))
             .child(
                 Button::new("mic")
-                    .ghost()
+                    .plain(cx)
                     .xsmall()
                     .icon(Icon::new(AppIcon::Mic))
+                    .disabled(true)
                     .tooltip("Voice input, coming soon"),
             )
-            .when(self.busy, |row| {
+            // Stop only where the reply is: in another session it would end
+            // a reply that is not on screen.
+            .when(self.busy && self.busy_elsewhere().is_none(), |row| {
                 // A turn can wait on a slow tool or a card nobody answers;
                 // this is the way out that does not need a restart.
                 row.child(
@@ -536,7 +691,42 @@ impl Chat {
                     } else {
                         "Send (Enter)"
                     })
+                    .disabled(
+                        (self.composer_empty && self.attached().is_empty())
+                            || self.busy_elsewhere().is_some(),
+                    )
                     .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
+            );
+        let frame = if compact {
+            v_flex()
+        } else {
+            h_flex().items_center()
+        }
+        .w_full()
+        .gap_1()
+        .rounded(cx.theme().radius)
+        .border_1()
+        .border_color(cx.theme().border)
+        .bg(cx.theme().secondary.opacity(0.4))
+        .px_2()
+        .py_1();
+        // Narrow, the text takes the whole width and the controls go under
+        // it, rather than the text being squeezed to a few words a line.
+        let frame = if compact {
+            frame.child(input.w_full()).child(
+                h_flex()
+                    .items_center()
+                    .gap_1()
+                    .child(attach)
+                    .child(div().flex_1())
+                    .child(controls),
             )
+        } else {
+            frame.child(attach).child(input.flex_1()).child(controls)
+        };
+        v_flex()
+            .w_full()
+            .children(self.attached_row(cx))
+            .child(frame)
     }
 }
