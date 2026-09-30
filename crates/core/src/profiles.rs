@@ -23,6 +23,11 @@ pub struct Profile {
 /// it is always unambiguous.
 pub const DEFAULT: &str = "Default";
 
+/// The panel's browser profile in a data folder, never cloned: its browser
+/// holds those files open while the window runs, which Windows refuses to
+/// copy, and its web sign-ins belong to the profile they were made in.
+const BROWSER: &str = "browser";
+
 fn root() -> PathBuf {
     crate::chat::base_dir().join("profiles")
 }
@@ -130,7 +135,7 @@ pub fn create(name: &str, clone_from: Option<&str>) -> Result<Profile, String> {
             // The default profile's dir is `base_dir`, which also holds
             // `profiles` itself -- every other profile's files, none of
             // which belong inside the one being cloned.
-            copy_dir(&source.dir, &dir, &root())
+            copy_dir(&source.dir, &dir, &[root(), source.dir.join(BROWSER)])
         }
         None => std::fs::create_dir_all(&dir),
     };
@@ -142,15 +147,15 @@ pub fn create(name: &str, clone_from: Option<&str>) -> Result<Profile, String> {
     Ok(Profile { name, dir })
 }
 
-/// Every file and folder under `src`, made again under `dst`, but not
-/// `exclude` itself. Links are left out: copying one would read whatever it
-/// points at, wherever that is, into the new profile.
-fn copy_dir(src: &Path, dst: &Path, exclude: &Path) -> std::io::Result<()> {
+/// Every file and folder under `src`, made again under `dst`, but none of
+/// `exclude`. Links are left out: copying one would read whatever it points
+/// at, wherever that is, into the new profile.
+fn copy_dir(src: &Path, dst: &Path, exclude: &[PathBuf]) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let path = entry.path();
-        if path == exclude {
+        if exclude.contains(&path) {
             continue;
         }
         let to = dst.join(entry.file_name());
@@ -276,6 +281,35 @@ mod tests {
         assert!(create("../..", None).is_err());
         assert!(create("nul", None).is_err());
         assert!(create("COM3", None).is_err());
+
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn cloning_leaves_the_browser_profile_behind() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = scratch("browser");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        std::fs::create_dir_all(dir.join("browser/Default")).unwrap();
+        let cookies = dir.join("browser/Default/Cookies");
+        std::fs::write(&cookies, "session=1").unwrap();
+        // Held as a running browser holds it, which Windows will not copy.
+        #[cfg(windows)]
+        let _held = {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&cookies)
+                .unwrap()
+        };
+        std::fs::write(dir.join("SOUL.md"), "Be terse.").unwrap();
+
+        let clone = create("Copy", Some(DEFAULT)).unwrap();
+        assert!(clone.dir.join("SOUL.md").exists());
+        assert!(!clone.dir.join(BROWSER).exists());
 
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
