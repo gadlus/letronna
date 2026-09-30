@@ -101,8 +101,12 @@ pub const COMMANDS: &[Command] = &[
         blurb: "skills: use one, switch them on or off, add from GitHub",
     },
     Command {
+        name: "/mcp",
+        blurb: "MCP servers: how each is doing; reconnect, enable, disable, log, reload",
+    },
+    Command {
         name: "/resume",
-        blurb: "pick up a session from before",
+        blurb: "pick up a session; a word finds it by title or what was said",
     },
     Command {
         name: "/undo",
@@ -117,8 +121,24 @@ pub const COMMANDS: &[Command] = &[
         blurb: "carry on in a copy of this session",
     },
     Command {
+        name: "/init",
+        blurb: "have the model write or fill in the project's AGENTS.md",
+    },
+    Command {
+        name: "/btw",
+        blurb: "ask something aside; the answer is not kept",
+    },
+    Command {
+        name: "/image",
+        blurb: "attach a picture to your next message: /image <path>",
+    },
+    Command {
         name: "/where",
         blurb: "show the project folder and session file",
+    },
+    Command {
+        name: "/usage",
+        blurb: "tokens and cost: this session, by day and by model",
     },
     Command {
         name: "/clear",

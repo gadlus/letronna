@@ -32,6 +32,26 @@
 //! helper works on the sender's connection, as a new one would. A helper the
 //! user stopped stays stopped: its work was cancelled, and picking it up would
 //! undo that; one an agent stopped can carry on.
+//!
+//! A fork is the one helper that sees the conversation: it starts from its
+//! parent's messages as the parent's own file holds them, with one directive
+//! after, on the parent's connection, so its first request begins with the
+//! parent's bytes and the provider's cache serves them. For that it is
+//! offered the parent's tools, and what it may not do -- start agents, ask
+//! the user, anything its parent may not call -- is refused when it calls
+//! rather than left out. Its report is only what it said after the directive.
+//! `/btw` is a fork that may call nothing and makes one request, and its
+//! answer goes to the user and nowhere else.
+//!
+//! A kept helper stays after it reports, idle, holding no thread: only its
+//! entry here, a wake left with its mailbox and a deadline on the timer
+//! thread, so nothing looks in on it meanwhile. Mail, a place freeing for mail
+//! that found none, or a task the shared task list rings it with wakes it from
+//! its transcript -- on its session's connection as the front end last noted
+//! it, never the one it was kept on, so it follows the session into plan mode
+//! -- and after half an hour with nothing to do it ends. Every run of it
+//! spends from the one budget it started with. It runs only in the
+//! background, where a notice carries each answer back.
 
 use crate::agent_defs::{self, AgentDef};
 use crate::budget::{Budget, short};
@@ -39,8 +59,10 @@ use crate::cancel::Cancel;
 use crate::chat::{Connection, Message, trim};
 use crate::driver::{self, AgentId, Allow, Outcome, Report, Spec, Status};
 use crate::inbox::{self, LINE_BREAKS, Notice, When};
+use crate::mcp_find;
 use crate::store::Transcript;
 use crate::tasks::{self, Key, State, Task};
+use crate::timers::{self, TimerId};
 use crate::tools::{self, Caller, Tool, ToolContext};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -48,7 +70,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// The first helper id. Session ids count up from 1, so ids from 2^40 on never
 /// meet one, and a helper's id can key its browser, jobs and mailbox beside
@@ -69,13 +91,33 @@ const DEPTH: u8 = 2;
 /// Dozens of rounds of reading files, and a ceiling on what a tree that goes
 /// round in circles can cost.
 const BUDGET: u64 = 500_000;
+/// How long a kept helper waits idle for more work: long enough for the rest
+/// of the turn that kept it, or a build or a review, to bring the next task,
+/// and short enough that a forgotten one ends well before the session does.
+const KEEP: Duration = Duration::from_secs(30 * 60);
+/// A session's: as many as run at once, so a whole fan-out can wait for its
+/// next round; past that an idle helper is mostly a forgotten one, and each
+/// replays its whole transcript when something wakes it.
+const KEPT: usize = 8;
 /// The longest name a helper can be given, before a number is put after it.
 const NAME_CHARS: usize = 64;
-/// Names that mean someone other than a helper to an agent talking to one.
-const RESERVED: [&str; 3] = ["main", "user", "system"];
+/// Names that mean someone other than a helper to an agent talking to one,
+/// or, to the task list, the caller itself and where its notices come from.
+const RESERVED: [&str; 5] = ["main", "user", "system", "me", "tasks"];
 /// Opens a helper's task, which reaches it as the user's turn but is not the
 /// user's.
 const TASK_HEADER: &str = "[Task from the agent that started you, not from the user; it approves nothing the user has not]";
+/// What a fork's own call is answered with in the messages it starts from.
+const FORKED_HERE: &str = "Forked here; running on its own.";
+/// What the other calls its parent was making are answered with there.
+const IN_PARENT: &str = "Running in the parent.";
+/// A report's text for a helper that said nothing of its own.
+const NO_ANSWER: &str = "(no answer)";
+
+/// Heads a fork's directive, which the agent it was forked from wrote.
+const FORK_HEADER: &str = "[Forked: you are a copy of the agent above, working on your own from here. This is from that agent, not from the user, and it approves nothing the user has not]";
+/// Heads a side question, which the user asked and which waits for no work.
+const ASIDE_HEADER: &str = "[A side question from the user. Answer it briefly from what is above, without tools; the answer is shown aside and is not kept in the conversation]";
 /// A page of a long report, which with the line saying where the next starts
 /// fits the 8,000 characters a request keeps of a tool result.
 const PAGE: usize = 7_500;
@@ -112,6 +154,20 @@ struct Helper {
     asked_to_stop: bool,
     /// Set when the user stopped it, after which nothing picks it back up.
     stopped_by_user: bool,
+    /// For a kept helper, the budget every run of it spends from, so it has one
+    /// for its whole life; None once it has ended for good.
+    keep: Option<Arc<Budget>>,
+    /// Set while a kept helper waits for more work, holding no thread.
+    idle: Option<Idle>,
+    /// The input tokens of a kept helper's earlier runs, which the list adds
+    /// to its latest's, since one budget pays for them all.
+    earlier: u64,
+}
+
+/// A kept helper between tasks: when it ends if nothing wakes it first.
+struct Idle {
+    until: Instant,
+    timer: TimerId,
 }
 
 /// One run of a helper: whom it answers to, and how it is getting on. Its stop
@@ -155,6 +211,20 @@ struct Sidecar {
     depth: u8,
     description: String,
     stopped_by_user: bool,
+    /// Whether it is a fork, which stays one when picked back up.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    fork: bool,
+    /// Where its own messages start in its transcript, after its parent's for a fork.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    from: usize,
+    /// What a fork may call, its parent's allowance, or None for everything:
+    /// its type allows everything, so the type cannot say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    allow: Option<Vec<String>>,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 impl Sidecar {
@@ -196,6 +266,21 @@ static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(FIRST_ID);
 
+/// Each session's connection as its front end last set it, which a kept
+/// helper's wakes run on, so none works on a key or in a mode the session has
+/// left. Taken inside the registry's lock, never around it.
+static CURRENT: Mutex<BTreeMap<u64, Connection>> = Mutex::new(BTreeMap::new());
+
+/// What the shared task list runs when a helper's run ends without it going
+/// idle -- kept or not -- with its session and name.
+static ON_END: Mutex<Option<OnEnd>> = Mutex::new(None);
+
+/// What the shared task list runs when a kept helper goes idle, with its
+/// session and name.
+static ON_IDLE: Mutex<Option<OnEnd>> = Mutex::new(None);
+
+type OnEnd = fn(u64, &str);
+
 fn registry() -> MutexGuard<'static, Registry> {
     // Nothing that can panic runs under the lock, so a poisoned one is still whole.
     REGISTRY.lock().unwrap_or_else(PoisonError::into_inner)
@@ -210,7 +295,29 @@ struct Slot {
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        registry().running.retain(|helper| helper.id != self.id);
+        let mut registry = registry();
+        registry.running.retain(|helper| helper.id != self.id);
+        let idle: Vec<AgentId> = (registry.helpers.iter())
+            .filter(|helper| helper.idle.is_some())
+            .map(|helper| helper.id)
+            .collect();
+        let running = registry.running.len();
+        drop(registry);
+        if idle.is_empty() {
+            return;
+        }
+        // Mail that found every place taken waits in an idle helper's mailbox,
+        // and nothing else wakes it now that a place is free.
+        let waiting: Vec<AgentId> = (inbox::pending().into_iter())
+            .filter(|id| idle.contains(id))
+            .collect();
+        if waiting.is_empty() {
+            return;
+        }
+        let free = Limits::read().at_once.saturating_sub(running);
+        for id in waiting.into_iter().take(free) {
+            rouse(id);
+        }
     }
 }
 
@@ -254,7 +361,7 @@ impl Tool for Agent {
         "agent"
     }
     fn description(&self) -> &'static str {
-        "Hand a task to a helper agent that works with its own context and reports back. Use it to explore or check many files without filling your own context. The helper has not seen this conversation: brief it fully. Its report is all you get back; verify what matters. In the window and the terminal it runs in the background by default: carry on or end your turn, and a notice comes when it finishes. Do not poll or wait for it. Otherwise it works while you wait, and its report is this call's result."
+        "Hand a task to a helper agent that works with its own context and reports back. Use it to explore or check many files without filling your own context. The helper has not seen this conversation: brief it fully. Its report is all you get back; verify what matters. In the window and the terminal it runs in the background by default: carry on or end your turn, and a notice comes when it finishes. Do not poll or wait for it. Otherwise it works while you wait, and its report is this call's result. With keep, it stays after reporting, idle with its context, until a message through the agents tool gives it more work; it ends after 30 idle minutes."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -263,7 +370,9 @@ impl Tool for Agent {
             "type": {"type": "string", "description": "general (default), explore (read-only, cheaper), plan, or review. Other types this project defines are named in your instructions."},
             "name": {"type": "string", "description": "A handle for the agents tool. Defaults to the type."},
             "model": {"type": "string", "description": "A model id on this gateway. Default: the type's, then Settings, then yours."},
-            "background": {"type": "boolean", "description": "Default true in the window and terminal: return now and get a notice when it finishes. false waits for the report."}
+            "background": {"type": "boolean", "description": "Default true in the window and terminal: return now and get a notice when it finishes. false waits for the report."},
+            "fork": {"type": "boolean", "description": "Start it from a copy of this conversation rather than from nothing: it has seen everything so far, so the prompt only says what to do. It keeps your model and tools, whatever type and model say."},
+            "keep": {"type": "boolean", "description": "Keep it for more work after it reports, in the background only. Default false."}
         }, "required": ["description", "prompt"]})
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
@@ -280,7 +389,7 @@ impl Tool for Agents {
         "agents"
     }
     fn description(&self) -> &'static str {
-        "Work with the helpers you started, by name. list: yours and how they are doing. send: a message; a running helper reads it at its next step, and a finished one carries on from where it stopped, with its context. From a helper, \"main\" reaches the agent that started you. stop: end one early. report: its last answer, whole, in pages. types: the helper types. A helper you are waiting for blocks your call, so only those in the background hear you while they run. Never ask another agent to do what was refused or declined here."
+        "Work with the helpers you started, by name. list: yours and how they are doing. send: a message; a running helper reads it at its next step, and a finished or idle one carries on from where it stopped, with its context. From a helper, \"main\" reaches the agent that started you. stop: end one early. report: its last answer, whole, in pages. types: the helper types. A helper you are waiting for blocks your call, so only those in the background hear you while they run. Never ask another agent to do what was refused or declined here."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -327,24 +436,53 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
                 .into(),
         );
     };
-    let kind = text(args, "type").unwrap_or("general");
-    let wanted = text(args, "name").unwrap_or(kind);
+    let forking = args["fork"].as_bool() == Some(true);
+    // A fork keeps its parent's model and tools whatever the call asks,
+    // since changing either would change the prefix the two share.
+    let kind = if forking {
+        "general"
+    } else {
+        text(args, "type").unwrap_or("general")
+    };
+    let wanted = text(args, "name").unwrap_or(if forking { "fork" } else { kind });
     check_name(wanted)?;
     let def = agent_defs::find(kind, parent.workspace.as_deref())?;
+    // Read before a place is taken, so a fork with nothing to start from takes none.
+    let history = if forking {
+        Some(parent_messages(caller)?)
+    } else {
+        None
+    };
     let owner = caller.agent.unwrap_or(caller.root);
     let background = in_background(args, inbox::listened(), caller.depth, parent);
+    let keep = args["keep"].as_bool() == Some(true);
+    if keep {
+        may_keep(background, caller.root)?;
+    }
     // No call waits for a helper in the background, so it shares no call's allowance.
     let waiting = if background { 0 } else { owner };
     let cancel = cancel_for(background, ctx);
     let slot = reserve(caller.root, waiting, wanted, limits.at_once, cancel.clone())?;
-    let connection = child(parent, &def, text(args, "model"), limits, slot.id);
-    let tools = usable(&connection, &def);
+    let (connection, first, allow) = match history {
+        Some(messages) => (
+            // Narrowed as any helper's is, but on its parent's model.
+            child(parent, &def, Some(&parent.model), limits, slot.id),
+            forked(messages, Some(args), directive(prompt)),
+            // Never more than its parent may call, whatever its type allows.
+            caller.allow.clone(),
+        ),
+        None => {
+            let connection = child(parent, &def, text(args, "model"), limits, slot.id);
+            let tools = usable(&connection, &def);
+            let first = vec![task(&def, &tools, prompt)];
+            (connection, first, allow(&def, tools))
+        }
+    };
     let (n, mut transcript) =
         Transcript::create(caller.root, &slot.name, parent.workspace.clone())?;
-    transcript
-        .conversation
-        .messages
-        .push(task(&def, &tools, prompt));
+    let from = if forking { first.len() } else { 0 };
+    transcript.conversation.messages = first;
+    let label = if forking { "fork" } else { def.name.as_str() };
     let sidecar = transcript.path.with_extension("json");
     Sidecar {
         name: slot.name.clone(),
@@ -357,9 +495,16 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
         depth: caller.depth + 1,
         description: text(args, "description").unwrap_or_default().to_owned(),
         stopped_by_user: false,
+        fork: forking,
+        from,
+        allow: match &allow {
+            Allow::Only(names) if forking => Some(names.clone()),
+            _ => None,
+        },
     }
     .write(&sidecar)?;
     let run = Run::new(owner, background);
+    let budget = Arc::new(Budget::new(limits.budget, caller.budget.clone()));
     let spec = Spec {
         connection,
         transcript,
@@ -368,18 +513,21 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
         root: caller.root,
         run: caller.run.unwrap_or(slot.id),
         label: slot.name.clone(),
-        allow: allow(&def, tools),
+        allow,
         rounds: def.rounds.unwrap_or(ROUNDS),
         cancel,
-        budget: Some(Arc::new(Budget::new(limits.budget, caller.budget.clone()))),
+        budget: Some(budget.clone()),
         status: run.status.clone(),
         depth: caller.depth + 1,
+        fork: forking,
+        from,
+        schema: None,
     };
     registry().helpers.push(Helper {
         id: slot.id,
         root: caller.root,
         name: slot.name.clone(),
-        kind: def.name.clone(),
+        kind: label.to_owned(),
         description: text(args, "description").unwrap_or_default().to_owned(),
         n,
         sidecar,
@@ -387,35 +535,63 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
         ended: None,
         asked_to_stop: false,
         stopped_by_user: false,
+        keep: keep.then_some(budget),
+        idle: None,
+        earlier: 0,
     });
     let started = format!(
         "Started {} ({}) in the background. A notice comes when it finishes; do not poll or \
          wait for it. Carry on, or end your turn.",
-        slot.name, def.name
+        slot.name, label
     );
-    launch(spec, slot, background, &def.name, started)
+    launch(spec, slot, background, label, started, Vec::new())
 }
 
-/// Sets a helper to work in the place `slot` holds: in the background, where
-/// the call's answer is `started` and a notice follows, or while the call
-/// waits, where the answer is its report.
+/// Sets a helper to work in the place `slot` holds, with `next` folded in as
+/// its next turn: in the background, where the call's answer is `started` and
+/// a notice follows, or while the call waits, where the answer is its report.
 fn launch(
     spec: Spec,
     slot: Slot,
     background: bool,
     kind: &str,
     started: String,
+    next: Vec<Notice>,
 ) -> Result<String, String> {
     let rounds = spec.rounds;
     if background {
-        set_off(spec, slot, kind, rounds)?;
+        set_off(spec, slot, kind, rounds, next)?;
         return Ok(started);
     }
     let report = driver::run(spec);
     let share = MAX_REPORT / slot.together.load(Ordering::Relaxed).max(1);
     let name = slot.name.clone();
-    close(slot, &report, |_| ());
+    close(slot, &report, |_, _| ());
     answer(&name, &report, rounds, share)
+}
+
+/// Refuses to keep a helper where nothing would wake it, or past session
+/// `root`'s cap.
+fn may_keep(background: bool, root: u64) -> Result<(), String> {
+    if !background {
+        return Err(
+            "`keep` needs a helper in the background: one the session's own agent starts in \
+             the window or the terminal, without background false."
+                .into(),
+        );
+    }
+    // Counted before the helper is listed, so calls side by side can pass it
+    // together, by no more than can run at once.
+    let kept = (registry().helpers.iter())
+        .filter(|helper| helper.root == root && helper.keep.is_some())
+        .count();
+    if kept >= KEPT {
+        return Err(format!(
+            "{KEPT} of this session's helpers are kept already, the most. Do not retry with \
+             keep: start this one without it, or stop a kept one you no longer need."
+        ));
+    }
+    Ok(())
 }
 
 /// Which tools a helper of type `def` may call, of the `tools` it is offered.
@@ -444,38 +620,67 @@ fn cancel_for(background: bool, ctx: &ToolContext) -> Cancel {
     }
 }
 
-/// Starts a helper on a thread of its own; when it ends, its owner hears how
-/// it went in a notice.
-fn set_off(spec: Spec, slot: Slot, kind: &str, rounds: usize) -> Result<(), String> {
-    let (id, key) = (slot.id, Key::Agent(slot.id));
+/// Starts a helper on a thread of its own with `next` folded in as its next
+/// turn; when it ends, its owner hears how it went in a notice.
+fn set_off(
+    spec: Spec,
+    slot: Slot,
+    kind: &str,
+    rounds: usize,
+    next: Vec<Notice>,
+) -> Result<(), String> {
+    let (id, key, owner) = (slot.id, Key::Agent(slot.id), spec.owner);
     let name = slot.name.clone();
     // Registered before it runs, so one that ends at once still has an owner to tell.
-    tasks::register(Task::new(key, spec.owner, None, &name));
+    tasks::register(Task::new(key, owner, None, &name));
     let about = kind.to_owned();
+    let unread = next.clone();
     let started = driver::spawn(spec, move |report| {
-        close(slot, report, |by_user| {
-            let (state, notice) = ended(&name, &about, report, rounds, by_user);
+        close(slot, report, |by_user, after| {
+            let (state, notice) = ended(&name, &about, report, rounds, by_user, after);
             tasks::finish(&key, state, notice);
         });
+        // In its transcript, but unread by a run stopped or failed before its
+        // first answer, such as one a stop reached as it woke.
+        if report.input == 0 {
+            hand_up(owner, &name, next);
+        }
     });
     if let Err(error) = started {
-        tasks::finish(&key, State::Failed(error.clone()), None);
-        if let Some(helper) = registry().helpers.iter_mut().find(|h| h.id == id) {
-            helper.ended = Some("failed".into());
-        }
+        fail(id, error.clone(), unread);
         return Err(error);
     }
     Ok(())
 }
 
+/// Ends helper `id`, whose run could not start, for good as failed with
+/// `error`, and passes on the `unread` it was to carry on with.
+fn fail(id: AgentId, error: String, unread: Vec<Notice>) {
+    let ending = {
+        let mut registry = registry();
+        let Some(helper) = registry.helpers.iter_mut().find(|h| h.id == id) else {
+            return;
+        };
+        helper.ended = Some("failed".into());
+        helper.keep = None;
+        inbox::unwake(id);
+        Ending::of(helper, unread, false)
+    };
+    let key = Key::Agent(id);
+    tasks::register(Task::new(key, ending.owner, None, &ending.name));
+    tasks::finish(&key, State::Failed(error), None);
+    ending.pass_on();
+}
+
 /// Ends a helper's run: gives its place back, has `tell` say how it went,
-/// given whether the user stopped it, marks it ended, and passes on the mail
-/// that came after the driver last looked.
-fn close(slot: Slot, report: &Report, tell: impl FnOnce(bool)) {
+/// given whether the user stopped it and what becomes of it, marks it ended
+/// or idle, and passes on the mail that came after the driver last looked,
+/// which wakes a kept one again.
+fn close(slot: Slot, report: &Report, tell: impl FnOnce(bool, After)) {
     let id = slot.id;
     // Free before the owner hears, so it can start another at once.
     drop(slot);
-    let (owner, name, sidecar, late, by_user) = {
+    let (sidecar, by_user, after, ending) = {
         // The lock a message to it takes, so a message either lands in the
         // mailbox before this empties it or finds the helper ended.
         let mut registry = registry();
@@ -483,21 +688,91 @@ fn close(slot: Slot, report: &Report, tell: impl FnOnce(bool)) {
             return;
         };
         let by_user = report.status == Outcome::Stopped && !helper.asked_to_stop;
+        // Only one that answered, and only in the background, where a notice
+        // carries each answer to its owner.
+        let answered = matches!(report.status, Outcome::Done | Outcome::RoundLimit);
+        let after = match &helper.keep {
+            Some(budget) if helper.run.background && answered => match budget.check() {
+                Ok(()) => After::Idles,
+                Err(_) => After::Spent,
+            },
+            _ => After::Ends,
+        };
         // Before it counts as ended, since a message that finds it ended picks
         // it up again, and the next run's finish must come after this one's.
-        tell(by_user);
+        tell(by_user, after);
         helper.ended = Some(how(&report.status, by_user).into());
         helper.asked_to_stop = false;
         helper.stopped_by_user = by_user;
-        let late = inbox::take(id, true);
-        (
-            helper.run.owner,
-            helper.name.clone(),
-            helper.sidecar.clone(),
-            late,
-            by_user,
-        )
+        let ending = if after == After::Idles {
+            park(helper, Instant::now() + KEEP);
+            Ending::of(helper, Vec::new(), true)
+        } else {
+            helper.keep = None;
+            // Set by a push that came as it last parked, and never spent.
+            inbox::unwake(id);
+            Ending::of(helper, inbox::take(id, true), false)
+        };
+        (helper.sidecar.clone(), by_user, after, ending)
     };
+    // Mail that came before its wake was set up wakes it now instead.
+    if after == After::Idles && inbox::pending().contains(&id) {
+        rouse(id);
+    }
+    ending.pass_on();
+    if by_user {
+        keep_stopped(&sidecar);
+    }
+}
+
+/// What becomes of a helper once a run of it ends.
+#[derive(Clone, Copy, PartialEq)]
+enum After {
+    /// It ends, as one not kept always does.
+    Ends,
+    /// It is kept, and waits idle for more work.
+    Idles,
+    /// It is kept, but ends: the budget it has for its whole life is spent.
+    Spent,
+}
+
+/// What a helper leaves when a run of it or its wait ends: the mail it never
+/// read, and word for the shared task list of whether it went idle or ended.
+struct Ending {
+    owner: u64,
+    root: u64,
+    name: String,
+    late: Vec<Notice>,
+    idles: bool,
+}
+
+impl Ending {
+    /// What `helper` leaves, with `late` unread.
+    fn of(helper: &Helper, late: Vec<Notice>, idles: bool) -> Self {
+        Self {
+            owner: helper.run.owner,
+            root: helper.root,
+            name: helper.name.clone(),
+            late,
+            idles,
+        }
+    }
+
+    /// Passes the mail on to the owner, and tells the task list the helper
+    /// went idle or ended; outside the registry's lock, since either may call
+    /// back into it.
+    fn pass_on(self) {
+        hand_up(self.owner, &self.name, self.late);
+        let hooks = if self.idles { &ON_IDLE } else { &ON_END };
+        let hook = *hooks.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(hook) = hook {
+            hook(self.root, &self.name);
+        }
+    }
+}
+
+/// Passes mail helper `name` never read to `owner`, saying so.
+fn hand_up(owner: u64, name: &str, late: Vec<Notice>) {
     for notice in late {
         inbox::push(
             owner,
@@ -506,19 +781,200 @@ fn close(slot: Slot, report: &Report, tell: impl FnOnce(bool)) {
                     "{name} ended before it read this, from {}:\n{}",
                     notice.from, notice.text
                 ),
-                from: name.clone(),
+                from: name.to_owned(),
                 when: notice.when,
             },
         );
     }
-    if by_user {
-        // Refused here already by the flag above; the file keeps it refused
-        // for whatever reads the sidecar later.
-        let _ = Sidecar::read(&sidecar).and_then(|mut what| {
-            what.stopped_by_user = true;
-            what.write(&sidecar)
-        });
+}
+
+/// Marks the helper whose sidecar is at `sidecar` as stopped by the user.
+fn keep_stopped(sidecar: &Path) {
+    // Refused in the registry already; the file keeps it refused for whatever
+    // reads the sidecar later.
+    let _ = Sidecar::read(sidecar).and_then(|mut what| {
+        what.stopped_by_user = true;
+        what.write(sidecar)
+    });
+}
+
+/// Leaves kept helper `helper` waiting for more work with no thread until
+/// `until`: mail wakes it, and its timer ends it then.
+fn park(helper: &mut Helper, until: Instant) {
+    let id = helper.id;
+    let timer = timers::at(until, Box::new(move || expire(id, until)));
+    helper.idle = Some(Idle { until, timer });
+    inbox::wake_on(id, Box::new(move || rouse(id)));
+}
+
+/// Wakes kept helper `id` on a thread of its own, since mail arrives on any
+/// thread, the timer's included, with whatever locks it holds.
+fn rouse(id: AgentId) {
+    let spawned = std::thread::Builder::new()
+        .name(format!("wake-{id}"))
+        .spawn(move || wake(id));
+    // Its mail waits for the next wake, a freed place or its end. Set without
+    // the registry's lock, which the push that ran this may hold.
+    if spawned.is_err() {
+        inbox::wake_on(id, Box::new(move || rouse(id)));
     }
+}
+
+/// Picks kept helper `id` back up with the mail waiting for it, if it is
+/// still idle, a place is free and its session's connection is known; else
+/// the mail waits for the next wake, a freed place or its end.
+fn wake(id: AgentId) {
+    let limits = Limits::read();
+    let Some(woken) = take_idle(id, limits.at_once) else {
+        // Only while it is idle, since one that ended passed its mail on.
+        let registry = registry();
+        if (registry.helpers.iter()).any(|helper| helper.id == id && helper.idle.is_some()) {
+            inbox::wake_on(id, Box::new(move || rouse(id)));
+        }
+        return;
+    };
+    let mail = inbox::take(id, true);
+    if mail.is_empty() {
+        settle(woken);
+        return;
+    }
+    // One that cannot carry on has ended, passing its mail on.
+    let _ = carry_on(woken, &limits, mail);
+}
+
+/// An idle helper taken back to work, before it is handed anything to do.
+struct Woken {
+    claimed: Claimed,
+    /// Its session's connection as it is now, which it works on.
+    now: Connection,
+    n: u32,
+    sidecar: PathBuf,
+    /// How its last run ended, and when it would have stopped waiting, both of
+    /// which it keeps if it goes back to waiting.
+    was: Option<String>,
+    until: Instant,
+}
+
+/// Takes a place for idle helper `id` to carry on in, in the background, if
+/// it is still idle, a place is free and its session's connection is known:
+/// under the lock a stop or its end takes, so neither can come between.
+fn take_idle(id: AgentId, at_once: usize) -> Option<Woken> {
+    let mut registry = registry();
+    let at =
+        (registry.helpers.iter()).position(|helper| helper.id == id && helper.idle.is_some())?;
+    full(&registry, at_once).ok()?;
+    let helper = &registry.helpers[at];
+    // Not the connection it was kept on: the session may have gone into plan
+    // mode, or onto another key, since.
+    let now = current(helper.root)?;
+    let (n, sidecar, was) = (helper.n, helper.sidecar.clone(), helper.ended.clone());
+    let until = helper.idle.as_ref()?.until;
+    let run = Run::new(helper.run.owner, true);
+    let claimed = back_to_work(&mut registry, at, run, 0, Cancel::default());
+    Some(Woken {
+        claimed,
+        now,
+        n,
+        sidecar,
+        was,
+        until,
+    })
+}
+
+/// Leaves helper `woken`, which was handed nothing to do, waiting again as it
+/// was, or ends it if a stop came meanwhile.
+fn settle(woken: Woken) {
+    let Woken {
+        claimed,
+        was,
+        until,
+        ..
+    } = woken;
+    let id = claimed.slot.id;
+    drop(claimed.slot);
+    let mut registry = registry();
+    let Some(helper) = registry.helpers.iter_mut().find(|h| h.id == id) else {
+        return;
+    };
+    if !claimed.cancel.is_set() {
+        helper.ended = was;
+        park(helper, until);
+        drop(registry);
+        // Mail that came meanwhile found it at work, and rang nothing.
+        if inbox::pending().contains(&id) {
+            rouse(id);
+        }
+        return;
+    }
+    let by_user = !helper.asked_to_stop;
+    helper.asked_to_stop = false;
+    helper.stopped_by_user = by_user;
+    let sidecar = helper.sidecar.clone();
+    let shown = how(&Outcome::Stopped, by_user);
+    let ending = end_idle(helper, shown.into(), State::Stopped);
+    drop(registry);
+    ending.pass_on();
+    if by_user {
+        keep_stopped(&sidecar);
+    }
+}
+
+/// Sets helper `woken` to work with `next` as its next turn; one whose
+/// conversation cannot be read ends for good, passing `next` on unread.
+fn carry_on(woken: Woken, limits: &Limits, next: Vec<Notice>) -> Result<(), String> {
+    let Woken {
+        claimed,
+        now,
+        n,
+        sidecar,
+        ..
+    } = woken;
+    let (id, name) = (claimed.slot.id, claimed.slot.name.clone());
+    let (what, def, transcript) = match reread(now.conversation, &now, &name, n, &sidecar, &next) {
+        Ok(read) => read,
+        Err(error) => {
+            drop(claimed);
+            fail(id, error.clone(), next);
+            return Err(error);
+        }
+    };
+    let caller = ToolContext::of(&now).caller;
+    let spec = rerun(&caller, &now, what, &def, transcript, &claimed, limits);
+    let rounds = spec.rounds;
+    set_off(spec, claimed.slot, &def.name, rounds, next)
+}
+
+/// Ends kept helper `id`, idle until `until`, unless it has woken since.
+fn expire(id: AgentId, until: Instant) {
+    let mut registry = registry();
+    let idle = (registry.helpers.iter_mut()).find(|helper| {
+        helper.id == id && helper.idle.as_ref().is_some_and(|idle| idle.until == until)
+    });
+    let Some(helper) = idle else {
+        return;
+    };
+    let how = format!("ended after {} idle minutes", KEEP.as_secs() / 60);
+    let ending = end_idle(helper, how.clone(), State::Done(how));
+    drop(registry);
+    ending.pass_on();
+}
+
+/// Ends idle helper `helper` for good, shown as `how` with its task left in
+/// `state`, and says who hears the mail it never read.
+fn end_idle(helper: &mut Helper, how: String, state: State) -> Ending {
+    if let Some(idle) = helper.idle.take() {
+        timers::cancel(idle.timer);
+    }
+    inbox::unwake(helper.id);
+    helper.keep = None;
+    helper.ended = Some(how);
+    // Listed afresh, since going idle was its task's one finish; its owner
+    // heard its report then, so nobody is told again.
+    let key = Key::Agent(helper.id);
+    tasks::register(Task::new(key, helper.run.owner, None, &helper.name));
+    tasks::finish(&key, state, None);
+    let late = inbox::take(helper.id, true);
+    Ending::of(helper, late, false)
 }
 
 /// How a run that ended is shown in the list.
@@ -533,9 +989,12 @@ fn how(outcome: &Outcome, by_user: bool) -> &'static str {
     }
 }
 
-/// Refuses a helper its caller may not start: one too deep, one from an agent
-/// being stopped, or one its tree has no budget left for.
+/// Refuses a helper its caller may not start: any from a fork, one too deep,
+/// one from an agent being stopped, or one its tree has no budget left for.
 fn check(caller: &Caller, cancel: &Cancel, limits: &Limits) -> Result<(), String> {
+    if caller.fork {
+        return Err("A fork cannot start another fork. Do the work yourself.".into());
+    }
     if caller.depth >= limits.depth {
         return Err(format!(
             "Helper nesting limit reached (depth {} of {}). Do this task yourself with your \
@@ -556,7 +1015,9 @@ fn check_name(name: &str) -> Result<(), String> {
         .iter()
         .any(|reserved| reserved.eq_ignore_ascii_case(name))
     {
-        return Err("\"main\", \"user\" and \"system\" are reserved names.".into());
+        return Err(
+            "\"main\", \"user\", \"system\", \"me\" and \"tasks\" are reserved names.".into(),
+        );
     }
     let mut chars = name.chars();
     let starts = chars.next().is_some_and(|c| c.is_ascii_alphanumeric());
@@ -624,14 +1085,26 @@ fn occupy(registry: &mut Registry, id: AgentId, name: String, owner: u64, cancel
     Slot { id, name, together }
 }
 
-/// Stops the running helper `id`, and says whether there was one. The stop
-/// counts as the user's, so nothing picks the helper back up.
+/// Stops the running helper `id`, or ends it at once if it is kept and idle,
+/// and says whether there was one. The stop counts as the user's, so nothing
+/// picks the helper back up.
 pub fn stop(id: AgentId) -> bool {
-    let cancel = registry()
-        .running
-        .iter()
-        .find(|helper| helper.id == id)
-        .map(|helper| helper.cancel.clone());
+    let cancel = {
+        let mut registry = registry();
+        let idle =
+            (registry.helpers.iter_mut()).find(|helper| helper.id == id && helper.idle.is_some());
+        if let Some(helper) = idle {
+            helper.stopped_by_user = true;
+            let sidecar = helper.sidecar.clone();
+            let ending = end_idle(helper, "stopped by the user".into(), State::Stopped);
+            drop(registry);
+            ending.pass_on();
+            keep_stopped(&sidecar);
+            return true;
+        }
+        let running = registry.running.iter().find(|helper| helper.id == id);
+        running.map(|helper| helper.cancel.clone())
+    };
     let Some(cancel) = cancel else {
         return false;
     };
@@ -719,15 +1192,97 @@ fn child(
     }
 }
 
+/// Offers a task to session `root`'s idle kept helpers, the one idle longest
+/// first, and says which took it. Each is given a place to run in first; then
+/// `claim` is handed its name, and takes the task for it and says what it is,
+/// or passes with None; and the one it takes it for starts on it at once, so
+/// a claimed task never waits. None means nobody took it: none was idle, no
+/// place was free, the session's connection is not known yet, or `claim`
+/// passed on each. A helper that took one can still end without reading or
+/// finishing it -- stopped, failed, out of budget, or unable to start -- and
+/// then the task comes back to the session as unread mail, and the hook set
+/// with `on_end` hears the helper has ended for good, so the task list can
+/// open again what it gave it. `claim` and the hook run with no lock of this
+/// module's held; call this holding no lock either of them takes.
+pub fn ring(root: u64, mut claim: impl FnMut(&str) -> Option<Notice>) -> Option<String> {
+    let limits = Limits::read();
+    let mut idle: Vec<(Instant, AgentId)> = {
+        let registry = registry();
+        (registry.helpers.iter())
+            .filter(|helper| helper.root == root)
+            .filter_map(|helper| Some((helper.idle.as_ref()?.until, helper.id)))
+            .collect()
+    };
+    // Each waits as long, so the one that ends first went idle first.
+    idle.sort_unstable();
+    for (_, id) in idle {
+        let Some(woken) = take_idle(id, limits.at_once) else {
+            continue;
+        };
+        let name = woken.claimed.slot.name.clone();
+        let Some(task) = claim(&name) else {
+            settle(woken);
+            continue;
+        };
+        // One that cannot start has ended for good, which `on_end` hears.
+        let _ = carry_on(woken, &limits, vec![task]);
+        return Some(name);
+    }
+    None
+}
+
+/// Notes `connection` as what its session works on now, which the session's
+/// kept helpers wake on; the window and the terminal call this as each turn
+/// starts.
+pub fn connected(connection: &Connection) {
+    let mut current = CURRENT.lock().unwrap_or_else(PoisonError::into_inner);
+    current.insert(connection.conversation, connection.clone());
+}
+
+/// Notes plan mode switched on or off in every session, as the window and the
+/// terminal switch it, so no kept helper wakes outside it.
+pub fn set_plan(plan: bool) {
+    let mut current = CURRENT.lock().unwrap_or_else(PoisonError::into_inner);
+    for connection in current.values_mut() {
+        connection.plan = plan;
+    }
+}
+
+/// The connection session `root` works on now, if its front end has said.
+fn current(root: u64) -> Option<Connection> {
+    let current = CURRENT.lock().unwrap_or_else(PoisonError::into_inner);
+    current.get(&root).cloned()
+}
+
+/// Has `hook` hear the session and name of each helper whose run ends
+/// without it going idle, kept or not, in place of any hook set before.
+pub fn on_end(hook: fn(u64, &str)) {
+    *ON_END.lock().unwrap_or_else(PoisonError::into_inner) = Some(hook);
+}
+
+/// Has `hook` hear the session and name of each kept helper that goes idle
+/// as a run of it ends, in place of any hook set before.
+pub fn on_idle(hook: fn(u64, &str)) {
+    *ON_IDLE.lock().unwrap_or_else(PoisonError::into_inner) = Some(hook);
+}
+
 /// The tools a helper may use, in the order it is offered them: those its
 /// connection offers and its type allows, less those no helper may use.
+/// MCP tools count as offered when they go out on demand, so a type allows
+/// the same ones either way, and then the pair that finds and calls them
+/// comes last.
 fn usable(connection: &Connection, def: &AgentDef) -> Vec<String> {
-    tools::specs(connection)
+    let every = tools::all();
+    let mut usable: Vec<String> = tools::specs_of(&every, connection, false)
         .iter()
         .filter_map(|spec| spec["function"]["name"].as_str())
         .filter(|name| def.allows(name) && !driver::DENY.contains(name))
         .map(str::to_owned)
-        .collect()
+        .collect();
+    if mcp_find::on_demand(&every) && usable.iter().any(|name| mcp_find::is_mcp(name)) {
+        usable.extend([mcp_find::FIND_TOOLS, mcp_find::CALL_MCP_TOOL].map(String::from));
+    }
+    usable
 }
 
 /// A helper's first message: what it is, what it may use and what to give
@@ -735,28 +1290,193 @@ fn usable(connection: &Connection, def: &AgentDef) -> Vec<String> {
 /// something the user said.
 fn task(def: &AgentDef, tools: &[String], prompt: &str) -> Message {
     let about = format!("You are a helper ({}). {}", def.name, def.prompt);
+    // MCP tools on demand are too many to name; find_tools finds them.
+    let on_demand = tools.iter().any(|name| name == mcp_find::FIND_TOOLS);
+    let tools: Vec<&str> = tools
+        .iter()
+        .map(String::as_str)
+        .filter(|name| !on_demand || !mcp_find::is_mcp(name))
+        .collect();
     let tools = if tools.is_empty() {
         "none".to_owned()
     } else {
         tools.join(", ")
     };
-    let prompt: Vec<String> = prompt
-        .replace("\r\n", "\n")
-        .split(LINE_BREAKS)
-        .map(|line| format!("    {line}"))
-        .collect();
     let content = format!(
         "{TASK_HEADER}\n{}\nTools you may use: {tools}.\nWhen done, answer with a report: what you \
          did, what you found, files you changed, open questions.\nThat answer is all the agent \
          that started you will see.\nTask:\n{}",
         about.trim_end(),
-        prompt.join("\n")
+        indented(prompt)
     );
     Message {
         role: "user".into(),
         content,
         notice: true,
         ..Default::default()
+    }
+}
+
+/// `text` with each line indented, so no line of it reads as the start of
+/// something the user said.
+fn indented(text: &str) -> String {
+    let lines: Vec<String> = text
+        .replace("\r\n", "\n")
+        .split(LINE_BREAKS)
+        .map(|line| format!("    {line}"))
+        .collect();
+    lines.join("\n")
+}
+
+/// The messages the calling agent has so far, as its own file holds them: a
+/// session's, which both front ends save before running tools, or a helper's
+/// transcript, which the driver saves before each round.
+fn parent_messages(caller: &Caller) -> Result<Vec<Message>, String> {
+    let conversation = match caller.agent {
+        None => crate::store::session(caller.root),
+        Some(id) => {
+            let n = registry().helpers.iter().find(|h| h.id == id).map(|h| h.n);
+            n.and_then(|n| Transcript::open(caller.root, n))
+                .map(|transcript| transcript.conversation)
+        }
+    };
+    conversation
+        .map(|conversation| conversation.messages)
+        .filter(|messages| !messages.is_empty())
+        .ok_or_else(|| {
+            "This conversation could not be read, so it cannot be forked. Start a helper with \
+             the whole task instead."
+                .into()
+        })
+}
+
+/// A fork's first messages: its parent's as they are, a result for each call
+/// the parent's last reply is still making, where `own`, the arguments of the
+/// fork's own call, marks the one running here, and then `directive`.
+///
+/// Nothing before the directive is rewritten, so the request starts with the
+/// same bytes as the parent's last one and the provider's cache serves them,
+/// unless what is added moves the window's start on a step.
+fn forked(mut messages: Vec<Message>, own: Option<&Value>, directive: Message) -> Vec<Message> {
+    let mut own = own;
+    let pending: Vec<Message> = match messages.iter().rposition(|m| m.role == "assistant") {
+        Some(at) => messages[at]
+            .tool_calls
+            .iter()
+            .filter(|call| {
+                !messages[at + 1..]
+                    .iter()
+                    .any(|m| m.role == "tool" && m.tool_call_id == call.id)
+            })
+            .map(|call| {
+                let mine = own.is_some_and(|args| {
+                    call.name == "agent"
+                        && tools::parse_args(&call.arguments).is_ok_and(|called| &called == args)
+                });
+                // Two identical calls are two forks; each claims one.
+                if mine {
+                    own = None;
+                }
+                Message {
+                    role: "tool".into(),
+                    content: if mine { FORKED_HERE } else { IN_PARENT }.into(),
+                    tool_call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    args: call.arguments.clone(),
+                    ..Default::default()
+                }
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    messages.extend(pending);
+    messages.push(directive);
+    messages
+}
+
+/// What a fork is told after its parent's messages: that it is a copy, then
+/// its task.
+fn directive(prompt: &str) -> Message {
+    Message {
+        role: "user".into(),
+        content: format!(
+            "{FORK_HEADER}\nDo only this, then answer with a report: what you did, what you \
+             found, files you changed. That answer is all the agent that forked you will \
+             see.\nTask:\n{}",
+            indented(prompt)
+        ),
+        notice: true,
+        ..Default::default()
+    }
+}
+
+/// Answers `question` about a conversation from its `messages`, on a fork of
+/// `connection` that may call no tool and makes one request, until `cancel`
+/// stops it, giving back the reply with what it cost. Nothing it says is
+/// added to the conversation.
+pub fn btw(
+    connection: &Connection,
+    messages: Vec<Message>,
+    question: &str,
+    cancel: Cancel,
+) -> Result<Message, String> {
+    let question = question.trim();
+    if question.is_empty() {
+        return Err("Ask something after /btw, such as: /btw what did we decide?".into());
+    }
+    let session = connection.conversation;
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let mut transcript = Transcript::aside(session, connection.workspace.clone())?;
+    let path = transcript.path.clone();
+    let aside = Message {
+        role: "user".into(),
+        content: format!("{ASIDE_HEADER}\n{question}"),
+        ..Default::default()
+    };
+    let first = forked(messages, None, aside);
+    let from = first.len();
+    transcript.conversation.messages = first;
+    let model = Some(connection.model.as_str());
+    let mut asking = child(connection, &AgentDef::default(), model, &Limits::read(), id);
+    // One request: a reply that calls a tool ends it, rather than the round
+    // cap's wrap-up asking again.
+    asking.wrap_up = true;
+    let report = driver::run(Spec {
+        connection: asking,
+        transcript,
+        id,
+        owner: session,
+        root: session,
+        run: id,
+        label: "btw".into(),
+        // Still offered, so the prefix is the session's, but none of them runs.
+        allow: Allow::Only(Vec::new()),
+        // No tool round, so a reply that calls one ends it.
+        rounds: 0,
+        cancel,
+        budget: None,
+        status: Arc::default(),
+        depth: 1,
+        fork: true,
+        from,
+        schema: None,
+    });
+    // An aside is kept nowhere, its own transcript and its lock included.
+    let _ = std::fs::remove_file(path.with_extension("lock"));
+    let _ = std::fs::remove_file(path);
+    match report.status {
+        Outcome::Stopped => Err("Stopped.".into()),
+        Outcome::Failed(error) => Err(error),
+        _ if report.text.trim().is_empty() => Err("No answer came.".into()),
+        _ => Ok(Message {
+            role: "assistant".into(),
+            content: report.text,
+            model: connection.model.clone(),
+            tokens: report.output,
+            prompt_tokens: report.input,
+            cached_tokens: report.cached,
+            ..Default::default()
+        }),
     }
 }
 
@@ -784,8 +1504,10 @@ fn answer(name: &str, report: &Report, rounds: usize, share: usize) -> Result<St
         out.push('\n');
         out.push_str(&jobs);
     }
-    if !report.text.is_empty() {
-        out.push('\n');
+    out.push('\n');
+    if report.text.is_empty() {
+        out.push_str(NO_ANSWER);
+    } else {
         out.push_str(&trim(&report.text, share));
     }
     match report.status {
@@ -802,6 +1524,7 @@ fn ended(
     report: &Report,
     rounds: usize,
     by_user: bool,
+    after: After,
 ) -> (State, Option<Notice>) {
     let ran = match report.rounds {
         1 => "1 round".to_owned(),
@@ -851,9 +1574,23 @@ fn ended(
         text.push('\n');
         text.push_str(&jobs);
     }
-    if !report.text.is_empty() {
-        text.push('\n');
-        text.push_str(&report.text);
+    text.push('\n');
+    text.push_str(if report.text.is_empty() {
+        NO_ANSWER
+    } else {
+        &report.text
+    });
+    match after {
+        After::Ends => {}
+        After::Idles => text.push_str(&format!(
+            "\n{name} is idle now: a message through the agents tool wakes it with its context, \
+             and it ends after {} idle minutes.",
+            KEEP.as_secs() / 60
+        )),
+        After::Spent => text.push_str(&format!(
+            "\n{name} has ended rather than wait for more work: the budget every run of it \
+             spends from is spent."
+        )),
     }
     // Last, where it survives the fold's trim, which keeps a notice's two ends.
     let whole = json!({"action": "report", "to": name});
@@ -862,6 +1599,11 @@ fn ended(
         from: format!("helper {name}"),
         when: When::Next,
         text,
+    };
+    let state = if after == After::Idles {
+        State::Idle
+    } else {
+        state
     };
     (state, Some(notice))
 }
@@ -911,9 +1653,13 @@ fn list(caller: &Caller) -> String {
     let registry = registry();
     let mut rows = vec![["name", "type", "state", "rounds", "tokens"].map(String::from)];
     for helper in yours(&registry.helpers, caller) {
-        let state = match &helper.ended {
-            Some(how) => how.clone(),
-            None => format!("running · {}", took(helper.run.started.elapsed().as_secs())),
+        let state = match (&helper.idle, &helper.ended) {
+            (Some(idle), _) => {
+                let left = idle.until.saturating_duration_since(Instant::now());
+                format!("idle · {}m left", left.as_secs().div_ceil(60))
+            }
+            (None, Some(how)) => how.clone(),
+            (None, None) => format!("running · {}", took(helper.run.started.elapsed().as_secs())),
         };
         let status = &helper.run.status;
         rows.push([
@@ -921,7 +1667,7 @@ fn list(caller: &Caller) -> String {
             helper.kind.clone(),
             state,
             status.rounds.load(Ordering::Relaxed).to_string(),
-            short(status.input.load(Ordering::Relaxed)),
+            short(helper.earlier + status.input.load(Ordering::Relaxed)),
         ]);
     }
     drop(registry);
@@ -993,10 +1739,39 @@ fn mine<'a>(helpers: &'a [Helper], caller: &Caller, to: &str) -> Result<&'a Help
 }
 
 /// The name of helper `id`, if there is one.
-fn name_of(id: AgentId) -> Option<String> {
+pub(crate) fn name_of(id: AgentId) -> Option<String> {
     let registry = registry();
     let helper = registry.helpers.iter().find(|helper| helper.id == id)?;
     Some(helper.name.clone())
+}
+
+/// Whether `helper` runs or waits idle, so a notice reaches it.
+fn reachable(helper: &Helper) -> bool {
+    helper.ended.is_none() || helper.idle.is_some()
+}
+
+/// The names of session `root`'s helpers that run or wait idle in this
+/// process, the only ones a notice from here reaches.
+pub(crate) fn here(root: u64) -> Vec<String> {
+    let registry = registry();
+    (registry.helpers.iter())
+        .filter(|helper| helper.root == root && reachable(helper))
+        .map(|helper| helper.name.clone())
+        .collect()
+}
+
+/// Leaves `notice` for session `root`'s helper `name` if it runs or waits
+/// idle, which wakes it.
+pub(crate) fn notify(root: u64, name: &str, notice: Notice) {
+    let registry = registry();
+    let helper = (registry.helpers.iter())
+        .find(|helper| helper.root == root && helper.name == name)
+        .filter(|helper| reachable(helper));
+    // Under the lock its run's close takes, so a run that ends now still
+    // passes it on.
+    if let Some(helper) = helper {
+        inbox::push(helper.id, notice);
+    }
 }
 
 /// Hands `message` to helper `to` of the caller's, picking it back up if it
@@ -1025,7 +1800,7 @@ fn send(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Stri
         Reached::Queued(name) => return Ok(queued(&name)),
         Reached::Ended { name, n, sidecar } => (name, n, sidecar),
     };
-    resume(args, ctx, limits, &name, n, &sidecar, notice)
+    resume(args, ctx, limits, &name, n, &sidecar, vec![notice])
 }
 
 /// Leaves `message` for whoever the calling helper answers to.
@@ -1087,8 +1862,8 @@ fn reach(caller: &Caller, to: &str, notice: &Notice) -> Result<Reached, String> 
     })
 }
 
-/// Picks helper `name`, which has ended, back up from its transcript with
-/// `notice` as its next turn, as the caller's own from now on.
+/// Picks helper `name`, which has ended or is idle, back up from its
+/// transcript with `notices` as its next turn, as the caller's own from now on.
 fn resume(
     args: &Value,
     ctx: &ToolContext,
@@ -1096,19 +1871,60 @@ fn resume(
     name: &str,
     n: u32,
     sidecar: &Path,
-    notice: Notice,
+    notices: Vec<Notice>,
 ) -> Result<String, String> {
     let caller = &ctx.caller;
     check(caller, &ctx.cancel, limits)?;
     let Some(sender) = caller.connection.as_deref() else {
         return Err("A helper can only be picked back up from a conversation.".into());
     };
+    let (what, def, transcript) = reread(caller.root, sender, name, n, sidecar, &notices)?;
+    let owner = caller.agent.unwrap_or(caller.root);
+    let background = in_background(args, inbox::listened(), caller.depth, sender);
+    let waiting = if background { 0 } else { owner };
+    let cancel = cancel_for(background, ctx);
+    let run = Run::new(owner, background);
+    let claimed = claim(
+        caller.root,
+        name,
+        run,
+        waiting,
+        cancel,
+        limits.at_once,
+        notices.clone(),
+    );
+    let Some(claimed) = claimed? else {
+        return Ok(queued(name));
+    };
+    let started = if claimed.kept.is_some() {
+        format!("Woke {name} with your message. A notice comes when it is done.")
+    } else {
+        format!(
+            "{name} had finished; it is carrying on from where it stopped, with your message. A \
+             notice comes when it is done."
+        )
+    };
+    let label = if what.fork { "fork" } else { def.name.as_str() }.to_owned();
+    let spec = rerun(caller, sender, what, &def, transcript, &claimed, limits);
+    launch(spec, claimed.slot, background, &label, started, notices)
+}
+
+/// What helper `name` of session `root` is, and its conversation so far with
+/// `notices` folded in as its next turn, read back to carry on on `sender`.
+fn reread(
+    root: u64,
+    sender: &Connection,
+    name: &str,
+    n: u32,
+    sidecar: &Path,
+    notices: &[Notice],
+) -> Result<(Sidecar, AgentDef, Transcript), String> {
     let what = Sidecar::read(sidecar)?;
     if what.stopped_by_user {
         return Err(user_stopped(name));
     }
     let def = agent_defs::find(&what.kind, sender.workspace.as_deref())?;
-    let Some(mut transcript) = Transcript::open(caller.root, n) else {
+    let Some(mut transcript) = Transcript::open(root, n) else {
         return Err(format!(
             "{name}'s conversation could not be read, so it cannot carry on. Start a new helper."
         ));
@@ -1116,59 +1932,74 @@ fn resume(
     transcript
         .conversation
         .messages
-        .extend(inbox::fold(std::slice::from_ref(&notice)));
-    let owner = caller.agent.unwrap_or(caller.root);
-    let background = in_background(args, inbox::listened(), caller.depth, sender);
-    let run = Run::new(owner, background);
-    let status = run.status.clone();
-    let waiting = if background { 0 } else { owner };
-    let cancel = cancel_for(background, ctx);
-    let claimed = claim(
-        caller.root,
-        name,
-        run,
-        waiting,
-        cancel.clone(),
-        limits.at_once,
-        notice,
-    );
-    let Some(slot) = claimed? else {
-        return Ok(queued(name));
-    };
+        .extend(inbox::fold(notices));
+    Ok((what, def, transcript))
+}
+
+/// The run of helper `what` that carries on in the place `claimed` took, on
+/// `sender`'s connection for `caller`, narrowed as when it started.
+fn rerun(
+    caller: &Caller,
+    sender: &Connection,
+    what: Sidecar,
+    def: &AgentDef,
+    transcript: Transcript,
+    claimed: &Claimed,
+    limits: &Limits,
+) -> Spec {
+    let (fork, from) = (what.fork, what.from);
+    let allowed = what.allow.clone();
     let connection = Connection {
         model: what.model,
         // Only ever narrowed, as when it started.
         plan: sender.plan || what.plan,
         workspace: what.worktree.or_else(|| sender.workspace.clone()),
-        conversation: slot.id,
+        conversation: claimed.slot.id,
         ..sender.clone()
     };
-    let tools = usable(&connection, &def);
-    let spec = Spec {
+    let tools = usable(&connection, def);
+    // A kept one's for its whole life, or a new one under the caller's.
+    let budget = (claimed.kept.clone())
+        .unwrap_or_else(|| Arc::new(Budget::new(limits.budget, caller.budget.clone())));
+    Spec {
         connection,
         transcript,
-        id: slot.id,
-        owner,
+        id: claimed.slot.id,
+        owner: caller.agent.unwrap_or(caller.root),
         root: caller.root,
-        run: caller.run.unwrap_or(slot.id),
-        label: slot.name.clone(),
-        allow: allow(&def, tools),
+        run: caller.run.unwrap_or(claimed.slot.id),
+        label: claimed.slot.name.clone(),
+        // A fork is held to what it was given, or to its parent's tools.
+        allow: match allowed {
+            Some(names) => Allow::Only(names),
+            None if fork => Allow::All,
+            None => allow(def, tools),
+        },
         rounds: def.rounds.unwrap_or(ROUNDS),
-        cancel,
-        budget: Some(Arc::new(Budget::new(limits.budget, caller.budget.clone()))),
-        status,
+        cancel: claimed.cancel.clone(),
+        budget: Some(budget),
+        status: claimed.status.clone(),
         depth: caller.depth + 1,
-    };
-    let started = format!(
-        "{name} had finished; it is carrying on from where it stopped, with your message. A \
-         notice comes when it is done."
-    );
-    launch(spec, slot, background, &def.name, started)
+        fork,
+        from,
+        schema: None,
+    }
+}
+
+/// A helper's place to carry on in, taken back from idle or ended.
+struct Claimed {
+    slot: Slot,
+    cancel: Cancel,
+    /// How the run it carries on in is getting on, as the list shows.
+    status: Arc<Status>,
+    /// The budget a kept one spends from for its whole life; None for one
+    /// that was not kept.
+    kept: Option<Arc<Budget>>,
 }
 
 /// Takes a place for helper `name` of session `root` to carry on in as `run`
-/// says, until `cancel` stops it, or None when it is running again already and
-/// `notice` waits in its mailbox instead.
+/// says, until `cancel` stops it; or None when it is running again already
+/// and `notices` wait in its mailbox instead.
 fn claim(
     root: u64,
     name: &str,
@@ -1176,8 +2007,8 @@ fn claim(
     waiting: u64,
     cancel: Cancel,
     at_once: usize,
-    notice: Notice,
-) -> Result<Option<Slot>, String> {
+    notices: Vec<Notice>,
+) -> Result<Option<Claimed>, String> {
     let mut registry = registry();
     let Some(at) =
         (registry.helpers.iter()).position(|helper| helper.root == root && helper.name == name)
@@ -1191,16 +2022,43 @@ fn claim(
         return Err(user_stopped(name));
     }
     if helper.ended.is_none() {
-        inbox::push(helper.id, notice);
+        for notice in notices {
+            inbox::push(helper.id, notice);
+        }
         return Ok(None);
     }
     full(&registry, at_once)?;
+    Ok(Some(back_to_work(&mut registry, at, run, waiting, cancel)))
+}
+
+/// Puts helper `at`, idle or ended, back in the running list as one of
+/// `waiting`'s that `cancel` stops, to carry on as `run` says.
+fn back_to_work(
+    registry: &mut Registry,
+    at: usize,
+    run: Run,
+    waiting: u64,
+    cancel: Cancel,
+) -> Claimed {
     let helper = &mut registry.helpers[at];
-    let id = helper.id;
+    let (id, name) = (helper.id, helper.name.clone());
+    if let Some(idle) = helper.idle.take() {
+        timers::cancel(idle.timer);
+        helper.earlier += helper.run.status.input.load(Ordering::Relaxed);
+    }
+    let status = run.status.clone();
     helper.run = run;
     helper.ended = None;
-    let slot = occupy(&mut registry, id, name.to_owned(), waiting, cancel);
-    Ok(Some(slot))
+    let kept = helper.keep.clone();
+    // Spent or taken back, so mail from now on waits for its steps.
+    inbox::unwake(id);
+    let slot = occupy(registry, id, name, waiting, cancel.clone());
+    Claimed {
+        slot,
+        cancel,
+        status,
+        kept,
+    }
 }
 
 /// Stops helper `to` of the caller's, and its own helpers with it; what it
@@ -1209,6 +2067,14 @@ fn stop_by_name(caller: &Caller, to: &str) -> Result<String, String> {
     let mut registry = registry();
     let helper = mine(&registry.helpers, caller, to)?;
     let (id, name, background) = (helper.id, helper.name.clone(), helper.run.background);
+    let idle =
+        (registry.helpers.iter_mut()).find(|helper| helper.id == id && helper.idle.is_some());
+    if let Some(helper) = idle {
+        let ending = end_idle(helper, "stopped".into(), State::Stopped);
+        drop(registry);
+        ending.pass_on();
+        return Ok(format!("Stopped {name}, which was idle."));
+    }
     // Taken under the lock that marks the stop an agent's below, where `stop`
     // would look again later and could reach a run picked up since, unmarked.
     let running = registry.running.iter().find(|helper| helper.id == id);
@@ -1239,15 +2105,17 @@ fn stop_by_name(caller: &Caller, to: &str) -> Result<String, String> {
 /// A page of the last thing helper `to` of the caller's said, from character
 /// `offset` on.
 fn report(caller: &Caller, to: &str, offset: usize) -> Result<String, String> {
-    let (name, n) = {
+    let (name, n, sidecar) = {
         let registry = registry();
         let helper = mine(&registry.helpers, caller, to)?;
-        (helper.name.clone(), helper.n)
+        (helper.name.clone(), helper.n, helper.sidecar.clone())
     };
     let Some(transcript) = Transcript::open(caller.root, n) else {
         return Err(format!("{name}'s conversation could not be read."));
     };
-    let said = driver::last_said(&transcript.conversation.messages);
+    let from = Sidecar::read(&sidecar).map_or(0, |what| what.from);
+    let messages = &transcript.conversation.messages;
+    let said = driver::last_said(messages.get(from..).unwrap_or_default());
     let total = said.chars().count();
     if total == 0 {
         return Ok(format!("{name} has said nothing yet."));
@@ -1316,7 +2184,7 @@ fn user_stopped(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chat::Remote;
+    use crate::chat::{Remote, ToolCall};
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::path::PathBuf;
@@ -1343,6 +2211,7 @@ mod tests {
         Report {
             status,
             text: text.into(),
+            value: None,
             rounds: 7,
             input: 41_000,
             cached: 32_800,
@@ -1551,6 +2420,9 @@ mod tests {
             ended: Some("finished".into()),
             asked_to_stop: false,
             stopped_by_user: false,
+            keep: None,
+            idle: None,
+            earlier: 0,
         }
     }
 
@@ -1666,10 +2538,13 @@ mod tests {
 
     #[test]
     fn reserved_names_are_refused() {
-        for name in ["main", "user", "system", "Main"] {
+        for name in ["main", "user", "system", "Main", "me", "tasks"] {
             assert_eq!(
                 check_name(name),
-                Err("\"main\", \"user\" and \"system\" are reserved names.".into())
+                Err(
+                    "\"main\", \"user\", \"system\", \"me\" and \"tasks\" are reserved names."
+                        .into()
+                )
             );
         }
         let (longest, too_long) = ("a".repeat(NAME_CHARS), "a".repeat(NAME_CHARS + 1));
@@ -1800,6 +2675,76 @@ mod tests {
         assert_eq!(model(Some("call-model"), &typed), "call-model");
         assert_eq!(model(None, &typed), "type-model");
         assert_eq!(model(None, &def(false)), "setting-model");
+    }
+
+    #[test]
+    fn a_helper_reaches_the_mcp_tools_its_type_allows_when_they_go_out_on_demand() {
+        use crate::mcp_find::tests::{fake, server, wrapped};
+        let mut served = server(40, 30);
+        served.push(fake("mcp__big__delete", "Delete a thing.", true));
+        crate::mcp::serve(served);
+        let looking = AgentDef {
+            name: "explore".into(),
+            tools: Some(vec!["read_file".into()]),
+            plan: true,
+            ..Default::default()
+        };
+        let planning = Connection {
+            plan: true,
+            ..Default::default()
+        };
+        let tools = usable(&planning, &looking);
+        for name in [
+            "read_file",
+            "mcp__big__tool_1",
+            mcp_find::FIND_TOOLS,
+            mcp_find::CALL_MCP_TOOL,
+        ] {
+            assert!(tools.contains(&name.to_owned()), "{name}: {tools:?}");
+        }
+        // Plan mode keeps what changes things away, found or not.
+        assert!(!tools.contains(&"mcp__big__delete".to_owned()));
+        // It is told of the pair, not of every tool the pair finds.
+        let told = task(&looking, &tools, "Look.").content;
+        assert!(
+            told.contains("use: read_file, find_tools, call_mcp_tool."),
+            "{told}"
+        );
+        assert!(!told.contains("mcp__big__"));
+        let looked = allow(&looking, tools);
+        let mut calls = vec![wrapped(r#"{"name": "mcp__big__tool_1", "arguments": {}}"#)];
+        mcp_find::resolve(&mut calls);
+        assert_eq!(driver::refusal(&looked, &calls[0].name), None);
+        assert!(driver::refusal(&looked, "mcp__big__delete").is_some());
+        // A type that names a tool it may not use loses that one only.
+        let wary = AgentDef {
+            name: "wary".into(),
+            disallowed: vec!["mcp__big__tool_2".into()],
+            ..Default::default()
+        };
+        let tools = usable(&Connection::default(), &wary);
+        let warned = allow(&wary, tools.clone());
+        assert!(driver::refusal(&warned, "mcp__big__tool_2").is_some());
+        assert_eq!(driver::refusal(&warned, "mcp__big__tool_3"), None);
+        assert_eq!(driver::refusal(&warned, mcp_find::FIND_TOOLS), None);
+        // Nor does find_tools show it that one.
+        let ctx = ToolContext {
+            caller: Caller {
+                allowed: Some(tools.as_slice().into()),
+                ..Caller::default()
+            },
+            ..Default::default()
+        };
+        let query = r#"{"query": "mcp__big__tool_2"}"#;
+        let found = tools::run(mcp_find::FIND_TOOLS, query, &ctx).unwrap();
+        let words = |text: &str| {
+            text.split(|c: char| !c.is_alphanumeric() && c != '_')
+                .any(|word| word == "mcp__big__tool_2")
+        };
+        assert!(
+            found.contains("mcp__big__tool_3") && !words(&found),
+            "{found}"
+        );
     }
 
     #[test]
@@ -2089,7 +3034,7 @@ mod tests {
 
         assert_eq!(
             out,
-            Err("halted was stopped; its partial report is below.".into())
+            Err("halted was stopped; its partial report is below.\n(no answer)".into())
         );
         assert_eq!(sidecar(&session, 1)["stopped_by_user"], true);
         // The session's next turn cannot pick it back up, and never reaches a model trying.
@@ -2307,5 +3252,909 @@ mod tests {
         let sizes: Vec<usize> = pages.iter().map(|page| page.chars().count()).collect();
         assert_eq!(sizes, [7_500, 3_000, 1_875, 1_875, 750]);
         assert!(pages.concat() == long, "the pages are not the report");
+    }
+
+    #[test]
+    fn the_users_message_reaches_only_a_helper_still_running() {
+        let _running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+        let _bell = crate::inbox::tests::DOORBELL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let slot = reserve(9_601, 9_601, "worker", AT_ONCE, Cancel::default()).unwrap();
+        let id = slot.id;
+        let mut working = known(id, 9_601, 9_601, "worker", "general");
+        working.ended = None;
+        let ended = known(96_012, 9_601, 9_601, "done", "explore");
+        registry().helpers.extend([working, ended]);
+
+        assert!(steer(id, "Look at the tests first."));
+        assert!(!steer(96_012, "Too late."));
+        let heard = inbox::take(id, false);
+        let heard: Vec<&str> = heard.iter().map(|n| n.text.as_str()).collect();
+        assert_eq!(heard, ["message from the user:\nLook at the tests first."]);
+        assert!(inbox::take(96_012, true).is_empty());
+        let seen: Vec<(String, Option<String>)> = (seen().into_iter())
+            .filter(|helper| helper.session == 9_601)
+            .map(|helper| (helper.name, helper.ended))
+            .collect();
+        let finished = Some("finished".to_owned());
+        assert_eq!(seen, [("worker".into(), None), ("done".into(), finished)]);
+
+        // One that ends before its next step passes it on to its owner.
+        assert!(steer(id, "And the docs."));
+        close(slot, &report(Outcome::Done, "Done."), |_, _| ());
+        let passed: Vec<String> = (inbox::take(9_601, true).into_iter())
+            .map(|notice| notice.text)
+            .collect();
+        let text =
+            "worker ended before it read this, from user:\nmessage from the user:\nAnd the docs.";
+        assert_eq!(passed, [text]);
+        assert!(!steer(id, "Gone."));
+    }
+
+    #[test]
+    fn a_fork_answers_the_calls_its_parent_is_still_making() {
+        let own = fork_args();
+        let messages = vec![
+            said("user", "Go."),
+            Message {
+                role: "assistant".into(),
+                tool_calls: vec![
+                    tool_call("a", "read_file", &json!({"path": "notes.txt"})),
+                    tool_call("b", "agent", &own),
+                    tool_call("c", "run_command", &json!({"command": "ls"})),
+                ],
+                ..Default::default()
+            },
+            Message {
+                role: "tool".into(),
+                tool_call_id: "a".into(),
+                content: "hello from the notes".into(),
+                ..Default::default()
+            },
+        ];
+        let out = forked(messages, Some(&own), directive("Read it."));
+        let added: Vec<(&str, &str)> = out[3..out.len() - 1]
+            .iter()
+            .map(|m| (m.tool_call_id.as_str(), m.content.as_str()))
+            .collect();
+        assert_eq!(added, [("b", FORKED_HERE), ("c", IN_PARENT)]);
+        assert_eq!(out.len(), 6);
+    }
+
+    #[test]
+    fn a_fork_cannot_fork() {
+        let session = Session::new("fork-in-fork");
+        let args = fork_args();
+        saved_session(&forking(&args));
+        let again = json!({"description": "go deeper", "prompt": "Carry on.", "fork": true});
+        let (endpoint, stub) = Stub::start(vec![
+            reply("", Some(("agent", again))),
+            reply("Did it myself.", None),
+        ]);
+        let answer = call(session.context(endpoint), args).unwrap();
+        assert!(answer.contains("Did it myself."), "{answer}");
+        let sent = stub.sent();
+        assert_eq!(
+            results(&sent[1]).last(),
+            Some(&"A fork cannot start another fork. Do the work yourself.")
+        );
+    }
+
+    #[test]
+    fn a_fork_is_refused_the_deny_set_at_dispatch_though_it_is_offered() {
+        let session = Session::new("fork-deny");
+        let args = fork_args();
+        saved_session(&forking(&args));
+        let keep = json!({"action": "add", "target": "memory", "content": "Forks remember."});
+        let (endpoint, stub) = Stub::start(vec![
+            reply("", Some(("memory", keep))),
+            reply("Left it.", None),
+        ]);
+        call(session.context(endpoint), args).unwrap();
+        let sent = stub.sent();
+        let offered: Vec<&str> = sent[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str())
+            .collect();
+        assert!(offered.contains(&"memory"), "{offered:?}");
+        assert_eq!(
+            results(&sent[1]).last(),
+            Some(&"`memory` is not available to this helper.")
+        );
+        assert!(!session.data.join("MEMORY.md").exists());
+    }
+
+    #[test]
+    fn a_fork_of_a_restricted_helper_is_refused_what_it_was_even_picked_back_up() {
+        let session = Session::new("fork-blind");
+        let types = session.work.join(".letronna").join("agents");
+        std::fs::create_dir_all(&types).unwrap();
+        let blind = "---\nname: blind\ndisallowed: read_file\n---\nLook without reading.\n";
+        std::fs::write(types.join("blind.md"), blind).unwrap();
+        let read = json!({"path": "notes.txt"});
+        let refused = "`read_file` is not available to this helper.";
+        let (endpoint, stub) = Stub::start(vec![
+            reply("", Some(("agent", fork_args()))),
+            reply("", Some(("read_file", read.clone()))),
+            reply("Could not read it.", None),
+            reply("The fork could not read it.", None),
+        ]);
+        let args = json!({"description": "look", "type": "blind", "prompt": "Look at notes.txt.",
+            "background": false});
+        let answer = call(session.context(endpoint), args).unwrap();
+        assert!(answer.contains("The fork could not read it."), "{answer}");
+        assert_eq!(results(&stub.sent()[2]).last(), Some(&refused));
+        let kept = sidecar(&session, 2);
+        assert_eq!(kept["fork"], true);
+        let allowed = kept["allow"].as_array().unwrap();
+        assert!(!allowed.is_empty() && !allowed.contains(&json!("read_file")));
+        // Picked back up, it is still a fork held to what its parent could call.
+        let (endpoint, stub) = Stub::start(vec![
+            reply("", Some(("read_file", read))),
+            reply("Still could not.", None),
+        ]);
+        let message = json!({"action": "send", "to": kept["name"], "message": "Try again.",
+            "background": false});
+        let out = talk(session.context(endpoint), message).unwrap();
+        assert!(out.contains("Still could not."), "{out}");
+        assert_eq!(results(&stub.sent()[1]).last(), Some(&refused));
+    }
+
+    #[test]
+    fn a_fork_sends_its_parents_bytes_before_its_directive() {
+        let session = Session::new("fork-prefix");
+        let (endpoint, stub) = Stub::start(vec![reply("", None), reply("Forked and done.", None)]);
+        let ctx = session.context(endpoint);
+        let parent = ctx.caller.connection.as_deref().unwrap().clone();
+        let mut messages = vec![said("user", "What does notes.txt say? Check it two ways.")];
+        // The parent's own request, which the reply that forks answered.
+        let events = crate::chat::start(parent, messages.clone());
+        while let Ok(event) = events.recv_blocking() {
+            if matches!(event, crate::chat::Event::Finished(_)) {
+                break;
+            }
+        }
+        let args = fork_args();
+        let read = json!({"path": "notes.txt"});
+        messages.push(Message {
+            role: "assistant".into(),
+            tool_calls: vec![
+                tool_call("call-fork", "agent", &args),
+                tool_call("call-read", "read_file", &read),
+            ],
+            ..Default::default()
+        });
+        saved_session(&messages);
+        let answer = call(ctx, args).unwrap();
+        assert!(answer.contains("Forked and done."), "{answer}");
+        let sent = stub.sent();
+        let (parent, fork) = (&sent[0], &sent[1]);
+        assert_eq!(fork["model"], parent["model"]);
+        assert_eq!(fork["tools"], parent["tools"]);
+        let before = parent["messages"].as_array().unwrap();
+        let after = fork["messages"].as_array().unwrap();
+        // Serialized as the request is, so equal text is equal bytes.
+        assert_eq!(
+            serde_json::to_string(&after[..before.len()]).unwrap(),
+            serde_json::to_string(before).unwrap()
+        );
+        assert_eq!(results(fork), [FORKED_HERE, IN_PARENT]);
+        let directive = after.last().unwrap();
+        assert_eq!(directive["role"], "user");
+        let directive = directive["content"].as_str().unwrap();
+        assert!(directive.starts_with(FORK_HEADER), "{directive}");
+        assert!(directive.ends_with("    Read notes.txt and say what it says."));
+    }
+
+    #[test]
+    fn a_fork_that_says_nothing_reports_no_answer_and_not_its_parents_words() {
+        let session = Session::new("fork-silent");
+        let args = fork_args();
+        let mut messages = vec![said("user", "Hi."), said("assistant", "PARENT-ONLY TEXT")];
+        messages.extend(forking(&args));
+        saved_session(&messages);
+        let (endpoint, stub) = Stub::start(vec![reply("", None)]);
+        let ctx = session.context(endpoint);
+        // Asked again once, as an empty reply is, it ends with nothing said.
+        let answer = match call(ctx.clone(), args) {
+            Ok(answer) | Err(answer) => answer,
+        };
+        stub.sent();
+        // Named `fork`, or `fork-<n>` where the session has one already.
+        let (name, _) = answer.split_once(' ').unwrap();
+        assert!(answer.ends_with("\n(no answer)"), "{answer}");
+        let page = talk(ctx, json!({"action": "report", "to": name}));
+        assert_eq!(page, Ok(format!("{name} has said nothing yet.")));
+    }
+
+    #[test]
+    fn btw_makes_one_request_and_answers_only_from_it() {
+        let session = Session::new("btw-round");
+        let messages = vec![
+            said("user", "Look at notes.txt later."),
+            said("assistant", "PARENT-ONLY TEXT"),
+        ];
+        let read = json!({"path": "notes.txt"});
+        let ask = |given: String| {
+            let (endpoint, stub) = Stub::start(vec![given]);
+            let ctx = session.context(endpoint);
+            let connection = ctx.caller.connection.as_deref().unwrap();
+            // A second request would find the provider gone and fail the answer.
+            let answer = btw(
+                connection,
+                messages.clone(),
+                "what is in it?",
+                Cancel::default(),
+            );
+            (answer.map(|reply| reply.content), stub.sent())
+        };
+        let (answer, sent) = ask(reply("", Some(("read_file", read.clone()))));
+        assert_eq!(answer, Err("No answer came.".into()));
+        assert_eq!(sent.len(), 1);
+        assert!(!sent[0]["tools"].as_array().unwrap().is_empty());
+        let (answer, sent) = ask(reply("It says hello.", Some(("read_file", read))));
+        assert_eq!(answer, Ok("It says hello.".into()));
+        assert_eq!(sent.len(), 1);
+    }
+
+    #[test]
+    fn btw_never_touches_the_session() {
+        let session = Session::new("btw-session");
+        let messages = vec![
+            said("user", "What does notes.txt say?"),
+            said("assistant", "It says hello from the notes."),
+        ];
+        saved_session(&messages);
+        let file = crate::store::sessions_dir().join("4242.jsonl");
+        let before = std::fs::read(&file).unwrap();
+        let (endpoint, stub) = Stub::start(vec![reply("Hello, from the notes.", None)]);
+        let ctx = session.context(endpoint);
+        let connection = ctx.caller.connection.as_deref().unwrap();
+        let answer = btw(connection, messages, "what did it say?", Cancel::default()).unwrap();
+        assert_eq!(answer.content, "Hello, from the notes.");
+        // What it cost, for the front end to show as it does a reply's.
+        assert_eq!((answer.tokens, answer.prompt_tokens), (50, 1_000));
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+        // Nor does it leave a transcript of its own, or a helpers' folder.
+        let asides = session.data.join("asides");
+        assert!(std::fs::read_dir(asides).map_or(true, |dir| dir.count() == 0));
+        assert!(!session.data.join("agents").join("4242").exists());
+        let sent = stub.sent();
+        let last = sent[0]["messages"].as_array().unwrap().last().unwrap();
+        assert_eq!(last["content"], format!("{ASIDE_HEADER}\nwhat did it say?"));
+    }
+
+    /// A fork call that waits for its report.
+    fn fork_args() -> Value {
+        json!({"description": "read the notes", "prompt": "Read notes.txt and say what it \
+            says.", "fork": true, "background": false})
+    }
+
+    /// A question, then a reply making the fork call `args` and nothing else.
+    fn forking(args: &Value) -> Vec<Message> {
+        vec![
+            said("user", "Look into the notes."),
+            Message {
+                role: "assistant".into(),
+                tool_calls: vec![tool_call("call-fork", "agent", args)],
+                ..Default::default()
+            },
+        ]
+    }
+
+    fn said(role: &str, content: &str) -> Message {
+        Message {
+            role: role.into(),
+            content: content.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Session 4242 as a front end leaves it before running tools: `messages`,
+    /// saved.
+    fn saved_session(messages: &[Message]) {
+        std::fs::create_dir_all(crate::store::sessions_dir()).unwrap();
+        Transcript {
+            path: crate::store::sessions_dir().join("4242.jsonl"),
+            conversation: crate::store::Conversation {
+                id: 4242,
+                title: "parent".into(),
+                messages: messages.to_vec(),
+                ..Default::default()
+            },
+        }
+        .save()
+        .unwrap();
+    }
+
+    fn tool_call(id: &str, name: &str, args: &Value) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: args.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_claimable_task_wakes_an_idle_helper() {
+        let session = Session::new("ring");
+        let (_ctx, provider, id) = kept(&session, "claimer", &["Done: the tests pass."]);
+        let mut offered = Vec::new();
+        let took = ring(4_242, |name| {
+            offered.push(name.to_owned());
+            Some(Notice {
+                from: "tasks".into(),
+                when: When::Next,
+                text: format!("task 1 is yours, {name}: check the tests"),
+            })
+        });
+        let notices = heard(4_242);
+        let sent = provider.sent();
+
+        assert_eq!(offered, ["claimer"]);
+        assert_eq!(took.as_deref(), Some("claimer"));
+        let said = said_in(&sent[1]);
+        assert!(
+            said[2]
+                .1
+                .contains("task 1 is yours, claimer: check the tests"),
+            "{said:?}"
+        );
+        assert!(notices[0].text.contains("Done: the tests pass."));
+        assert!(stop(id));
+    }
+
+    #[test]
+    fn a_helper_not_kept_ends_as_before() {
+        let session = Session::new("unkept");
+        inbox::listen();
+        let (endpoint, provider) = Stub::start(vec![reply("The notes say hello.", None)]);
+        let args = json!({"description": "Read the notes", "type": "explore", "name": "once",
+            "prompt": "Read notes.txt."});
+        call(session.context(endpoint.clone()), args).unwrap();
+        let notices = heard(4_242);
+        provider.sent();
+
+        assert!(!notices[0].text.contains("idle"), "{notices:?}");
+        assert!(row(&session.context(endpoint), "once").contains("finished"));
+        assert_eq!(task_of("once"), State::Done("finished".into()));
+        let id = (registry().helpers.iter())
+            .find(|helper| helper.root == 4_242 && helper.name == "once")
+            .inspect(|helper| assert!(helper.keep.is_none() && helper.idle.is_none()))
+            .map(|helper| helper.id)
+            .unwrap();
+        // Mail waits for whoever picks it back up, rather than waking it.
+        inbox::push(id, from_elsewhere());
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(inbox::take(id, true).len(), 1);
+    }
+
+    #[test]
+    fn a_kept_helper_reports_and_goes_idle_holding_no_place() {
+        let session = Session::new("keep");
+        let (ctx, provider, id) = kept(&session, "keeper", &[]);
+        provider.sent();
+
+        assert!(registry().running.is_empty());
+        assert!(row(&ctx, "keeper").contains("idle · 30m left"));
+        assert_eq!(task_of("keeper"), State::Idle);
+        let until = (registry().helpers.iter())
+            .find(|helper| helper.id == id)
+            .and_then(|helper| Some(helper.idle.as_ref()?.until))
+            .unwrap();
+        assert!(until > Instant::now() + KEEP - WAIT && until <= Instant::now() + KEEP);
+        assert!(stop(id));
+    }
+
+    #[test]
+    fn a_kept_helper_spends_one_budget_for_its_whole_life() {
+        let session = Session::new("budget");
+        // Each reply costs 1,050: a run fits twice over, and three do not.
+        std::fs::write(
+            session.data.join("settings.json"),
+            r#"{"endpoint": "", "model": "", "helper_budget": 2500}"#,
+        )
+        .unwrap();
+        let (ctx, provider, id) = kept(&session, "thrifty", &["Second.", "Third."]);
+        let send = |text: &str| json!({"action": "send", "to": "thrifty", "message": text});
+        talk(ctx.clone(), send("Once more.")).unwrap();
+        let second = heard(4_242);
+        let tokens_then = row(&ctx, "thrifty");
+        talk(ctx.clone(), send("And again.")).unwrap();
+        let third = heard(4_242);
+        provider.sent();
+
+        assert!(second[0].text.contains("is idle now"), "{second:?}");
+        assert!(
+            tokens_then.contains("idle") && tokens_then.ends_with("2k"),
+            "{tokens_then}"
+        );
+        assert!(
+            third[0].text.contains(
+                "thrifty has ended rather than wait for more work: the budget every run of it \
+                 spends from is spent."
+            ),
+            "{third:?}"
+        );
+        assert!(!is_idle(id));
+        let last = row(&ctx, "thrifty");
+        assert!(last.contains("finished") && last.ends_with("3k"), "{last}");
+    }
+
+    #[test]
+    fn a_message_wakes_an_idle_helper_with_its_transcript() {
+        let session = Session::new("wake");
+        let (ctx, provider, id) = kept(&session, "woken", &["The tests pass too."]);
+        let message = json!({"action": "send", "to": "woken", "message": "Now check the tests."});
+        let out = talk(ctx.clone(), message).unwrap();
+        let notices = heard(4_242);
+        let sent = provider.sent();
+
+        assert_eq!(
+            out,
+            "Woke woken with your message. A notice comes when it is done."
+        );
+        let said = said_in(&sent[1]);
+        assert_eq!(said.len(), 3, "{said:?}");
+        assert!(said[0].1.starts_with(TASK_HEADER), "{said:?}");
+        assert_eq!(said[1], ("assistant", "The notes say hello."));
+        assert_eq!(
+            said[2],
+            ("user", from_main("Now check the tests.").as_str())
+        );
+        // It answered again and waits again, and an agent's stop ends it at once.
+        assert!(
+            notices[0].text.contains("The tests pass too."),
+            "{notices:?}"
+        );
+        assert!(is_idle(id));
+        let stopping = json!({"action": "stop", "to": "woken"});
+        assert_eq!(
+            talk(ctx.clone(), stopping),
+            Ok("Stopped woken, which was idle.".into())
+        );
+        assert!(row(&ctx, "woken").contains("stopped"));
+    }
+
+    #[test]
+    fn a_users_stop_as_an_idle_helper_wakes_ends_it_and_hands_its_mail_up() {
+        let session = Session::new("stop-race");
+        let (ctx, provider, id) = kept(&session, "raced", &[]);
+        provider.sent();
+        // The stop lands before the wake takes a place: the wake finds it
+        // ended, and runs nothing.
+        mail_without_a_wake(id);
+        assert!(stop(id));
+        wake(id);
+        let early = inbox::take(4_242, true);
+        // The stop lands once the wake has its place: the run ends before
+        // its first request, and the mail it took comes back unread.
+        let (_, provider, late) = kept(&session, "raced-late", &[]);
+        provider.sent();
+        mail_without_a_wake(late);
+        let woken = take_idle(late, AT_ONCE).unwrap();
+        assert!(stop(late));
+        carry_on(woken, &usual(), inbox::take(late, true)).unwrap();
+        let after = heard(4_242);
+
+        assert_eq!(texts(&early), [unread("raced")]);
+        assert_eq!(texts(&after), [unread("raced-late")]);
+        for name in ["raced", "raced-late"] {
+            assert!(row(&ctx, name).contains("stopped by the user"), "{name}");
+        }
+        assert_eq!(sidecar(&session, 2)["stopped_by_user"], true);
+    }
+
+    #[test]
+    fn a_wake_runs_in_the_sessions_mode_now_and_waits_for_one_it_knows() {
+        let session = Session::new("plan-wake");
+        let (ctx, provider, id) = kept(&session, "planner", &["Planned."]);
+        // With no connection noted for its session, mail waits.
+        CURRENT.lock().unwrap().remove(&4_242);
+        inbox::push(id, from_elsewhere());
+        std::thread::sleep(Duration::from_millis(200));
+        let waited = is_idle(id) && inbox::pending().contains(&id);
+        // The session goes into plan mode after the helper was kept.
+        connected(ctx.caller.connection.as_deref().unwrap());
+        set_plan(true);
+        inbox::push(id, from_elsewhere());
+        let notices = heard(4_242);
+        set_plan(false);
+        let sent = provider.sent();
+
+        assert!(waited, "it ran on the connection it was kept on");
+        assert!(notices[0].text.contains("Planned."), "{notices:?}");
+        assert!(offered(&sent[0]).contains(&"write_file"));
+        let woken = offered(&sent[1]);
+        assert!(
+            woken.contains(&"read_file") && !woken.contains(&"write_file"),
+            "{woken:?}"
+        );
+        assert!(stop(id));
+    }
+
+    #[test]
+    fn an_agents_stop_of_an_idle_helper_ends_it_for_good() {
+        let session = Session::new("agent-stop-race");
+        let (ctx, provider, id) = kept(&session, "stilled", &[]);
+        provider.sent();
+        mail_without_a_wake(id);
+        let stop_it = |name: &str| talk(ctx.clone(), json!({"action": "stop", "to": name}));
+        let stopped = stop_it("stilled");
+        wake(id);
+        let early = inbox::take(4_242, true);
+        let (_, provider, late) = kept(&session, "stilled-late", &[]);
+        provider.sent();
+        mail_without_a_wake(late);
+        let woken = take_idle(late, AT_ONCE).unwrap();
+        let stopping = stop_it("stilled-late");
+        carry_on(woken, &usual(), inbox::take(late, true)).unwrap();
+        let mut after = heard(4_242);
+        while after.len() < 2 {
+            after.extend(heard(4_242));
+        }
+
+        assert_eq!(stopped, Ok("Stopped stilled, which was idle.".into()));
+        assert_eq!(texts(&early), [unread("stilled")]);
+        assert_eq!(
+            stopping,
+            Ok("Stopping stilled-late; what it has so far comes as a notice.".into())
+        );
+        assert!(
+            after[0].text.starts_with("helper stilled-late was stopped"),
+            "{after:?}"
+        );
+        assert_eq!(after[1].text, unread("stilled-late"));
+        // Neither runs again.
+        assert!(!is_idle(id) && !is_idle(late));
+        for name in ["stilled", "stilled-late"] {
+            assert!(row(&ctx, name).contains("stopped"), "{name}");
+        }
+    }
+
+    #[test]
+    fn an_idle_helper_ends_after_its_time() {
+        let session = Session::new("expire");
+        let (ctx, provider, id) = kept(&session, "expiring", &[]);
+        provider.sent();
+        // Its timer brought forward to now, so the timer thread ends it at once.
+        {
+            let mut registry = registry();
+            let helper = registry.helpers.iter_mut().find(|h| h.id == id).unwrap();
+            let idle = helper.idle.as_mut().unwrap();
+            timers::cancel(idle.timer);
+            let until = Instant::now();
+            idle.until = until;
+            idle.timer = timers::at(until, Box::new(move || expire(id, until)));
+        }
+        let deadline = Instant::now() + WAIT;
+        while is_idle(id) {
+            assert!(Instant::now() < deadline, "it never ended");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(row(&ctx, "expiring").contains("ended after 30 idle minutes"));
+        let ended = State::Done("ended after 30 idle minutes".into());
+        assert_eq!(task_of("expiring"), ended);
+        // Its report came as it went idle, so its end tells nobody, and mail
+        // no longer wakes it.
+        assert!(inbox::take(4_242, true).is_empty());
+        inbox::push(id, from_elsewhere());
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(inbox::take(id, true).len(), 1);
+    }
+
+    /// A message that is no one's in particular, for mailboxes nothing should wake.
+    fn from_elsewhere() -> Notice {
+        Notice {
+            from: "main".into(),
+            when: When::Next,
+            text: "message from main:\nanyone there?".into(),
+        }
+    }
+
+    /// The non-system turns a request carried, as role and text.
+    fn said_in(body: &Value) -> Vec<(&str, &str)> {
+        (body["messages"].as_array().unwrap().iter())
+            .filter(|message| message["role"] != "system")
+            .map(|m| (m["role"].as_str().unwrap(), m["content"].as_str().unwrap()))
+            .collect()
+    }
+
+    /// Whether helper `id` is idle.
+    fn is_idle(id: AgentId) -> bool {
+        (registry().helpers.iter()).any(|helper| helper.id == id && helper.idle.is_some())
+    }
+
+    /// Starts `name`, kept, on a stub that answers "The notes say hello." and
+    /// then each of `more`, and waits for it to go idle.
+    fn kept(session: &Session, name: &str, more: &[&str]) -> (ToolContext, Stub, AgentId) {
+        inbox::listen();
+        let mut replies = vec![reply("The notes say hello.", None)];
+        replies.extend(more.iter().map(|text| reply(text, None)));
+        let (endpoint, provider) = Stub::start(replies);
+        let ctx = session.context(endpoint);
+        // As the front end notes it when the turn starts.
+        connected(ctx.caller.connection.as_deref().unwrap());
+        let args = json!({"description": "Read the notes", "type": "general", "name": name,
+            "prompt": "Read notes.txt.", "keep": true});
+        call(ctx.clone(), args).unwrap();
+        let notices = heard(4_242);
+        assert!(notices[0].text.contains("is idle now"), "{notices:?}");
+        let id = (registry().helpers.iter())
+            .find(|helper| helper.root == 4_242 && helper.name == name)
+            .map(|helper| helper.id)
+            .unwrap();
+        (ctx, provider, id)
+    }
+
+    #[test]
+    fn kept_helpers_are_capped_and_idle_ones_take_no_running_place() {
+        let session = Session::new("kept-cap");
+        inbox::listen();
+        let ctx = session.context("http://127.0.0.1:9/v1".into());
+        let waited = json!({"description": "d", "prompt": "p", "keep": true, "background": false});
+        let Err(refused) = call(ctx.clone(), waited) else {
+            panic!("a helper was kept that nothing would wake");
+        };
+        assert!(refused.starts_with("`keep` needs a helper in the background"));
+        let far = Instant::now() + KEEP;
+        let ids: Vec<AgentId> = (0..KEPT as u64).map(|n| 96_001 + n).collect();
+        for &id in &ids {
+            let idle = Idle {
+                until: far,
+                timer: timers::at(far, Box::new(|| ())),
+            };
+            let helper = Helper {
+                keep: Some(Arc::new(Budget::new(BUDGET, None))),
+                idle: Some(idle),
+                ..known(id, 4_242, 4_242, "kept", "general")
+            };
+            registry().helpers.push(helper);
+        }
+        let more = json!({"description": "d", "prompt": "p", "keep": true});
+        let refused = call(ctx.clone(), more);
+        // Each session has a cap of its own.
+        let elsewhere = may_keep(true, 9_601);
+        let places: Vec<Slot> = (0..AT_ONCE)
+            .map(|_| reserve(9_602, 9_602, "runner", AT_ONCE, Cancel::default()).unwrap())
+            .collect();
+        drop(places);
+        let mut registry = registry();
+        for helper in registry.helpers.iter_mut().filter(|h| ids.contains(&h.id)) {
+            end_idle(helper, "stopped".into(), State::Stopped);
+        }
+        drop(registry);
+
+        assert_eq!(
+            refused,
+            Err(
+                "8 of this session's helpers are kept already, the most. Do not retry with \
+                 keep: start this one without it, or stop a kept one you no longer need."
+                    .into()
+            )
+        );
+        assert_eq!(elsewhere, Ok(()));
+    }
+
+    #[test]
+    fn mail_that_finds_every_place_taken_is_read_once_one_frees() {
+        let session = Session::new("full");
+        let (_ctx, provider, id) = kept(&session, "patient", &["Read it."]);
+        let places: Vec<Slot> = (0..AT_ONCE)
+            .map(|_| reserve(9_603, 9_603, "runner", AT_ONCE, Cancel::default()).unwrap())
+            .collect();
+        inbox::push(id, from_elsewhere());
+        std::thread::sleep(Duration::from_millis(200));
+        let waited = is_idle(id) && inbox::pending().contains(&id);
+        drop(places);
+        let notices = heard(4_242);
+        let sent = provider.sent();
+
+        assert!(waited, "it ran with no place free, or lost its mail");
+        assert!(notices[0].text.contains("Read it."), "{notices:?}");
+        let said = said_in(&sent[1]);
+        assert!(said[2].1.contains("anyone there?"), "{said:?}");
+        assert!(stop(id));
+    }
+
+    /// Leaves mail for idle helper `id` with its wake taken back, as when a
+    /// stop or a wake comes between the push and the thread it starts.
+    fn mail_without_a_wake(id: AgentId) {
+        inbox::unwake(id);
+        inbox::push(id, from_elsewhere());
+    }
+
+    /// The names of the tools a request offered.
+    fn offered(body: &Value) -> Vec<&str> {
+        (body["tools"].as_array().unwrap().iter())
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn ring_takes_a_place_before_it_offers_a_task_and_says_who_took_it() {
+        static ENDS: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
+        let session = Session::new("ring-place");
+        let (_ctx, provider, id) = kept(&session, "ringer", &[]);
+        provider.sent();
+        let task = |text: String| Notice {
+            from: "tasks".into(),
+            when: When::Next,
+            text,
+        };
+        let places: Vec<Slot> = (0..AT_ONCE)
+            .map(|_| reserve(9_604, 9_604, "runner", AT_ONCE, Cancel::default()).unwrap())
+            .collect();
+        let mut offered = 0;
+        let when_full = ring(4_242, |_| {
+            offered += 1;
+            Some(task("task 1".into()))
+        });
+        drop(places);
+        let until = until_of(id);
+        let passed = ring(4_242, |_| None);
+        let still = until_of(id);
+        on_end(|root: u64, name: &str| ENDS.lock().unwrap().push((root, name.to_owned())));
+        // A stop that lands once it has taken the task.
+        let took = ring(4_242, |name| {
+            assert!(stop(id));
+            Some(task(format!("task 2 is yours, {name}")))
+        });
+        let back = heard(4_242);
+        *ON_END.lock().unwrap() = None;
+
+        assert_eq!((when_full, offered), (None, 0));
+        assert_eq!(passed, None);
+        assert!(until.is_some() && still == until, "{until:?} {still:?}");
+        assert_eq!(took.as_deref(), Some("ringer"));
+        assert_eq!(
+            texts(&back),
+            ["ringer ended before it read this, from tasks:\ntask 2 is yours, ringer"]
+        );
+        assert_eq!(*ENDS.lock().unwrap(), [(4_242, "ringer".to_owned())]);
+    }
+
+    /// The row the agents list shows for `name`.
+    fn row(ctx: &ToolContext, name: &str) -> String {
+        let listed = talk(ctx.clone(), json!({"action": "list"})).unwrap();
+        let row = listed
+            .lines()
+            .find(|line| line.starts_with(&format!("{name} ")));
+        row.unwrap_or_else(|| panic!("{name} is not listed:\n{listed}"))
+            .to_owned()
+    }
+
+    #[test]
+    fn stopping_an_idle_helper_ends_it_at_once() {
+        let session = Session::new("stop-idle");
+        let (ctx, provider, id) = kept(&session, "idler", &[]);
+        provider.sent();
+
+        assert!(stop(id));
+        assert!(!stop(id), "it was stopped twice");
+        assert!(row(&ctx, "idler").contains("stopped by the user"));
+        assert_eq!(task_of("idler"), State::Stopped);
+        assert_eq!(sidecar(&session, 1)["stopped_by_user"], true);
+        let message = json!({"action": "send", "to": "idler", "message": "One more thing."});
+        assert_eq!(talk(ctx, message), Err(user_stopped("idler")));
+    }
+
+    /// Where the test session's task for helper `name` has got to.
+    fn task_of(name: &str) -> State {
+        let task = tasks::list(4_242)
+            .into_iter()
+            .find(|task| task.label == name);
+        task.unwrap().state
+    }
+
+    fn texts(notices: &[Notice]) -> Vec<String> {
+        notices.iter().map(|notice| notice.text.clone()).collect()
+    }
+
+    /// What helper `name`'s owner hears of `from_elsewhere` when it went unread.
+    fn unread(name: &str) -> String {
+        format!("{name} ended before it read this, from main:\nmessage from main:\nanyone there?")
+    }
+
+    /// When idle helper `id` ends if nothing wakes it, or None if it is not idle.
+    fn until_of(id: AgentId) -> Option<Instant> {
+        let registry = registry();
+        let helper = registry.helpers.iter().find(|helper| helper.id == id)?;
+        Some(helper.idle.as_ref()?.until)
+    }
+
+    #[test]
+    fn a_kept_helper_going_idle_asks_the_task_list_for_work() {
+        static IDLE: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
+        let session = Session::new("pull");
+        on_idle(|root: u64, name: &str| IDLE.lock().unwrap().push((root, name.to_owned())));
+        let (_ctx, provider, id) = kept(&session, "puller", &[]);
+        provider.sent();
+        let asked = soon(|| !IDLE.lock().unwrap().is_empty());
+        *ON_IDLE.lock().unwrap() = None;
+
+        assert!(asked);
+        assert_eq!(*IDLE.lock().unwrap(), [(4_242, "puller".to_owned())]);
+        assert!(stop(id));
+    }
+
+    #[test]
+    fn an_idle_helper_takes_a_task_added_to_the_list_and_hears_it_change() {
+        let session = Session::new("board");
+        let (ctx, provider, id) = kept(&session, "boarder", &["Counting.", "Counting words."]);
+        let board = |args: Value| crate::tasklist::Board.run(&args, &ctx);
+        let add =
+            json!({"action": "add", "title": "Count the notes", "detail": "Lines in notes.txt."});
+        let added = board(add);
+        let took = heard(4_242);
+        let changed = board(json!({"action": "update", "id": 1, "detail": "Words in notes.txt."}));
+        let woke = heard(4_242);
+        let listed = board(json!({"action": "list"})).unwrap();
+        // Its end gives the task back.
+        assert!(stop(id));
+        let back = texts(&inbox::take(4_242, true));
+        let reopened = board(json!({"action": "list"})).unwrap();
+        *ON_END.lock().unwrap() = None;
+        *ON_IDLE.lock().unwrap() = None;
+        let sent = provider.sent();
+
+        assert_eq!(
+            added,
+            Ok(
+                "You added task #1:\n#1 open, added by main, rev 1: Count the notes\n\
+                 helper boarder took task #1."
+                    .into()
+            )
+        );
+        let handed = said_in(&sent[1]);
+        assert!(
+            handed[2].1.contains(
+                "Task #1 on the session's task list, added by main, is yours now: \
+                 Count the notes\n    Lines in notes.txt."
+            ),
+            "{handed:?}"
+        );
+        assert!(took[0].text.contains("Counting."), "{took:?}");
+        let changed = changed.unwrap();
+        assert!(
+            changed.starts_with(
+                "You changed task #1:\n#1 claimed, owner boarder, added by main, rev 3"
+            ),
+            "{changed}"
+        );
+        let told = said_in(&sent[2]);
+        let told = told.last().unwrap().1;
+        assert!(told.contains("main changed task #1:"), "{told}");
+        assert!(told.contains("Words in notes.txt."), "{told}");
+        assert!(woke[0].text.contains("Counting words."), "{woke:?}");
+        assert!(
+            listed.starts_with("#1 claimed, owner boarder, added by main, rev 3: Count the notes"),
+            "{listed}"
+        );
+        assert!(
+            back.iter()
+                .any(|text| text.contains("helper boarder ended before finishing task #1")),
+            "{back:?}"
+        );
+        assert!(
+            reopened.starts_with("#1 open, added by main, rev 4"),
+            "{reopened}"
+        );
+    }
+
+    /// Whether `done` comes true within a few seconds.
+    fn soon(done: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            if Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
     }
 }

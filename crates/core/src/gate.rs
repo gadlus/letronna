@@ -338,6 +338,12 @@ fn ladder(call: &ToolCall, gate: &Gate, judge: Option<&dyn Fn(&str) -> Verdict>)
     if let Some(rule) = &ruling.deny {
         return Outcome::Refuse(denied(rule));
     }
+    // A hooks.json that cannot be used may hold what guards this call, so
+    // every call but a question waits for a person until it is fixed.
+    let question = [tools::ASK_USER, tools::EXIT_PLAN].contains(&tool.name());
+    if let Some(why) = crate::hooks::trouble().filter(|_| !question) {
+        return held(&why, tool.name(), gate);
+    }
     // A line the floor cannot read, such as `git $(echo push)`, could be
     // what a deny rule names, so a person looks at it as at a risky one.
     if let (Some(Risk::Opaque), Some(rule)) = (risk, &ruling.denies) {
@@ -484,6 +490,14 @@ fn unavailable(
     plan: bool,
 ) -> Option<String> {
     let name = tool.name();
+    // A tool the user switched off is not offered either, but the model may
+    // remember it from earlier in the conversation.
+    if tools::switched_off(name, &crate::store::disabled_tools()) {
+        return Some(format!(
+            "`{name}` is switched off: the user listed it in `disabled_tools` in \
+             Letronna's settings.json. Carry on without it."
+        ));
+    }
     // Only fitting tools are offered, but the model can name any of them;
     // refuse here too rather than trust the offer.
     if ctx.shared() && tool.machine() {

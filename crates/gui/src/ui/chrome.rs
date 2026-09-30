@@ -136,12 +136,20 @@ impl Chat {
             )
             .dropdown_menu_with_anchor(gpui::Corner::TopRight, move |menu, _, _| {
                 let (settings, account, auth) = (chat.clone(), chat.clone(), chat.clone());
+                let usage = chat.clone();
                 menu.min_w(px(180.))
                     .item(
                         PopupMenuItem::new("Account")
                             .icon(Icon::new(IconName::CircleUser))
                             .on_click(move |_, window, cx| {
                                 account.update(cx, |this, cx| this.open_account(window, cx))
+                            }),
+                    )
+                    .item(
+                        PopupMenuItem::new("Usage")
+                            .icon(Icon::new(AppIcon::Clock))
+                            .on_click(move |_, window, cx| {
+                                usage.update(cx, |this, cx| this.open_usage(window, cx))
                             }),
                     )
                     .item(
@@ -274,6 +282,30 @@ impl Chat {
         )
     }
 
+    /// How many helpers are working, while any are; click to see them.
+    fn helper_pill(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let working = self.helpers_working();
+        if working == 0 {
+            return None;
+        }
+        let s = if working == 1 { "" } else { "s" };
+        Some(
+            Button::new("helpers")
+                .ghost()
+                .xsmall()
+                .text_color(cx.theme().muted_foreground)
+                .tooltip("See, steer or stop them")
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(div().size(px(6.)).rounded_full().bg(cx.theme().green))
+                        .child(format!("{working} helper{s} working")),
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.open_activity(window, cx))),
+        )
+    }
+
     pub(crate) fn status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .h(px(20.))
@@ -285,6 +317,7 @@ impl Chat {
             .child(self.gateway_chip(cx))
             .child(self.workspace_chip(cx))
             .child(self.job_chips(cx))
+            .children(self.helper_pill(cx))
             .child(div().flex_1())
             .children(self.update_chip(cx))
             .child(concat!("v", env!("CARGO_PKG_VERSION")))

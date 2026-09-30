@@ -11,7 +11,7 @@ use std::time::Instant;
 use crate::banner::{banner, folder_name, footer, replay};
 use crate::bar;
 use crate::render;
-use crate::session::Runner;
+use crate::session::{Runner, usage as reply_usage};
 
 pub enum Flow {
     Handled,
@@ -19,6 +19,8 @@ pub enum Flow {
     Unknown,
     /// Send this as the user's turn: an MCP server's prompt, filled in.
     Send(String),
+    /// Send this prompt to the model, as though it had been typed.
+    Ask(&'static str),
 }
 
 pub fn command(
@@ -56,6 +58,7 @@ pub fn command(
             } else {
                 Mode::Plan
             };
+            letronna_core::agents::set_plan(runner.mode == Mode::Plan);
             let note = footer(runner);
             runner.bar.set_footer(note);
             render::blank();
@@ -94,7 +97,7 @@ pub fn command(
             Flow::Handled
         }
         "/model" => {
-            switch_model(runner, rest);
+            switch_model(runner, Some(*session), rest);
             Flow::Handled
         }
         "/gateways" => {
@@ -129,7 +132,7 @@ pub fn command(
             Flow::Handled
         }
         "/effort" => {
-            effort(runner, rest);
+            effort(runner, *session, rest);
             Flow::Handled
         }
         "/thinking" => {
@@ -174,8 +177,12 @@ pub fn command(
             skills(runner, rest, workspace);
             Flow::Handled
         }
+        "/mcp" => {
+            mcp_servers(rest);
+            Flow::Handled
+        }
         "/resume" => {
-            resume(runner, session, workspace);
+            resume(runner, session, workspace, rest);
             Flow::Handled
         }
         "/undo" => {
@@ -206,6 +213,25 @@ pub fn command(
             branch(runner, session, rest);
             Flow::Handled
         }
+        "/init" => {
+            let conversation = &runner.store.conversations[*session];
+            match letronna_core::init::prompt(conversation.workspace.as_deref()) {
+                Ok(prompt) => Flow::Ask(prompt),
+                Err(why) => {
+                    render::blank();
+                    render::line(&render::dim(&why));
+                    Flow::Handled
+                }
+            }
+        }
+        "/btw" => {
+            aside(runner, *session, rest);
+            Flow::Handled
+        }
+        "/image" => {
+            attach(runner, rest, workspace);
+            Flow::Handled
+        }
         "/where" => {
             render::blank();
             render::line(&format!(
@@ -221,6 +247,10 @@ pub fn command(
                 render::dim("session"),
                 store::sessions_dir().join(format!("{id}.jsonl")).display()
             ));
+            Flow::Handled
+        }
+        "/usage" => {
+            usage(runner.store.conversations[*session].id);
             Flow::Handled
         }
         name if name.starts_with("/mcp__") => match mcp_prompt(runner, name, rest) {
@@ -261,6 +291,74 @@ fn mcp_prompt(runner: &mut Runner, command: &str, rest: &str) -> Option<Result<S
             }
             None
         })
+}
+
+/// What the model calls took: this session's, each recent day's and each
+/// model's, added up from the saved sessions.
+fn usage(session: u64) {
+    use letronna_core::usage::{self, Totals};
+    let report = usage::report(session);
+    let days = report
+        .days
+        .iter()
+        .map(|(date, totals)| (usage::day_name(*date), totals));
+    let models = report
+        .models
+        .iter()
+        .map(|(model, totals)| (model.clone(), totals));
+    let sections: [(String, Vec<(String, &Totals)>); 3] = [
+        (
+            String::new(),
+            vec![("this session".into(), &report.session)],
+        ),
+        (format!("the last {} days", usage::DAYS), days.collect()),
+        (
+            format!("by model, the last {} days", usage::MODEL_DAYS),
+            models.collect(),
+        ),
+    ];
+    let width = sections
+        .iter()
+        .flat_map(|(_, rows)| rows.iter().map(|(label, _)| label.chars().count()))
+        .max()
+        .unwrap_or(0);
+    render::blank();
+    render::said(&render::blue("●"), &render::bold("Usage"));
+    for (heading, rows) in sections.iter().filter(|(_, rows)| !rows.is_empty()) {
+        if !heading.is_empty() {
+            render::blank();
+            render::line(&render::dim(heading));
+        }
+        for (label, totals) in rows {
+            render::line(&format!(
+                "{}  {}",
+                render::bold(&format!("{label:<width$}")),
+                totals.line()
+            ));
+        }
+    }
+    if let Some(legend) = report.legend() {
+        render::blank();
+        render::line(&render::dim(&legend));
+    }
+}
+
+/// A side question, answered dim under it from what the session holds so far
+/// and kept out of the session.
+fn aside(runner: &mut Runner, session: usize, question: &str) {
+    match runner.btw(session, question) {
+        Ok(answer) => {
+            let mut lines = answer.content.lines();
+            let first = lines.next().unwrap_or_default();
+            render::said(&render::dim("◇"), &render::dim(first));
+            for line in lines {
+                render::line(&render::dim(line));
+            }
+            // What it cost, as under a reply, since the session keeps no trace of it.
+            render::line(&render::dim(&reply_usage(&answer)));
+        }
+        Err(error) => render::line(&render::red(&error)),
+    }
 }
 
 /// Keys the box answers to. None of them are written down anywhere else but
@@ -500,22 +598,23 @@ pub fn open_in_browser(url: &str) {
     }
 }
 
-/// How hard the model should think, from the levels the model in use offers.
+/// How hard the model should think in this session and new ones, from the
+/// levels the session's model offers.
 ///
 /// On a model that can be told, this is the difference between sixty-four
 /// reasoning tokens and seven hundred. The levels come from its gateway's
 /// model list, or are low, medium and high when the list does not say.
-fn effort(runner: &mut Runner, rest: &str) {
+fn effort(runner: &mut Runner, session: usize, rest: &str) {
     // This terminal only asks for the gateway's list with its first request
     // or /model, and the levels are on it.
-    let (endpoint, key) = runner.route();
+    let (endpoint, key) = runner.route(session);
     if let Some(asked) = letronna_core::models::ask_for_list(&endpoint, &key) {
         runner.bar.busy("asking what the model offers", move || {
             letronna_core::models::wait_for_list(asked)
         });
     }
-    let settings = &runner.store.settings;
-    let model = settings.model.clone();
+    let model = runner.store.model(session).1.to_owned();
+    let saved = runner.store.effort(session).to_owned();
     let levels = letronna_core::models::efforts(&endpoint, &model);
     if levels.is_empty() {
         render::blank();
@@ -529,8 +628,8 @@ fn effort(runner: &mut Runner, rest: &str) {
         .collect();
     // What goes with the next request, which for a level saved on another
     // model is the nearest this one offers.
-    let current = letronna_core::models::clamp(&levels, &settings.effort)
-        .map_or("auto", |level| level.id.as_str());
+    let current =
+        letronna_core::models::clamp(&levels, &saved).map_or("auto", |level| level.id.as_str());
     let chosen = match rest {
         // Nothing named: slide to it. Effort is a point on one line from
         // less to more, and a slider says so where a list would not.
@@ -539,7 +638,7 @@ fn effort(runner: &mut Runner, rest: &str) {
             match runner.bar.slide("How hard should it think?", &stops, start) {
                 // Where it already was: a level saved on a model that goes
                 // further stays saved for when that model is back.
-                Some(index) if stops[index] == current => settings.effort.clone(),
+                Some(index) if stops[index] == current => saved.clone(),
                 Some(index) => stops[index].to_owned(),
                 None => {
                     render::blank();
@@ -554,11 +653,8 @@ fn effort(runner: &mut Runner, rest: &str) {
     // nearest it has, and as named again on a model that has it. Auto, or a
     // word that is no level, leaves it to the model.
     let sent = letronna_core::models::clamp(&levels, &chosen).map(|level| level.id.clone());
-    runner.store.settings.effort = if sent.is_some() {
-        chosen.clone()
-    } else {
-        String::new()
-    };
+    let effort = if sent.is_some() { chosen.as_str() } else { "" };
+    runner.store.choose_effort(session, effort);
     runner.persist();
     let note = footer(runner);
     runner.bar.set_footer(note);
@@ -771,6 +867,86 @@ fn send_to_helper(helpers: &[Seen], rest: &str) {
     }
 }
 
+/// The MCP servers and how each is doing, or reconnect, enable, disable or
+/// read the log of one, or read mcp.json again.
+fn mcp_servers(rest: &str) {
+    use letronna_core::mcp;
+    let (verb, name) = rest.split_once(' ').unwrap_or((rest, ""));
+    let name = name.trim();
+    render::blank();
+    if !verb.is_empty() && verb != "reload" && name.is_empty() {
+        let which = format!("Which server? /mcp {verb} <name>");
+        render::said(&render::blue("●"), &render::bold(&which));
+        return;
+    }
+    let done = match verb {
+        "" => Ok(()),
+        "log" => return mcp_log(name),
+        "reload" => mcp::reload().map(|done| {
+            render::line(&render::dim(&format!("Reloaded mcp.json: {done}")));
+        }),
+        "reconnect" => mcp::reconnect(name),
+        "enable" => mcp::set_enabled(name, true),
+        "disable" => mcp::set_enabled(name, false),
+        _ => Err(format!(
+            "/mcp {verb} is not one of reconnect, enable, disable, log or reload."
+        )),
+    };
+    if let Err(error) = done {
+        render::line(&render::red(&error));
+        return;
+    }
+    // One just started gets as long to answer as a question asked once waits.
+    if matches!(verb, "reconnect" | "enable" | "reload") {
+        mcp::ready(crate::MCP_WAIT);
+    }
+    if let Some(error) = mcp::unreadable() {
+        render::line(&render::red(&error));
+    }
+    let servers = mcp::status();
+    if servers.is_empty() {
+        render::said(&render::blue("●"), &render::bold("No MCP servers"));
+        render::line(&render::dim("Add one with `letronna mcp add` in a shell."));
+        return;
+    }
+    render::said(&render::blue("●"), &render::bold("MCP servers"));
+    for server in servers.iter().filter(|s| name.is_empty() || s.name == name) {
+        render::line(&format!(
+            "{}  {}  {}",
+            render::bold(&server.name),
+            render::dim(server.transport),
+            crate::mcp::health(server)
+        ));
+    }
+    render::line(&render::dim(
+        "/mcp reconnect|enable|disable|log <name>, or /mcp reload after editing mcp.json",
+    ));
+}
+
+/// The newest of what one server printed on stderr.
+fn mcp_log(name: &str) {
+    let found = letronna_core::mcp::status()
+        .into_iter()
+        .find(|server| server.name == name);
+    let Some(server) = found else {
+        render::line(&render::red(&format!("There is no {name} in mcp.json.")));
+        return;
+    };
+    if server.log.trim().is_empty() {
+        let none = match server.transport {
+            "http" => format!("{name} runs elsewhere, so it has no log here"),
+            _ => format!("{name} has printed nothing"),
+        };
+        render::said(&render::blue("●"), &render::bold(&none));
+        return;
+    }
+    let what = format!("What {name} printed, newest last");
+    render::said(&render::blue("●"), &render::bold(&what));
+    for line in server.log.lines() {
+        render::line(&render::dim(line));
+    }
+}
+
 /// The skills: list them, use one, switch one on or off, or add some.
 ///
 /// Skills are written in the window and were unreachable from here, which
@@ -963,17 +1139,54 @@ fn add_skills(runner: &mut Runner, source: &str) {
 /// the window; this is the shortlist you would actually pick from.
 const SESSION_CHOICES: usize = 9;
 
+/// How a session reads in the `/resume` list: its title, project folder and
+/// length.
+fn choice_label(conversation: &store::Conversation) -> String {
+    let title = match conversation.title.trim() {
+        "" => "untitled".to_owned(),
+        title => title.to_owned(),
+    };
+    let folder = conversation
+        .workspace
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "no project".into());
+    // Listed sessions are not read yet, so their messages are empty and the
+    // count comes from the listing.
+    format!(
+        "{title}  ·  {folder}  ·  {} messages",
+        conversation.length()
+    )
+}
+
 /// Pick up a session from before. The same files the window uses, so a
-/// conversation started there can be carried on here.
-pub fn resume(runner: &mut Runner, session: &mut usize, workspace: Option<&std::path::Path>) {
+/// conversation started there can be carried on here. With a `term`, only
+/// sessions whose title holds it are offered, or failing that, those where
+/// it was said.
+pub fn resume(
+    runner: &mut Runner,
+    session: &mut usize,
+    workspace: Option<&std::path::Path>,
+    term: &str,
+) {
     // Newest first, skipping the one already open and any that never got a
     // word said in them.
+    let lower = term.to_lowercase();
     let mut recent: Vec<usize> = (0..runner.store.conversations.len())
         .filter(|i| *i != *session && runner.store.conversations[*i].length() > 0)
+        .filter(|i| {
+            let title = &runner.store.conversations[*i].title;
+            title.to_lowercase().contains(&lower)
+        })
         .collect();
     recent.sort_by_key(|i| std::cmp::Reverse(runner.store.conversations[*i].updated));
     recent.truncate(SESSION_CHOICES);
 
+    if recent.is_empty() && !term.is_empty() {
+        resume_said(runner, session, workspace, term);
+        return;
+    }
     if recent.is_empty() {
         render::blank();
         render::line(&render::dim("No earlier sessions to pick up."));
@@ -982,23 +1195,7 @@ pub fn resume(runner: &mut Runner, session: &mut usize, workspace: Option<&std::
 
     let labels: Vec<String> = recent
         .iter()
-        .map(|i| {
-            let conversation = &runner.store.conversations[*i];
-            let title = match conversation.title.trim() {
-                "" => "untitled".to_owned(),
-                title => title.to_owned(),
-            };
-            let folder = conversation
-                .workspace
-                .as_ref()
-                .and_then(|p| p.file_name())
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "no project".into());
-            format!(
-                "{title}  ·  {folder}  ·  {} messages",
-                conversation.messages.len()
-            )
-        })
+        .map(|i| choice_label(&runner.store.conversations[*i]))
         .collect();
 
     render::blank();
@@ -1012,7 +1209,131 @@ pub fn resume(runner: &mut Runner, session: &mut usize, workspace: Option<&std::
         render::line(&render::dim("Stayed put."));
         return;
     };
+    pick_up(runner, session, workspace, index);
+}
 
+/// Sessions where `term` was said, for `/resume <term>` when no title holds
+/// it: one line each, with a little of what was said, the best match first.
+fn resume_said(
+    runner: &mut Runner,
+    session: &mut usize,
+    workspace: Option<&std::path::Path>,
+    term: &str,
+) {
+    let within = store::Within {
+        exclude: runner.store.conversations[*session].id,
+        ..Default::default()
+    };
+    // A session gives up to three hits; picking one opens the session, so
+    // it is listed once, by its best.
+    let mut hits = store::search(term, &within, SESSION_CHOICES * 3);
+    let mut listed: Vec<u64> = Vec::new();
+    hits.retain(|hit| {
+        let first = !listed.contains(&hit.id);
+        listed.push(hit.id);
+        first
+    });
+    hits.truncate(SESSION_CHOICES);
+    if hits.is_empty() {
+        render::blank();
+        render::line(&render::dim(&format!(
+            "No earlier session has \"{term}\" in its title or what was said."
+        )));
+        return;
+    }
+
+    let room = render::width().saturating_sub(PICKER_EDGES);
+    let labels: Vec<String> = hits
+        .iter()
+        .map(|hit| {
+            let title = match hit.title.trim() {
+                "" => "untitled",
+                title => title,
+            };
+            // A match in the title has only the title to show.
+            let label = match hit.ordinal {
+                Some(_) => format!("{title}  ·  {}", from_match(&hit.snippet, term)),
+                None => title.to_owned(),
+            };
+            // What was said can hold an escape a tool read from the web,
+            // which printed raw would restyle or move about the terminal.
+            render::fit(&label, room)
+                .chars()
+                .filter(|c| !c.is_control())
+                .collect()
+        })
+        .collect();
+
+    render::blank();
+    render::said(
+        &render::blue("●"),
+        &render::bold("Said in earlier sessions"),
+    );
+    let mut options: Vec<&str> = labels.iter().map(String::as_str).collect();
+    options.push("Stay where I am");
+    let Some(picked) = runner.bar.choose("Which one?", Vec::new(), &options) else {
+        return;
+    };
+    let Some(hit) = hits.get(picked) else {
+        render::line(&render::dim("Stayed put."));
+        return;
+    };
+    // One begun in the window since this terminal started is not listed
+    // here yet, so it is read from its file.
+    let index = match runner
+        .store
+        .conversations
+        .iter()
+        .position(|c| c.id == hit.id)
+    {
+        Some(index) => index,
+        None => {
+            let Some(conversation) = store::saved(hit.id) else {
+                render::line(&render::red("That session is no longer on disk."));
+                return;
+            };
+            runner.store.conversations.push(conversation);
+            runner.store.conversations.len() - 1
+        }
+    };
+    pick_up(runner, session, workspace, index);
+}
+
+/// Columns a picker line loses to the box around it and its number: two
+/// margins, two borders with their spaces, and "› 10 ".
+const PICKER_EDGES: usize = 13;
+/// Characters of a snippet kept before its first match, so the match is on
+/// screen after the session's title.
+const SNIPPET_LEAD: usize = 20;
+
+/// `snippet` from a little before the first of `query`'s words it holds,
+/// ignoring case, so the match is not cut off the end of a picker line.
+fn from_match(snippet: &str, query: &str) -> String {
+    let lower = snippet.to_lowercase();
+    let first = query
+        .split(|c: char| c.is_whitespace() || c == '"')
+        .map(|word| word.trim_matches(|c: char| c.is_ascii_punctuation()))
+        .filter(|word| !word.is_empty())
+        .filter_map(|word| lower.find(&word.to_lowercase()))
+        .min();
+    // Counted in characters, as core cuts its snippets.
+    let skip = first.map_or(0, |at| {
+        lower[..at].chars().count().saturating_sub(SNIPPET_LEAD)
+    });
+    if skip == 0 {
+        return snippet.to_owned();
+    }
+    let rest: String = snippet.chars().skip(skip).collect();
+    format!("…{}", rest.trim_start())
+}
+
+/// Make session `index` the open one and show what was said in it.
+fn pick_up(
+    runner: &mut Runner,
+    session: &mut usize,
+    workspace: Option<&std::path::Path>,
+    index: usize,
+) {
     *session = index;
     runner.enter(index);
     // A session carries its own project folder; one that never had a folder
@@ -1117,7 +1438,8 @@ fn undo(runner: &mut Runner, session: usize, workspace: Option<&std::path::Path>
 }
 
 /// Take the session back to just before the last thing you said, and the
-/// screen with it. Returns what you said, or `None` when nothing has been.
+/// screen with it. Returns what you said -- a command as it was typed -- or
+/// `None` when nothing has been.
 fn take_back(
     runner: &mut Runner,
     session: usize,
@@ -1125,6 +1447,8 @@ fn take_back(
 ) -> Option<String> {
     let (at, prompt) = last_prompt(&runner.store.conversations[session].messages)?;
     let conversation = &mut runner.store.conversations[session];
+    // Its pictures come back with its words, to go with them again.
+    runner.images = std::mem::take(&mut conversation.messages[at].images);
     conversation.rewind(at);
     // The checklist is the one the last `todo` left standing.
     conversation.todos = store::todos_in(&conversation.messages);
@@ -1139,7 +1463,67 @@ fn take_back(
     }
     // After the redraw, so a failure to save is not cleared off the screen.
     runner.persist();
-    Some(prompt)
+    Some(letronna_core::init::typed(&prompt).map_or(prompt, str::to_owned))
+}
+
+/// Attach the picture at `raw` to the next message, saved as the window
+/// saves one pasted there; with no path, say what is attached, and with
+/// `clear`, drop it.
+fn attach(runner: &mut Runner, raw: &str, workspace: Option<&std::path::Path>) {
+    render::blank();
+    if raw == "clear" {
+        runner.images.clear();
+        render::line(&render::dim("No pictures attached."));
+        return;
+    }
+    if raw.is_empty() {
+        let note = match runner.images.len() {
+            0 => "Nothing attached. /image <path> attaches a picture to your next message.".into(),
+            n => format!("{n} attached to your next message; /image clear drops them."),
+        };
+        render::line(&render::dim(&note));
+        return;
+    }
+    let path = typed_path(raw, workspace);
+    let name = path.file_stem().unwrap_or_default().to_string_lossy();
+    let saved = std::fs::read(&path)
+        .map_err(|e| format!("Cannot read {}: {e}", path.display()))
+        .and_then(|bytes| letronna_core::media::attach(&name, &bytes));
+    match saved {
+        Ok(saved) => {
+            runner.images.push(saved);
+            render::line(&render::dim(&format!(
+                "Attached {}; it goes with your next message.",
+                path.display()
+            )));
+        }
+        Err(error) => render::line(&render::red(&error)),
+    }
+}
+
+/// The file a typed path names: quoted, or with its spaces escaped as a
+/// terminal pastes a file dragged onto it; `~` for home; and from the
+/// project folder when relative.
+fn typed_path(raw: &str, workspace: Option<&std::path::Path>) -> std::path::PathBuf {
+    let quoted = ['"', '\''].iter().find_map(|&quote| {
+        raw.strip_prefix(quote)
+            .and_then(|inner| inner.strip_suffix(quote))
+    });
+    let raw = match quoted {
+        Some(inner) => inner.to_owned(),
+        // A backslash is the separator on Windows, not an escape.
+        None if cfg!(windows) => raw.to_owned(),
+        None => raw.replace("\\ ", " "),
+    };
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" });
+    let path = match (raw.strip_prefix("~/"), home) {
+        (Some(rest), Some(home)) => std::path::Path::new(&home).join(rest),
+        _ => std::path::PathBuf::from(raw),
+    };
+    match workspace {
+        Some(folder) => folder.join(path),
+        None => path,
+    }
 }
 
 /// Where the last thing you said sits among `messages`, and what it said.
@@ -1171,6 +1555,10 @@ fn branch(runner: &mut Runner, session: &mut usize, name: &str) {
         updated: letronna_core::chat::now(),
         workspace: from.workspace.clone(),
         todos: from.todos.clone(),
+        model: from.model.clone(),
+        gateway: from.gateway.clone(),
+        effort: from.effort.clone(),
+        summary: from.summary.clone(),
         ..Default::default()
     };
     history::share(from.id, copy.id);
@@ -1246,19 +1634,24 @@ fn switch_media(runner: &mut Runner, kind: &'static str, label: &str) {
     }
 }
 
-/// Change the model, picking from what every set-up gateway actually offers.
-/// `filter` narrows the list (by model or gateway name), and an exact model
-/// name skips the asking entirely.
-pub fn switch_model(runner: &mut Runner, filter: &str) {
+/// Change the model of `session` and of new sessions -- only the latter
+/// before there is a session, in setup -- picking from what every set-up
+/// gateway actually offers. `filter` narrows the list (by model or gateway
+/// name), and an exact model name skips the asking entirely.
+pub fn switch_model(runner: &mut Runner, session: Option<usize>, filter: &str) {
     // `/model image`, `/model video`: what makes those, not the chat model.
     if let Some((kind, label)) = media_kind(filter) {
         switch_media(runner, kind, label);
         return;
     }
-    let settings = &runner.store.settings;
     let keys = store::load_keys();
-    let custom = settings.custom_endpoint.clone();
-    let current = format!("{} · {}", settings.model, settings.gateway);
+    let custom = runner.store.settings.custom_endpoint.clone();
+    let settings = &runner.store.settings;
+    let (gateway, model) = match session {
+        Some(index) => runner.store.model(index),
+        None => (settings.gateway.as_str(), settings.model.as_str()),
+    };
+    let current = format!("{model} · {gateway}");
 
     render::blank();
     render::said(&render::blue("●"), &render::bold("Models"));
@@ -1284,7 +1677,7 @@ pub fn switch_model(runner: &mut Runner, filter: &str) {
     // An exact name is an instruction, not a search.
     if let Some(exact) = models.iter().find(|(_, m)| m.eq_ignore_ascii_case(filter)) {
         let (gateway, model) = exact.clone();
-        set_model(runner, gateway, model);
+        set_model(runner, session, gateway, model);
         return;
     }
 
@@ -1321,15 +1714,20 @@ pub fn switch_model(runner: &mut Runner, filter: &str) {
         return;
     };
     match shown.get(picked) {
-        Some((gateway, model)) => set_model(runner, gateway.clone(), model.clone()),
+        Some((gateway, model)) => set_model(runner, session, gateway.clone(), model.clone()),
         None => render::line(&render::dim("Left as it was.")),
     }
 }
 
 /// A model and the gateway it is on, chosen together.
-fn set_model(runner: &mut Runner, gateway: String, model: String) {
-    runner.store.settings.gateway = gateway.clone();
-    runner.store.settings.model = model.clone();
+fn set_model(runner: &mut Runner, session: Option<usize>, gateway: String, model: String) {
+    match session {
+        Some(index) => runner.store.choose_model(index, &gateway, &model),
+        None => {
+            runner.store.settings.gateway = gateway.clone();
+            runner.store.settings.model = model.clone();
+        }
+    }
     runner.persist();
     let note = footer(runner);
     runner.bar.set_footer(note);
@@ -1518,7 +1916,7 @@ pub fn gateways(runner: &mut Runner) {
 
 #[cfg(test)]
 mod tests {
-    use super::{agent_rows, last_prompt, with_files};
+    use super::{agent_rows, choice_label, from_match, last_prompt, typed_path, with_files};
     use letronna_core::agents::Seen;
     use letronna_core::chat::Message;
     use letronna_core::driver::Status;
@@ -1553,6 +1951,24 @@ mod tests {
     fn nothing_said_means_nothing_to_take_back() {
         assert_eq!(last_prompt(&[]), None);
         assert_eq!(last_prompt(&[said("assistant", "hello")]), None);
+    }
+
+    #[test]
+    fn a_typed_or_dragged_path_names_its_file() {
+        let project = std::path::Path::new("/work");
+        let at = |raw: &str| typed_path(raw, Some(project));
+        assert_eq!(at("shot.png"), project.join("shot.png"));
+        assert_eq!(at("\"my shot.png\""), project.join("my shot.png"));
+        assert_eq!(at("'my shot.png'"), project.join("my shot.png"));
+        if !cfg!(windows) {
+            assert_eq!(
+                at("/tmp/my\\ shot.png"),
+                std::path::Path::new("/tmp/my shot.png")
+            );
+            let home = std::env::var_os("HOME").unwrap();
+            assert_eq!(at("~/a.png"), std::path::Path::new(&home).join("a.png"));
+        }
+        assert_eq!(typed_path("a.png", None), std::path::Path::new("a.png"));
     }
 
     #[test]
@@ -1638,5 +2054,47 @@ mod tests {
         assert_eq!(at(&wide[0], "task"), at(&wide[1], "Find"));
         assert_eq!(at(&wide[0], "task"), at(&wide[2], "Run every"));
         assert_eq!(at(&wide[0], "state"), at(&wide[2], "stopped"));
+    }
+
+    #[test]
+    fn a_hit_is_shown_from_just_before_its_match() {
+        let snippet = format!("…{} the Signing key was rotated", "x".repeat(90));
+        let shown = from_match(&snippet, "signing KEY");
+        assert!(shown.starts_with('…'));
+        assert!(shown.contains("the Signing key"));
+        assert_eq!(
+            shown.chars().count(),
+            1 + 20 + "Signing key was rotated".len()
+        );
+        // Near the start already, or holding none of the words: as it is.
+        assert_eq!(from_match("the signing key", "signing"), "the signing key");
+        assert_eq!(
+            from_match("nothing here", "\"signing key\""),
+            "nothing here"
+        );
+    }
+
+    #[test]
+    fn a_listed_session_is_offered_with_the_messages_it_holds() {
+        // As the terminal lists it at start: counted, none of it read yet.
+        let listed = letronna_core::store::Conversation {
+            title: "Fix the build".into(),
+            workspace: Some("/work/letronna".into()),
+            counted: 4,
+            ..Default::default()
+        };
+        assert_eq!(
+            choice_label(&listed),
+            "Fix the build  ·  letronna  ·  4 messages"
+        );
+        // Once read, the messages themselves are the count.
+        let read = letronna_core::store::Conversation {
+            messages: vec![said("user", "one"), said("assistant", "two")],
+            ..Default::default()
+        };
+        assert_eq!(
+            choice_label(&read),
+            "untitled  ·  no project  ·  2 messages"
+        );
     }
 }

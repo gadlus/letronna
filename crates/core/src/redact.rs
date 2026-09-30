@@ -114,6 +114,8 @@ pub(crate) fn secrets() -> Vec<String> {
         chats.telegram.token,
         chats.discord.bot_token,
         chats.discord.webhook,
+        chats.slack.app_token,
+        chats.slack.bot_token,
     ]);
     all.extend(crate::mcp::secrets());
     let mut all: Vec<String> = all

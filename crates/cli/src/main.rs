@@ -17,6 +17,7 @@ mod doctor;
 mod edit;
 mod input;
 mod install;
+mod mcp;
 mod render;
 mod screen;
 mod session;
@@ -34,7 +35,7 @@ use letronna_core::cancel::Cancel;
 use letronna_core::chat::{self, Message};
 use letronna_core::driver::{self, Allow, Outcome, Report, Spec, Status};
 use letronna_core::store::Transcript;
-use letronna_core::{agent, store, tools, update};
+use letronna_core::{agent, hooks, store, tools, update};
 use serde_json::{Value, json};
 use session::Runner;
 use std::io::IsTerminal;
@@ -69,6 +70,9 @@ fn main() {
         println!("letronna {}", env!("CARGO_PKG_VERSION"));
         return;
     }
+    if let Some(words) = &args.mcp {
+        std::process::exit(mcp::run(words));
+    }
     if args.gui {
         launch_window();
         return;
@@ -89,6 +93,14 @@ fn main() {
     if args.doctor {
         std::process::exit(doctor::run(args.offline));
     }
+    // Before anything is opened, so a mistyped name leaves nothing behind.
+    let gateway = match args.gateway.as_deref().map(gateway_named).transpose() {
+        Ok(gateway) => gateway,
+        Err(error) => {
+            render::line(&render::red(&error));
+            std::process::exit(1);
+        }
+    };
     letronna_core::diag::init("cli");
     let mode = match &args.mode {
         Ok(mode) => *mode,
@@ -112,6 +124,7 @@ fn main() {
         trouble: None,
         bar: bar::Bar::new(String::new()),
         stopped: false,
+        images: Vec::new(),
     };
     letronna_core::browser::share_browser(runner.store.settings.browser_shared);
     std::thread::spawn(letronna_core::browser::close_left_over);
@@ -153,6 +166,7 @@ fn main() {
         },
         _ => runner.open(false, workspace.clone()),
     };
+    choose_by_flags(&mut runner, session, gateway, &args);
 
     // One question, one answer, no banner: this form gets piped.
     if let Some(prompt) = &args.prompt {
@@ -163,6 +177,7 @@ fn main() {
         // outlive this run unseen.
         letronna_core::browser::close_hidden();
         letronna_core::jobs::stop_all();
+        letronna_core::mcp::stop_all();
         if !finished {
             letronna_core::diag::stop();
             std::process::exit(1);
@@ -196,7 +211,7 @@ fn main() {
         });
     }
     if args.start == Start::Choose {
-        resume(&mut runner, &mut session, workspace.as_deref());
+        resume(&mut runner, &mut session, workspace.as_deref(), "");
     } else if runner.store.conversations[session].length() > 0 {
         replay(&runner, session);
     }
@@ -222,10 +237,13 @@ fn main() {
             }
             continue;
         };
-        let mut line = line.trim().to_owned();
+        let line = line.trim().to_owned();
         if line.is_empty() {
             continue;
         }
+        let mut prompt = line.as_str();
+        // What an MCP server's prompt came to, when the command was one.
+        let sent: String;
         if line.starts_with('/') {
             let flow = command(&mut runner, &line, &mut session, workspace.as_deref());
             // Every turn follows its own session's helpers; this is for the
@@ -249,12 +267,15 @@ fn main() {
                 // slash would be run as a command.
                 Flow::Send(text) => {
                     runner.bar.echo(&text);
-                    line = text;
+                    sent = text;
+                    prompt = &sent;
                 }
+                // The command stays on screen as typed; the model gets its prompt.
+                Flow::Ask(asked) => prompt = asked,
                 _ => continue,
             }
         }
-        if let Err(error) = runner.ask(session, &line) {
+        if let Err(error) = runner.ask(session, prompt) {
             render::blank();
             render::line(&render::red(&error));
             // Nothing is painted after this until the next key, so without
@@ -270,6 +291,7 @@ fn main() {
     // A job's process is not ended with ours, so a dev server left running
     // would carry on with nobody left to stop it.
     letronna_core::jobs::stop_all();
+    letronna_core::mcp::stop_all();
     letronna_core::browser::close_hidden();
     render::title("");
     render::blank();
@@ -332,6 +354,9 @@ fn ask_once(runner: &mut Runner, session: usize, prompt: &str, args: &Args) -> b
         run: id,
         label: "Letronna".into(),
         depth: 0,
+        fork: false,
+        from: 0,
+        schema: None,
         allow: args.tools.clone().map_or(Allow::All, Allow::Only),
         rounds: args.max_rounds.unwrap_or(agent::MAX_ROUNDS),
         cancel: Cancel::default(),
@@ -351,6 +376,10 @@ fn ask_once(runner: &mut Runner, session: usize, prompt: &str, args: &Args) -> b
     let progress =
         (args.output == Output::StreamJson).then(|| show_progress(spec.status.clone(), ended));
     let mut report = driver::run(spec);
+    // On stderr, apart from the answer: what a hook said or could not do.
+    for problem in hooks::problems() {
+        eprintln!("{problem}");
+    }
     drop(running);
     if let Some(progress) = progress {
         let _ = progress.join();
@@ -401,6 +430,7 @@ fn failed(error: String) -> Report {
         seconds: 0,
         files: Vec::new(),
         jobs: Vec::new(),
+        value: None,
     }
 }
 
@@ -452,6 +482,7 @@ fn answer_approvals(yes: bool, keyboard: bool, context: tools::ToolContext, canc
 /// does, stopping the run when they say stop or leave the question.
 fn consult(request: &Request, context: &tools::ToolContext, cancel: &Cancel) -> Decision {
     let call = &request.call;
+    hooks::card(context.clone(), &call.name);
     let summary = tools::summary(&call.name, &call.arguments);
     // A change to a file is shown as a diff, anything else as its preview.
     match crate::diff::of(&call.name, &call.arguments, context) {
@@ -554,6 +585,46 @@ fn as_json(report: &Report) -> Value {
         out["error"] = error.as_str().into();
     }
     out
+}
+
+/// The gateway `name` means, in any case.
+fn gateway_named(name: &str) -> Result<&'static str, String> {
+    let gateways = letronna_core::gateway::GATEWAYS;
+    if let Some(gateway) = gateways
+        .iter()
+        .find(|g| g.name.eq_ignore_ascii_case(name.trim()))
+    {
+        return Ok(gateway.name);
+    }
+    let names: Vec<&str> = gateways.iter().map(|g| g.name).collect();
+    Err(format!(
+        "There is no gateway called {name}. The gateways are {}.",
+        names.join(", ")
+    ))
+}
+
+/// Put the session on the model, gateway and effort the flags name. Only the
+/// session takes them: the settings, and with them new sessions, stay as
+/// they were.
+fn choose_by_flags(runner: &mut Runner, session: usize, gateway: Option<&str>, args: &args::Args) {
+    if gateway.is_some() || args.model.is_some() {
+        let (on, model) = runner.store.model(session);
+        let gateway = gateway.unwrap_or(on).to_owned();
+        let model = args.model.clone().unwrap_or_else(|| model.to_owned());
+        let conversation = &mut runner.store.conversations[session];
+        conversation.gateway = Some(gateway);
+        conversation.model = Some(model);
+    }
+    if let Some(effort) = &args.effort {
+        let effort = effort.trim().to_lowercase();
+        // Auto leaves it to the model, as it does for `/effort`.
+        let effort = if effort == "auto" {
+            String::new()
+        } else {
+            effort
+        };
+        runner.store.conversations[session].effort = Some(effort);
+    }
 }
 
 /// Hand the terminal back if we panic. Without this a crash leaves the
@@ -672,6 +743,7 @@ mod tests {
             seconds: 4,
             files: vec!["notes.txt".into()],
             jobs: Vec::new(),
+            value: None,
         }
     }
 

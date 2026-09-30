@@ -333,7 +333,7 @@ fn tell(id: u64, text: String) {
 }
 
 /// Add output to the log, dropping its oldest bytes beyond `MAX_LOG`.
-fn append(log: &mut VecDeque<u8>, bytes: &[u8]) {
+pub(crate) fn append(log: &mut VecDeque<u8>, bytes: &[u8]) {
     log.extend(bytes);
     // Keep the tail: the newest output is what matters.
     let over = log.len().saturating_sub(MAX_LOG);
@@ -341,7 +341,7 @@ fn append(log: &mut VecDeque<u8>, bytes: &[u8]) {
 }
 
 /// The log as text, starting at its first whole character.
-fn text(log: &mut VecDeque<u8>) -> String {
+pub(crate) fn text(log: &mut VecDeque<u8>) -> String {
     let bytes = log.make_contiguous();
     // Dropping bytes can leave the tail of a cut character at the front, and a
     // character is at most four bytes, so at most three of them.
@@ -362,15 +362,16 @@ fn text(log: &mut VecDeque<u8>) -> String {
     text
 }
 
-/// A job's shell and everything it starts, held as one Job Object so that
-/// stopping reaches a server the shell launched and not just the shell.
+/// A job's shell, or an MCP server, and everything it starts, held as one
+/// Job Object so that stopping reaches a server the shell launched and not
+/// just the shell.
 #[cfg(windows)]
-struct Tree(std::os::windows::io::OwnedHandle);
+pub(crate) struct Tree(std::os::windows::io::OwnedHandle);
 
 #[cfg(windows)]
 impl Tree {
     /// Put a just-started shell in a new Job Object that ends its processes when closed.
-    fn of(child: &Child) -> Result<Tree, String> {
+    pub(crate) fn of(child: &Child) -> Result<Tree, String> {
         use std::os::windows::io::{AsRawHandle, HandleOrNull, OwnedHandle};
         use windows_sys::Win32::System::JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -379,7 +380,7 @@ impl Tree {
         };
         let failed = || {
             format!(
-                "Cannot group the job's processes: {}",
+                "Cannot group the processes it starts: {}",
                 std::io::Error::last_os_error()
             )
         };
@@ -418,7 +419,7 @@ impl Tree {
     }
 
     /// End every process in the tree, with the exit code a killed child gets.
-    fn kill(&self) {
+    pub(crate) fn kill(&self) {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::System::JobObjects::TerminateJobObject;
         // SAFETY: the handle is open for as long as the tree is.
@@ -426,20 +427,20 @@ impl Tree {
     }
 }
 
-/// A job's shell and everything it starts, as the process group the shell
-/// leads.
+/// A job's shell, or an MCP server, and everything it starts, as the
+/// process group the shell leads.
 #[cfg(unix)]
-struct Tree(libc::pid_t);
+pub(crate) struct Tree(libc::pid_t);
 
 #[cfg(unix)]
 impl Tree {
     /// The group a shell started with `process_group(0)` leads.
-    fn of(child: &Child) -> Result<Tree, String> {
+    pub(crate) fn of(child: &Child) -> Result<Tree, String> {
         Ok(Tree(child.id() as libc::pid_t))
     }
 
     /// End every process in the tree, with the signal a killed child gets.
-    fn kill(&self) {
+    pub(crate) fn kill(&self) {
         // SAFETY: this only sends a signal.
         unsafe { libc::kill(-self.0, libc::SIGKILL) };
     }

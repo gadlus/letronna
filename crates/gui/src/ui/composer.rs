@@ -8,14 +8,14 @@ impl Chat {
     /// The (gateway, model) pairs the picker shows for what is typed in its
     /// search box.
     pub(crate) fn model_matches(&self, cx: &App) -> Vec<(String, String)> {
-        let current = self.model.read(cx).value().to_string();
+        let (on, current) = self.store.model(self.store.active);
+        let (on, current) = (on.to_owned(), current.to_owned());
         let query = self.model_search.read(cx).value().to_lowercase();
-        let on = &self.store.settings.gateway;
         let mut ids = self.models.clone();
         // The model in use stays on the list even when its gateway did not
         // offer it, or the picker could not show what is picked.
-        if !current.is_empty() && !ids.iter().any(|(g, m)| g == on && *m == current) {
-            ids.insert(0, (on.clone(), current));
+        if !current.is_empty() && !ids.iter().any(|(g, m)| *g == on && *m == current) {
+            ids.insert(0, (on, current));
         }
         ids.retain(|(gw, id)| {
             query.is_empty()
@@ -26,7 +26,8 @@ impl Chat {
     }
 
     pub(crate) fn model_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let current = self.model.read(cx).value().to_string();
+        let (on, current) = self.store.model(self.store.active);
+        let (on, current) = (on.to_owned(), current.to_owned());
         let short = current.rsplit('/').next().unwrap_or(&current).to_string();
         let mut list = v_flex()
             .id("model-list")
@@ -34,7 +35,6 @@ impl Chat {
             .overflow_y_scroll()
             .p_1()
             .gap_0p5();
-        let on = self.store.settings.gateway.clone();
         // The chat models, unless a media tab is showing instead.
         let chat = self.model_kind == "chat";
         let matches = if chat {
@@ -583,7 +583,7 @@ impl Chat {
                         PopupMenuItem::new("Images")
                             .icon(Icon::new(AppIcon::Image))
                             .on_click(move |_, window, cx| {
-                                images.update(cx, |this, cx| this.attach(false, window, cx))
+                                images.update(cx, |this, cx| this.pick_pictures(window, cx))
                             }),
                     )
                     .separator()
@@ -606,6 +606,7 @@ impl Chat {
         let input = div()
             .min_w_0()
             .key_context("Composer")
+            .capture_action(cx.listener(Self::paste_picture))
             // Ctrl+Enter sends now what Enter would queue for the next step.
             // With nothing running it stays the new line it always was.
             .on_action(cx.listener(|this, _: &SendNow, window, cx| {
@@ -690,7 +691,10 @@ impl Chat {
                     } else {
                         "Send (Enter)"
                     })
-                    .disabled(self.composer_empty || self.busy_elsewhere().is_some())
+                    .disabled(
+                        (self.composer_empty && self.attached().is_empty())
+                            || self.busy_elsewhere().is_some(),
+                    )
                     .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
             );
         let frame = if compact {
@@ -708,7 +712,7 @@ impl Chat {
         .py_1();
         // Narrow, the text takes the whole width and the controls go under
         // it, rather than the text being squeezed to a few words a line.
-        if compact {
+        let frame = if compact {
             frame.child(input.w_full()).child(
                 h_flex()
                     .items_center()
@@ -719,6 +723,10 @@ impl Chat {
             )
         } else {
             frame.child(attach).child(input.flex_1()).child(controls)
-        }
+        };
+        v_flex()
+            .w_full()
+            .children(self.attached_row(cx))
+            .child(frame)
     }
 }
