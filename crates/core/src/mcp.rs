@@ -239,6 +239,10 @@ pub(crate) struct ServerConfig {
     /// own app ids.
     #[serde(default)]
     oauth: crate::mcp_auth::OAuthConfig,
+    /// The folder `cwd` is taken from in place of the data folder: the
+    /// plugin's, for a server a plugin brings.
+    #[serde(skip)]
+    base: Option<PathBuf>,
 }
 
 /// `autoApprove`: which of a server's tools run without asking.
@@ -915,7 +919,7 @@ fn missing(name: &str) -> String {
 }
 
 fn reload_from(path: &Path) -> Result<Reloaded, String> {
-    let servers = entries(&read_config(path)?);
+    let servers = with_plugins(entries(&read_config(path)?));
     let done = {
         let slots = slots()
             .lock()
@@ -985,6 +989,15 @@ fn apply(done: &Reloaded, mut servers: BTreeMap<String, Result<ServerConfig, Str
     }
 }
 
+/// Stop the servers the plugin `plugin` brings, before its folder moves:
+/// Windows will not move a folder a program is running in, and one left
+/// running would go on with the old copy's code, as `reload` finds its
+/// entry unchanged. `reload` starts them again from what is then in place.
+pub(crate) fn stop_plugin(plugin: &str) {
+    let prefix = format!("{plugin}:");
+    remove_slots(|name| name.starts_with(&prefix));
+}
+
 /// Take the slots of the servers `which` picks out, and stop them, each
 /// process tree and all.
 fn remove_slots(which: impl Fn(&str) -> bool) {
@@ -1030,7 +1043,66 @@ fn read_config(path: &std::path::Path) -> Result<Value, String> {
 /// The servers `mcp.json` lists, each read on its own so one bad entry
 /// shows as failed rather than hiding the rest.
 fn configured() -> Result<BTreeMap<String, Result<ServerConfig, String>>, String> {
-    Ok(entries(&read_config(&config_path())?))
+    Ok(with_plugins(entries(&read_config(&config_path())?)))
+}
+
+/// `servers` and those of the plugins switched on whose servers the user
+/// allowed, each named `<plugin>:<server>`; a name `mcp.json` already gives
+/// keeps its entry there.
+fn with_plugins(
+    servers: BTreeMap<String, Result<ServerConfig, String>>,
+) -> BTreeMap<String, Result<ServerConfig, String>> {
+    // Tests read the servers they are given, never the plugins installed on
+    // the machine running them.
+    if cfg!(test) {
+        return servers;
+    }
+    joined(servers, crate::plugins::servers())
+}
+
+/// `servers` with `plugins` added, each after those before it.
+fn joined(
+    mut servers: BTreeMap<String, Result<ServerConfig, String>>,
+    plugins: Vec<crate::plugins::Server>,
+) -> BTreeMap<String, Result<ServerConfig, String>> {
+    for server in plugins {
+        if servers.contains_key(&server.name) {
+            continue;
+        }
+        // `kit:files` and mcp.json's `kit_files` name their tools alike, and
+        // the plugin's, sorting first, would be the one called and the one
+        // the user's rules for the other allow.
+        let prefix = tool_name(&server.name, "");
+        let taken = servers.keys().find(|name| tool_name(name, "") == prefix);
+        let read = match taken {
+            Some(taken) => Err(format!(
+                "Its tools would take the names of {taken}'s, so it does not start."
+            )),
+            None => ServerConfig::deserialize(&server.config)
+                .map(|config| ServerConfig {
+                    base: Some(server.folder),
+                    ..config
+                })
+                .map_err(|e| {
+                    format!(
+                        "Its entry in {}'s plugin.json will not read: {e}",
+                        server.plugin
+                    )
+                }),
+        };
+        servers.insert(server.name, read);
+    }
+    servers
+}
+
+/// Why a server's entry, as `mcp.json` would hold it, will not read.
+pub(crate) fn readable(server: &Value) -> Result<(), String> {
+    if !server.is_object() {
+        return Err("its entry is not an object.".into());
+    }
+    ServerConfig::deserialize(server)
+        .map(drop)
+        .map_err(|e| format!("its entry will not read: {e}"))
 }
 
 fn entries(config: &Value) -> BTreeMap<String, Result<ServerConfig, String>> {
@@ -1359,7 +1431,8 @@ fn launch(name: &str, config: &ServerConfig, run: u64) -> Result<Vec<Arc<dyn Too
     if !config.url.trim().is_empty() {
         return reach(name, config, run);
     }
-    let mut child = spawn(config, &crate::chat::data_dir())?;
+    let base = config.base.clone().unwrap_or_else(crate::chat::data_dir);
+    let mut child = spawn(config, &base)?;
     // At once, so the server has had as little time as possible to start
     // anything outside the tree.
     let tree = match crate::jobs::Tree::of(&child) {
@@ -4868,6 +4941,45 @@ mod tests {
         };
         assert_eq!(gate::decide(&read("shelf_near"), &gate), Outcome::Run);
         assert_eq!(gate::decide(&read("shelf_far"), &gate), Outcome::Ask);
+    }
+
+    #[test]
+    fn stopping_a_plugins_servers_leaves_every_other_server_running() {
+        let names = ["stopkit:files", "stopkit", "stopkit2:web", "other:stopkit"];
+        {
+            let mut slots = slots().lock().unwrap();
+            for name in names {
+                slots.insert(name.to_owned(), Slot::default());
+            }
+        }
+        stop_plugin("stopkit");
+        let slots = slots().lock().unwrap();
+        let left: Vec<&str> = names
+            .into_iter()
+            .filter(|name| slots.contains_key(*name))
+            .collect();
+        assert_eq!(left, ["stopkit", "stopkit2:web", "other:stopkit"]);
+    }
+
+    #[test]
+    fn a_plugins_server_cannot_take_the_tool_names_of_another() {
+        let server = |name: &str| crate::plugins::Server {
+            name: name.into(),
+            plugin: "kit".into(),
+            folder: PathBuf::from("kit"),
+            config: json!({"command": "node"}),
+        };
+        let servers = super::joined(
+            entries(&json!({"mcpServers": {"kit_files": {"command": "files"}}})),
+            vec![server("kit:files"), server("kit:web")],
+        );
+        let Err(refused) = &servers["kit:files"] else {
+            panic!("kit:files would share kit_files's tool names");
+        };
+        assert!(refused.contains("kit_files"), "{refused}");
+        let kept = servers["kit:web"].as_ref().unwrap();
+        assert_eq!(kept.base.as_deref(), Some(Path::new("kit")));
+        assert_eq!(servers["kit_files"].as_ref().unwrap().command, "files");
     }
 
     #[test]

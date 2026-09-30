@@ -307,7 +307,7 @@ fn is_skill_file(path: &str) -> bool {
 /// write under a skill's folder, or None when a part of it could not be
 /// written the same everywhere. The skill's own SKILL.md is always named so,
 /// whatever its case, since that is the name it is read by.
-fn safe(path: &str) -> Option<PathBuf> {
+pub(crate) fn safe(path: &str) -> Option<PathBuf> {
     if !path.contains('/') && is_skill_file(path) {
         return Some(PathBuf::from(SKILL_FILE));
     }
@@ -325,7 +325,7 @@ fn safe(path: &str) -> Option<PathBuf> {
 /// empty, `.` or `..`; no character Windows forbids; not ending in a dot or a
 /// space, which Windows drops; and not a device's name, which Windows opens
 /// as the device.
-pub(super) fn plain(part: &str) -> bool {
+pub(crate) fn plain(part: &str) -> bool {
     !matches!(part, "" | "." | "..")
         && !part.ends_with(['.', ' '])
         && !part
@@ -335,7 +335,7 @@ pub(super) fn plain(part: &str) -> bool {
 }
 
 /// Why a file cannot be installed: its name.
-fn unwritable(file: &str) -> String {
+pub(crate) fn unwritable(file: &str) -> String {
     format!(
         "{file} has a name that cannot be written on every computer -- a device's name such as \
          CON, a character Windows forbids, or a dot or space at the end -- so nothing was \
@@ -354,7 +354,7 @@ fn left_out(inside: &str) -> bool {
 /// Refuse an install over `MAX_FILES` or `MAX_BYTES`, with a file over
 /// `FILE_BYTES`, or with a SKILL.md over the `SKILL_BYTES` a skill is read
 /// to, before anything is fetched or copied.
-fn within_limits<'a>(files: impl Iterator<Item = (&'a str, u64)>) -> Result<(), String> {
+pub(crate) fn within_limits<'a>(files: impl Iterator<Item = (&'a str, u64)>) -> Result<(), String> {
     let (mut count, mut total) = (0, 0);
     for (path, size) in files {
         if size > FILE_BYTES {
@@ -423,7 +423,7 @@ fn single(
 }
 
 /// The client every download goes through: https only, redirects included.
-fn client() -> Result<reqwest::blocking::Client, String> {
+pub(crate) fn client() -> Result<reqwest::blocking::Client, String> {
     reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(60))
@@ -443,7 +443,7 @@ fn client() -> Result<reqwest::blocking::Client, String> {
 
 /// A file from the web, whole, and what kind the server says it is. Refused
 /// past `FILE_BYTES`.
-fn get(
+pub(crate) fn get(
     client: &reqwest::blocking::Client,
     url: reqwest::Url,
     what: &str,

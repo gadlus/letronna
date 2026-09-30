@@ -319,10 +319,18 @@ fn from_skill(skill: &Skill) -> Option<Command> {
         return None;
     }
     let (description, body) = match skill.source {
-        Source::User => (skill.description.clone(), skill.body.clone()),
-        Source::Project => (
+        Source::User if !skill.learned => (skill.description.clone(), skill.body.clone()),
+        // Anyone's, or a model's: fenced as the prompt fences them.
+        source => (
             untrusted::visible(&skill.description),
-            untrusted::vetted("this project's skill", &skill.body),
+            untrusted::vetted(
+                match source {
+                    Source::Project => "this project's skill",
+                    Source::Plugin => "a plugin's skill",
+                    Source::User => "a learned skill",
+                },
+                &skill.body,
+            ),
         ),
     };
     let body = typeable(&body);

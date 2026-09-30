@@ -232,6 +232,10 @@ pub fn command(
             mcp_servers(runner, rest);
             Flow::Handled
         }
+        "/plugins" => {
+            plugins(runner, rest);
+            Flow::Handled
+        }
         "/resume" => {
             resume(runner, session, workspace, rest);
             Flow::Handled
@@ -1481,6 +1485,7 @@ fn skills(runner: &mut Runner, rest: &str, workspace: Option<&std::path::Path>) 
             Source::User if skill.learned => "learned",
             Source::User => "yours",
             Source::Project => "project",
+            Source::Plugin => "plugin",
         };
         // A line each: descriptions are written for the model, and run long.
         let about = format!("{source} · {}", skill.description);
@@ -1606,6 +1611,231 @@ fn add_skills(runner: &mut Runner, source: &str) {
         }
         Err(why) => render::line(&render::red(&why)),
     }
+}
+
+/// The plugins: list them and what each brings, or add, switch, allow,
+/// update or remove one, or look through the marketplaces.
+fn plugins(runner: &mut Runner, rest: &str) {
+    use letronna_core::plugins;
+    render::blank();
+    let (verb, target) = rest
+        .split_once(' ')
+        .map_or((rest, ""), |(verb, target)| (verb, target.trim()));
+    let needs_name = matches!(verb, "on" | "off" | "allow" | "remove" | "add");
+    if needs_name && target.is_empty() {
+        let what = if verb == "add" {
+            "<git url or owner/repo>"
+        } else {
+            "<name>"
+        };
+        render::said(
+            &render::blue("●"),
+            &render::bold(&format!("Which one? /plugins {verb} {what}")),
+        );
+        return;
+    }
+    let done = match verb {
+        "" | "list" => Ok(()),
+        "market" => return plugin_market(runner, target),
+        "add" => {
+            let from = target.to_owned();
+            match runner
+                .bar
+                .busy("cloning the plugin", move || plugins::add(&from))
+            {
+                Ok(plugin) => {
+                    render::said(
+                        &render::blue("●"),
+                        &render::bold(&format!("Added {}", plugin.name)),
+                    );
+                    describe_plugin(&plugin);
+                    return;
+                }
+                Err(why) => Err(why),
+            }
+        }
+        "on" | "off" => plugins::set_enabled(target, verb == "on"),
+        "allow" => plugins::allow(target),
+        "remove" => plugins::remove(target).map(|kept| {
+            render::line(&render::dim(&format!(
+                "Removed {target}; it is kept in {}",
+                kept.display()
+            )));
+        }),
+        "update" => return update_plugins(runner, target),
+        _ => Err(format!(
+            "/plugins {verb} is not one of add, on, off, allow, update, remove or market."
+        )),
+    };
+    if let Err(why) = done {
+        render::line(&render::red(&why));
+        return;
+    }
+    let installed = match plugins::list() {
+        Ok(installed) => installed,
+        Err(why) => {
+            render::line(&render::red(&why));
+            return;
+        }
+    };
+    if installed.is_empty() {
+        render::said(&render::blue("●"), &render::bold("No plugins yet"));
+        render::line(&render::dim(
+            "/plugins add <git url or owner/repo>, or /plugins market to see what is listed",
+        ));
+        return;
+    }
+    render::said(&render::blue("●"), &render::bold("Plugins"));
+    for plugin in &installed {
+        let state = if plugin.enabled {
+            render::green("on ")
+        } else {
+            render::dim("off")
+        };
+        let version = match plugin.version.as_str() {
+            "" => String::new(),
+            version => format!(" {version}"),
+        };
+        render::line(&format!(
+            "{state}  {}{}  {}",
+            render::bold(&plugin.name),
+            render::dim(&version),
+            render::dim(&plugin.description)
+        ));
+        describe_plugin(plugin);
+    }
+    render::line(&render::dim(
+        "/plugins add <url|owner/repo> · on|off|allow|update|remove <name> · market",
+    ));
+}
+
+/// What a plugin brings, what of it is left out, and whether its servers
+/// wait for the user's say.
+fn describe_plugin(plugin: &letronna_core::plugins::Plugin) {
+    if let Some(why) = &plugin.broken {
+        render::line(&render::red(&format!("     {why}")));
+        return;
+    }
+    let lists = [
+        ("skills", &plugin.skills),
+        ("commands", &plugin.commands),
+        ("styles", &plugin.styles),
+    ];
+    for (what, names) in lists {
+        if !names.is_empty() {
+            render::line(&render::dim(&format!("     {what}: {}", names.join(", "))));
+        }
+    }
+    for (name, target) in &plugin.servers {
+        render::line(&render::dim(&format!("     MCP server {name}: {target}")));
+    }
+    for why in &plugin.clashes {
+        render::line(&render::amber(&format!("     {why}")));
+    }
+    if !plugin.allowed {
+        render::line(&render::amber(&format!(
+            "     Its MCP servers run programs on this computer and wait for your say: \
+             /plugins allow {} to start them.",
+            plugin.name
+        )));
+    }
+}
+
+/// Update one plugin, or every one, from where each came.
+fn update_plugins(runner: &mut Runner, name: &str) {
+    use letronna_core::plugins;
+    let names: Vec<String> = match name {
+        "" => match plugins::list() {
+            Ok(installed) => installed.into_iter().map(|p| p.name).collect(),
+            Err(why) => {
+                render::line(&render::red(&why));
+                return;
+            }
+        },
+        name => vec![name.to_owned()],
+    };
+    if names.is_empty() {
+        render::said(&render::blue("●"), &render::bold("No plugins to update"));
+        return;
+    }
+    for name in names {
+        let which = name.clone();
+        let done = runner
+            .bar
+            .busy(&format!("updating {name}"), move || plugins::update(&which));
+        match done {
+            Ok(None) => render::line(&render::dim(&format!("{name} is up to date"))),
+            Ok(Some(kept)) => render::line(&format!(
+                "{} {}",
+                render::bold(&format!("Updated {name};")),
+                render::dim(&format!("the earlier copy is kept in {}", kept.display()))
+            )),
+            Err(why) => render::line(&render::red(&why)),
+        }
+    }
+}
+
+/// The marketplaces and what each lists, or add or take away one.
+fn plugin_market(runner: &mut Runner, rest: &str) {
+    use letronna_core::plugins;
+    let (verb, url) = rest
+        .split_once(' ')
+        .map_or((rest, ""), |(verb, url)| (verb, url.trim()));
+    let changed = match verb {
+        "add" => Some(plugins::add_market(url)),
+        "remove" => Some(plugins::remove_market(url)),
+        _ => None,
+    };
+    if let Some(Err(why)) = changed {
+        render::line(&render::red(&why));
+        return;
+    }
+    let markets = match runner.bar.busy("reading the marketplaces", plugins::market) {
+        Ok(markets) => markets,
+        Err(why) => {
+            render::line(&render::red(&why));
+            return;
+        }
+    };
+    if markets.is_empty() {
+        render::said(&render::blue("●"), &render::bold("No marketplaces yet"));
+        render::line(&render::dim(
+            "/plugins market add <https link to a JSON index of plugins>",
+        ));
+        return;
+    }
+    let installed: Vec<String> = plugins::list()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| p.name)
+        .collect();
+    for market in &markets {
+        render::said(&render::blue("●"), &render::bold(&market.url));
+        match &market.listings {
+            Ok(listings) if listings.is_empty() => {
+                render::line(&render::dim("It lists no plugins."));
+            }
+            Ok(listings) => {
+                for listing in listings {
+                    let mark = if installed.contains(&listing.name) {
+                        render::green("installed")
+                    } else {
+                        render::dim(&listing.repo)
+                    };
+                    render::line(&format!(
+                        "{}  {}  {}",
+                        render::bold(&listing.name),
+                        mark,
+                        render::dim(&listing.description)
+                    ));
+                }
+            }
+            Err(why) => render::line(&render::red(why)),
+        }
+    }
+    render::line(&render::dim(
+        "/plugins add <repo> to install one · /plugins market add|remove <url>",
+    ));
 }
 
 /// Sessions offered at once. Older ones are still on disk and still open in
