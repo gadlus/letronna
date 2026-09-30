@@ -7,6 +7,7 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const LETRONNA: &str = env!("CARGO_BIN_EXE_letronna");
@@ -25,9 +26,10 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-/// Runs `program` with `args` in `dir`, with nowhere to reach outside it.
-fn run(program: &Path, dir: &Path, args: &[&str]) -> Output {
-    Command::new(program)
+/// `program` with `args` in `dir`, with nowhere to reach outside it.
+fn command(program: &Path, dir: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(program);
+    command
         .args(args)
         .current_dir(dir)
         .env("AGENT_DATA_DIR", dir.join("data"))
@@ -36,9 +38,33 @@ fn run(program: &Path, dir: &Path, args: &[&str]) -> Output {
         .env("USERPROFILE", dir)
         // A debug build leaves updating alone unless told otherwise.
         .env("LETRONNA_UPDATES", "1")
-        .stdin(Stdio::null())
-        .output()
-        .unwrap()
+        .stdin(Stdio::null());
+    command
+}
+
+/// Runs `program` with `args` in `dir`, with nowhere to reach outside it.
+fn run(program: &Path, dir: &Path, args: &[&str]) -> Output {
+    command(program, dir, args).output().unwrap()
+}
+
+/// Runs it as [`run`] does, but stops it and gives nothing back when it is
+/// still going after `limit`.
+fn run_within(program: &Path, dir: &Path, args: &[&str], limit: Duration) -> Option<Output> {
+    let mut child = command(program, dir, args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + limit;
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Some(child.wait_with_output().unwrap())
 }
 
 fn state_path(dir: &Path) -> PathBuf {
@@ -227,6 +253,28 @@ fn a_version_that_never_settled_is_put_back_and_started_instead() {
     let state = read_state(&dir);
     assert!(state["pending"].is_null());
     assert_eq!(state["skip"], VERSION);
+}
+
+#[test]
+fn a_version_given_up_on_that_was_not_put_back_carries_on() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = scratch("nothing-put-back");
+    // Kept nowhere, so nothing is put back, and the state cannot be saved,
+    // so a copy started again would find it just as this one did.
+    let dest = dir.join("bin").join("letronna");
+    write_state(&dir, pending(&dest, 2));
+    std::fs::create_dir(dir.join("data").join("update.tmp")).unwrap();
+    let Some(out) = run_within(
+        Path::new(LETRONNA),
+        &dir,
+        &["-p", "hello"],
+        Duration::from_secs(30),
+    ) else {
+        panic!("it kept starting itself again");
+    };
+    assert_eq!(out.status.code(), Some(1));
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(said.contains("Nothing is set up yet"), "{said}");
 }
 
 #[test]

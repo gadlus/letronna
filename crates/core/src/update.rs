@@ -335,9 +335,12 @@ pub fn on_start() -> Option<PathBuf> {
     if state.pending.as_ref().is_some_and(|p| p.to == VERSION) {
         // Asked before anything moves, as in `install`.
         let me = std::env::current_exe().ok();
-        let rolled_back = started(&mut state, VERSION);
+        let put_back = started(&mut state, VERSION);
         let _ = state.save();
-        return me.filter(|_| rolled_back);
+        // Only a program that changed is worth starting again: started as
+        // it is, it would find the same state and, when that could not be
+        // saved, start itself again for ever.
+        return me.filter(|me| put_back.iter().any(|dest| same_file(me, dest)));
     }
     if state.staged.is_some() {
         return install().ok().flatten();
@@ -359,15 +362,16 @@ pub fn confirm() {
 }
 
 /// Count a start of the version waiting to be confirmed, and put the old one
-/// back when it has had its chances. True when it was put back.
-fn started(state: &mut State, version: &str) -> bool {
+/// back when it has had its chances. Gives the files that were put back.
+fn started(state: &mut State, version: &str) -> Vec<PathBuf> {
     let Some(pending) = state.pending.as_mut().filter(|p| p.to == version) else {
-        return false;
+        return Vec::new();
     };
     pending.starts += 1;
     if pending.starts < GIVE_UP {
-        return false;
+        return Vec::new();
     }
+    let mut put_back = Vec::new();
     for dest in pending.files.iter().rev() {
         let old = beside(dest, "old");
         if !old.exists() {
@@ -377,13 +381,17 @@ fn started(state: &mut State, version: &str) -> bool {
         // moved aside.
         let failed = beside(dest, "failed");
         let _ = std::fs::remove_file(&failed);
-        if rename(dest, &failed).is_ok() && rename(&old, dest).is_err() {
-            let _ = rename(&failed, dest);
+        if rename(dest, &failed).is_ok() {
+            if rename(&old, dest).is_ok() {
+                put_back.push(dest.clone());
+            } else {
+                let _ = rename(&failed, dest);
+            }
         }
     }
     state.skip = pending.to.clone();
     state.pending = None;
-    true
+    put_back
 }
 
 /// Keep only what is newer than `current`, not refused before, and has a
@@ -1200,19 +1208,38 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            !started(&mut state, "1.0.0"),
+            started(&mut state, "1.0.0").is_empty(),
             "another version's start is not counted"
         );
         for _ in 1..GIVE_UP {
-            assert!(!started(&mut state, "2.0.0"));
+            assert!(started(&mut state, "2.0.0").is_empty());
             assert_eq!(std::fs::read_to_string(&window).unwrap(), "window 2");
         }
-        assert!(started(&mut state, "2.0.0"));
+        assert_eq!(started(&mut state, "2.0.0"), std::slice::from_ref(&window));
         assert_eq!(std::fs::read_to_string(&window).unwrap(), "window 1");
         assert_eq!(
             std::fs::read_to_string(beside(&window, "failed")).unwrap(),
             "window 2"
         );
+        assert_eq!(state.skip, "2.0.0");
+        assert!(state.pending.is_none());
+    }
+
+    #[test]
+    fn a_version_with_nothing_kept_to_put_back_is_given_up_on_all_the_same() {
+        let dir = scratch("nothing-kept");
+        let window = installed(&dir, "Letronna.exe", "window 2", None);
+        let mut state = State {
+            pending: Some(Pending {
+                from: "1.0.0".into(),
+                to: "2.0.0".into(),
+                starts: GIVE_UP - 1,
+                files: vec![window.clone()],
+            }),
+            ..Default::default()
+        };
+        assert!(started(&mut state, "2.0.0").is_empty());
+        assert_eq!(std::fs::read_to_string(&window).unwrap(), "window 2");
         assert_eq!(state.skip, "2.0.0");
         assert!(state.pending.is_none());
     }
