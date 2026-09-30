@@ -247,6 +247,9 @@ fn main() {
     runner.bar.listen();
     runner.ended = Some(letronna_core::notify::listen());
     offer_added(&mut runner, workspace.as_deref());
+    runner
+        .bar
+        .set_folder(runner.store.conversations[session].workspace.clone());
     while let Some(waited) = runner.bar.wait() {
         // Helpers that ended ring the doorbell as they do.
         runner.tell_ended();
@@ -283,6 +286,9 @@ fn main() {
             // footer's count once a command has opened another.
             let open = runner.store.conversations[session].id;
             runner.bar.show_helpers_of(open);
+            runner
+                .bar
+                .set_folder(runner.store.conversations[session].workspace.clone());
             if let Flow::Unknown = flow {
                 let name = line.split_whitespace().next().unwrap_or(&line);
                 render::line(&render::dim(&match runner.bar.meant(name) {
@@ -362,9 +368,10 @@ fn ask_once(runner: &mut Runner, session: usize, prompt: &str, args: &Args) -> b
         conversation.title = prompt.chars().take(40).collect();
     }
     conversation.updated = chat::now();
+    let content = letronna_core::references::expand(prompt, conversation.workspace.as_deref());
     conversation.messages.push(Message {
         role: "user".into(),
-        content: prompt.to_owned(),
+        content,
         ..Default::default()
     });
     runner.persist();

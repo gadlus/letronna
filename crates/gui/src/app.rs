@@ -1251,6 +1251,7 @@ impl Chat {
         // What is said goes after what was said before, and the model is
         // sent all of it.
         self.fill_now(self.store.active);
+        let from_chat_app = remote.is_some();
         let connection = match self.connection_for(self.store.active, remote) {
             Ok(connection) => connection,
             Err(error) => {
@@ -1284,9 +1285,17 @@ impl Chat {
         conversation
             .messages
             .extend(inbox::fold(&inbox::take(conversation.id, true)));
+        // Only what the user typed here: a chat app's message is someone
+        // else's, and must not read the user's files by naming them, nor
+        // hide its end from the window behind the marker.
+        let content = if from_chat_app {
+            letronna_core::references::inert(&prompt)
+        } else {
+            letronna_core::references::expand(&prompt, conversation.workspace.as_deref())
+        };
         conversation.messages.push(Message {
             role: "user".into(),
-            content: prompt,
+            content,
             images,
             ..Default::default()
         });
@@ -2028,12 +2037,14 @@ impl Chat {
             .messages
             .extend(inbox::fold(&inbox::take(conversation.id, false)));
         // What you sent while it worked goes in now, before the model is
-        // asked again, so it reads it before going on.
+        // asked again, so it reads it before going on, with its `@` paths
+        // attached as a message sent on its own has them.
+        let workspace = conversation.workspace.clone();
         conversation
             .messages
             .extend(self.follow_ups.drain(..).map(|text| Message {
                 role: "user".into(),
-                content: text,
+                content: letronna_core::references::expand(&text, workspace.as_deref()),
                 folded: true,
                 ..Default::default()
             }));

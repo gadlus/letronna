@@ -2283,7 +2283,7 @@ fn open_picture(path: &Path, raw: &str) -> Result<Option<String>, String> {
 /// A file's text as UTF-8, without a byte order mark and with UTF-16 decoded,
 /// and whether it stops at `UTF16_BYTES`; a NUL byte near the start marks a
 /// binary file, which is refused.
-fn open_text(path: &Path) -> Result<(Box<dyn BufRead>, bool), String> {
+pub(crate) fn open_text(path: &Path) -> Result<(Box<dyn BufRead>, bool), String> {
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mut reader = BufReader::new(file);
     let start = reader.fill_buf().map_err(|e| e.to_string())?;
@@ -2316,7 +2316,7 @@ fn open_text(path: &Path) -> Result<(Box<dyn BufRead>, bool), String> {
 /// Lines from `offset` on, numbered, until `limit` of them or `PAGE_BYTES`,
 /// with a footer saying where the rest starts and a note on every page of a
 /// `cut` file; and whether that showed all of the file, as it is.
-fn page(
+pub(crate) fn page(
     reader: &mut impl BufRead,
     offset: usize,
     limit: usize,

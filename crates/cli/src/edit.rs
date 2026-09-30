@@ -188,6 +188,30 @@ impl Line {
         self.cursor = self.word_end();
     }
 
+    /// What follows the `@` of the reference the cursor ends, if it ends
+    /// one; a space after a backslash is part of it.
+    pub fn reference_before(&self) -> Option<String> {
+        let start = self.reference_start();
+        let word: String = self.chars()[start..self.cursor].iter().collect();
+        word.strip_prefix('@').map(str::to_owned)
+    }
+
+    /// Put `with` in place of what follows the `@` the cursor's word starts with.
+    pub fn replace_reference(&mut self, with: &str) {
+        let start = self.reference_start() + 1;
+        self.cut(start.min(self.cursor), self.cursor);
+        self.insert_str(with);
+    }
+
+    fn reference_start(&self) -> usize {
+        let chars = self.chars();
+        let mut at = self.cursor;
+        while at > 0 && !(chars[at - 1].is_whitespace() && (at < 2 || chars[at - 2] != '\\')) {
+            at -= 1;
+        }
+        at
+    }
+
     fn word_start(&self) -> usize {
         let chars = self.chars();
         let mut at = self.cursor;
@@ -323,6 +347,20 @@ mod tests {
         let mut line = Line::default();
         line.insert_str(text);
         line
+    }
+
+    #[test]
+    fn the_reference_the_cursor_ends_is_found_and_replaced() {
+        let mut line = typed("see me@home and @src/ma");
+        assert_eq!(line.reference_before().as_deref(), Some("src/ma"));
+        line.replace_reference("src/main.rs");
+        assert_eq!(line.text(), "see me@home and @src/main.rs");
+        let mut spaced = typed("@my\\ no");
+        assert_eq!(spaced.reference_before().as_deref(), Some("my\\ no"));
+        spaced.replace_reference("my\\ notes.md");
+        assert_eq!(spaced.text(), "@my\\ notes.md");
+        assert_eq!(typed("mail me@home").reference_before(), None);
+        assert_eq!(typed("word ").reference_before(), None);
     }
 
     #[test]

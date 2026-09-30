@@ -240,6 +240,25 @@ fn matches<'a>(text: &str, added: &'a [(String, String)]) -> Vec<Command<'a>> {
     found
 }
 
+/// The names an `@` path could go on as, as many as fit in `width` columns
+/// of the footer, which is cut rather than wrapped.
+fn offered(names: &[String], width: usize) -> String {
+    let room = width.saturating_sub(render::PAD.len() + 2);
+    let mut out = String::new();
+    for name in names {
+        let wanted = out.chars().count() + name.chars().count() + 2;
+        if !out.is_empty() && wanted > room {
+            out.push_str("  …");
+            break;
+        }
+        if !out.is_empty() {
+            out.push_str("  ");
+        }
+        out.push_str(name);
+    }
+    out
+}
+
 /// Columns the longest command name takes, the `added` ones' too, up to
 /// `NAME_WIDTH`, so every blurb starts in the same place.
 pub fn name_width(added: &[(String, String)]) -> usize {
@@ -419,6 +438,8 @@ pub struct Bar {
     /// The commands the user, the project and skills added, as the menu
     /// offers them: (`/name`, blurb).
     added: Vec<(String, String)>,
+    /// The open session's project folder, where an `@` path is completed.
+    folder: Option<std::path::PathBuf>,
 }
 
 impl Bar {
@@ -456,6 +477,7 @@ impl Bar {
             guard: None,
             focus: crate::notify::Focus::new(std::time::Instant::now()),
             added: Vec::new(),
+            folder: None,
         }
     }
 
@@ -474,6 +496,11 @@ impl Bar {
     /// What is in the box, typed and not yet sent.
     pub fn draft(&self) -> &str {
         self.line.text()
+    }
+
+    /// Complete `@` paths in `folder`, the open session's project folder.
+    pub fn set_folder(&mut self, folder: Option<std::path::PathBuf>) {
+        self.folder = folder;
     }
 
     /// Take the window.
@@ -1108,6 +1135,13 @@ impl Bar {
                 if let Some(choice) = options.get(self.picked) {
                     self.line.set(choice.name);
                     self.picked = 0;
+                } else if let Some(partial) = self.line.reference_before() {
+                    let (completed, choices) =
+                        letronna_core::references::complete(&partial, self.folder.as_deref());
+                    self.line.replace_reference(&completed);
+                    if !choices.is_empty() {
+                        self.note = Some(offered(&choices, render::width()));
+                    }
                 }
             }
             KeyCode::Up if !options.is_empty() => {
@@ -1748,7 +1782,7 @@ mod tests {
     use super::{
         Bar, Choice, MENU_LIMIT, NAME_WIDTH, PLAN_ROWS, QUEUED_LIMIT, RELAY_LIMIT, STILL, Slider,
         Waited, at_work, checklist, closest, fitted, is_command, matches, menu_top, name_width,
-        one_row, relay_line, stops_at, track, unescaped,
+        offered, one_row, relay_line, stops_at, track, unescaped,
     };
     use crate::render::{MARGIN, plain, visible};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -2372,5 +2406,12 @@ mod tests {
         bar.guard = Instant::now().checked_sub(STILL);
         bar.pick(key(KeyCode::Enter));
         assert_eq!(bar.answer, Some(0));
+    }
+
+    #[test]
+    fn the_paths_offered_after_an_at_are_cut_to_the_footer() {
+        let names: Vec<String> = ["deep/", "lib.rs", "main.rs"].map(String::from).into();
+        assert_eq!(offered(&names, 80), "deep/  lib.rs  main.rs");
+        assert_eq!(offered(&names, 20), "deep/  lib.rs  …");
     }
 }
