@@ -240,6 +240,10 @@ pub fn command(
             working_diff(runner, *session, workspace, rest);
             Flow::Handled
         }
+        "/import" => {
+            import(runner, session, workspace, rest);
+            Flow::Handled
+        }
         "/undo" => {
             match with_files(rest) {
                 Some(files) => undo(runner, *session, workspace, files),
@@ -1880,6 +1884,119 @@ fn working_diff(
     render::blank();
     for line in diff.patch.lines() {
         render::line(&crate::diff::patch_line(line, width));
+    }
+}
+
+/// Sessions from Claude Code and Codex offered at once.
+const IMPORT_CHOICES: usize = 9;
+
+/// How a candidate reads in the `/import` list: its title, the tool it came
+/// from and its project folder.
+fn import_label(candidate: &letronna_core::import::Candidate) -> String {
+    let title = match candidate.title.trim() {
+        "" => "untitled",
+        title => title,
+    };
+    let folder = candidate
+        .workspace
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "no project".into());
+    format!("{title}  ·  {}  ·  {folder}", candidate.tool.label())
+}
+
+/// Bring in a session from Claude Code or Codex as a session of this app's
+/// own. Named or numbered with `term`, the matching one is imported without
+/// asking which; bare, the newest from both are offered to pick from.
+fn import(
+    runner: &mut Runner,
+    session: &mut usize,
+    workspace: Option<&std::path::Path>,
+    term: &str,
+) {
+    if !term.is_empty() {
+        let path = std::path::PathBuf::from(term);
+        let candidate = letronna_core::import::candidate_at(&path).or_else(|| {
+            letronna_core::import::list(usize::MAX)
+                .into_iter()
+                .find(|c| c.session_id == term)
+        });
+        let Some(candidate) = candidate else {
+            render::blank();
+            render::line(&render::red(&format!(
+                "No Claude Code or Codex session matches \"{term}\"."
+            )));
+            return;
+        };
+        import_one(runner, session, workspace, &candidate);
+        return;
+    }
+
+    let candidates = letronna_core::import::list(IMPORT_CHOICES);
+    if candidates.is_empty() {
+        render::blank();
+        render::line(&render::dim(
+            "No Claude Code or Codex sessions found to import.",
+        ));
+        return;
+    }
+
+    let labels: Vec<String> = candidates.iter().map(import_label).collect();
+    render::blank();
+    render::said(
+        &render::blue("●"),
+        &render::bold("Continue from Claude Code or Codex"),
+    );
+    let mut options: Vec<&str> = labels.iter().map(String::as_str).collect();
+    options.push("Never mind");
+    let Some(picked) = runner.bar.choose("Which one?", Vec::new(), &options) else {
+        return;
+    };
+    let Some(candidate) = candidates.get(picked) else {
+        render::line(&render::dim("Stayed put."));
+        return;
+    };
+    import_one(runner, session, workspace, candidate);
+}
+
+/// Import `candidate`, or open the session it was already imported into.
+fn import_one(
+    runner: &mut Runner,
+    session: &mut usize,
+    workspace: Option<&std::path::Path>,
+    candidate: &letronna_core::import::Candidate,
+) {
+    if let Some(index) = runner
+        .store
+        .find_by_import(candidate.tool, &candidate.session_id)
+    {
+        render::blank();
+        render::line(&render::dim("Already imported; opening it."));
+        pick_up(runner, session, workspace, index);
+        return;
+    }
+    let imported = match letronna_core::import::import(candidate) {
+        Ok(imported) => imported,
+        Err(error) => {
+            render::blank();
+            render::line(&render::red(&error));
+            return;
+        }
+    };
+    let skipped = imported.skipped;
+    let id = runner.store.reserve_id();
+    runner
+        .store
+        .conversations
+        .push(letronna_core::import::into_conversation(imported, id));
+    let index = runner.store.conversations.len() - 1;
+    pick_up(runner, session, workspace, index);
+    if skipped > 0 {
+        render::line(&render::dim(&format!(
+            "{skipped} part{} of the original session could not be imported.",
+            if skipped == 1 { "" } else { "s" }
+        )));
     }
 }
 

@@ -135,6 +135,10 @@ pub const COMMANDS: &[Command<'static>] = &[
         blurb: "what changed in the project; /diff session for this session's files",
     },
     Command {
+        name: "/import",
+        blurb: "continue a session from Claude Code or Codex",
+    },
+    Command {
         name: "/undo",
         blurb: "take back the last exchange; --files puts files back too",
     },

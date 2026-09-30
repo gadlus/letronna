@@ -37,6 +37,7 @@ pub mod goal;
 mod grep;
 pub mod history;
 pub mod hooks;
+pub mod import;
 pub mod inbox;
 pub mod init;
 pub mod insights;
