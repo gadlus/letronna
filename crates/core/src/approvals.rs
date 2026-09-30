@@ -134,7 +134,8 @@ pub(crate) fn ask(
         drop(lock(&ASKS));
         SETTLED.notify_all();
     });
-    let key = (run, call.name.clone());
+    // Per tool, and for a resource read per server too, as a session's grants are.
+    let key = (run, crate::gate::grant(call));
     // The grant answers for this tool from whichever call first asked about
     // it, so it covers this one only if this one clears on its own. Worked
     // out before the lock, since letting go of it between the check and the
@@ -484,5 +485,29 @@ pub(crate) mod tests {
             said.recv_timeout(WAIT),
             Ok(Err("not on the main branch".to_owned()))
         );
+    }
+
+    #[test]
+    fn allowing_one_servers_reads_for_a_run_still_asks_about_anothers() {
+        let _turn = lock(&SERVING);
+        let requests = serve();
+        let read = |id: &str, server: &str| ToolCall {
+            id: id.into(),
+            name: crate::mcp::READ_RESOURCE.into(),
+            arguments: format!(r#"{{"server": "{server}", "uri": "notes://today"}}"#),
+        };
+        let first = asking(1909, read("a", "near"), ToolContext::default());
+        let request = requests.recv_timeout(WAIT).unwrap();
+        request.answer(Decision::ForRun);
+        assert_eq!(first.recv_timeout(WAIT), Ok(true));
+
+        // A repeat on the same server is covered only where its tool is
+        // offered, which takes a server with resources; another server is
+        // asked about whatever the grant.
+        let far = asking(1909, read("c", "far"), ToolContext::default());
+        let request = requests.recv_timeout(WAIT).unwrap();
+        assert_eq!(request.call.id, "c");
+        request.answer(Decision::Deny(String::new()));
+        assert_eq!(far.recv_timeout(WAIT), Ok(false));
     }
 }

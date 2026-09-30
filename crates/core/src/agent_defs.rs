@@ -32,6 +32,8 @@ const CLAUDE_TOOLS: &[(&str, &str)] = &[
     ("Write", "write_file"),
     ("WebFetch", "web_fetch"),
     ("WebSearch", "search_web"),
+    ("ListMcpResourcesTool", "list_mcp_resources"),
+    ("ReadMcpResourceTool", "read_mcp_resource"),
 ];
 /// What the built-in types that only look may use.
 const LOOKING: &[&str] = &[
@@ -43,6 +45,8 @@ const LOOKING: &[&str] = &[
     "list_sessions",
     "search_sessions",
     "read_job",
+    "list_mcp_resources",
+    "read_mcp_resource",
 ];
 
 /// A frontmatter key with its value, or with the `- item` lines under it.
@@ -506,6 +510,13 @@ mod tests {
         let ours = parse(text, "checker", false).unwrap();
         assert!(!ours.allows("read_file"));
         assert!(ours.allows("mcp__docs__look_up"));
+        // Reading an MCP server's resources is looking, under either name.
+        let resources = "---\ntools: ListMcpResourcesTool, ReadMcpResourceTool\n---\n";
+        let resources = parse(resources, "resources", true).unwrap();
+        let explore = built_ins().into_iter().find(|def| def.name == "explore");
+        for def in [resources, explore.unwrap()] {
+            assert!(def.allows("list_mcp_resources") && def.allows("read_mcp_resource"));
+        }
     }
 
     #[test]

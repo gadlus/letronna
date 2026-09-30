@@ -243,6 +243,8 @@ fn main() {
             continue;
         }
         let mut prompt = line.as_str();
+        // What an MCP server's prompt came to, when the command was one.
+        let sent: String;
         if line.starts_with('/') {
             let flow = command(&mut runner, &line, &mut session, workspace.as_deref());
             // Every turn follows its own session's helpers; this is for the
@@ -262,6 +264,13 @@ fn main() {
             screen::settle();
             match flow {
                 Flow::Stop => break,
+                // Asked here rather than queued, where text starting with a
+                // slash would be run as a command.
+                Flow::Send(text) => {
+                    runner.bar.echo(&text);
+                    sent = text;
+                    prompt = &sent;
+                }
                 // The command stays on screen as typed; the model gets its prompt.
                 Flow::Ask(asked) => prompt = asked,
                 _ => continue,

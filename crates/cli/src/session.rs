@@ -743,7 +743,7 @@ impl Runner {
                 self.allowed
                     .entry(turn.connection.conversation)
                     .or_default()
-                    .insert(call.name.clone());
+                    .insert(gate::grant(&call));
                 Ok(self.run_call(turn, call, true))
             }
             Some("No, and stop here") | None => Ok(false),

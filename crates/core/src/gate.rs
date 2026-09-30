@@ -390,7 +390,7 @@ fn ladder(call: &ToolCall, gate: &Gate, judge: Option<&dyn Fn(&str) -> Verdict>)
     let granted = gate
         .grants
         .get(&gate.ctx.conversation)
-        .is_some_and(|tools| tools.contains(tool.name()));
+        .is_some_and(|tools| tools.contains(&grant(call)));
     if !opaque && (granted || ruling.allow) {
         return Outcome::Run;
     }
@@ -433,7 +433,7 @@ pub(crate) fn cleared(call: &ToolCall, ctx: &ToolContext) -> bool {
     // it then stops where such a grant stops, at the floor's refusals and
     // its asking, a line it cannot read and a project rule. The user's own
     // rules stay the frontend's to hold.
-    let grants = Grants::from([(ctx.conversation, HashSet::from([call.name.clone()]))]);
+    let grants = Grants::from([(ctx.conversation, HashSet::from([grant(call)]))]);
     let gate = Gate {
         ctx,
         mode: Mode::Default,
@@ -443,6 +443,22 @@ pub(crate) fn cleared(call: &ToolCall, ctx: &ToolContext) -> bool {
         human: true,
     };
     ladder(call, &gate, None) == Outcome::Run
+}
+
+/// What "Yes, and stop asking for this" on `call`'s card allows for the
+/// rest of its session, as `Grants` keeps it: its tool, and for
+/// `read_mcp_resource`, which reads from every MCP server, the server too,
+/// so a yes to one server's reads is not a yes to another's.
+pub fn grant(call: &ToolCall) -> String {
+    if call.name != crate::mcp::READ_RESOURCE {
+        return call.name.clone();
+    }
+    let args = tools::parse_args(&call.arguments).unwrap_or_default();
+    format!(
+        "{}@{}",
+        call.name,
+        args["server"].as_str().unwrap_or_default()
+    )
 }
 
 /// Whether the tool named `name` spends the user's credit, which is theirs

@@ -29,6 +29,7 @@ use std::time::Duration;
 use crate::edit::Line;
 use crate::render;
 
+#[derive(Clone, Copy)]
 pub struct Command {
     pub name: &'static str,
     pub blurb: &'static str,
@@ -193,12 +194,18 @@ const PLAN_LEAVES: usize = 12;
 /// question takes.
 const STILL: Duration = Duration::from_millis(500);
 
-fn matches(text: &str) -> Vec<&'static Command> {
+fn matches(text: &str) -> Vec<Command> {
     if !text.starts_with('/') || text.contains(char::is_whitespace) {
         return Vec::new();
     }
+    // MCP servers' prompts come after the built-in commands.
+    let prompts = letronna_core::mcp::prompts()
+        .into_iter()
+        .map(|(name, blurb)| Command { name, blurb });
     COMMANDS
         .iter()
+        .copied()
+        .chain(prompts)
         .filter(|c| c.name.starts_with(text))
         .collect()
 }
@@ -1202,7 +1209,7 @@ impl Bar {
 
     /// Put the line into the conversation above the box, so your side of it
     /// is in the scrollback where the answers are.
-    fn echo(&self, line: &str) {
+    pub fn echo(&self, line: &str) {
         render::blank();
         let mut parts = line.lines();
         render::said(

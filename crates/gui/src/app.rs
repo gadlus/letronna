@@ -277,6 +277,9 @@ pub(crate) struct Chat {
     /// into the box; set where there is no window to hand, put there when
     /// the window next draws.
     pub(crate) returned_follow_ups: Option<String>,
+    /// An MCP server's prompt is being fetched for the line in the box, so
+    /// Enter does not ask for another meanwhile.
+    pub(crate) fetching_prompt: bool,
     /// Where to add skills from: a GitHub repository, a link or a path.
     pub(crate) skill_source: Entity<InputState>,
     /// Skills are being added, which waits on the network.
@@ -652,6 +655,7 @@ impl Chat {
             skill_prompt,
             follow_ups: Vec::new(),
             returned_follow_ups: None,
+            fetching_prompt: false,
             skill_source,
             adding_skills: false,
             skills_note: None,
@@ -816,6 +820,9 @@ impl Chat {
 
     pub(crate) fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let prompt = self.composer.read(cx).value().trim().to_owned();
+        if prompt.starts_with("/mcp__") {
+            return self.send_mcp_prompt(prompt, window, cx);
+        }
         // Asked beside the session, so it waits for no reply to end.
         if let Some(question) = side_question(&prompt) {
             let question = question.to_owned();
@@ -851,6 +858,74 @@ impl Chat {
         } else {
             self.attachments.remove(&session);
         }
+    }
+
+    /// Fetch the MCP server's prompt that `typed` names, off the window's
+    /// thread, with the line left in the box meanwhile. It is sent as though
+    /// typed, or queued behind the answer being written, only while the box
+    /// still holds that line in that session; otherwise, or when the fetch
+    /// fails, a notice says so and the box is left as the user has it.
+    fn send_mcp_prompt(&mut self, typed: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.fetching_prompt {
+            self.error = Some("Still waiting on an MCP server for the last prompt.".into());
+            cx.notify();
+            return;
+        }
+        self.fetching_prompt = true;
+        // Without the line Enter added.
+        self.composer
+            .update(cx, |input, cx| input.set_value(typed.clone(), window, cx));
+        let session = self.store.conversations[self.store.active].id;
+        let (tx, rx) = async_channel::bounded(1);
+        let line = typed.clone();
+        std::thread::spawn(move || {
+            let (command, rest) = line.split_once(char::is_whitespace).unwrap_or((&line, ""));
+            let _ = tx.send_blocking(letronna_core::mcp::expand(command, rest));
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let expanded = rx
+                .recv()
+                .await
+                .unwrap_or_else(|_| Err("The MCP server's prompt could not be fetched.".into()));
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.fetching_prompt = false;
+                let here = this.store.conversations[this.store.active].id == session
+                    && this.draft_for == session;
+                let unchanged = this.composer.read(cx).value().trim() == typed;
+                let command = typed.split_whitespace().next().unwrap_or_default();
+                let refused = if !here || !unchanged {
+                    Some(format!(
+                        "{command} was not sent: its answer came after the box or the session changed."
+                    ))
+                } else if this.busy && this.streaming_id != Some(session) {
+                    Some(
+                        "Another session is working. Send this when it is done, or stop it first."
+                            .into(),
+                    )
+                } else {
+                    None
+                };
+                match (expanded, refused) {
+                    (Err(why), _) | (Ok(_), Some(why)) => {
+                        this.error = Some(why);
+                        cx.notify();
+                    }
+                    (Ok(text), None) if this.busy => this.queue_follow_up(text, window, cx),
+                    (Ok(text), None) => {
+                        this.composer
+                            .update(cx, |input, cx| input.set_value("", window, cx));
+                        // Pictures attached go with it, as with a typed message.
+                        let images = this.attached().to_vec();
+                        if this.dispatch(text, images, None, cx).is_err() {
+                            this.open_settings(window, cx);
+                        } else {
+                            this.attachments.remove(&session);
+                        }
+                    }
+                }
+            });
+        })
+        .detach();
     }
 
     /// What sending `text` in the active session asks the model: `/init`
@@ -2243,7 +2318,7 @@ impl Chat {
                     self.session_allow
                         .entry(id)
                         .or_default()
-                        .insert(call.name.clone());
+                        .insert(letronna_core::gate::grant(&call));
                     // Its helpers waiting on the same tool are allowed too.
                     self.decide_agent_asks(cx);
                 }

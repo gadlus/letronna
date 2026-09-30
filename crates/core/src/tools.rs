@@ -4016,7 +4016,8 @@ mod tests {
             .iter()
             .filter(|t| t.untrusted())
             .map(|t| t.name())
-            .filter(|name| !name.starts_with("mcp__"))
+            // MCP's come and go with the servers other tests start.
+            .filter(|name| !name.starts_with("mcp__") && !name.contains("_mcp_"))
             .collect();
         // read_chat fences other people's lines itself, and not the user's.
         assert_eq!(fenced, ["web_fetch", "browse", "use_page"]);
