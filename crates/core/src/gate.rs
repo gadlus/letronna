@@ -559,6 +559,12 @@ fn unavailable(
              Letronna's settings.json. Carry on without it."
         ));
     }
+    if tools::switched_off(name, &tools::turned_off()) {
+        return Some(format!(
+            "`{name}` is switched off: a rule in Letronna's permissions.json denies \
+             every call of it. Carry on without it."
+        ));
+    }
     // Only fitting tools are offered, but the model can name any of them;
     // refuse here too rather than trust the offer.
     if ctx.shared() && tool.machine() {

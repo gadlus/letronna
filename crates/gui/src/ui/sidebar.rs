@@ -36,12 +36,10 @@ impl Chat {
             .child(div().flex_1().child(label))
             .when_some(page, |this, page| {
                 this.on_click(cx.listener(move |this, _, window, cx| {
-                    this.page = page;
-                    // The terminal or the session's project may have brought
-                    // skills since the list was read.
-                    if page == Page::Skills {
-                        this.reload_skills();
+                    if page == Page::Capabilities {
+                        return this.open_capabilities(window, cx);
                     }
+                    this.page = page;
                     if page == Page::Artifacts {
                         this.read_artifacts(cx);
                     }
@@ -268,10 +266,10 @@ impl Chat {
                             .on_click(cx.listener(|this, _, window, cx| this.new_chat(window, cx))),
                     )
                     .child(self.nav_item(
-                        "skills",
+                        "capabilities",
                         AppIcon::Sparkles,
-                        "Skills",
-                        Some(Page::Skills),
+                        "Capabilities",
+                        Some(Page::Capabilities),
                         cx,
                     ))
                     .child(self.nav_item(

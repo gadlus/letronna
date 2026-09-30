@@ -1,4 +1,4 @@
-//! The Skills page: SKILL.md folders, added from GitHub, a link or a folder
+//! The Skills tab of the Capabilities page: SKILL.md folders, added from GitHub, a link or a folder
 //! and switched on and off. The agent loads one that is on when a task calls
 //! for it, and Use puts its instructions in the composer.
 
@@ -472,27 +472,17 @@ impl Chat {
                     .items_center()
                     .justify_between()
                     .gap_4()
+                    // The page's title and tabs stand above it.
                     .child(
-                        v_flex()
+                        div()
                             .flex_1()
                             .min_w_0()
-                            .gap_1()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
                             .child(
-                                div()
-                                    .text_xl()
-                                    .font_family(HEADING_FONT)
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child("Skills"),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(
-                                        "Instructions for a kind of task. Letronna loads a skill \
-                                         that is on when a task calls for it, and Use puts one \
-                                         in the composer to adjust first.",
-                                    ),
+                                "Instructions for a kind of task. Letronna loads a skill \
+                                 that is on when a task calls for it, and Use puts one \
+                                 in the composer to adjust first.",
                             ),
                     )
                     .child(

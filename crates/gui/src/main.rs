@@ -70,6 +70,21 @@ fn main() {
             KeyBinding::new("secondary-shift-a", OpenActivity, Some("Chat")),
             KeyBinding::new("secondary-k", ui::palette::OpenPalette, Some("Chat")),
             KeyBinding::new(
+                "secondary-shift-k",
+                ui::capabilities::OpenCapabilities,
+                Some("Chat"),
+            ),
+            KeyBinding::new(
+                "ctrl-tab",
+                ui::capabilities::NextCapabilityTab,
+                Some("Capabilities"),
+            ),
+            KeyBinding::new(
+                "ctrl-shift-tab",
+                ui::capabilities::PrevCapabilityTab,
+                Some("Capabilities"),
+            ),
+            KeyBinding::new(
                 "shift-enter",
                 gpui_component::input::Enter { secondary: true },
                 Some("Input"),

@@ -78,7 +78,7 @@ pub(crate) struct Aside {
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Page {
     Chat,
-    Skills,
+    Capabilities,
     Messaging,
     Artifacts,
     Jobs,
@@ -88,7 +88,7 @@ impl Page {
     pub(crate) fn title(self) -> &'static str {
         match self {
             Page::Chat => "Chat",
-            Page::Skills => "Skills",
+            Page::Capabilities => "Capabilities",
             Page::Messaging => "Messaging",
             Page::Artifacts => "Artifacts",
             Page::Jobs => "Scheduled jobs",
@@ -98,9 +98,7 @@ impl Page {
     pub(crate) fn blurb(self) -> &'static str {
         match self {
             Page::Chat => "",
-            Page::Skills => {
-                "Reusable playbooks Letronna can load into a session. Nothing installed yet."
-            }
+            Page::Capabilities => "Skills, tools and MCP servers Letronna can reach.",
             Page::Messaging => "Message Letronna from a chat app, and get answers back there.",
             Page::Artifacts => "Files, images and links produced in sessions will collect here.",
             // Jobs renders its own page; this blurb is only a fallback.
@@ -333,6 +331,8 @@ pub(crate) struct Chat {
     pub(crate) skills_note: Option<Result<String, String>>,
     /// The skills the last add left out, each with why.
     pub(crate) skills_refused: Vec<String>,
+    /// The Capabilities page's tabs beside Skills.
+    pub(crate) capabilities: crate::ui::capabilities::Capabilities,
     /// The side question on show, if one is.
     pub(crate) aside: Option<Aside>,
     /// A failed turn set to be asked again once its provider's wait is over.
@@ -602,7 +602,9 @@ impl Chat {
         });
         let steer =
             cx.new(|cx| InputState::new(window, cx).placeholder("What it should know or do now"));
+        let (capabilities, filled) = crate::ui::capabilities::Capabilities::new(window, cx);
         let subscriptions = vec![
+            filled,
             cx.subscribe_in(&model_search, window, |this, _, event, window, cx| {
                 // Enter takes the first match, so a model can be picked by
                 // typing a few letters of it. Only on the text tab: the
@@ -683,7 +685,7 @@ impl Chat {
             }),
         ];
         // The message when the old skills.json will not move across, or the
-        // skills cannot be read at all; the Skills page shows it too.
+        // skills cannot be read at all; the Skills tab shows it too.
         let workspace = store.conversations[store.active].workspace.as_deref();
         let moved = letronna_core::skills::migrate();
         let (skills, skills_error) = match letronna_core::skills::list(workspace) {
@@ -811,6 +813,7 @@ impl Chat {
             adding_skills: false,
             skills_note: None,
             skills_refused: Vec::new(),
+            capabilities,
             aside: None,
             waiting_retry: None,
             unseen: std::collections::HashSet::new(),
@@ -3879,8 +3882,8 @@ impl Render for Chat {
             self.schedules_page(cx).into_any_element()
         } else if self.page == Page::Artifacts {
             self.artifacts_page(cx).into_any_element()
-        } else if self.page == Page::Skills {
-            self.skills_page(cx).into_any_element()
+        } else if self.page == Page::Capabilities {
+            self.capabilities_page(window, cx).into_any_element()
         } else if self.page == Page::Messaging {
             self.messaging_page(cx).into_any_element()
         } else if self.page == Page::Activity {
@@ -3938,6 +3941,11 @@ impl Render for Chat {
             .h_full()
             .when(self.page != Page::Chat, |this| {
                 this.track_focus(&self.page_focus)
+            })
+            // Around the page's focus, so its tab keys reach whatever in it
+            // holds the keys.
+            .when(self.page == Page::Capabilities, |this| {
+                this.key_context("Capabilities")
             })
             .child(body)
             .when(self.page == Page::Chat, |this| {
@@ -4012,6 +4020,21 @@ impl Render for Chat {
                     this.open_palette(window, cx)
                 }),
             )
+            .on_action(cx.listener(
+                |this, _: &crate::ui::capabilities::OpenCapabilities, window, cx| {
+                    this.open_capabilities(window, cx)
+                },
+            ))
+            .on_action(cx.listener(
+                |this, _: &crate::ui::capabilities::NextCapabilityTab, window, cx| {
+                    this.step_capability(1, window, cx)
+                },
+            ))
+            .on_action(cx.listener(
+                |this, _: &crate::ui::capabilities::PrevCapabilityTab, window, cx| {
+                    this.step_capability(-1, window, cx)
+                },
+            ))
             .child(
                 div()
                     .relative()

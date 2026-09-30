@@ -13,7 +13,6 @@ pub(crate) const PAGES: &[(&str, AppIcon)] = &[
     ("Thinking", AppIcon::Sparkles),
     ("Privacy", AppIcon::Shield),
     ("Shortcuts", AppIcon::Keyboard),
-    ("MCP", AppIcon::PlugsConnected),
     ("Plugins", AppIcon::Puzzle),
     ("About", AppIcon::Info),
 ];
@@ -305,6 +304,10 @@ impl Chat {
             return;
         }
         self.settings_closing = true;
+        // A readiness note on the Tools tab may have sent the user here.
+        if self.page == Page::Capabilities {
+            self.reload_tools();
+        }
         self.focus_composer(window, cx);
         cx.notify();
         cx.spawn(async move |this, cx| {
@@ -474,7 +477,6 @@ impl Chat {
             "Thinking" => thinking_page(&chat, &self.store, window, cx).into_any_element(),
             "Shortcuts" => shortcuts_page(&hotkey, &chat, cx).into_any_element(),
             "Plugins" => plugins_page(&chat, cx).into_any_element(),
-            "MCP" => super::mcp::mcp_page(&chat, window, cx).into_any_element(),
             "About" => about_page(&chat, self, cx).into_any_element(),
             "Search" => search_page(self.search_rows(), &pick, &endpoint, &key, &chat, cx)
                 .into_any_element(),

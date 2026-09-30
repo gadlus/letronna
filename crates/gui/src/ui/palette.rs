@@ -98,7 +98,7 @@ fn commands() -> Vec<(&'static str, Rc<dyn Action>)> {
 
 /// The pages the sidebar goes to, with its icons.
 const PAGES: &[(Page, AppIcon)] = &[
-    (Page::Skills, AppIcon::Sparkles),
+    (Page::Capabilities, AppIcon::Sparkles),
     (Page::Messaging, AppIcon::MessageSquare),
     (Page::Artifacts, AppIcon::File),
     (Page::Activity, AppIcon::Robot),
@@ -449,11 +449,9 @@ impl Chat {
         match pick {
             Pick::Action(action) => window.dispatch_action(action.boxed_clone(), cx),
             Pick::Page(Page::Activity) => self.open_activity(window, cx),
+            Pick::Page(Page::Capabilities) => self.open_capabilities(window, cx),
             Pick::Page(page) => {
                 self.page = page;
-                if page == Page::Skills {
-                    self.reload_skills();
-                }
                 self.focus_composer(window, cx);
             }
             Pick::Settings(name) => {
@@ -518,10 +516,16 @@ mod tests {
         let session =
             |id, title: &str| Row::new(AppIcon::MessageSquare, title.to_owned(), Pick::Session(id));
         vec![
-            ("Go to", vec![page(Page::Messaging), page(Page::Skills)]),
+            (
+                "Go to",
+                vec![page(Page::Messaging), page(Page::Capabilities)],
+            ),
             (
                 "Sessions",
-                vec![session(41, "Skills to add"), session(7, "Fix the tray")],
+                vec![
+                    session(41, "Capabilities to add"),
+                    session(7, "Fix the tray"),
+                ],
             ),
             (FOLDERS, Vec::new()),
         ]
@@ -532,10 +536,10 @@ mod tests {
         assert_eq!(
             labels(&sift(&groups(), "")),
             vec![
-                ("Go to", vec!["Messaging".into(), "Skills".into()]),
+                ("Go to", vec!["Messaging".into(), "Capabilities".into()]),
                 (
                     "Sessions",
-                    vec!["Skills to add".into(), "Fix the tray".into()]
+                    vec!["Capabilities to add".into(), "Fix the tray".into()]
                 ),
             ]
         );
@@ -548,13 +552,13 @@ mod tests {
             labels(&shown),
             vec![("Sessions", vec!["Fix the tray".into()])]
         );
-        // "Skills" is exact on the page, a prefix on the session.
-        let shown = sift(&groups(), "skills");
+        // "Capabilities" is exact on the page, a prefix on the session.
+        let shown = sift(&groups(), "capabilities");
         assert_eq!(
             labels(&shown),
             vec![
-                ("Go to", vec!["Skills".into()]),
-                ("Sessions", vec!["Skills to add".into()]),
+                ("Go to", vec!["Capabilities".into()]),
+                ("Sessions", vec!["Capabilities to add".into()]),
             ]
         );
     }

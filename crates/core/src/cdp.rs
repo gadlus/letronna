@@ -137,7 +137,7 @@ const LINUX: &[&str] = &[
 
 /// The browser to drive: the one `LETRONNA_BROWSER` names, else the first
 /// installed one.
-fn installed() -> Option<PathBuf> {
+pub(crate) fn installed() -> Option<PathBuf> {
     first_existing(&candidates())
 }
 
