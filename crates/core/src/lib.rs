@@ -58,6 +58,7 @@ pub mod slash;
 mod state;
 pub mod store;
 pub mod structured;
+pub mod styles;
 pub mod tasklist;
 pub mod tasks;
 pub mod timers;

@@ -213,6 +213,10 @@ pub struct Settings {
     /// a model without that level is sent the nearest one it has.
     #[serde(default)]
     pub effort: String,
+    /// The output style replies are written in, by name; empty, or a name
+    /// no style has, for none.
+    #[serde(default)]
+    pub style: String,
     /// Show the model's thinking as it arrives, rather than only its answer.
     #[serde(default)]
     pub thinking: bool,
@@ -291,6 +295,7 @@ impl Default for Settings {
             presence: String::new(),
             mode: crate::gate::Mode::Default,
             effort: String::new(),
+            style: String::new(),
             thinking: false,
             search: false,
             active_id: 0,
@@ -332,7 +337,8 @@ pub struct Store {
     pub active: usize,
     pub settings: Settings,
     /// The settings as JSON when last read or written, so a save puts back
-    /// only the fields changed here since; only loading and `save` touch it.
+    /// only the fields changed here since; only loading, `save` and
+    /// `choose_style` touch it.
     pub settings_written: serde_json::Value,
 }
 
@@ -521,6 +527,18 @@ impl Store {
         self.settings.effort = effort.to_owned();
         if let Some(conversation) = self.conversations.get_mut(index) {
             conversation.effort = Some(effort.to_owned());
+        }
+    }
+
+    /// Have replies written in the style called `name`, empty for none.
+    ///
+    /// Requests read the style from the file, which the other process may
+    /// have changed since this one last wrote, so the pick is written even
+    /// when this copy already holds it; `save` would otherwise skip it.
+    pub fn choose_style(&mut self, name: &str) {
+        self.settings.style = name.to_owned();
+        if let Some(fields) = self.settings_written.as_object_mut() {
+            fields.remove("style");
         }
     }
 
@@ -3396,6 +3414,41 @@ pub(crate) mod tests {
             let back = load().settings;
             assert_eq!((back.appearance.as_str(), back.grain), (appearance, grain));
         }
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_saved_style_comes_back_and_an_unknown_one_reads_as_none() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("style");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let old = super::read_settings(br#"{"endpoint": "", "model": "m"}"#).unwrap();
+        assert_eq!(old.style, "");
+        // A name no style has: one that did would change the prompt of the
+        // tests running beside this one, which read the same settings file.
+        let mut store = Store::default();
+        store.settings.style = "gone".into();
+        store.save().unwrap();
+        assert_eq!(load().settings.style, "gone");
+        assert_eq!(crate::styles::chosen(), None);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_style_picked_in_one_process_can_be_undone_in_the_other() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("style-two");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let mut window = load();
+        let mut terminal = load();
+        // A name no style has, as above.
+        terminal.choose_style("gone");
+        terminal.save().unwrap();
+        assert_eq!(super::current_settings().style, "gone");
+        // The window never saw that pick, so it already holds "" itself.
+        window.choose_style("");
+        window.save().unwrap();
+        assert_eq!(super::current_settings().style, "");
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 
