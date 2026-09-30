@@ -52,6 +52,7 @@ pub struct Source {
 
 /// A session offered for import, read cheaply: its head, and as much of the
 /// file as it took to find the first thing said.
+#[derive(Clone)]
 pub struct Candidate {
     pub tool: Tool,
     pub session_id: String,
@@ -75,16 +76,54 @@ pub struct Imported {
 
 /// Sessions from Claude Code and Codex, newest first, `limit` at most.
 pub fn list(limit: usize) -> Vec<Candidate> {
-    let mut found = Vec::new();
+    let mut files = Vec::new();
     if let Some(root) = claude_code_root() {
-        found.extend(list_claude_code(&root));
+        files.extend(
+            claude_code_files(&root)
+                .into_iter()
+                .map(|p| (Tool::ClaudeCode, p)),
+        );
     }
     if let Some(root) = codex_root() {
-        found.extend(list_codex(&root));
+        files.extend(codex_files(&root).into_iter().map(|p| (Tool::Codex, p)));
     }
-    found.sort_by_key(|c| std::cmp::Reverse(c.updated));
-    found.truncate(limit);
-    found
+    newest_titled(files, limit)
+}
+
+/// The newest `limit` of `files`, each titled from its head. Sorted and cut
+/// before any head is read: a machine can hold thousands of sessions, and
+/// reading the head of every one to offer a few is what made listing slow.
+fn newest_titled(files: Vec<(Tool, PathBuf)>, limit: usize) -> Vec<Candidate> {
+    // Only plain files: a pipe named like a session would hold the listing
+    // thread for good the moment its head was opened.
+    let mut files: Vec<(u64, Tool, PathBuf)> = files
+        .into_iter()
+        .filter(|(_, path)| path.is_file())
+        .map(|(tool, path)| (modified_secs(&path), tool, path))
+        .collect();
+    files.sort_by_key(|&(updated, ..)| std::cmp::Reverse(updated));
+    files.truncate(limit);
+    files
+        .into_iter()
+        .map(|(updated, tool, path)| {
+            let (session_id, title, workspace) = match tool {
+                Tool::ClaudeCode => {
+                    let (title, workspace) = claude_code_head(&path);
+                    let session_id = path.file_stem().and_then(|s| s.to_str());
+                    (session_id.unwrap_or_default().to_owned(), title, workspace)
+                }
+                Tool::Codex => codex_head(&path),
+            };
+            Candidate {
+                tool,
+                session_id,
+                path,
+                title,
+                workspace,
+                updated,
+            }
+        })
+        .collect()
 }
 
 /// Read `candidate`'s file in full and turn it into messages this app knows
@@ -146,6 +185,22 @@ pub fn into_conversation(imported: Imported, id: u64) -> Conversation {
     }
 }
 
+/// Why a file yielded no messages at all, with how much of it was skipped,
+/// so an empty file reads differently from a full one. Skipped is not
+/// unreadable: the count takes in records left out on purpose, like a
+/// summary line, as much as lines this build cannot parse.
+fn nothing_to_import(path: &Path, skipped: usize) -> String {
+    let what = match skipped {
+        0 => return format!("{} has nothing Letronna can import.", path.display()),
+        1 => "1 part of it was".to_owned(),
+        n => format!("{n} parts of it were"),
+    };
+    format!(
+        "{} has nothing Letronna can import: {what} skipped.",
+        path.display()
+    )
+}
+
 fn claude_code_root() -> Option<PathBuf> {
     std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
@@ -160,7 +215,8 @@ fn codex_root() -> Option<PathBuf> {
 
 // -- Claude Code -------------------------------------------------------
 
-fn list_claude_code(root: &Path) -> Vec<Candidate> {
+/// Every Claude Code session file under `root`, unread.
+fn claude_code_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for project in subdirs(&root.join("projects")) {
         let Ok(files) = std::fs::read_dir(&project) else {
@@ -171,18 +227,10 @@ fn list_claude_code(root: &Path) -> Vec<Candidate> {
             if path.extension().is_none_or(|e| e != "jsonl") {
                 continue;
             }
-            let Some(session_id) = path.file_stem().and_then(|s| s.to_str()) else {
+            if path.file_stem().and_then(|s| s.to_str()).is_none() {
                 continue;
-            };
-            let (title, workspace) = claude_code_head(&path);
-            out.push(Candidate {
-                tool: Tool::ClaudeCode,
-                session_id: session_id.to_owned(),
-                updated: modified_secs(&path),
-                path,
-                title,
-                workspace,
-            });
+            }
+            out.push(path);
         }
     }
     out
@@ -251,10 +299,7 @@ fn import_claude_code(path: &Path) -> Result<Imported, String> {
         }
     }
     if messages.is_empty() {
-        return Err(format!(
-            "{} has nothing Letronna can import.",
-            path.display()
-        ));
+        return Err(nothing_to_import(path, skipped));
     }
     let messages = join_rounds(messages);
     let title = first_user_title(&messages);
@@ -433,7 +478,8 @@ fn tool_result_text(content: &Value) -> String {
 
 // -- Codex ---------------------------------------------------------------
 
-fn list_codex(root: &Path) -> Vec<Candidate> {
+/// Every Codex rollout under `root`, unread.
+fn codex_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for year in subdirs(&root.join("sessions")) {
         for month in subdirs(&year) {
@@ -450,15 +496,7 @@ fn list_codex(root: &Path) -> Vec<Candidate> {
                     if !(name.starts_with("rollout-") && name.ends_with(".jsonl")) {
                         continue;
                     }
-                    let (session_id, title, workspace) = codex_head(&path);
-                    out.push(Candidate {
-                        tool: Tool::Codex,
-                        session_id,
-                        updated: modified_secs(&path),
-                        path,
-                        title,
-                        workspace,
-                    });
+                    out.push(path);
                 }
             }
         }
@@ -561,10 +599,7 @@ fn import_codex(path: &Path) -> Result<Imported, String> {
         return Err(format!("{} has no session id.", path.display()));
     }
     if messages.is_empty() {
-        return Err(format!(
-            "{} has nothing Letronna can import.",
-            path.display()
-        ));
+        return Err(nothing_to_import(path, skipped));
     }
     let messages = join_rounds(messages);
     let title = first_user_title(&messages);
@@ -956,6 +991,28 @@ mod tests {
     }
 
     #[test]
+    fn a_file_with_nothing_readable_says_how_much_was_skipped() {
+        let dir = scratch("nothing-readable");
+        let path = write(&dir, "def456.jsonl", "not json\n{\"type\":\"summary\"}\n");
+
+        let Err(error) = import_claude_code(&path) else {
+            panic!("a file with no turns in it imported");
+        };
+        assert!(error.ends_with("has nothing Letronna can import: 2 parts of it were skipped."));
+        // A summary alone is read without trouble, and still not a message.
+        let summary = write(&dir, "ghi789.jsonl", "{\"type\":\"summary\"}\n");
+        let Err(error) = import_claude_code(&summary) else {
+            panic!("a summary alone imported");
+        };
+        assert!(error.ends_with("has nothing Letronna can import: 1 part of it was skipped."));
+        let empty = write(&dir, "empty.jsonl", "");
+        let Err(error) = import_claude_code(&empty) else {
+            panic!("an empty file imported");
+        };
+        assert!(error.ends_with("has nothing Letronna can import."));
+    }
+
+    #[test]
     fn a_huge_tool_result_is_capped_the_way_a_live_tool_result_is() {
         let dir = scratch("codex-huge");
         let output = "x".repeat(MAX_TOOL_CHARS * 2);
@@ -1025,7 +1082,13 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         write(&project, "abc123.jsonl", CLAUDE_CODE_FIXTURE);
 
-        let found = list_claude_code(&claude_root);
+        let found = newest_titled(
+            claude_code_files(&claude_root)
+                .into_iter()
+                .map(|p| (Tool::ClaudeCode, p))
+                .collect(),
+            usize::MAX,
+        );
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].session_id, "abc123");
         assert_eq!(found[0].title, "Fix the login bug");
@@ -1036,10 +1099,70 @@ mod tests {
         std::fs::create_dir_all(&day).unwrap();
         write(&day, "rollout-2024-01-01T00-00-00-abc.jsonl", CODEX_FIXTURE);
 
-        let found = list_codex(&codex_root);
+        let found = newest_titled(
+            codex_files(&codex_root)
+                .into_iter()
+                .map(|p| (Tool::Codex, p))
+                .collect(),
+            usize::MAX,
+        );
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].session_id, "codex-abc");
         assert_eq!(found[0].title, "Add a health check endpoint");
+    }
+
+    #[test]
+    fn listing_offers_the_newest_first_and_no_more_than_asked() {
+        let dir = scratch("newest");
+        let age = |path: &Path, secs: u64| {
+            let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+            let file = std::fs::File::options().write(true).open(path).unwrap();
+            file.set_modified(when).unwrap();
+        };
+        let old = write(&dir, "old.jsonl", CLAUDE_CODE_FIXTURE);
+        age(&old, 1_000);
+        let new = write(&dir, "new.jsonl", CLAUDE_CODE_FIXTURE);
+        age(&new, 3_000);
+        let middle = write(&dir, "rollout-middle.jsonl", CODEX_FIXTURE);
+        age(&middle, 2_000);
+
+        let found = newest_titled(
+            vec![
+                (Tool::ClaudeCode, old),
+                (Tool::ClaudeCode, new),
+                (Tool::Codex, middle),
+            ],
+            2,
+        );
+        let ids: Vec<&str> = found.iter().map(|c| c.session_id.as_str()).collect();
+        assert_eq!(ids, ["new", "codex-abc"]);
+        assert_eq!(found[0].title, "Fix the login bug");
+        assert_eq!(found[0].updated, 3_000);
+        assert_eq!(found[1].title, "Add a health check endpoint");
+    }
+
+    /// A pipe never ends and opening one waits for a writer, so a head read
+    /// from it would hold the listing thread for good.
+    #[cfg(unix)]
+    #[test]
+    fn listing_passes_over_what_is_not_a_plain_file() {
+        let dir = scratch("not-a-file");
+        let project = dir.join("projects").join("-home-dev-project");
+        std::fs::create_dir_all(&project).unwrap();
+        write(&project, "abc123.jsonl", CLAUDE_CODE_FIXTURE);
+        let pipe = project.join("pipe.jsonl");
+        let made = std::process::Command::new("mkfifo").arg(&pipe).status();
+        assert!(made.is_ok_and(|s| s.success()), "mkfifo failed");
+
+        let found = newest_titled(
+            claude_code_files(&dir)
+                .into_iter()
+                .map(|p| (Tool::ClaudeCode, p))
+                .collect(),
+            usize::MAX,
+        );
+        let ids: Vec<&str> = found.iter().map(|c| c.session_id.as_str()).collect();
+        assert_eq!(ids, ["abc123"]);
     }
 
     #[test]

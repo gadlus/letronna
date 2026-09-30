@@ -157,6 +157,7 @@ impl Chat {
                     AppIcon::Export,
                     Chat::export_session,
                 ))
+                .item(item("Import a session", AppIcon::PopIn, Chat::open_import))
                 .separator()
                 .item(item("Delete", AppIcon::Trash, Chat::delete_session))
         }

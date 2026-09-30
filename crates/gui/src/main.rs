@@ -133,6 +133,11 @@ fn main() {
             KeyBinding::new("secondary-shift-c", ui::files::CopyPath, Some("Files")),
             KeyBinding::new("secondary-i", ui::files::ToggleIgnored, Some("Files")),
             KeyBinding::new("escape", ui::files::ClosePreview, Some("Files")),
+            // Bound after the input's own, and so tried first: the picker's
+            // box keeps the keys while the list moves under it.
+            KeyBinding::new("up", ui::import::PickPrevious, Some("ImportPicker > Input")),
+            KeyBinding::new("down", ui::import::PickNext, Some("ImportPicker > Input")),
+            KeyBinding::new("enter", ui::import::PickThis, Some("ImportPicker > Input")),
         ]);
         // Windows hands Shift and a digit over as the character they type,
         // Ctrl+Shift+4 as "ctrl-$", which a binding written "shift-4" never
