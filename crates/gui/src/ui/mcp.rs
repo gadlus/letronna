@@ -8,9 +8,19 @@
 //! one is retrying, that wait begins when its next start is due.
 //! The log tail is shown here and nowhere else the model could read it.
 //! A tool switched off is a permission rule, read into `off` by the page.
+//!
+//! A server reached by URL can be signed in to and out of here. While a
+//! sign-in waits for the browser, the row says where it was sent and takes
+//! the address the browser ended on, for one that cannot reach this
+//! computer; the wait is a thread's, so nothing ticks meanwhile either.
+//! Finding where to sign in can be cancelled too, and a sign-in the model
+//! started shows in its row at the next redraw, for its paste and Cancel.
 
 use crate::prelude::*;
 use letronna_core::mcp::{Kind, ServerStatus, State};
+use letronna_core::mcp_auth::{self, SignIn};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// How long a wait for starting servers lasts at most: the minute core gives
 /// a server to start and list its tools.
@@ -224,12 +234,60 @@ fn server_row(
             acted(done, &chat, &trouble, &waiting, cx);
         })
     };
+    let http = server.transport == "http";
+    let signing = window.use_keyed_state(key("signing"), cx, |_, _| None::<Signing>);
+    let ours = signing.read(cx).clone();
+    // One the model started shows here too, for its Cancel and paste.
+    let flow = match &ours {
+        Some(ours) => ours.sign_in.clone(),
+        None => http.then(|| mcp_auth::pending(&name)).flatten(),
+    };
+    let sign_in = (http && ours.is_none() && flow.is_none() && !on).then(|| {
+        let (chat, trouble, waiting, signing, name) = (
+            chat.clone(),
+            trouble.clone(),
+            waiting.clone(),
+            signing.clone(),
+            name.clone(),
+        );
+        Button::new(key("sign-in"))
+            .framed(cx)
+            .xsmall()
+            .label(if server.signed_in {
+                "Sign in again"
+            } else {
+                "Sign in"
+            })
+            .on_click(move |_, _, cx| begin(&name, &chat, &trouble, &waiting, &signing, cx))
+    });
+    let sign_out = (http && server.signed_in).then(|| {
+        let (chat, trouble, waiting, name) =
+            (chat.clone(), trouble.clone(), waiting.clone(), name.clone());
+        Button::new(key("sign-out"))
+            .framed(cx)
+            .xsmall()
+            .label("Sign out")
+            .on_click(move |_, _, cx| {
+                let done = mcp_auth::sign_out(&name);
+                acted(done, &chat, &trouble, &waiting, cx);
+            })
+    });
+    let stop = ours.as_ref().map(|ours| ours.stop.clone());
+    let waiting_panel = match flow {
+        Some(flow) => {
+            let field = paste_field(&key, &signing, &name, chat, trouble, window, cx);
+            Some(waiting_row(&flow, stop, &field, chat, trouble, &key, cx))
+        }
+        None => stop.map(|stop| finding_row(stop, &name, &signing, chat, &key, cx)),
+    };
     let actions = h_flex()
         .flex_shrink_0()
         .items_center()
         .gap_1()
         .children(tools_button)
         .children(log_button)
+        .children(sign_in)
+        .children(sign_out)
         .children(reconnect)
         .child(div().ml_1().child(switch));
     v_flex()
@@ -259,6 +317,7 @@ fn server_row(
                 .clone()
                 .map(|error| div().text_xs().text_color(cx.theme().danger).child(error)),
         )
+        .children(waiting_panel)
         .when(open, |row| {
             row.child(
                 div()
@@ -455,4 +514,263 @@ fn acted(
         settle(chat, waiting, None, cx);
     }
     chat.update(cx, |_, cx| cx.notify());
+}
+
+/// A sign-in this page started for one server.
+#[derive(Clone)]
+struct Signing {
+    /// Set by Cancel, so how it ends is not reported as a failure.
+    stop: Arc<AtomicBool>,
+    /// None while it is still finding where to sign in.
+    sign_in: Option<Arc<SignIn>>,
+}
+
+/// Start signing in to the server `name`: find where off the UI thread, open
+/// the page, then wait on a thread of its own for the browser or a paste,
+/// and redraw as each step ends.
+fn begin(
+    name: &str,
+    chat: &Entity<Chat>,
+    trouble: &Entity<Option<String>>,
+    waiting: &Entity<bool>,
+    signing: &Entity<Option<Signing>>,
+    cx: &mut App,
+) {
+    let stop = Arc::new(AtomicBool::new(false));
+    signing.update(cx, |signing, _| {
+        *signing = Some(Signing {
+            stop: stop.clone(),
+            sign_in: None,
+        });
+    });
+    trouble.update(cx, |trouble, _| *trouble = None);
+    chat.update(cx, |_, cx| cx.notify());
+    let (found, begun) = async_channel::bounded(1);
+    let (name, stopped) = (name.to_owned(), stop.clone());
+    std::thread::spawn(move || {
+        found.send_blocking(mcp_auth::begin(&name, &|| stopped.load(Ordering::Relaxed)))
+    });
+    let (chat, trouble, waiting, signing) = (
+        chat.clone(),
+        trouble.clone(),
+        waiting.clone(),
+        signing.clone(),
+    );
+    cx.spawn(async move |cx| {
+        let begun = begun
+            .recv()
+            .await
+            .unwrap_or_else(|_| Err(mcp_auth::CANCELLED.into()));
+        let finished = match begun {
+            Ok(sign_in) if !stop.load(Ordering::Relaxed) => {
+                let url = sign_in.url.clone();
+                cx.background_executor()
+                    .spawn(async move { mcp_auth::open_browser(&url) })
+                    .detach();
+                let shown = Some(sign_in.clone());
+                let _ = signing.update(cx, |signing, _| {
+                    if let Some(ours) = signing
+                        .as_mut()
+                        .filter(|ours| Arc::ptr_eq(&ours.stop, &stop))
+                    {
+                        ours.sign_in = shown;
+                    }
+                });
+                let _ = chat.update(cx, |_, cx| cx.notify());
+                let (done, finished) = async_channel::bounded(1);
+                std::thread::spawn(move || done.send_blocking(sign_in.finish()));
+                finished
+                    .recv()
+                    .await
+                    .unwrap_or_else(|_| Err(mcp_auth::CANCELLED.into()))
+            }
+            // Cancelled just as it was found.
+            Ok(sign_in) => {
+                sign_in.cancel();
+                Err(mcp_auth::CANCELLED.into())
+            }
+            Err(error) => Err(error),
+        };
+        let _ = cx.update(|cx| {
+            // Only this sign-in is cleared: one started again since stays.
+            signing.update(cx, |signing, _| {
+                if signing
+                    .as_ref()
+                    .is_some_and(|ours| Arc::ptr_eq(&ours.stop, &stop))
+                {
+                    *signing = None;
+                }
+            });
+            match finished {
+                // Given up on by the user: what was asked for, not a failure.
+                Err(_) if stop.load(Ordering::Relaxed) => {
+                    trouble.update(cx, |trouble, _| *trouble = None);
+                    chat.update(cx, |_, cx| cx.notify());
+                }
+                // A success starts the server again: wait for it to settle.
+                done => acted(done, &chat, &trouble, &waiting, cx),
+            }
+        });
+    })
+    .detach();
+}
+
+/// A sign-in under way: where the browser was sent, and a field for the
+/// address it ended on, for a browser that cannot reach this computer.
+/// `stop` is this page's own sign-in's, None for one the model started.
+fn waiting_row(
+    flow: &Arc<SignIn>,
+    stop: Option<Arc<AtomicBool>>,
+    field: &Entity<InputState>,
+    chat: &Entity<Chat>,
+    trouble: &Entity<Option<String>>,
+    key: &dyn Fn(&str) -> SharedString,
+    cx: &mut App,
+) -> Div {
+    let paste = {
+        let (flow, field, chat, trouble) =
+            (flow.clone(), field.clone(), chat.clone(), trouble.clone());
+        Button::new(key("paste-use"))
+            .framed(cx)
+            .xsmall()
+            .label("Use address")
+            .on_click(move |_, window, cx| submit(&flow, &field, &chat, &trouble, window, cx))
+    };
+    let copy = {
+        let url = flow.url.clone();
+        Button::new(key("copy"))
+            .framed(cx)
+            .xsmall()
+            .label("Copy address")
+            .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(url.clone())))
+    };
+    let cancel = {
+        let (flow, chat) = (flow.clone(), chat.clone());
+        Button::new(key("cancel"))
+            .framed(cx)
+            .xsmall()
+            .label("Cancel")
+            .on_click(move |_, _, cx| {
+                if let Some(stop) = &stop {
+                    stop.store(true, Ordering::Relaxed);
+                }
+                flow.cancel();
+                chat.update(cx, |_, cx| cx.notify());
+            })
+    };
+    v_flex()
+        .gap_1p5()
+        .child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child("Finish signing in in your browser. If it cannot reach this computer, paste the address it ended on."),
+        )
+        .child(
+            div()
+                .text_xs()
+                .font_family(MONO_FONT)
+                .text_color(cx.theme().muted_foreground)
+                .truncate()
+                .child(flow.url.clone()),
+        )
+        .child(
+            h_flex()
+                .gap_1()
+                .child(Input::new(field).small().flex_1())
+                .child(paste)
+                .child(copy)
+                .child(cancel),
+        )
+}
+
+/// The field the address a browser ended on is pasted into: Enter uses it
+/// as the button does, on whichever sign-in the row shows then.
+fn paste_field(
+    key: &dyn Fn(&str) -> SharedString,
+    signing: &Entity<Option<Signing>>,
+    name: &str,
+    chat: &Entity<Chat>,
+    trouble: &Entity<Option<String>>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<InputState> {
+    let field = window.use_keyed_state(key("paste"), cx, |window, cx| {
+        InputState::new(window, cx)
+            .placeholder("Paste the address the browser ended on")
+            .masked(true)
+    });
+    let (signing, name, chat, trouble) = (
+        signing.clone(),
+        name.to_owned(),
+        chat.clone(),
+        trouble.clone(),
+    );
+    // Kept while the field is drawn, and dropped with it.
+    window.use_keyed_state(key("paste-enter"), cx, |window, cx| {
+        window.subscribe(&field, cx, move |field, event: &InputEvent, window, cx| {
+            if !matches!(event, InputEvent::PressEnter { .. }) {
+                return;
+            }
+            let ours = signing
+                .read(cx)
+                .as_ref()
+                .and_then(|ours| ours.sign_in.clone());
+            if let Some(flow) = ours.or_else(|| mcp_auth::pending(&name)) {
+                submit(&flow, &field, &chat, &trouble, window, cx);
+            }
+        })
+    });
+    field
+}
+
+/// Give `flow` the pasted address, emptying the field once it is taken.
+fn submit(
+    flow: &SignIn,
+    field: &Entity<InputState>,
+    chat: &Entity<Chat>,
+    trouble: &Entity<Option<String>>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let text = field.read(cx).value().trim().to_owned();
+    let done = flow.paste(&text);
+    if done.is_ok() {
+        field.update(cx, |field, cx| field.set_value("", window, cx));
+    }
+    trouble.update(cx, |trouble, _| *trouble = done.err());
+    chat.update(cx, |_, cx| cx.notify());
+}
+
+/// A sign-in still finding where to go, with a Cancel that gives it up.
+fn finding_row(
+    stop: Arc<AtomicBool>,
+    name: &str,
+    signing: &Entity<Option<Signing>>,
+    chat: &Entity<Chat>,
+    key: &dyn Fn(&str) -> SharedString,
+    cx: &mut App,
+) -> Div {
+    let cancel = {
+        let (signing, chat) = (signing.clone(), chat.clone());
+        Button::new(key("cancel"))
+            .framed(cx)
+            .xsmall()
+            .label("Cancel")
+            .on_click(move |_, _, cx| {
+                stop.store(true, Ordering::Relaxed);
+                signing.update(cx, |signing, _| *signing = None);
+                chat.update(cx, |_, cx| cx.notify());
+            })
+    };
+    h_flex()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(format!("Finding where {name} signs in…")),
+        )
+        .child(cancel)
 }
