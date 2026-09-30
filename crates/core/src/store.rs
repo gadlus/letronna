@@ -86,6 +86,17 @@ pub struct Conversation {
     /// it is visible for the same reason as `flushed`.
     #[serde(skip)]
     pub summary_saved: bool,
+    /// Where this copy stands in its file, so what another process adds
+    /// there can be told apart and followed. Set by reading the file and
+    /// kept by saving; a copy without it, as the terminal's are, is saved
+    /// blind to the other's lines, as before. Only the store should touch
+    /// it; it is visible for the same reason as `flushed`.
+    #[serde(skip)]
+    pub seen: Option<Seen>,
+    /// Set when a save found another process had added messages here too,
+    /// and kept this copy's over theirs, so the window can say so.
+    #[serde(skip)]
+    pub diverged: bool,
 }
 
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -597,6 +608,34 @@ impl Store {
         crate::history::forget(gone.id);
         crate::tasklist::forget(gone.id);
     }
+
+    /// Take in what another process wrote to the sessions since this one
+    /// last looked: what it added to sessions here, and sessions it started.
+    /// Those `busy` names, and any with something here not yet saved, are
+    /// left as they are. Whether anything changed.
+    pub fn follow(&mut self, busy: impl Fn(u64) -> bool) -> bool {
+        let mut changed = false;
+        for conversation in &mut self.conversations {
+            if !busy(conversation.id) {
+                changed |= conversation.follow();
+            }
+        }
+        let known: std::collections::HashSet<u64> =
+            self.conversations.iter().map(|c| c.id).collect();
+        let mut started: Vec<Conversation> = session_ids()
+            .into_iter()
+            .filter(|id| !known.contains(id))
+            // Reserved and not yet saved: it belongs to whoever reserved it.
+            .filter(|&id| std::fs::metadata(session_path(id)).is_ok_and(|m| m.len() > 0))
+            .filter_map(|id| replay(&session_path(id)))
+            .collect();
+        started.sort_by_key(|c| c.updated);
+        changed |= !started.is_empty();
+        // At the end, where the newest go: the places of the others, which
+        // the active session is known by, stay as they were.
+        self.conversations.extend(started);
+        changed
+    }
 }
 
 impl Conversation {
@@ -664,6 +703,34 @@ impl Conversation {
             .append(true)
             .read(true)
             .open(path)?;
+        // What another process added since this copy was read or written.
+        let theirs = match &self.seen {
+            Some(seen) => match added_since(&mut file, seen)? {
+                Some(bytes) => bytes,
+                // Replaced under this copy, as when a new session took the
+                // freed id: writing on would put this one's lines in it.
+                None => {
+                    self.gone = true;
+                    return Ok(());
+                }
+            },
+            None => Vec::new(),
+        };
+        let standing = kept_by(&theirs, self.flushed);
+        let mine = self.flushed < self.messages.len() || self.rewound.is_some();
+        // Both said something since: this copy wins. A rewind to what the
+        // two share goes after their lines, and this copy's own from there,
+        // so the file reads back as this copy -- with their lines still in
+        // it, as nothing is ever rewritten.
+        let clash = mine && standing.is_some();
+        if clash && let Some(to) = standing {
+            self.flushed = to;
+            self.rewound = Some(to);
+            self.diverged = true;
+        }
+        // Theirs may have come after this copy's, so this copy's go again.
+        let meta_changed = meta_changed || clash;
+        let summary_new = summary_new || (clash && self.summary.is_some());
         let mut out = String::new();
         // A crash part way through a line leaves the file without its last
         // newline. Appending straight after it would glue the next record to
@@ -705,7 +772,141 @@ impl Conversation {
         self.written = Some(meta);
         self.rewound = None;
         self.summary_saved = true;
+        // With their lines in the file and not in this copy, the mark stays
+        // before them, so following takes them in.
+        if self.seen.is_some() && (standing.is_none() || clash) {
+            self.seen = seen_at_end(&mut file, self.messages.len()).ok();
+        }
         Ok(())
+    }
+
+    /// Carry this copy on over `bytes`, lines of its file, and say how many
+    /// of them were taken. A line that will not parse is skipped rather than
+    /// failing the session: losing one message is better than losing the
+    /// conversation it was part of.
+    fn apply(&mut self, bytes: &[u8], summaries: &mut Vec<(usize, String)>) -> usize {
+        let end = whole_lines(bytes);
+        // Read leniently: a write cut part way through a character leaves
+        // bytes that are not UTF-8, which would otherwise fail the whole
+        // file rather than the one line they are on.
+        for line in String::from_utf8_lossy(&bytes[..end]).lines() {
+            if let Ok(record) = serde_json::from_str(line) {
+                self.play(record, summaries);
+            }
+        }
+        // A last line with no newline yet is still being written, and is
+        // left to be read whole later -- unless it already is whole, a
+        // record whose newline a crash cut off.
+        match serde_json::from_str(&String::from_utf8_lossy(&bytes[end..])) {
+            Ok(record) => {
+                self.play(record, summaries);
+                bytes.len()
+            }
+            Err(_) => end,
+        }
+    }
+
+    /// Carry this copy on over one record of its file.
+    fn play(&mut self, record: Record, summaries: &mut Vec<(usize, String)>) {
+        match record {
+            Record::Head { id, created } => {
+                self.id = id;
+                self.updated = created;
+            }
+            Record::Meta(meta) => {
+                self.title = meta.title;
+                self.updated = meta.updated;
+                self.pinned = meta.pinned;
+                self.workspace = meta.workspace;
+                self.todos = meta.todos;
+                self.model = meta.model;
+                self.gateway = meta.gateway;
+                self.effort = meta.effort;
+            }
+            Record::Message(message) => self.messages.push(message),
+            Record::Rewind { to } => {
+                self.messages.truncate(to);
+                summaries.retain(|(upto, _)| *upto <= to);
+            }
+            Record::Summary { upto, text } => {
+                if upto <= self.messages.len() {
+                    summaries.push((upto, text));
+                }
+            }
+        }
+    }
+
+    /// Mark everything in this copy as already in the file, which it was
+    /// just read from, with the newest of `summaries` standing.
+    fn caught_up(&mut self, mut summaries: Vec<(usize, String)>) {
+        self.flushed = self.messages.len();
+        self.written = Some(self.meta());
+        self.summary = summaries.pop();
+        self.summary_saved = true;
+        // The model is not asked again for what the file already has.
+        if let Some((upto, text)) = &self.summary
+            && let Some(covered) = self.messages.get(..*upto)
+        {
+            crate::compact::remember(covered, text);
+        }
+    }
+
+    /// Take in what another process added to the file since this copy was
+    /// read or written: only the lines added, when the file just grew, and
+    /// all of it again when it was replaced. Whether anything changed.
+    fn follow(&mut self) -> bool {
+        let unsaved = self.flushed != self.messages.len()
+            || self.rewound.is_some()
+            || self.written.as_ref() != Some(&self.meta())
+            || (self.summary.is_some() && !self.summary_saved);
+        // Never saved, it is not in the file. Listed and not read in, it is
+        // read fresh when it is opened. And what this copy has not saved is
+        // its own: the next save settles which copy the file keeps.
+        if self.written.is_none() || (self.counted > 0 && self.messages.is_empty()) || unsaved {
+            return false;
+        }
+        let path = session_path(self.id);
+        // Gone, the next save knows not to bring it back.
+        let Ok(stat) = std::fs::metadata(&path) else {
+            return false;
+        };
+        let (size, mtime) = (stat.len(), modified(&stat));
+        let Some(seen) = self.seen else {
+            return self.read_again(&path);
+        };
+        if (size, mtime) == (seen.size, seen.mtime) {
+            return false;
+        }
+        // Only a copy that is still what the mark was taken of can be carried
+        // on from it; one read in again some other way since is read afresh.
+        let resumed = (self.messages.len() == seen.messages)
+            .then(|| std::fs::File::open(&path).ok())
+            .flatten()
+            .and_then(|mut file| read_on(&mut file, seen.len, seen.tail, size).ok().flatten());
+        let Some((from, start, bytes)) = resumed else {
+            return self.read_again(&path);
+        };
+        let mut summaries = self.summary.take().into_iter().collect();
+        let taken = start + self.apply(&bytes[start..], &mut summaries);
+        self.seen = Some(Seen {
+            size,
+            mtime,
+            len: from + taken as u64,
+            // All in `bytes`: they start that far before the old end.
+            tail: tail_hash(&bytes[taken.saturating_sub(TAIL_CHECK as usize)..taken]),
+            messages: self.messages.len(),
+        });
+        self.caught_up(summaries);
+        taken > start
+    }
+
+    /// Replace this copy with its file as it is now; whether there was one.
+    fn read_again(&mut self, path: &std::path::Path) -> bool {
+        let Some(read) = replay(path) else {
+            return false;
+        };
+        *self = read;
+        true
     }
 }
 
@@ -727,48 +928,17 @@ fn torn(file: &mut std::fs::File) -> std::io::Result<bool> {
     Ok(last[0] != b'\n')
 }
 
-/// Rebuild a session by replaying its file. A line that will not parse is
-/// skipped rather than failing the session: losing one message is better than
-/// losing the conversation it was part of.
+/// Rebuild a session by replaying its file.
 fn replay(path: &std::path::Path) -> Option<Conversation> {
-    // Read leniently: a write cut part way through a character leaves bytes
-    // that are not UTF-8, which would otherwise fail the whole file rather
-    // than the one line they are on.
+    // Taken before the read: a write landing between the two only makes
+    // the next look at the file read its end again.
+    let mtime = modified(&std::fs::metadata(path).ok()?);
     let bytes = std::fs::read(path).ok()?;
-    let text = String::from_utf8_lossy(&bytes);
     let mut conversation = Conversation::default();
     // Every summary still within the history so far: a rewind can take the
     // newest back and leave an earlier one standing.
     let mut summaries = Vec::new();
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        match serde_json::from_str::<Record>(line) {
-            Ok(Record::Head { id, created }) => {
-                conversation.id = id;
-                conversation.updated = created;
-            }
-            Ok(Record::Meta(meta)) => {
-                conversation.title = meta.title;
-                conversation.updated = meta.updated;
-                conversation.pinned = meta.pinned;
-                conversation.workspace = meta.workspace;
-                conversation.todos = meta.todos;
-                conversation.model = meta.model;
-                conversation.gateway = meta.gateway;
-                conversation.effort = meta.effort;
-            }
-            Ok(Record::Message(message)) => conversation.messages.push(message),
-            Ok(Record::Rewind { to }) => {
-                conversation.messages.truncate(to);
-                summaries.retain(|(upto, _)| *upto <= to);
-            }
-            Ok(Record::Summary { upto, text }) => {
-                if upto <= conversation.messages.len() {
-                    summaries.push((upto, text));
-                }
-            }
-            Err(_) => continue,
-        }
-    }
+    let len = conversation.apply(&bytes, &mut summaries);
     // A crash in the first save can tear the head line itself. The file is
     // named after the session, so its id survives that.
     if conversation.id == 0 {
@@ -777,16 +947,14 @@ fn replay(path: &std::path::Path) -> Option<Conversation> {
     if conversation.id == 0 {
         return None;
     }
-    conversation.flushed = conversation.messages.len();
-    conversation.written = Some(conversation.meta());
-    conversation.summary = summaries.pop();
-    conversation.summary_saved = true;
-    // The model is not asked again for what the file already has.
-    if let Some((upto, text)) = &conversation.summary
-        && let Some(covered) = conversation.messages.get(..*upto)
-    {
-        crate::compact::remember(covered, text);
-    }
+    conversation.seen = Some(Seen {
+        size: bytes.len() as u64,
+        mtime,
+        len: len as u64,
+        tail: tail_hash(&bytes[len.saturating_sub(TAIL_CHECK as usize)..len]),
+        messages: conversation.messages.len(),
+    });
+    conversation.caught_up(summaries);
     Some(conversation)
 }
 
@@ -959,6 +1127,24 @@ struct Indexed {
     summary: Summary,
 }
 
+/// Where a copy of a session stands in its file: the file as this process
+/// last read or wrote it, so what another process adds after that can be
+/// told apart and read on its own.
+#[derive(Clone, Copy, Default, PartialEq)]
+pub struct Seen {
+    /// The file's size and modification time then: while both hold, nothing
+    /// in it has moved.
+    size: u64,
+    mtime: u64,
+    /// How far the copy goes: the end of the last whole record.
+    len: u64,
+    /// A hash of the `TAIL_CHECK` bytes before `len`.
+    tail: u64,
+    /// How many messages the file held up to `len`, to tell a copy that has
+    /// been read in again another way since.
+    messages: usize,
+}
+
 fn index_path() -> PathBuf {
     sessions_dir().join("index.json")
 }
@@ -1024,11 +1210,8 @@ fn scan(path: &std::path::Path, id: u64, known: Option<&Indexed>) -> Option<(Ind
     // changed in place was rewritten, and is read from the start.
     let appended = |k: &&Indexed| size > k.size || (size, mtime) == (k.size, k.mtime);
     let resumed = known.filter(appended).and_then(|k| {
-        let from = k.len.saturating_sub(TAIL_CHECK);
-        let bytes = read_range(&mut file, from, size)?;
-        let seen = usize::try_from(k.len - from).ok()?;
-        let same = bytes.get(..seen).is_some_and(|b| tail_hash(b) == k.tail);
-        same.then(|| (k.summary.clone(), from, seen, bytes))
+        let (from, seen, bytes) = read_on(&mut file, k.len, k.tail, size).ok().flatten()?;
+        Some((k.summary.clone(), from, seen, bytes))
     });
     let (mut summary, from, start, bytes) = match resumed {
         Some(resumed) => resumed,
@@ -1215,6 +1398,86 @@ fn wrote(message: &Message) -> Option<String> {
     // Under the name the write ran with, `file_path` included.
     crate::tools::rename_aliases(&message.name, &mut args);
     args["path"].as_str().map(str::to_owned)
+}
+
+/// The file's bytes from `TAIL_CHECK` before `len` up to `size`, and where
+/// `len` falls in them -- if what was read up to `len` is still there, so
+/// the file has only been added to since; None if it was replaced.
+fn read_on(
+    file: &mut std::fs::File,
+    len: u64,
+    tail: u64,
+    size: u64,
+) -> std::io::Result<Option<(u64, usize, Vec<u8>)>> {
+    let from = len.saturating_sub(TAIL_CHECK);
+    file.seek(SeekFrom::Start(from))?;
+    let mut bytes = Vec::new();
+    file.take(size.saturating_sub(from))
+        .read_to_end(&mut bytes)?;
+    let Ok(seen) = usize::try_from(len - from) else {
+        return Ok(None);
+    };
+    let same = bytes.get(..seen).is_some_and(|b| tail_hash(b) == tail);
+    Ok(same.then_some((from, seen, bytes)))
+}
+
+/// How far the whole lines of `bytes` go: to just after the last newline.
+fn whole_lines(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |at| at + 1)
+}
+
+/// What the file holds past `seen`: nothing when it has not grown, the
+/// bytes added when it only grew, and None when it no longer holds what
+/// `seen` was taken from.
+fn added_since(file: &mut std::fs::File, seen: &Seen) -> std::io::Result<Option<Vec<u8>>> {
+    let size = file.metadata()?.len();
+    if size == seen.size {
+        return Ok(Some(Vec::new()));
+    }
+    let read = read_on(file, seen.len, seen.tail, size)?;
+    Ok(read.map(|(_, start, mut bytes)| bytes.split_off(start)))
+}
+
+/// How many of the first `had` messages survive `bytes`, lines another
+/// process added to the file: all of them, or fewer after a rewind there.
+/// None when the lines hold no whole record, as a write cut short leaves.
+fn kept_by(bytes: &[u8], had: usize) -> Option<usize> {
+    let end = whole_lines(bytes);
+    let mut standing = None;
+    for line in String::from_utf8_lossy(&bytes[..end]).lines() {
+        // Messages are counted by their tag, as the listing counts them.
+        if line.starts_with("{\"type\":\"message\"") {
+            standing = standing.or(Some(had));
+            continue;
+        }
+        match serde_json::from_str::<Record>(line) {
+            Ok(Record::Rewind { to }) => standing = Some(standing.unwrap_or(had).min(to)),
+            Ok(_) => standing = standing.or(Some(had)),
+            Err(_) => {}
+        }
+    }
+    standing
+}
+
+/// Where a copy stands that has just written the end of the file, holding
+/// `messages`: at that end.
+fn seen_at_end(file: &mut std::fs::File, messages: usize) -> std::io::Result<Seen> {
+    let stat = file.metadata()?;
+    let size = stat.len();
+    let from = size.saturating_sub(TAIL_CHECK);
+    file.seek(SeekFrom::Start(from))?;
+    let mut end = Vec::new();
+    file.take(size - from).read_to_end(&mut end)?;
+    Ok(Seen {
+        size,
+        mtime: modified(&stat),
+        len: size,
+        tail: tail_hash(&end),
+        messages,
+    })
 }
 
 /// The model calls saved in the sessions and their helpers' conversations
@@ -4444,6 +4707,362 @@ pub(crate) mod tests {
         assert!(running.exists() && other.exists());
         assert!(running_lock.exists() && other_lock.exists());
         assert!(!dir.join("agents").exists());
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    /// Session 1 saved with `n` numbered messages, then read in by the window
+    /// as it starts and by the terminal as it opens the session: the window's
+    /// copy follows the file, and the terminal's is saved blind, as before.
+    fn window_and_terminal(n: usize) -> (Store, Store) {
+        let mut first = Store::default();
+        first.conversations.push(numbered(n));
+        first.save().unwrap();
+        let window = load();
+        let mut terminal = load_listing();
+        fill(&mut terminal.conversations[0]);
+        (window, terminal)
+    }
+
+    fn contents(conversation: &Conversation) -> Vec<&str> {
+        conversation
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect()
+    }
+
+    fn append(path: &std::path::Path, bytes: &str) {
+        use std::io::Write;
+        let mut file = std::fs::File::options().append(true).open(path).unwrap();
+        file.write_all(bytes.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn what_the_terminal_appends_reaches_the_window() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("follow-appended");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let (mut window, mut terminal) = window_and_terminal(2);
+        let path = dir.join("sessions/1.jsonl");
+
+        terminal.conversations[0]
+            .messages
+            .push(said("assistant", "from the terminal"));
+        terminal.conversations[0].title = "renamed there".into();
+        terminal.save().unwrap();
+        assert!(window.follow(|_| false));
+        let open = &window.conversations[0];
+        assert_eq!(contents(open), ["0", "1", "from the terminal"]);
+        assert_eq!(open.title, "renamed there");
+
+        // Taken in as the file has it, so there is nothing to write back.
+        let before = std::fs::read(&path).unwrap();
+        window.save().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!window.follow(|_| false));
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn only_the_lines_the_terminal_added_are_read() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("follow-tail");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let mut first = Store::default();
+        let long = "x".repeat(2 * super::TAIL_CHECK as usize);
+        first.conversations.push(Conversation {
+            id: 1,
+            title: "kept".into(),
+            messages: vec![said("user", &long)],
+            ..Default::default()
+        });
+        first.save().unwrap();
+        let mut window = load();
+
+        // Changed where only a reading from the start would see it: before
+        // the long message and the bytes checked at its end.
+        let path = dir.join("sessions/1.jsonl");
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, text.replace("\"kept\"", "\"lost\"")).unwrap();
+        append(
+            &path,
+            "{\"type\":\"message\",\"role\":\"user\",\"content\":\"more\"}\n",
+        );
+        assert!(window.follow(|_| false));
+        let open = &window.conversations[0];
+        assert_eq!((open.title.as_str(), open.messages.len()), ("kept", 2));
+        assert_eq!(open.messages[1].content, "more");
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_session_file_replaced_under_the_window_is_read_again_in_full() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("follow-replaced");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let path = dir.join("sessions/3.jsonl");
+        std::fs::create_dir_all(dir.join("sessions")).unwrap();
+        std::fs::write(&path, session_text("long", 3)).unwrap();
+        let mut window = load();
+        let open = |store: &Store| {
+            let c = &store.conversations[0];
+            (c.title.clone(), c.messages.len())
+        };
+
+        // Rewritten shorter, as a compacted session would be.
+        std::fs::write(&path, session_text("short", 1)).unwrap();
+        assert!(window.follow(|_| false));
+        assert_eq!(open(&window), ("short".into(), 1));
+        // Replaced by a longer one, as when a deleted session's id is reused.
+        std::fs::write(&path, session_text("other", 4)).unwrap();
+        assert!(window.follow(|_| false));
+        assert_eq!(open(&window), ("other".into(), 4));
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_session_the_terminal_starts_joins_the_window_which_leaves_it_be() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("follow-started");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let (mut window, mut terminal) = window_and_terminal(1);
+
+        // Reserved and not yet saved, it is the terminal's alone.
+        let id = terminal.reserve_id();
+        assert!(!window.follow(|_| false));
+        assert_eq!(window.conversations.len(), 1);
+
+        terminal.conversations.push(Conversation {
+            id,
+            title: "started there".into(),
+            messages: vec![said("user", "hello")],
+            ..Default::default()
+        });
+        terminal.save().unwrap();
+        assert!(window.follow(|_| false));
+        let started = &window.conversations[1];
+        assert_eq!((started.id, started.title.as_str()), (id, "started there"));
+        assert_eq!(contents(started), ["hello"]);
+
+        let path = dir.join(format!("sessions/{id}.jsonl"));
+        let before = std::fs::read(&path).unwrap();
+        window.save().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_session_the_window_is_replying_in_is_followed_once_the_reply_ends() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("follow-busy");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let (mut window, mut terminal) = window_and_terminal(1);
+
+        terminal.conversations[0]
+            .messages
+            .push(said("user", "meanwhile"));
+        terminal.save().unwrap();
+        assert!(!window.follow(|id| id == 1));
+        assert_eq!(contents(&window.conversations[0]), ["0"]);
+        assert!(window.follow(|_| false));
+        assert_eq!(contents(&window.conversations[0]), ["0", "meanwhile"]);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn when_both_said_something_the_window_keeps_its_own_copy_and_says_so() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("follow-clash");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let (mut window, mut terminal) = window_and_terminal(2);
+        let path = dir.join("sessions/1.jsonl");
+
+        terminal.conversations[0]
+            .messages
+            .push(said("user", "in the terminal"));
+        terminal.save().unwrap();
+        let theirs = std::fs::read(&path).unwrap();
+        // The window's reply ends, and is saved, before it has followed.
+        window.conversations[0]
+            .messages
+            .push(said("assistant", "in the window"));
+        window.save().unwrap();
+        assert!(window.conversations[0].diverged);
+        assert_eq!(
+            contents(&replay(&path).unwrap()),
+            ["0", "1", "in the window"]
+        );
+        // Only added to: the terminal's line is still in the file.
+        assert!(std::fs::read(&path).unwrap().starts_with(&theirs));
+
+        // Nothing is left to take in, or to say again.
+        window.conversations[0].diverged = false;
+        assert!(!window.follow(|_| false));
+        window.save().unwrap();
+        assert!(!window.conversations[0].diverged);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_rewind_among_the_terminal_lines_does_not_cut_into_the_window_copy() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("follow-clash-rewind");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let (mut window, mut terminal) = window_and_terminal(3);
+        let path = dir.join("sessions/1.jsonl");
+
+        terminal.conversations[0].rewind(1);
+        terminal.conversations[0]
+            .messages
+            .push(said("user", "instead"));
+        terminal.save().unwrap();
+        window.conversations[0]
+            .messages
+            .push(said("assistant", "in the window"));
+        window.save().unwrap();
+        assert_eq!(
+            contents(&replay(&path).unwrap()),
+            ["0", "1", "2", "in the window"]
+        );
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_rename_in_the_window_while_the_terminal_writes_keeps_both() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("follow-rename");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let (mut window, mut terminal) = window_and_terminal(1);
+        let path = dir.join("sessions/1.jsonl");
+
+        terminal.conversations[0]
+            .messages
+            .push(said("user", "in the terminal"));
+        terminal.save().unwrap();
+        window.conversations[0].title = "renamed here".into();
+        window.save().unwrap();
+        assert!(!window.conversations[0].diverged);
+        let back = replay(&path).unwrap();
+        assert_eq!(back.title, "renamed here");
+        assert_eq!(contents(&back), ["0", "in the terminal"]);
+
+        assert!(window.follow(|_| false));
+        let open = &window.conversations[0];
+        assert_eq!(open.title, "renamed here");
+        assert_eq!(contents(open), ["0", "in the terminal"]);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_line_the_terminal_is_still_writing_is_taken_in_once_whole() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("follow-half-line");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let (mut window, _) = window_and_terminal(1);
+        let path = dir.join("sessions/1.jsonl");
+
+        append(
+            &path,
+            "{\"type\":\"message\",\"role\":\"user\",\"content\":\"tw",
+        );
+        assert!(!window.follow(|_| false));
+        assert_eq!(contents(&window.conversations[0]), ["0"]);
+        append(&path, "o\"}\n");
+        assert!(window.follow(|_| false));
+        assert_eq!(contents(&window.conversations[0]), ["0", "two"]);
+        assert!(!window.follow(|_| false));
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_line_a_crash_cut_short_is_not_taken_for_the_terminal_writing() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("follow-torn");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let (mut window, _) = window_and_terminal(1);
+        let path = dir.join("sessions/1.jsonl");
+
+        append(&path, "{\"type\":\"message\",\"role\":\"us");
+        window.conversations[0].messages.push(said("user", "again"));
+        window.save().unwrap();
+        assert!(!window.conversations[0].diverged);
+        assert_eq!(contents(&replay(&path).unwrap()), ["0", "again"]);
+        assert!(!window.follow(|_| false));
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_session_replaced_under_the_window_is_not_written_into() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("follow-replaced-save");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let (mut window, _) = window_and_terminal(2);
+        let path = dir.join("sessions/1.jsonl");
+
+        // Deleted elsewhere, and its id given to a session started there.
+        std::fs::remove_file(&path).unwrap();
+        let mut terminal = Store::default();
+        terminal.conversations.push(Conversation {
+            id: 1,
+            title: "another".into(),
+            messages: vec![said("user", "not yours")],
+            ..Default::default()
+        });
+        terminal.save().unwrap();
+        let theirs = std::fs::read(&path).unwrap();
+
+        window.conversations[0]
+            .messages
+            .push(said("user", "still here?"));
+        window.save().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), theirs);
+        assert!(window.conversations[0].gone);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_session_the_window_started_is_followed_after_its_first_save() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("follow-new-here");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let mut window = load();
+        let id = window.reserve_id();
+        window.conversations.push(Conversation {
+            id,
+            messages: vec![said("user", "hello")],
+            ..Default::default()
+        });
+        window.save().unwrap();
+
+        let mut terminal = load_listing();
+        fill(&mut terminal.conversations[0]);
+        terminal.conversations[0]
+            .messages
+            .push(said("assistant", "from the terminal"));
+        terminal.save().unwrap();
+        assert!(window.follow(|_| false));
+        assert_eq!(
+            contents(&window.conversations[0]),
+            ["hello", "from the terminal"]
+        );
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn following_leaves_a_listed_session_to_be_read_when_it_is_opened() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("follow-listed");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let (_, mut terminal) = window_and_terminal(2);
+        let mut listing = load_listing();
+
+        terminal.conversations[0]
+            .messages
+            .push(said("user", "more"));
+        terminal.save().unwrap();
+        assert!(!listing.follow(|_| false));
+        assert!(listing.conversations[0].messages.is_empty());
+        assert_eq!(listing.conversations[0].length(), 2);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 }

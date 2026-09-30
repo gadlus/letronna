@@ -42,6 +42,9 @@ const OVERDRAW: Pixels = px(800.);
 /// opened is let go and read again from disk, a few milliseconds, when it is
 /// next opened. Running, chat-app and scheduled sessions come on top.
 const OPEN_SESSIONS: usize = 8;
+/// How long after the system says a session file changed the folder is
+/// looked at: one save is a few writes, and they are taken in together.
+const SESSIONS_SETTLE: std::time::Duration = std::time::Duration::from_millis(200);
 
 pub(crate) enum Verdict {
     Allow {
@@ -316,6 +319,9 @@ pub(crate) struct Chat {
     pub(crate) notices: notify::Notices,
     /// Whether the window is the one in front, as it last said.
     pub(crate) in_front: bool,
+    /// Sessions the window has said it kept its own copy of, when another
+    /// Letronna wrote there too, so that is said once.
+    pub(crate) kept_own: std::collections::HashSet<u64>,
     /// Set by Stop for the `finish` it causes, so stopping does not start a
     /// turn for notices in the same moment.
     pub(crate) stopping: bool,
@@ -614,6 +620,13 @@ impl Chat {
                     crate::theme::apply(&this.store.settings.appearance, window, cx);
                 }
             }),
+            // Also on coming to the front, for a change the system did not
+            // report, as on some network folders.
+            cx.observe_window_activation(window, |this, window, cx| {
+                if window.is_window_active() {
+                    this.follow_sessions(cx);
+                }
+            }),
             cx.subscribe_in(&steer, window, |this, _, event, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
                     this.send_steer(window, cx);
@@ -734,6 +747,7 @@ impl Chat {
             unseen: std::collections::HashSet::new(),
             notices: notify::Notices::new(Box::new(crate::platform::notify::desktop())),
             in_front: window.is_window_active(),
+            kept_own: std::collections::HashSet::new(),
             stopping: false,
             helpers: Vec::new(),
             helper_tick: false,
@@ -785,6 +799,7 @@ impl Chat {
         Self::watch_schedules(cx);
         Self::watch_updates(cx);
         Self::watch_inbox(cx);
+        Self::watch_sessions(cx);
         Self::serve_approvals(cx);
         Self::watch_ended(cx);
         Self::watch_clicks(window, cx);
@@ -877,6 +892,28 @@ impl Chat {
             );
             self.error =
                 Some("Could not save chat history. Your current chat remains in memory.".into());
+        }
+        for conversation in &mut self.store.conversations {
+            if std::mem::take(&mut conversation.diverged) && self.kept_own.insert(conversation.id) {
+                self.note = Some(format!(
+                    "\"{}\" was also changed elsewhere, so this window kept its own copy.",
+                    conversation.title
+                ));
+            }
+        }
+    }
+
+    /// Take in what the terminal wrote to the sessions since the window last
+    /// looked. The session a reply is running in, and one with a message
+    /// being changed, are left until that is done.
+    pub(crate) fn follow_sessions(&mut self, cx: &mut Context<Self>) {
+        let replying = self.streaming_id;
+        let editing = self.editing_message.map(|(id, _)| id);
+        if self
+            .store
+            .follow(|id| Some(id) == replying || Some(id) == editing)
+        {
+            cx.notify();
         }
     }
 
@@ -1290,6 +1327,55 @@ impl Chat {
                     this.wake_idle(cx)
                 });
                 if rang.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Follow the sessions whenever the system says a session file changed.
+    /// Nothing runs between changes, so a window left alone, shown or not,
+    /// costs nothing; where the system cannot watch the folder, coming to
+    /// the front still catches up.
+    fn watch_sessions(cx: &mut Context<Self>) {
+        use ::notify::Watcher as _;
+        let folder = letronna_core::store::sessions_dir();
+        let _ = std::fs::create_dir_all(&folder);
+        // One waiting is enough: the folder is looked at whole.
+        let (tx, rx) = async_channel::bounded(1);
+        let watcher =
+            ::notify::recommended_watcher(move |event: ::notify::Result<::notify::Event>| {
+                // Not the index, locks or temp files beside them.
+                let session = event.is_ok_and(|event| {
+                    event
+                        .paths
+                        .iter()
+                        .any(|path| path.extension().is_some_and(|x| x == "jsonl"))
+                });
+                if session {
+                    let _ = tx.try_send(());
+                }
+            });
+        let Ok(mut watcher) = watcher else {
+            return;
+        };
+        if watcher
+            .watch(&folder, ::notify::RecursiveMode::NonRecursive)
+            .is_err()
+        {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            // Watching stops when this is dropped.
+            let _watcher = watcher;
+            while rx.recv().await.is_ok() {
+                cx.background_executor().timer(SESSIONS_SETTLE).await;
+                let _ = rx.try_recv();
+                if this
+                    .update(cx, |this, cx| this.follow_sessions(cx))
+                    .is_err()
+                {
                     break;
                 }
             }
