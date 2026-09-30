@@ -2259,6 +2259,7 @@ struct Reply {
     assembler: Assembler,
     reasoning_details: Vec<Value>,
     finish: Option<FinishReason>,
+    think: crate::think::Scrubber,
 }
 
 impl Reply {
@@ -2303,10 +2304,29 @@ impl Reply {
                 .map_err(|_| Failure::new(FailureKind::Stopped, "Chat closed."))?;
         }
         if let Some(text) = chunk.content {
-            self.received = true;
             *stands = true;
+            let pieces = self.think.feed(&text);
+            self.pass_on(pieces, sender)?;
+        }
+        Ok(())
+    }
+
+    /// Send the answer and the inline thinking on, each as its own event.
+    fn pass_on(
+        &mut self,
+        pieces: Vec<crate::think::Piece>,
+        sender: &async_channel::Sender<Event>,
+    ) -> Result<(), Failure> {
+        for piece in pieces {
+            let event = match piece {
+                crate::think::Piece::Answer(text) => {
+                    self.received = true;
+                    Event::Delta(text)
+                }
+                crate::think::Piece::Thought(text) => Event::Reasoning(text),
+            };
             sender
-                .send_blocking(Event::Delta(text))
+                .send_blocking(event)
                 .map_err(|_| Failure::new(FailureKind::Stopped, "Chat closed."))?;
         }
         Ok(())
@@ -2316,13 +2336,15 @@ impl Reply {
     ///
     /// A stream without `[DONE]` still counts when it said why it finished.
     fn end(
-        self,
+        mut self,
         done: bool,
         began: std::time::Instant,
         connection: &Connection,
         extra_tools: &[Value],
         sender: &async_channel::Sender<Event>,
     ) -> Result<(), Failure> {
+        let held = self.think.finish();
+        self.pass_on(held, sender)?;
         if self.completion_tokens > 0 {
             let secs = began.elapsed().as_secs_f32().max(0.001);
             let _ = sender.send_blocking(Event::Usage {
@@ -4873,6 +4895,14 @@ mod tests {
         // So is one with nothing in it at all.
         let events = reply_of("text/event-stream", "data: [DONE]\n\n");
         assert!(matches!(events[..], [Event::Finished(Ok(()))]));
+        // And one whose only text is an inline block.
+        let events = reply_of(
+            "text/event-stream",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"<think>Hmm.</think>\\n\"},\"finish_reason\":\"stop\"}]}\n\n\
+             data: [DONE]\n\n",
+        );
+        assert!(matches!(&events[0], Event::Reasoning(s) if s == "Hmm."));
+        assert!(matches!(events[1], Event::Finished(Ok(()))));
     }
 
     #[test]
@@ -6224,5 +6254,32 @@ mod tests {
         );
         // What the retry left out cannot be what it is refused for again.
         assert!(!learn(&c, &again, refusal));
+    }
+
+    #[test]
+    fn inline_thinking_streams_as_reasoning_and_not_as_the_answer() {
+        let (sender, events) = async_channel::unbounded();
+        let mut reply = Reply::default();
+        let mut stands = false;
+        for part in ["<thi", "nk>Two and two.</th", "ink>\n\nIt is 4."] {
+            let chunk = Chunk {
+                content: Some(part.into()),
+                ..Default::default()
+            };
+            reply.absorb(chunk, &mut stands, &sender).unwrap();
+        }
+        reply.finish = Some(FinishReason::Stop);
+        let began = std::time::Instant::now();
+        reply.end(true, began, &connection(), &[], &sender).unwrap();
+        let (mut answer, mut thought) = (String::new(), String::new());
+        while let Ok(event) = events.try_recv() {
+            match event {
+                Event::Delta(text) => answer.push_str(&text),
+                Event::Reasoning(text) => thought.push_str(&text),
+                _ => {}
+            }
+        }
+        assert_eq!(answer, "It is 4.");
+        assert_eq!(thought, "Two and two.");
     }
 }
