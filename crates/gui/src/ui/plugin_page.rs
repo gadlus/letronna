@@ -317,11 +317,15 @@ impl Chat {
                             .min_w_0()
                             .gap_0p5()
                             .child(
+                                // Clipped, not truncated: gpui keeps the first
+                                // width a truncated line was measured at, here
+                                // too narrow, and drew the name as "…".
                                 div()
                                     .min_w_0()
                                     .text_sm()
                                     .font_weight(FontWeight::MEDIUM)
-                                    .truncate()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
                                     .when(!enabled, |this| this.text_color(muted))
                                     .child(heading),
                             )
