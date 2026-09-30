@@ -1724,8 +1724,8 @@ impl Tool for ReadJob {
             "limit": {"type": "integer", "description": "How many lines to read from there."}
         }, "required": ["id"]})
     }
-    fn run(&self, args: &Value, _: &ToolContext) -> Result<String, String> {
-        let id = job_id(args)?;
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
+        let id = own_job(job_id(args)?, ctx)?;
         let log = crate::jobs::log(id)?;
         let state = job_state(crate::jobs::running(id)?, crate::jobs::exit_code(id)?);
         let (offset, limit) = (args["offset"].as_u64(), args["limit"].as_u64());
@@ -1832,8 +1832,8 @@ impl Tool for StopJob {
             "id": {"type": "integer"}
         }, "required": ["id"]})
     }
-    fn run(&self, args: &Value, _: &ToolContext) -> Result<String, String> {
-        let id = job_id(args)?;
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
+        let id = own_job(job_id(args)?, ctx)?;
         crate::jobs::stop(id)?;
         Ok(format!("Stopped job #{id}."))
     }
@@ -1866,6 +1866,7 @@ impl Tool for Wait {
             }
             return Ok(format!("Waited {seconds:.0}s."));
         };
+        let id = own_job(id, ctx)?;
         let until = args["until"].as_str().unwrap_or_default();
         let started = std::time::Instant::now();
         // Text printed before the wait began would match at once, and say
@@ -1916,6 +1917,20 @@ fn job_id(args: &Value) -> Result<u64, String> {
     args["id"]
         .as_u64()
         .ok_or_else(|| "`id` is required and must be a job number.".to_owned())
+}
+
+/// Job `id` if this conversation or a helper it started began it; any other
+/// is refused in the words for a number never given out, so none tells of
+/// another conversation's work.
+fn own_job(id: u64, ctx: &ToolContext) -> Result<u64, String> {
+    let key = crate::tasks::Key::Job(id);
+    if crate::tasks::list(ctx.conversation)
+        .iter()
+        .any(|task| task.key == key)
+    {
+        return Ok(id);
+    }
+    Err(format!("No job #{id} in this conversation."))
 }
 
 /// Wait up to `limit` for job `id` to print its first line. Its exit does not
@@ -3513,6 +3528,45 @@ mod tests {
         assert!(!listed.contains("0123456789abcdefghij"), "{listed}");
         assert!(listed.contains(crate::redact::MARKER), "{listed}");
         assert!(listed.ends_with("x\u{2026}`"), "{listed}");
+    }
+
+    #[test]
+    fn read_stop_and_wait_answer_for_another_conversations_job_as_for_none() {
+        use crate::tasks::{Key, Task};
+        let dir = std::env::temp_dir();
+        let sleeper = if cfg!(windows) {
+            "Start-Sleep 30"
+        } else {
+            "sleep 30"
+        };
+        // Session 7621 started helper 7622; session 7623 is another one.
+        crate::tasks::register(Task::new(Key::Agent(7_622), 7_621, None, "explore"));
+        let own = crate::jobs::start_for(sleeper, &dir, 7_621).unwrap();
+        let helpers = crate::jobs::start_for(sleeper, &dir, 7_622).unwrap();
+        let other = crate::jobs::start_for(sleeper, &dir, 7_623).unwrap();
+        let (session, helper) = (in_conversation(7_621, &dir), in_conversation(7_622, &dir));
+        let read = |id, ctx: &ToolContext| ReadJob.run(&json!({"id": id}), ctx);
+        let wait = |id, ctx: &ToolContext| Wait.run(&json!({"job": id, "seconds": 0}), ctx);
+        let stop = |id, ctx: &ToolContext| StopJob.run(&json!({"id": id}), ctx);
+        let none = |id| format!("No job #{id} in this conversation.");
+        assert_eq!(read(other, &session).unwrap_err(), none(other));
+        assert_eq!(wait(other, &session).unwrap_err(), none(other));
+        assert_eq!(stop(other, &session).unwrap_err(), none(other));
+        assert!(crate::jobs::running(other).unwrap());
+        crate::jobs::stop(other).unwrap();
+        assert_eq!(read(u64::MAX, &session).unwrap_err(), none(u64::MAX));
+        // A helper has only its own, not the session's that started it.
+        assert_eq!(read(own, &helper).unwrap_err(), none(own));
+        assert!(read(helpers, &helper).is_ok());
+        for id in [own, helpers] {
+            let read = read(id, &session).unwrap();
+            let running = format!("Job #{id} is running.");
+            assert!(read.starts_with(&running), "{read}");
+            let waited = wait(id, &session).unwrap();
+            let still = format!("Job #{id} is still running after 0s.");
+            assert!(waited.starts_with(&still), "{waited}");
+            assert_eq!(stop(id, &session).unwrap(), format!("Stopped job #{id}."));
+        }
     }
 
     #[test]
