@@ -45,15 +45,7 @@ impl WorkingDiff {
 /// limited to `only` when given (paths relative to `folder`). Outside a git
 /// repository there is nothing to compare with, and the error says so.
 pub fn working_diff(folder: &Path, only: Option<&[PathBuf]>) -> Result<WorkingDiff, String> {
-    let inside = git(folder, &["rev-parse", "--is-inside-work-tree"], 64)
-        .map(|(out, _)| out.trim() == "true")
-        .unwrap_or(false);
-    if !inside {
-        return Err(format!(
-            "{} is not in a git repository, so there is nothing to compare it with.",
-            folder.display()
-        ));
-    }
+    in_repository(folder)?;
     if only.is_some_and(<[PathBuf]>::is_empty) {
         return Ok(WorkingDiff::default());
     }
@@ -114,6 +106,185 @@ pub fn working_diff(folder: &Path, only: Option<&[PathBuf]>) -> Result<WorkingDi
         stat: printable(&stat),
         patch: printable(&patch),
     })
+}
+
+/// Where a project folder's repository stands, for the window's status bar.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Status {
+    /// The branch checked out, or `None` when the head is detached.
+    pub branch: Option<String>,
+    /// Files changed, staged or untracked.
+    pub changed: usize,
+    /// Commits ahead of and behind the branch's upstream.
+    pub ahead: usize,
+    pub behind: usize,
+}
+
+impl Status {
+    /// The status in a few words: "main · 3 changed ↑1".
+    pub fn describe(&self) -> String {
+        let mut parts = vec![self.branch.clone().unwrap_or_else(|| "detached".into())];
+        if self.changed > 0 {
+            parts.push(format!("{} changed", self.changed));
+        }
+        let mut line = parts.join(" · ");
+        if self.ahead > 0 {
+            line.push_str(&format!(" ↑{}", self.ahead));
+        }
+        if self.behind > 0 {
+            line.push_str(&format!(" ↓{}", self.behind));
+        }
+        line
+    }
+}
+
+/// Where `folder`'s repository stands. Git is told to take no optional
+/// locks, so a look while the user commits never gets in their way, and
+/// the repository's own filters are off, as status reads changed files
+/// through them.
+pub fn status(folder: &Path) -> Result<Status, String> {
+    let off = filters_off(folder)?;
+    let args = [
+        "--no-optional-locks",
+        "status",
+        "--porcelain=v2",
+        "--branch",
+        "-z",
+        "--untracked-files=normal",
+    ];
+    let (out, _) = run(folder, &args, STAT_CAP, &[0], &off)?;
+    Ok(parse_status(&out))
+}
+
+fn parse_status(out: &str) -> Status {
+    let mut status = Status::default();
+    let mut fields = out.split('\0').filter(|field| !field.is_empty());
+    while let Some(field) = fields.next() {
+        if let Some(head) = field.strip_prefix("# branch.head ") {
+            status.branch = (head != "(detached)").then(|| head.to_owned());
+        } else if let Some(counts) = field.strip_prefix("# branch.ab ") {
+            for count in counts.split(' ') {
+                let number = |s: &str| s.parse().unwrap_or(0);
+                if let Some(n) = count.strip_prefix('+') {
+                    status.ahead = number(n);
+                } else if let Some(n) = count.strip_prefix('-') {
+                    status.behind = number(n);
+                }
+            }
+        } else if field.starts_with(['1', 'u', '?']) {
+            status.changed += 1;
+        } else if field.starts_with('2') {
+            status.changed += 1;
+            // A rename's old name follows as a field of its own.
+            fields.next();
+        }
+    }
+    status
+}
+
+/// One changed file, with the lines it gained and lost.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ChangedFile {
+    /// Relative to the project folder.
+    pub path: PathBuf,
+    pub added: usize,
+    pub removed: usize,
+    /// Made since the comparison's start: untracked, or created by a tool.
+    pub created: bool,
+    /// Not text, so there are no lines to count.
+    pub binary: bool,
+}
+
+/// The files changed in `folder` since the last commit, tracked and
+/// untracked, with their counts; outside a git repository, an error that
+/// says so.
+pub fn changed_files(folder: &Path) -> Result<Vec<ChangedFile>, String> {
+    in_repository(folder)?;
+    let base = base(folder)?;
+    let off = filters_off(folder)?;
+    let args = [
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        "--relative",
+        "--numstat",
+        "-z",
+        base.as_str(),
+        "--",
+        ".",
+    ];
+    let (numstat, _) = run(folder, &args, STAT_CAP, &[0], &off)?;
+    let mut files: Vec<ChangedFile> = numstat
+        .split('\0')
+        .filter_map(|record| {
+            let mut parts = record.splitn(3, '\t');
+            let (added, removed, path) = (parts.next()?, parts.next()?, parts.next()?);
+            Some(ChangedFile {
+                path: PathBuf::from(path),
+                added: added.parse().unwrap_or(0),
+                removed: removed.parse().unwrap_or(0),
+                created: false,
+                binary: added == "-",
+            })
+        })
+        .collect();
+    let listing = [
+        "ls-files",
+        "-z",
+        "--others",
+        "--exclude-standard",
+        "--",
+        ".",
+    ];
+    let (untracked, _) = git(folder, &listing, STAT_CAP)?;
+    for path in untracked.split('\0').filter(|p| !p.is_empty()) {
+        // Counted from the file itself, as git would for a new one; one too
+        // big to be worth reading is listed without its count.
+        let text = read_small(&folder.join(path)).map(String::from_utf8);
+        files.push(ChangedFile {
+            path: PathBuf::from(path),
+            added: match &text {
+                Some(Ok(text)) => text.lines().count(),
+                _ => 0,
+            },
+            removed: 0,
+            created: true,
+            binary: matches!(text, Some(Err(_))),
+        });
+    }
+    Ok(files)
+}
+
+/// A plain file's bytes, or `None` for a link, a device, a pipe or a file
+/// over [`PATCH_CAP`]: a link to `/dev/zero` reports no size and never ends,
+/// and a pipe blocks the read for good.
+fn read_small(path: &Path) -> Option<Vec<u8>> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > PATCH_CAP as u64 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    let file = std::fs::File::open(path).ok()?;
+    file.take(PATCH_CAP as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() <= PATCH_CAP).then_some(bytes)
+}
+
+/// Ok when `folder` is in a git repository, or an error saying there is
+/// nothing to compare it with.
+fn in_repository(folder: &Path) -> Result<(), String> {
+    let inside = git(folder, &["rev-parse", "--is-inside-work-tree"], 64)
+        .map(|(out, _)| out.trim() == "true")
+        .unwrap_or(false);
+    if !inside {
+        return Err(format!(
+            "{} is not in a git repository, so there is nothing to compare it with.",
+            folder.display()
+        ));
+    }
+    Ok(())
 }
 
 /// What the changes are measured from: the last commit, or nothing at all
@@ -282,7 +453,9 @@ fn run(
     read.map_err(|e| format!("git's output could not be read: {e}"))?;
     if !cut && !status.code().is_some_and(|code| fine.contains(&code)) {
         let why = why.as_deref().unwrap_or("it failed");
-        return Err(format!("git {} failed: {why}", args[0]));
+        // Named by its command, not by an option given before it.
+        let command = args.iter().find(|arg| !arg.starts_with('-'));
+        return Err(format!("git {} failed: {why}", command.unwrap_or(&"")));
     }
     bytes.truncate(cap);
     let mut text = String::from_utf8_lossy(&bytes).into_owned();
@@ -316,7 +489,7 @@ fn why_failed(stderr: impl Read) -> Option<String> {
 
 /// `text` without what a terminal would act on: a file's own escapes must
 /// not reach the screen as escapes. Tabs and line ends stay.
-fn printable(text: &str) -> String {
+pub(crate) fn printable(text: &str) -> String {
     text.chars()
         .filter(|&c| c != '\r')
         .map(|c| match c {
@@ -429,6 +602,13 @@ mod tests {
         let diff = working_diff(&folder, None).unwrap();
         assert!(diff.patch.contains("+three"), "{}", diff.patch);
         assert!(diff.patch.contains("+fresh"), "{}", diff.patch);
+        // The Changes tab's list and the status bar read the same files.
+        let files = changed_files(&folder).unwrap();
+        assert!(
+            files.iter().any(|f| f.path == Path::new("a.txt")),
+            "{files:?}"
+        );
+        assert!(status(&folder).unwrap().changed > 0);
         let markers = [
             "ran-command",
             "ran-textconv",
@@ -518,5 +698,66 @@ mod tests {
     #[test]
     fn escapes_in_a_file_do_not_reach_the_screen() {
         assert_eq!(printable("a\x1b[31mb\r\n\tc"), "a?[31mb\n\tc");
+    }
+
+    #[test]
+    fn changed_files_are_counted_tracked_and_untracked() {
+        let folder = repo("counts");
+        std::fs::write(folder.join("a.txt"), "one\n2\nthree\n").unwrap();
+        std::fs::write(folder.join("new.txt"), "x\ny\n").unwrap();
+        let files = changed_files(&folder).unwrap();
+        let counts: Vec<(String, usize, usize, bool)> = files
+            .iter()
+            .map(|f| (f.path.display().to_string(), f.added, f.removed, f.created))
+            .collect();
+        assert_eq!(
+            counts,
+            vec![
+                ("a.txt".into(), 2, 1, false),
+                ("new.txt".into(), 2, 0, true)
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_untracked_link_to_a_device_is_listed_without_being_read() {
+        let folder = repo("device-link");
+        std::os::unix::fs::symlink("/dev/zero", folder.join("zero")).unwrap();
+        let files = changed_files(&folder).unwrap();
+        let zero = files.iter().find(|f| f.path == Path::new("zero")).unwrap();
+        assert!(zero.created && !zero.binary && zero.added == 0, "{zero:?}");
+    }
+
+    #[test]
+    fn the_status_counts_changes_and_names_the_branch() {
+        let folder = repo("status");
+        std::fs::write(folder.join("a.txt"), "changed\n").unwrap();
+        std::fs::write(folder.join("new.txt"), "x\n").unwrap();
+        let status = status(&folder).unwrap();
+        assert_eq!(status.changed, 2, "{status:?}");
+        assert!(status.branch.is_some(), "{status:?}");
+    }
+
+    #[test]
+    fn a_status_line_reads_as_the_status_bar_shows_it() {
+        let out = "# branch.oid abc\0# branch.head main\0# branch.upstream origin/main\0\
+                   # branch.ab +1 -2\0\
+                   1 .M N... 100644 100644 100644 a b a.txt\0\
+                   2 R. N... 100644 100644 100644 a b R100 new.txt\0old.txt\0\
+                   ? loose.txt\0";
+        let status = parse_status(out);
+        assert_eq!(
+            status,
+            Status {
+                branch: Some("main".into()),
+                changed: 3,
+                ahead: 1,
+                behind: 2,
+            }
+        );
+        assert_eq!(status.describe(), "main · 3 changed ↑1 ↓2");
+        let detached = parse_status("# branch.head (detached)\0");
+        assert_eq!(detached.describe(), "detached");
     }
 }

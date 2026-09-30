@@ -238,31 +238,52 @@ impl Chat {
             .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx)))
     }
 
-    /// The session's project folder. Click to pick or change it.
+    /// The session's project folder, with its branch and how many files
+    /// changed when it is in git. Click to see the changes, or to pick a
+    /// folder when there is none.
     fn workspace_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let workspace = &self.store.conversations[self.store.active].workspace;
-        let (name, tip) = match workspace {
-            Some(p) => (
-                p.file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| p.display().to_string()),
-                p.display().to_string(),
-            ),
-            None => ("No project".into(), "Attach a project folder".into()),
+        let Some(folder) = workspace else {
+            return Button::new("workspace")
+                .plain(cx)
+                .xsmall()
+                .text_color(cx.theme().muted_foreground)
+                .tooltip("Attach a project folder")
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(Icon::new(AppIcon::Folder).size_3())
+                        .child("No project"),
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.attach_workspace(window, cx)));
+        };
+        let name = folder
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| folder.display().to_string());
+        let status = self.git_status();
+        let (icon, label) = match status {
+            Some(status) => (AppIcon::Branch, format!("{name} · {}", status.describe())),
+            None => (AppIcon::Folder, name),
         };
         Button::new("workspace")
             .plain(cx)
             .xsmall()
             .text_color(cx.theme().muted_foreground)
-            .tooltip(tip)
+            .tooltip_with_action(
+                format!("{}: see the changes", folder.display()),
+                &crate::ui::changes::ChangesTab,
+                Some("Chat"),
+            )
             .child(
                 h_flex()
                     .gap_1()
                     .items_center()
-                    .child(Icon::new(AppIcon::Folder).size_3())
-                    .child(name),
+                    .child(Icon::new(icon).size_3())
+                    .child(label),
             )
-            .on_click(cx.listener(|this, _, window, cx| this.attach_workspace(window, cx)))
+            .on_click(cx.listener(|this, _, window, cx| this.show_changes(window, cx)))
     }
 
     /// One chip per background job, with a stop button. Only running jobs are

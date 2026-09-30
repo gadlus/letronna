@@ -152,7 +152,12 @@ impl Chat {
                 let browser = self.browser.read(cx);
                 browser.has_content(docked).then(|| browser.waiting())
             }
-            PanelTab::Changes => self.has_changes().then_some(0),
+            // Or while it is the tab asked for, so the status bar's chip
+            // opens it even with nothing to list.
+            PanelTab::Changes => {
+                let chosen = self.panel.tabs.get(&self.session_on_screen()) == Some(&tab);
+                (chosen || self.has_changes()).then_some(0)
+            }
             PanelTab::Files => self.has_files().then_some(0),
         }
     }

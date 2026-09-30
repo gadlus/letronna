@@ -84,6 +84,7 @@ fn main() {
                 ui::capabilities::PrevCapabilityTab,
                 Some("Capabilities"),
             ),
+            KeyBinding::new("secondary-shift-d", ui::changes::ChangesTab, Some("Chat")),
             KeyBinding::new(
                 "shift-enter",
                 gpui_component::input::Enter { secondary: true },
@@ -153,6 +154,14 @@ fn main() {
                 ui::complete::CloseChoices,
                 Some("Completing > Input"),
             ),
+            // The Changes tab's list, once it has the keys.
+            KeyBinding::new("down", ui::changes::NextChange, Some("Changes")),
+            KeyBinding::new("up", ui::changes::PreviousChange, Some("Changes")),
+            KeyBinding::new("enter", ui::changes::OpenChange, Some("Changes")),
+            KeyBinding::new("s", ui::changes::SwitchScope, Some("Changes")),
+            KeyBinding::new("a", ui::changes::AddChange, Some("Changes")),
+            KeyBinding::new("r", ui::changes::RevertChange, Some("Changes")),
+            KeyBinding::new("escape", ui::changes::LeaveChanges, Some("Changes")),
         ]);
         // Windows hands Shift and a digit over as the character they type,
         // Ctrl+Shift+4 as "ctrl-$", which a binding written "shift-4" never

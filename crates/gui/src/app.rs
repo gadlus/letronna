@@ -380,7 +380,7 @@ pub(crate) struct Chat {
     pub(crate) video_frame: Option<std::sync::Arc<RenderImage>>,
     /// The right panel's state: shown or hidden, its width and its tabs.
     pub(crate) panel: crate::ui::panel::Panel,
-    /// The file open in the panel's Changes tab.
+    /// The panel's Changes tab, and the project's git status.
     pub(crate) changes: crate::ui::changes::Changes,
     /// The browser the agent uses, shown beside the chat while it does, and
     /// the session whose browser it shows: each session has its own.
@@ -695,10 +695,12 @@ impl Chat {
                 }
             }),
             // Also on coming to the front, for a change the system did not
-            // report, as on some network folders.
+            // report, as on some network folders; and the user may have
+            // committed or edited elsewhere, so the changes are read again.
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
                     this.follow_sessions(cx);
+                    this.refresh_changes(cx);
                 }
             }),
             cx.subscribe_in(&steer, window, |this, _, event, window, cx| {
@@ -861,7 +863,7 @@ impl Chat {
             video: None,
             video_frame: None,
             panel: Default::default(),
-            changes: Default::default(),
+            changes: crate::ui::changes::Changes::new(cx),
             browser: cx.new(|cx| crate::ui::browser::BrowserView::new(window, cx)),
             browser_for: 0,
             files: crate::ui::files::Files::new(cx),
@@ -2211,6 +2213,10 @@ impl Chat {
                 if let Some(ix) = self.streaming_id.and_then(|id| self.store.index_of(id)) {
                     let conversation = &mut self.store.conversations[ix];
                     conversation.messages.extend(results);
+                    let session = conversation.id;
+                    // The files the tools wrote are noted on these results,
+                    // which are in the conversation only from here.
+                    self.refresh_changes(cx);
                     let looped = self.turn.as_ref().and_then(agent::Turn::looping);
                     if let Some(why) = looped.map(str::to_owned) {
                         // An error, so a schedule's or chat's report says why.
@@ -2218,7 +2224,7 @@ impl Chat {
                         self.save();
                         self.finish(cx);
                     // A hook's `continue: false`, shown with the results.
-                    } else if letronna_core::hooks::halted(conversation.id) {
+                    } else if letronna_core::hooks::halted(session) {
                         self.save();
                         self.finish(cx);
                     } else {
@@ -2338,6 +2344,9 @@ impl Chat {
             turn.finish_call(result);
         }
         self.files.changed();
+        // A tool may have run git; the files it wrote are counted once its
+        // results join the conversation.
+        self.refresh_changes(cx);
         self.show_hook_problems();
         self.advance_tools(cx);
     }
@@ -3798,6 +3807,8 @@ impl Render for Chat {
         // And the composer holds its draft, however the session was switched
         // to: a click, a schedule, or a message from a chat app.
         self.swap_draft(window, cx);
+        // And the Changes tab and the status bar speak of its folder.
+        self.keep_changes_current(cx);
         if self.page == Page::Chat {
             self.unseen.remove(&on_screen);
         }
@@ -4042,6 +4053,13 @@ impl Render for Chat {
                 cx.listener(|this, _: &crate::ui::files::FilesTab, window, cx| {
                     if !window.has_active_dialog(cx) && !this.settings_open {
                         this.open_files_tab(window, cx)
+                    }
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::ui::changes::ChangesTab, window, cx| {
+                    if !window.has_active_dialog(cx) && !this.settings_open {
+                        this.show_changes(window, cx)
                     }
                 }),
             )
