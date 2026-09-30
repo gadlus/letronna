@@ -109,7 +109,7 @@ impl Chat {
 
     /// Put the skill's instructions in the composer of the active chat, ready
     /// to adjust. Sending them is left to the user.
-    fn use_skill(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn use_skill(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(skill) = skills::find(&self.skills, name) else {
             return;
         };

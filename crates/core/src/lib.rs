@@ -55,6 +55,7 @@ pub mod models;
 mod notebook;
 pub mod notify;
 mod page;
+pub mod palette;
 mod patch;
 pub mod paths;
 pub mod permissions;

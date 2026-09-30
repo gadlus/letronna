@@ -65,6 +65,7 @@ fn main() {
             KeyBinding::new("secondary-shift-l", ui::panel::BrowserTab, Some("Chat")),
             KeyBinding::new("secondary-shift-u", ui::usage::OpenUsage, Some("Chat")),
             KeyBinding::new("secondary-shift-a", OpenActivity, Some("Chat")),
+            KeyBinding::new("secondary-k", ui::palette::OpenPalette, Some("Chat")),
             KeyBinding::new(
                 "shift-enter",
                 gpui_component::input::Enter { secondary: true },

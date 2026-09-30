@@ -3,7 +3,7 @@ use letronna_core::gate::Mode;
 
 type ApplyMode = std::rc::Rc<dyn Fn(plugins::PresenceMode, &mut App)>;
 
-const PAGES: &[(&str, AppIcon)] = &[
+pub(crate) const PAGES: &[(&str, AppIcon)] = &[
     ("Account", AppIcon::User),
     ("Usage", AppIcon::Clock),
     ("Gateways", AppIcon::Plugs),
