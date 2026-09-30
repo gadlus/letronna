@@ -42,6 +42,36 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **Terminal** — Notices show and are taken mid-turn and between prompts; lines typed while it works show as queued and can be taken back.
 - **All** — Send now: a queued message goes in without waiting for the step.
 - **App** — Point mode in the browser panel: click a spot on the page, comment on it, and the reference goes in the composer.
+- **All** — Workflows: scripts run in a sandboxed JavaScript engine, Letronna can run one it wrote once you approve it, and Crew (`@crew` or a switch) opts a message into orchestration.
+- **All** — Helpers can work in a git worktree of their own.
+- **All** — `/loop` and `/heartbeat` keep one session going; a session can keep working toward a goal until a check says stop.
+- **All** — Run your own prompts and skills as slash commands, and let the model save, patch and undo skills it learned.
+- **All** — Attach files, line ranges and folders by typing `@path`; the composer offers commands after `/` and references after `@`.
+- **All** — Choose a reply style, or write your own.
+- **All** — Replies can be read aloud as they stream; voice input records to text at the cursor.
+- **All** — Pictures you attach can be edited through the chat's image gateway, and long video renders run as background jobs.
+- **All** — Computer use asks once for each app, on macOS and on Linux under X11.
+- **All** — The browser uploads project files, keeps downloads, saves a page as a PDF, shoots the whole page, hovers, drags, waits for words, acts in frames from other sites and runs steps in a batch.
+- **All** — Fetched pages keep their links, and a PDF is saved as a file; web searches can keep to some sites, skip others or stay recent.
+- **All** — MCP: read resources, run prompts as commands, sign in to servers that use OAuth, and tools get unique names and clean schemas.
+- **All** — Plugins bring skills and MCP servers from a git repository.
+- **All** — Other agents can use Letronna's browser and media tools over MCP, and Zed and JetBrains editors can run Letronna over ACP.
+- **All** — OpenAI models change several files in one patch and one yes.
+- **All** — New errors from a language server reach the model after edits, and a turn that changed files is asked once to build or test them.
+- **All** — A task carries on with a fallback model when its own fails.
+- **All** — A subfolder's AGENTS.md reaches the model when it works there.
+- **All** — `/insights` shows the last weeks by day, hour, tool and model; `/diff` shows what changed in the project and in this session.
+- **All** — Notifications call you back when a run ends or needs you.
+- **All** — Continue a Claude Code or Codex session, in the terminal or the window.
+- **All** — Memory makes several changes in one call, all or none.
+- **All** — Keys and tokens move to the Keychain or Credential Manager.
+- **Terminal** — Other programs can drive `letronna -p` over stdin as JSON lines, and `--mode accept-edits` edits inside the project.
+- **App** — Ctrl+K opens a palette of actions, pages, sessions and models, and a global shortcut opens a quick entry bar from anywhere.
+- **App** — Files and Changes tabs beside the chat: browse and preview the project, review and revert this session's edits, and stage, commit and push.
+- **App** — Capabilities gains Tools and MCP tabs with per-tool switches, and a Plugins page.
+- **App** — A first-run setup page, data-folder profiles, and sidebar filters for session state and project grouping.
+- **App** — HTML and SVG artifacts can be previewed, and a failed turn says why in the chat and offers the fix.
+- **App** — Set up Slack from the Messaging page and pair a member by code.
 
 ### Changed
 - **All** — A failed model request says what went wrong: the key, credit, a rate limit, a busy provider, a conversation too long, and so on.
@@ -66,6 +96,14 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — Long replies are no longer cut off at two minutes; only five minutes of silence ends one.
 - **All** — Unattended runs never stall waiting on a question.
 - **All** — Summaries reuse the chat connection, and a busy background job no longer copies its whole log on every read.
+- **All** — Runs without a window (`-p`, helpers, workflows) keep to deny rules and the safety floor, and a yes for the run no longer covers a worse call after it.
+- **All** — Unattended runs that repeat one call with the same result are stopped.
+- **All** — Jobs are listed, waits match only new output, and a session sees only its own jobs.
+- **All** — A command printing past 4 MiB is saved whole for `read_file`.
+- **All** — Chat-app, web and media calls reuse one warm connection each; cache misses are named with the part that changed.
+- **All** — Inline think blocks stream as reasoning; `read_file` shows notebooks as cells.
+- **App** — The window reads a session in only when it is opened, follows what the terminal writes to sessions, and highlights eight languages instead of twenty-seven.
+- **App** — Session search skips sessions that cannot hold the words, and a reply that moves the window no longer waits for its summary.
 
 ### Fixed
 - **All** — Catastrophic commands, such as deleting your home folder, are refused whatever the approval setting.
@@ -79,6 +117,10 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **Terminal** — `letronna -p` no longer keeps a processor core busy while a reply streams.
 - **All** — Two copies of Letronna starting at once never write into one session.
 - **Terminal** — Background jobs stop when the terminal exits.
+- **All** — Follow-ups and notices sent mid-turn keep the turn's request in view.
+- **All** — `/btw` shares the session's cache and leaves no stale locks.
+- **App** — The window opens again on a session that has messages.
+- **Terminal** — A bad update is put back, and a good one is kept.
 
 ## [0.1.0-alpha.2] - 2026-09-27
 
