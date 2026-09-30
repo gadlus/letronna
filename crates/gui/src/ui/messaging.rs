@@ -31,10 +31,10 @@ const CHANNELS: &[Channel] = &[
     },
     Channel {
         name: "Slack",
-        blurb: "Direct messages and channels.",
+        blurb: "Talk to Letronna in a direct message, or mention it in a channel.",
         icon: "icons/brands/slack.svg",
         colour: 0x611f69,
-        built: false,
+        built: true,
     },
     Channel {
         name: "WhatsApp",
@@ -470,6 +470,7 @@ impl Chat {
         match CHANNELS[index].name {
             "Telegram" => self.messaging.telegram.ready(),
             "Discord" => self.messaging.discord.ready() || self.messaging.discord.bot_ready(),
+            "Slack" => self.messaging.slack.ready(),
             _ => false,
         }
     }
@@ -477,6 +478,7 @@ impl Chat {
     pub(crate) fn messaging_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let pane = match CHANNELS[self.channel].name {
             "Discord" => self.discord_pane(cx).into_any_element(),
+            "Slack" => self.slack_pane(cx).into_any_element(),
             _ => self.telegram_pane(cx).into_any_element(),
         };
         v_flex()
@@ -933,5 +935,376 @@ impl Chat {
                             ),
                     ),
             )
+    }
+}
+
+impl Chat {
+    /// Check both tokens with Slack before keeping them, so a typo, a token
+    /// of the wrong kind or Socket Mode left off is caught here rather than
+    /// by silence later.
+    fn connect_slack(&mut self, cx: &mut Context<Self>) {
+        let app = self.slack_app_input.read(cx).value().trim().to_owned();
+        let bot = self.slack_bot_input.read(cx).value().trim().to_owned();
+        if app.is_empty() || bot.is_empty() {
+            self.error = Some("Add both the app-level token and the bot token.".into());
+            cx.notify();
+            return;
+        }
+        // Checking opens a socket, a call Slack limits; tokens already
+        // checked need not spend one.
+        let slack = &self.messaging.slack;
+        if app == slack.app_token && bot == slack.bot_token {
+            self.messaging.slack.enabled = true;
+            self.save_messaging(cx);
+            return;
+        }
+        self.connecting = true;
+        cx.notify();
+        let entity = cx.entity();
+        cx.spawn(async move |_, cx| {
+            let check = cx
+                .background_executor()
+                .spawn(async move {
+                    let name = messaging::slack_check(&app, &bot)?;
+                    Ok::<_, String>((name, app, bot))
+                })
+                .await;
+            let _ = entity.update(cx, |this, cx| {
+                this.connecting = false;
+                match check {
+                    Ok((name, app, bot)) => {
+                        let slack = &mut this.messaging.slack;
+                        slack.app_token = app;
+                        slack.bot_token = bot;
+                        slack.enabled = true;
+                        this.slack_bot_name = Some(name);
+                        this.save_messaging(cx);
+                    }
+                    Err(error) => this.error = Some(error),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Who the app answers: the member that was paired, the code that pairs
+    /// one, or how to get one.
+    fn slack_member(&self, has_tokens: bool, cx: &mut Context<Self>) -> AnyElement {
+        let owner = self.messaging.slack.owner.trim().to_owned();
+        if !owner.is_empty() {
+            return h_flex()
+                .gap_2()
+                .items_center()
+                .child(help(
+                    &format!("Answering member {owner}, and nobody else."),
+                    cx,
+                ))
+                .child(
+                    Button::new("forget-slack-member")
+                        .plain(cx)
+                        .xsmall()
+                        .label("Forget")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.messaging.slack.owner.clear();
+                            this.save_messaging(cx);
+                        })),
+                )
+                .into_any_element();
+        }
+        if !has_tokens {
+            return help("Add both tokens first.", cx).into_any_element();
+        }
+        let now = std::time::Instant::now();
+        let live = self.slack_code.as_ref().filter(|code| code.live(now));
+        let pair = Button::new("pair-slack-member")
+            .primary()
+            .small()
+            .label(if self.slack_code.is_some() {
+                "New code"
+            } else {
+                "Pair"
+            })
+            .on_click(cx.listener(|this, _, _, cx| {
+                match pairing::Code::new() {
+                    Ok(code) => this.slack_code = Some(code),
+                    Err(error) => this.error = Some(error),
+                }
+                cx.notify();
+            }));
+        let Some(code) = live else {
+            return v_flex()
+                .gap_2()
+                .child(help(
+                    match self.slack_code {
+                        Some(_) => "That code ran out or was guessed at too often.",
+                        None => "Pair makes a code; send it to your app as a direct message.",
+                    },
+                    cx,
+                ))
+                .child(h_flex().child(pair))
+                .into_any_element();
+        };
+        let mut said = format!(
+            "Send this code to your app as a direct message within {} minutes. \
+             Whoever sends it is the one member answered; five wrong codes void it.",
+            pairing::LIFE.as_secs() / 60
+        );
+        if code.wrong() > 0 {
+            said.push_str(&format!(" Wrong codes so far: {}.", code.wrong()));
+        }
+        v_flex()
+            .gap_2()
+            .child(
+                div()
+                    .text_xl()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(code.code.clone()),
+            )
+            .child(help(&said, cx))
+            .child(h_flex().child(pair))
+            .into_any_element()
+    }
+
+    fn slack_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let channel = &CHANNELS[2];
+        let config = &self.messaging.slack;
+        let has_tokens = !config.app_token.trim().is_empty() && !config.bot_token.trim().is_empty();
+        let enabled = config.enabled;
+        let live = config.ready();
+        let allow_tools = config.allow_tools;
+
+        let mut pills = h_flex().flex_wrap().gap_1p5().items_center().child(pill(
+            if live { "Enabled" } else { "Disabled" },
+            if live {
+                cx.theme().green
+            } else {
+                cx.theme().muted_foreground
+            },
+            cx,
+        ));
+        // What the listener says it is doing, not what the settings hope.
+        let state = self.slack_state.as_ref().filter(|_| live);
+        let refused = match state {
+            Some(messaging::SlackState::Refused(why)) => Some(why.clone()),
+            _ => None,
+        };
+        if !has_tokens {
+            pills = pills.child(pill("Needs setup", cx.theme().muted_foreground, cx));
+        } else if refused.is_some() {
+            pills = pills.child(pill("Stopped", cx.theme().danger, cx));
+        } else if live && state != Some(&messaging::SlackState::Listening) {
+            pills = pills.child(pill("Connecting", cx.theme().warning, cx));
+        } else if config.owner.trim().is_empty() {
+            pills = pills.child(pill("Waiting for a member", cx.theme().warning, cx));
+        } else if live {
+            pills = pills.child(pill("Listening", cx.theme().green, cx));
+        }
+
+        let setup = v_flex()
+            .w_full()
+            .min_w_0()
+            .px_6()
+            .py_5()
+            .gap_5()
+            .child(
+                v_flex()
+                    .gap_1p5()
+                    .child(
+                        h_flex()
+                            .flex_wrap()
+                            .gap_2p5()
+                            .items_center()
+                            .child(badge(channel))
+                            .child(
+                                div()
+                                    .text_base()
+                                    .font_family(HEADING_FONT)
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(channel.name),
+                            )
+                            .child(pills),
+                    )
+                    .child(help(channel.blurb, cx)),
+            )
+            .child(v_flex().gap_2().child(section("What this does", cx)).child(help(
+                "You talk to Letronna in a direct message with your app, or by mentioning it \
+                 in a channel it was invited to, where it answers in a thread; your replies \
+                 in that thread reach it without a mention. Send !stop to cancel a reply and \
+                 !new to start over. It only ever hears you: everyone else is ignored. \
+                 Letronna opens the connection to Slack itself, so nothing here has to be \
+                 reachable from the internet. Scheduled jobs report to your direct message.",
+                cx,
+            )))
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(section("Get your credentials", cx))
+                    .child(help(
+                        "Create an app from scratch. Under Socket Mode, turn it on and make an \
+                         app-level token with connections:write. Under Event Subscriptions, \
+                         subscribe the bot to message.im, app_mention, message.channels and \
+                         message.groups. Under OAuth & Permissions, give the bot chat:write, \
+                         im:history, app_mentions:read, channels:history and groups:history, \
+                         then install the app and copy its bot token. Under App Home, let \
+                         people send messages from the Messages tab.",
+                        cx,
+                    ))
+                    .child(
+                        h_flex().child(
+                            Button::new("slack-apps")
+                                .framed(cx)
+                                .xsmall()
+                                .label("Open your Slack apps")
+                                .on_click(|_, _, cx| cx.open_url("https://api.slack.com/apps")),
+                        ),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(section("Required", cx))
+                    .child(field(
+                        "App-level token",
+                        "Starts with xapp-. It opens the connection, and is kept on this machine.",
+                        cx,
+                    ))
+                    .child(
+                        Input::new(&self.slack_app_input)
+                            .small()
+                            .w_full()
+                            .mask_toggle(),
+                    )
+                    .child(field(
+                        "Bot token",
+                        "Starts with xoxb-. It posts the replies, and is kept on this machine.",
+                        cx,
+                    ))
+                    .child(
+                        Input::new(&self.slack_bot_input)
+                            .small()
+                            .w_full()
+                            .mask_toggle(),
+                    )
+                    .when_some(self.slack_bot_name.clone(), |this, name| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().green)
+                                .child(format!("Connected as {name}")),
+                        )
+                    })
+                    .when_some(refused, |this, why| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().danger)
+                                .child(format!("Stopped listening: {why}")),
+                        )
+                    }),
+            )
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(section("Allowed member", cx))
+                    .child(field(
+                        "One member, paired by a code",
+                        "Anyone in the workspace can message an app, so Letronna answers only \
+                         the member who sends the code shown here, and ignores everyone else.",
+                        cx,
+                    ))
+                    .child(self.slack_member(has_tokens, cx)),
+            )
+            .child(
+                v_flex().gap_2().child(section("Recommended", cx)).child(
+                    h_flex()
+                        .w_full()
+                        .min_w_0()
+                        .items_center()
+                        .justify_between()
+                        .gap_4()
+                        // The hint takes what the switch leaves, or it
+                        // shrinks to a letter per line.
+                        .child(div().flex_1().min_w_0().child(field(
+                            "Let messages use tools",
+                            "Off, a message can read and search but not write or run \
+                             anything, because nobody on the other end can answer an \
+                             approval card.",
+                            cx,
+                        )))
+                        .child(
+                            div().flex_shrink_0().cursor_pointer().child(
+                                gpui_component::switch::Switch::new("slack-allow-tools")
+                                    .checked(allow_tools)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.messaging.slack.allow_tools = !allow_tools;
+                                        this.save_messaging(cx);
+                                    })),
+                            ),
+                        ),
+                ),
+            );
+
+        let footer = h_flex()
+            .w_full()
+            .flex_wrap()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .px_6()
+            .py_3()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .gap_2p5()
+                    .items_center()
+                    .child(
+                        div().flex_shrink_0().cursor_pointer().child(
+                            gpui_component::switch::Switch::new("slack-enabled")
+                                .checked(enabled)
+                                .disabled(!has_tokens)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.messaging.slack.enabled = !enabled;
+                                    this.save_messaging(cx);
+                                })),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if has_tokens {
+                                "Listen for messages"
+                            } else {
+                                "Add both tokens to enable"
+                            }),
+                    ),
+            )
+            .child(
+                Button::new("save-slack")
+                    .primary()
+                    .small()
+                    .label("Save changes")
+                    .loading(self.connecting)
+                    .disabled(self.connecting)
+                    .on_click(cx.listener(|this, _, _, cx| this.connect_slack(cx))),
+            );
+
+        v_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .child(
+                div()
+                    .id("slack-setup")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(setup),
+            )
+            .child(footer)
     }
 }
