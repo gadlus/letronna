@@ -1,12 +1,23 @@
-//! `letronna mcp`: add, list, get and remove the MCP servers in `mcp.json`.
+//! `letronna mcp`: add, list, get and remove the MCP servers in `mcp.json`,
+//! and `serve`, which offers Letronna's own tools to other MCP clients.
 //!
 //! The flags are Claude Code's own, so a server's README that says `claude
 //! mcp add ...` works with `letronna` in its place. Letronna keeps one list
 //! for every folder, so `user` is the only scope it takes, and it signs in to
 //! no server yet, so the OAuth flags are refused rather than dropped.
 
+use crate::bar::Bar;
 use crate::render;
+use crate::session::Runner;
+use letronna_core::approvals::{self, Decision};
+use letronna_core::chat::{self, Message, ToolCall};
+use letronna_core::driver::{self, Allow, Outcome, Spec};
+use letronna_core::gate::{self, Gate, Grants, Mode};
 use letronna_core::mcp::{self, ServerStatus, State};
+use letronna_core::mcp_serve;
+use letronna_core::permissions::{self, Rule};
+use letronna_core::store::Transcript;
+use letronna_core::tools::ToolContext;
 use serde_json::{Map, Value, json};
 use std::time::Duration;
 
@@ -21,6 +32,12 @@ Manage the MCP servers in mcp.json
   letronna mcp list              every server, started to see it answer
   letronna mcp get <name>        one server in full
   letronna mcp remove <name>     take one out
+  letronna mcp serve [options]   offer the browser, media and search tools
+                                 to another agent over stdio
+
+Options for serve
+      --yes                run tools that need a yes without one
+      --allow-turn         also offer letronna_turn, a whole agent turn
 
 Options for add
   -t, --transport <kind>   stdio (a command run here) or http; a URL means http
@@ -47,6 +64,16 @@ pub fn run(words: &[String]) -> i32 {
     if wants_help || matches!(verb, "" | "help" | "-h" | "--help") {
         print!("{HELP}");
         return 0;
+    }
+    // Its stdout is the protocol's, so its one failure goes to stderr.
+    if verb == "serve" {
+        return match serve(rest) {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("{error}");
+                1
+            }
+        };
     }
     let done = match verb {
         "add" => add(rest),
@@ -175,6 +202,133 @@ fn get(name: &str) -> Result<(), String> {
         "To remove it: letronna mcp remove {name}"
     )));
     Ok(())
+}
+
+/// Serve Letronna's tools over stdin and stdout until the client hangs up.
+fn serve(words: &[String]) -> Result<(), String> {
+    let (mut yes, mut allow_turn) = (false, false);
+    for word in words {
+        match word.as_str() {
+            "--yes" => yes = true,
+            "--allow-turn" => allow_turn = true,
+            other => {
+                return Err(format!(
+                    "`letronna mcp serve` takes --yes and --allow-turn, not {other}."
+                ));
+            }
+        }
+    }
+    letronna_core::diag::init("cli");
+    let settings = letronna_core::store::load_listing().settings;
+    letronna_core::browser::share_browser(settings.browser_shared);
+    std::thread::spawn(letronna_core::browser::close_left_over);
+    let turn = allow_turn.then(|| {
+        // Served once, before any turn: a request with nobody serving is
+        // declined at once, and there is no keyboard behind this stdin.
+        answer_from_gate(yes);
+        let turn: mcp_serve::Turn = Box::new(move |prompt| turn(prompt, yes));
+        turn
+    });
+    let mut server = mcp_serve::Server::new(mcp_serve::exposed(), yes, turn);
+    let served = mcp_serve::serve(&mut server, std::io::stdin().lock(), std::io::stdout());
+    // A hidden browser, a job or an MCP server of our own would outlive the
+    // client unseen.
+    letronna_core::browser::close_hidden();
+    letronna_core::jobs::stop_all();
+    mcp::stop_all();
+    letronna_core::diag::stop();
+    served
+}
+
+/// Answers the calls a turn asks a yes for as the gate settles a helper's
+/// with no terminal to ask on, saying why one was refused on stderr, since
+/// stdout is the protocol's.
+fn answer_from_gate(yes: bool) {
+    let requests = approvals::serve();
+    std::thread::spawn(move || {
+        for request in requests {
+            // Read afresh each time, since the window may have added one.
+            let rules = permissions::load(&permissions::user_file());
+            let decision = decided(&request.call, request.root, yes, &rules);
+            if let Decision::Deny(why) = &decision {
+                eprintln!("`{}`: {why}", request.call.name);
+            }
+            request.answer(decision);
+        }
+    });
+}
+
+/// What the gate makes of `call` in session `root` with nobody to ask, as
+/// the terminal settles a helper's: in Bypass under --yes, so a yes to every
+/// card still leaves the floor and the user's deny and ask rules to refuse.
+fn decided(call: &ToolCall, root: u64, yes: bool, rules: &Result<Vec<Rule>, String>) -> Decision {
+    let mut ctx = ToolContext::default();
+    ctx.conversation = root;
+    ctx.workspace = std::env::current_dir().ok();
+    let mode = if yes { Mode::Bypass } else { Mode::Default };
+    let none = Grants::new();
+    match gate::decide(call, &Gate::for_terminal(&ctx, &none, rules, mode, false)) {
+        gate::Outcome::Run => Decision::Once,
+        gate::Outcome::Refuse(why) => Decision::Deny(why),
+        // With nobody to answer the gate refuses rather than asks; a card
+        // here would be a yes nobody gave.
+        gate::Outcome::Ask => Decision::Deny(String::new()),
+    }
+}
+
+/// Runs `prompt` as `letronna -p` would, in a session of its own that is
+/// listed with the rest, and gives the last thing the agent said.
+fn turn(prompt: &str, yes: bool) -> Result<String, String> {
+    let mut runner = Runner {
+        store: letronna_core::store::load_listing(),
+        allowed: Default::default(),
+        mode: if yes { Mode::Bypass } else { Mode::Default },
+        human: false,
+        trouble: None,
+        bar: Bar::new(String::new()),
+        stopped: false,
+        images: Vec::new(),
+    };
+    let session = runner.start(std::env::current_dir().ok());
+    let connection = runner.connection(session);
+    chat::validate(&connection)?;
+    let mut conversation = runner.store.conversations.remove(session);
+    conversation.title = prompt.chars().take(40).collect();
+    conversation.messages.push(Message {
+        role: "user".into(),
+        content: prompt.to_owned(),
+        ..Default::default()
+    });
+    let id = conversation.id;
+    // The run is the only writer of the session's file, which lists it.
+    let report = driver::run(Spec {
+        connection,
+        transcript: Transcript {
+            path: letronna_core::store::sessions_dir().join(format!("{id}.jsonl")),
+            conversation,
+        },
+        id,
+        owner: id,
+        root: id,
+        run: id,
+        label: "Letronna".into(),
+        allow: Allow::All,
+        rounds: letronna_core::agent::MAX_ROUNDS,
+        cancel: Default::default(),
+        budget: None,
+        status: Default::default(),
+        depth: 0,
+        fork: false,
+        from: 0,
+        schema: None,
+    });
+    for problem in letronna_core::hooks::problems() {
+        eprintln!("{problem}");
+    }
+    match report.status {
+        Outcome::Failed(why) => Err(why),
+        _ => Ok(report.text),
+    }
 }
 
 /// Every server, once each has answered or had `HEALTH_WAIT` to.
@@ -339,10 +493,50 @@ fn is_header(word: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use letronna_core::permissions::Effect;
 
     fn read(words: &[&str]) -> Result<(String, Value), String> {
         let words: Vec<String> = words.iter().map(|w| w.to_string()).collect();
         entry(&words)
+    }
+
+    /// A turn's `run_command` call of `line`.
+    fn command(line: &str) -> ToolCall {
+        ToolCall {
+            name: "run_command".into(),
+            arguments: json!({"command": line}).to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_turns_calls_under_yes_still_meet_the_floor_and_the_deny_rules() {
+        let none = Ok(Vec::new());
+        assert_eq!(decided(&command("ls"), 1, true, &none), Decision::Once);
+        let Decision::Deny(why) = decided(&command("rm -rf victim"), 1, true, &none) else {
+            panic!("a folder was deleted with nobody to ask");
+        };
+        assert!(why.contains("nobody"), "{why}");
+        let denied = Ok(vec![Rule {
+            tool: "run_command".into(),
+            pattern: "ls".into(),
+            effect: Effect::Deny,
+            project: None,
+        }]);
+        let Decision::Deny(why) = decided(&command("ls"), 1, true, &denied) else {
+            panic!("a denied command ran");
+        };
+        assert!(why.contains("permission rule denies"), "{why}");
+    }
+
+    #[test]
+    fn a_turns_calls_without_yes_are_refused_unless_they_only_read() {
+        let none = Ok(Vec::new());
+        assert!(matches!(
+            decided(&command("touch made"), 1, false, &none),
+            Decision::Deny(_)
+        ));
+        assert_eq!(decided(&command("ls"), 1, false, &none), Decision::Once);
     }
 
     #[test]

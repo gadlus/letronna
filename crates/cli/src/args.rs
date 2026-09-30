@@ -15,6 +15,7 @@ Letronna — a small agent in your terminal
   letronna update          install the newest version
   letronna doctor          check the setup, the disk and the gateway
   letronna mcp             add, list, get or remove MCP servers
+  letronna mcp serve       offer the browser, media and search tools over MCP
   letronna --uninstall     take it off again
 
 Options

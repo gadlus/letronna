@@ -40,6 +40,7 @@ pub mod judge;
 pub mod limits;
 mod login_env;
 pub mod mcp;
+pub mod mcp_serve;
 mod mcp_find;
 pub mod media;
 pub mod memory;
