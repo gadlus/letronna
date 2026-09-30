@@ -866,10 +866,11 @@ mod tests {
             .collect()
     }
 
+    /// The entries' paths spelled with `/`, which Windows writes as `\`.
     fn paths(entries: &[Entry]) -> Vec<String> {
         entries
             .iter()
-            .map(|entry| entry.path.display().to_string())
+            .map(|entry| entry.path.display().to_string().replace('\\', "/"))
             .collect()
     }
 
