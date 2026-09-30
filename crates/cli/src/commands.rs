@@ -6,7 +6,7 @@ use letronna_core::fallback::Fallback;
 use letronna_core::gate::Mode;
 use letronna_core::skills::{Skill, Source};
 use letronna_core::slash::{self, Origin};
-use letronna_core::{history, store};
+use letronna_core::{goal, history, store};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
@@ -281,6 +281,20 @@ pub fn command(
         }
         "/btw" => {
             aside(runner, *session, rest);
+            Flow::Handled
+        }
+        "/goal" => {
+            let goal = &mut runner.store.conversations[*session].goal;
+            let said = goal::apply_command(goal, goal::parse(rest));
+            runner.persist();
+            runner.show_goal();
+            render::blank();
+            match said {
+                Ok(said) => said
+                    .lines()
+                    .for_each(|line| render::line(&render::dim(line))),
+                Err(error) => render::line(&render::red(&error)),
+            }
             Flow::Handled
         }
         "/image" => {
@@ -2075,6 +2089,7 @@ fn branch(runner: &mut Runner, session: &mut usize, name: &str) {
     *session = runner.store.conversations.len() - 1;
     runner.store.active = *session;
     runner.persist();
+    runner.show_goal();
     render::blank();
     render::line(&render::dim(&format!(
         "Now in {title}. The original is kept; /resume goes back to it."

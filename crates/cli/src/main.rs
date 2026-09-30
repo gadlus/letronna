@@ -391,6 +391,13 @@ fn begin(
         return Err(format!("There is no tool called `{name}`."));
     }
     let conversation = &mut runner.store.conversations[session];
+    // One turn and out: nobody is there to watch a loop or stop it.
+    if conversation.goal.is_some() {
+        eprintln!(
+            "This session has a goal, but goals are pursued only in the terminal and the \
+             window, not with -p: this runs one turn."
+        );
+    }
     if conversation.messages.is_empty() && conversation.title.is_empty() {
         conversation.title = prompt.chars().take(40).collect();
     }

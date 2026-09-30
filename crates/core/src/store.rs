@@ -58,6 +58,9 @@ pub struct Conversation {
     /// How hard the model thinks in this session; `None` follows the settings.
     #[serde(default)]
     pub effort: Option<String>,
+    /// What the session keeps working toward after each turn, if anything.
+    #[serde(default)]
+    pub goal: Option<crate::goal::Goal>,
     /// Messages already on disk. Everything past this is appended on save.
     /// Only `flush` and `rewind` should touch it; it is visible because
     /// callers build a Conversation with `..Default::default()`.
@@ -114,6 +117,8 @@ pub struct Meta {
     pub gateway: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<crate::goal::Goal>,
 }
 
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -706,6 +711,7 @@ impl Conversation {
             model: self.model.clone(),
             gateway: self.gateway.clone(),
             effort: self.effort.clone(),
+            goal: self.goal.clone(),
         }
     }
 
@@ -879,6 +885,7 @@ impl Conversation {
                 self.model = meta.model;
                 self.gateway = meta.gateway;
                 self.effort = meta.effort;
+                self.goal = meta.goal;
             }
             Record::Message(message) => self.messages.push(message),
             Record::Rewind { to } => {
@@ -1116,6 +1123,8 @@ pub struct Summary {
     pub model: Option<String>,
     pub gateway: Option<String>,
     pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<crate::goal::Goal>,
 }
 
 /// The sessions on disk, newest first, without loading what is in them.
@@ -1322,6 +1331,7 @@ fn tally(summary: &mut Summary, bytes: &[u8]) {
                 summary.model = meta.model;
                 summary.gateway = meta.gateway;
                 summary.effort = meta.effort;
+                summary.goal = meta.goal;
             }
             Ok(Record::Message(_)) => summary.messages += 1,
             Ok(Record::Rewind { to }) => summary.messages = summary.messages.min(to),
@@ -1578,6 +1588,50 @@ fn conversation_files() -> Vec<(u64, PathBuf)> {
     }
     files.sort();
     files
+}
+
+/// Keeps with session `session`'s helpers, where `spent` counts them, the
+/// model calls saved in the throwaway conversation at `aside`, such as a
+/// goal check's: what each took and cost, and nothing it said.
+pub(crate) fn keep_calls(aside: &std::path::Path, session: u64) -> std::io::Result<()> {
+    let Some(aside) = replay(aside) else {
+        return Ok(());
+    };
+    let mut out = String::new();
+    for reply in aside.messages.iter().filter(|m| m.role == "assistant") {
+        let call = Message {
+            role: reply.role.clone(),
+            model: reply.model.clone(),
+            tokens: reply.tokens,
+            prompt_tokens: reply.prompt_tokens,
+            cached_tokens: reply.cached_tokens,
+            cache_write_tokens: reply.cache_write_tokens,
+            reasoning_tokens: reply.reasoning_tokens,
+            cost: reply.cost,
+            cost_estimated: reply.cost_estimated,
+            summary_usage: reply.summary_usage,
+            at: reply.at,
+            ..Default::default()
+        };
+        push(&mut out, &Record::Message(call));
+    }
+    if out.is_empty() {
+        return Ok(());
+    }
+    let dir = helpers_dir(session);
+    std::fs::create_dir_all(&dir)?;
+    // Not a number, so no helper's conversation is ever given this name.
+    let path = dir.join("calls.jsonl");
+    let _lock = Lock::take(&path)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .read(true)
+        .open(&path)?;
+    if torn(&mut file)? {
+        out.insert(0, '\n');
+    }
+    file.write_all(out.as_bytes())
 }
 
 /// Whether the file at `path` was written to at `since` or later, or might
@@ -2166,6 +2220,7 @@ pub fn load_listing() -> Store {
                 model: s.model,
                 gateway: s.gateway,
                 effort: s.effort,
+                goal: s.goal,
                 counted: s.messages,
                 ..Default::default()
             };
@@ -5305,5 +5360,66 @@ pub(crate) mod tests {
         assert!(listing.conversations[0].messages.is_empty());
         assert_eq!(listing.conversations[0].length(), 2);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_goal_checks_calls_count_in_usage_without_what_it_said() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("goal-calls");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        for (at, answer) in [(500, "first verdict"), (560, "second verdict")] {
+            let mut aside = Transcript::aside(7, None).unwrap();
+            aside.conversation.messages = vec![
+                said("user", "the question"),
+                Message {
+                    model: "judge".into(),
+                    tokens: 40,
+                    prompt_tokens: 800,
+                    cost: Some(0.002),
+                    at,
+                    ..said("assistant", answer)
+                },
+            ];
+            aside.save().unwrap();
+            super::keep_calls(&aside.path, 7).unwrap();
+        }
+        let spent = super::spent(0, 7);
+        assert_eq!(spent.len(), 2, "{spent:?}");
+        assert!(spent.iter().all(|call| {
+            (
+                call.session,
+                call.model.as_str(),
+                call.usage.output,
+                call.usage.input,
+            ) == (7, "judge", 40, 800)
+                && call.usage.cost == Some(0.002)
+                && !call.copy
+        }));
+        let kept = std::fs::read_to_string(dir.join("agents/7/calls.jsonl")).unwrap();
+        assert!(
+            !kept.contains("verdict") && !kept.contains("question"),
+            "{kept}"
+        );
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_goal_is_kept_with_its_session_and_cleared_on_disk_too() {
+        let dir = scratch("goal");
+        let path = dir.join("1.jsonl");
+        let mut conversation = tagged(1, "goal");
+        conversation.flush_to(&path).unwrap();
+        // A session without one writes no more than before goals existed.
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("goal\""));
+        let goal = crate::goal::Goal {
+            continuations: 3,
+            ..crate::goal::Goal::new("ship it", Some("cargo test".into()))
+        };
+        conversation.goal = Some(goal.clone());
+        conversation.flush_to(&path).unwrap();
+        assert_eq!(replay(&path).unwrap().goal, Some(goal));
+        conversation.goal = None;
+        conversation.flush_to(&path).unwrap();
+        assert_eq!(replay(&path).unwrap().goal, None);
     }
 }

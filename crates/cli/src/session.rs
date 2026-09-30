@@ -14,7 +14,7 @@ use letronna_core::inbox;
 use letronna_core::notify::{self, Why};
 use letronna_core::speech::{self, Voice};
 use letronna_core::store::{Conversation, Store};
-use letronna_core::{hooks, permissions, tools};
+use letronna_core::{goal, hooks, permissions, tools};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -114,6 +114,7 @@ impl Runner {
                 conversation.title = shown.chars().take(40).collect();
             }
             conversation.updated = chat::now();
+            goal::interrupted(&mut conversation.goal);
         }
         // What came meanwhile goes in ahead of the prompt, so the user's
         // words are the last thing the model reads.
@@ -128,7 +129,8 @@ impl Runner {
         });
         self.persist();
 
-        self.run(connection, session)
+        let answer = self.run(connection, session);
+        self.pursue(session, answer)
     }
 
     /// Run a turn on the notices waiting for an idle session, with nothing
@@ -145,7 +147,95 @@ impl Runner {
         let connection = self.connection(session);
         chat::validate(&connection)?;
         self.take_notices(session, true);
-        self.run(connection, session)
+        let answer = self.run(connection, session);
+        self.pursue(session, answer)
+    }
+
+    /// After a turn that ended by itself, looks at the session's goal and
+    /// carries on toward it, turn after turn, until the look says to stop.
+    /// A stop, or anything typed, ends it where it is.
+    fn pursue(
+        &mut self,
+        session: usize,
+        mut answer: Result<String, String>,
+    ) -> Result<String, String> {
+        loop {
+            if self.stopped || self.bar.finished() {
+                goal::interrupted(&mut self.store.conversations[session].goal);
+                self.persist();
+                self.show_goal();
+                return answer;
+            }
+            // What was typed is the user's next turn, which the goal waits for.
+            if answer.is_err() || self.bar.has_queued() {
+                return answer;
+            }
+            let Some(standing) = goal::active(&self.store.conversations[session].goal) else {
+                return answer;
+            };
+            let connection = self.connection(session);
+            let reply = (self.store.conversations[session].messages.iter())
+                .rfind(|message| message.role == "assistant")
+                .map(|message| message.content.clone())
+                .unwrap_or_default();
+            let cancel = Cancel::default();
+            let (sender, receiver) = mpsc::sync_channel(1);
+            let (asking, stop, judged) = (connection.clone(), cancel.clone(), standing.clone());
+            std::thread::spawn(move || {
+                let _ = sender.send(goal::review(&judged, &asking, &reply, &stop));
+            });
+            self.bar.working(true);
+            self.bar.wait_line_about("goal check");
+            let waited = self.wait_on(&receiver);
+            self.bar.wait_line(false);
+            self.bar.working(false);
+            let step = match waited {
+                Ok(_) if self.bar.has_queued() => goal::Step::Cleared,
+                Ok(step) => step,
+                Err(Unheard::Stopped) => {
+                    // Stopped as a turn is, so a ring waits for the user too.
+                    self.stopped = true;
+                    render::blank();
+                    render::said(&render::dim("●"), &render::dim("Stopped."));
+                    goal::Step::Cleared
+                }
+                Err(Unheard::Gone) => goal::Step::Pause {
+                    notice: "The goal check ended without a verdict. The goal is paused; \
+                             /goal resume carries on."
+                        .into(),
+                    why: "the check failed".into(),
+                },
+            };
+            cancel.set();
+            let conversation = &mut self.store.conversations[session];
+            if !goal::settle(&mut conversation.goal, &standing, &step) {
+                return answer;
+            }
+            let (notice, message) = match step {
+                goal::Step::Continue { notice, message } => (notice, Some(message)),
+                goal::Step::Done(notice)
+                | goal::Step::Pause { notice, .. }
+                | goal::Step::Deferred(notice) => (notice, None),
+                goal::Step::Cleared => {
+                    goal::interrupted(&mut conversation.goal);
+                    self.persist();
+                    self.show_goal();
+                    return answer;
+                }
+            };
+            render::blank();
+            render::said(&render::dim("●"), &render::dim(&notice));
+            self.show_goal();
+            let Some(message) = message else {
+                self.persist();
+                return answer;
+            };
+            let conversation = &mut self.store.conversations[session];
+            conversation.messages.push(goal::continuation(message));
+            conversation.updated = chat::now();
+            self.persist();
+            answer = self.run(connection, session);
+        }
     }
 
     /// Ask a side question about the session on a fork of it, with no tools
@@ -1016,9 +1106,18 @@ impl Runner {
             letronna_core::store::fill(conversation);
             self.bar.set_plan(&conversation.todos);
         }
+        self.show_goal();
         // Each session has its own model, and the footer names it.
         let note = crate::banner::footer(self);
         self.bar.set_footer(note);
+    }
+
+    /// Show the open session's goal over the box, as the window does, or
+    /// nothing when it has none.
+    pub fn show_goal(&mut self) {
+        let conversation = self.store.conversations.get(self.store.active);
+        let line = conversation.and_then(|c| c.goal.as_ref().map(goal::Goal::line));
+        self.bar.set_goal(line);
     }
 
     /// A session of its own.
@@ -1033,6 +1132,7 @@ impl Runner {
         let index = self.store.conversations.len() - 1;
         self.store.active = index;
         self.bar.set_plan(&[]);
+        self.bar.set_goal(None);
         let note = crate::banner::footer(self);
         self.bar.set_footer(note);
         index

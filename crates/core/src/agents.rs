@@ -1480,6 +1480,65 @@ pub fn btw(
     }
 }
 
+/// Puts `question` alone to the helpers' model, or the session's when none
+/// is set, on a run that offers no tool and makes one request, until
+/// `cancel` stops it, and gives back what it said. For a quick look that
+/// needs none of the conversation, so it costs the same however long that
+/// is. Only what it cost is kept, where /usage counts it for the session.
+pub fn quick(connection: &Connection, question: &str, cancel: Cancel) -> Result<String, String> {
+    let session = connection.conversation;
+    let id = fresh_id();
+    let mut transcript = Transcript::aside(session, connection.workspace.clone())?;
+    let path = transcript.path.clone();
+    transcript.conversation.messages = vec![Message {
+        role: "user".into(),
+        content: question.to_owned(),
+        ..Default::default()
+    }];
+    let mut asking = child(connection, &AgentDef::default(), None, &Limits::read(), id);
+    // No tool schemas either, which would cost more than the question.
+    asking.tools = false;
+    asking.wrap_up = true;
+    // A look is one short verdict: thinking at the session's level would cost
+    // hundreds of tokens more for nothing it needs.
+    asking.effort = "low".into();
+    let report = driver::run(Spec {
+        connection: asking,
+        transcript,
+        id,
+        owner: session,
+        root: session,
+        run: id,
+        label: "check".into(),
+        allow: Allow::Only(Vec::new()),
+        rounds: 0,
+        cancel,
+        budget: None,
+        status: Arc::default(),
+        depth: 1,
+        fork: false,
+        from: 0,
+        schema: None,
+        decide: None,
+        watch: None,
+    });
+    // A cost that cannot be written down is no reason to lose the answer.
+    let _ = crate::store::keep_calls(&path, session);
+    let _ = std::fs::remove_file(path.with_extension("lock"));
+    let _ = std::fs::remove_file(path);
+    match report.status {
+        Outcome::Stopped => Err("Stopped.".into()),
+        Outcome::Failed(error) => Err(error),
+        _ if report.text.trim().is_empty() => Err("No answer came.".into()),
+        _ => Ok(report.text),
+    }
+}
+
+/// An id no helper, run or other agent has, for one that needs its own.
+pub(crate) fn fresh_id() -> AgentId {
+    NEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 /// What the agent that started a helper hears back: how it went, what it
 /// changed, and its report cut to `share` characters, keeping both ends.
 fn answer(name: &str, report: &Report, rounds: usize, share: usize) -> Result<String, String> {
@@ -3557,6 +3616,29 @@ mod tests {
         let sent = stub.sent();
         let last = sent[0]["messages"].as_array().unwrap().last().unwrap();
         assert_eq!(last["content"], format!("{ASIDE_HEADER}\nwhat did it say?"));
+    }
+
+    #[test]
+    fn a_quick_look_thinks_little_offers_no_tools_and_is_counted() {
+        let session = Session::new("quick-look");
+        let (endpoint, stub) = Stub::start(vec![reply("It is done.", None)]);
+        let ctx = session.context(endpoint);
+        let mut connection = ctx.caller.connection.as_deref().unwrap().clone();
+        connection.effort = "high".into();
+        let answer = quick(&connection, "is it done?", Cancel::default());
+        assert_eq!(answer, Ok("It is done.".into()));
+        let sent = stub.sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["reasoning_effort"], "low", "{}", sent[0]);
+        assert!(sent[0].get("tools").is_none(), "{}", sent[0]);
+        // What it cost is kept where /usage counts it, and nothing else is.
+        let spent = crate::store::spent(0, connection.conversation);
+        let counted = spent
+            .iter()
+            .filter(|call| call.session == connection.conversation);
+        assert_eq!(counted.count(), 1, "{spent:?}");
+        let asides = session.data.join("asides");
+        assert!(std::fs::read_dir(asides).map_or(true, |dir| dir.count() == 0));
     }
 
     /// A fork call that waits for its report.

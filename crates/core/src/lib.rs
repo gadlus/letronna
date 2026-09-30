@@ -32,6 +32,7 @@ mod filestate;
 pub mod gate;
 pub mod gateway;
 pub mod git;
+pub mod goal;
 mod grep;
 pub mod history;
 pub mod hooks;
