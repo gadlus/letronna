@@ -220,6 +220,10 @@ pub fn command(
             jobs(rest);
             Flow::Handled
         }
+        "/loop" | "/heartbeat" => {
+            looping(runner, *session, line, rest);
+            Flow::Handled
+        }
         "/agents" => {
             agents(runner.store.conversations[*session].id, rest);
             Flow::Handled
@@ -2430,6 +2434,19 @@ fn typed_path(raw: &str, workspace: Option<&std::path::Path>) -> std::path::Path
     match workspace {
         Some(folder) => folder.join(path),
         None => path,
+    }
+}
+
+/// Start, stop or show the open session's loop.
+fn looping(runner: &Runner, session: usize, name: &str, rest: &str) {
+    let id = runner.store.conversations[session].id;
+    let Some(done) = letronna_core::wake::command(id, name, rest) else {
+        return;
+    };
+    render::blank();
+    match done {
+        Ok(said) => render::line(&render::dim(&said)),
+        Err(why) => render::line(&render::red(&why)),
     }
 }
 

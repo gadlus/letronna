@@ -14,6 +14,7 @@ use letronna_core::inbox;
 use letronna_core::notify::{self, Why};
 use letronna_core::speech::{self, Voice};
 use letronna_core::store::{Conversation, Store};
+use letronna_core::wake;
 use letronna_core::{goal, hooks, permissions, tools};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -305,6 +306,16 @@ impl Runner {
         }
         self.tell_ended();
         self.bar.working(false);
+        // The session's loop goes round again from the turn that took its
+        // tick, and a stop ends it.
+        let id = self.store.conversations[session].id;
+        let ended = (!self.stopped).then(|| answer.as_deref().unwrap_or_default());
+        if let Some(said) = wake::turn_ended(id, ended) {
+            render::blank();
+            render::line(&render::dim(&said));
+            // Nothing else paints until the next key.
+            crate::screen::settle();
+        }
         answer
     }
 

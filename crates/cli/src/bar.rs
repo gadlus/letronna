@@ -115,6 +115,14 @@ pub const COMMANDS: &[Command<'static>] = &[
         blurb: "commands still running in the background",
     },
     Command {
+        name: "/loop",
+        blurb: "run a prompt every so often, or at the model's pace; /loop stop ends it",
+    },
+    Command {
+        name: "/heartbeat",
+        blurb: "look in on this session every so many minutes",
+    },
+    Command {
         name: "/agents",
         blurb: "helpers working for this session; stop one or tell it something",
     },

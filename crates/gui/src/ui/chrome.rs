@@ -318,6 +318,31 @@ impl Chat {
         )
     }
 
+    /// The loop in the session on screen, if it has one, with a stop button.
+    fn loop_chip(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let session = self.store.conversations[self.store.active].id;
+        let about = letronna_core::wake::looping(session)?;
+        Some(
+            Button::new("loop")
+                .ghost()
+                .xsmall()
+                .text_color(cx.theme().muted_foreground)
+                .tooltip(format!("{about} — click to stop"))
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(Icon::new(AppIcon::Reload).size_3())
+                        .child("Loop")
+                        .child(Icon::new(IconName::Close).size_3()),
+                )
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    letronna_core::wake::stop(session);
+                    cx.notify();
+                })),
+        )
+    }
+
     /// How many helpers are working, while any are; click to see them.
     fn helper_pill(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let working = self.helpers_working();
@@ -353,6 +378,7 @@ impl Chat {
             .child(self.gateway_chip(cx))
             .child(self.workspace_chip(cx))
             .child(self.job_chips(cx))
+            .children(self.loop_chip(cx))
             .children(self.helper_pill(cx))
             .child(div().flex_1())
             .children(self.update_chip(cx))
