@@ -379,6 +379,8 @@ pub(crate) struct Chat {
     /// the session whose browser it shows: each session has its own.
     pub(crate) browser: Entity<crate::ui::browser::BrowserView>,
     pub(crate) browser_for: u64,
+    /// The Files tab's tree and preview.
+    pub(crate) files: crate::ui::files::Files,
     /// The composer holds the draft of the session `draft_for`; the other
     /// sessions' drafts wait here, by session id.
     pub(crate) drafts: std::collections::HashMap<u64, String>,
@@ -676,6 +678,9 @@ impl Chat {
                     this.send_steer(window, cx);
                 }
             }),
+            cx.observe_window_activation(window, |this, window, cx| {
+                this.files_on_front(window, cx)
+            }),
         ];
         // The message when the old skills.json will not move across, or the
         // skills cannot be read at all; the Skills page shows it too.
@@ -828,6 +833,7 @@ impl Chat {
             changes: Default::default(),
             browser: cx.new(|cx| crate::ui::browser::BrowserView::new(window, cx)),
             browser_for: 0,
+            files: crate::ui::files::Files::new(cx),
             drafts: std::collections::HashMap::new(),
             draft_for,
             attachments: std::collections::HashMap::new(),
@@ -2285,6 +2291,7 @@ impl Chat {
         if let Some(turn) = self.turn.as_mut() {
             turn.finish_id(id, result);
         }
+        self.files.changed();
         self.show_hook_problems();
         // The calls still running are drawn from the queue, which just lost one.
         cx.notify();
@@ -2296,6 +2303,7 @@ impl Chat {
         if let Some(turn) = self.turn.as_mut() {
             turn.finish_call(result);
         }
+        self.files.changed();
         self.show_hook_problems();
         self.advance_tools(cx);
     }
@@ -3761,6 +3769,7 @@ impl Render for Chat {
         }
         self.open_on_screen(cx);
         self.lay_out_turns();
+        self.keep_files_current(window, cx);
         // What a stopped or failed reply did not take goes back in the box,
         // ahead of anything typed since.
         if let Some(text) = self.returned_follow_ups.take() {
@@ -3985,6 +3994,13 @@ impl Render for Chat {
                 cx.listener(|this, _: &crate::ui::panel::BrowserTab, window, cx| {
                     if !window.has_active_dialog(cx) && !this.settings_open {
                         this.show_tab(crate::ui::panel::PanelTab::Browser, window, cx)
+                    }
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::ui::files::FilesTab, window, cx| {
+                    if !window.has_active_dialog(cx) && !this.settings_open {
+                        this.open_files_tab(window, cx)
                     }
                 }),
             )
