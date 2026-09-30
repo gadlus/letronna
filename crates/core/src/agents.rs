@@ -3166,7 +3166,7 @@ mod tests {
         let out = call(session.context(endpoint), args).unwrap();
         let sent = provider.sent();
 
-        assert_eq!(results(&sent[1]), ["a repository"]);
+        assert_eq!(results(&sent[1]), ["1|a repository"]);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(
             lines[1..],
@@ -3215,7 +3215,7 @@ mod tests {
         let recorded = &sidecar(&session, 1)["worktree"];
         assert_eq!(recorded["path"], json!(tree));
         assert_eq!(recorded["branch"], "letronna/tree-kept");
-        assert_eq!(results(&sent[1]), ["from the helper"]);
+        assert_eq!(results(&sent[1]), ["1|from the helper"]);
         assert_eq!(resumed.lines().nth(1), Some(kept.as_str()), "{resumed}");
     }
 
