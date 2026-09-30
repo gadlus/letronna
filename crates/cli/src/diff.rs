@@ -201,6 +201,24 @@ fn paint(rows: &[Row]) -> Vec<String> {
     out
 }
 
+/// One line of a git patch as `/diff` shows it, cut to `width`: what goes
+/// in red and what comes in green, as an approval's diff has them, with
+/// the file and hunk headers set apart from the code.
+pub fn patch_line(line: &str, width: usize) -> String {
+    let line = render::clip(&line.replace('\t', "    "), width);
+    if line.starts_with("diff ") || line.starts_with("+++ ") || line.starts_with("--- ") {
+        return render::bold(&line);
+    }
+    match line.chars().next() {
+        Some('+') => render::green(&line),
+        Some('-') => render::red(&line),
+        Some('@') => render::blue(&line),
+        Some(' ') | None => line,
+        // Git's own notes: the index line, modes, "No newline at end".
+        Some(_) => render::dim(&line),
+    }
+}
+
 /// Cut or pad to exactly `width`, so every row of the block is the same
 /// length. Tabs are spread out first: a tab inside a coloured run would
 /// otherwise take an unpredictable amount of the row.
@@ -217,7 +235,7 @@ fn clip(text: &str, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Row, ToolContext, compare, fold, of};
+    use super::{Row, ToolContext, compare, fold, of, patch_line};
 
     fn rows(text: &[&str]) -> Vec<String> {
         text.iter().map(|t| (*t).to_owned()).collect()
@@ -305,5 +323,13 @@ mod tests {
         let device = format!(r"\\?\{}", dir.join("old.txt").display());
         assert!(!shown(device).contains("unread_before"));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_patch_line_keeps_its_text_and_fits_the_width() {
+        let plain = |line: &str| crate::render::plain(&patch_line(line, 8));
+        assert_eq!(plain("+added"), "+added");
+        assert_eq!(plain("-a longer removed line"), "-a long…");
+        assert_eq!(plain(" \tkept"), "     ke…");
     }
 }

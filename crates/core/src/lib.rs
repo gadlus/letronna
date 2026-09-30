@@ -31,6 +31,7 @@ pub mod fallback;
 mod filestate;
 pub mod gate;
 pub mod gateway;
+pub mod git;
 mod grep;
 pub mod history;
 pub mod hooks;
