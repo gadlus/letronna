@@ -33,6 +33,10 @@ actions!(
 /// generated file's thousands of lines would each be an element.
 const SHOWN_LINES: usize = 1500;
 
+/// Characters drawn of one patch line: a minified file is one line of the
+/// whole patch, laid out again on every frame the tab is open.
+const LINE_CHARS: usize = 1000;
+
 /// A row of the file list; the list is virtual, so every row is this tall.
 const ROW: Pixels = px(24.);
 
@@ -65,12 +69,16 @@ pub(crate) struct Changes {
     again: bool,
     focus: FocusHandle,
     scroll: UniformListScrollHandle,
+    /// Diffs asked for so far, to tell each answer's ask apart.
+    asked: u64,
 }
 
 struct Open {
     session: u64,
     scope: Scope,
     file: PathBuf,
+    /// Which ask of git this is, so an answer to an earlier one is dropped.
+    ask: u64,
     /// `None` while it is still being read.
     diff: Option<Result<String, String>>,
 }
@@ -94,6 +102,7 @@ impl Changes {
             again: false,
             focus: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
+            asked: 0,
         }
     }
 }
@@ -284,6 +293,7 @@ impl Chat {
             session,
             scope,
             file,
+            ask: 0,
             diff: None,
         });
         self.read_open_diff(cx);
@@ -296,7 +306,7 @@ impl Chat {
         let Some(open) = self
             .changes
             .open
-            .as_ref()
+            .as_mut()
             .filter(|open| open.session == conversation.id)
         else {
             return;
@@ -304,6 +314,11 @@ impl Chat {
         let Some(folder) = conversation.workspace.clone() else {
             return;
         };
+        // Each read is numbered, so a slower earlier one never lands over
+        // the answer to a later one.
+        self.changes.asked += 1;
+        let ask = self.changes.asked;
+        open.ask = ask;
         let (session, scope, file) = (open.session, open.scope, open.file.clone());
         let notes = file_notes(&conversation.messages);
         let asked = file.clone();
@@ -322,10 +337,10 @@ impl Chat {
         cx.spawn(async move |this, cx| {
             let diff = diff.await;
             let _ = this.update(cx, |this, cx| {
-                // Only for the file still open: a later choice wins.
-                if let Some(open) = this.changes.open.as_mut().filter(|open| {
-                    open.session == session && open.scope == scope && open.file == file
-                }) {
+                // Only for this ask: a later click, or a later read of the
+                // same file, in this session or another with its own
+                // project, wins.
+                if let Some(open) = this.changes.open.as_mut().filter(|o| o.ask == ask) {
                     open.diff = Some(diff);
                 }
                 cx.notify();
@@ -704,7 +719,7 @@ fn patch(open: &Open, cx: &App) -> AnyElement {
             .px_2()
             .text_color(colour)
             .when_some(ground, |line, ground| line.bg(ground))
-            .child(line.replace('\t', "    "))
+            .child(shown_line(line))
     });
     v_flex()
         .py_1()
@@ -722,6 +737,15 @@ fn patch(open: &Open, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
+/// A patch line as drawn: tabs spread out, and cut after `LINE_CHARS`.
+fn shown_line(line: &str) -> String {
+    let mut shown: String = line.chars().take(LINE_CHARS).collect();
+    if shown.len() < line.len() {
+        shown.push('…');
+    }
+    shown.replace('\t', "    ")
+}
+
 /// A quiet line of text in place of a list or a diff.
 fn note(text: &str, cx: &App) -> AnyElement {
     div()
@@ -730,4 +754,18 @@ fn note(text: &str, cx: &App) -> AnyElement {
         .text_color(cx.theme().muted_foreground)
         .child(text.to_owned())
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LINE_CHARS, shown_line};
+
+    #[test]
+    fn a_long_patch_line_is_cut_and_a_short_one_kept() {
+        assert_eq!(shown_line("+\tkept"), "+    kept");
+        let long = format!("+{}", "é".repeat(5000));
+        let shown = shown_line(&long);
+        assert_eq!(shown.chars().count(), LINE_CHARS + 1);
+        assert!(shown.ends_with('…'));
+    }
 }
