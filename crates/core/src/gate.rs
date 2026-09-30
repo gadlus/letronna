@@ -425,6 +425,26 @@ fn ladder(call: &ToolCall, gate: &Gate, judge: Option<&dyn Fn(&str) -> Verdict>)
     ))
 }
 
+/// Whether a grant of `call`'s tool lets `call` run on its own arguments,
+/// by the floor and the project's own rules but not the user's.
+pub(crate) fn cleared(call: &ToolCall, ctx: &ToolContext) -> bool {
+    // A `ForRun` grant answers from whichever call first asked, so a later
+    // one goes through the ladder as if its session had allowed the tool:
+    // it then stops where such a grant stops, at the floor's refusals and
+    // its asking, a line it cannot read and a project rule. The user's own
+    // rules stay the frontend's to hold.
+    let grants = Grants::from([(ctx.conversation, HashSet::from([call.name.clone()]))]);
+    let gate = Gate {
+        ctx,
+        mode: Mode::Default,
+        grants: &grants,
+        rules: &[],
+        broken: None,
+        human: true,
+    };
+    ladder(call, &gate, None) == Outcome::Run
+}
+
 /// Whether the tool named `name` spends the user's credit, which is theirs
 /// to decide rather than a question of safety for the judge.
 fn spends(name: &str) -> bool {
@@ -1564,6 +1584,36 @@ mod tests {
             }
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cleared_refuses_what_the_floor_or_the_projects_own_rule_would() {
+        let ctx = ToolContext::default();
+        assert!(cleared(&command("ls"), &ctx));
+        assert!(!cleared(&command(HARDLINE), &ctx));
+
+        let dir =
+            std::env::temp_dir().join(format!("letronna-gate-cleared-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".letronna")).unwrap();
+        std::fs::write(
+            dir.join(".letronna/permissions.json"),
+            r#"[{"tool": "run_command", "effect": "deny"}]"#,
+        )
+        .unwrap();
+        let project = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        assert!(!cleared(&command("ls"), &project));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cleared_refuses_what_a_session_grant_would_still_ask_about() {
+        let ctx = ToolContext::default();
+        assert!(cleared(&command("cargo test"), &ctx));
+        assert!(!cleared(&command(DANGEROUS), &ctx));
+        assert!(!cleared(&command(OPAQUE), &ctx));
     }
 
     fn edit(path: &str) -> ToolCall {
