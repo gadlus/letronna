@@ -89,6 +89,13 @@ impl Notifier for Terminal {
     }
 }
 
+/// Shows nothing: for a run whose stdout speaks a protocol, as ACP and MCP do.
+pub struct Silent;
+
+impl Notifier for Silent {
+    fn show(&mut self, _: &Note) {}
+}
+
 /// Whether anyone is looking at the terminal.
 pub struct Focus {
     /// What the terminal last said, once it has said anything.

@@ -288,6 +288,8 @@ fn turn(prompt: &str, yes: bool) -> Result<String, String> {
         bar: Bar::new(String::new()),
         stopped: false,
         images: Vec::new(),
+        notices: letronna_core::notify::Notices::new(Box::new(crate::notify::Silent)),
+        ended: None,
     };
     let session = runner.start(std::env::current_dir().ok());
     let connection = runner.connection(session);
@@ -321,6 +323,8 @@ fn turn(prompt: &str, yes: bool) -> Result<String, String> {
         fork: false,
         from: 0,
         schema: None,
+        decide: None,
+        watch: None,
     });
     for problem in letronna_core::hooks::problems() {
         eprintln!("{problem}");

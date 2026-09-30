@@ -436,6 +436,8 @@ impl Run {
             fork: false,
             from: 0,
             schema: None,
+            watch: None,
+            decide: None,
         };
         let owed = Owed {
             arrivals: self.arrivals.0.clone(),

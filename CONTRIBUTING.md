@@ -47,6 +47,7 @@ crates/cli    the terminal (binary `letronna`)
   render.rs   colour, wrapping, the marks either side of the conversation
   session.rs  driving a turn, showing tools, asking for approval
   diff.rs     a change shown before it happens
+  acp.rs      an editor's agent, over the Agent Client Protocol on stdio
 ```
 
 A new tool is a struct in `tools.rs` implementing `Tool` plus a line in

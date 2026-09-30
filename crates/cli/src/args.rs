@@ -16,6 +16,7 @@ Letronna — a small agent in your terminal
   letronna doctor          check the setup, the disk and the gateway
   letronna mcp             add, list, get or remove MCP servers
   letronna mcp serve       offer the browser, media and search tools over MCP
+  letronna acp             serve an editor over the Agent Client Protocol
   letronna --uninstall     take it off again
 
 Options
@@ -89,6 +90,8 @@ pub struct Args {
     pub budget: Option<u64>,
     /// The words after `letronna mcp`, which manage MCP servers.
     pub mcp: Option<Vec<String>>,
+    /// `letronna acp`: speak the Agent Client Protocol on stdin and stdout.
+    pub acp: bool,
 }
 
 pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -115,10 +118,17 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
         tools: None,
         budget: None,
         mcp: None,
+        acp: false,
     };
     // Only as the first word, so `-p mcp` still asks about it.
     if raw.next_if(|first| first == "mcp").is_some() {
         args.mcp = Some(raw.collect());
+        return Ok(args);
+    }
+    // Only as the first word too, since an editor starts it with nothing
+    // after and `letronna acp` anywhere else is a question about it.
+    if raw.next_if(|first| first == "acp").is_some() {
+        args.acp = true;
         return Ok(args);
     }
     while let Some(arg) = raw.next() {
@@ -302,6 +312,8 @@ mod tests {
             ["add", "fs", "-e", "K=V", "--", "npx", "-y"]
         );
         assert_eq!(args(&["-p", "mcp"]).prompt.as_deref(), Some("mcp"));
+        assert!(args(&["acp"]).acp && args(&["acp"]).prompt.is_none());
+        assert_eq!(args(&["-p", "acp"]).prompt.as_deref(), Some("acp"));
     }
 
     #[test]
