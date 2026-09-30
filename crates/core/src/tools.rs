@@ -3480,6 +3480,44 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_project_reached_through_a_link_is_written_and_edited_but_a_link_out_of_it_is_not() {
+        // As /tmp is a link to /private/tmp on macOS.
+        let dir = std::env::temp_dir().join(format!("letronna-linked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("old.txt"), "x").unwrap();
+        let root = dir.join("linked");
+        std::os::unix::fs::symlink(&project, &root).unwrap();
+        std::os::unix::fs::symlink(&dir, project.join("up")).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(root.clone()),
+            ..Default::default()
+        };
+        WriteFile
+            .run(&json!({"path": "new.txt", "content": "made"}), &ctx)
+            .unwrap();
+        let absolute = root.join("sub/new.txt").display().to_string();
+        WriteFile
+            .run(&json!({"path": absolute, "content": "made"}), &ctx)
+            .unwrap();
+        EditFile
+            .run(&json!({"path": "old.txt", "old": "x", "new": "y"}), &ctx)
+            .unwrap();
+        let read = |name: &str| std::fs::read_to_string(project.join(name)).unwrap();
+        assert_eq!(read("new.txt"), "made");
+        assert_eq!(read("sub/new.txt"), "made");
+        assert_eq!(read("old.txt"), "y");
+        let refused = WriteFile
+            .run(&json!({"path": "up/x.txt", "content": "escaped"}), &ctx)
+            .unwrap_err();
+        assert_eq!(refused, "`up/x.txt` is outside the project folder.");
+        assert!(!dir.join("x.txt").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn writes_stay_out_of_letronnas_folder_and_off_its_program() {
         let dir = std::env::temp_dir().join(format!("letronna-guarded-{}", std::process::id()));

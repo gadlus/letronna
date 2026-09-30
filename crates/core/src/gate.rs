@@ -1872,6 +1872,41 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn accept_edits_runs_edits_in_a_project_reached_through_a_link_but_not_ones_leaving_it() {
+        // As /tmp is a link to /private/tmp on macOS.
+        let dir = project_dir("linked-root");
+        let root = dir.join("linked");
+        std::os::unix::fs::symlink(dir.join("project"), &root).unwrap();
+        std::os::unix::fs::symlink(&dir, dir.join("project/up")).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(root.clone()),
+            ..Default::default()
+        };
+        let change = call(
+            "edit_file",
+            serde_json::json!({ "path": "notes.txt", "old": "a", "new": "b" }),
+        );
+        let outside = root.join("up/outside.txt").display().to_string();
+        for (call, expected) in [
+            (edit("new.txt"), 'R'),
+            (edit("new/folder/new.txt"), 'R'),
+            (edit(&root.join("new.txt").display().to_string()), 'R'),
+            (change, 'R'),
+            (edit("up/outside.txt"), 'A'),
+            (edit(&outside), 'A'),
+        ] {
+            assert_eq!(
+                letter(&call, Mode::AcceptEdits, &ctx, &[]),
+                expected,
+                "{}",
+                call.arguments
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn a_file_with_a_second_name_or_an_unknown_count_is_shared() {
         assert!(!shared(Some(1)));

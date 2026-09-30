@@ -1186,18 +1186,42 @@ pub fn intent(name: &str, summary: &str) -> String {
 
 /// What the session's own gate makes of a helper's call, or `None` when
 /// only the user can say: with no terminal to ask on, that is a no.
-fn settled(
+pub fn settled(
     request: &Request,
     mode: Mode,
     allowed: &Grants,
     rules: &Result<Vec<letronna_core::permissions::Rule>, String>,
     terminal: bool,
 ) -> Option<Decision> {
+    let workspace = std::env::current_dir().ok();
+    judged(
+        &request.call,
+        request.root,
+        workspace,
+        mode,
+        allowed,
+        rules,
+        terminal,
+    )
+}
+
+/// `settled` for a call made by session `root` working in `workspace`,
+/// which after `-c` or `-r` is the folder the session was made in, not the
+/// one the program was started from.
+pub fn judged(
+    call: &ToolCall,
+    root: u64,
+    workspace: Option<std::path::PathBuf>,
+    mode: Mode,
+    allowed: &Grants,
+    rules: &Result<Vec<letronna_core::permissions::Rule>, String>,
+    terminal: bool,
+) -> Option<Decision> {
     let mut ctx = tools::ToolContext::default();
-    ctx.conversation = request.root;
-    ctx.workspace = std::env::current_dir().ok();
+    ctx.conversation = root;
+    ctx.workspace = workspace;
     let gate = Gate::for_terminal(&ctx, allowed, rules, mode, terminal);
-    match gate::decide(&request.call, &gate) {
+    match gate::decide(call, &gate) {
         gate::Outcome::Run => Some(Decision::Once),
         gate::Outcome::Refuse(why) => Some(Decision::Deny(why)),
         gate::Outcome::Ask => (!terminal).then(|| Decision::Deny(String::new())),
@@ -1508,5 +1532,69 @@ mod tests {
                 ok("c", &path("c"))
             ]
         );
+    }
+
+    fn made(name: &str, arguments: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: format!("{name}-1"),
+            name: name.into(),
+            arguments: arguments.to_string(),
+        }
+    }
+
+    #[test]
+    fn an_edit_is_judged_in_the_folder_the_session_works_in() {
+        let dir = std::env::temp_dir().join(format!("letronna-judged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (project, elsewhere) = (dir.join("project"), dir.join("elsewhere"));
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let rules = Ok(Vec::new());
+        let judge = |workspace: &std::path::Path, path: &str| {
+            let call = made("write_file", json!({ "path": path, "content": "x" }));
+            let (none, mode) = (Grants::new(), Mode::AcceptEdits);
+            judged(
+                &call,
+                1,
+                Some(workspace.to_owned()),
+                mode,
+                &none,
+                &rules,
+                false,
+            )
+        };
+        assert_eq!(judge(&project, "new.txt"), Some(Decision::Once));
+        let inside = project.join("new.txt").display().to_string();
+        assert_eq!(judge(&project, &inside), Some(Decision::Once));
+        // The same path is another folder's when the session is not here.
+        assert!(matches!(
+            judge(&elsewhere, &inside),
+            Some(Decision::Deny(_))
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bypass_still_holds_back_a_denied_or_risky_call() {
+        use letronna_core::permissions::{Effect, Rule};
+        let dir = std::env::temp_dir().join(format!("letronna-bypass-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rules = Ok(vec![Rule {
+            tool: "run_command".into(),
+            pattern: "git push".into(),
+            effect: Effect::Deny,
+            project: None,
+        }]);
+        let judge = |line: &str| {
+            let call = made("run_command", json!({ "command": line }));
+            let (none, mode) = (Grants::new(), Mode::Bypass);
+            judged(&call, 1, Some(dir.clone()), mode, &none, &rules, false)
+        };
+        assert_eq!(judge("echo hi"), Some(Decision::Once));
+        assert!(
+            matches!(judge("git push origin main"), Some(Decision::Deny(why)) if !why.is_empty())
+        );
+        assert!(matches!(judge("git reset --hard"), Some(Decision::Deny(why)) if !why.is_empty()));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
