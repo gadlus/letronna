@@ -599,8 +599,26 @@ fn sized(context: Option<u64>, output: Option<u64>, cap: usize, fixed: usize) ->
 /// start, so nothing needs saving and two requests over the same history agree.
 fn window_start(messages: &[Message], budget: &Budget) -> usize {
     let last_user = messages.iter().rposition(opens_turn).unwrap_or(0);
+    start_before(messages, budget, last_user, 0, 0)
+}
+
+/// Where the window would start for the request after a reply to `messages`
+/// and a turn following it, which add `ahead` tokens between them.
+fn start_ahead(messages: &[Message], budget: &Budget, ahead: usize) -> usize {
+    start_before(messages, budget, messages.len(), ahead, 2)
+}
+
+/// `window_start`, where the turn at `last_user` goes in whatever its size,
+/// and `more` messages of `ahead` tokens come after `messages`.
+fn start_before(
+    messages: &[Message],
+    budget: &Budget,
+    last_user: usize,
+    ahead: usize,
+    more: usize,
+) -> usize {
     let sums = token_sums(messages, budget.tool_chars);
-    let total = sums[messages.len()];
+    let total = sums[messages.len()] + ahead;
     // Toward the steps a message counts as at least its share of a window
     // full by the message guard, so a run of short ones, which meets the
     // guard long before the budget, still steps on. Pictures are left out:
@@ -613,14 +631,14 @@ fn window_start(messages: &[Message], budget: &Budget) -> usize {
     }
     let mut start = 0;
     while start < last_user
-        && (total - sums[start] > budget.tokens || messages.len() - start > budget.messages)
+        && (total - sums[start] > budget.tokens || messages.len() + more - start > budget.messages)
     {
         // On to the first user turn past the next whole step from the
         // beginning, so the window never begins midway through a tool
         // exchange and where it can begin depends on nothing after it.
         let next = (marks[start] / budget.step + 1) * budget.step;
         start = (start + 1..=last_user)
-            .find(|i| marks[*i] >= next && opens_turn(&messages[*i]))
+            .find(|i| marks[*i] >= next && messages.get(*i).is_none_or(opens_turn))
             .unwrap_or(last_user);
     }
     start
@@ -1947,15 +1965,28 @@ pub struct Extra {
     pub guard: Option<Box<dyn Any + Send>>,
 }
 
+/// A reply to `messages`, streamed, after which the summary the next turn's
+/// request is likely to need is made ahead, since someone usually answers.
 pub fn start(connection: Connection, messages: Vec<Message>) -> async_channel::Receiver<Event> {
-    start_with(connection, messages, Extra::default())
+    begin(connection, messages, Extra::default(), true)
 }
 
-/// `start`, with tools, a stop signal and a guard of the caller's own.
+/// `start`, with tools, a stop signal and a guard of the caller's own, and
+/// no summary made ahead, since a run's last reply is often its answer.
 pub fn start_with(
     connection: Connection,
     messages: Vec<Message>,
     extra: Extra,
+) -> async_channel::Receiver<Event> {
+    begin(connection, messages, extra, false)
+}
+
+/// `start_with`, making the next summary ahead if `ahead`.
+fn begin(
+    connection: Connection,
+    messages: Vec<Message>,
+    extra: Extra,
+    ahead: bool,
 ) -> async_channel::Receiver<Event> {
     let budget = budget(&connection, crate::store::context_cap());
     // Before the reply exists, so every call it makes is stamped with it.
@@ -2005,7 +2036,21 @@ pub fn start_with(
                 ("ms", crate::diag::millis(started)),
             ],
         );
+        // Claimed before the reply is said to be over, so a request sent the
+        // moment it is finds the summary being made and waits for it rather
+        // than asking for another.
+        let making = if ahead && result.is_ok() {
+            claim_next(&connection, &messages, &budget)
+        } else {
+            None
+        };
         let _ = sender.send_blocking(Event::Finished(result));
+        // Whoever still reads the reply's events hears the end rather than
+        // waiting on the summary.
+        drop(sender);
+        if let Some((making, _permit)) = making {
+            making.make(&connection, budget.tokens);
+        }
     });
     receiver
 }
@@ -2034,6 +2079,32 @@ fn budget_for(connection: &Connection, primary: &Connection, own: Budget) -> Bud
         return own;
     }
     budget(connection, crate::store::context_cap())
+}
+
+/// The place claimed for the summary of what the window drops at its next
+/// step, when the next turn after a reply to `messages` is likely to take it
+/// there, and the provider's turn it is asked on.
+fn claim_next<'a>(
+    connection: &Connection,
+    messages: &'a [Message],
+    budget: &Budget,
+) -> Option<(crate::compact::Making<'a>, crate::limits::Permit)> {
+    // A quarter of the window: more than most replies and results, so the
+    // summary is ready in time, and not so much that it is made long before.
+    // The places the window starts at stay put, so one made early is used
+    // when it gets there, unless the session ends or is taken back first.
+    let next = start_ahead(messages, budget, budget.tokens / 4);
+    // Only a place among the messages sent: where the reply's own turn falls
+    // is not known yet.
+    if next <= window_start(messages, budget) || next >= messages.len() {
+        return None;
+    }
+    // Nobody waits for it yet, so it is a background call: without a permit
+    // it could take the stream the provider keeps for the next round, sent
+    // at once while it runs. With none free the step asks as it did.
+    let permit = crate::limits::gate(&connection.endpoint).try_acquire()?;
+    let making = crate::compact::claim(connection, &messages[..next])?;
+    Some((making, permit))
 }
 
 /// Send `messages` in the window `budget` gives, unless what no window
@@ -4111,6 +4182,224 @@ mod tests {
         ));
         let bodies = worker.join().unwrap();
         assert!(bodies[1].contains("No summary could be made"));
+    }
+
+    /// A model on this computer, serving until the tests end, that takes
+    /// `summarizing` over each summary and answers every other request at
+    /// once, and a count of the summaries it was asked for.
+    fn slow_summaries(
+        summarizing: Duration,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::Write;
+        use std::sync::{Arc, atomic::AtomicUsize, atomic::Ordering};
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1", server.local_addr().unwrap());
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counted = asked.clone();
+        std::thread::spawn(move || {
+            for mut socket in server.incoming().flatten() {
+                let counted = counted.clone();
+                std::thread::spawn(move || {
+                    // Only a summary is asked for whole rather than streamed.
+                    let (kind, reply) = if request_body(&mut socket).contains("\"stream\":false") {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(summarizing);
+                        (
+                            "application/json",
+                            r#"{"choices":[{"message":{"content":"The summary so far."}}]}"#,
+                        )
+                    } else {
+                        (
+                            "text/event-stream",
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: [DONE]\n\n",
+                        )
+                    };
+                    let _ = write!(
+                        socket,
+                        "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                        reply.len()
+                    );
+                });
+            }
+        });
+        (endpoint, asked)
+    }
+
+    /// `pairs` turns of about 300 tokens a message and a question after
+    /// them, told apart from any other test's by `tag`, so no summary
+    /// remembered for another is taken.
+    fn long_talk(tag: &str, pairs: usize) -> Vec<Message> {
+        let said = |role: &str, text: String| Message {
+            role: role.into(),
+            content: text,
+            ..Default::default()
+        };
+        let mut messages: Vec<Message> = (0..pairs)
+            .flat_map(|i| {
+                [
+                    said("user", format!("{tag} question {i} {}", "x".repeat(1_200))),
+                    said(
+                        "assistant",
+                        format!("{tag} answer {i} {}", "y".repeat(1_200)),
+                    ),
+                ]
+            })
+            .collect();
+        messages.push(said(
+            "user",
+            format!("{tag} and then? {}", "z".repeat(1_200)),
+        ));
+        messages
+    }
+
+    /// `messages` with the reply the model gives and a long next question,
+    /// which takes the conversation past the small window.
+    fn one_turn_on(messages: &[Message]) -> Vec<Message> {
+        let mut next = messages.to_vec();
+        next.push(Message {
+            role: "assistant".into(),
+            content: "Hello".into(),
+            ..Default::default()
+        });
+        next.push(Message {
+            role: "user".into(),
+            content: format!("Now this: {}", "w".repeat(6_400)),
+            ..Default::default()
+        });
+        next
+    }
+
+    /// How long a reply to `messages` took to begin, read to its end so
+    /// whatever follows the reply on its worker still happens.
+    fn first_words(connection: &Connection, messages: Vec<Message>) -> Duration {
+        let began = std::time::Instant::now();
+        let rx = start(connection.clone(), messages);
+        let mut began_after = None;
+        loop {
+            match rx.recv_blocking().unwrap() {
+                Event::Delta(_) => began_after = began_after.or(Some(began.elapsed())),
+                Event::Finished(result) => {
+                    assert!(result.is_ok());
+                    return began_after.unwrap();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "a measurement of about 15 s: run with --ignored --nocapture"]
+    fn how_long_the_reply_that_crosses_the_limit_waits() {
+        // What a summary of 12,000 tokens into 300 words takes a hosted
+        // model, going by prefill and a few dozen tokens a second out.
+        use std::sync::atomic::Ordering;
+        const SUMMARIZING: Duration = Duration::from_secs(3);
+        let (endpoint, asked) = slow_summaries(SUMMARIZING);
+        let session = |conversation: u64| Connection {
+            endpoint: endpoint.clone(),
+            conversation,
+            ..connection()
+        };
+        let asked_since = |before: usize| asked.load(Ordering::SeqCst) - before;
+        let tag = format!("measured {}", std::process::id());
+        let quiet = long_talk(&tag, 7);
+        let crossing = one_turn_on(&quiet);
+        assert_eq!(window_start(&quiet, &Budget::SMALL), 0);
+        assert!(window_start(&crossing, &Budget::SMALL) > 0);
+
+        // A reply the window still holds, then one that moves it, a few
+        // seconds later as the user reads and types.
+        let before = asked.load(Ordering::SeqCst);
+        let within = first_words(&session(u64::MAX - 1), quiet.clone());
+        std::thread::sleep(SUMMARIZING + Duration::from_secs(1));
+        let later = first_words(&session(u64::MAX - 1), crossing.clone());
+        let later_asked = asked_since(before);
+
+        // The same, sent the moment the reply before it ended, as the next
+        // round of a turn with tools is.
+        let tag = format!("measured at once {}", std::process::id());
+        let quiet = long_talk(&tag, 7);
+        let before = asked.load(Ordering::SeqCst);
+        first_words(&session(u64::MAX - 2), quiet.clone());
+        let at_once = first_words(&session(u64::MAX - 2), one_turn_on(&quiet));
+        let at_once_asked = asked_since(before);
+
+        // The one that moves it with nothing before it, as after a restart.
+        let tag = format!("measured cold {}", std::process::id());
+        let before = asked.load(Ordering::SeqCst);
+        let cold = first_words(&session(u64::MAX - 3), one_turn_on(&long_talk(&tag, 7)));
+        let cold_asked = asked_since(before);
+
+        println!("summary takes {SUMMARIZING:?}");
+        println!("reply within the window begins after {within:?}");
+        println!("reply that moves it, cold, after {cold:?} ({cold_asked} summary asked)");
+        println!("reply that moves it, a pause later, after {later:?} ({later_asked} asked)");
+        println!("reply that moves it, at once, after {at_once:?} ({at_once_asked} asked)");
+    }
+
+    #[test]
+    fn the_reply_that_moves_the_window_takes_the_summary_made_after_the_last() {
+        use std::sync::atomic::Ordering;
+        let (endpoint, asked) = slow_summaries(Duration::ZERO);
+        let c = Connection {
+            endpoint,
+            conversation: u64::MAX - 4,
+            ..connection()
+        };
+        let quiet = long_talk(&format!("ahead {}", std::process::id()), 7);
+        let crossing = one_turn_on(&quiet);
+        let dropped = window_start(&crossing, &Budget::SMALL);
+        assert_eq!(window_start(&quiet, &Budget::SMALL), 0);
+        assert_eq!(
+            start_ahead(&quiet, &Budget::SMALL, Budget::SMALL.tokens / 4),
+            dropped
+        );
+        first_words(&c, quiet);
+        // Asked for once that reply is over, before the one that needs it is
+        // sent: one asked for on the spot would pass the checks below too.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while asked.load(Ordering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no summary was made ahead"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let rx = start(c, crossing);
+        let mut kept = None;
+        loop {
+            match rx.recv_blocking().unwrap() {
+                Event::Summarized { upto, text } => kept = Some((upto, text)),
+                Event::Finished(result) => {
+                    assert!(result.is_ok());
+                    break;
+                }
+                _ => {}
+            }
+        }
+        // Handed to the session to keep, as one made on the spot is, and
+        // asked for once.
+        assert_eq!(kept, Some((dropped, "The summary so far.".to_owned())));
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn no_summary_is_made_ahead_while_the_background_has_every_stream() {
+        // A provider of its own, which nothing else in the tests holds.
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1", server.local_addr().unwrap());
+        let c = Connection {
+            endpoint: endpoint.clone(),
+            conversation: u64::MAX - 5,
+            ..connection()
+        };
+        let quiet = long_talk(&format!("gated {}", std::process::id()), 7);
+        // A helper's stream: the one left is the next round's.
+        let helper = crate::limits::gate(&endpoint).try_acquire();
+        assert!(helper.is_some());
+        assert!(claim_next(&c, &quiet, &Budget::SMALL).is_none());
+        drop(helper);
+        assert!(claim_next(&c, &quiet, &Budget::SMALL).is_some());
     }
 
     #[test]
