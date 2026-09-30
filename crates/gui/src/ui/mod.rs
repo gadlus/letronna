@@ -16,6 +16,7 @@ pub(crate) mod messaging;
 pub(crate) mod palette;
 pub(crate) mod panel;
 pub(crate) mod pictures;
+pub(crate) mod plugin_page;
 pub(crate) mod profiles;
 pub(crate) mod quick;
 pub(crate) mod schedules;

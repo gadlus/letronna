@@ -43,6 +43,9 @@ impl Chat {
                     if page == Page::Artifacts {
                         this.read_artifacts(cx);
                     }
+                    if page == Page::Plugins {
+                        this.reload_plugins();
+                    }
                     this.focus_composer(window, cx);
                     cx.notify();
                 }))
@@ -270,6 +273,13 @@ impl Chat {
                         AppIcon::Sparkles,
                         "Capabilities",
                         Some(Page::Capabilities),
+                        cx,
+                    ))
+                    .child(self.nav_item(
+                        "plugins",
+                        AppIcon::Puzzle,
+                        "Plugins",
+                        Some(Page::Plugins),
                         cx,
                     ))
                     .child(self.nav_item(
