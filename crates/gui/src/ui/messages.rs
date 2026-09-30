@@ -1,4 +1,13 @@
 use crate::prelude::*;
+use gpui_component::notification::Notification;
+use letronna_core::failure::{self, Failure, FailureKind, Fix, Kept};
+
+/// A failed turn set to be asked again when its provider's wait is over.
+pub(crate) struct WaitingRetry {
+    pub(crate) session: u64,
+    /// When, in seconds since 1970.
+    pub(crate) at: u64,
+}
 
 impl Chat {
     /// An id for part of a message that also names its session, so state
@@ -43,6 +52,9 @@ impl Chat {
                 .child(self.tool_row(index, message, window, cx))
                 .children(bar)
                 .into_any_element();
+        }
+        if message.role == failure::ROLE {
+            return self.failure_row(index, message, labeled, bar, cx);
         }
         if message.notice {
             return self.notice_row(index, message, window, cx);
@@ -428,6 +440,266 @@ impl Chat {
                     .child(answer),
             );
         Some(row.into_any_element())
+    }
+
+    /// Keep the turn that just failed in its session, to be drawn where it
+    /// failed; false when there is nothing to keep, as for a stopped turn.
+    pub(crate) fn keep_failure(&mut self, failure: &Failure) -> bool {
+        let Some(ix) = self.streaming_id.and_then(|id| self.store.index_of(id)) else {
+            return false;
+        };
+        let Some(model) = self.turn.as_ref().map(|turn| turn.connection.model.clone()) else {
+            return false;
+        };
+        let hosted = self.store.model(ix).0 == LETRONNA;
+        let Some(message) = failure.kept(&model, hosted, backend::now()) else {
+            return false;
+        };
+        let session = self.store.conversations[ix].id;
+        // A wait set for an earlier failure there is for a turn now gone by.
+        if self
+            .waiting_retry
+            .as_ref()
+            .is_some_and(|w| w.session == session)
+        {
+            self.waiting_retry = None;
+        }
+        self.store.conversations[ix].messages.push(message);
+        if ix != self.store.active {
+            self.unseen.insert(session);
+        }
+        self.save();
+        true
+    }
+
+    /// Whether the session `session` still ends on a failed turn, the one
+    /// thing a retry there carries on from.
+    pub(crate) fn ends_failed(&self, session: u64) -> bool {
+        self.store.index_of(session).is_some_and(|ix| {
+            self.store.conversations[ix]
+                .messages
+                .last()
+                .is_some_and(|m| m.role == failure::ROLE)
+        })
+    }
+
+    /// Ask the failed turn in `session` again at `at`, counting down on its
+    /// row until then. The count looks once a second and stops as soon as
+    /// the wait is cancelled or replaced, so nothing ticks once it is over.
+    pub(crate) fn wait_to_retry(&mut self, session: u64, at: u64, cx: &mut Context<Self>) {
+        let same = move |w: &WaitingRetry| w.session == session && w.at == at;
+        if self.waiting_retry.as_ref().is_some_and(same) {
+            return;
+        }
+        self.waiting_retry = Some(WaitingRetry { session, at });
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(1))
+                    .await;
+                let waiting = this.update(cx, |this, cx| {
+                    // A turn since, or the session gone, leaves nothing to
+                    // wait for, and the count must not tick on until `at`.
+                    if this.waiting_retry.as_ref().is_some_and(same) && !this.ends_failed(session) {
+                        this.waiting_retry = None;
+                    }
+                    let waiting = this.waiting_retry.as_ref().is_some_and(same);
+                    // In the same update as the check, so nothing can take
+                    // the agent in between.
+                    if waiting && retry_due(backend::now(), at, this.busy) {
+                        this.retry_failed(session, cx);
+                        return false;
+                    }
+                    cx.notify();
+                    waiting
+                });
+                if !matches!(waiting, Ok(true)) {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// A turn that failed: why, in a few words, one line of what the provider
+    /// said, and on the newest, at most two ways out, the likely one first.
+    fn failure_row(
+        &self,
+        index: usize,
+        message: &Message,
+        labeled: bool,
+        bar: Option<AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let conversation = &self.store.conversations[self.store.active];
+        let session = conversation.id;
+        let kept = message.failed.as_deref().copied().unwrap_or(Kept {
+            kind: FailureKind::Unknown,
+            until: None,
+            hosted: false,
+        });
+        let now = backend::now();
+        // One further up is history: something came after it.
+        let newest = index + 1 == conversation.messages.len();
+        let running_here = self.busy && self.streaming_id == Some(session);
+        let muted = cx.theme().muted_foreground;
+        let danger = cx.theme().danger;
+        let waiting = self
+            .waiting_retry
+            .as_ref()
+            .filter(|w| w.session == session && Some(w.at) == kept.until);
+        let actions =
+            if !newest || running_here {
+                None
+            } else if let Some(waiting) = waiting {
+                let when = if now >= waiting.at {
+                    "Retrying once the reply running now is done".to_owned()
+                } else {
+                    let left = countdown(waiting.at - now);
+                    format!("Retrying at {}, in {left}", failure::clock(waiting.at))
+                };
+                Some(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(div().text_xs().text_color(muted).child(when))
+                        .child(
+                            Button::new(self.row_id("failure-cancel", index))
+                                .plain(cx)
+                                .small()
+                                .label("Cancel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.waiting_retry = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            } else {
+                let fixes = kept.fixes(now).into_iter().enumerate();
+                Some(h_flex().gap_2().items_center().children(
+                    fixes.map(|(n, fix)| self.fix_button(index, n == 0, fix, message, cx)),
+                ))
+            };
+        v_flex()
+            .w_full()
+            .gap_1p5()
+            // Heading its turn as a reply would, so one asked again after it
+            // reads as the same turn going on.
+            .when(labeled, |this| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .font_family(HEADING_FONT)
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(cx.theme().link)
+                        .child(message.model.clone()),
+                )
+            })
+            .child(
+                v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_1()
+                    .pl_3()
+                    .border_l_2()
+                    .border_color(danger)
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .items_center()
+                            .child(
+                                Icon::new(IconName::TriangleAlert)
+                                    .size_3p5()
+                                    .text_color(danger),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(kept.cause(failure::clock)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(muted)
+                            // Clipped, not truncated: gpui keeps the first
+                            // width a truncated line was measured at, here
+                            // too narrow, and drew the line as "…".
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(letronna_core::tools::one_line(&message.content)),
+                    )
+                    .children(actions.map(|actions| div().pt_1().child(actions))),
+            )
+            .children(bar)
+            .into_any_element()
+    }
+
+    /// The button for one way out of the failure kept in `message`; the
+    /// `first` is the likely one, and framed to say so.
+    fn fix_button(
+        &self,
+        index: usize,
+        first: bool,
+        fix: Fix,
+        message: &Message,
+        cx: &mut Context<Self>,
+    ) -> Button {
+        let session = self.store.conversations[self.store.active].id;
+        let (label, icon) = match fix {
+            Fix::Retry => ("Retry".to_owned(), Icon::new(AppIcon::Reload)),
+            Fix::RetryAt(at) => (
+                format!("Retry at {}", failure::clock(at)),
+                Icon::new(AppIcon::Clock),
+            ),
+            Fix::AddCredit => ("Add credit".to_owned(), Icon::new(AppIcon::PopOut)),
+            Fix::ChooseModel => ("Choose a model".to_owned(), Icon::new(AppIcon::Sparkles)),
+            Fix::SignIn => ("Sign in".to_owned(), Icon::new(AppIcon::User)),
+            Fix::CopyDetails => ("Copy details".to_owned(), Icon::new(IconName::Copy)),
+        };
+        let button = Button::new(self.row_id(if first { "fix" } else { "fix-other" }, index))
+            .small()
+            .icon(icon)
+            .label(label)
+            // Another session's reply owns the agent until it is done.
+            .disabled(self.busy && matches!(fix, Fix::Retry | Fix::RetryAt(_)));
+        let button = if first {
+            button.framed(cx)
+        } else {
+            button.plain(cx)
+        };
+        match fix {
+            Fix::Retry => {
+                button.on_click(cx.listener(move |this, _, _, cx| this.retry_failed(session, cx)))
+            }
+            Fix::RetryAt(at) => button
+                .on_click(cx.listener(move |this, _, _, cx| this.wait_to_retry(session, at, cx))),
+            Fix::AddCredit => {
+                button.on_click(|_, _, cx| cx.open_url(&letronna_core::auth::checkout()))
+            }
+            Fix::ChooseModel => button.on_click(cx.listener(|this, _, window, cx| {
+                this.model_open = true;
+                this.model_search.update(cx, |search, cx| {
+                    search.set_value("", window, cx);
+                    search.focus(window, cx);
+                });
+                cx.notify();
+            })),
+            Fix::SignIn => button.on_click(cx.listener(|this, _, window, cx| {
+                this.open_account(window, cx);
+                this.sign_in(cx);
+            })),
+            Fix::CopyDetails => {
+                let details = failure::details(message);
+                button.on_click(move |_, window, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(details.clone()));
+                    window.push_notification(Notification::success("Copied."), cx);
+                })
+            }
+        }
     }
 
     /// Something that happened meanwhile, such as a job exiting: one quiet
@@ -843,6 +1115,22 @@ impl Chat {
     }
 }
 
+/// Whether a retry set for `at` goes at `now`. Another session's reply owns
+/// the agent while `busy`, and the retry waits for it rather than being lost.
+fn retry_due(now: u64, at: u64, busy: bool) -> bool {
+    now >= at && !busy
+}
+
+/// What is left of a wait, as a clock counts it down: 0:45, 3:05, 1:02:03.
+fn countdown(seconds: u64) -> String {
+    let (hours, minutes, seconds) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
+}
+
 /// The line under a reply. Cached input is a fraction of the price of fresh
 /// input, so the hit rate is worth showing whenever the provider reports it.
 fn usage_line(message: &Message) -> String {
@@ -1049,8 +1337,24 @@ fn sound_button(index: usize, path: PathBuf, cx: &mut Context<Chat>) -> Button {
 mod tests {
     // Deliberately not `use super::*`: the prelude re-exports gpui, whose own
     // `test` macro would shadow the built-in attribute here.
-    use super::usage_line;
+    use super::{countdown, retry_due, usage_line};
     use letronna_core::chat::Message;
+
+    #[test]
+    fn a_retry_that_falls_due_while_busy_waits_rather_than_going() {
+        assert!(!retry_due(999, 1_000, false));
+        assert!(retry_due(1_000, 1_000, false));
+        assert!(!retry_due(1_000, 1_000, true));
+        assert!(retry_due(1_500, 1_000, false));
+    }
+
+    #[test]
+    fn a_countdown_reads_as_a_clock_does() {
+        assert_eq!(countdown(0), "0:00");
+        assert_eq!(countdown(45), "0:45");
+        assert_eq!(countdown(185), "3:05");
+        assert_eq!(countdown(3_723), "1:02:03");
+    }
 
     #[test]
     fn usage_line_reports_the_cache_hit_rate() {

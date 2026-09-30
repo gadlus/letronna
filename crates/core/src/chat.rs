@@ -92,6 +92,9 @@ pub struct Message {
     // Boxed, since few messages have one and every message is kept in memory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay: Option<Box<Replay>>,
+    /// For `role: "failure"`: what went wrong, for the window to explain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed: Option<Box<crate::failure::Kept>>,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -799,6 +802,10 @@ fn body_hashed(
     };
     let on_demand = connection.tools && crate::mcp_find::on_demand(&every);
     for (i, m) in window.iter().enumerate() {
+        // Kept for the user to read; to a provider it is a role it rejects.
+        if m.role == crate::failure::ROLE {
+            continue;
+        }
         let mut wired = wire_message(m, budget.tool_chars);
         carry_back(
             &mut wired,
@@ -2031,8 +2038,11 @@ fn send_window(
 fn doomed(connection: &Connection, messages: &[Message], budget: &Budget) -> Option<Failure> {
     let model = connection.model.trim();
     let context = crate::models::facts(&connection.endpoint, model).context?;
+    // Asked again after a failure, the session ends on the failure, which
+    // is never sent.
     let newest = messages
-        .last()
+        .iter()
+        .rfind(|m| m.role != crate::failure::ROLE)
         .map_or(0, |m| message_tokens(m, budget.tool_chars));
     let fixed = fixed_tokens(connection) + newest;
     (fixed as u64 > context).then(|| {
@@ -4338,6 +4348,22 @@ mod tests {
         assert_eq!(sent["content"], "job #7 exited with code 1");
         // The flag is Letronna's own; a provider only ever sees a user turn.
         assert!(sent.get("notice").is_none(), "{sent}");
+    }
+
+    #[test]
+    fn a_kept_failure_is_never_sent_to_the_model() {
+        let failed = crate::failure::Failure::new(crate::failure::FailureKind::Network, "Down.")
+            .kept("m", false, 1_000)
+            .unwrap();
+        let messages = [said("user", "hi"), failed];
+        let payload = body(&connection(), &messages, None, None);
+        let roles: Vec<&str> = payload["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["system", "user"]);
     }
 
     #[test]

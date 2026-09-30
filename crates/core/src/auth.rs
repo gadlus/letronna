@@ -54,6 +54,11 @@ pub fn dashboard() -> String {
     format!("{}/dashboard", site.trim_end_matches('/'))
 }
 
+/// Where credit is bought on the website.
+pub fn checkout() -> String {
+    format!("{}/checkout", dashboard())
+}
+
 /// How long to hold the port open before giving up on the browser. Ten
 /// minutes, because a first sign-in can take a GitHub login and a wait for
 /// the device-verification email.
