@@ -14,6 +14,7 @@ pub(crate) mod messaging;
 pub(crate) mod palette;
 pub(crate) mod panel;
 pub(crate) mod pictures;
+pub(crate) mod profiles;
 pub(crate) mod schedules;
 pub(crate) mod search;
 pub(crate) mod sessions;

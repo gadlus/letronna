@@ -227,6 +227,10 @@ pub(crate) struct Chat {
     pub(crate) editing: Option<u64>,
     pub(crate) job_name: Entity<InputState>,
     pub(crate) job_prompt: Entity<InputState>,
+    /// The name field on the New profile dialog.
+    pub(crate) profile_name: Entity<InputState>,
+    /// The active profile's name for the title bar, once there are several.
+    pub(crate) profile_label: Option<String>,
     pub(crate) messaging: letronna_core::messaging::Config,
     /// The code the Messaging page shows for pairing a Telegram chat.
     pub(crate) pairing: Option<letronna_core::messaging::pairing::Code>,
@@ -574,6 +578,7 @@ impl Chat {
                 .auto_grow(2, 6)
                 .placeholder("Run the tests and tell me what broke.")
         });
+        let profile_name = cx.new(|cx| InputState::new(window, cx).placeholder("Work"));
         let edit_message = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
@@ -731,6 +736,8 @@ impl Chat {
             editing: None,
             job_name,
             job_prompt,
+            profile_name,
+            profile_label: crate::ui::profiles::title_label(),
             messaging: letronna_core::messaging::load(),
             pairing: None,
             slack_code: None,

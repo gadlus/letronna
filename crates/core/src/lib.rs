@@ -60,6 +60,7 @@ mod patch;
 pub mod paths;
 pub mod permissions;
 pub mod preview;
+pub mod profiles;
 mod redact;
 pub mod references;
 pub mod retry;

@@ -2105,7 +2105,8 @@ fn in_reach(
                 .strip_prefix('~')
                 .is_some_and(|rest| !rest.is_empty() && !rest.starts_with(['/', '\\']));
             let provider = dialect == Dialect::PowerShell && raw.find(':').is_some_and(|at| at > 1);
-            let reached = !(tilde || provider || dialect != Dialect::Sh && windows_alias(raw))
+            let aliased = dialect != Dialect::Sh && windows_alias(raw);
+            let reached = !(tilde || provider || aliased)
                 && places.path(raw).is_some_and(|path| {
                     within(&path, root)
                         && !places.own(&path)

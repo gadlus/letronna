@@ -1823,7 +1823,14 @@ fn parse_chunk(value: &Value) -> Result<Chunk, Failure> {
     })
 }
 
-pub fn data_dir() -> std::path::PathBuf {
+/// Switched to by `profiles::switch`, so every call below reads and writes
+/// wherever the active profile lives; `None` is the default profile, at
+/// `base_dir` itself.
+static PROFILE_DIR: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+/// Where the default profile keeps its files, and every other profile's
+/// folder besides: `AGENT_DATA_DIR`, or the platform convention.
+pub fn base_dir() -> std::path::PathBuf {
     if let Some(path) = std::env::var_os("AGENT_DATA_DIR") {
         return path.into();
     }
@@ -1839,6 +1846,25 @@ pub fn data_dir() -> std::path::PathBuf {
         })
         .unwrap_or_else(std::env::temp_dir)
         .join("Letronna")
+}
+
+pub fn data_dir() -> std::path::PathBuf {
+    // Nothing that can panic runs under this lock, so a poisoned one is
+    // still whole.
+    let dir = PROFILE_DIR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    dir.unwrap_or_else(base_dir)
+}
+
+/// Point `data_dir` at `dir` from now on, or back at `base_dir` for `None`.
+/// The switch is process-wide and takes effect for the very next read or
+/// write, so callers should not have one of their own in flight.
+pub fn set_profile_dir(dir: Option<std::path::PathBuf>) {
+    *PROFILE_DIR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = dir;
 }
 
 /// How long a reply may go quiet before it is given up on: five minutes
@@ -2597,6 +2623,21 @@ mod tests {
             ".local/share/Letronna"
         };
         assert!(dir.ends_with(expected), "{dir:?}");
+    }
+    #[test]
+    fn a_profile_dir_wins_over_base_dir_until_it_is_cleared() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let base = base_dir();
+        assert_eq!(data_dir(), base);
+        let other = std::env::temp_dir().join("letronna-chat-test-profile");
+        set_profile_dir(Some(other.clone()));
+        assert_eq!(data_dir(), other);
+        // base_dir itself never moves: it is where the profiles list lives.
+        assert_eq!(base_dir(), base);
+        set_profile_dir(None);
+        assert_eq!(data_dir(), base);
     }
     #[test]
     fn endpoint_validation() {
