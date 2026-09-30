@@ -863,7 +863,7 @@ impl Chat {
             video: None,
             video_frame: None,
             panel: Default::default(),
-            changes: crate::ui::changes::Changes::new(cx),
+            changes: crate::ui::changes::Changes::new(window, cx),
             browser: cx.new(|cx| crate::ui::browser::BrowserView::new(window, cx)),
             browser_for: 0,
             files: crate::ui::files::Files::new(cx),
@@ -901,6 +901,11 @@ impl Chat {
         this._subscriptions.push(front);
         let point_comment = this.follow_point_comments(window, cx);
         this._subscriptions.push(point_comment);
+        // The tab getting the keys is a moment the user may have committed
+        // or edited elsewhere, like the window coming to the front.
+        let focus = this.changes.focus.clone();
+        let tab = cx.on_focus_in(&focus, window, |this, _, cx| this.refresh_changes(cx));
+        this._subscriptions.push(tab);
         this.load_models(window, cx);
         // Directly, not through `focus_composer`: the window's root does
         // not exist yet to ask about dialogs, and there can be none.
@@ -1513,7 +1518,7 @@ impl Chat {
 
     /// A checked connection for a turn in the session at `ix`, on the gateway
     /// and model chosen now.
-    fn connection_for(
+    pub(crate) fn connection_for(
         &self,
         ix: usize,
         remote: Option<letronna_core::chat::Remote>,
@@ -3500,6 +3505,8 @@ impl Chat {
         self.outstanding = 0;
         self.stop_blocks = 0;
         plugins::emit(cx, plugins::AppEvent::ChatIdle);
+        // The reply may have changed files, or committed them.
+        self.refresh_changes(cx);
         self.send_follow_ups(session, cx);
         if stopped && let Some(ix) = session.and_then(|id| self.store.index_of(id)) {
             goal::interrupted(&mut self.store.conversations[ix].goal);
