@@ -238,6 +238,9 @@ impl Tool for EditImage {
             files.push(("mask", name.as_path(), bytes.as_slice()));
         }
         let (boundary, body) = forms(&fields, &files);
+        // The form holds a copy of each, so they go now rather than being
+        // held beside it, up to 800 MB more, for as long as the upload runs.
+        drop((images, mask));
         // Not followed, as the chat's own requests are not: a 307 would send
         // the pictures on to wherever the gateway pointed, plain HTTP and
         // this network included.
