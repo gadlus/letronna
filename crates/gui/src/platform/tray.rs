@@ -70,6 +70,7 @@ mod linux_impl {
 
     /// Ids are matched back from the menu event, so keep them stable.
     const SHOW: &str = "show";
+    const QUICK_ENTRY: &str = "quick-entry";
     const UPDATES: &str = "updates";
     const QUIT: &str = "quit";
 
@@ -87,10 +88,20 @@ mod linux_impl {
     pub(super) fn init(cx: &mut App) {
         let menu = Menu::new();
         let show = MenuItem::with_id(SHOW, format!("Open {BRAND}"), true, None);
+        // Wayland grants no application a global key at all, so this is the
+        // only way to the quick entry bar there; harmless to offer under X11
+        // too, where the shortcut usually already works.
+        let quick_entry = MenuItem::with_id(QUICK_ENTRY, "Quick entry", true, None);
         let updates = MenuItem::with_id(UPDATES, "Check for updates", true, None);
         let quit = MenuItem::with_id(QUIT, format!("Quit {BRAND}"), true, None);
         if menu
-            .append_items(&[&show, &PredefinedMenuItem::separator(), &updates, &quit])
+            .append_items(&[
+                &show,
+                &quick_entry,
+                &PredefinedMenuItem::separator(),
+                &updates,
+                &quit,
+            ])
             .is_err()
         {
             return;
@@ -116,6 +127,7 @@ mod linux_impl {
                 while let Ok(event) = MenuEvent::receiver().try_recv() {
                     let _ = cx.update(|cx| match event.id.0.as_str() {
                         SHOW => show_main_window(cx),
+                        QUICK_ENTRY => crate::ui::quick::toggle(cx),
                         UPDATES => check_for_updates(cx),
                         QUIT => cx.quit(),
                         _ => {}

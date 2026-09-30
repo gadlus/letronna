@@ -11,6 +11,7 @@
 
 pub(crate) mod audio;
 pub(crate) mod backdrop;
+pub(crate) mod hotkey;
 pub(crate) mod install;
 pub(crate) mod notify;
 pub(crate) mod poster;

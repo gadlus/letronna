@@ -313,6 +313,10 @@ pub struct Settings {
     /// how long ago each was updated.
     #[serde(default)]
     pub group_by_project: bool,
+    /// The global shortcut that opens the quick entry bar, e.g.
+    /// "ctrl+shift+space". Empty until the window fills in its default.
+    #[serde(default)]
+    pub quick_entry_hotkey: String,
 }
 
 // Written out rather than derived so the film grain and notifications start
@@ -350,6 +354,7 @@ impl Default for Settings {
             verify_edits: true,
             session_filter: String::new(),
             group_by_project: false,
+            quick_entry_hotkey: String::new(),
         }
     }
 }

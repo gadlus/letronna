@@ -111,6 +111,7 @@ fn main() {
             .into_iter()
             .flatten(),
         );
+        ui::quick::init(cx);
         platform::tray::init(cx);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
@@ -149,6 +150,9 @@ fn main() {
                 },
                 |window, cx| {
                     let chat = cx.new(|cx| Chat::new(window, cx));
+                    // Shared with the quick entry window, so a prompt sent
+                    // from the bar lands in this same store.
+                    cx.set_global(ui::quick::MainChat(chat.clone()));
                     cx.new(|cx| Root::new(chat, window, cx))
                 },
             )
@@ -156,6 +160,15 @@ fn main() {
         // Opened with the chat built; its first frame comes on the next
         // refresh of the display.
         letronna_core::diag::mark("window");
+        let hotkey_spec = cx
+            .global::<ui::quick::MainChat>()
+            .0
+            .read(cx)
+            .store
+            .settings
+            .quick_entry_hotkey
+            .clone();
+        platform::hotkey::init(&hotkey_spec, cx);
         // With a tray to bring it back, closing the window tucks the app
         // away; without one that would strand it, so let it close.
         if platform::tray::available() {

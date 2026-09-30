@@ -126,6 +126,8 @@ pub(crate) struct Chat {
     /// The models to carry on with, written as a comma-separated list.
     pub(crate) fallbacks: Entity<InputState>,
     pub(crate) key: Entity<InputState>,
+    /// The quick entry shortcut, as typed on the Shortcuts settings page.
+    pub(crate) hotkey: Entity<InputState>,
     /// Where the browser is when it is not on this computer.
     pub(crate) browser_address: Entity<InputState>,
     /// Every model on every set-up gateway, as (gateway, model).
@@ -467,6 +469,9 @@ impl Chat {
             store.settings.endpoint = std::env::var("AGENT_BASE_URL")
                 .unwrap_or_else(|_| gateway(&store.settings.gateway).base.into());
         }
+        if store.settings.quick_entry_hotkey.is_empty() {
+            store.settings.quick_entry_hotkey = crate::platform::hotkey::DEFAULT.into();
+        }
         let keys = load_keys();
         let saved_key = keys
             .get(key_slot(&store.settings.gateway))
@@ -502,6 +507,11 @@ impl Chat {
                 .placeholder("API key")
                 .masked(true)
                 .default_value(saved_key)
+        });
+        let hotkey = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(crate::platform::hotkey::DEFAULT)
+                .default_value(store.settings.quick_entry_hotkey.clone())
         });
         let browser_address = cx.new(|cx| {
             InputState::new(window, cx)
@@ -694,6 +704,7 @@ impl Chat {
             model,
             fallbacks,
             key,
+            hotkey,
             browser_address,
             models: Vec::new(),
             model_kind: "chat",
@@ -1386,6 +1397,58 @@ impl Chat {
         self.follow();
         self.run_turn(cx);
         Ok(())
+    }
+
+    /// The quick entry bar's send: like [`Self::dispatch`], but window-free,
+    /// since it runs from a window other than the one this `Chat` renders in.
+    /// `new_session` opens a fresh conversation first; otherwise the prompt
+    /// lands in whichever one was last active. `Err` is the reason for the
+    /// bar to show, and leaves the sessions as they were.
+    pub(crate) fn quick_dispatch(
+        &mut self,
+        prompt: String,
+        images: Vec<PathBuf>,
+        new_session: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        // A second turn started over a running one would replace its agent
+        // loop; the composer queues a follow-up here, which the bar cannot.
+        if self.busy {
+            return Err("A reply is still running. Send this when it is done.".into());
+        }
+        if prompt.chars().count() > 12_000 {
+            return Err("Please keep each message under 12,000 characters.".into());
+        }
+        let previous = self.store.active;
+        if new_session {
+            let workspace = self.store.conversations[previous].workspace.clone();
+            self.store.conversations.push(Conversation {
+                id: self.store.reserve_id(),
+                title: "New session".into(),
+                updated: backend::now(),
+                workspace,
+                ..Default::default()
+            });
+            self.store.active = self.store.conversations.len() - 1;
+        }
+        let sent = match self.prompt_for(prompt, cx) {
+            Some(prompt) => self.dispatch(prompt, images, None, cx).is_ok(),
+            None => false,
+        };
+        if sent {
+            return Ok(());
+        }
+        // Shown in the bar, which stays open, not behind it in the window.
+        let why = self
+            .error
+            .take()
+            .unwrap_or_else(|| "That could not be sent.".into());
+        if new_session {
+            self.store.conversations.pop();
+            self.store.active = previous;
+        }
+        cx.notify();
+        Err(why)
     }
 
     /// A checked connection for a turn in the session at `ix`, on the gateway
