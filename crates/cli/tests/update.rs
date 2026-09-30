@@ -158,6 +158,28 @@ fn help_and_version_leave_the_update_state_as_it_was() {
 }
 
 #[test]
+fn opening_the_window_leaves_its_start_to_the_window() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = scratch("gui");
+    let dest = installed(&dir);
+    // A window that starts and leaves, where the launcher looks first, so
+    // no real one opens.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let window = dir.join("bin").join("letronna-gui");
+        std::fs::write(&window, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&window, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // Counted here as well as by the window, this start would be the third.
+    write_state(&dir, pending(&dest, 2));
+    let before = std::fs::read(state_path(&dir)).unwrap();
+    let out = run(&dest, &dir, &["gui"]);
+    assert!(out.status.success());
+    assert_eq!(std::fs::read(state_path(&dir)).unwrap(), before);
+}
+
+#[test]
 fn a_downloaded_update_is_put_in_place_and_started_instead() {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let dir = scratch("finish");

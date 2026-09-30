@@ -73,6 +73,23 @@ fn main() {
         println!("letronna {}", env!("CARGO_PKG_VERSION"));
         return;
     }
+    // Before the update is seen to: the window counts its own start and
+    // installs what is waiting, so counting here too would put a working
+    // version back after half the starts, and removing Letronna has no use
+    // for a newer one.
+    if args.gui {
+        launch_window();
+        return;
+    }
+    if args.uninstall {
+        match install::remove() {
+            Ok(done) => done
+                .iter()
+                .for_each(|line| render::line(&render::dim(line))),
+            Err(error) => render::line(&render::red(&error)),
+        }
+        return;
+    }
     // An update downloaded last time goes in now, before anything is running,
     // and so does the old version when a new one keeps failing to start.
     // After `--version`, which the updater runs a new binary with before it
@@ -87,19 +104,6 @@ fn main() {
     }
     if let Some(words) = &args.mcp {
         std::process::exit(mcp::run(words));
-    }
-    if args.gui {
-        launch_window();
-        return;
-    }
-    if args.uninstall {
-        match install::remove() {
-            Ok(done) => done
-                .iter()
-                .for_each(|line| render::line(&render::dim(line))),
-            Err(error) => render::line(&render::red(&error)),
-        }
-        return;
     }
     if args.update {
         update_now();
