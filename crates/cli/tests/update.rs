@@ -238,15 +238,29 @@ fn a_version_that_never_settled_is_put_back_and_started_instead() {
     let dir = scratch("roll-back");
     let dest = installed(&dir);
     let old = beside(&dest, "old");
-    std::fs::copy(LETRONNA, &old).unwrap();
-    // Told apart from the version it stands behind by what follows the program.
-    let kept = [std::fs::read(&old).unwrap(), b"old".to_vec()].concat();
+    // A version that says what it was asked, so that starting it can be told
+    // from this one carrying on. Elsewhere, told apart from the version it
+    // stands behind only by what follows the program.
+    #[cfg(unix)]
+    let kept = b"#!/bin/sh\necho \"the old version, asked $*\"\n".to_vec();
+    #[cfg(not(unix))]
+    let kept = [std::fs::read(LETRONNA).unwrap(), b"old".to_vec()].concat();
     std::fs::write(&old, &kept).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     write_state(&dir, pending(&dest, 2));
     let out = run(&dest, &dir, &["-p", "hello"]);
-    assert_eq!(out.status.code(), Some(1));
     let said = String::from_utf8_lossy(&out.stdout);
-    assert!(said.contains("Nothing is set up yet"), "{said}");
+    if cfg!(unix) {
+        assert!(out.status.success(), "{said}");
+        assert_eq!(said.trim(), "the old version, asked -p hello");
+    } else {
+        assert_eq!(out.status.code(), Some(1));
+        assert!(said.contains("Nothing is set up yet"), "{said}");
+    }
     assert_eq!(std::fs::read(&dest).unwrap(), kept);
     assert!(beside(&dest, "failed").is_file());
     assert!(!old.exists());
