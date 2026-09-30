@@ -63,3 +63,19 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --release --locked
+
+      # The bench, one test at a time since each times the whole process: the
+      # many-agents budget, then the core's and the terminal's times against
+      # bench/baseline.json, failing on one more than 20% over. The baseline
+      # is kept per platform and was taken on a Mac, so a runner prints what
+      # it measured and passes until its own numbers are recorded there with
+      # LETRONNA_BENCH_RECORD=1.
+      - name: Bench
+        shell: bash
+        env:
+          AGENT_DATA_DIR: ${{ runner.temp }}/letronna-bench-agents
+        run: |
+          mkdir -p "$AGENT_DATA_DIR"
+          cargo test -p letronna-core --release --locked -- --ignored many_agents_keep_to_the_performance_budget --nocapture
+          cargo test -p letronna-core --release --locked -- --ignored the_core_keeps_to_its_baseline --nocapture
+          cargo test -p letronna-cli --release --locked --test bench -- --ignored --nocapture

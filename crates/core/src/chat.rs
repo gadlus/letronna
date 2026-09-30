@@ -607,6 +607,13 @@ fn window_start(messages: &[Message], budget: &Budget) -> usize {
     start
 }
 
+/// Where the window starts over `messages` for a model that reads `context`
+/// tokens, under the default cap, for the bench to time.
+#[cfg(test)]
+pub(crate) fn window_start_within(context: u64, messages: &[Message]) -> usize {
+    window_start(messages, &sized(Some(context), None, CAP_TOKENS, 0))
+}
+
 /// Whether a message starts a turn: the user's, and not folded into one running.
 pub(crate) fn opens_turn(message: &Message) -> bool {
     // Roles alone cannot tell a follow-up folded in after tool results from a

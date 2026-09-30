@@ -11,6 +11,8 @@ pub mod agent_defs;
 pub mod agents;
 pub mod approvals;
 pub mod auth;
+#[cfg(test)]
+mod bench;
 pub mod browser;
 pub mod budget;
 pub mod cancel;
