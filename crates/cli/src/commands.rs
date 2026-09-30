@@ -4,6 +4,7 @@
 use letronna_core::agents::Seen;
 use letronna_core::gate::Mode;
 use letronna_core::skills::{Skill, Source};
+use letronna_core::slash::{self, Origin};
 use letronna_core::{history, store};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -29,6 +30,7 @@ pub fn command(
     session: &mut usize,
     workspace: Option<&std::path::Path>,
 ) -> Flow {
+    let whole = line;
     // A command may carry a word after it: `/model gpt` narrows the list
     // rather than making you scroll it.
     let (line, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
@@ -36,7 +38,7 @@ pub fn command(
     match line {
         "/exit" | "/quit" => Flow::Stop,
         "/help" => {
-            help();
+            help(workspace);
             Flow::Handled
         }
         "/clear" => {
@@ -275,7 +277,7 @@ pub fn command(
             }
             None => Flow::Handled,
         },
-        _ => Flow::Unknown,
+        _ => added(runner, whole, workspace),
     }
 }
 
@@ -304,6 +306,96 @@ fn mcp_prompt(runner: &mut Runner, command: &str, rest: &str) -> Option<Result<S
             }
             None
         })
+}
+
+/// A command the user, the project or a skill added: what it gives goes in
+/// the box, to be read before it is sent. Unknown when none has the name.
+fn added(runner: &mut Runner, line: &str, workspace: Option<&std::path::Path>) -> Flow {
+    let Some((name, args)) = slash::split(line) else {
+        return Flow::Unknown;
+    };
+    let commands = listed(workspace);
+    let Some(command) = slash::find(&commands, name) else {
+        return Flow::Unknown;
+    };
+    render::blank();
+    render::said(
+        &render::blue("●"),
+        &format!(
+            "{} {}",
+            render::bold(&format!("/{}", command.name)),
+            render::dim(&format!("· {}", from(command.origin)))
+        ),
+    );
+    match slash::fill(command, args) {
+        Ok(given) => {
+            // Queued while a turn ran, it can find a next line begun, which stays.
+            let given = match runner.bar.draft().trim() {
+                "" => given,
+                draft => format!("{draft}\n{given}"),
+            };
+            runner.bar.say(&given);
+        }
+        Err(error) => render::line(&render::red(&error)),
+    }
+    Flow::Handled
+}
+
+/// Offer the added commands in the `/` menu, read afresh, so a file made or
+/// changed shows from the next command on.
+pub fn offer_added(runner: &mut Runner, workspace: Option<&std::path::Path>) {
+    let offered = listed(workspace)
+        .into_iter()
+        .filter(|c| c.hidden_by.is_none())
+        .map(|c| {
+            let blurb = match c.hint.as_str() {
+                "" => c.description,
+                hint => format!("{hint} · {}", c.description),
+            };
+            (format!("/{}", c.name), blurb)
+        })
+        .collect();
+    runner.bar.offer(offered);
+}
+
+/// An added command's line in `/help`: where it comes from and what it does,
+/// or, when another has its name, which one that is.
+fn about(command: &slash::Command) -> String {
+    let from = from(command.origin);
+    let Some(winner) = command.hidden_by else {
+        return match command.hint.as_str() {
+            "" => format!("{from} · {}", command.description),
+            hint => format!("{from} · {hint} · {}", command.description),
+        };
+    };
+    let winner = match winner {
+        Origin::BuiltIn => "Letronna's own",
+        Origin::User => "yours",
+        Origin::Project => "the project's",
+        Origin::Skill => "a skill",
+    };
+    format!("{from} · hidden, {winner} has the name")
+}
+
+/// Where an added command comes from, in a word.
+fn from(origin: Origin) -> &'static str {
+    match origin {
+        // Only a name's winner is ever built in; the match must name it.
+        Origin::BuiltIn => "built in",
+        Origin::User => "yours",
+        Origin::Project => "project",
+        Origin::Skill => "skill",
+    }
+}
+
+/// Every added command, beside Letronna's own, which win over them.
+fn listed(workspace: Option<&std::path::Path>) -> Vec<slash::Command> {
+    let own: Vec<&str> = bar::COMMANDS
+        .iter()
+        .map(|c| c.name.trim_start_matches('/'))
+        .chain(["quit"])
+        .collect();
+    slash::list(workspace, &own)
 }
 
 /// What the model calls took: this session's, each recent day's and each
@@ -384,18 +476,35 @@ const KEYS: &[(&str, &str)] = &[
     ("ctrl+c", "copy what is selected, clear the line, or leave"),
     ("page up/down", "scroll back through the conversation"),
     ("drag", "select and copy"),
+    ("//", "start a message with one /, as in //tmp is full"),
 ];
 
-/// The commands, then the keys, each in one column so it reads straight down.
-fn help() {
+/// The commands, then the added ones, then the keys, each in one column so
+/// it reads straight down.
+fn help(workspace: Option<&std::path::Path>) {
     render::blank();
-    let width = bar::name_width();
-    for entry in bar::COMMANDS {
+    let added: Vec<(String, String)> = listed(workspace)
+        .iter()
+        .map(|c| (format!("/{}", c.name), about(c)))
+        .collect();
+    let width = bar::name_width(&added);
+    let row = |name: &str, blurb: &str| {
+        // An added command's description is its writer's and can run long.
+        let room = render::width().saturating_sub(width + 2);
         render::line(&format!(
             "{}  {}",
-            render::bold(&format!("{:<width$}", entry.name)),
-            render::dim(entry.blurb)
+            render::bold(&format!("{:<width$}", render::fit(name, width))),
+            render::dim(&render::fit(blurb, room))
         ));
+    };
+    for entry in bar::COMMANDS {
+        row(entry.name, entry.blurb);
+    }
+    if !added.is_empty() {
+        render::blank();
+        for (name, about) in &added {
+            row(name, about);
+        }
     }
     render::blank();
     let width = KEYS

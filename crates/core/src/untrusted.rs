@@ -155,7 +155,7 @@ pub(crate) fn cleaned(text: &str) -> (String, usize) {
 /// Whether `c` shows as nothing on screen: a format character, a tag
 /// character, a variation selector, a filler, or an unassigned code point
 /// among them.
-fn invisible(c: char) -> bool {
+pub(crate) fn invisible(c: char) -> bool {
     matches!(
         c,
         '\u{00AD}'

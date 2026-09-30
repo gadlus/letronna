@@ -54,6 +54,7 @@ mod scan;
 pub mod schedule;
 pub mod search;
 pub mod skills;
+pub mod slash;
 mod state;
 pub mod store;
 pub mod structured;
