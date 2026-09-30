@@ -313,6 +313,8 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
     // In place of the MCP tools when those are too many to send; see
     // `specs`. Here, so that no plugin can take their names.
     tools.extend(crate::mcp_find::tools());
+    #[cfg(feature = "workflows")]
+    tools.push(Arc::new(crate::workflow::tool::Workflow));
     // The user's own search service, once one is set up.
     if crate::search::ready() {
         tools.push(Arc::new(crate::search::SearchWeb));
@@ -915,6 +917,8 @@ pub fn summary(name: &str, args: &str) -> String {
             Some(file) => format!("{} {file}", v["name"].as_str().unwrap_or_default()),
             None => v["name"].as_str().unwrap_or_default().to_owned(),
         },
+        #[cfg(feature = "workflows")]
+        "workflow" => crate::workflow::tool::summary(&v),
         _ => v["path"].as_str().unwrap_or(".").to_owned(),
     };
     one_line(&text)

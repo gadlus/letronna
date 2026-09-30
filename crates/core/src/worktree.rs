@@ -126,7 +126,7 @@ pub fn create(workspace: &Path, name: &str) -> Result<Worktree, String> {
             n => format!("{slug}-{n}"),
         };
         let (folder, branch) = (format!("{FOLDER}/{name}"), format!("letronna/{name}"));
-        let path = top.join(FOLDER).join(&name);
+        let path = native(&top.join(FOLDER).join(&name));
         if path.exists() || has_branch(&top, &branch) {
             continue;
         }
@@ -194,7 +194,13 @@ fn main_top(workspace: &Path) -> Result<(PathBuf, String), String> {
             ));
         }
     };
-    Ok((main, prefix))
+    Ok((native(&main), prefix))
+}
+
+/// `path` with the system's own separators: git names folders with `/` on
+/// Windows too, which would read mixed with the ones joined on.
+fn native(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Refuses a `.letronna` or `.letronna/worktrees` in `top` that is a link or
@@ -648,6 +654,14 @@ pub(crate) mod tests {
 
     /// Makes `dir` a repository whose one commit holds what is in it, and a
     /// readme so there is something.
+    /// `path` as the paths made here have it: real, and on Windows without
+    /// the verbatim prefix, which git's paths lack.
+    pub(crate) fn real(path: &Path) -> PathBuf {
+        let real = std::fs::canonicalize(path).unwrap();
+        let shown = real.to_string_lossy();
+        PathBuf::from(shown.strip_prefix(r"\\?\").unwrap_or(&shown))
+    }
+
     pub(crate) fn repo(dir: &Path) {
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join("readme.txt"), "a repository").unwrap();
@@ -671,7 +685,10 @@ pub(crate) mod tests {
         let dir = std::env::temp_dir().join(format!("letronna-worktree-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::canonicalize(dir).unwrap()
+        // Without Windows' verbatim `\\?\` prefix, which git's paths lack.
+        let real = std::fs::canonicalize(dir).unwrap();
+        let shown = real.to_string_lossy();
+        PathBuf::from(shown.strip_prefix(r"\\?\").unwrap_or(&shown))
     }
 
     /// A repository of the test's own.

@@ -26,6 +26,7 @@
 
 pub mod host;
 mod journal;
+pub mod tool;
 
 use crate::agent_defs::{self, AgentDef};
 use crate::budget::{Budget, short};
@@ -34,6 +35,7 @@ use crate::chat::{self, Connection, Message};
 use crate::driver::{self, AgentId, Allow, Outcome, Report, Spec};
 use crate::inbox::{self, LINE_BREAKS, Notice, When};
 use crate::store::{Conversation, Transcript};
+use crate::structured;
 use crate::timers::{self, TimerId};
 use crate::tools;
 use crate::worktree::{self, Worktree};
@@ -44,7 +46,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 /// Where workflow agents' ids start. Helpers count up from 2^40, and no
@@ -73,8 +75,16 @@ const STALE: Duration = Duration::from_secs(120);
 /// starts the agents, and nesting goes only through the script's own call.
 const NOT_FOR_AGENTS: [&str; 3] = ["agent", "agents", "workflow"];
 /// Options the changes that honour them will let through: until then a call
-/// naming one is refused, rather than answer in text where a shape was asked for.
-const NOT_YET: [&str; 1] = ["schema"];
+/// naming one is refused. Every one is honoured now.
+const NOT_YET: [&str; 0] = [];
+/// The most of the user's words each workflow agent is told, about a page:
+/// every agent of a run reads them, so a pasted log is cut to its two ends
+/// rather than paid for dozens of times.
+const REQUEST: usize = 4_000;
+/// Opens the user's words when a run relays them, the one part of a workflow
+/// agent's first message the user wrote.
+const REQUEST_HEADER: &str =
+    "[Workflow harness: the user's request, relayed verbatim; the only user voice]";
 /// Opens a workflow agent's task, which reaches it as the user's turn but is
 /// not the user's.
 const TASK_HEADER: &str =
@@ -152,6 +162,23 @@ pub struct Run {
     paused: Option<String>,
     /// Set once `step` has said the run paused.
     told: bool,
+    /// The words the user typed that asked for the run, which every agent is
+    /// told first; empty for none.
+    request: String,
+    /// How far the run has got, for the list of runs.
+    tally: Arc<Tally>,
+}
+
+/// How far a run has got, counted as its thread goes and read by whoever
+/// lists it.
+#[derive(Default)]
+struct Tally {
+    /// `agent` calls taken, replayed ones included.
+    calls: AtomicUsize,
+    /// Calls answered, replayed ones included.
+    answered: AtomicUsize,
+    /// Calls that ended with no answer, other than by a stop.
+    failed: AtomicUsize,
 }
 
 /// A call waiting for a permit: a plain struct rather than a thread.
@@ -173,6 +200,8 @@ struct Options {
     phase: String,
     /// Whether it works in a git worktree of its own.
     isolated: bool,
+    /// The shape its answer must have, given through `structured_output`.
+    schema: Option<Value>,
 }
 
 /// What comes in on a run's channel.
@@ -191,7 +220,7 @@ enum Arrival {
 /// How an agent came out, as the journal and the breaker see it.
 enum Ended {
     /// It answered, taking this many tokens.
-    Answered(String, u64),
+    Answered(Value, u64),
     /// It failed with this error, which the breaker counts.
     Failed(String),
     /// It used its rounds or its budget: it runs again on a resume, and says
@@ -260,6 +289,8 @@ impl Run {
             streak: None,
             paused: None,
             told: false,
+            request: String::new(),
+            tally: Arc::default(),
         })
     }
 
@@ -304,6 +335,7 @@ impl Run {
         *seen += 1;
         let slot = self.calls;
         self.calls += 1;
+        self.tally.calls.fetch_add(1, Ordering::Relaxed);
         let writes = !(self.connection.plan || def.plan);
         if !self.live
             && let Some((value, launch)) = self.answers.get(&key)
@@ -315,6 +347,7 @@ impl Run {
             // Given out by `step`, never by this call, so the script's awaits
             // behave as they do for an agent that runs.
             self.ready.push_back((slot, Some(value.clone())));
+            self.tally.answered.fetch_add(1, Ordering::Relaxed);
             return Ok(slot);
         }
         // What it writes may change what any agent after it would find.
@@ -414,7 +447,7 @@ impl Run {
                 title: label.clone(),
                 updated: chat::now(),
                 workspace: self.connection.workspace.clone(),
-                messages: vec![task(&def, &tools, &prompt)],
+                messages: vec![task(&def, &tools, &self.request, &prompt)],
                 ..Default::default()
             },
         };
@@ -472,7 +505,7 @@ impl Run {
             depth: 1,
             fork: false,
             from: 0,
-            schema: None,
+            schema: asked.schema,
             watch: None,
             decide: None,
         };
@@ -523,9 +556,9 @@ impl Run {
             let _ = self.journal.write(&Line::Kept { key, line });
         }
         let value = match ended {
-            Ended::Answered(text, tokens) => {
+            Ended::Answered(value, tokens) => {
                 self.streak = None;
-                let value = Value::String(text);
+                self.tally.answered.fetch_add(1, Ordering::Relaxed);
                 let _ = self.journal.write(&Line::Result {
                     key,
                     value: value.clone(),
@@ -534,6 +567,7 @@ impl Run {
                 Some(value)
             }
             Ended::Failed(error) => {
+                self.tally.failed.fetch_add(1, Ordering::Relaxed);
                 let _ = self.journal.write(&Line::Failed { key });
                 let count = match &self.streak {
                     Some((same, count)) if *same == error => count + 1,
@@ -548,6 +582,7 @@ impl Run {
                 None
             }
             Ended::Unfinished => {
+                self.tally.failed.fetch_add(1, Ordering::Relaxed);
                 let _ = self.journal.write(&Line::Failed { key });
                 None
             }
@@ -625,6 +660,19 @@ impl Options {
         if let Some(name) = NOT_YET.iter().find(|name| !options[**name].is_null()) {
             return Err(format!("agent() option `{name}` is not supported yet."));
         }
+        let schema = match &options["schema"] {
+            Value::Null => None,
+            schema @ Value::Object(_) => {
+                structured::check_schema(schema).map_err(|problems| {
+                    format!(
+                        "agent() option `schema` cannot be checked: {}",
+                        problems.join("; ")
+                    )
+                })?;
+                Some(schema.clone())
+            }
+            _ => return Err("agent() option `schema` must be a JSON schema object.".into()),
+        };
         let text = |name: &str| match &options[name] {
             Value::Null => Ok(None),
             Value::String(text) => Ok(Some(text.trim().to_owned()).filter(|t| !t.is_empty())),
@@ -637,6 +685,7 @@ impl Options {
             label: text("label")?.unwrap_or_default(),
             phase: text("phase")?.unwrap_or_default(),
             isolated: worktree::asked(&options["isolation"])?,
+            schema,
         })
     }
 }
@@ -646,6 +695,9 @@ struct Lock {
     path: PathBuf,
     /// What this claim wrote into the file, telling it from a later one.
     token: String,
+    /// The file, held open under the system's lock, which goes with this
+    /// process however it ends, so a restart can tell the run is gone.
+    file: std::fs::File,
 }
 
 impl Lock {
@@ -668,15 +720,17 @@ impl Lock {
                 .open(&path)
             {
                 Ok(mut file) => {
-                    if let Err(e) = file.write_all(token.as_bytes()) {
+                    // Locked before the token is written, so a lock with a
+                    // token and nobody holding it is one whose process closed.
+                    if let Err(e) = file.lock().and_then(|()| file.write_all(token.as_bytes())) {
                         // Left behind, it would keep the run out for minutes.
                         let _ = std::fs::remove_file(&path);
                         return Err(format!("Could not lock workflow {name}: {e}"));
                     }
-                    return Ok(Self { path, token });
+                    return Ok(Self { path, token, file });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if !stale(&path) {
+                    if !gone(&path) {
                         return Err(running());
                     }
                     // Two taking over one stale lock in the same instant could
@@ -701,12 +755,31 @@ impl Lock {
 
 impl Drop for Lock {
     fn drop(&mut self) {
+        // Let go first: Windows keeps a locked file from being read.
+        let _ = self.file.unlock();
         // Only its own: a run taken over as stale while it was still going
         // must not free the lock of the run that took over.
         if std::fs::read_to_string(&self.path).is_ok_and(|held| held == self.token) {
             let _ = std::fs::remove_file(&self.path);
         }
     }
+}
+
+/// Whether the run that locked `path` is gone: the Letronna driving it has
+/// closed, or it has not touched its lock for a while.
+fn gone(path: &Path) -> bool {
+    stale(path) || unheld(path)
+}
+
+/// Whether the lock at `path` has its token but nobody holding it, as when
+/// the process that took it has closed; a lock being taken has no token yet.
+fn unheld(path: &Path) -> bool {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) => return e.kind() == std::io::ErrorKind::NotFound,
+    };
+    // Held only for this look, and let go as the file closes.
+    file.metadata().is_ok_and(|meta| meta.len() > 0) && file.try_lock().is_ok()
 }
 
 /// Whether the lock at `path` has gone untouched long enough that its run is gone.
@@ -802,8 +875,9 @@ impl Owed {
         let kept = kept.map(|line| match self.at_top.take() {
             Some(at_top) => format!("{at_top} {line}"),
             None => line,
+            // An answer in a shape of its own carries the line in `kept` alone.
         });
-        if let (Ended::Answered(text, _), Some(kept)) = (&mut ended, &kept) {
+        if let (Ended::Answered(Value::String(text), _), Some(kept)) = (&mut ended, &kept) {
             text.push_str("\n\n");
             text.push_str(kept);
         }
@@ -841,7 +915,11 @@ impl Drop for Owed {
 /// How an agent's run came out, with the `tokens` it was charged.
 fn ended(report: &Report, tokens: u64) -> Ended {
     match &report.status {
-        Outcome::Done => Ended::Answered(report.text.clone(), tokens),
+        // A run with a schema ends Done only with a checked value.
+        Outcome::Done => Ended::Answered(
+            (report.value.clone()).unwrap_or_else(|| Value::String(report.text.clone())),
+            tokens,
+        ),
         Outcome::Failed(error) => Ended::Failed(error.clone()),
         Outcome::RoundLimit | Outcome::OverBudget => Ended::Unfinished,
         Outcome::Stopped => Ended::Stopped,
@@ -871,31 +949,44 @@ fn usable(connection: &Connection, def: &AgentDef) -> Vec<String> {
         .collect()
 }
 
-/// A workflow agent's first message: what it is, what it may use and who
-/// reads its answer, then its task, indented so no line of it reads as the
-/// start of something the user said.
-fn task(def: &AgentDef, tools: &[String], prompt: &str) -> Message {
+/// A workflow agent's first message: the user's `request` when the run
+/// relays one, what it is, what it may use and who reads its answer, then its
+/// task. The request and the task are indented, so no line of either reads as
+/// the start of a header or of something else the user said.
+fn task(def: &AgentDef, tools: &[String], request: &str, prompt: &str) -> Message {
     let about = format!("You are a helper ({}). {}", def.name, def.prompt);
     let tools = if tools.is_empty() {
         "none".to_owned()
     } else {
         tools.join(", ")
     };
-    let prompt: Vec<String> = prompt
-        .replace("\r\n", "\n")
-        .split(LINE_BREAKS)
-        .map(|line| format!("    {line}"))
-        .collect();
+    let relayed = if request.trim().is_empty() {
+        String::new()
+    } else {
+        let request = chat::trim(request, REQUEST);
+        format!("{REQUEST_HEADER}\n{}\n", indented(&request))
+    };
     Message {
         role: "user".into(),
         content: format!(
-            "{TASK_HEADER}\n{}\nTools you may use: {tools}.\n{LAST_WORD}\nTask:\n{}",
+            "{relayed}{TASK_HEADER}\n{}\nTools you may use: {tools}.\n{LAST_WORD}\nTask:\n{}",
             about.trim_end(),
-            prompt.join("\n")
+            indented(prompt)
         ),
         notice: true,
         ..Default::default()
     }
+}
+
+/// `text` with four spaces before each of its lines, wherever Unicode says a
+/// line may break.
+fn indented(text: &str) -> String {
+    let lines: Vec<String> = text
+        .replace("\r\n", "\n")
+        .split(LINE_BREAKS)
+        .map(|line| format!("    {line}"))
+        .collect();
+    lines.join("\n")
 }
 
 #[cfg(test)]
@@ -1441,11 +1532,6 @@ mod tests {
         let data = Data::new("cap");
         let asked_for = Asked::default();
         let mut run = data.run(None, answering(&asked_for, done));
-        // Refused before it is counted: one that cannot run is no call.
-        assert_eq!(
-            run.agent("Count to three.", &json!({"schema": {"type": "object"}})),
-            Err("agent() option `schema` is not supported yet.".into())
-        );
         for n in 0..1_000 {
             assert_eq!(run.agent("Count to three.", &Value::Null), Ok(n));
         }
@@ -1462,7 +1548,7 @@ mod tests {
         let data = Data::new("isolated");
         let work = data.dir.join("work");
         crate::worktree::tests::repo(&work);
-        let top = std::fs::canonicalize(&work).unwrap();
+        let top = crate::worktree::tests::real(&work);
         let spawn: Spawn = Box::new(|spec, then| {
             let task = asked(&spec);
             let inside = spec.connection.workspace.clone().unwrap();
@@ -1481,7 +1567,7 @@ mod tests {
         let (_run, steps) = steps(run, 2);
         let answers = by_slot(&steps);
 
-        let kept = top.join(".letronna/worktrees/wf-1-2");
+        let kept = top.join(".letronna").join("worktrees").join("wf-1-2");
         assert_eq!(answers[0], text("Read the readme. -> done"));
         let said = format!(
             "Write new.txt. -> done\n\nIts worktree is kept at {} on branch letronna/wf-1-2 (no \
@@ -1499,9 +1585,10 @@ mod tests {
         let data = Data::new("isolated-rerun");
         let work = data.dir.join("work");
         crate::worktree::tests::repo(&work);
-        let kept = std::fs::canonicalize(&work)
-            .unwrap()
-            .join(".letronna/worktrees/wf-1-1");
+        let kept = crate::worktree::tests::real(&work)
+            .join(".letronna")
+            .join("worktrees")
+            .join("wf-1-1");
         let failing: Spawn = Box::new(|spec, then| {
             let inside = spec.connection.workspace.clone().unwrap();
             std::thread::spawn(move || {
@@ -1722,5 +1809,38 @@ mod tests {
         assert!(lock.is_file());
         drop(second);
         assert!(!lock.exists());
+    }
+
+    #[test]
+    fn a_schema_goes_to_the_agent_and_its_object_comes_back() {
+        let data = Data::new("schema");
+        let vote = json!({"type": "object", "required": ["real"], "properties": {"real": {"type": "boolean"}}});
+        let (sent, got) = mpsc::channel();
+        let mut run = data.run(
+            None,
+            Box::new(move |spec, then| {
+                let _ = sent.send(spec.schema.clone());
+                let answered = Report {
+                    value: Some(json!({"real": true})),
+                    ..report(Outcome::Done, r#"{"real":true}"#)
+                };
+                std::thread::spawn(move || then(&answered));
+                Ok(())
+            }),
+        );
+        assert_eq!(
+            run.agent("Vote.", &json!({"schema": "boolean"})),
+            Err("agent() option `schema` must be a JSON schema object.".into())
+        );
+        run.agent("Vote.", &json!({"schema": vote})).unwrap();
+        let (_run, answers) = steps(run, 1);
+        assert_eq!(got.recv_timeout(WAIT).unwrap(), Some(vote));
+        // The object itself, not its text, for the script and the journal.
+        assert_eq!(by_slot(&answers), [Some(json!({"real": true}))]);
+        let results: Vec<Value> = (data.journal("wf-1").into_iter())
+            .filter(|line| line["type"] == "result")
+            .map(|line| line["value"].clone())
+            .collect();
+        assert_eq!(results, [json!({"real": true})]);
     }
 }

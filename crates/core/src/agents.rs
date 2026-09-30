@@ -402,6 +402,11 @@ impl Tool for Agents {
         }, "required": ["action"]})
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
+        // A workflow run is stopped and reported by its name, as a helper is.
+        #[cfg(feature = "workflows")]
+        if let Some(done) = crate::workflow::tool::control(args, &ctx.caller) {
+            return done;
+        }
         let to = || text(args, "to").ok_or_else(|| "`to` is required: a helper's name.".to_owned());
         match args["action"].as_str().unwrap_or_default() {
             "list" => Ok(list(&ctx.caller)),
@@ -1825,6 +1830,8 @@ fn list(caller: &Caller) -> String {
         ]);
     }
     drop(registry);
+    #[cfg(feature = "workflows")]
+    rows.extend(crate::workflow::tool::rows(caller));
     if rows.len() == 1 {
         return "You have started no helpers.".into();
     }
@@ -2311,6 +2318,12 @@ fn report(caller: &Caller, to: &str, offset: usize) -> Result<String, String> {
     let from = Sidecar::read(&sidecar).map_or(0, |what| what.from);
     let messages = &transcript.conversation.messages;
     let said = driver::last_said(messages.get(from..).unwrap_or_default());
+    page(&name, &said, offset)
+}
+
+/// A page of `said`, the last thing `name` said, from character `offset` on,
+/// ending with the call for the next page when there is more.
+pub(crate) fn page(name: &str, said: &str, offset: usize) -> Result<String, String> {
     let total = said.chars().count();
     if total == 0 {
         return Ok(format!("{name} has said nothing yet."));
@@ -3273,8 +3286,8 @@ mod tests {
     fn a_resumed_helper_carries_on_in_the_worktree_it_kept() {
         let session = Session::new("tree-kept");
         crate::worktree::tests::repo(&session.work);
-        let top = std::fs::canonicalize(&session.work).unwrap();
-        let tree = top.join(".letronna/worktrees/tree-kept");
+        let top = crate::worktree::tests::real(&session.work);
+        let tree = top.join(".letronna").join("worktrees").join("tree-kept");
         let inside = tree.clone();
         // What it wrote lands in its worktree while it waits for its answer.
         let (endpoint, provider) = Stub::held(vec![reply("Wrote it.", None)], move |_| {

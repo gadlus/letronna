@@ -82,11 +82,7 @@ impl Journal {
         if bytes.last().is_some_and(|&last| last != b'\n') {
             file.write_all(b"\n").map_err(unreadable)?;
         }
-        let lines = bytes
-            .split(|&byte| byte == b'\n')
-            .filter_map(|line| serde_json::from_slice(line).ok())
-            .collect();
-        Ok((Self { file }, lines))
+        Ok((Self { file }, parse(&bytes)))
     }
 
     /// Appends `line` in one write.
@@ -97,6 +93,22 @@ impl Journal {
             .write_all(text.as_bytes())
             .map_err(|e| format!("Could not write to the workflow's journal: {e}"))
     }
+}
+
+/// The lines of the journal at `path`, read without taking it for writing;
+/// none when it cannot be read.
+pub(super) fn read(path: &Path) -> Vec<Line> {
+    std::fs::read(path)
+        .map(|bytes| parse(&bytes))
+        .unwrap_or_default()
+}
+
+/// The lines of a journal's bytes that parse, skipping a torn one.
+fn parse(bytes: &[u8]) -> Vec<Line> {
+    bytes
+        .split(|&byte| byte == b'\n')
+        .filter_map(|line| serde_json::from_slice(line).ok())
+        .collect()
 }
 
 /// The answers `lines` hold, by key, each with the launch of the run that gave
