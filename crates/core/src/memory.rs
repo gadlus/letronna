@@ -172,6 +172,31 @@ fn instructions(workspace: &Path, data: &Path, home: Option<&Path>) -> Vec<(Stri
     found
 }
 
+/// The instructions in `file`, the AGENTS.md or CLAUDE.md of a folder below
+/// the project folder `workspace`, labelled `label` from it: cut to `max`
+/// characters, with imports from inside `workspace` pulled in, and marked
+/// when they look planted, as the project's own are. None when it is empty
+/// or no plain file.
+pub(crate) fn folder_instructions(
+    workspace: &Path,
+    file: &Path,
+    label: &str,
+    max: usize,
+) -> Option<String> {
+    let data = crate::chat::data_dir();
+    let mut reach = Reach {
+        root: workspace,
+        data: &data,
+        // A package's file is not the user's, so no `~/` import reaches
+        // the home folder from it.
+        home: None,
+        seen: std::fs::canonicalize(file).into_iter().collect(),
+    };
+    let text = read_ends(file, label, max)?;
+    let text = expand(text, file, label, max, 0, &mut reach);
+    Some(crate::untrusted::vetted("this file", &text))
+}
+
 /// `workspace` and the folders above it, nearest first, up to the first that
 /// `is_root` says is a repository's top. Only `workspace` when none is: the
 /// folders above a project with no repository are no part of it.

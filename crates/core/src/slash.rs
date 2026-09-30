@@ -406,6 +406,7 @@ mod tests {
             folder: PathBuf::from(name),
             source,
             enabled: true,
+            learned: false,
         }
     }
 

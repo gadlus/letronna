@@ -66,6 +66,7 @@ mod state;
 pub mod store;
 pub mod structured;
 pub mod styles;
+mod subfolders;
 pub mod tasklist;
 pub mod tasks;
 mod think;
