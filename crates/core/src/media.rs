@@ -267,9 +267,20 @@ impl Tool for EditImage {
         if let Some(why) = refusal(&reply) {
             return Err(why);
         }
-        let encoded = reply["data"][0]["b64_json"]
-            .as_str()
-            .ok_or("No edited image came back.")?;
+        // A gateway picking dall-e-2 when no model is named, as OpenAI's
+        // does, answers with a link; it is not fetched, since the gateway
+        // could point it anywhere, but the paid edit is not called a failure.
+        let Some(encoded) = reply["data"][0]["b64_json"].as_str() else {
+            return Err(match reply["data"][0]["url"].as_str() {
+                Some(link) => format!(
+                    "The edit was made, but {place} sent it as a link, which is not \
+                     fetched: {link}. Give the user the link rather than editing again; \
+                     name a model that sends the picture itself, such as gpt-image-1, \
+                     for it to be saved."
+                ),
+                None => "No edited image came back.".to_owned(),
+            });
+        };
         let bytes = base64(encoded).ok_or("The edited image came back damaged.")?;
         let path = save(ctx, prompt, image_extension(&bytes), &bytes)?;
         let from: Vec<String> = raws.iter().map(|raw| format!("`{raw}`")).collect();
@@ -1698,6 +1709,30 @@ mod tests {
         asked.join().unwrap();
         assert!(why.contains("answered 307"), "{why}");
         assert!(!reached.is_finished() && !project.join("media").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_edit_answered_with_a_link_says_it_was_made_and_where() {
+        let (_turn, dir) = scratch("link");
+        let project = dir.join("project");
+        std::fs::write(
+            project.join("cat.png"),
+            picture(4, 4, image::ImageFormat::Png),
+        )
+        .unwrap();
+        // What OpenAI answers with no model named: dall-e-2, by link.
+        let link = "https://files.example/edit/1.png";
+        let reply = json!({"data": [{"url": link}]}).to_string();
+        let (base, asked) = gateway("200 OK", &reply);
+        let args = json!({"images": ["cat.png"], "prompt": "a hat"});
+        let why = EditImage
+            .run(&args, &on_gateway(&base, &project))
+            .unwrap_err();
+        asked.join().unwrap();
+        assert!(why.contains("was made") && why.contains(link), "{why}");
+        assert!(why.contains("gpt-image-1"), "{why}");
+        assert!(!project.join("media").exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
