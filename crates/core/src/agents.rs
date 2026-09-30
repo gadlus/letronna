@@ -2785,6 +2785,31 @@ mod tests {
     }
 
     #[test]
+    fn a_helper_is_held_to_the_users_deny_rules() {
+        let session = Session::new("denied");
+        // Held to this project, so another test's run reading its own
+        // notes.txt meanwhile is not refused too.
+        let rule = json!([{"tool": "read_file", "pattern": "notes.txt", "effect": "deny",
+            "project": session.work}]);
+        std::fs::write(session.data.join("permissions.json"), rule.to_string()).unwrap();
+        let (endpoint, provider) = Stub::start(vec![
+            reply("", Some(("read_file", json!({"path": "notes.txt"})))),
+            reply("The notes are closed to me.", None),
+        ]);
+        let args = json!({"description": "Read the notes", "type": "explore", "name": "denied",
+            "background": false, "prompt": "Read notes.txt and say what it says."});
+        let out = call(session.context(endpoint), args).unwrap();
+        let sent = provider.sent();
+
+        assert!(out.ends_with("\nThe notes are closed to me."), "{out}");
+        let got = results(&sent[1]);
+        assert!(
+            got[0].starts_with("Refused: a permission rule denies `read_file` for `notes.txt`."),
+            "{got:?}"
+        );
+    }
+
+    #[test]
     fn a_background_helper_notices_its_owner_once() {
         let session = Session::new("background");
         // As a front end does, so a notice has someone to wake the session for it.

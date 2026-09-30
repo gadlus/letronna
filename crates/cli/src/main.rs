@@ -746,6 +746,8 @@ fn installed_name() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use letronna_core::chat::ToolCall;
+    use letronna_core::permissions::{self, Rule};
 
     fn report(status: Outcome) -> Report {
         Report {
@@ -811,5 +813,82 @@ mod tests {
         ];
         assert_eq!(said_last(&session[2..]), "");
         assert_eq!(said_last(&session), "The notes say hello.");
+    }
+
+    fn call(name: &str, args: Value) -> ToolCall {
+        ToolCall {
+            id: format!("{name}-1"),
+            name: name.into(),
+            arguments: args.to_string(),
+        }
+    }
+
+    fn command(line: &str) -> ToolCall {
+        call("run_command", json!({ "command": line }))
+    }
+
+    /// How `-p` answers `call`: the gate in `mode`, as `answer_helpers` asks it.
+    fn answered(
+        call: &ToolCall,
+        ctx: &tools::ToolContext,
+        rules: &Result<Vec<Rule>, String>,
+        mode: Mode,
+        keyboard: bool,
+    ) -> Option<Decision> {
+        let none = letronna_core::gate::Grants::new();
+        crate::session::judged(call, 0, ctx.workspace.clone(), mode, &none, rules, keyboard)
+    }
+
+    fn write() -> ToolCall {
+        call("write_file", json!({ "path": "notes.txt", "content": "x" }))
+    }
+
+    #[test]
+    fn yes_answers_under_the_floor_and_the_deny_rules() {
+        let ctx = tools::ToolContext::default();
+        let none = Ok(Vec::new());
+        let yes = |call: &ToolCall, rules| answered(call, &ctx, rules, Mode::Bypass, false);
+        assert_eq!(yes(&write(), &none), Some(Decision::Once));
+        // Deletes the home folder, in sh and in PowerShell alike.
+        let Some(Decision::Deny(why)) = yes(&command("Remove-Item -Recurse -Force ~"), &none)
+        else {
+            panic!("a hardline command got a yes");
+        };
+        assert!(why.contains("deletes the home folder"), "{why}");
+        // Hard to take back, so it needs a person, and nobody is here.
+        let Some(Decision::Deny(why)) = yes(&command("git reset --hard HEAD~1"), &none) else {
+            panic!("a dangerous command got a yes with nobody to give it");
+        };
+        assert!(why.contains("nobody is here to approve it"), "{why}");
+        let denied = Ok(vec![Rule {
+            tool: "write_file".into(),
+            pattern: String::new(),
+            effect: permissions::Effect::Deny,
+            project: None,
+        }]);
+        let Some(Decision::Deny(why)) = yes(&write(), &denied) else {
+            panic!("a denied write got a yes");
+        };
+        assert!(
+            why.contains("a permission rule denies `write_file`"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn without_yes_a_call_is_asked_at_the_keyboard_or_refused() {
+        let ctx = tools::ToolContext::default();
+        let none = Ok(Vec::new());
+        let asked = |call: &ToolCall, mode, keyboard| answered(call, &ctx, &none, mode, keyboard);
+        assert_eq!(asked(&write(), Mode::Default, true), None);
+        let Some(Decision::Deny(why)) = asked(&write(), Mode::Default, false) else {
+            panic!("a write got a yes with nobody to give it");
+        };
+        assert!(why.contains("nobody is here to give it"), "{why}");
+        // Someone at the keyboard is asked about what the floor holds back.
+        assert_eq!(
+            asked(&command("git reset --hard HEAD~1"), Mode::Bypass, true),
+            None
+        );
     }
 }

@@ -3,13 +3,15 @@
 //! A helper, a `letronna -p` run or a workflow's agent has nobody watching it
 //! stream and nobody to click a card, so this is one more caller of
 //! `agent::Turn` beside the window and the terminal: the same loop, with the
-//! parts that need a person swapped for what works without one. A call that
-//! needs a yes goes to `approvals`, where the session's own rules or its user
-//! answer it; a question is refused with advice, since nobody is there to
-//! answer it; the checklist is kept on the agent's transcript; the browser is
-//! used unseen, with no panel to open; and messages sent meanwhile are read
-//! from the inbox after each batch of results and before the run counts as
-//! done.
+//! parts that need a person swapped for what works without one. Every call
+//! is put to the gate first, as the window's and the terminal's own are, so
+//! the floor and the user's deny rules hold for a tool that needs no yes
+//! too; one that still needs a yes goes to `approvals`, where the session's
+//! own rules or its user answer it; a question is refused with advice,
+//! since nobody is there to answer it; the checklist is kept on the agent's
+//! transcript; the browser is used unseen, with no panel to open; and
+//! messages sent meanwhile are read from the inbox after each batch of
+//! results and before the run counts as done.
 //!
 //! A run given a schema answers through one more tool, `structured_output`,
 //! offered after the rest so the tools before it keep their cached bytes. Its
@@ -31,8 +33,10 @@ use crate::approvals;
 use crate::budget::Budget;
 use crate::cancel::Cancel;
 use crate::chat::{self, Connection, Event, Extra, Message, ToolCall};
+use crate::gate::{Gate, Grants, Mode};
 use crate::inbox::{self, Notice, When};
 use crate::limits::{self, Permit};
+use crate::permissions::{self, Rule};
 use crate::store::{Todo, Transcript};
 use crate::structured;
 use crate::tasks::{self, Key};
@@ -342,21 +346,25 @@ fn steps(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result<Outcom
 /// Works through one reply's calls, running together the ones that may, then
 /// hands back their results and any mail that cannot wait, leaving early at a stop.
 fn work_through(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result<(), String> {
+    // Read once a reply, so a rule the user adds holds from the next one.
+    let rules = permissions::load(&permissions::user_file());
     loop {
         if spec.cancel.is_set() {
             return Ok(());
         }
         // A tool allowed for the whole run would get its yes at once from
-        // `approvals::ask` for a call that clears on its own, so such a
-        // call counts as allowed here and can join a batch.
-        let batchable = |call: &ToolCall| {
-            let name = call.name.as_str();
-            refusal(&spec.allow, name).is_none()
-                && tools::needs_approval(name)
-                && !(approvals::granted(spec.run, name)
+        // `approvals::ask`, so it counts as allowed here and can join a batch.
+        let waits = |call: &ToolCall| match gated(spec, call, &rules) {
+            crate::gate::Outcome::Run => false,
+            // A grant covers the tool, not a call it does not clear, such as a
+            // read of a secret file.
+            crate::gate::Outcome::Ask => {
+                !(approvals::granted(spec.run, &call.name)
                     && crate::gate::cleared(call, &context(spec)))
+            }
+            crate::gate::Outcome::Refuse(_) => true,
         };
-        let batch = turn.next_batch(batchable, MAX_BATCH);
+        let batch = turn.next_batch(waits, MAX_BATCH);
         if !batch.is_empty() {
             for (call, outcome) in batch.iter().zip(together(spec, &batch)) {
                 // One a stop kept from starting gets no result, as a lone call does.
@@ -366,15 +374,7 @@ fn work_through(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result
             }
             continue;
         }
-        // A call this helper may not make runs into its refusal in `dispatch`.
-        let gate = |call: &ToolCall| {
-            if refusal(&spec.allow, &call.name).is_none() && tools::needs_approval(&call.name) {
-                crate::gate::Outcome::Ask
-            } else {
-                crate::gate::Outcome::Run
-            }
-        };
-        let outcome = match turn.next(gate) {
+        let outcome = match turn.next(|call| gated(spec, call, &rules)) {
             Next::Done => return Ok(()),
             Next::Ask => {
                 spec.transcript
@@ -483,6 +483,34 @@ pub(crate) fn refusal(allow: &Allow, name: &str) -> Option<String> {
         return Some(format!("`{name}` is not available to this helper."));
     }
     None
+}
+
+/// What the gate makes of this agent's `call` under the user's `rules`,
+/// except that a tool needing a yes still goes to `approvals` rather than run.
+fn gated(spec: &Spec, call: &ToolCall, rules: &Result<Vec<Rule>, String>) -> crate::gate::Outcome {
+    // A call this agent may not make runs into its refusal in `dispatch`,
+    // and its answer is no tool the gate knows.
+    let answer = call.name == STRUCTURED_OUTPUT && spec.schema.is_some();
+    if answer || refusal(&spec.allow, &call.name).is_some() {
+        return crate::gate::Outcome::Run;
+    }
+    let ctx = context(spec);
+    // The session's mode and what its user allowed are known where the
+    // approval is answered. The default mode refuses only what every mode
+    // does, and with someone to ask what the floor holds back waits for
+    // `approvals` too, which says no at once when nobody is serving.
+    let gate = Gate {
+        ctx: &ctx,
+        mode: Mode::Default,
+        grants: &Grants::new(),
+        rules: rules.as_deref().unwrap_or_default(),
+        broken: rules.as_ref().err().map(String::as_str),
+        human: true,
+    };
+    match crate::gate::decide(call, &gate) {
+        crate::gate::Outcome::Run if tools::needs_approval(&call.name) => crate::gate::Outcome::Ask,
+        outcome => outcome,
+    }
 }
 
 /// What this agent's tool calls can reach, stopping when it stops.
@@ -1294,6 +1322,87 @@ mod tests {
         );
     }
 
+    /// Answers yes to every request of run `run`, as `-p --yes` once did,
+    /// counting them; the rest are dropped, which declines them.
+    fn yes_to_all(run: u64) -> Arc<AtomicUsize> {
+        let requests = approvals::serve();
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counted = asked.clone();
+        std::thread::spawn(move || {
+            for request in requests.iter().filter(|request| request.run == run) {
+                counted.fetch_add(1, Ordering::Relaxed);
+                request.answer(approvals::Decision::Once);
+            }
+        });
+        asked
+    }
+
+    #[test]
+    fn a_deny_rule_holds_for_a_tool_that_needs_no_yes() {
+        let _serving = crate::approvals::tests::SERVING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for yes in [false, true] {
+            let dir = scratch(&format!("denied-read-{yes}"));
+            std::fs::create_dir_all(dir.join(".letronna")).unwrap();
+            let rule = json!([{"tool": "read_file", "pattern": "notes.txt", "effect": "deny"}]);
+            std::fs::write(dir.join(permissions::PROJECT_FILE), rule.to_string()).unwrap();
+            let id = AGENTS + 200 + u64::from(yes);
+            // Nobody serving declines every request, as `-p` without a
+            // keyboard or --yes does.
+            let asked = if yes {
+                yes_to_all(id)
+            } else {
+                drop(approvals::serve());
+                Arc::default()
+            };
+            let (endpoint, provider) = provider(vec![
+                reply("", &[read_notes()]),
+                reply("The notes are closed to me.", &[]),
+            ]);
+            let report = finished(spec(endpoint, &dir, id));
+            assert_eq!(report.status, Outcome::Done);
+            let sent = provider.sent();
+
+            let got = results(&sent[1]);
+            assert!(
+                got[0]
+                    .starts_with("Refused: a permission rule denies `read_file` for `notes.txt`."),
+                "{got:?}"
+            );
+            assert_eq!(asked.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn a_hardline_command_is_refused_though_every_request_gets_a_yes() {
+        let _serving = crate::approvals::tests::SERVING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("hardline");
+        let id = AGENTS + 210;
+        let asked = yes_to_all(id);
+        // Named for the floor alone: no such program exists to run.
+        let wipe = (
+            "run_command",
+            json!({"command": "mkfs.letronna-test disk.img"}),
+        );
+        let (endpoint, provider) = provider(vec![
+            reply("", &[wipe]),
+            reply("That is not mine to run.", &[]),
+        ]);
+        let report = finished(spec(endpoint, &dir, id));
+        assert_eq!(report.status, Outcome::Done);
+        let sent = provider.sent();
+
+        let got = results(&sent[1]);
+        assert!(
+            got[0].starts_with("Refused: this command formats or wipes a disk."),
+            "{got:?}"
+        );
+        assert_eq!(asked.load(Ordering::Relaxed), 0);
+    }
+
     #[test]
     fn a_fetch_the_projects_rule_denies_asks_despite_the_runs_grant() {
         let _serving = crate::approvals::tests::SERVING
@@ -1332,15 +1441,13 @@ mod tests {
         std::thread::spawn(move || {
             let _ = tx.send(finished(run));
         });
-        for _ in 0..2 {
-            let request = requests
-                .recv_timeout(WAIT)
-                .expect("a denied fetch went out without asking");
-            assert_eq!(request.call.name, "web_fetch");
-            request.answer(approvals::Decision::Deny(String::new()));
-        }
+        // The gate refuses it by the project's rule, asking nobody.
         assert_eq!(report.recv_timeout(WAIT).unwrap().status, Outcome::Done);
-        assert_eq!(results(&provider.sent()[1]), [NOT_APPROVED, NOT_APPROVED]);
+        assert!(requests.try_recv().is_err());
+        let sent = provider.sent();
+        let refused = results(&sent[1]);
+        assert_eq!(refused.len(), 2);
+        assert!(refused.iter().all(|r| r.contains("denies")), "{refused:?}");
     }
 
     #[test]
