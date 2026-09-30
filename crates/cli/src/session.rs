@@ -46,6 +46,8 @@ pub struct Runner {
     pub notices: letronna_core::notify::Notices,
     /// Helpers and workflow runs that ended, once the box is up to say so.
     pub ended: Option<async_channel::Receiver<letronna_core::notify::Ended>>,
+    /// Pictures `/image` attached, which go with the next message.
+    pub images: Vec<std::path::PathBuf>,
 }
 
 impl Runner {
@@ -101,6 +103,7 @@ impl Runner {
         self.store.conversations[session].messages.push(Message {
             role: "user".into(),
             content: prompt.to_owned(),
+            images: std::mem::take(&mut self.images),
             ..Default::default()
         });
         self.persist();

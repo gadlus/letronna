@@ -249,6 +249,7 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(ExitPlan),
         Arc::new(Todo),
         Arc::new(crate::messaging::ReadChat),
+        Arc::new(crate::messaging::files::SendFile),
         Arc::new(Sessions),
         Arc::new(crate::memory::Remember),
         Arc::new(crate::skills::UseSkill),
@@ -486,6 +487,7 @@ pub fn offers_plan(connection: &Connection) -> bool {
 /// where other people read the replies, so is everything that touches this
 /// computer; `read_chat` exists only where there is a chat to read, and
 /// `exit_plan` only where there is a plan to hand over and someone to take it.
+/// The tools the user switched off are never offered.
 /// MCP tools too many to send go out on demand, through `find_tools` and
 /// `call_mcp_tool` (see `mcp_find`).
 pub fn specs(connection: &Connection) -> Vec<Value> {
@@ -505,8 +507,10 @@ pub(crate) fn specs_of(
         .remote
         .as_ref()
         .is_some_and(|r| r.history.is_some());
+    let disabled = crate::store::disabled_tools();
     tools
         .iter()
+        .filter(|t| !switched_off(t.name(), &disabled))
         .filter(|t| crate::mcp_find::in_array(t.name(), on_demand))
         .filter(|t| !connection.plan || !t.mutates() || t.name() == "run_command")
         .filter(|t| t.name() != EXIT_PLAN || offers_plan(connection))
@@ -515,6 +519,11 @@ pub(crate) fn specs_of(
         .filter(|t| t.offered(connection))
         .map(|t| spec(t.as_ref()))
         .collect()
+}
+
+/// Whether `disabled`, the settings' `disabled_tools`, names the tool `name`.
+pub(crate) fn switched_off(name: &str, disabled: &[String]) -> bool {
+    disabled.iter().any(|off| off.trim() == name)
 }
 
 /// How `tool` is offered in a request's `tools` array.
@@ -602,12 +611,14 @@ pub(crate) fn run_found(
 }
 
 /// What an untrusted tool returned, fenced. A browse screenshot's first line
-/// is Letronna's own, naming the file it saved, and stays above the fence,
-/// where the window looks for it and nothing a page writes can reach.
+/// is Letronna's own, naming the file it saved, as is an MCP result's that
+/// names a picture its server sent; it stays above the fence, where the
+/// window looks for it and nothing a page or server writes can reach.
 fn fenced(name: &str, args: &Value, text: &str) -> Result<String, String> {
     let shot = name == crate::browser::BROWSE && args["action"] == "screenshot";
+    let saves = shot || crate::mcp::is_tool(name);
     match text.split_once('\n') {
-        Some((own, rest)) if shot && crate::media::saved(own).is_some() => {
+        Some((own, rest)) if saves && crate::media::saved(own).is_some() => {
             let room = MAX_OUTPUT.saturating_sub(own.len() + 1);
             Ok(format!("{own}\n{}", crate::untrusted::fence(rest, room)?))
         }
@@ -935,6 +946,16 @@ fn own_program(path: &Path, me: &Path) -> bool {
 
 /// The platform shell, configured the way every caller needs it.
 pub fn shell(command: &str, cwd: Option<&Path>) -> std::process::Command {
+    shell_over(crate::login_env::vars(), command, cwd)
+}
+
+/// `shell` starting from the login shell's variables `login`, which every
+/// variable set here wins over.
+fn shell_over(
+    login: &[(std::ffi::OsString, std::ffi::OsString)],
+    command: &str,
+    cwd: Option<&Path>,
+) -> std::process::Command {
     use std::process::Command;
     let mut cmd = if cfg!(windows) {
         let mut c = Command::new("powershell");
@@ -946,6 +967,7 @@ pub fn shell(command: &str, cwd: Option<&Path>) -> std::process::Command {
         c.args(["-c", command]);
         c
     };
+    cmd.envs(login.iter().map(|(name, value)| (name, value)));
     // Output is read back as UTF-8, and Python writes to a pipe in the
     // locale's encoding, which on Windows is not. An encoding on its own
     // would make Python strict, and a file name holding bytes that are not
@@ -2061,7 +2083,7 @@ impl Tool for ReadFile {
         true
     }
     fn description(&self) -> &'static str {
-        "Read a text file. Paths are relative to the workspace. Each line is shown as `N|text`, N being its line number; the `N|` is not part of the file. A long file comes a page at a time, and the page ends with the offset to continue from."
+        "Read a text file, or look at a PNG, JPEG, GIF or WebP picture. Paths are relative to the workspace. Each line is shown as `N|text`, N being its line number; the `N|` is not part of the file. A long file comes a page at a time, and the page ends with the offset to continue from."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -2075,6 +2097,9 @@ impl Tool for ReadFile {
         let path = resolve(raw, ctx).map_err(|e| e + &similar(raw, ctx))?;
         let offset = args["offset"].as_u64().unwrap_or(1).max(1) as usize;
         let limit = args["limit"].as_u64().unwrap_or(u64::MAX).max(1) as usize;
+        if let Some(copy) = open_picture(&path, raw)? {
+            return Ok(copy);
+        }
         let before = crate::filestate::stat(&path);
         let (mut text, cut) = open_text(&path)?;
         let (shown, whole) = page(&mut text, offset, limit, cut)?;
@@ -2083,6 +2108,36 @@ impl Tool for ReadFile {
         crate::filestate::read(ctx.conversation, &path, before, whole);
         Ok(shown)
     }
+}
+
+/// A picture read_file was pointed at, copied as it is now into Letronna's
+/// own `media/`, from where the next request shows it to the model; None
+/// for a file that is not a picture every provider takes.
+fn open_picture(path: &Path, raw: &str) -> Result<Option<String>, String> {
+    let mut start = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|file| file.take(12).read_to_end(&mut start))
+        .map_err(|e| e.to_string())?;
+    let Some(kind) = crate::media::picture_kind(&start) else {
+        return Ok(None);
+    };
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let size = crate::media::size(bytes.len());
+    if bytes.len() > crate::media::PICTURE_BYTES {
+        return Err(format!(
+            "`{raw}` is a picture of {size}, more than the {} a model is sent. A smaller copy of it can be read.",
+            crate::media::size(crate::media::PICTURE_BYTES)
+        ));
+    }
+    let about = path.file_stem().unwrap_or_default().to_string_lossy();
+    // Not into the project, as a media tool's are: looking at a picture
+    // leaves the user's files as they were, in plan mode too.
+    let copy = crate::media::save(&ToolContext::default(), &about, kind, &bytes)?;
+    Ok(Some(format!(
+        "{}{}\nA copy of the picture `{raw}`, {size}. It follows the results when this model takes pictures.",
+        crate::media::SAVED,
+        copy.display()
+    )))
 }
 
 /// A file's text as UTF-8, without a byte order mark and with UTF-16 decoded,
@@ -2733,6 +2788,45 @@ mod tests {
     }
 
     #[test]
+    fn read_file_saves_a_copy_of_a_picture_and_names_it() {
+        let (_turn, data) = data_folder("picture");
+        // Outside the data folder, whose files read_file refuses.
+        let dir = std::env::temp_dir().join(format!("letronna-picture-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+        std::fs::write(dir.join("chart.png"), png).unwrap();
+        std::fs::write(dir.join(".env"), png).unwrap();
+        std::fs::write(dir.join("big.gif"), b"GIF89a").unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("big.gif"));
+        file.unwrap()
+            .set_len(crate::media::PICTURE_BYTES as u64 + 1)
+            .unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let read = run("read_file", r#"{"path":"chart.png"}"#, &ctx).unwrap();
+        let copy = crate::media::saved_by("read_file", &read).unwrap();
+        assert!(copy.starts_with(data.join("media")) && copy.to_string_lossy().ends_with(".png"));
+        assert_eq!(std::fs::read(&copy).unwrap(), png);
+        assert!(!read.contains("PNG") && read.contains("`chart.png`, 1 KB"));
+        // A secret-named file is refused whatever it holds, one too big to
+        // send is refused with its size, and other bytes are still no text.
+        let refused = run("read_file", r#"{"path":".env"}"#, &ctx).unwrap_err();
+        assert!(refused.contains("out of reach"), "{refused}");
+        let big = run("read_file", r#"{"path":"big.gif"}"#, &ctx).unwrap_err();
+        assert!(big.contains("a picture of 3.8 MB"), "{big}");
+        std::fs::write(dir.join("blob.bin"), b"\0\x01\x02").unwrap();
+        let blob = run("read_file", r#"{"path":"blob.bin"}"#, &ctx).unwrap_err();
+        assert_eq!(blob, "Not a text file.");
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[test]
     fn edit_file_makes_every_edit_or_none_and_keeps_the_file_as_it_was_written() {
         let dir = std::env::temp_dir().join(format!("letronna-edit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2923,6 +3017,29 @@ mod tests {
         assert_eq!(
             String::from_utf8_lossy(&out.stdout).trim(),
             "cat cat true 1 dumb"
+        );
+    }
+
+    #[test]
+    fn the_login_shell_gives_commands_its_variables_but_not_a_pager_or_colour() {
+        let login: Vec<(std::ffi::OsString, std::ffi::OsString)> = [
+            ("PAGER", "less"),
+            ("GIT_PAGER", "delta"),
+            ("TERM", "xterm-256color"),
+            ("FROM_PROFILE", "yes"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.into(), value.into()))
+        .collect();
+        let print = if cfg!(windows) {
+            r#"Write-Output "$env:PAGER $env:GIT_PAGER $env:TERM $env:FROM_PROFILE""#
+        } else {
+            r#"echo "$PAGER $GIT_PAGER $TERM $FROM_PROFILE""#
+        };
+        let out = shell_over(&login, print, None).output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "cat cat dumb yes"
         );
     }
 
@@ -3891,6 +4008,13 @@ mod tests {
         // A page titled like the line, looked at rather than photographed.
         let look = fenced(crate::browser::BROWSE, &json!({"action": "look"}), &shot).unwrap();
         assert_eq!(crate::media::saved_by(crate::browser::BROWSE, &look), None);
+        // An MCP result naming the picture its server sent keeps it too; the
+        // server's own words shaped like it start with a space, so they don't.
+        let sent = format!("{}/p/media/mcp-1.png\nHere it is.", crate::media::SAVED);
+        let out = fenced("mcp__demo__shoot", &json!({}), &sent).unwrap();
+        assert!(crate::media::saved_by("mcp__demo__shoot", &out).is_some());
+        let forged = fenced("mcp__demo__shoot", &json!({}), &format!(" {sent}")).unwrap();
+        assert_eq!(crate::media::saved_by("mcp__demo__shoot", &forged), None);
     }
 
     #[test]
@@ -3931,5 +4055,115 @@ mod tests {
         assert!(refused.starts_with("Refused"), "{refused}");
         assert!(on_disk().contains("sk-real-"));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The names of the tools a plain local session is offered.
+    fn offered_names() -> Vec<String> {
+        specs(&Connection {
+            tools: true,
+            ..Default::default()
+        })
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap().to_owned())
+        .collect()
+    }
+
+    #[test]
+    fn media_tools_are_offered_only_while_signed_in() {
+        let (_turn, dir) = data_folder("media-offered");
+        let media = ["make_image", "speak", "transcribe", "make_video"];
+        let signed_out = offered_names();
+        assert!(signed_out.contains(&"read_file".to_owned()));
+        assert!(
+            media.iter().all(|m| !signed_out.contains(&m.to_string())),
+            "{signed_out:?}"
+        );
+        // One the model remembers is refused before it reaches the API.
+        let args = r#"{"prompt":"a lighthouse"}"#;
+        let refused = run("make_image", args, &ToolContext::default()).unwrap_err();
+        assert!(refused.contains("not available"), "{refused}");
+
+        let account = crate::auth::Account {
+            token: "t-1".into(),
+            ..Default::default()
+        };
+        let account = serde_json::to_string(&account).unwrap();
+        std::fs::write(dir.join("account.json"), account).unwrap();
+        let signed_in = offered_names();
+        assert!(
+            media.iter().all(|m| signed_in.contains(&m.to_string())),
+            "{signed_in:?}"
+        );
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    /// A tool of any name that answers "ran", for what is decided by name.
+    struct Named(&'static str);
+    impl Tool for Named {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn description(&self) -> &'static str {
+            "Answers ran."
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn run(&self, _: &Value, _: &ToolContext) -> Result<String, String> {
+            Ok("ran".into())
+        }
+    }
+
+    #[test]
+    fn a_switched_off_tool_is_neither_offered_nor_run_and_other_names_are_passed_over() {
+        use crate::gate::{Gate, Grants, Mode, Outcome, decide};
+        let (_turn, dir) = data_folder("switched-off");
+        let off = ["search_sessions", " mcp__demo__echo ", "no_such_tool"];
+        let settings = json!({"endpoint": "", "model": "", "disabled_tools": off});
+        std::fs::write(dir.join("settings.json"), settings.to_string()).unwrap();
+        let names = offered_names();
+        assert!(!names.contains(&"search_sessions".to_owned()), "{names:?}");
+        assert!(names.contains(&"list_sessions".to_owned()), "{names:?}");
+
+        // One the model remembers from earlier is refused, saying why, before
+        // any card and whatever the mode.
+        let ctx = ToolContext::default();
+        let args = r#"{"query":"fig"}"#;
+        let refused = run("search_sessions", args, &ctx).unwrap_err();
+        assert!(refused.contains("`disabled_tools`"), "{refused}");
+        let call = crate::chat::ToolCall {
+            id: "c-1".into(),
+            name: "search_sessions".into(),
+            arguments: args.into(),
+        };
+        let gate = Gate {
+            ctx: &ctx,
+            mode: Mode::Bypass,
+            grants: &Grants::new(),
+            rules: &[],
+            broken: None,
+            human: true,
+        };
+        assert!(
+            matches!(decide(&call, &gate), Outcome::Refuse(why) if why.contains("switched off"))
+        );
+
+        // An MCP server's tool goes by its full name, and only that one.
+        let refused = run_found(
+            &Named("mcp__demo__echo"),
+            "{}",
+            &ctx,
+            &Ok(Default::default()),
+        )
+        .unwrap_err();
+        assert!(refused.contains("switched off"), "{refused}");
+        let other = run_found(
+            &Named("mcp__demo__other"),
+            "{}",
+            &ctx,
+            &Ok(Default::default()),
+        );
+        assert_eq!(other.as_deref(), Ok("ran"));
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 }

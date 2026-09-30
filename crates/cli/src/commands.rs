@@ -239,6 +239,10 @@ pub fn command(
             aside(runner, *session, rest);
             Flow::Handled
         }
+        "/image" => {
+            attach(runner, rest, workspace);
+            Flow::Handled
+        }
         "/where" => {
             render::blank();
             render::line(&format!(
@@ -839,13 +843,13 @@ fn send_to_helper(helpers: &[Seen], rest: &str) {
 }
 
 /// The MCP servers and how each is doing, or reconnect, enable, disable or
-/// read the log of one.
+/// read the log of one, or read mcp.json again.
 fn mcp_servers(rest: &str) {
     use letronna_core::mcp;
     let (verb, name) = rest.split_once(' ').unwrap_or((rest, ""));
     let name = name.trim();
     render::blank();
-    if !verb.is_empty() && name.is_empty() {
+    if !verb.is_empty() && verb != "reload" && name.is_empty() {
         let which = format!("Which server? /mcp {verb} <name>");
         render::said(&render::blue("●"), &render::bold(&which));
         return;
@@ -853,11 +857,14 @@ fn mcp_servers(rest: &str) {
     let done = match verb {
         "" => Ok(()),
         "log" => return mcp_log(name),
+        "reload" => mcp::reload().map(|done| {
+            render::line(&render::dim(&format!("Reloaded mcp.json: {done}")));
+        }),
         "reconnect" => mcp::reconnect(name),
         "enable" => mcp::set_enabled(name, true),
         "disable" => mcp::set_enabled(name, false),
         _ => Err(format!(
-            "/mcp {verb} is not one of reconnect, enable, disable or log."
+            "/mcp {verb} is not one of reconnect, enable, disable, log or reload."
         )),
     };
     if let Err(error) = done {
@@ -865,7 +872,7 @@ fn mcp_servers(rest: &str) {
         return;
     }
     // One just started gets as long to answer as a question asked once waits.
-    if verb == "reconnect" || verb == "enable" {
+    if matches!(verb, "reconnect" | "enable" | "reload") {
         mcp::ready(crate::MCP_WAIT);
     }
     if let Some(error) = mcp::unreadable() {
@@ -886,7 +893,9 @@ fn mcp_servers(rest: &str) {
             crate::mcp::health(server)
         ));
     }
-    render::line(&render::dim("/mcp reconnect|enable|disable|log <name>"));
+    render::line(&render::dim(
+        "/mcp reconnect|enable|disable|log <name>, or /mcp reload after editing mcp.json",
+    ));
 }
 
 /// The newest of what one server printed on stderr.
@@ -1413,6 +1422,8 @@ fn take_back(
 ) -> Option<String> {
     let (at, prompt) = last_prompt(&runner.store.conversations[session].messages)?;
     let conversation = &mut runner.store.conversations[session];
+    // Its pictures come back with its words, to go with them again.
+    runner.images = std::mem::take(&mut conversation.messages[at].images);
     conversation.rewind(at);
     // The checklist is the one the last `todo` left standing.
     conversation.todos = store::todos_in(&conversation.messages);
@@ -1428,6 +1439,66 @@ fn take_back(
     // After the redraw, so a failure to save is not cleared off the screen.
     runner.persist();
     Some(letronna_core::init::typed(&prompt).map_or(prompt, str::to_owned))
+}
+
+/// Attach the picture at `raw` to the next message, saved as the window
+/// saves one pasted there; with no path, say what is attached, and with
+/// `clear`, drop it.
+fn attach(runner: &mut Runner, raw: &str, workspace: Option<&std::path::Path>) {
+    render::blank();
+    if raw == "clear" {
+        runner.images.clear();
+        render::line(&render::dim("No pictures attached."));
+        return;
+    }
+    if raw.is_empty() {
+        let note = match runner.images.len() {
+            0 => "Nothing attached. /image <path> attaches a picture to your next message.".into(),
+            n => format!("{n} attached to your next message; /image clear drops them."),
+        };
+        render::line(&render::dim(&note));
+        return;
+    }
+    let path = typed_path(raw, workspace);
+    let name = path.file_stem().unwrap_or_default().to_string_lossy();
+    let saved = std::fs::read(&path)
+        .map_err(|e| format!("Cannot read {}: {e}", path.display()))
+        .and_then(|bytes| letronna_core::media::attach(&name, &bytes));
+    match saved {
+        Ok(saved) => {
+            runner.images.push(saved);
+            render::line(&render::dim(&format!(
+                "Attached {}; it goes with your next message.",
+                path.display()
+            )));
+        }
+        Err(error) => render::line(&render::red(&error)),
+    }
+}
+
+/// The file a typed path names: quoted, or with its spaces escaped as a
+/// terminal pastes a file dragged onto it; `~` for home; and from the
+/// project folder when relative.
+fn typed_path(raw: &str, workspace: Option<&std::path::Path>) -> std::path::PathBuf {
+    let quoted = ['"', '\''].iter().find_map(|&quote| {
+        raw.strip_prefix(quote)
+            .and_then(|inner| inner.strip_suffix(quote))
+    });
+    let raw = match quoted {
+        Some(inner) => inner.to_owned(),
+        // A backslash is the separator on Windows, not an escape.
+        None if cfg!(windows) => raw.to_owned(),
+        None => raw.replace("\\ ", " "),
+    };
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" });
+    let path = match (raw.strip_prefix("~/"), home) {
+        (Some(rest), Some(home)) => std::path::Path::new(&home).join(rest),
+        _ => std::path::PathBuf::from(raw),
+    };
+    match workspace {
+        Some(folder) => folder.join(path),
+        None => path,
+    }
 }
 
 /// Where the last thing you said sits among `messages`, and what it said.
@@ -1820,7 +1891,7 @@ pub fn gateways(runner: &mut Runner) {
 
 #[cfg(test)]
 mod tests {
-    use super::{agent_rows, choice_label, from_match, last_prompt, with_files};
+    use super::{agent_rows, choice_label, from_match, last_prompt, typed_path, with_files};
     use letronna_core::agents::Seen;
     use letronna_core::chat::Message;
     use letronna_core::driver::Status;
@@ -1855,6 +1926,24 @@ mod tests {
     fn nothing_said_means_nothing_to_take_back() {
         assert_eq!(last_prompt(&[]), None);
         assert_eq!(last_prompt(&[said("assistant", "hello")]), None);
+    }
+
+    #[test]
+    fn a_typed_or_dragged_path_names_its_file() {
+        let project = std::path::Path::new("/work");
+        let at = |raw: &str| typed_path(raw, Some(project));
+        assert_eq!(at("shot.png"), project.join("shot.png"));
+        assert_eq!(at("\"my shot.png\""), project.join("my shot.png"));
+        assert_eq!(at("'my shot.png'"), project.join("my shot.png"));
+        if !cfg!(windows) {
+            assert_eq!(
+                at("/tmp/my\\ shot.png"),
+                std::path::Path::new("/tmp/my shot.png")
+            );
+            let home = std::env::var_os("HOME").unwrap();
+            assert_eq!(at("~/a.png"), std::path::Path::new(&home).join("a.png"));
+        }
+        assert_eq!(typed_path("a.png", None), std::path::Path::new("a.png"));
     }
 
     #[test]

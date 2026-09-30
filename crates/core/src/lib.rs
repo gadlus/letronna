@@ -33,6 +33,7 @@ pub mod init;
 pub mod jobs;
 pub mod judge;
 pub mod limits;
+mod login_env;
 pub mod mcp;
 mod mcp_find;
 pub mod media;
@@ -62,6 +63,8 @@ pub mod usage;
 pub mod wake;
 pub mod watch;
 pub mod web;
+#[cfg(feature = "workflows")]
+pub mod workflow;
 mod write;
 
 /// The name the app goes by, used in paths and on screen.

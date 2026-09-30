@@ -76,6 +76,19 @@ pub fn health(server: &ServerStatus) -> String {
             render::dim(&format!("· {} tools", server.tools))
         ),
         State::Starting => render::dim("… still starting"),
+        State::Retrying => {
+            let why = server.error.as_deref().unwrap_or("stopped");
+            let next = server.retry.map_or_else(String::new, |retry| {
+                format!(
+                    " in {} s ({} of {})",
+                    retry.wait.as_secs_f64().ceil(),
+                    retry.attempt,
+                    retry.attempts
+                )
+            });
+            let why = why.lines().next().unwrap_or(why);
+            render::amber(&format!("↻ retrying{next}: {why}"))
+        }
         State::Disabled => render::dim("switched off"),
         State::Failed => {
             let why = server.error.as_deref().unwrap_or("failed");
@@ -97,9 +110,9 @@ fn add(words: &[String]) -> Result<(), String> {
         render::bold(&name),
         mcp::config_path().display()
     ));
-    render::line(&render::dim(&format!(
-        "New sessions start it; one already open does with /mcp reconnect {name}."
-    )));
+    render::line(&render::dim(
+        "New sessions start it; one already open does with /mcp reload.",
+    ));
     Ok(())
 }
 
@@ -109,6 +122,9 @@ fn remove(name: &str) -> Result<(), String> {
         "Removed the MCP server {} from {}",
         render::bold(name),
         mcp::config_path().display()
+    ));
+    render::line(&render::dim(
+        "A session already open stops it with /mcp reload.",
     ));
     Ok(())
 }

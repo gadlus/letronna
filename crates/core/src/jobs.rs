@@ -362,8 +362,9 @@ pub(crate) fn text(log: &mut VecDeque<u8>) -> String {
     text
 }
 
-/// A job's shell and everything it starts, held as one Job Object so that
-/// stopping reaches a server the shell launched and not just the shell.
+/// A job's shell, or an MCP server, and everything it starts, held as one
+/// Job Object so that stopping reaches a server the shell launched and not
+/// just the shell.
 #[cfg(windows)]
 pub(crate) struct Tree(std::os::windows::io::OwnedHandle);
 
@@ -379,7 +380,7 @@ impl Tree {
         };
         let failed = || {
             format!(
-                "Cannot group the job's processes: {}",
+                "Cannot group the processes it starts: {}",
                 std::io::Error::last_os_error()
             )
         };
@@ -426,8 +427,8 @@ impl Tree {
     }
 }
 
-/// A job's shell and everything it starts, as the process group the shell
-/// leads.
+/// A job's shell, or an MCP server, and everything it starts, as the
+/// process group the shell leads.
 #[cfg(unix)]
 pub(crate) struct Tree(libc::pid_t);
 

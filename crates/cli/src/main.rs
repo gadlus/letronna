@@ -127,6 +127,7 @@ fn main() {
         stopped: false,
         notices: letronna_core::notify::Notices::new(Box::new(notify::Terminal::here())),
         ended: None,
+        images: Vec::new(),
     };
     letronna_core::browser::share_browser(runner.store.settings.browser_shared);
     std::thread::spawn(letronna_core::browser::close_left_over);
@@ -352,6 +353,7 @@ fn ask_once(runner: &mut Runner, session: usize, prompt: &str, args: &Args) -> b
         depth: 0,
         fork: false,
         from: 0,
+        schema: None,
         allow: args.tools.clone().map_or(Allow::All, Allow::Only),
         rounds: args.max_rounds.unwrap_or(agent::MAX_ROUNDS),
         cancel: Cancel::default(),
@@ -425,6 +427,7 @@ fn failed(error: String) -> Report {
         seconds: 0,
         files: Vec::new(),
         jobs: Vec::new(),
+        value: None,
     }
 }
 
@@ -737,6 +740,7 @@ mod tests {
             seconds: 4,
             files: vec!["notes.txt".into()],
             jobs: Vec::new(),
+            value: None,
         }
     }
 

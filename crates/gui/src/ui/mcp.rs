@@ -3,7 +3,8 @@
 //! The page reads core's status afresh each time it is drawn rather than
 //! keeping a copy, so it is never staler than the last redraw. Nothing
 //! ticks: while a server is still starting, one wait off the UI thread for
-//! the servers to settle asks for the redraw that shows how it went.
+//! the servers to settle asks for the redraw that shows how it went; while
+//! one is retrying, that wait begins when its next start is due.
 //! The log tail is shown here and nowhere else the model could read it.
 
 use crate::prelude::*;
@@ -12,6 +13,9 @@ use letronna_core::mcp::{ServerStatus, State};
 /// How long a wait for starting servers lasts at most: the minute core gives
 /// a server to start and list its tools.
 const SETTLE_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long after a retry is due the page waits for it: time for core's
+/// timer to fire and the start to begin, so the wait does not end before it.
+const RETRY_SLACK: std::time::Duration = std::time::Duration::from_millis(100);
 /// Tallest a log gets before it scrolls: about fifteen lines.
 const LOG_HEIGHT: Pixels = px(240.);
 
@@ -19,8 +23,10 @@ pub(crate) fn mcp_page(chat: &Entity<Chat>, window: &mut Window, cx: &mut App) -
     let servers = letronna_core::mcp::status();
     let trouble = window.use_keyed_state("mcp-trouble", cx, |_, _| None::<String>);
     let waiting = window.use_keyed_state("mcp-waiting", cx, |_, _| false);
-    if servers.iter().any(|s| s.state == State::Starting) && !*waiting.read(cx) {
-        settle(chat, &waiting, cx);
+    let retry = servers.iter().filter_map(|s| s.retry).map(|r| r.wait).min();
+    let busy = retry.is_some() || servers.iter().any(|s| s.state == State::Starting);
+    if busy && !*waiting.read(cx) {
+        settle(chat, &waiting, retry, cx);
     }
     let problem = letronna_core::mcp::unreadable().or_else(|| trouble.read(cx).clone());
     let mut list = v_flex();
@@ -39,13 +45,33 @@ pub(crate) fn mcp_page(chat: &Entity<Chat>, window: &mut Window, cx: &mut App) -
     for server in &servers {
         list = list.child(server_row(chat, server, &trouble, &waiting, window, cx));
     }
+    // After mcp.json is edited by hand: added servers start, removed ones
+    // stop and changed ones start again, the rest untouched.
+    let reload = {
+        let (chat, trouble, waiting) = (chat.clone(), trouble.clone(), waiting.clone());
+        Button::new("mcp-reload")
+            .framed(cx)
+            .xsmall()
+            .label("Reload")
+            .on_click(move |_, _, cx| {
+                let done = letronna_core::mcp::reload().map(drop);
+                acted(done, &chat, &trouble, &waiting, cx);
+            })
+    };
     v_flex()
         .gap_4()
-        .child(super::settings::heading(
-            "MCP servers",
-            "Servers listed in mcp.json. Their tools join Letronna's own; what they print stays here.",
-            cx,
-        ))
+        .child(
+            h_flex()
+                .items_start()
+                .justify_between()
+                .gap_3()
+                .child(super::settings::heading(
+                    "MCP servers",
+                    "Servers listed in mcp.json. Their tools join Letronna's own; what they print stays here.",
+                    cx,
+                ).flex_1().min_w_0())
+                .child(reload),
+        )
         .children(problem.map(|problem| {
             div()
                 .text_sm()
@@ -55,12 +81,22 @@ pub(crate) fn mcp_page(chat: &Entity<Chat>, window: &mut Window, cx: &mut App) -
         .child(list)
 }
 
-/// Wait off the UI thread for the servers still starting, then redraw.
-fn settle(chat: &Entity<Chat>, waiting: &Entity<bool>, cx: &mut App) {
+/// Wait off the UI thread for the servers still starting, after the soonest
+/// retry is due if one is waiting, then redraw.
+fn settle(
+    chat: &Entity<Chat>,
+    waiting: &Entity<bool>,
+    retry: Option<std::time::Duration>,
+    cx: &mut App,
+) {
     waiting.update(cx, |waiting, _| *waiting = true);
-    let settled = cx
-        .background_executor()
-        .spawn(async { letronna_core::mcp::ready(SETTLE_WAIT) });
+    let executor = cx.background_executor().clone();
+    let settled = cx.background_executor().spawn(async move {
+        if let Some(retry) = retry {
+            executor.timer(retry + RETRY_SLACK).await;
+        }
+        letronna_core::mcp::ready(SETTLE_WAIT)
+    });
     let (chat, waiting) = (chat.clone(), waiting.clone());
     cx.spawn(async move |cx| {
         settled.await;
@@ -91,11 +127,20 @@ fn server_row(
     let (state, colour) = match server.state {
         State::Connected => ("Connected", cx.theme().green),
         State::Starting => ("Starting", cx.theme().warning),
+        State::Retrying => ("Retrying", cx.theme().warning),
         State::Failed => ("Failed", cx.theme().danger),
         State::Disabled => ("Off", cx.theme().muted_foreground),
     };
     let what = match server.state {
         State::Connected => format!("{} · {} tools", server.transport, server.tools),
+        // No countdown: nothing ticks to keep one true.
+        State::Retrying => match server.retry {
+            Some(retry) => format!(
+                "{} · retry {} of {}",
+                server.transport, retry.attempt, retry.attempts
+            ),
+            None => server.transport.to_owned(),
+        },
         _ => server.transport.to_owned(),
     };
     let head = h_flex()
@@ -224,7 +269,7 @@ fn acted(
     let started = failed.is_none();
     trouble.update(cx, |trouble, _| *trouble = failed);
     if started && !*waiting.read(cx) {
-        settle(chat, waiting, cx);
+        settle(chat, waiting, None, cx);
     }
     chat.update(cx, |_, cx| cx.notify());
 }

@@ -105,7 +105,7 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "/mcp",
-        blurb: "MCP servers: how each is doing; reconnect, enable, disable, log",
+        blurb: "MCP servers: how each is doing; reconnect, enable, disable, log, reload",
     },
     Command {
         name: "/resume",
@@ -130,6 +130,10 @@ pub const COMMANDS: &[Command] = &[
     Command {
         name: "/btw",
         blurb: "ask something aside; the answer is not kept",
+    },
+    Command {
+        name: "/image",
+        blurb: "attach a picture to your next message: /image <path>",
     },
     Command {
         name: "/where",

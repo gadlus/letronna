@@ -583,7 +583,7 @@ impl Chat {
                         PopupMenuItem::new("Images")
                             .icon(Icon::new(AppIcon::Image))
                             .on_click(move |_, window, cx| {
-                                images.update(cx, |this, cx| this.attach(false, window, cx))
+                                images.update(cx, |this, cx| this.pick_pictures(window, cx))
                             }),
                     )
                     .separator()
@@ -606,6 +606,7 @@ impl Chat {
         let input = div()
             .min_w_0()
             .key_context("Composer")
+            .capture_action(cx.listener(Self::paste_picture))
             // Ctrl+Enter sends now what Enter would queue for the next step.
             // With nothing running it stays the new line it always was.
             .on_action(cx.listener(|this, _: &SendNow, window, cx| {
@@ -690,7 +691,10 @@ impl Chat {
                     } else {
                         "Send (Enter)"
                     })
-                    .disabled(self.composer_empty || self.busy_elsewhere().is_some())
+                    .disabled(
+                        (self.composer_empty && self.attached().is_empty())
+                            || self.busy_elsewhere().is_some(),
+                    )
                     .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
             );
         let frame = if compact {
@@ -708,7 +712,7 @@ impl Chat {
         .py_1();
         // Narrow, the text takes the whole width and the controls go under
         // it, rather than the text being squeezed to a few words a line.
-        if compact {
+        let frame = if compact {
             frame.child(input.w_full()).child(
                 h_flex()
                     .items_center()
@@ -719,6 +723,10 @@ impl Chat {
             )
         } else {
             frame.child(attach).child(input.flex_1()).child(controls)
-        }
+        };
+        v_flex()
+            .w_full()
+            .children(self.attached_row(cx))
+            .child(frame)
     }
 }

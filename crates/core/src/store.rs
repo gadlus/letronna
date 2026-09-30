@@ -256,6 +256,10 @@ pub struct Settings {
     /// the usual 500k.
     #[serde(default)]
     pub helper_budget: u64,
+    /// Tools never offered to the model nor run, by name, an MCP server's by
+    /// its full `mcp__server__tool` name; a name no tool has is passed over.
+    #[serde(default, deserialize_with = "tool_names")]
+    pub disabled_tools: Vec<String>,
 }
 
 // Written out rather than derived so the film grain and notifications start
@@ -270,6 +274,7 @@ impl Default for Settings {
             helpers_at_once: 0,
             helper_depth: 0,
             helper_budget: 0,
+            disabled_tools: Vec::new(),
             gateway: String::new(),
             custom_endpoint: String::new(),
             presence: String::new(),
@@ -290,6 +295,20 @@ impl Default for Settings {
 
 fn yes() -> bool {
     true
+}
+
+/// `disabled_tools` as written by hand: one name alone is a list of one, and
+/// any other shape switches nothing off rather than failing the whole file,
+/// which would be moved aside as unreadable.
+fn tool_names<'de, D: serde::Deserializer<'de>>(names: D) -> Result<Vec<String>, D::Error> {
+    Ok(match serde_json::Value::deserialize(names)? {
+        serde_json::Value::String(name) => vec![name],
+        serde_json::Value::Array(names) => names
+            .into_iter()
+            .filter_map(|name| name.as_str().map(str::to_owned))
+            .collect(),
+        _ => Vec::new(),
+    })
 }
 
 /// Settings that are chosen as one and so saved as one: a model id belongs
@@ -1654,6 +1673,12 @@ pub(crate) fn context_cap() -> u64 {
     settings().0.context_cap
 }
 
+/// The tools the settings file switches off, read again each time so a hand
+/// edit counts from the next request.
+pub(crate) fn disabled_tools() -> Vec<String> {
+    settings().0.disabled_tools
+}
+
 /// The settings file. A file that will not read at all is kept aside by
 /// `state::read` as before.
 fn read_settings_file() -> Settings {
@@ -1667,7 +1692,7 @@ fn read_settings_file() -> Settings {
 
 /// The settings, and as JSON what the file said before a retired gateway is
 /// moved, so the move is saved like any other change.
-fn settings() -> (Settings, serde_json::Value) {
+pub(crate) fn settings() -> (Settings, serde_json::Value) {
     let mut s = read_settings_file();
     let read = serde_json::to_value(&s).unwrap_or_default();
     retire_gateway(&mut s);
@@ -3433,6 +3458,22 @@ pub(crate) mod tests {
         let first = load().settings;
         assert_eq!((first.appearance.as_str(), first.grain), ("", true));
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn disabled_tools_written_by_hand_in_another_shape_never_cost_the_file() {
+        let read = |disabled: &str| {
+            let text = format!(r#"{{"endpoint": "", "model": "m", "disabled_tools": {disabled}}}"#);
+            let settings = super::read_settings(text.as_bytes()).unwrap();
+            assert_eq!(settings.model, "m");
+            settings.disabled_tools
+        };
+        assert_eq!(
+            read(r#"["speak", 3, "make_video"]"#),
+            ["speak", "make_video"]
+        );
+        assert_eq!(read(r#""speak""#), ["speak"]);
+        assert!(read("null").is_empty() && read(r#"{"speak": true}"#).is_empty());
     }
 
     #[test]

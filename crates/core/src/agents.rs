@@ -521,6 +521,7 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
         depth: caller.depth + 1,
         fork: forking,
         from,
+        schema: None,
     };
     registry().helpers.push(Helper {
         id: slot.id,
@@ -1458,6 +1459,7 @@ pub fn btw(
         depth: 1,
         fork: true,
         from,
+        schema: None,
     });
     // An aside is kept nowhere, its own transcript and its lock included.
     let _ = std::fs::remove_file(path.with_extension("lock"));
@@ -1980,6 +1982,7 @@ fn rerun(
         depth: caller.depth + 1,
         fork,
         from,
+        schema: None,
     }
 }
 
@@ -2208,6 +2211,7 @@ mod tests {
         Report {
             status,
             text: text.into(),
+            value: None,
             rounds: 7,
             input: 41_000,
             cached: 32_800,
