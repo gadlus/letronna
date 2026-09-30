@@ -431,6 +431,9 @@ pub(crate) struct Chat {
     /// Whether a frame has been drawn, before which the window has no focus
     /// path to ask about.
     pub(crate) drawn: bool,
+    /// The mic button's own state: recording, or sending what it heard off
+    /// to be transcribed. `None` the rest of the time; nothing runs then.
+    pub(crate) mic: Option<crate::ui::voice::Voice>,
     pub(crate) _subscriptions: Vec<Subscription>,
 }
 
@@ -860,6 +863,7 @@ impl Chat {
             hit_at: None,
             mode_menu: None,
             drawn: false,
+            mic: None,
             _subscriptions: subscriptions,
         };
         let widen = this.follow_browser_layout(window, cx);

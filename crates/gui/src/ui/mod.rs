@@ -27,6 +27,7 @@ pub(crate) mod sidebar;
 pub(crate) mod skills;
 pub(crate) mod update;
 pub(crate) mod usage;
+pub(crate) mod voice;
 
 use crate::prelude::*;
 use gpui_component::{

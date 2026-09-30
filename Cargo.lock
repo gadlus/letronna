@@ -3735,6 +3735,7 @@ dependencies = [
  "async-channel 2.5.0",
  "block",
  "chrono",
+ "cpal",
  "discord-rich-presence",
  "embed-resource",
  "global-hotkey",

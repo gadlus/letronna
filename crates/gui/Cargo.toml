@@ -43,6 +43,9 @@ tree-sitter-diff = "0.1"
 # Windows, macOS and X11; Wayland grants no global key at all, so there the
 # tray's "Quick entry" item is the only way in.
 global-hotkey = "0.7"
+# Already in the tree via rodio, but not exposed by it: rodio only plays
+# sound, so the mic button opens an input stream with cpal directly.
+cpal = "0.17"
 
 [target.'cfg(windows)'.dependencies]
 tray-icon = "0.25"

@@ -40,7 +40,7 @@ const VIDEO_POLL: Duration = Duration::from_secs(5);
 /// render the service has lost does not leave a job running for good.
 const VIDEO_WAIT: Duration = Duration::from_secs(1800);
 /// The largest file the API takes for transcription.
-const UPLOAD_BYTES: u64 = 25 * 1024 * 1024;
+pub const UPLOAD_BYTES: u64 = 25 * 1024 * 1024;
 /// The largest picture a model is sent: Anthropic refuses one over 5 MB of
 /// base64, which is four thirds of the file.
 pub const PICTURE_BYTES: usize = 5 * 1024 * 1024 / 4 * 3;
