@@ -10,6 +10,11 @@
 //! nothing polls the log, and the owner hears in batches at a limited rate:
 //! a word that a chatty job prints all the time would otherwise fill the
 //! conversation it was meant to help.
+//!
+//! A finished job stays a while, so its owner can still read what it
+//! printed, and is then cleared: a long session would otherwise keep every
+//! log it ever made. Job numbers are never reused, so a cleared one still
+//! answers that it finished rather than that it never was.
 
 use crate::inbox::{Notice, When};
 use crate::tasks::{Key, State, Task};
@@ -60,23 +65,58 @@ const MAX_NOTICES: u32 = 8;
 /// 45 seconds of steady matching means the text is too common to watch for.
 const MAX_CROWDED: u32 = 3;
 
+/// How long a finished job is kept after it ends: time to read what it
+/// printed after its exit notice or a break, not the whole session.
+const KEEP_FINISHED: Duration = Duration::from_secs(30 * 60);
+
+/// Jobs kept at most, the oldest finished cleared first past it: 64 logs of
+/// 64 KB each hold 4 MB.
+const MAX_JOBS: usize = 64;
+
 pub struct Job {
     pub id: u64,
     pub command: String,
-    log: Arc<Mutex<VecDeque<u8>>>,
+    log: Arc<Mutex<Log>>,
     tree: Tree,
     /// Set once the process has exited and the reader threads are done.
     finished: Arc<AtomicBool>,
     exit_code: Arc<Mutex<Option<i32>>>,
     watch: Option<Arc<Mutex<Watch>>>,
+    started: Instant,
+    /// When the process exited, which starts the time until it is cleared.
+    ended: Arc<OnceLock<Instant>>,
 }
 
-/// What the UI needs to draw a chip. Cloned out so callers hold no locks.
+/// What a job has printed: its newest bytes, and how many it printed in all.
+#[derive(Default)]
+struct Log {
+    tail: VecDeque<u8>,
+    /// Counted from the start, so a place in the output stays put while the
+    /// oldest bytes are dropped.
+    written: u64,
+}
+
+impl Log {
+    /// Add output, counting it, and keep the tail as `append` does.
+    fn add(&mut self, bytes: &[u8]) {
+        self.written += bytes.len() as u64;
+        append(&mut self.tail, bytes);
+    }
+}
+
+/// What the UI needs to draw a chip, and the agent to list jobs. Cloned out
+/// so callers hold no locks.
 #[derive(Clone)]
 pub struct JobInfo {
     pub id: u64,
     pub command: String,
     pub running: bool,
+    /// None while it runs, and for a job that ended without one.
+    pub exit_code: Option<i32>,
+    /// How long it has run, or ran.
+    pub took: Duration,
+    /// Bytes it has printed in all, kept or not.
+    pub written: u64,
 }
 
 fn registry() -> &'static Mutex<BTreeMap<u64, Job>> {
@@ -84,8 +124,10 @@ fn registry() -> &'static Mutex<BTreeMap<u64, Job>> {
     JOBS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
+/// The next job number; every one below it has been given out.
+static NEXT: AtomicU64 = AtomicU64::new(1);
+
 fn next_id() -> u64 {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
@@ -93,7 +135,7 @@ fn next_id() -> u64 {
 /// each line to the job's watch, if it has one.
 fn pump(
     mut source: impl Read + Send + 'static,
-    log: Arc<Mutex<VecDeque<u8>>>,
+    log: Arc<Mutex<Log>>,
     watch: Option<Arc<Mutex<Watch>>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
@@ -109,7 +151,7 @@ fn pump(
                     if let Some(watch) = &watch {
                         partial.feed(&block[..n], |line| check(watch, line));
                     }
-                    append(&mut log, &block[..n]);
+                    log.add(&block[..n]);
                 }
             }
         }
@@ -342,9 +384,21 @@ pub(crate) fn append(log: &mut VecDeque<u8>, bytes: &[u8]) {
 
 /// The log as text, starting at its first whole character.
 pub(crate) fn text(log: &mut VecDeque<u8>) -> String {
-    let bytes = log.make_contiguous();
-    // Dropping bytes can leave the tail of a cut character at the front, and a
-    // character is at most four bytes, so at most three of them.
+    decode(log.make_contiguous())
+}
+
+/// A job's output as text after its first `mark` bytes, or all of it once
+/// some of those are dropped, starting at its first whole character.
+fn since(log: &mut Log, mark: u64) -> String {
+    let new = usize::try_from(log.written.saturating_sub(mark)).unwrap_or(usize::MAX);
+    let bytes = log.tail.make_contiguous();
+    decode(&bytes[bytes.len().saturating_sub(new)..])
+}
+
+/// Output as text, starting at its first whole character.
+fn decode(bytes: &[u8]) -> String {
+    // Dropping bytes or a mark can leave the tail of a cut character at the
+    // front, and a character is at most four bytes, so at most three of them.
     let start = bytes
         .iter()
         .take(3)
@@ -425,6 +479,13 @@ impl Tree {
         // SAFETY: the handle is open for as long as the tree is.
         unsafe { TerminateJobObject(self.0.as_raw_handle(), 1) };
     }
+
+    /// Let go of the tree, leaving what is in it running: closing the Job
+    /// Object would end a server an exited shell left there, so its handle
+    /// stays open until Letronna quits.
+    fn leave(self) {
+        std::mem::forget(self);
+    }
 }
 
 /// A job's shell, or an MCP server, and everything it starts, as the
@@ -444,6 +505,10 @@ impl Tree {
         // SAFETY: this only sends a signal.
         unsafe { libc::kill(-self.0, libc::SIGKILL) };
     }
+
+    /// Let go of the tree, leaving what is in it running; a process group
+    /// needs no closing.
+    fn leave(self) {}
 }
 
 /// Start a job whose exit nobody is told of.
@@ -487,18 +552,19 @@ pub fn start_watching(
     let id = next_id();
     let watch =
         (!needles.is_empty()).then(|| Arc::new(Mutex::new(Watch::new(id, command, needles))));
-    let log = Arc::new(Mutex::new(VecDeque::new()));
+    let log = Arc::new(Mutex::new(Log::default()));
     let out = pump(child.stdout.take().unwrap(), log.clone(), watch.clone());
     let err = pump(child.stderr.take().unwrap(), log.clone(), watch.clone());
 
     crate::tasks::register(Task::new(Key::Job(id), owner, None, command));
     let finished = Arc::new(AtomicBool::new(false));
     let exit_code = Arc::new(Mutex::new(None));
+    let (started, ended) = (Instant::now(), Arc::new(OnceLock::new()));
 
     // Reap the process so `running` turns false on its own. Stopping goes
     // through the tree, so this can own the child and wait for it.
     {
-        let (finished, exit_code) = (finished.clone(), exit_code.clone());
+        let (finished, exit_code, ended) = (finished.clone(), exit_code.clone(), ended.clone());
         let (log, command) = (log.clone(), command.to_owned());
         let watch = watch.clone();
         std::thread::spawn(move || {
@@ -506,6 +572,7 @@ pub fn start_watching(
             if let Ok(mut code) = exit_code.lock() {
                 *code = status.code();
             }
+            let _ = ended.set(Instant::now());
             finished.store(true, Ordering::Relaxed);
             // The pumps can still be reading the last lines, which are the
             // ones the notice is for.
@@ -520,27 +587,62 @@ pub fn start_watching(
         });
     }
 
-    registry()
-        .lock()
-        .map_err(|_| "Job list is poisoned.")?
-        .insert(
+    let mut jobs = registry().lock().map_err(|_| "Job list is poisoned.")?;
+    prune(&mut jobs, Instant::now());
+    jobs.insert(
+        id,
+        Job {
             id,
-            Job {
-                id,
-                command: command.to_owned(),
-                log,
-                tree,
-                finished,
-                exit_code,
-                watch,
-            },
-        );
+            command: command.to_owned(),
+            log,
+            tree,
+            finished,
+            exit_code,
+            watch,
+            started,
+            ended,
+        },
+    );
     Ok(id)
 }
 
+/// Clear the finished jobs that ended over `KEEP_FINISHED` ago, and the
+/// oldest finished past `MAX_JOBS`, leaving what they left running alone.
+fn prune(jobs: &mut BTreeMap<u64, Job>, now: Instant) {
+    let ended = jobs
+        .values()
+        .map(|job| (job.id, job.ended.get().copied()))
+        .collect();
+    for id in stale(ended, now) {
+        if let Some(job) = jobs.remove(&id) {
+            job.tree.leave();
+        }
+    }
+}
+
+/// Which of `jobs`, each a number and when it ended if it has, to clear at
+/// `now`; one still running never is.
+fn stale(jobs: Vec<(u64, Option<Instant>)>, now: Instant) -> Vec<u64> {
+    let over = jobs.len().saturating_sub(MAX_JOBS);
+    let mut ended: Vec<(u64, Instant)> = jobs
+        .into_iter()
+        .filter_map(|(id, ended)| Some((id, ended?)))
+        .collect();
+    ended.sort_by_key(|(_, at)| *at);
+    ended
+        .into_iter()
+        .enumerate()
+        .filter(|(i, (_, at))| *i < over || now.saturating_duration_since(*at) > KEEP_FINISHED)
+        .map(|(_, (id, _))| id)
+        .collect()
+}
+
 /// Record how a job ended and tell its owner, with the last lines it printed.
-fn report_exit(id: u64, command: &str, code: Option<i32>, log: &Mutex<VecDeque<u8>>) {
-    let log = log.lock().map(|mut l| text(&mut l)).unwrap_or_default();
+fn report_exit(id: u64, command: &str, code: Option<i32>, log: &Mutex<Log>) {
+    let log = log
+        .lock()
+        .map(|mut l| text(&mut l.tail))
+        .unwrap_or_default();
     let how = match code {
         Some(code) => format!("exited with code {code}"),
         None => "ended without an exit code".to_owned(),
@@ -568,23 +670,47 @@ fn report_exit(id: u64, command: &str, code: Option<i32>, log: &Mutex<VecDeque<u
 
 fn with_job<T>(id: u64, f: impl FnOnce(&Job) -> T) -> Result<T, String> {
     let jobs = registry().lock().map_err(|_| "Job list is poisoned.")?;
-    let job = jobs.get(&id).ok_or_else(|| format!("No job #{id}."))?;
+    let Some(job) = jobs.get(&id) else {
+        // Numbers are never reused, so one given out and gone was cleared.
+        return Err(if id > 0 && id < NEXT.load(Ordering::Relaxed) {
+            format!("Job #{id} finished and was cleared, with its output.")
+        } else {
+            format!("No job #{id}.")
+        });
+    };
     Ok(f(job))
 }
 
 /// Everything the job has printed so far, without escape sequences.
 pub fn log(id: u64) -> Result<String, String> {
+    log_since(id, 0)
+}
+
+/// What the job has printed after its first `mark` bytes, as `log` gives it.
+pub fn log_since(id: u64, mark: u64) -> Result<String, String> {
     // Stripped here rather than as it arrives, because a sequence can
     // straddle two reads.
     let log = with_job(id, |job| {
         job.log
             .lock()
-            .map(|mut l| crate::tools::strip_escapes(&text(&mut l)))
+            .map(|mut l| crate::tools::strip_escapes(&since(&mut l, mark)))
             .unwrap_or_default()
     })?;
-    // Its start is where the oldest bytes were dropped and its end where a
-    // running job has got to, so either could be part of a key.
+    // Its start is where the oldest bytes were dropped or the mark fell, and
+    // its end where a running job has got to, so either could be part of a key.
     Ok(crate::redact::scrub_cut(&log, true))
+}
+
+/// How many bytes the job has printed, as a mark to read on from.
+pub fn written(id: u64) -> Result<u64, String> {
+    with_job(id, |job| job.log.lock().map_or(0, |log| log.written))
+}
+
+/// Whether the job has ended a line yet.
+pub fn printed_a_line(id: u64) -> Result<bool, String> {
+    with_job(id, |job| {
+        job.log.lock().is_ok_and(|log| log.tail.contains(&b'\n'))
+    })
 }
 
 /// Everything the job has printed so far, for whoever started it to show;
@@ -599,7 +725,7 @@ pub fn first_output(id: u64) -> Result<String, String> {
         {
             watch.shown = true;
         }
-        text(&mut log)
+        text(&mut log.tail)
     })
 }
 
@@ -627,15 +753,25 @@ pub fn stop(id: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// Every job kept, oldest first, clearing those due to go first.
 pub fn list() -> Vec<JobInfo> {
-    let Ok(jobs) = registry().lock() else {
+    let Ok(mut jobs) = registry().lock() else {
         return Vec::new();
     };
+    let now = Instant::now();
+    prune(&mut jobs, now);
     jobs.values()
         .map(|job| JobInfo {
             id: job.id,
             command: job.command.clone(),
             running: !job.finished.load(Ordering::Relaxed),
+            exit_code: job.exit_code.lock().ok().and_then(|c| *c),
+            took: job
+                .ended
+                .get()
+                .map_or(now, |at| *at)
+                .saturating_duration_since(job.started),
+            written: job.log.lock().map_or(0, |log| log.written),
         })
         .collect()
 }
@@ -826,6 +962,58 @@ mod tests {
         let read = text(&mut log);
         assert!(read.len() <= MAX_LOG, "{} bytes", read.len());
         assert!(read.chars().all(|c| c == char::REPLACEMENT_CHARACTER));
+    }
+
+    #[test]
+    fn a_mark_reads_only_what_came_after_it() {
+        let mut log = Log::default();
+        log.add(b"ready\n");
+        let mark = log.written;
+        assert_eq!(since(&mut log, mark), "");
+        log.add("ready again \u{20ac}\n".as_bytes());
+        assert_eq!(since(&mut log, mark), "ready again \u{20ac}\n");
+        // A mark inside a character starts at the next whole one.
+        let inside = log.written - 3;
+        assert_eq!(since(&mut log, inside), "\n");
+        // A mark older than what is kept reads all that is.
+        log.add(&[b'x'; MAX_LOG]);
+        assert_eq!(since(&mut log, mark), "x".repeat(MAX_LOG));
+    }
+
+    #[test]
+    fn finished_jobs_are_cleared_after_half_an_hour_or_past_the_limit() {
+        let base = Instant::now();
+        let at = |minutes: u64| base + Duration::from_secs(minutes * 60);
+        let now = at(100);
+        // One that ended 31 minutes ago goes, one that ended 29 minutes ago
+        // stays, and one still running stays however long it has run.
+        let jobs = vec![(1, Some(at(69))), (2, Some(at(71))), (3, None)];
+        assert_eq!(stale(jobs, now), vec![1]);
+        // Past the limit the oldest finished go first, however recent.
+        let mut jobs: Vec<_> = (0..MAX_JOBS as u64 - 2).map(|id| (id, None)).collect();
+        jobs.extend([
+            (100, Some(at(99))),
+            (101, Some(at(97))),
+            (102, Some(at(98))),
+        ]);
+        assert_eq!(stale(jobs, now), vec![101]);
+        // Running jobs past the limit are never cleared.
+        let jobs: Vec<_> = (0..MAX_JOBS as u64 + 5).map(|id| (id, None)).collect();
+        assert!(stale(jobs, now).is_empty());
+    }
+
+    #[test]
+    fn a_cleared_job_says_it_finished_rather_than_that_it_never_was() {
+        let id = start("exit 0", &std::env::temp_dir()).unwrap();
+        assert!(until(|| !running(id).unwrap()), "job never finished");
+        // Cleared as `prune` does, but alone: pruning the shared list would
+        // clear other tests' jobs.
+        let job = registry().lock().unwrap().remove(&id).unwrap();
+        job.tree.leave();
+        let cleared = format!("Job #{id} finished and was cleared, with its output.");
+        assert_eq!(log(id).unwrap_err(), cleared);
+        assert!(!list().iter().any(|job| job.id == id));
+        assert_eq!(log(u64::MAX).unwrap_err(), format!("No job #{}.", u64::MAX));
     }
 
     fn say_done() -> &'static str {

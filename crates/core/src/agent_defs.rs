@@ -47,6 +47,7 @@ const LOOKING: &[&str] = &[
     "read_job",
     "list_mcp_resources",
     "read_mcp_resource",
+    "list_jobs",
 ];
 
 /// A frontmatter key with its value, or with the `- item` lines under it.

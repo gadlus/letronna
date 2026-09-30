@@ -187,9 +187,15 @@ const COUNT_BYTES: u64 = 64 * 1024 * 1024;
 /// only this much of one is read. Such files are exports and redirected shell
 /// output, far smaller than this.
 const UTF16_BYTES: u64 = 16 * 1024 * 1024;
-/// How long a background command gets to print something before the tool
-/// replies, so the first message can carry a port or an early crash.
+/// How long a background command gets to print its first line before the
+/// tool replies, so the first message can carry a port or an early crash.
 const SETTLE: std::time::Duration = std::time::Duration::from_millis(1200);
+/// How often the settle looks for that first line: the reply follows it by
+/// at most this, too little to notice.
+const SETTLE_STEP: Duration = Duration::from_millis(50);
+/// Characters of a command `list_jobs` shows: enough to tell one job from
+/// another, short enough that a long list stays readable.
+const LISTED_COMMAND: usize = 100;
 /// How long a command's output pipes get to close after its shell exits. A
 /// child it left running, like `sleep 100 &` or a daemon, holds them open
 /// for as long as it lives; 300 ms is plenty for output still in flight and
@@ -242,6 +248,7 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(EditFile),
         Arc::new(RunCommand),
         Arc::new(ReadJob),
+        Arc::new(ListJobs),
         Arc::new(StopJob),
         Arc::new(Wait),
         Arc::new(crate::wake::WakeMe),
@@ -1463,9 +1470,10 @@ impl Tool for RunCommand {
         }
         let id = crate::jobs::start_watching(command, cwd, ctx.conversation, &notify_on)?;
         // Give it a moment to fail or announce a port, so the first reply says
-        // something more useful than "started". A stop cuts the moment short,
-        // but the job runs on either way, so it is still reported.
-        ctx.cancel.sleep(SETTLE);
+        // something more useful than "started"; its first line mostly does,
+        // so the moment ends there. A stop cuts the moment short, but the job
+        // runs on either way, so it is still reported.
+        settle(id, SETTLE, &ctx.cancel);
         // Read this way, what the reply shows never comes again as a notice.
         let log = crate::jobs::first_output(id).unwrap_or_default();
         let state = if crate::jobs::running(id).unwrap_or(false) {
@@ -1719,14 +1727,7 @@ impl Tool for ReadJob {
     fn run(&self, args: &Value, _: &ToolContext) -> Result<String, String> {
         let id = job_id(args)?;
         let log = crate::jobs::log(id)?;
-        let state = if crate::jobs::running(id)? {
-            "running".to_owned()
-        } else {
-            match crate::jobs::exit_code(id)? {
-                Some(code) => format!("exited with code {code}"),
-                None => "stopped".to_owned(),
-            }
-        };
+        let state = job_state(crate::jobs::running(id)?, crate::jobs::exit_code(id)?);
         let (offset, limit) = (args["offset"].as_u64(), args["limit"].as_u64());
         if offset.is_some() || limit.is_some() {
             let lines: Vec<&str> = log.trim_end().lines().collect();
@@ -1756,6 +1757,63 @@ impl Tool for ReadJob {
             }
         ))
     }
+}
+
+struct ListJobs;
+impl Tool for ListJobs {
+    fn hides_key_shapes(&self) -> bool {
+        true
+    }
+    fn name(&self) -> &'static str {
+        "list_jobs"
+    }
+    fn concurrent(&self) -> bool {
+        true
+    }
+    fn description(&self) -> &'static str {
+        "List the background jobs this conversation and its helpers started: each one's number, command, whether it still runs or how it ended, how long it ran and how much it printed. Finished jobs are cleared after a while."
+    }
+    fn parameters(&self) -> Value {
+        json!({"type": "object", "properties": {}})
+    }
+    fn run(&self, _: &Value, ctx: &ToolContext) -> Result<String, String> {
+        let mine: Vec<u64> = crate::tasks::list(ctx.conversation)
+            .iter()
+            .filter_map(|task| match task.key {
+                crate::tasks::Key::Job(id) => Some(id),
+                _ => None,
+            })
+            .collect();
+        // Newest first: the job just started is the one most often asked after.
+        let listed: Vec<String> = crate::jobs::list()
+            .iter()
+            .rev()
+            .filter(|job| mine.contains(&job.id))
+            .map(listed_job)
+            .collect();
+        if listed.is_empty() {
+            return Ok("No background jobs in this conversation.".into());
+        }
+        Ok(listed.join("\n"))
+    }
+}
+
+/// One line of `list_jobs`, its command cut short with any key in it hidden.
+fn listed_job(job: &crate::jobs::JobInfo) -> String {
+    let state = job_state(job.running, job.exit_code);
+    let took = crate::agents::took(job.took.as_secs());
+    let took = if job.running {
+        format!("for {took}")
+    } else {
+        format!("after {took}")
+    };
+    // Hidden before the cut, which could leave too little of a key to know it by.
+    let command = crate::redact::scrub(&one_line(&job.command), true);
+    let command = crate::page::cut(&command, LISTED_COMMAND);
+    format!(
+        "Job #{}, {state} {took}, {} bytes of output: `{command}`",
+        job.id, job.written
+    )
 }
 
 struct StopJob;
@@ -1790,13 +1848,13 @@ impl Tool for Wait {
         "wait"
     }
     fn description(&self) -> &'static str {
-        "Pause before continuing: for a number of seconds, or until a background job prints something. Use it to let a server come up before calling it; waiting for a job's `until` ends as soon as it prints. If you have wake_me, use it instead of a plain pause over 30 seconds."
+        "Pause before continuing: for a number of seconds, or until a background job prints something. Use it to let a server come up before calling it; waiting for a job's `until` ends as soon as it prints. Only what the job prints after the wait begins counts; read_job shows what it printed before. If you have wake_me, use it instead of a plain pause over 30 seconds."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
             "seconds": {"type": "number", "description": "How long to wait. Also the limit when waiting for output."},
             "job": {"type": "integer", "description": "Wait for this job to print `until`, or to exit."},
-            "until": {"type": "string", "description": "Text to watch for in the job's output, such as `ready` or `listening`."}
+            "until": {"type": "string", "description": "Text to watch for in what the job prints from now on, such as `ready` or `listening`."}
         }})
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
@@ -1810,29 +1868,41 @@ impl Tool for Wait {
         };
         let until = args["until"].as_str().unwrap_or_default();
         let started = std::time::Instant::now();
+        // Text printed before the wait began would match at once, and say
+        // nothing about what the job is doing now. That it was printed is
+        // still worth saying if the wait ends without it.
+        let mark = crate::jobs::written(id)?;
+        let earlier = if !until.is_empty() && crate::jobs::log(id)?.contains(until) {
+            format!(" It had printed `{until}` before the wait began.")
+        } else {
+            String::new()
+        };
+        let without = if until.is_empty() {
+            String::new()
+        } else {
+            format!(" without printing `{until}`")
+        };
         loop {
-            let log = crate::jobs::log(id)?;
+            let log = crate::jobs::log_since(id, mark)?;
             if !until.is_empty() && log.contains(until) {
                 return Ok(format!(
                     "Job #{id} printed `{until}` after {:.0}s.",
                     started.elapsed().as_secs_f32()
                 ));
             }
+            let new = if log.trim().is_empty() {
+                "[nothing]"
+            } else {
+                log.trim_end()
+            };
             if !crate::jobs::running(id)? {
                 return Ok(format!(
-                    "Job #{id} exited before printing `{until}`. Output:\n{}",
-                    log.trim_end()
+                    "Job #{id} exited{without}.{earlier} Output since the wait began:\n{new}"
                 ));
             }
             if started.elapsed() >= limit {
                 return Ok(format!(
-                    "Job #{id} is still running after {seconds:.0}s{}. Latest output:\n{}",
-                    if until.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" without printing `{until}`")
-                    },
-                    log.trim_end()
+                    "Job #{id} is still running after {seconds:.0}s{without}.{earlier} Output since the wait began:\n{new}"
                 ));
             }
             if !ctx.cancel.sleep(std::time::Duration::from_millis(250)) {
@@ -1846,6 +1916,27 @@ fn job_id(args: &Value) -> Result<u64, String> {
     args["id"]
         .as_u64()
         .ok_or_else(|| "`id` is required and must be a job number.".to_owned())
+}
+
+/// Wait up to `limit` for job `id` to print its first line. Its exit does not
+/// end the wait: what it printed last can still be in the pipe.
+fn settle(id: u64, limit: Duration, cancel: &Cancel) {
+    let started = Instant::now();
+    while !crate::jobs::printed_a_line(id).unwrap_or(true) {
+        let left = limit.saturating_sub(started.elapsed());
+        if left.is_zero() || !cancel.sleep(left.min(SETTLE_STEP)) {
+            return;
+        }
+    }
+}
+
+/// How a job stands, as `read_job` and `list_jobs` say it.
+fn job_state(running: bool, exit_code: Option<i32>) -> String {
+    match (running, exit_code) {
+        (true, _) => "running".to_owned(),
+        (false, Some(code)) => format!("exited with code {code}"),
+        (false, None) => "stopped".to_owned(),
+    }
 }
 
 /// The text a background command's output is watched for, from `notify_on`.
@@ -3308,6 +3399,120 @@ mod tests {
             past.ends_with(" No lines from line 401; the log has 300."),
             "{past}"
         );
+    }
+
+    #[test]
+    fn a_wait_matches_only_what_the_job_prints_after_it_begins() {
+        let print = if cfg!(windows) {
+            "Write-Output ready; Start-Sleep 3; Write-Output done"
+        } else {
+            "echo ready; sleep 3; echo done"
+        };
+        let id = crate::jobs::start(print, &std::env::temp_dir()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !crate::jobs::log(id).unwrap().contains("ready") && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let args = json!({"job": id, "seconds": 60, "until": "ready"});
+        let out = Wait.run(&args, &ToolContext::default()).unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "Job #{id} exited without printing `ready`. It had printed `ready` before the \
+                 wait began. Output since the wait began:\ndone"
+            )
+        );
+    }
+
+    #[test]
+    fn settling_ends_at_a_jobs_first_line() {
+        let (quick, silent) = if cfg!(windows) {
+            ("Write-Output up; Start-Sleep 60", "Start-Sleep 60")
+        } else {
+            ("echo up; sleep 60", "sleep 60")
+        };
+        let (dir, cancel) = (std::env::temp_dir(), Cancel::default());
+        let id = crate::jobs::start(quick, &dir).unwrap();
+        let started = Instant::now();
+        settle(id, Duration::from_secs(60), &cancel);
+        let took = started.elapsed();
+        crate::jobs::stop(id).unwrap();
+        assert!(took < Duration::from_secs(30), "{took:?}");
+        assert!(crate::jobs::log(id).unwrap().contains("up"));
+        // One that prints nothing is given the whole time.
+        let id = crate::jobs::start(silent, &dir).unwrap();
+        let started = Instant::now();
+        settle(id, Duration::from_millis(300), &cancel);
+        let took = started.elapsed();
+        crate::jobs::stop(id).unwrap();
+        assert!(took >= Duration::from_millis(300), "{took:?}");
+    }
+
+    #[test]
+    fn list_jobs_shows_the_conversations_jobs_and_its_helpers_only() {
+        use crate::tasks::{Key, Task};
+        let dir = std::env::temp_dir();
+        let sleeper = if cfg!(windows) {
+            "Start-Sleep 30 # own"
+        } else {
+            "sleep 30 # own"
+        };
+        // Session 7601 started helper 7602; session 7603 is another one.
+        crate::tasks::register(Task::new(Key::Agent(7_602), 7_601, None, "explore"));
+        let own = crate::jobs::start_for(sleeper, &dir, 7_601).unwrap();
+        let helpers = crate::jobs::start_for("exit 3", &dir, 7_602).unwrap();
+        let other = crate::jobs::start_for(sleeper, &dir, 7_603).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while crate::jobs::running(helpers).unwrap() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let list = |conversation| {
+            let ctx = ToolContext {
+                conversation,
+                ..Default::default()
+            };
+            ListJobs.run(&json!({}), &ctx).unwrap()
+        };
+        let (session, helper, another, none) = (list(7_601), list(7_602), list(7_603), list(7_604));
+        for id in [own, other] {
+            crate::jobs::stop(id).unwrap();
+        }
+        let lines: Vec<&str> = session.lines().collect();
+        assert_eq!(lines.len(), 2, "{session}");
+        let ended = format!("Job #{helpers}, exited with code 3 after ");
+        assert!(lines[0].starts_with(&ended), "{session}");
+        assert!(
+            lines[0].ends_with(" bytes of output: `exit 3`"),
+            "{session}"
+        );
+        let running = format!("Job #{own}, running for ");
+        assert!(lines[1].starts_with(&running), "{session}");
+        assert!(
+            lines[1].ends_with(&format!(", 0 bytes of output: `{sleeper}`")),
+            "{session}"
+        );
+        assert_eq!(helper, lines[0]);
+        assert!(
+            another.starts_with(&format!("Job #{other}, running")),
+            "{another}"
+        );
+        assert_eq!(none, "No background jobs in this conversation.");
+    }
+
+    #[test]
+    fn list_jobs_cuts_long_commands_and_hides_keys_in_them() {
+        let key = "sk-test-0123456789abcdefghij0123";
+        let command = format!("exit 0 # {key} {}", "x".repeat(200));
+        let id = crate::jobs::start_for(&command, &std::env::temp_dir(), 7_611).unwrap();
+        let ctx = ToolContext {
+            conversation: 7_611,
+            ..Default::default()
+        };
+        let listed = ListJobs.run(&json!({}), &ctx).unwrap();
+        assert!(listed.starts_with(&format!("Job #{id}, ")), "{listed}");
+        assert!(!listed.contains("0123456789abcdefghij"), "{listed}");
+        assert!(listed.contains(crate::redact::MARKER), "{listed}");
+        assert!(listed.ends_with("x\u{2026}`"), "{listed}");
     }
 
     #[test]
