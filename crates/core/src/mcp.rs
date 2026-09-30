@@ -195,10 +195,10 @@ const MAX_MESSAGE: usize = 32 * 1024 * 1024;
 
 /// One entry under `mcpServers` in `mcp.json`, as Claude Desktop writes it.
 #[derive(Deserialize, Clone, Default, PartialEq)]
-struct ServerConfig {
+pub(crate) struct ServerConfig {
     /// Empty for a server reached by URL.
     #[serde(default)]
-    command: String,
+    pub(crate) command: String,
     /// Where a server that runs elsewhere is reached, in place of a command.
     #[serde(default)]
     url: String,
@@ -208,9 +208,9 @@ struct ServerConfig {
     #[serde(default)]
     args: Vec<String>,
     #[serde(default)]
-    env: HashMap<String, String>,
+    pub(crate) env: HashMap<String, String>,
     #[serde(default)]
-    disabled: bool,
+    pub(crate) disabled: bool,
     /// Tools that run without asking.
     #[serde(default, rename = "autoApprove")]
     auto_approve: AutoApprove,
@@ -222,7 +222,7 @@ struct ServerConfig {
     startup_timeout_ms: Option<u64>,
     /// The folder a server run here starts in, from the config's own folder.
     #[serde(default)]
-    cwd: Option<String>,
+    pub(crate) cwd: Option<String>,
     /// Globs of the tool names offered; empty offers every tool.
     #[serde(default, rename = "includeTools")]
     include_tools: Vec<String>,
@@ -287,7 +287,7 @@ impl ServerConfig {
 
     /// This config with every `${VAR}` in its command, args, cwd, url, env
     /// and headers filled in from `var`.
-    fn expanded(&self, var: &dyn Fn(&str) -> Option<String>) -> Result<Self, String> {
+    pub(crate) fn expanded(&self, var: &dyn Fn(&str) -> Option<String>) -> Result<Self, String> {
         let one = |text: &String| fill_vars(text, var);
         let values = |map: &HashMap<String, String>| {
             map.iter()
@@ -517,14 +517,14 @@ impl Slot {
 
 /// A server run here and everything it starts -- npx's node, cmd's children
 /// -- as one tree, so that stopping it leaves none of them running.
-struct Process {
-    child: std::process::Child,
-    tree: crate::jobs::Tree,
+pub(crate) struct Process {
+    pub(crate) child: std::process::Child,
+    pub(crate) tree: crate::jobs::Tree,
 }
 
 impl Process {
     /// End the whole tree, then reap the server.
-    fn end(mut self) {
+    pub(crate) fn end(mut self) {
         // Before the wait: once the server is reaped, its Unix process group
         // id can pass to an unrelated process.
         self.tree.kill();
@@ -1237,7 +1237,7 @@ fn launch(name: &str, config: &ServerConfig, run: u64) -> Result<Vec<Arc<dyn Too
 
 /// The server's process, with its pipes, started in its `cwd` from `base`,
 /// the config's folder.
-fn spawn(config: &ServerConfig, base: &Path) -> Result<std::process::Child, String> {
+pub(crate) fn spawn(config: &ServerConfig, base: &Path) -> Result<std::process::Child, String> {
     use std::process::{Command, Stdio};
     let folder = config.folder(base);
     if let Some(folder) = &folder
@@ -2319,7 +2319,7 @@ fn said(error: &Value) -> String {
 
 /// The folder at `path` as a `file://` URI, every byte but letters, digits
 /// and `-._~/:` percent-encoded, `windows` saying it is a Windows path.
-fn file_uri(path: &[u8], windows: bool) -> String {
+pub(crate) fn file_uri(path: &[u8], windows: bool) -> String {
     // Windows paths are told apart by the caller, so both kinds can be
     // tested anywhere: backslashes turn, a drive gets a slash before it,
     // and a share's server becomes the host.

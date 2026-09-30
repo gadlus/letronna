@@ -1322,7 +1322,9 @@ impl Tool for WriteFile {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
+        let lsp = crate::lsp::before_write(ctx, &path, change.before());
         change.write(text.as_bytes(), &ctx.files)?;
+        crate::lsp::wrote(lsp, &text);
         Ok(format!("Wrote {} bytes.", text.len()))
     }
 }
@@ -1396,7 +1398,9 @@ impl Tool for EditFile {
             return Err(crate::redact::refused("`new`"));
         }
         crate::write::check_syntax(&path, Some(text.as_bytes()), &done.text)?;
+        let lsp = crate::lsp::before_write(ctx, &path, Some(text));
         change.write(done.text.as_bytes(), &ctx.files)?;
+        crate::lsp::wrote(lsp, &done.text);
         Ok(match (done.replaced, done.already) {
             (1, 0) => "Edited.".into(),
             (n, 0) => format!("Edited {n} places."),

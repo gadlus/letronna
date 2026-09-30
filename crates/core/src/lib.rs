@@ -39,6 +39,7 @@ pub mod jobs;
 pub mod judge;
 pub mod limits;
 mod login_env;
+pub mod lsp;
 pub mod mcp;
 mod mcp_find;
 pub mod mcp_serve;

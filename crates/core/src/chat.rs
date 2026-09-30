@@ -1877,7 +1877,17 @@ pub fn start_with(
     let (sender, receiver) = async_channel::bounded(64);
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
-        let result = send_window(&connection, &messages, &budget, &extra, &sender);
+        // Taken once for the call, as each error is told once: a resend
+        // after a failure or at a smaller window carries it again.
+        let lsp = crate::lsp::note(connection.conversation);
+        let result = send_window(
+            &connection,
+            &messages,
+            &budget,
+            &extra,
+            lsp.as_deref(),
+            &sender,
+        );
         // The call is over by now. Letting go before saying so means whoever
         // hears `Finished` never finds the guard still held.
         drop(extra.guard);
@@ -1902,19 +1912,21 @@ pub fn start_with(
 }
 
 /// Send `messages` in the window `budget` gives, unless what no window
-/// leaves out is already more than the model reads at once.
+/// leaves out is already more than the model reads at once. `lsp` is the
+/// language servers' note to end the request with.
 fn send_window(
     connection: &Connection,
     messages: &[Message],
     budget: &Budget,
     extra: &Extra,
+    lsp: Option<&str>,
     sender: &async_channel::Sender<Event>,
 ) -> Result<(), Failure> {
     if let Some(failure) = doomed(connection, messages, budget) {
         return Err(failure);
     }
     let start = window_start(messages, budget);
-    stream(connection, messages, start, budget, extra, sender)
+    stream(connection, messages, start, budget, extra, lsp, sender)
 }
 
 /// A refusal, when the model's window is known, for a request whose fixed
@@ -1984,6 +1996,7 @@ fn stream(
     start: usize,
     budget: &Budget,
     extra: &Extra,
+    lsp: Option<&str>,
     sender: &async_channel::Sender<Event>,
 ) -> Result<(), Failure> {
     let endpoint = validate(connection).map_err(|e| Failure::new(FailureKind::Settings, e))?;
@@ -2016,11 +2029,17 @@ fn stream(
             let _ = sender.send_blocking(Event::SummaryUsage(usage));
         },
     );
+    // Both ride on the end, the checklist first as it always has.
+    let ending: Vec<String> = checklist(messages)
+        .into_iter()
+        .chain(lsp.map(str::to_owned))
+        .collect();
+    let ending = ending.join("\n\n");
     let sent = body_with(
         connection,
         window,
         summary.as_deref(),
-        checklist(messages).as_deref(),
+        Some(ending.as_str()).filter(|ending| !ending.is_empty()),
         budget,
         &extra.tools,
     );
@@ -2079,14 +2098,14 @@ fn stream(
                 // about no field, and passes by itself.
                 // Once off the markers stay off, so this sends it again at most once.
                 if markers_refused(connection, &sent, status.as_u16(), &error) {
-                    return stream(connection, messages, start, budget, extra, sender);
+                    return stream(connection, messages, start, budget, extra, lsp, sender);
                 }
                 if status.is_client_error()
                     && !matches!(status.as_u16(), 408 | 429)
                     && learn(connection, &sent, &error)
                     && !sender.is_closed()
                 {
-                    return stream(connection, messages, start, budget, extra, sender);
+                    return stream(connection, messages, start, budget, extra, lsp, sender);
                 }
                 let body = serde_json::from_str::<Value>(&error).unwrap_or_default();
                 classify(Some(status.as_u16()), &headers, &body)
@@ -2107,7 +2126,7 @@ fn stream(
             // it gets here on the try it came back on. The one request sent
             // again after it has tries of its own for what does pass.
             if let Some(budget) = refit(connection, &failure, budget) {
-                return send_window(connection, messages, &budget, extra, sender);
+                return send_window(connection, messages, &budget, extra, lsp, sender);
             }
             return Err(failure);
         };

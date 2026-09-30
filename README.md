@@ -136,6 +136,7 @@ The window shows the browser beside the chat, live, while the agent uses it or o
 - `SOUL.md` who Letronna is, in your words; replaces the built-in first line of the prompt (optional, yours to write)
 - `USER.md` what Letronna knows about you, and `MEMORY.md` its own notes; it keeps both with its `memory` tool, and you can edit them. Both go into every conversation except chats other people can read, so they stay small (1,375 and 2,200 characters)
 - `mcp.json` MCP servers whose tools Letronna may use (optional, see below)
+- `lsp.json` language servers that check the files Letronna edits (optional, see below)
 - `search.json` the search service in use, and any address given for one
 - `media/` images, speech and video made with no project attached, and browser screenshots
 - `browser/` the browser's own profile: delete it to sign out of everything there
@@ -225,6 +226,26 @@ There is no Windows build, and inside WSL or Docker its virtual machine costs mo
   "args": ["you@mac-mini", "LIGHTPANDA_DISABLE_TELEMETRY=true exec ~/.local/bin/lightpanda mcp"]
 }
 ```
+
+## Language servers
+
+After Letronna writes or edits a file, a language server can check it, and the errors the edit brought in reach the model with its next request, without a build. Nothing runs unless you list servers in `lsp.json` in the data folder; each takes the `command`, `args`, `env` and `cwd` an MCP server does, the file `extensions` it serves, and the `projects` it is for:
+
+```json
+{
+  "servers": {
+    "rust": {
+      "command": "rust-analyzer",
+      "extensions": ["rs"],
+      "projects": ["/home/me/code/letronna"]
+    }
+  }
+}
+```
+
+A server serves only the project folders listed for it. Most run the project's own code as they check it -- rust-analyzer its build scripts and proc macros, a TypeScript server the project's own compiler -- so list only projects you would build yourself: there, an edit Letronna makes, in Accept edits mode too, can run that code on the next check.
+
+A server starts in the project folder the first time a file it serves is written there, serves every session in that project, and is shut down after ten minutes without a write and when Letronna quits. Only errors are told, not warnings, and only those that were not there before the edit. A server that cannot start or stops is mentioned once and not started again until the next session. Projects cannot add servers of their own, since a server is a command and whoever wrote a repository may not be whoever runs it.
 
 ## Build
 
