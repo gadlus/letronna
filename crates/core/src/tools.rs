@@ -270,6 +270,7 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(Sessions),
         Arc::new(crate::memory::Remember),
         Arc::new(crate::skills::UseSkill),
+        Arc::new(crate::skills::ManageSkill),
         Arc::new(SearchSessions),
         Arc::new(crate::web::WebFetch),
         Arc::new(crate::media::MakeImage),

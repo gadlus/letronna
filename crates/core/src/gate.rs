@@ -1721,6 +1721,7 @@ mod tests {
             project: None,
         }];
         let changed = serde_json::json!({ "path": "notes.txt", "old": "a", "new": "b" });
+        let learn = serde_json::json!({ "action": "create", "name": "n", "body": "b" });
         // In the order of `Mode::OFFERED`: Default, Accept edits, Plan,
         // Don't ask, Bypass. A line that only reads runs in every mode.
         let table = [
@@ -1730,6 +1731,8 @@ mod tests {
             (call("edit_file", changed), "ARXXR"),
             (edit(".git/hooks/pre-commit"), "AAXXR"),
             (edit("../outside.txt"), "AAXXR"),
+            // Learned skills live in Letronna's folder, never the project's.
+            (call("skill_manage", learn), "AAXXR"),
             (command(DANGEROUS), "AAXXA"),
             (command("git push origin main"), "XXXXX"),
         ];

@@ -254,6 +254,11 @@ impl Chat {
         let (name, enabled) = (skill.name.clone(), skill.enabled);
         // A project's skills are changed in the project's folder.
         let yours = skill.source == Source::User;
+        let badge = match (skill.source, skill.learned) {
+            (Source::Project, _) => Some("Project"),
+            (Source::User, true) => Some("Learned"),
+            (Source::User, false) => None,
+        };
         let (edit_name, delete_name, switch_name) = (name.clone(), name.clone(), name.clone());
         h_flex()
             .w_full()
@@ -283,7 +288,7 @@ impl Chat {
                                     })
                                     .child(skill.name.clone()),
                             )
-                            .when(!yours, |this| {
+                            .when_some(badge, |this, badge| {
                                 this.child(
                                     div()
                                         .flex_shrink_0()
@@ -293,7 +298,7 @@ impl Chat {
                                         .border_color(cx.theme().border)
                                         .text_xs()
                                         .text_color(cx.theme().muted_foreground)
-                                        .child("Project"),
+                                        .child(badge),
                                 )
                             }),
                     )

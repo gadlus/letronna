@@ -41,7 +41,7 @@ const SKIPPED: &[&str] = &[".git", "node_modules", "target"];
 const INCOMING: &str = "skills-incoming";
 /// The file in an installed skill's folder saying where it came from. Hidden,
 /// so it is neither listed to the model nor copied by another install.
-const MARK: &str = ".installed-from";
+pub(super) const MARK: &str = ".installed-from";
 /// A staging folder this old was left by an install that never finished.
 const STALE: Duration = Duration::from_secs(60 * 60);
 
@@ -325,7 +325,7 @@ fn safe(path: &str) -> Option<PathBuf> {
 /// empty, `.` or `..`; no character Windows forbids; not ending in a dot or a
 /// space, which Windows drops; and not a device's name, which Windows opens
 /// as the device.
-fn plain(part: &str) -> bool {
+pub(super) fn plain(part: &str) -> bool {
     !matches!(part, "" | "." | "..")
         && !part.ends_with(['.', ' '])
         && !part

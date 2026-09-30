@@ -802,11 +802,7 @@ impl Runner {
                 }
             }
             None => {
-                detail = tools::preview(&call.name, &call.arguments, &ctx)
-                    .lines()
-                    .take(DETAIL_LINES)
-                    .map(str::to_owned)
-                    .collect();
+                detail = card_lines(&tools::preview(&call.name, &call.arguments, &ctx));
             }
         }
 
@@ -1286,6 +1282,22 @@ fn bold_question(text: &str) -> String {
     render::bold(text)
 }
 
+/// A tool's preview as the lines of an approval card, cut as its output is
+/// and saying so: a card that stopped without a word would be approved as
+/// if the call ended there.
+fn card_lines(preview: &str) -> Vec<String> {
+    let total = preview.lines().count();
+    let mut lines: Vec<String> = preview
+        .lines()
+        .take(DETAIL_LINES)
+        .map(str::to_owned)
+        .collect();
+    if total > DETAIL_LINES {
+        lines.push(format!("… {} more lines", total - DETAIL_LINES));
+    }
+    lines
+}
+
 pub fn intent(name: &str, summary: &str) -> String {
     match name {
         "write_file" => format!("write {summary}"),
@@ -1356,12 +1368,7 @@ fn ask_about(bar: &mut Bar, request: &Request) -> Decision {
         request.label,
         intent(&call.name, &summary)
     );
-    let detail = request
-        .preview
-        .lines()
-        .take(DETAIL_LINES)
-        .map(str::to_owned)
-        .collect();
+    let detail = card_lines(&request.preview);
     let picked = bar.interject(
         &question,
         detail,
@@ -1421,6 +1428,23 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_long_preview_ends_its_card_with_how_many_lines_were_left_out() {
+        let short = card_lines("one\ntwo");
+        assert_eq!(short, ["one", "two"]);
+        let long = (1..=30)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let card = card_lines(&long);
+        assert_eq!(card.len(), DETAIL_LINES + 1);
+        assert_eq!(card[DETAIL_LINES - 1], DETAIL_LINES.to_string());
+        assert_eq!(
+            card[DETAIL_LINES],
+            format!("… {} more lines", 30 - DETAIL_LINES)
+        );
+    }
 
     #[test]
     fn a_wait_returns_what_was_sent() {
