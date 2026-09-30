@@ -1513,6 +1513,18 @@ fn seen_at_end(file: &mut std::fs::File, messages: usize) -> std::io::Result<See
 /// kept its time is marked a copy wherever it is seen after its first place.
 /// Sessions are numbered as they are made, which puts the original first.
 pub fn spent(since: u64, session: u64) -> Vec<crate::usage::Spent> {
+    let files = conversation_files();
+    let mut seen = std::collections::HashSet::new();
+    files
+        .into_iter()
+        .filter(|(id, path)| *id == session || written_since(path, since))
+        .flat_map(|(id, path)| spent_in(&path, id, &mut seen))
+        .collect()
+}
+
+/// Every session file and helper transcript, with the session each belongs
+/// to, in order.
+fn conversation_files() -> Vec<(u64, PathBuf)> {
     let mut files: Vec<(u64, PathBuf)> = session_ids()
         .into_iter()
         .map(|id| (id, session_path(id)))
@@ -1533,12 +1545,7 @@ pub fn spent(since: u64, session: u64) -> Vec<crate::usage::Spent> {
         );
     }
     files.sort();
-    let mut seen = std::collections::HashSet::new();
     files
-        .into_iter()
-        .filter(|(id, path)| *id == session || written_since(path, since))
-        .flat_map(|(id, path)| spent_in(&path, id, &mut seen))
-        .collect()
 }
 
 /// Whether the file at `path` was written to at `since` or later, or might
@@ -1605,6 +1612,83 @@ fn spent_in(
         call.at = updated;
     }
     spent
+}
+
+/// Each saved reply in the session and helper files written to at `since`
+/// or later, with when it was made, leaving out the copies a branch took of
+/// replies already passed. Files are read a line at a time, so a long
+/// history costs the largest line in memory rather than the largest file.
+pub(crate) fn replies(since: u64, mut visit: impl FnMut(u64, &Message)) {
+    let files = conversation_files();
+    let mut seen = std::collections::HashSet::new();
+    for (_, path) in files.iter().filter(|(_, path)| written_since(path, since)) {
+        replies_in(path, &mut seen, &mut visit);
+    }
+}
+
+/// The replies in one conversation file, as `replies` hands them on.
+fn replies_in(
+    path: &std::path::Path,
+    seen: &mut std::collections::HashSet<(u64, String, u64, u64, u64)>,
+    visit: &mut impl FnMut(u64, &Message),
+) {
+    use std::io::BufRead;
+    let Ok(file) = std::fs::File::open(path) else {
+        return;
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut bytes = Vec::new();
+    let mut updated = 0;
+    // A reply saved before replies kept their time takes the session's
+    // last, which the meta line after it says, so those few wait for the end.
+    let mut undated = Vec::new();
+    loop {
+        bytes.clear();
+        match reader.read_until(b'\n', &mut bytes) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let line = String::from_utf8_lossy(&bytes);
+        let line = line.trim_end();
+        if line.starts_with("{\"type\":\"message\"")
+            && !line.starts_with("{\"type\":\"message\",\"role\":\"assistant\"")
+        {
+            continue;
+        }
+        match serde_json::from_str::<Record>(line) {
+            Ok(Record::Head { created, .. }) => updated = updated.max(created),
+            Ok(Record::Meta(meta)) => updated = updated.max(meta.updated),
+            Ok(Record::Message(mut reply)) => {
+                if reply.at == 0 {
+                    // Only the counts and the tool names are wanted from it
+                    // later, and clearing would keep what the text took.
+                    reply.content = String::new();
+                    reply.reasoning = String::new();
+                    reply.replay = None;
+                    for call in &mut reply.tool_calls {
+                        call.id = String::new();
+                        call.arguments = String::new();
+                    }
+                    undated.push(reply);
+                    continue;
+                }
+                let key = (
+                    reply.at,
+                    reply.model.clone(),
+                    reply.tokens,
+                    reply.prompt_tokens,
+                    reply.cached_tokens,
+                );
+                if seen.insert(key) {
+                    visit(reply.at, &reply);
+                }
+            }
+            _ => {}
+        }
+    }
+    for reply in &undated {
+        visit(updated, reply);
+    }
 }
 
 /// A place in an earlier session where a search found what it looked for.
@@ -4745,6 +4829,32 @@ pub(crate) mod tests {
         assert_eq!(super::spent(u64::MAX, 1).len(), 4);
         assert!(super::spent(u64::MAX, 3).is_empty());
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn undated_replies_wait_for_the_end_without_their_text() {
+        let path = scratch("undated").join("1.jsonl");
+        let big = "x".repeat(100_000);
+        let lines = [
+            r#"{"type":"head","id":1,"created":100}"#.to_owned(),
+            format!(
+                r#"{{"type":"message","role":"assistant","content":"{big}","reasoning":"{big}","model":"m","tool_calls":[{{"id":"1","name":"write_file","arguments":"{big}"}}]}}"#
+            ),
+            r#"{"type":"meta","title":"t","updated":200,"pinned":false,"workspace":null,"todos":[]}"#.to_owned(),
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        let mut held = Vec::new();
+        super::replies_in(&path, &mut seen, &mut |at, reply: &Message| {
+            let call = &reply.tool_calls[0];
+            held.push((
+                at,
+                call.name.clone(),
+                reply.content.capacity() + reply.reasoning.capacity(),
+                call.arguments.capacity(),
+            ));
+        });
+        assert_eq!(held, [(200, "write_file".to_owned(), 0, 0)]);
     }
 
     #[test]

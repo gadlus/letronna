@@ -151,6 +151,10 @@ pub const COMMANDS: &[Command<'static>] = &[
         blurb: "tokens and cost: this session, by day and by model",
     },
     Command {
+        name: "/insights",
+        blurb: "the last weeks by day and hour, top tools and models: /insights 8",
+    },
+    Command {
         name: "/clear",
         blurb: "clear the screen",
     },

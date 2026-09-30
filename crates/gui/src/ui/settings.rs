@@ -412,7 +412,12 @@ impl Chat {
             )
             .into_any_element(),
             "Account" => super::account::account_page(&chat, self, cx).into_any_element(),
-            "Usage" => super::usage::usage_page(self.usage_report.as_ref(), cx).into_any_element(),
+            "Usage" => super::usage::usage_page(
+                self.usage_report.as_ref(),
+                self.usage_insights.as_ref(),
+                cx,
+            )
+            .into_any_element(),
             "Thinking" => thinking_page(&chat, &self.store, window, cx).into_any_element(),
             "Plugins" => plugins_page(&chat, cx).into_any_element(),
             "MCP" => super::mcp::mcp_page(&chat, window, cx).into_any_element(),

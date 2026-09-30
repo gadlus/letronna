@@ -272,6 +272,10 @@ pub fn command(
             usage(runner.store.conversations[*session].id);
             Flow::Handled
         }
+        "/insights" => {
+            insights(rest);
+            Flow::Handled
+        }
         name if name.starts_with("/mcp__") => match mcp_prompt(runner, name, rest) {
             Some(Ok(text)) => Flow::Send(text),
             Some(Err(error)) => {
@@ -450,6 +454,137 @@ fn usage(session: u64) {
         render::blank();
         render::line(&render::dim(&legend));
     }
+}
+
+/// How the last weeks went: replies and tokens by day, the hours they came
+/// in, the tools and models used most, and what the cache served.
+fn insights(rest: &str) {
+    use letronna_core::insights::{self, bar, spark};
+    use letronna_core::usage::{count, day_name};
+    let weeks = match rest {
+        "" => insights::WEEKS,
+        words => match words.parse::<u64>() {
+            Ok(weeks) if (1..=insights::MAX_WEEKS).contains(&weeks) => weeks,
+            _ => {
+                render::line(&render::red(&format!(
+                    "Weeks is a number from 1 to {}: /insights 8",
+                    insights::MAX_WEEKS
+                )));
+                return;
+            }
+        },
+    };
+    let found = insights::insights(weeks);
+    const BAR: usize = 20;
+    let cached = |totals: &letronna_core::usage::Totals| {
+        totals
+            .cache_rate()
+            .map(|rate| format!("{rate}% cached"))
+            .unwrap_or_else(|| "cache not reported".into())
+    };
+    let row = |label: &str, width: usize, bar: String, rest: String| {
+        render::line(&format!(
+            "{}  {}  {}",
+            render::bold(&format!("{label:<width$}")),
+            render::blue(&format!("{bar:<BAR$}")),
+            render::dim(&rest)
+        ));
+    };
+    render::blank();
+    render::said(&render::blue("●"), &render::bold("Insights"));
+    let weeks_name = if weeks == 1 { "week" } else { "weeks" };
+    let replies = found.replies();
+    let mut summary = vec![
+        format!("the last {weeks} {weeks_name}"),
+        format!(
+            "{replies} {}",
+            if replies == 1 { "reply" } else { "replies" }
+        ),
+        format!(
+            "{} tokens",
+            count(found.total.input.saturating_add(found.total.output))
+        ),
+    ];
+    if found.total.calls > 0 {
+        summary.push(cached(&found.total));
+    }
+    render::line(&render::dim(&summary.join(" · ")));
+    if replies == 0 {
+        return;
+    }
+
+    render::blank();
+    render::line(&render::dim("by day"));
+    let days: Vec<(String, &insights::Day)> = found
+        .days
+        .iter()
+        .rev()
+        .filter(|day| day.replies > 0)
+        .map(|day| (day_name(day.date), day))
+        .collect();
+    let most = days.iter().map(|(_, day)| day.tokens).max().unwrap_or(0);
+    let width = days.iter().map(|(name, _)| name.chars().count()).max();
+    for (name, day) in &days {
+        let replies = if day.replies == 1 { "reply" } else { "replies" };
+        let rest = format!("{} {replies} · {}", day.replies, count(day.tokens));
+        row(name, width.unwrap_or(0), bar(day.tokens, most, BAR), rest);
+    }
+
+    render::blank();
+    render::line(&render::dim("by hour"));
+    render::line(&render::blue(&spark(&found.hours)));
+    render::line(&render::dim("0     6     12    18"));
+
+    if !found.tools.is_empty() {
+        render::blank();
+        render::line(&render::dim("top tools"));
+        let most = found.tools.first().map_or(0, |(_, calls)| *calls);
+        let width = found
+            .tools
+            .iter()
+            .map(|(name, _)| name_label(name).chars().count())
+            .max();
+        for (name, calls) in &found.tools {
+            let times = if *calls == 1 { "call" } else { "calls" };
+            let rest = format!("{calls} {times}");
+            row(
+                &name_label(name),
+                width.unwrap_or(0),
+                bar(*calls, most, BAR),
+                rest,
+            );
+        }
+    }
+
+    render::blank();
+    render::line(&render::dim("top models"));
+    let tokens = |totals: &letronna_core::usage::Totals| totals.input.saturating_add(totals.output);
+    let most = found.models.first().map_or(0, |(_, totals)| tokens(totals));
+    let width = found
+        .models
+        .iter()
+        .map(|(name, _)| name_label(name).chars().count())
+        .max();
+    for (name, totals) in &found.models {
+        let rest = format!("{} tokens · {}", count(tokens(totals)), cached(totals));
+        row(
+            &name_label(name),
+            width.unwrap_or(0),
+            bar(tokens(totals), most, BAR),
+            rest,
+        );
+    }
+}
+
+/// A tool or model name as its row starts it: one line, cut short, and
+/// without control characters.
+fn name_label(name: &str) -> String {
+    // The names come from the model or its gateway as sent, so an escape in
+    // one would restyle the terminal and one long one would pad every row.
+    render::fit(name, 40)
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect()
 }
 
 /// A side question, answered dim under it from what the session holds so far
@@ -2112,7 +2247,9 @@ pub fn gateways(runner: &mut Runner) {
 
 #[cfg(test)]
 mod tests {
-    use super::{agent_rows, choice_label, from_match, last_prompt, typed_path, with_files};
+    use super::{
+        agent_rows, choice_label, from_match, last_prompt, name_label, typed_path, with_files,
+    };
     use letronna_core::agents::Seen;
     use letronna_core::chat::Message;
     use letronna_core::driver::Status;
@@ -2292,5 +2429,15 @@ mod tests {
             choice_label(&read),
             "untitled  ·  no project  ·  2 messages"
         );
+    }
+
+    #[test]
+    fn an_insights_name_is_one_short_line_with_no_escapes() {
+        assert_eq!(name_label("read_file"), "read_file");
+        assert_eq!(name_label("x\x1b[2J\x1b]0;hi\x07"), "x[2J]0;hi");
+        assert_eq!(name_label("a\nb"), "a b");
+        let long = name_label(&"t".repeat(10_000));
+        assert_eq!(long.chars().count(), 40);
+        assert!(long.ends_with('…'));
     }
 }
