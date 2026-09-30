@@ -121,8 +121,12 @@ fn word_len(text: &str) -> usize {
 fn attach(written: &str, ctx: &ToolContext) -> Option<String> {
     let (raw, lines) = split_lines(written);
     let raw = raw.replace("\\ ", " ");
-    // A sentence can end on a reference, but a file can end on a dot too.
-    let raw = if !exists(&raw, ctx) && exists(raw.trim_end_matches('.'), ctx) {
+    // A sentence can end on a reference, but a file can end on a dot too --
+    // not on Windows, which drops the dot and opens the name without it, so
+    // there the dot is the sentence's.
+    let as_written =
+        exists(&raw, ctx) && crate::paths::unsafe_raw(&raw, ctx.workspace.as_deref()).is_none();
+    let raw = if !as_written && exists(raw.trim_end_matches('.'), ctx) {
         raw.trim_end_matches('.').to_owned()
     } else {
         raw
