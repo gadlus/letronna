@@ -780,7 +780,9 @@ impl Chat {
             drafts: std::collections::HashMap::new(),
             draft_for,
             attachments: std::collections::HashMap::new(),
-            error: error.or(skills_error),
+            error: error
+                .or(skills_error)
+                .or_else(letronna_core::vault::trouble),
             updating: Default::default(),
             note: None,
             hook_note: None,
@@ -2333,7 +2335,9 @@ impl Chat {
                     // Saved without restarting the poller: a new one starts
                     // without the offset and could hear the code again, now
                     // as the paired chat's first message.
-                    letronna_core::messaging::save(&self.messaging);
+                    if let Err(error) = letronna_core::messaging::save(&self.messaging) {
+                        self.error = Some(error);
+                    }
                     self.tell_remote(
                         &source,
                         "Paired. Letronna answers this chat now, and only your answers \
@@ -2361,7 +2365,9 @@ impl Chat {
             ) {
                 Some(pairing::Attempt::Paired) => {
                     // The listener hears only the member it started with.
-                    letronna_core::messaging::save(&self.messaging);
+                    if let Err(error) = letronna_core::messaging::save(&self.messaging) {
+                        self.error = Some(error);
+                    }
                     self.tell_remote(&source, "Paired. Send your message.", cx);
                     self.restart_messaging(cx);
                     cx.notify();
@@ -2415,7 +2421,9 @@ impl Chat {
             && let Some(held) = self.voice_waiting.remove(&source)
         {
             files::choose_voice(&mut self.messaging, &source, &message.said);
-            letronna_core::messaging::save(&self.messaging);
+            if let Err(error) = letronna_core::messaging::save(&self.messaging) {
+                self.error = Some(error);
+            }
             return self.on_remote(held, cx);
         }
         if self.busy {

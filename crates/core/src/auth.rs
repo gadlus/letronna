@@ -5,10 +5,12 @@
 //! reach, and waits for the page to send the token back to it. Nothing is
 //! typed and no password passes through here.
 //!
-//! What comes back is a device token for this computer. It lives in
-//! `account.json`, which the terminal and the window both read, so signing in
-//! or out in one is seen by the other. The token is checked against the API
-//! for the plan and credits, and the dashboard can sign a computer out.
+//! What comes back is a device token for this computer. Who it belongs to
+//! lives in `account.json`, which the terminal and the window both read, so
+//! signing in or out in one is seen by the other; the token itself is kept
+//! in the system's vault where there is one (see `vault`). The token is
+//! checked against the API for the plan and credits, and the dashboard can
+//! sign a computer out.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
@@ -113,30 +115,70 @@ pub fn path() -> PathBuf {
     backend::data_dir().join("account.json")
 }
 
-/// Who is signed in, if anyone.
-pub fn account() -> Option<Account> {
-    let account: Account = std::fs::read(path())
+/// Where in `account.json` the token sits, and its name in the vault.
+pub(crate) const SECRETS: &[(&str, &str)] = &[("/token", TOKEN)];
+const TOKEN: &str = "account.token";
+
+fn on_disk() -> Option<Account> {
+    std::fs::read(path())
         .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())?;
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+}
+
+/// Who is signed in, if anyone. A token the vault would not give reads as
+/// signed out, and `vault::trouble` says why.
+pub fn account() -> Option<Account> {
+    let mut account = on_disk()?;
+    if account.token.is_empty() {
+        account.token = crate::vault::get(TOKEN).ok().flatten().unwrap_or_default();
+    }
     (!account.token.trim().is_empty()).then_some(account)
+}
+
+/// Forget the token here: the vault's copy first, and the file only once
+/// that is gone, so a token the vault would not let go of is not left there
+/// unlisted and unseen.
+fn forget() -> Result<(), String> {
+    crate::vault::remove(TOKEN)
+        .map_err(|why| format!("Not signed out: {why}, and the sign-in is still kept here."))?;
+    let _ = std::fs::remove_file(path());
+    Ok(())
 }
 
 pub fn signed_in() -> bool {
     account().is_some()
 }
 
-/// Sign this computer out, on the server as well when it can be reached, so
-/// it drops off the dashboard's list. The local file goes either way.
-pub fn sign_out() {
-    if let Some(account) = account() {
-        let _ = client(Duration::from_secs(5)).and_then(|c| {
-            c.post(api("/devices/self/revoke"))
-                .bearer_auth(&account.token)
-                .send()
-                .map_err(|e| e.to_string())
-        });
-    }
-    let _ = std::fs::remove_file(path());
+/// Sign this computer out: on the server first when the token can be read,
+/// so it drops off the dashboard's list, then here. Gives what is left to do
+/// on the website when the server was not told, and an error saying what is
+/// left when the token could not be taken out of the vault.
+pub fn sign_out() -> Result<Option<String>, String> {
+    let note = match account() {
+        Some(account) => {
+            let revoked = client(Duration::from_secs(5)).and_then(|c| {
+                c.post(api("/devices/self/revoke"))
+                    .bearer_auth(&account.token)
+                    .send()
+                    .map_err(|e| e.to_string())
+            });
+            // 401: the dashboard signed it out already.
+            let told = revoked.is_ok_and(|answer| {
+                answer.status().is_success() || answer.status().as_u16() == 401
+            });
+            (!told).then_some(
+                "The account service could not be told, so sign this computer out \
+                 on the website too.",
+            )
+        }
+        None if on_disk().is_some() => Some(
+            "The sign-in could not be read, so the account service was not told: \
+             sign this computer out on the website too.",
+        ),
+        None => None,
+    };
+    forget()?;
+    Ok(note.map(str::to_owned))
 }
 
 /// Ask the API who this token belongs to and what they have, and keep the
@@ -149,7 +191,11 @@ pub fn refresh() -> Result<Account, String> {
         .send()
         .map_err(|_| "Could not reach the Letronna account service.".to_owned())?;
     if response.status().as_u16() == 401 {
-        let _ = std::fs::remove_file(path());
+        if let Err(why) = forget() {
+            return Err(format!(
+                "This computer was signed out on the website. {why}"
+            ));
+        }
         return Err("This computer was signed out. /login to sign in again.".into());
     }
     #[derive(Deserialize)]
@@ -224,9 +270,18 @@ fn client(timeout: Duration) -> Result<reqwest::blocking::Client, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Keep who is signed in, with the token in the vault where there is one; a
+/// vault that refuses it fails the sign-in rather than leave it in the file.
 fn remember(account: &Account) -> Result<(), String> {
     let _ = std::fs::create_dir_all(backend::data_dir());
-    let bytes = serde_json::to_vec_pretty(account).map_err(|e| e.to_string())?;
+    let in_file = on_disk().map(|account| account.token).unwrap_or_default();
+    let token = crate::vault::save(TOKEN, &account.token, &in_file)
+        .map_err(|why| format!("Could not keep the sign-in: {why}."))?;
+    let kept = Account {
+        token,
+        ..account.clone()
+    };
+    let bytes = serde_json::to_vec_pretty(&kept).map_err(|e| e.to_string())?;
     crate::store::write_private(&path(), &bytes).map_err(|e| e.to_string())
 }
 

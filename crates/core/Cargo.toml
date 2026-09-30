@@ -29,9 +29,15 @@ toml = { version = "1", default-features = false, features = ["std", "parse", "s
 
 # Stopping a background job ends everything it started: a Job Object on
 # Windows, a process group elsewhere. Both are already in the lock file,
-# windows-sys at the version the window uses.
+# windows-sys at the version the window uses. Credential Manager keeps the
+# keys and tokens on Windows.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Credentials", "Win32_System_JobObjects", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
+
+# The login Keychain keeps the keys and tokens on macOS; already in the lock
+# file under rustls-native-certs.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

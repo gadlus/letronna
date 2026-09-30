@@ -77,6 +77,10 @@ fn report(dir: &Path, offline: bool) -> Vec<Check> {
         }
         Err(error) => checks.push(broken("settings", error)),
     }
+    checks.push(fine("keys", letronna_core::vault::place()));
+    if let Some(why) = letronna_core::vault::trouble() {
+        checks.push(broken("keys", why));
+    }
     checks.push(fine("logs", diag::logs(dir).display().to_string()));
     let crash = diag::last_crash(dir).map_or("none".into(), |path| path.display().to_string());
     checks.push(fine("last crash", crash));
@@ -104,7 +108,8 @@ fn provider(dir: &Path, settings: &Settings, offline: bool) -> Vec<Check> {
         .unwrap_or_default();
     let key_saved = keys
         .get(gateway::key_slot(name))
-        .is_some_and(|key| !key.trim().is_empty());
+        .is_some_and(|key| !key.trim().is_empty())
+        || letronna_core::vault::has_key(gateway::key_slot(name));
     let (ready, how) = match name {
         gateway::LETRONNA if auth::signed_in() => (true, "signed in"),
         gateway::LETRONNA => (false, "not signed in: run `letronna setup`"),

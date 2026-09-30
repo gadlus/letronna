@@ -72,6 +72,7 @@ pub mod tools;
 pub mod untrusted;
 pub mod update;
 pub mod usage;
+pub mod vault;
 pub mod wake;
 pub mod watch;
 pub mod web;

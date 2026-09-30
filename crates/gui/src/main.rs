@@ -33,6 +33,9 @@ fn main() {
             .spawn();
         return;
     }
+    // Before anything reads a key, so each comes from the vault and any
+    // still in a file is moved there.
+    letronna_core::vault::open();
     letronna_core::diag::init("gui");
     Application::new().with_assets(Assets).run(|cx| {
         letronna_core::diag::mark("app");

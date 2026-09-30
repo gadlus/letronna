@@ -285,6 +285,12 @@ pub struct Settings {
     /// with one, off by default because the speech is paid from credit.
     #[serde(default)]
     pub voice: bool,
+    /// Where keys and tokens are kept on macOS and Windows: empty or "vault"
+    /// for the Keychain or Credential Manager, or "files" for keys.json and
+    /// the other files, which the next start moves them all back into, as
+    /// an older Letronna needs. Edited by hand.
+    #[serde(default)]
+    pub keys_in: String,
 }
 
 // Written out rather than derived so the film grain and notifications start
@@ -301,6 +307,7 @@ impl Default for Settings {
             helper_budget: 0,
             disabled_tools: Vec::new(),
             computer_use: false,
+            keys_in: String::new(),
             gateway: String::new(),
             custom_endpoint: String::new(),
             presence: String::new(),
@@ -2365,41 +2372,51 @@ pub fn keys_path() -> PathBuf {
     backend::data_dir().join("keys.json")
 }
 
-/// Write the keys file. Private to this user: the keys are the one thing
-/// here worth stealing.
-pub fn save_keys(keys: &std::collections::HashMap<String, String>) -> std::io::Result<()> {
-    std::fs::create_dir_all(backend::data_dir())?;
-    let keys = serde_json::to_value(keys)?;
-    crate::state::update::<std::collections::HashMap<String, String>>(&keys_path(), |disk| {
-        *disk = keys
-    })
-    .map_err(std::io::Error::other)
-}
-
-/// Put one key in the keys file, or with `None` take it out, leaving every
-/// other slot as the file has it, and give back the keys it then holds.
+/// Put one key in the vault, or the keys file where there is none, or with
+/// `None` take it out, leaving every other slot as it is, and give back the
+/// keys there are then. One at a time, so a key the vault would not give is
+/// never saved over or cleared by a whole list that went without it.
 pub fn save_key(
     slot: &str,
     key: Option<&str>,
 ) -> std::io::Result<std::collections::HashMap<String, String>> {
     std::fs::create_dir_all(backend::data_dir())?;
-    let mut saved = serde_json::Value::Null;
+    let name = format!("{}{slot}", crate::vault::KEYS);
+    let mut refused = None;
     crate::state::update::<std::collections::HashMap<String, String>>(&keys_path(), |disk| {
-        match (disk.as_object_mut(), key) {
-            (Some(keys), Some(key)) => {
-                keys.insert(slot.to_owned(), key.into());
+        let in_file = disk
+            .get(slot)
+            .and_then(|key| key.as_str())
+            .unwrap_or_default();
+        let kept = match key {
+            Some(key) => crate::vault::save(&name, key, in_file),
+            // Out of the vault whether or not it could be read, and a vault
+            // that will not let it go is the error, the key left listed.
+            None => crate::vault::remove(&name).map(|()| String::new()),
+        };
+        let kept = match kept {
+            Ok(kept) => kept,
+            Err(why) => {
+                refused = Some(why);
+                return;
             }
-            (Some(keys), None) => {
+        };
+        match (disk.as_object_mut(), kept.is_empty()) {
+            (Some(keys), false) => {
+                keys.insert(slot.to_owned(), kept.into());
+            }
+            (Some(keys), true) => {
                 keys.remove(slot);
             }
-            (None, Some(key)) => *disk = serde_json::json!({ slot: key }),
-            (None, None) => {}
+            (None, false) => *disk = serde_json::json!({ slot: kept }),
+            (None, true) => {}
         }
-        saved = disk.clone();
     })
     .map_err(std::io::Error::other)?;
-    // Null, with no file and nothing to put in one, is no keys.
-    Ok(serde_json::from_value(saved).unwrap_or_default())
+    match refused {
+        Some(why) => Err(std::io::Error::other(why)),
+        None => Ok(load_keys()),
+    }
 }
 
 /// Write a file only its owner may read: the keys, the sign-in, bot tokens.
@@ -2425,8 +2442,17 @@ pub fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()
     std::fs::write(path, bytes)
 }
 
+/// Every saved key by slot: the keys file's, and the vault's for each slot
+/// the file has none in.
 pub fn load_keys() -> std::collections::HashMap<String, String> {
-    crate::state::read(&keys_path()).unwrap_or_default()
+    let mut keys: std::collections::HashMap<String, String> =
+        crate::state::read(&keys_path()).unwrap_or_default();
+    for (slot, key) in crate::vault::under(crate::vault::KEYS) {
+        if keys.get(&slot).is_none_or(|copy| copy.is_empty()) {
+            keys.insert(slot, key);
+        }
+    }
+    keys
 }
 
 pub fn bucket(updated: u64, now: u64) -> &'static str {

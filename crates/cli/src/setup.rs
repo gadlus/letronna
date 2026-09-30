@@ -140,7 +140,7 @@ fn choose_provider(runner: &mut Runner) -> bool {
 
     if chosen.needs_key {
         let slot = gateway::key_slot(chosen.name).to_owned();
-        let mut keys = store::load_keys();
+        let keys = store::load_keys();
         let have = keys.get(&slot).is_some_and(|k| !k.trim().is_empty());
         render::line(&render::dim(if have {
             "A key is already saved. Paste a new one, or enter to keep it."
@@ -154,8 +154,7 @@ fn choose_provider(runner: &mut Runner) -> bool {
             .trim()
             .to_owned();
         if !key.is_empty() {
-            keys.insert(slot, key);
-            if let Err(error) = store::save_keys(&keys) {
+            if let Err(error) = store::save_key(&slot, Some(&key)) {
                 render::line(&render::red(&format!("Could not save the key: {error}")));
             } else {
                 render::line(&render::dim("Key saved."));

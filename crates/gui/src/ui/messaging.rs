@@ -54,7 +54,9 @@ const CHANNELS: &[Channel] = &[
 
 impl Chat {
     fn save_messaging(&mut self, cx: &mut Context<Self>) {
-        messaging::save(&self.messaging);
+        if let Err(error) = messaging::save(&self.messaging) {
+            self.error = Some(error);
+        }
         self.restart_messaging(cx);
         cx.notify();
     }

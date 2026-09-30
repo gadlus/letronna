@@ -3686,6 +3686,7 @@ dependencies = [
  "regex",
  "reqwest",
  "ring",
+ "security-framework",
  "semver",
  "serde",
  "serde_json",

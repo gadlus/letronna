@@ -116,16 +116,25 @@ pub fn command(
         }
         "/logout" => {
             let who = letronna_core::auth::account();
-            runner
+            let out = runner
                 .bar
                 .busy("signing this computer out", letronna_core::auth::sign_out);
             render::blank();
-            match who {
-                Some(account) => render::line(&render::dim(&format!(
-                    "Signed out {}. Your sessions and settings stay where they are.",
-                    account.name
-                ))),
-                None => render::line(&render::dim("Nobody was signed in.")),
+            match (who, out) {
+                (_, Err(why)) => render::line(&render::red(&why)),
+                (Some(account), Ok(note)) => {
+                    render::line(&render::dim(&format!(
+                        "Signed out {}. Your sessions and settings stay where they are.",
+                        account.name
+                    )));
+                    if let Some(note) = note {
+                        render::line(&render::dim(&note));
+                    }
+                }
+                (None, Ok(Some(note))) => {
+                    render::line(&render::dim(&format!("Signed out here. {note}")));
+                }
+                (None, Ok(None)) => render::line(&render::dim("Nobody was signed in.")),
             }
             Flow::Handled
         }
@@ -2102,7 +2111,7 @@ fn set_model(runner: &mut Runner, session: Option<usize>, gateway: String, model
 /// or remove one. The one set up last is used.
 pub fn search_services(runner: &mut Runner) {
     use letronna_core::search::{self, SERVICES};
-    let mut keys = store::load_keys();
+    let keys = store::load_keys();
     let mut choice = search::choice();
     let mut rows = Vec::new();
     let mut choices: Vec<(String, &'static str, &'static str)> = Vec::new();
@@ -2131,8 +2140,12 @@ pub fn search_services(runner: &mut Runner) {
         return;
     };
     render::blank();
+    let mut saved = Ok(Default::default());
     if what == "remove" {
-        keys.remove(name);
+        if let Err(error) = store::save_key(name, None) {
+            render::line(&render::red(&format!("Could not remove {name}: {error}")));
+            return;
+        }
         choice.set_address(service, "");
         if choice.service == name {
             choice.service.clear();
@@ -2153,7 +2166,7 @@ pub fn search_services(runner: &mut Runner) {
         if given.trim().is_empty() {
             return;
         }
-        keys.insert(name.to_owned(), given.trim().to_owned());
+        saved = store::save_key(name, Some(given.trim()));
         // Its official address unless another is given; "official" goes back to it.
         let now = choice.address(service);
         let hint = format!("{name} address (Enter keeps {now}; official resets it)");
@@ -2170,7 +2183,7 @@ pub fn search_services(runner: &mut Runner) {
             choice.address(service)
         )));
     }
-    if let Err(error) = store::save_keys(&keys) {
+    if let Err(error) = saved {
         render::line(&render::red(&format!("Could not save the key: {error}")));
     }
     if let Err(error) = search::choose(&choice) {
@@ -2226,10 +2239,14 @@ pub fn gateways(runner: &mut Runner) {
     let Some((_, name, what)) = choices.get(picked).cloned() else {
         return;
     };
-    let mut keys = keys;
+    let mut saved = Ok(keys);
     match what {
         "remove" => {
-            keys.remove(gateway::key_slot(name));
+            if let Err(error) = store::save_key(gateway::key_slot(name), None) {
+                render::blank();
+                render::line(&render::red(&format!("Could not remove {name}: {error}")));
+                return;
+            }
             if gateway::gateway(name).base.is_empty() {
                 runner.store.settings.custom_endpoint.clear();
             }
@@ -2259,7 +2276,7 @@ pub fn gateways(runner: &mut Runner) {
             };
             let key = runner.bar.ask(&hint, true).unwrap_or_default();
             if !key.trim().is_empty() {
-                keys.insert(gateway::key_slot(name).to_owned(), key.trim().to_owned());
+                saved = store::save_key(gateway::key_slot(name), Some(key.trim()));
             }
             render::blank();
             render::line(&render::dim(&format!(
@@ -2267,7 +2284,7 @@ pub fn gateways(runner: &mut Runner) {
             )));
         }
     }
-    if let Err(error) = store::save_keys(&keys) {
+    if let Err(error) = saved {
         render::line(&render::red(&format!("Could not save the key: {error}")));
     }
     runner.persist();

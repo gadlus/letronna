@@ -94,8 +94,11 @@ impl Chat {
         self.signing_in = true;
         self.off_thread(
             || {
-                auth::sign_out();
-                Err("Signed out. Your chats and settings stay where they are.".into())
+                Err(match auth::sign_out() {
+                    Ok(None) => "Signed out. Your chats and settings stay where they are.".into(),
+                    Ok(Some(note)) => format!("Signed out here. {note}"),
+                    Err(why) => why,
+                })
             },
             cx,
         );
