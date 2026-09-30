@@ -59,6 +59,7 @@ pub mod palette;
 mod patch;
 pub mod paths;
 pub mod permissions;
+mod prefilter;
 pub mod preview;
 pub mod profiles;
 mod redact;
