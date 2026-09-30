@@ -3713,6 +3713,8 @@ version = "0.1.0-alpha.2"
 dependencies = [
  "async-channel 2.5.0",
  "chrono",
+ "core-foundation 0.10.0",
+ "core-graphics 0.24.0",
  "ignore",
  "image",
  "libc",
