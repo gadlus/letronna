@@ -5,9 +5,13 @@
 //! model starts with them instead of spending a round on `read_file`. Paths go
 //! through the same checks and paging as `read_file`: a file of keys, one in
 //! Letronna's own folder or one outside the workspace and home folder is not
-//! read, and a path that is not there stays as typed.
+//! read, and a path that is not there stays as typed. `@diff` attaches the
+//! project's uncommitted changes and `@session:12` the end of that session.
 
+use std::io::Read;
 use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::permissions;
 use crate::tools::{self, ToolContext};
@@ -29,6 +33,18 @@ const LISTED: usize = 500;
 
 /// Names after an `@` that mean someone rather than a path.
 const MENTIONS: &[&str] = &["crew"];
+
+/// The reference that attaches the project's uncommitted changes. It is kept
+/// by name, as `@crew` is, so a file called diff is not attached this way.
+pub const DIFF: &str = "diff";
+
+/// What goes before a session's id in a reference to it.
+pub const SESSION: &str = "session:";
+
+/// How long git gets, over both of its runs, to say what changed. The
+/// window expands a message on its own thread, so this is how long it can
+/// stop answering; a diff git takes longer over is better asked for.
+const DIFF_TIME: Duration = Duration::from_secs(5);
 
 /// `text` with what its `@` references name attached after it, or `text` as
 /// it is when none of them names anything there.
@@ -119,6 +135,24 @@ fn word_len(text: &str) -> usize {
 /// folder's entries, or why it is not attached. None for a path that is not
 /// there, which is left as typed text.
 fn attach(written: &str, ctx: &ToolContext) -> Option<String> {
+    let bare = written.trim_end_matches('.');
+    let named = if bare == DIFF {
+        Some(diff(ctx))
+    } else {
+        session_id(bare).map(tools::read_end)
+    };
+    if let Some(body) = named {
+        let header = format!("--- @{bare} ---");
+        return Some(match body {
+            Ok(body) => format!("{header}\n{body}"),
+            Err(why) => format!("{header}\nNot attached: {why}"),
+        });
+    }
+    // A session named wrong stays as typed, rather than being taken for a
+    // path, which on Windows `session:x` would be: a stream of `session`.
+    if bare.starts_with(SESSION) {
+        return None;
+    }
     let (raw, lines) = split_lines(written);
     let raw = raw.replace("\\ ", " ");
     // A sentence can end on a reference, but a file can end on a dot too --
@@ -149,6 +183,127 @@ fn attach(written: &str, ctx: &ToolContext) -> Option<String> {
         Ok(body) => format!("{header}\n{body}"),
         Err(why) => format!("{header}\nNot attached: {why}"),
     })
+}
+
+/// The session a reference such as `session:12` names.
+fn session_id(written: &str) -> Option<u64> {
+    written.strip_prefix(SESSION)?.parse().ok()
+}
+
+/// The project's changes to tracked files since its last commit, as git
+/// shows them, leaving out what `read_file` would refuse to read.
+fn diff(ctx: &ToolContext) -> Result<String, String> {
+    let Some(folder) = ctx.workspace.as_deref() else {
+        return Err("the session has no project folder to compare.".into());
+    };
+    // A program named in the repository's own config would run on a diff,
+    // and nothing asked first; `git diff` as a command asks.
+    if crate::command::config_runs_programs(folder) {
+        return Err(
+            "the repository's config names programs git would run, so ask for git diff instead."
+                .into(),
+        );
+    }
+    let deadline = Instant::now() + DIFF_TIME;
+    let names = git(
+        folder,
+        &["diff", "--name-only", "-z", "--relative", "HEAD"],
+        deadline,
+    )?;
+    // A list cut short ends part way through a name, and a pathspec of part
+    // of one can be the folder holding a file of keys, so only the names git
+    // ended are taken.
+    let ended = names.rfind('\0').map_or("", |at| &names[..at]);
+    let data = crate::chat::data_dir();
+    let (shown, kept): (Vec<&str>, Vec<&str>) = ended
+        .split('\0')
+        .filter(|name| !name.is_empty())
+        // Joined, not resolved: a deleted file is a change too.
+        .partition(|name| {
+            let path = folder.join(name);
+            !tools::secret(&path) && !tools::private(&path, &data)
+        });
+    if shown.is_empty() && kept.is_empty() {
+        return Ok("No changes since the last commit.".into());
+    }
+    let mut args = vec![
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-color",
+        "--relative",
+        "HEAD",
+        "--",
+    ];
+    args.extend(&shown);
+    let mut out = if shown.is_empty() {
+        String::new()
+    } else {
+        git(folder, &args, deadline)?
+    };
+    if !kept.is_empty() {
+        out.push_str(&format!(
+            "\n[Left out, as files holding keys: {}.]",
+            kept.join(", ")
+        ));
+    }
+    Ok(out.trim_start_matches('\n').to_owned())
+}
+
+/// What git prints for `args` in `folder`, with the read-only guards on, at
+/// most `ATTACHED_CHARS` of it and until `deadline`.
+fn git(folder: &Path, args: &[&str], deadline: Instant) -> Result<String, String> {
+    let mut command = Command::new("git");
+    command
+        .args(["--no-pager", "--literal-pathspecs"])
+        .args(args)
+        .current_dir(folder)
+        .envs(crate::command::GUARDS.iter().copied())
+        .env_remove("GIT_EXTERNAL_DIFF")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("git could not be run: {e}"))?;
+    let Some(stdout) = child.stdout.take() else {
+        return Err("git gave no output to read.".into());
+    };
+    // Read on a thread, so a git that hangs is given up on rather than
+    // holding the message.
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let read = stdout
+            .take(ATTACHED_CHARS as u64)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes);
+        let _ = sender.send(read);
+    });
+    let read = receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+    let whole = matches!(&read, Ok(Ok(bytes)) if bytes.len() < ATTACHED_CHARS);
+    // Cut or late, the rest is not wanted and git would wait on it.
+    if !whole {
+        let _ = child.kill();
+    }
+    let status = child.wait();
+    let bytes = match read {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(e)) => return Err(format!("git's output could not be read: {e}")),
+        Err(_) => return Err("git took too long to say what changed.".into()),
+    };
+    if whole && !status.is_ok_and(|s| s.success()) {
+        return Err(
+            "git could not compare the folder; is it in a repository with a commit?".into(),
+        );
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Err with the reason when a deny rule, the user's or the project's, keeps
@@ -487,6 +642,99 @@ mod tests {
         assert!(expand(&named, Some(&dir)).contains("1|spaced"));
         let outside = reference(&dir.join("src/lib.rs"), None);
         assert_eq!(outside, format!("@{}", dir.join("src/lib.rs").display()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn diff_attaches_the_changes_but_not_a_file_of_keys() {
+        let dir = project("diff");
+        let git = |args: &[&str]| {
+            let done = Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(done.status.success(), "{done:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["add", "-f", "."]);
+        git(&["commit", "-q", "-m", "start"]);
+        std::fs::write(dir.join("src/lib.rs"), "pub fn changed() {}\n").unwrap();
+        std::fs::write(dir.join(".env"), "TOKEN=sk-new-secret\n").unwrap();
+        let sent = expand("review @diff.", Some(&dir));
+        assert!(sent.contains("--- @diff ---\ndiff --git"), "{sent}");
+        assert!(sent.contains("+pub fn changed() {}"), "{sent}");
+        assert!(!sent.contains("sk-new-secret"), "{sent}");
+        assert!(
+            sent.contains("[Left out, as files holding keys: .env.]"),
+            "{sent}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_cut_list_of_changes_does_not_take_in_the_folder_of_a_part_name() {
+        let dir = project("diff-cut");
+        let git = |args: &[&str]| {
+            let done = Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(done.status.success(), "{done:?}");
+        };
+        // Files of keys, left out of the diff, whose names with their NULs
+        // fill all but two bytes of what is read, so the list is cut just
+        // after the `zz` of `zz/.env`.
+        std::fs::create_dir_all(dir.join(".aws")).unwrap();
+        std::fs::create_dir_all(dir.join("zz")).unwrap();
+        let mut filled = 0;
+        let mut n = 0;
+        while filled < ATTACHED_CHARS - 2 {
+            let len = (ATTACHED_CHARS - 2 - filled).min(80) - 1;
+            let name = format!(".aws/{n:04}{}", "x".repeat(len - 9));
+            std::fs::write(dir.join(&name), "old\n").unwrap();
+            filled += len + 1;
+            n += 1;
+        }
+        std::fs::write(dir.join("zz/.env"), "TOKEN=old\n").unwrap();
+        git(&["init", "-q"]);
+        git(&["add", "-f", "."]);
+        git(&["commit", "-q", "-m", "start"]);
+        for entry in std::fs::read_dir(dir.join(".aws")).unwrap() {
+            std::fs::write(entry.unwrap().path(), "new\n").unwrap();
+        }
+        std::fs::write(dir.join("zz/.env"), "TOKEN=sk-cut-secret\n").unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..ToolContext::default()
+        };
+        let shown = diff(&ctx).unwrap();
+        assert!(!shown.contains("sk-cut-secret"), "{shown}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn git_past_its_deadline_is_given_up_on() {
+        let dir = project("late");
+        let said = git(&dir, &["status"], Instant::now());
+        assert_eq!(said, Err("git took too long to say what changed.".into()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn diff_without_a_project_says_why_and_a_bad_session_stays_as_typed() {
+        let sent = expand("@diff", None);
+        assert!(
+            sent.contains("--- @diff ---\nNot attached: the session has no project folder"),
+            "{sent}"
+        );
+        assert_eq!(session_id("session:12"), Some(12));
+        assert_eq!(session_id("session:twelve"), None);
+        let dir = project("session");
+        assert_eq!(expand("see @session:x", Some(&dir)), "see @session:x");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

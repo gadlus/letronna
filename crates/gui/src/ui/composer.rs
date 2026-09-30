@@ -567,12 +567,16 @@ impl Chat {
 
     /// Open the list of modes with the keys in it, as the chip's popover
     /// shows it.
-    fn open_mode_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_mode_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.mode_menu.is_some() {
             return;
         }
         let (chat, mode) = (cx.entity(), self.active_mode());
+        // Closed, the menu hands the keys back to the composer, where /mode
+        // was typed; otherwise they would go nowhere.
+        let back = self.composer.focus_handle(cx);
         let menu = PopupMenu::build(window, cx, move |menu, _, _| {
+            let menu = menu.action_context(back);
             Mode::OFFERED.into_iter().fold(menu, |menu, choice| {
                 let chat = chat.clone();
                 menu.item(
@@ -665,7 +669,16 @@ impl Chat {
                     this.toggle_voice(window, cx);
                 }),
             )
-            .child(Input::new(&self.composer).w_full().appearance(false));
+            // Around the input rather than on it, so the list's keys come
+            // before the input's own only while the list is up.
+            .child(
+                self.completion_keys(
+                    div()
+                        .w_full()
+                        .child(Input::new(&self.composer).w_full().appearance(false)),
+                    cx,
+                ),
+            );
         let controls = h_flex()
             .items_center()
             .gap_1()
@@ -771,8 +784,11 @@ impl Chat {
             frame.child(attach).child(input.flex_1()).child(controls)
         };
         v_flex()
+            .relative()
             .w_full()
             .children(self.attached_row(cx))
+            .children(self.accepted_row(cx))
             .child(frame)
+            .children(self.completion_list(cx))
     }
 }

@@ -7,6 +7,7 @@ pub(crate) mod browser;
 pub(crate) mod capabilities;
 pub(crate) mod changes;
 pub(crate) mod chrome;
+pub(crate) mod complete;
 pub(crate) mod composer;
 pub(crate) mod files;
 pub(crate) mod grain;

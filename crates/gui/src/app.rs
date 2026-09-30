@@ -226,6 +226,8 @@ pub(crate) struct Chat {
     pub(crate) job_tick: bool,
     /// Whether the message box holds nothing to send.
     pub(crate) composer_empty: bool,
+    /// What the composer offers for a `/` or `@` being typed.
+    pub(crate) completer: crate::ui::complete::Completer,
     /// The mode picked on each session's chip; a session not in here is in
     /// the Default mode setting.
     pub(crate) modes: std::collections::HashMap<u64, letronna_core::gate::Mode>,
@@ -637,6 +639,7 @@ impl Chat {
                             this.composer_empty = empty;
                             cx.notify();
                         }
+                        this.update_completion(cx);
                     }
                     _ => {}
                 }
@@ -788,6 +791,7 @@ impl Chat {
             deny_reason,
             job_tick: false,
             composer_empty: true,
+            completer: Default::default(),
             modes: std::collections::HashMap::new(),
             schedules: letronna_core::schedule::load(),
             editing: None,

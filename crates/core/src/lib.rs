@@ -21,6 +21,7 @@ mod cdp;
 pub mod chat;
 pub mod command;
 pub mod compact;
+pub mod complete;
 pub mod computer;
 pub mod diag;
 mod downloads;

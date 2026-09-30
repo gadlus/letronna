@@ -138,6 +138,21 @@ fn main() {
             KeyBinding::new("up", ui::import::PickPrevious, Some("ImportPicker > Input")),
             KeyBinding::new("down", ui::import::PickNext, Some("ImportPicker > Input")),
             KeyBinding::new("enter", ui::import::PickThis, Some("ImportPicker > Input")),
+            // Last, so they come before the input's own keys and the Tab
+            // above while the composer's list is up, and only then.
+            KeyBinding::new("up", ui::complete::ChoiceUp, Some("Completing > Input")),
+            KeyBinding::new("down", ui::complete::ChoiceDown, Some("Completing > Input")),
+            KeyBinding::new(
+                "enter",
+                ui::complete::TakeChoice,
+                Some("Completing > Input"),
+            ),
+            KeyBinding::new("tab", ui::complete::OpenChoice, Some("Completing > Input")),
+            KeyBinding::new(
+                "escape",
+                ui::complete::CloseChoices,
+                Some("Completing > Input"),
+            ),
         ]);
         // Windows hands Shift and a digit over as the character they type,
         // Ctrl+Shift+4 as "ctrl-$", which a binding written "shift-4" never

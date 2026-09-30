@@ -1839,8 +1839,14 @@ fn repo_runs_programs(args: &[String], places: &Places) -> bool {
     let Some((_, start)) = git_start(args, places) else {
         return true;
     };
+    config_runs_programs(&start)
+}
+
+/// Whether the repository `folder` lies in has its own config name a program
+/// a read may run.
+pub(crate) fn config_runs_programs(folder: &Path) -> bool {
     // Git fails in a folder that is not there, running nothing.
-    let Ok(start) = std::fs::canonicalize(start) else {
+    let Ok(start) = std::fs::canonicalize(folder) else {
         return false;
     };
     let Some(git) = start.ancestors().find_map(git_dir) else {
