@@ -759,10 +759,11 @@ mod tests {
     use super::*;
     use crate::inbox::When;
     use crate::store::Conversation;
+    use crate::store::tests::Scratch;
     use serde_json::{Value, json};
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::sync::mpsc;
     use std::thread::JoinHandle;
     use std::time::Duration;
@@ -772,11 +773,9 @@ mod tests {
     /// Where the tests' agent ids start, clear of every session id as real ones are.
     const AGENTS: AgentId = 1 << 40;
 
-    /// A workspace holding `notes.txt`, emptied and reused on each run.
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("letronna-driver-{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+    /// A workspace holding `notes.txt`, removed when dropped.
+    fn scratch(name: &str) -> Scratch {
+        let dir = Scratch::new(&format!("driver-{name}"));
         std::fs::write(dir.join("notes.txt"), "hello from the notes").unwrap();
         dir
     }

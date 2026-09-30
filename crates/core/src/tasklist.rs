@@ -1064,16 +1064,15 @@ impl Tool for Board {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::tests::Scratch;
 
     /// Points Letronna's data at a fresh folder, kept from other tests until
-    /// the guard goes.
-    fn data(name: &str) -> MutexGuard<'static, ()> {
+    /// the guard goes and removed with it.
+    fn data(name: &str) -> (MutexGuard<'static, ()>, Scratch) {
         let turn = (crate::store::tests::DATA_DIR.lock()).unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("letronna-tasklist-{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = Scratch::new(&format!("tasklist-{name}"));
         unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
-        turn
+        (turn, dir)
     }
 
     /// The helpers the tests treat as running here.

@@ -387,6 +387,7 @@ fn unquote(text: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::tests::Scratch;
 
     /// The tools a session has, standing in for the registry.
     const AVAILABLE: &[&str] = &[
@@ -403,11 +404,8 @@ mod tests {
         "mcp__docs__look_up",
     ];
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("letronna-agent-defs-{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(name: &str) -> Scratch {
+        Scratch::new(&format!("agent-defs-{name}"))
     }
 
     fn write(dir: &Path, file: &str, text: &str) {

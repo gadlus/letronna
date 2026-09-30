@@ -885,9 +885,7 @@ mod tests {
         let _turn = crate::store::tests::DATA_DIR
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let data = std::env::temp_dir().join("letronna-messaging-scrub");
-        let _ = std::fs::remove_dir_all(&data);
-        std::fs::create_dir_all(&data).unwrap();
+        let data = crate::store::tests::Scratch::new("messaging-scrub");
         unsafe { std::env::set_var("AGENT_DATA_DIR", &data) };
         let key = "a-saved-key-of-no-known-shape";
         std::fs::write(data.join("keys.json"), format!(r#"{{"OpenAI":"{key}"}}"#)).unwrap();
@@ -3204,9 +3202,7 @@ mod slack_tests {
         let _turn = crate::store::tests::DATA_DIR
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let data = std::env::temp_dir().join("letronna-slack-scrub");
-        let _ = std::fs::remove_dir_all(&data);
-        std::fs::create_dir_all(&data).unwrap();
+        let data = crate::store::tests::Scratch::new("slack-scrub");
         unsafe { std::env::set_var("AGENT_DATA_DIR", &data) };
         let config = super::Config {
             slack: Slack {
