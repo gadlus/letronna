@@ -438,6 +438,14 @@ fn dispatch(
             report.files.push(path.to_owned());
         }
     }
+    if outcome.is_ok() && call.name == crate::patch::APPLY_PATCH {
+        let args = tools::parse_args(&call.arguments).unwrap_or_default();
+        for path in crate::patch::paths(&args).unwrap_or_default() {
+            if !report.files.contains(&path) {
+                report.files.push(path);
+            }
+        }
+    }
     Some(outcome)
 }
 

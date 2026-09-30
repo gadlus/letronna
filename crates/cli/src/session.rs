@@ -1230,6 +1230,8 @@ pub fn intent(name: &str, summary: &str) -> String {
     match name {
         "write_file" => format!("write {summary}"),
         "edit_file" => format!("edit {summary}"),
+        // Every path, since the card below shows only the patch's first lines.
+        "apply_patch" => format!("change {summary}"),
         "run_command" => "run a command".to_owned(),
         "browse" | "use_page" => summary.to_owned(),
         "search_web" => "search the web".to_owned(),
@@ -1649,5 +1651,14 @@ mod tests {
         );
         assert!(matches!(judge("git reset --hard"), Some(Decision::Deny(why)) if !why.is_empty()));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_patch_question_names_every_file() {
+        let patch = "*** Begin Patch\n*** Update File: a.rs\n@@\n-a\n+b\n\
+                     *** Delete File: b.rs\n*** End Patch";
+        let args = json!({ "patch": patch }).to_string();
+        let summary = tools::summary("apply_patch", &args);
+        assert_eq!(intent("apply_patch", &summary), "change a.rs, b.rs");
     }
 }

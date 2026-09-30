@@ -48,6 +48,7 @@ pub mod models;
 mod notebook;
 pub mod notify;
 mod page;
+mod patch;
 pub mod paths;
 pub mod permissions;
 mod redact;

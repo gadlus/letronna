@@ -4833,7 +4833,8 @@ pub(crate) mod tests {
 
     #[test]
     fn undated_replies_wait_for_the_end_without_their_text() {
-        let path = scratch("undated").join("1.jsonl");
+        let dir = scratch("undated");
+        let path = dir.join("1.jsonl");
         let big = "x".repeat(100_000);
         let lines = [
             r#"{"type":"head","id":1,"created":100}"#.to_owned(),

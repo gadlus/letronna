@@ -11,9 +11,10 @@
 //! over, or on Windows a file another program holds open -- is written in
 //! place as before. Every write ends by checking the size on disk. The folder
 //! itself is not synced: a power cut may undo the rename, which still leaves
-//! the old file whole. The file tools write through [`atomic`] and nothing
-//! else, so there is one place to see every change they make: it hands the
-//! old bytes to the turn's `history::Log` first, for a rewind to put back.
+//! the old file whole. The file tools write through [`atomic`] and delete
+//! through [`remove`], nothing else, so there is one place to see every
+//! change they make: each hands the old bytes to the turn's `history::Log`
+//! first, for a rewind to put back.
 
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::Write;
@@ -63,6 +64,17 @@ pub fn atomic(path: &Path, bytes: &[u8], log: &crate::history::Log) -> Result<()
         ));
     }
     log.note(path, before, bytes);
+    Ok(())
+}
+
+/// Delete the file at `path`, keeping what it held in `log` first, so a
+/// rewind can bring it back.
+pub fn remove(path: &Path, log: &crate::history::Log) -> std::io::Result<()> {
+    // Its real path, taken while it is there, names it as `atomic` would.
+    let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    let before = log.keep(path, true);
+    std::fs::remove_file(path)?;
+    log.gone(&real, before);
     Ok(())
 }
 
