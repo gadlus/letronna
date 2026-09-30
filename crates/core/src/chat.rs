@@ -752,8 +752,10 @@ fn body_hashed(
     // conversation grows.
     let identity = system.len();
     let memory = crate::memory::context(connection);
+    let servers = crate::mcp::context(connection);
     let skills = crate::skills::context(connection);
     system.push_str(&memory);
+    system.push_str(&servers);
     system.push_str(&skills);
     let tail = system.len();
     // Models reckon "today" from their training and guess who they are. The
