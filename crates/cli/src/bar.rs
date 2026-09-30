@@ -163,6 +163,10 @@ pub const COMMANDS: &[Command<'static>] = &[
         blurb: "attach a picture to your next message: /image <path>",
     },
     Command {
+        name: "/preview",
+        blurb: "serve an HTML or SVG file to your browser: /preview [--open] <path>",
+    },
+    Command {
         name: "/where",
         blurb: "show the project folder and session file",
     },

@@ -8,6 +8,8 @@
 //! memory: once each time the page opens, off the UI thread.
 
 use crate::prelude::*;
+use gpui_component::notification::Notification;
+use letronna_core::preview;
 
 impl Chat {
     /// Read the files the Artifacts page lists again, off the UI thread:
@@ -47,6 +49,8 @@ impl Chat {
                 // A file can be moved or deleted outside Letronna, so say so
                 // rather than offering to open something that is not there.
                 let exists = artifact.path.exists();
+                let previewable = preview::previewable(&artifact.path);
+                let preview_path = artifact.path.clone();
                 let open_path = artifact.path.clone();
                 let reveal_path = artifact.path.clone();
                 h_flex()
@@ -100,6 +104,25 @@ impl Chat {
                         h_flex()
                             .gap_1()
                             .items_center()
+                            .when(previewable, |this| {
+                                this.child(
+                                    Button::new(("preview", index))
+                                        .plain(cx)
+                                        .xsmall()
+                                        .label("Preview")
+                                        .tooltip("Open in your browser, on this computer only")
+                                        .disabled(!exists)
+                                        .on_click(move |_, window, cx| {
+                                            match preview::start(&preview_path) {
+                                                Ok(url) => cx.open_url(&url),
+                                                Err(error) => window.push_notification(
+                                                    Notification::warning(error),
+                                                    cx,
+                                                ),
+                                            }
+                                        }),
+                                )
+                            })
                             .child(
                                 Button::new(("open", index))
                                     .plain(cx)

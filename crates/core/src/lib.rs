@@ -57,6 +57,7 @@ mod page;
 mod patch;
 pub mod paths;
 pub mod permissions;
+pub mod preview;
 mod redact;
 pub mod references;
 pub mod retry;
