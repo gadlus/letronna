@@ -230,6 +230,10 @@ pub struct Settings {
     /// the transcript, code or diffs.
     #[serde(default = "yes")]
     pub grain: bool,
+    /// Tell the computer when a run ends or needs an answer while nobody is
+    /// looking at the window or the terminal.
+    #[serde(default = "yes")]
+    pub notifications: bool,
     /// The most tokens a request carries besides the reply, its system prompt
     /// and tools included, however much the model could take; 0 keeps the
     /// default of 64,000, and set however low the conversation still gets
@@ -258,8 +262,8 @@ pub struct Settings {
     pub disabled_tools: Vec<String>,
 }
 
-// Written out rather than derived so the film grain starts on for a first
-// run too, as it does for a settings file from before it existed.
+// Written out rather than derived so the film grain and notifications start
+// on for a first run too, as they do for a settings file from before them.
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -284,6 +288,7 @@ impl Default for Settings {
             browse_unseen: false,
             appearance: String::new(),
             grain: true,
+            notifications: true,
         }
     }
 }

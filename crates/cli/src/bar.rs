@@ -89,6 +89,10 @@ pub const COMMANDS: &[Command] = &[
         blurb: "let the model search the web; /search services for your own",
     },
     Command {
+        name: "/notify",
+        blurb: "say when a reply ends or needs you while you are away, or stop",
+    },
+    Command {
         name: "/jobs",
         blurb: "commands still running in the background",
     },
@@ -361,6 +365,8 @@ pub struct Bar {
     /// While a question that came up on its own is open, when it came up or
     /// when a letter was last typed under it, whichever is later.
     guard: Option<std::time::Instant>,
+    /// Whether anyone is looking, for notifications.
+    focus: crate::notify::Focus,
 }
 
 impl Bar {
@@ -396,6 +402,7 @@ impl Bar {
             asks: None,
             held: None,
             guard: None,
+            focus: crate::notify::Focus::new(std::time::Instant::now()),
         }
     }
 
@@ -444,6 +451,12 @@ impl Bar {
         if self.live {
             self.bell = Some(letronna_core::inbox::listen());
         }
+    }
+
+    /// Whether nobody is looking at the box, as of `now`; never while it is
+    /// not up, when there is no terminal to notify through.
+    pub fn away(&self, now: std::time::Instant) -> bool {
+        self.live && self.focus.away(now)
     }
 
     /// Take helpers' requests for a yes from now on, to put to the user in the
@@ -692,12 +705,14 @@ impl Bar {
                 Ok(Event::Key(key)) if key.kind != KeyEventKind::Press => continue,
                 Ok(Event::Key(key)) => {
                     self.handled += 1;
+                    self.focus.touch(std::time::Instant::now());
                     self.key(key);
                 }
                 // Terminals that hand pasted text over in one piece. Windows
                 // consoles do not, which the enter key handles instead.
                 Ok(Event::Paste(text)) => {
                     self.handled += 1;
+                    self.focus.touch(std::time::Instant::now());
                     if self.choice.is_none() {
                         self.line.paste(&text);
                         self.picked = 0;
@@ -707,7 +722,14 @@ impl Bar {
                 // restoring one sends several at once. Note it and deal with
                 // the last shape rather than every shape on the way there.
                 Ok(Event::Resize(_, _)) => resized = true,
+                Ok(Event::FocusGained) => self.focus.report(true),
+                Ok(Event::FocusLost) => self.focus.report(false),
                 Ok(Event::Mouse(mouse)) => {
+                    // A pointer passing over the window is not someone
+                    // looking at it; a click or a scroll is.
+                    if mouse.kind != MouseEventKind::Moved {
+                        self.focus.touch(std::time::Instant::now());
+                    }
                     self.mouse(mouse);
                     // The footer says how far back the view is and whether
                     // something was just copied, so it has to be rebuilt when

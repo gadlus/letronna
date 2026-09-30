@@ -94,18 +94,45 @@ pub fn finish(key: &Key, state: State, notice: Option<Notice>) {
         if task.notified {
             return;
         }
+        let ended = ended_words(key, &state, &task.label);
         task.state = state;
         task.notified = true;
         let owner = task.owner;
-        climb(&tasks, owner, |state| {
+        let to = climb(&tasks, owner, |state| {
             !matches!(state, State::Running | State::Idle)
-        })
+        });
+        // Only news that reaches a session: a helper's own helpers report
+        // to it, and it is what the user hears from. Before the notice, so a
+        // front end the doorbell wakes finds it.
+        let session = to != 0 && !tasks.contains_key(&Key::Agent(to));
+        if let Some(what) = ended.filter(|_| notice.is_some() && session) {
+            crate::notify::ended(to, what);
+        }
+        to
     };
     let Some(notice) = notice else {
         return;
     };
     if to != 0 {
         inbox::push(to, notice);
+    }
+}
+
+/// How a helper or workflow run ended, in words for a notification; None
+/// for other work, whose notice starts a turn that is notified of itself,
+/// and for work someone stopped.
+fn ended_words(key: &Key, state: &State, label: &str) -> Option<String> {
+    let what = match key {
+        Key::Agent(_) => "Helper",
+        Key::Workflow(_) => "Workflow",
+        Key::Job(_) | Key::Wake(_) => return None,
+    };
+    match state {
+        State::Done(how) => Some(format!("{what} {label} {how}")),
+        // Kept for more work, with this piece of it done.
+        State::Idle => Some(format!("{what} {label} finished")),
+        State::Failed(why) => Some(format!("{what} {label} failed: {why}")),
+        State::Running | State::Stopped => None,
     }
 }
 
@@ -237,6 +264,50 @@ mod tests {
         let second = [Key::Job(7_505), Key::Job(7_506), Key::Agent(7_503)];
         assert_eq!(keys(7_502), second);
         assert_eq!(keys(7_503), [Key::Job(7_506)]);
+    }
+
+    #[test]
+    fn a_helper_whose_news_reaches_its_session_is_told_to_a_notifying_front_end() {
+        let _turn = inbox::tests::DOORBELL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let ended = crate::notify::listen();
+        // Session 7401 started helpers 7402 and 7405; 7402 started helpers
+        // 7403 and 7406 and job 7404.
+        register(Task::new(Key::Agent(7_402), 7_401, None, "explore"));
+        register(Task::new(Key::Agent(7_403), 7_402, None, "review"));
+        register(Task::new(Key::Job(7_404), 7_402, None, "npm test"));
+        register(Task::new(Key::Agent(7_405), 7_401, None, "stopped"));
+        register(Task::new(Key::Agent(7_406), 7_402, None, "late"));
+        register(Task::new(Key::Agent(7_407), 7_401, None, "keeper"));
+        while ended.try_recv().is_ok() {}
+        let done = State::Done("finished".into());
+        // Its helper hears of it, not the user.
+        finish(&Key::Agent(7_403), done.clone(), exited(7_403));
+        let exit = State::Failed("exited".into());
+        finish(&Key::Job(7_404), exit, exited(7_404));
+        finish(&Key::Agent(7_405), State::Stopped, None);
+        let failed = State::Failed("the budget ran out".into());
+        finish(&Key::Agent(7_402), failed, exited(7_402));
+        // With its helper gone, its news reaches the session.
+        finish(&Key::Agent(7_406), done.clone(), exited(7_406));
+        finish(&Key::Agent(7_406), done, exited(7_406));
+        finish(&Key::Agent(7_407), State::Idle, exited(7_407));
+        let mine: Vec<crate::notify::Ended> = std::iter::from_fn(|| ended.try_recv().ok())
+            .filter(|e| [7_401, 7_402].contains(&e.session))
+            .collect();
+        let said: Vec<(u64, &str)> = mine.iter().map(|e| (e.session, e.what.as_str())).collect();
+        assert_eq!(
+            said,
+            [
+                (7_401, "Helper explore failed: the budget ran out"),
+                (7_401, "Helper late finished"),
+                (7_401, "Helper keeper finished")
+            ]
+        );
+        for session in [7_401, 7_402] {
+            inbox::take(session, true);
+        }
     }
 
     #[test]

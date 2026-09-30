@@ -84,6 +84,9 @@ pub fn open() {
     // handle, which is an API call and not something that can be printed.
     // Without it no mouse event ever arrives and selecting does nothing.
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+    // Whether the window has focus, so a notification goes out only when it
+    // has not. A terminal that cannot say ignores the request.
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableFocusChange);
     let _ = std::io::stdout().flush();
 }
 
@@ -94,7 +97,11 @@ pub fn close() {
         return;
     }
     s.open = false;
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::DisableFocusChange,
+        crossterm::event::DisableMouseCapture
+    );
     print!("\x1b[?2004l\x1b[?25h\x1b[?1049l");
     let _ = std::io::stdout().flush();
 }

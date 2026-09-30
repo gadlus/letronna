@@ -41,6 +41,7 @@ pub mod media;
 pub mod memory;
 pub mod messaging;
 pub mod models;
+pub mod notify;
 mod page;
 pub mod paths;
 pub mod permissions;

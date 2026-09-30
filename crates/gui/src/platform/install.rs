@@ -56,6 +56,9 @@ pub(crate) fn single_instance() -> bool {
 #[cfg(windows)]
 use windows_impl as imp;
 
+#[cfg(windows)]
+pub(crate) use windows_impl::shortcut;
+
 #[cfg(target_os = "linux")]
 use linux_impl as imp;
 
@@ -103,7 +106,8 @@ mod windows_impl {
         Some(PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join(format!("Programs\\{BRAND}")))
     }
 
-    fn shortcut() -> Option<PathBuf> {
+    /// The Start menu shortcut, which also carries the id toasts need.
+    pub(crate) fn shortcut() -> Option<PathBuf> {
         Some(
             PathBuf::from(std::env::var_os("APPDATA")?)
                 .join("Microsoft\\Windows\\Start Menu\\Programs")

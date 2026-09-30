@@ -649,6 +649,7 @@ fn privacy_page(
 ) -> Div {
     let (default_mode, shared) = (settings.mode, settings.browser_shared);
     let unseen = settings.browse_unseen;
+    let notifications = settings.notifications;
     let current = plugins::PresenceMode::from_str(presence.read(cx));
     let enabled = plugins::list(cx)
         .iter()
@@ -878,6 +879,22 @@ fn privacy_page(
             cx,
         ))
         .child(approvals)
+        .child(heading(
+            "Notifications",
+            "What the computer is told while Letronna's window is hidden or behind others.",
+            cx,
+        ))
+        .child(toggle_row(
+            "notifications",
+            "Notify when Letronna needs you",
+            "A reply that ends, a card or question waiting, a helper or scheduled run done. Clicking one opens its session.",
+            notifications,
+            chat,
+            cx,
+            std::rc::Rc::new(move |this: &mut Chat| {
+                this.store.settings.notifications = !notifications
+            }),
+        ))
         .child(heading(
             "Browser",
             "Each session browses in a browser of its own, as a separate agent would.",

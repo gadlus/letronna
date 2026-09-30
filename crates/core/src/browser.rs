@@ -2656,7 +2656,10 @@ mod tests {
             ..ToolContext::default()
         };
         let pdf = json!({"action": "pdf"});
-        let folder = Path::new("/work/site/media/downloads/7");
+        let folder = &Path::new("/work/site")
+            .join("media")
+            .join("downloads")
+            .join("7");
         let said = format!("Writes a PDF of the page into {}", folder.display());
         let card = Browse.preview(&pdf, &ctx);
         assert!(
