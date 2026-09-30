@@ -107,6 +107,8 @@ Signed in, the agent can also make things on Letronna's hosted models, whichever
 | `transcribe` | the words in an audio or video file, up to 25 MB          | the minute    |
 | `make_video` | a short MP4 from a description, in a few minutes          | the second    |
 
+`edit_image` changes pictures instead of making one: one or more from the project, or already in the conversation, with an optional mask marking where to redraw. It goes to the chat's own gateway, so it also works on OpenAI or any OpenAI-compatible server with an `/images/edits` route, paid there; on Letronna it is paid by the image. A picture is never taken from outside the project or Letronna's media folder, nor from a file of keys, and one the route would refuse for its size is stopped before it is uploaded.
+
 Each one asks first, since it spends your credit, and none is offered in plan mode or in a shared chat. Unless a model is named, the cheapest one working is used; the prices are on the dashboard's models page. What is made is saved in `media/` in the project folder, or in the data folder when no project is attached. The window shows a made image in the chat, and opens any made file.
 
 ## Browser

@@ -286,6 +286,7 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(SearchSessions),
         Arc::new(crate::web::WebFetch),
         Arc::new(crate::media::MakeImage),
+        Arc::new(crate::media::EditImage),
         Arc::new(crate::media::Speak),
         Arc::new(crate::media::Transcribe),
         Arc::new(crate::media::MakeVideo),
@@ -845,7 +846,7 @@ pub fn summary(name: &str, args: &str) -> String {
             .unwrap_or_default()
             .trim_start_matches(['#', ' '])
             .to_owned(),
-        "make_image" => v["prompt"].as_str().unwrap_or_default().to_owned(),
+        "make_image" | "edit_image" => v["prompt"].as_str().unwrap_or_default().to_owned(),
         "make_video" => v["prompt"]
             .as_str()
             .or(v["job"].as_str())

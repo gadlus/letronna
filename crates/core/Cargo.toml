@@ -26,6 +26,10 @@ tungstenite = { version = "0.30", default-features = false, features = ["handsha
 # Refusing a Cargo.toml or pyproject.toml a write would break; toml 1 is
 # already in the lock file, and only its parser is needed.
 toml = { version = "1", default-features = false, features = ["std", "parse", "serde"] }
+# Turning a picture an image edit would refuse into a PNG, and reading a
+# mask's size; already in the lock file under the window, which takes more
+# of its formats.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 
 # Stopping a background job ends everything it started: a Job Object on
 # Windows, a process group elsewhere. Both are already in the lock file,

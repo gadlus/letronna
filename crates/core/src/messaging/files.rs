@@ -43,7 +43,7 @@ const CAPTION_CHARS: usize = 1000;
 /// Long enough for 50 MB over a slow line.
 const TRANSFER_TIME: Duration = Duration::from_secs(300);
 /// The media tools whose files go to the chat after the reply unasked.
-const MAKERS: [&str; 3] = ["make_image", "speak", "make_video"];
+const MAKERS: [&str; 4] = ["make_image", "edit_image", "speak", "make_video"];
 
 /// What a file that came with a message is to the model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -517,7 +517,7 @@ impl To {
 /// or in Letronna's own media folder, which holds what chats sent and what
 /// was made with no project; and never a file of keys, whatever the card
 /// said.
-fn pick(raw: &str, ctx: &ToolContext) -> Result<PathBuf, String> {
+pub(crate) fn pick(raw: &str, ctx: &ToolContext) -> Result<PathBuf, String> {
     let path = match own_media(raw, ctx) {
         Some(path) => path,
         None => {

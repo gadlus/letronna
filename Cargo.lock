@@ -3682,6 +3682,7 @@ dependencies = [
  "async-channel 2.5.0",
  "chrono",
  "ignore",
+ "image",
  "libc",
  "regex",
  "reqwest",
