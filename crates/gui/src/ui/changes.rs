@@ -50,6 +50,10 @@ actions!(
 /// generated file's thousands of lines would each be an element.
 const SHOWN_LINES: usize = 1500;
 
+/// Characters drawn of one patch line: a minified file is one line of the
+/// whole patch, laid out again on every frame the tab is open.
+const LINE_CHARS: usize = 1000;
+
 /// A row of the file list; the list is virtual, so every row is this tall.
 const ROW: Pixels = px(24.);
 
@@ -90,6 +94,8 @@ pub(crate) struct Changes {
     message: Entity<InputState>,
     pub(crate) focus: FocusHandle,
     scroll: UniformListScrollHandle,
+    /// Diffs asked for so far, to tell each answer's ask apart.
+    asked: u64,
 }
 
 struct Open {
@@ -99,6 +105,8 @@ struct Open {
     /// In the working tree: the file as git lists it, and whether its staged
     /// side is the one open.
     entry: Option<(Entry, bool)>,
+    /// Which ask of git this is, so an answer to an earlier one is dropped.
+    ask: u64,
     /// `None` while it is still being read.
     diff: Option<Result<String, String>>,
     /// In the working tree: the open side cut into hunks, and the one the
@@ -150,6 +158,7 @@ impl Changes {
             message,
             focus: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
+            asked: 0,
         }
     }
 }
@@ -449,6 +458,7 @@ impl Chat {
             scope,
             file,
             entry,
+            ask: 0,
             diff: None,
             hunks: None,
             hunk: 0,
@@ -463,7 +473,7 @@ impl Chat {
         let Some(open) = self
             .changes
             .open
-            .as_ref()
+            .as_mut()
             .filter(|open| open.session == conversation.id)
         else {
             return;
@@ -471,6 +481,11 @@ impl Chat {
         let Some(folder) = conversation.workspace.clone() else {
             return;
         };
+        // Each read is numbered, so a slower earlier one never lands over
+        // the answer to a later one.
+        self.changes.asked += 1;
+        let ask = self.changes.asked;
+        open.ask = ask;
         let (session, scope, file) = (open.session, open.scope, open.file.clone());
         let entry = open.entry.clone();
         let side = entry.as_ref().map(|(_, staged)| *staged);
@@ -495,12 +510,14 @@ impl Chat {
         cx.spawn(async move |this, cx| {
             let diff = diff.await;
             let _ = this.update(cx, |this, cx| {
-                // Only for the file still open: a later choice wins.
+                // Only for this ask of the file and side still open: a later
+                // click, or a later read of the same file, in this session
+                // or another with its own project, wins.
                 if let Some(open) = this
                     .changes
                     .open
                     .as_mut()
-                    .filter(|open| open.is(session, scope, &file, side))
+                    .filter(|open| open.ask == ask && open.is(session, scope, &file, side))
                 {
                     let (text, hunks) = match diff {
                         Ok((text, hunks)) => (Ok(text), hunks),
@@ -533,6 +550,13 @@ impl Chat {
         let text = format!("[attached: {}]\n", folder.join(file).display());
         self.insert(&text, window, cx);
         self.focus_composer(window, cx);
+        // Setting a many-line box's text puts its cursor at the start, and
+        // what is typed next goes on after the attached path.
+        self.composer.update(cx, |input, cx| {
+            use gpui_component::input::RopeExt;
+            let end = input.text().offset_to_position(input.value().len());
+            input.set_cursor_position(end, window, cx);
+        });
     }
 
     /// Run `act` on the project folder off the UI thread, then say what
@@ -1475,6 +1499,7 @@ fn file_row(file: &ChangedFile, selected: bool, cx: &App) -> Div {
         ]
     };
     h_flex()
+        .w_full()
         .h(ROW)
         .px_2()
         .gap_2()
@@ -1535,9 +1560,18 @@ fn patch_lines<'a>(lines: impl Iterator<Item = &'a str>, cx: &App) -> Div {
             .px_2()
             .text_color(colour)
             .when_some(ground, |line, ground| line.bg(ground))
-            .child(line.replace('\t', "    "))
+            .child(shown_line(line))
     });
     v_flex().text_xs().font_family(MONO_FONT).children(lines)
+}
+
+/// A patch line as drawn: tabs spread out, and cut after `LINE_CHARS`.
+fn shown_line(line: &str) -> String {
+    let mut shown: String = line.chars().take(LINE_CHARS).collect();
+    if shown.len() < line.len() {
+        shown.push('…');
+    }
+    shown.replace('\t', "    ")
 }
 
 /// A quiet line of text in place of a list or a diff.
@@ -1548,4 +1582,18 @@ fn note(text: &str, cx: &App) -> AnyElement {
         .text_color(cx.theme().muted_foreground)
         .child(text.to_owned())
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LINE_CHARS, shown_line};
+
+    #[test]
+    fn a_long_patch_line_is_cut_and_a_short_one_kept() {
+        assert_eq!(shown_line("+\tkept"), "+    kept");
+        let long = format!("+{}", "é".repeat(5000));
+        let shown = shown_line(&long);
+        assert_eq!(shown.chars().count(), LINE_CHARS + 1);
+        assert!(shown.ends_with('…'));
+    }
 }
