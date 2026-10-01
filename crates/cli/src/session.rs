@@ -1444,6 +1444,20 @@ pub fn settled(
     rules: &Result<Vec<letronna_core::permissions::Rule>, String>,
     terminal: bool,
 ) -> Option<Decision> {
+    // A scheduled run decides in its schedule's mode and folder, never in
+    // the terminal's: only in Default is there anyone to ask.
+    if let Some(run) = letronna_core::schedule::running(request.root) {
+        let asks = terminal && run.unattended().is_none();
+        return judged(
+            &request.call,
+            request.root,
+            run.workspace,
+            run.mode,
+            allowed,
+            rules,
+            asks,
+        );
+    }
     let workspace = std::env::current_dir().ok();
     judged(
         &request.call,

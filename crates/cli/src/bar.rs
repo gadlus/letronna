@@ -395,6 +395,8 @@ pub enum Waited {
     Line(String),
     /// The doorbell rang for notices that came while the session sat idle.
     Rang,
+    /// Something happened to the schedules this terminal runs.
+    Scheduled(letronna_core::schedule::Event),
     /// A helper asked for a yes, which `asked` hands over.
     Asked,
 }
@@ -463,6 +465,8 @@ pub struct Bar {
     looked: std::time::Instant,
     /// The doorbell for notices, once the conversation listens for them.
     bell: Option<async_channel::Receiver<()>>,
+    /// What the schedules' runner says, told at the idle prompt.
+    schedules: Option<async_channel::Receiver<letronna_core::schedule::Event>>,
     /// Helpers' requests for a yes, once the terminal answers them.
     asks: Option<Receiver<Request>>,
     /// A request taken but not yet answered: one that ended a wait at the
@@ -511,6 +515,7 @@ impl Bar {
             relay: Vec::new(),
             looked: std::time::Instant::now(),
             bell: None,
+            schedules: None,
             asks: None,
             held: None,
             guard: None,
@@ -595,6 +600,14 @@ impl Bar {
         }
     }
 
+    /// Let what the schedules' runner says end a wait at the prompt.
+    pub fn hear_schedules(
+        &mut self,
+        events: async_channel::Receiver<letronna_core::schedule::Event>,
+    ) {
+        self.schedules = Some(events);
+    }
+
     /// Whether nobody is looking at the box, as of `now`; never while it is
     /// not up, when there is no terminal to notify through.
     pub fn away(&self, now: std::time::Instant) -> bool {
@@ -624,8 +637,9 @@ impl Bar {
         self.held = Some(request);
     }
 
-    /// Wait at the prompt for a whole line, for the doorbell, or for a
-    /// helper's request. `None` when the user is done.
+    /// Wait at the prompt for a whole line, for the doorbell, for a helper's
+    /// request, or for what the schedules' runner says. `None` when the user
+    /// is done.
     pub fn wait(&mut self) -> Option<Waited> {
         loop {
             if self.done {
@@ -647,6 +661,9 @@ impl Bar {
     fn waited(&mut self) -> Option<Waited> {
         if let Some(line) = self.next_line() {
             return Some(Waited::Line(line));
+        }
+        if let Some(event) = self.schedules.as_ref().and_then(|s| s.try_recv().ok()) {
+            return Some(Waited::Scheduled(event));
         }
         // A receiver cannot be looked into without taking what it holds, so
         // the request is kept here until `asked` hands it over.

@@ -1877,6 +1877,8 @@ pub fn resume(
     workspace: Option<&std::path::Path>,
     term: &str,
 ) {
+    // Scheduled runs, and the window, make sessions while this is open.
+    runner.store.pick_up_new();
     // Newest first, skipping the one already open and any that never got a
     // word said in them.
     let lower = term.to_lowercase();
