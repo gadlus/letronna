@@ -1114,7 +1114,7 @@ fn with_utf8_output(command: &str) -> String {
 
 #[cfg(test)]
 fn run_shell(command: &str, cwd: Option<&Path>, cancel: &Cancel) -> Result<String, String> {
-    run_shell_saving(command, cwd, cancel, None)
+    run_shell_saving(command, cwd, cancel, None, COMMAND_TIMEOUT, None)
 }
 
 /// Where a command's output is saved whole when it is too long to keep, and
@@ -1125,14 +1125,18 @@ struct SaveTo {
 }
 
 /// `run_shell`, with output cut while it was read saved whole to `save`, up
-/// to its cap, and the cut saying where.
+/// to its cap, and the cut saying where. A command still running at `limit`
+/// is moved to the background as a job told to `owner`, or stopped if it has
+/// none.
 fn run_shell_saving(
     command: &str,
     cwd: Option<&Path>,
     cancel: &Cancel,
     save: Option<SaveTo>,
+    limit: Duration,
+    owner: Option<u64>,
 ) -> Result<String, String> {
-    let result = run_shell_into(command, cwd, cancel, save.as_ref());
+    let result = run_shell_into(command, cwd, cancel, save.as_ref(), limit, owner);
     // What the pipes were streamed to only goes into the saved file.
     if let Some(save) = &save {
         for pipe in PIPE_NAMES {
@@ -1150,14 +1154,24 @@ fn run_shell_into(
     cwd: Option<&Path>,
     cancel: &Cancel,
     save: Option<&SaveTo>,
+    limit: Duration,
+    owner: Option<u64>,
 ) -> Result<String, String> {
     use std::process::Stdio;
-    let mut child = shell(command, cwd)
+    let mut cmd = shell(command, cwd);
+    // Grouped the way a job's shell is, so one moved to the background can
+    // be stopped with everything it started.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Cannot start the shell: {e}"))?;
+    // At once, as for a job, so nothing it starts escapes the tree. Without
+    // one it can still run; it just cannot move to the background.
+    let tree = crate::jobs::Tree::leaving(&child).ok();
     let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
         let _ = child.kill();
         return Err("Cannot read the command's output.".into());
@@ -1176,19 +1190,23 @@ fn run_shell_into(
         forward_into(stderr, sender, start(PIPE_NAMES[1])),
     ];
     let started = std::time::Instant::now();
+    // None once it is still running at the limit and can move to the background.
     let waited = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
+            Ok(Some(status)) => break Ok(Some(status)),
             Ok(None) => {}
             Err(e) => break Err(e.to_string()),
         }
-        if started.elapsed() > COMMAND_TIMEOUT {
+        if started.elapsed() > limit {
+            if owner.is_some() && tree.is_some() {
+                break Ok(None);
+            }
             let _ = child.kill();
             break Err(format!(
                 "Timed out after {}s and was stopped. If this command is meant to \
                  keep running, such as a dev server, call it again with \
                  background: true.",
-                COMMAND_TIMEOUT.as_secs()
+                limit.as_secs()
             ));
         }
         if !cancel.sleep(std::time::Duration::from_millis(50)) {
@@ -1205,15 +1223,24 @@ fn run_shell_into(
             return Err(e);
         }
     };
-    let held_open = !pipes_closed(&open);
-    let [mut out, mut err] = [take(&kept[0]), take(&kept[1])];
+    // A command moving to the background keeps its readers, which from here
+    // add to the job's log, so nothing is lost or read twice.
+    let log = status
+        .is_none()
+        .then(|| Arc::new(Mutex::new(crate::jobs::Log::default())));
+    let held_open = status.is_some() && !pipes_closed(&open);
+    let [mut out, mut err] = match &log {
+        Some(log) => [hand_over(&kept[0], log), hand_over(&kept[1], log)],
+        None => [take(&kept[0]), take(&kept[1])],
+    };
     let pipes = [(out.spill.take(), out.bytes), (err.spill.take(), err.bytes)];
     let (mut text, gap) = out.into_text();
     let mut gaps: Vec<Gap> = gap.into_iter().collect();
     let (err, err_gap) = err.into_text();
     let err_shown = !err.trim().is_empty();
-    let code =
-        (!status.success()).then(|| format!("\n[exit code {}]", status.code().unwrap_or(-1)));
+    let code = status
+        .filter(|status| !status.success())
+        .map(|status| format!("\n[exit code {}]", status.code().unwrap_or(-1)));
     let mut note = String::new();
     // Saved before the cut below, which names the file.
     if (gap.is_some() || err_gap.is_some() && err_shown)
@@ -1262,12 +1289,50 @@ fn run_shell_into(
             gap.at += text.len() - len;
         }
     }
-    if !gaps.is_empty() {
-        // Only this knows where the gaps are, so it makes the cut, and the
-        // one `run` makes then finds the result short enough.
-        text = keep_ends_around(text, &gaps, MAX_OUTPUT, &note);
+    if let (Some(log), Some(owner), Some(tree)) = (log, owner, tree) {
+        let so_far = cut_around(text.clone(), &gaps, &note);
+        // In the log before the job exists, so its exit notice cannot miss
+        // it; what the readers added since the hand-over came after it.
+        if let Ok(mut log) = log.lock() {
+            log.lead_with(so_far.as_bytes());
+        }
+        let id = crate::jobs::adopt(command, owner, started, child, tree, log, open);
+        let id = id.map_err(|e| {
+            format!(
+                "Timed out after {}s and was stopped, since it could not be moved \
+                 to the background: {e}",
+                limit.as_secs()
+            )
+        })?;
+        if text.trim().is_empty() {
+            text = "[nothing yet]".into();
+        }
+        // First, where no cut can drop it: what to do about it comes before
+        // the output.
+        let moved = format!(
+            "Still running after {}s, so it carries on in the background as job \
+             #{id} instead of being stopped. A notice comes when it exits; call \
+             wait with job {id} to wait for it, or read_job to read what it \
+             prints. Output so far:\n",
+            limit.as_secs()
+        );
+        text.insert_str(0, &moved);
+        for gap in &mut gaps {
+            gap.at += moved.len();
+        }
     }
-    Ok(text)
+    Ok(cut_around(text, &gaps, &note))
+}
+
+/// `text` cut to `MAX_OUTPUT` around the output left out at `gaps`, with
+/// `note` on the marker, or as it is when nothing was.
+fn cut_around(text: String, gaps: &[Gap], note: &str) -> String {
+    if gaps.is_empty() {
+        return text;
+    }
+    // Only the command's run knows where the gaps are, so it makes the cut,
+    // and the one `run` makes then finds the result short enough.
+    keep_ends_around(text, gaps, MAX_OUTPUT, note)
 }
 
 /// Puts a command's output together in `save` as the model would read it
@@ -1561,12 +1626,22 @@ fn line_breaks(bytes: &[u8]) -> usize {
     bytes.iter().filter(|&&b| b == b'\n').count()
 }
 
+/// Where a reader puts what its pipe yields.
+pub(crate) enum Sink {
+    /// Kept for the call's result.
+    Reply(Captured),
+    /// Added to the log of the job the command became.
+    Job(Arc<Mutex<crate::jobs::Log>>),
+    /// Dropped, once the result is made.
+    Dropped,
+}
+
 /// Keep what `pipe` yields in the returned capture until it closes or the
 /// capture is taken, then drop `open`.
 pub(crate) fn forward(
     pipe: impl std::io::Read + Send + 'static,
     open: std::sync::mpsc::Sender<()>,
-) -> Arc<Mutex<Option<Captured>>> {
+) -> Arc<Mutex<Sink>> {
     forward_into(pipe, open, Captured::default())
 }
 
@@ -1575,8 +1650,8 @@ fn forward_into(
     mut pipe: impl std::io::Read + Send + 'static,
     open: std::sync::mpsc::Sender<()>,
     start: Captured,
-) -> Arc<Mutex<Option<Captured>>> {
-    let kept = Arc::new(Mutex::new(Some(start)));
+) -> Arc<Mutex<Sink>> {
+    let kept = Arc::new(Mutex::new(Sink::Reply(start)));
     let slot = kept.clone();
     std::thread::spawn(move || {
         let _open = open;
@@ -1588,10 +1663,15 @@ fn forward_into(
                     // Once the capture is taken the rest is dropped; reading
                     // on anyway keeps a child left behind from blocking on a
                     // full pipe, or dying of a broken one.
-                    if let Ok(mut slot) = slot.lock()
-                        && let Some(kept) = slot.as_mut()
-                    {
-                        kept.push(&block[..n]);
+                    let Ok(mut slot) = slot.lock() else { continue };
+                    match &mut *slot {
+                        Sink::Reply(kept) => kept.push(&block[..n]),
+                        Sink::Job(log) => {
+                            if let Ok(mut log) = log.lock() {
+                                log.add(&block[..n]);
+                            }
+                        }
+                        Sink::Dropped => {}
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -1611,11 +1691,24 @@ pub(crate) fn pipes_closed(open: &std::sync::mpsc::Receiver<()>) -> bool {
 }
 
 /// What a reader kept so far, which also stops it keeping more.
-pub(crate) fn take(kept: &Mutex<Option<Captured>>) -> Captured {
-    kept.lock()
-        .ok()
-        .and_then(|mut kept| kept.take())
-        .unwrap_or_default()
+pub(crate) fn take(kept: &Mutex<Sink>) -> Captured {
+    replace(kept, Sink::Dropped)
+}
+
+/// What a reader kept so far, with what it reads from now on going to `log`.
+fn hand_over(kept: &Mutex<Sink>, log: &Arc<Mutex<crate::jobs::Log>>) -> Captured {
+    replace(kept, Sink::Job(log.clone()))
+}
+
+/// What a reader kept so far, with what it reads from now on going to `then`.
+fn replace(kept: &Mutex<Sink>, then: Sink) -> Captured {
+    let Ok(mut kept) = kept.lock() else {
+        return Captured::default();
+    };
+    match std::mem::replace(&mut *kept, then) {
+        Sink::Reply(captured) => captured,
+        Sink::Job(_) | Sink::Dropped => Captured::default(),
+    }
 }
 
 struct WriteFile;
@@ -1830,7 +1923,19 @@ impl Tool for RunCommand {
                 path,
                 cap: PIPE_SPILL_BYTES,
             });
-            let out = run_shell_saving(command, Some(cwd), &ctx.cancel, save);
+            // A helper's command is stopped at the limit instead, since its
+            // report would come back before the command had finished, as is
+            // one run for no conversation, which no exit notice would reach.
+            let own = ctx.caller.agent.is_none() && ctx.conversation != 0;
+            let owner = own.then_some(ctx.conversation);
+            let out = run_shell_saving(
+                command,
+                Some(cwd),
+                &ctx.cancel,
+                save,
+                COMMAND_TIMEOUT,
+                owner,
+            );
             let note = crate::filestate::note(ctx.conversation, before, cwd);
             // The note goes first, so cutting long output short cannot drop it.
             return match out {
@@ -4095,6 +4200,104 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Run `command` in the temporary folder as a session's own agent would,
+    /// with `limit` in place of the two minutes, for `owner`.
+    fn run_for(command: &str, limit: Duration, owner: Option<u64>) -> Result<String, String> {
+        let dir = std::env::temp_dir();
+        run_shell_saving(command, Some(&dir), &Cancel::default(), None, limit, owner)
+    }
+
+    /// The job a command moved to the background became, from what the
+    /// result says, and what it says the command printed so far.
+    fn moved_job(said: &str, limit: &str) -> (u64, String) {
+        let prefix =
+            format!("Still running after {limit}, so it carries on in the background as job #");
+        let (note, so_far) = said
+            .split_once("Output so far:\n")
+            .unwrap_or_else(|| panic!("{said}"));
+        let id = note
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.split_once(' '))
+            .and_then(|(id, _)| id.parse().ok())
+            .unwrap_or_else(|| panic!("{said}"));
+        (id, so_far.to_owned())
+    }
+
+    #[test]
+    fn a_command_past_its_limit_becomes_a_job_with_what_it_printed() {
+        let _turn = crate::inbox::tests::DOORBELL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // It prints `after` well past the limit, which it could not do if it
+        // had been stopped there.
+        let command = if cfg!(windows) {
+            "Write-Output before; Start-Sleep 6; Write-Output after"
+        } else {
+            "echo before; sleep 6; echo after"
+        };
+        let said = run_for(command, Duration::from_secs(4), Some(7_701));
+        let (id, so_far) = moved_job(&said.unwrap(), "4s");
+        assert_eq!(so_far.trim_end(), "before");
+
+        // A cold PowerShell start comes on top of the sleep, so the wait is generous.
+        let from = format!("job {id}");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut heard = Vec::new();
+        while heard.is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+            let taken = crate::inbox::take(7_701, true);
+            heard.extend(taken.into_iter().filter(|notice| notice.from == from));
+        }
+        assert_eq!(heard.len(), 1, "no exit notice for job #{id}");
+        assert_eq!(
+            heard[0].text,
+            format!("job #{id} exited with code 0 (`{command}`):\nbefore\nafter")
+        );
+    }
+
+    #[test]
+    fn a_command_with_no_owner_is_still_stopped_at_its_limit() {
+        // The command is this test's own, so no other test's job can pass for it.
+        let command = if cfg!(windows) {
+            "Start-Sleep 30; Write-Output helper"
+        } else {
+            "sleep 30; echo helper"
+        };
+        let out = run_for(command, Duration::from_secs(1), None).unwrap_err();
+        assert!(
+            out.starts_with("Timed out after 1s and was stopped."),
+            "{out}"
+        );
+        let jobs = crate::jobs::list();
+        assert!(
+            jobs.iter().all(|job| job.command != command),
+            "it became a job"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stopping_a_command_moved_to_the_background_ends_what_it_started() {
+        let command = "sleep 60 & echo \"grandchild $!\"; wait";
+        let said = run_for(command, Duration::from_secs(1), Some(7_702));
+        let (id, so_far) = moved_job(&said.unwrap(), "1s");
+        let pid: libc::pid_t = so_far
+            .trim()
+            .strip_prefix("grandchild ")
+            .and_then(|pid| pid.parse().ok())
+            .unwrap_or_else(|| panic!("{so_far}"));
+        // SAFETY: signal 0 only asks whether the process is there.
+        let alive = || unsafe { libc::kill(pid, 0) == 0 };
+        assert!(alive(), "process {pid} was not running");
+
+        crate::jobs::stop(id).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while alive() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(!alive(), "process {pid} outlived its job");
+    }
+
     #[test]
     fn plan_mode_refuses_a_tool_that_changes_things_even_when_named() {
         let dir = std::env::temp_dir().join(format!("letronna-plan-{}", std::process::id()));
@@ -4744,7 +4947,15 @@ mod tests {
             path: dir.join("out.txt"),
             cap,
         };
-        let out = run_shell_saving("seq 1 999999", None, &Cancel::default(), Some(save)).unwrap();
+        let out = run_shell_saving(
+            "seq 1 999999",
+            None,
+            &Cancel::default(),
+            Some(save),
+            COMMAND_TIMEOUT,
+            None,
+        )
+        .unwrap();
         let path = dir.join("out.txt");
         let note = format!("; its first {cap} bytes are in {}, which", path.display());
         assert!(out.contains(&note), "{out}");
