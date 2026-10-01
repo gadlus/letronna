@@ -94,6 +94,8 @@ pub enum Next {
     Ask,
     /// Run this call. The caller has already decided it may.
     Run(ToolCall),
+    /// Run this call inside the OS sandbox, which is all the gate allowed.
+    Sandboxed(ToolCall),
     /// This call needs the user: an approval, or a question to answer.
     AskUser(ToolCall),
     /// This call may not run, and the reason goes back to the model as its
@@ -460,6 +462,7 @@ impl Turn {
         };
         match gate(call) {
             Outcome::Run => Next::Run(call.clone()),
+            Outcome::Sandboxed => Next::Sandboxed(call.clone()),
             Outcome::Ask => Next::AskUser(call.clone()),
             Outcome::Refuse(why) => Next::Refuse(call.clone(), why),
         }

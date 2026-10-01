@@ -228,8 +228,9 @@ impl Server {
             Outcome::Run => None,
             Outcome::Refuse(why) => Some(why),
             // With nobody to answer the gate refuses rather than asks; a
-            // card here would be a yes nobody gave.
-            Outcome::Ask => Some(format!(
+            // card here would be a yes nobody gave. Nor is there a sandbox
+            // here to hold a call the gate would confine.
+            Outcome::Ask | Outcome::Sandboxed => Some(format!(
                 "`{name}` needs a yes, and nobody is here to give it."
             )),
         }

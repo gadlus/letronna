@@ -214,6 +214,7 @@ pub fn run(runner: &mut Runner, session: usize, args: &Args) -> i32 {
                 let answerable = args.ask_stdio && open;
                 match gated(&request.call, request.root, mode, &rules, answerable) {
                     gate::Outcome::Run => request.answer(Decision::Once),
+                    gate::Outcome::Sandboxed => request.answer(Decision::Sandboxed),
                     gate::Outcome::Refuse(why) => request.answer(Decision::Deny(why)),
                     gate::Outcome::Ask if !answerable => {
                         crate::say_refused(&request.call.name, "");
@@ -294,7 +295,11 @@ fn checked(decision: Decision, request: &Request, mode: Mode, rules: &Rules) -> 
     };
     match gated(&changed_call, request.root, mode, rules, true) {
         gate::Outcome::Refuse(why) => Decision::Deny(why),
-        gate::Outcome::Run | gate::Outcome::Ask => Decision::Changed(arguments),
+        // The program's yes is a card's, which runs a command outside the
+        // sandbox the gate would have held it to.
+        gate::Outcome::Run | gate::Outcome::Sandboxed | gate::Outcome::Ask => {
+            Decision::Changed(arguments)
+        }
     }
 }
 

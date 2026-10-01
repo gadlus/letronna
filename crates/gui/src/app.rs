@@ -1920,6 +1920,7 @@ impl Chat {
         );
         match letronna_core::gate::decide(call, &gate) {
             letronna_core::gate::Outcome::Run => Some(approvals::Decision::Once),
+            letronna_core::gate::Outcome::Sandboxed => Some(approvals::Decision::Sandboxed),
             letronna_core::gate::Outcome::Refuse(why) => Some(approvals::Decision::Deny(why)),
             letronna_core::gate::Outcome::Ask => None,
         }
@@ -2262,7 +2263,7 @@ impl Chat {
         if !batch.is_empty() {
             self.asking = None;
             for call in batch {
-                self.execute_call(call, false, cx);
+                self.execute_call(call, false, false, cx);
             }
             cx.notify();
             return;
@@ -2326,7 +2327,8 @@ impl Chat {
             agent::Next::Run(call) if call.name == letronna_core::tools::TODO => {
                 self.apply_todo(&call.arguments.clone(), cx)
             }
-            agent::Next::Run(call) => self.execute_call(call, false, cx),
+            agent::Next::Run(call) => self.execute_call(call, false, false, cx),
+            agent::Next::Sandboxed(call) => self.execute_call(call, false, true, cx),
             agent::Next::Refuse(_, why) => self.record_result(Err(why), cx),
             agent::Next::Ask => {
                 let results = self
@@ -2422,10 +2424,18 @@ impl Chat {
     }
 
     /// Run one call off the UI thread and continue the queue when it returns;
-    /// `approved` when the user said yes to it on its card.
-    fn execute_call(&mut self, call: backend::ToolCall, approved: bool, cx: &mut Context<Self>) {
+    /// `approved` when the user said yes to it on its card, `sandboxed` when
+    /// the gate let it run only inside the OS sandbox.
+    fn execute_call(
+        &mut self,
+        call: backend::ToolCall,
+        approved: bool,
+        sandboxed: bool,
+        cx: &mut Context<Self>,
+    ) {
         let mut ctx = self.call_context();
         ctx.approved = approved;
+        ctx.sandboxed = sandboxed;
         ctx.cancel = self.turn_stop.clone();
         self.call_running = true;
         let (id, name) = (call.id.clone(), call.name.clone());
@@ -3141,7 +3151,7 @@ impl Chat {
                     // Its helpers waiting on the same tool are allowed too.
                     self.decide_agent_asks(cx);
                 }
-                self.execute_call(call, true, cx);
+                self.execute_call(call, true, false, cx);
             }
             Verdict::AllowHere => {
                 // Into the user's own rules, held to this project: the
@@ -3151,7 +3161,7 @@ impl Chat {
                 if let Some(Err(error)) = kept {
                     self.error = Some(error);
                 }
-                self.execute_call(call, true, cx);
+                self.execute_call(call, true, false, cx);
             }
         }
     }

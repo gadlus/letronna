@@ -215,6 +215,10 @@ fn forward_approvals(agent: &Agent) {
                     request.answer(Decision::Once);
                     continue;
                 }
+                gate::Outcome::Sandboxed => {
+                    request.answer(Decision::Sandboxed);
+                    continue;
+                }
                 gate::Outcome::Refuse(why) => {
                     request.answer(Decision::Deny(why));
                     continue;

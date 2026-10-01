@@ -776,7 +776,10 @@ impl Chat {
                     Outcome::Refuse(why) => {
                         window.push_notification(Notification::warning(why), cx)
                     }
-                    Outcome::Ask => this.ask_push(session, folder, plan, window, cx),
+                    // A push needs the network, which the sandbox takes away.
+                    Outcome::Ask | Outcome::Sandboxed => {
+                        this.ask_push(session, folder, plan, window, cx)
+                    }
                 }
             });
         })

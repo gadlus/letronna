@@ -634,7 +634,13 @@ impl Runner {
                 }
                 Next::Run(call) if call.name == tools::TODO => self.apply_todo(turn, session, call),
                 Next::Run(call) => {
-                    if !self.run_call(turn, call, false) {
+                    if !self.run_call(turn, call, false, false) {
+                        self.keep_stopped(turn, session);
+                        return Ok(false);
+                    }
+                }
+                Next::Sandboxed(call) => {
+                    if !self.run_call(turn, call, false, true) {
                         self.keep_stopped(turn, session);
                         return Ok(false);
                     }
@@ -682,15 +688,18 @@ impl Runner {
     }
 
     /// Runs `call` and shows what came of it; `approved` when the user said
-    /// yes to it just now. False when the user stopped it, which ends the turn.
+    /// yes to it just now, `sandboxed` when the gate let it run only inside
+    /// the OS sandbox. False when the user stopped it, which ends the turn.
     fn run_call(
         &mut self,
         turn: &mut Turn,
         call: letronna_core::chat::ToolCall,
         approved: bool,
+        sandboxed: bool,
     ) -> bool {
         let mut ctx = turn.tool_context();
         ctx.approved = approved;
+        ctx.sandboxed = sandboxed;
         let summary = tools::summary(&call.name, &call.arguments);
         let ran = self.run_off_the_loop(&call, ctx, &summary);
         let stopped = ran.is_none();
@@ -940,13 +949,13 @@ impl Runner {
         let picked = self.bar.choose(&question, detail, &choices);
 
         match picked.and_then(|at| choices.get(at).copied()) {
-            Some("Yes") => Ok(self.run_call(turn, call, true)),
+            Some("Yes") => Ok(self.run_call(turn, call, true, false)),
             Some("Yes, and stop asking for this") => {
                 self.allowed
                     .entry(turn.connection.conversation)
                     .or_default()
                     .insert(gate::grant(&call));
-                Ok(self.run_call(turn, call, true))
+                Ok(self.run_call(turn, call, true, false))
             }
             Some("No, and stop here") | None => Ok(false),
             Some("No, tell it why not") => {
@@ -966,7 +975,7 @@ impl Runner {
                 if let Some(Err(error)) = kept {
                     render::line(&render::red(&error));
                 }
-                self.run_call(turn, call, true);
+                self.run_call(turn, call, true, false);
                 Ok(true)
             }
         }
@@ -1478,6 +1487,7 @@ pub fn judged(
     let gate = Gate::for_terminal(&ctx, allowed, rules, mode, terminal);
     match gate::decide(call, &gate) {
         gate::Outcome::Run => Some(Decision::Once),
+        gate::Outcome::Sandboxed => Some(Decision::Sandboxed),
         gate::Outcome::Refuse(why) => Some(Decision::Deny(why)),
         gate::Outcome::Ask => (!terminal).then(|| Decision::Deny(String::new())),
     }
