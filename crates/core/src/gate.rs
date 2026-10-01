@@ -38,6 +38,9 @@ pub type Grants = HashMap<u64, HashSet<String>>;
 pub enum Outcome {
     /// Run it now.
     Run,
+    /// Run it now inside the OS sandbox: no network, and writes only in the
+    /// project.
+    Sandboxed,
     /// Wait for the user: a yes or no, or the answer to a question.
     Ask,
     /// Do not run it; the text is the call's result, which the model reads.
@@ -278,7 +281,7 @@ impl<'a> Gate<'a> {
 
 /// Decides `call` from its tool, its arguments and `gate`, layer by layer.
 pub fn decide(call: &ToolCall, gate: &Gate) -> Outcome {
-    decide_with(call, gate, None)
+    decide_with(call, gate, None, crate::sandbox::available())
 }
 
 /// `decide` in auto mode: what would ask is put to the judge on the
@@ -290,17 +293,18 @@ pub fn settle(call: &ToolCall, gate: &Gate, connection: &Connection, typed: &[St
         return decide(call, gate);
     }
     let judge = |call: &ToolCall, why: &str| judge::judge(call, why, typed, connection, gate.ctx);
-    decide_with(call, gate, Some(&judge))
+    decide_with(call, gate, Some(&judge), crate::sandbox::available())
 }
 
 /// The judge for a call no earlier layer settles, told why.
 type Judge<'a> = &'a dyn Fn(&ToolCall, &str) -> Verdict;
 
-/// `decide`, with the judge for what no earlier layer settles, if there is one.
-fn decide_with(call: &ToolCall, gate: &Gate, judge: Option<Judge>) -> Outcome {
+/// `decide`, with the judge for what no earlier layer settles, if there is
+/// one, and commands confined when `sandbox` says this system can.
+fn decide_with(call: &ToolCall, gate: &Gate, judge: Option<Judge>, sandbox: bool) -> Outcome {
     match crate::browser::batch_calls(call) {
-        Some(steps) => batched(call, steps, gate, judge),
-        None => decide_one(call, gate, judge),
+        Some(steps) => batched(call, steps, gate, judge, sandbox),
+        None => decide_one(call, gate, judge, sandbox),
     }
 }
 
@@ -314,17 +318,18 @@ fn batched(
     steps: Result<Vec<ToolCall>, String>,
     gate: &Gate,
     judge: Option<Judge>,
+    sandbox: bool,
 ) -> Outcome {
     let steps = match steps {
         Ok(steps) => steps,
         Err(why) => return Outcome::Refuse(why),
     };
-    let mut outcome = decide_one(call, gate, judge);
+    let mut outcome = decide_one(call, gate, judge, sandbox);
     if let Outcome::Refuse(_) = outcome {
         return outcome;
     }
     for (at, step) in steps.iter().enumerate() {
-        match decide_one(step, gate, judge) {
+        match decide_one(step, gate, judge, sandbox) {
             Outcome::Refuse(why) => {
                 let what = tools::summary(&step.name, &step.arguments);
                 return Outcome::Refuse(format!(
@@ -333,7 +338,8 @@ fn batched(
                     at + 1
                 ));
             }
-            Outcome::Ask => outcome = Outcome::Ask,
+            // The batch runs as one call, which cannot be confined in part.
+            Outcome::Ask | Outcome::Sandboxed => outcome = Outcome::Ask,
             Outcome::Run => {}
         }
     }
@@ -341,12 +347,12 @@ fn batched(
 }
 
 /// `decide_with` for a call that is not a batch.
-fn decide_one(call: &ToolCall, gate: &Gate, judge: Option<Judge>) -> Outcome {
+fn decide_one(call: &ToolCall, gate: &Gate, judge: Option<Judge>, sandbox: bool) -> Outcome {
     let judged = judge.map(|judge| move |why: &str| judge(call, why));
     let judged = judged
         .as_ref()
         .map(|judged| judged as &dyn Fn(&str) -> Verdict);
-    let outcome = ladder(call, gate, judged);
+    let outcome = ladder(call, gate, judged, sandbox);
     // Layer 3's Don't ask turns every card into a refusal, the floor's too.
     // A question, or a plan put for approval, is not an approval to give
     // unasked, so those still ask.
@@ -358,7 +364,12 @@ fn decide_one(call: &ToolCall, gate: &Gate, judge: Option<Judge>) -> Outcome {
 }
 
 /// `decide_with`'s layers, before Don't ask turns a card into a refusal.
-fn ladder(call: &ToolCall, gate: &Gate, judge: Option<&dyn Fn(&str) -> Verdict>) -> Outcome {
+fn ladder(
+    call: &ToolCall,
+    gate: &Gate,
+    judge: Option<&dyn Fn(&str) -> Verdict>,
+    sandbox: bool,
+) -> Outcome {
     let Some(tool) = tools::find(&call.name) else {
         return Outcome::Refuse(format!("Unknown tool `{}`.", call.name));
     };
@@ -462,8 +473,21 @@ fn ladder(call: &ToolCall, gate: &Gate, judge: Option<&dyn Fn(&str) -> Verdict>)
             .is_some_and(|tools| tools.contains(&grant(call))),
     };
     let apart = uploads(tool.name(), &args) || in_frame(tool.name(), &args);
+    // Layer 7 reaches back to here: where commands run in the OS sandbox,
+    // one the user allowed runs in it too, as a rule for `cargo test` also
+    // covers whatever a build script in the project does. Only a yes on a
+    // card, or the judge, runs one outside.
+    let jailed = sandbox
+        && tool.name() == "run_command"
+        && matches!(gate.mode, Mode::AcceptEdits | Mode::Auto);
+    let confined = jailed && !opaque && confinable(&args, gate.ctx);
     if !opaque && !apart && (granted || ruling.allow) {
-        return Outcome::Run;
+        if !jailed {
+            return Outcome::Run;
+        }
+        if confined {
+            return Outcome::Sandboxed;
+        }
     }
     // Layer 5: a command that only reads, inside the workspace, needs no
     // more of a yes than `read_file` does.
@@ -474,6 +498,11 @@ fn ladder(call: &ToolCall, gate: &Gate, judge: Option<&dyn Fn(&str) -> Verdict>)
     let edits = matches!(gate.mode, Mode::AcceptEdits | Mode::Auto);
     if edits && editable(tool.name(), &args, gate.ctx) {
         return Outcome::Run;
+    }
+    // Layer 7: a command that would otherwise ask runs confined instead,
+    // where it can break nothing an edit could not and send nothing out.
+    if confined {
+        return Outcome::Sandboxed;
     }
     // Then the judge.
     if let Some(judge) = judge
@@ -513,7 +542,7 @@ pub(crate) fn cleared(call: &ToolCall, ctx: &ToolContext) -> bool {
         broken: None,
         human: true,
     };
-    ladder(call, &gate, None) == Outcome::Run
+    ladder(call, &gate, None, false) == Outcome::Run
 }
 
 /// What "Yes, and stop asking for this" on `call`'s card allows for the
@@ -819,7 +848,7 @@ fn unasked(tool: &str) -> String {
 /// launchd runs what they hold, or they hold Letronna's own rules, agents
 /// and workflows, other agents' settings (whose hooks run programs) and
 /// servers, or keys.
-const PROTECTED: &[&str] = &[
+pub(crate) const PROTECTED: &[&str] = &[
     ".git",
     ".gitmodules",
     ".githooks",
@@ -887,6 +916,47 @@ fn editable_path(raw: &str, ctx: &ToolContext) -> bool {
         && !protected(inside)
         && !tools::private(&path, &crate::chat::data_dir())
         && !linked(&path)
+}
+
+/// Whether the OS sandbox can hold the command `args` asks for in `ctx`'s
+/// project and let it work: in the foreground, not asked to run outside it,
+/// in a project that is neither the home folder, a folder above it, among
+/// its settings nor in Letronna's own, and naming neither a protected path,
+/// which a card should ask about, nor Git, whose writes to `.git` the
+/// sandbox refuses.
+fn confinable(args: &Value, ctx: &ToolContext) -> bool {
+    let flag = |name: &str| args[name].as_bool().unwrap_or(false);
+    if flag("background") || flag("unsandboxed") {
+        return false;
+    }
+    let Some(workspace) = &ctx.workspace else {
+        return false;
+    };
+    let Ok(root) = std::fs::canonicalize(workspace) else {
+        return false;
+    };
+    let home = tools::home().and_then(|home| std::fs::canonicalize(home).ok());
+    if touches_home(&root, &root, home.as_deref())
+        || tools::private(&root, &crate::chat::data_dir())
+    {
+        return false;
+    }
+    let line = args["command"].as_str().unwrap_or_default();
+    let assessed = command::assess(line, Dialect::here(), Some(workspace));
+    !assessed.commands.iter().any(guarded)
+}
+
+/// Whether `command`, or one it hands to another shell, is Git or names a
+/// protected path, whole or after a `=` as in `--out=.git/x`.
+fn guarded(command: &command::Command) -> bool {
+    let git = (command.argv.get(command.at)).is_some_and(|word| command::name_of(word) == "git");
+    let named = command.argv.iter().chain(&command.writes).any(|word| {
+        let value = word
+            .split_once('=')
+            .map_or(word.as_str(), |(_, value)| value);
+        protected(Path::new(word)) || protected(Path::new(value))
+    });
+    git || named || command.nested.iter().any(guarded)
 }
 
 /// Whether `path` is a file that other names share, which may lie outside
@@ -1357,6 +1427,7 @@ mod tests {
             };
             let outcome = match decide(queued, &gate) {
                 Outcome::Run => "run",
+                Outcome::Sandboxed => "sandboxed",
                 Outcome::Ask => "ask",
                 Outcome::Refuse(_) => "refuse",
             };
@@ -1415,27 +1486,30 @@ mod tests {
                 rules: &[],
                 broken: None,
             };
-            assert_eq!(decide_with(&write(), &gate, Some(&allow)), Outcome::Run);
             assert_eq!(
-                decide_with(&command(OPAQUE), &gate, Some(&opaque)),
+                decide_with(&write(), &gate, Some(&allow), false),
                 Outcome::Run
             );
-            let Outcome::Refuse(why) = decide_with(&write(), &gate, Some(&deny)) else {
+            assert_eq!(
+                decide_with(&command(OPAQUE), &gate, Some(&opaque), false),
+                Outcome::Run
+            );
+            let Outcome::Refuse(why) = decide_with(&write(), &gate, Some(&deny), false) else {
                 panic!("a denied write was not refused");
             };
             assert!(why.contains("beyond what was asked"), "{why}");
-            let unsure = decide_with(&write(), &gate, Some(&unsure));
+            let unsure = decide_with(&write(), &gate, Some(&unsure), false);
             assert_eq!(unsure == Outcome::Ask, human, "{unsure:?}");
             // The floor comes first, and spending credit is the user's call.
-            let hardline = decide_with(&command(HARDLINE), &gate, Some(&unasked));
+            let hardline = decide_with(&command(HARDLINE), &gate, Some(&unasked), false);
             assert!(matches!(hardline, Outcome::Refuse(_)));
-            let dangerous = decide_with(&command(DANGEROUS), &gate, Some(&unasked));
+            let dangerous = decide_with(&command(DANGEROUS), &gate, Some(&unasked), false);
             assert_eq!(dangerous, decide(&command(DANGEROUS), &gate));
             let image = call(
                 "make_image",
                 serde_json::json!({ "prompt": "a lighthouse" }),
             );
-            let image = decide_with(&image, &gate, Some(&unasked));
+            let image = decide_with(&image, &gate, Some(&unasked), false);
             assert_eq!(image == Outcome::Ask, human, "{image:?}");
         }
     }
@@ -1782,7 +1856,8 @@ mod tests {
     }
 
     /// What `decide` makes of `call` in `mode` with someone there, as the
-    /// letter the ladder tests use: R runs, A asks, X is refused.
+    /// letter the ladder tests use: R runs, S runs sandboxed, A asks, X is
+    /// refused.
     fn letter(call: &ToolCall, mode: Mode, ctx: &ToolContext, rules: &[Rule]) -> char {
         let none = Grants::new();
         let gate = Gate {
@@ -1795,6 +1870,7 @@ mod tests {
         };
         match decide(call, &gate) {
             Outcome::Run => 'R',
+            Outcome::Sandboxed => 'S',
             Outcome::Ask => 'A',
             Outcome::Refuse(_) => 'X',
         }
@@ -1816,10 +1892,12 @@ mod tests {
         let changed = serde_json::json!({ "path": "notes.txt", "old": "a", "new": "b" });
         let learn = serde_json::json!({ "action": "create", "name": "n", "body": "b" });
         // In the order of `Mode::OFFERED`: Default, Accept edits, Plan,
-        // Don't ask, Bypass. A line that only reads runs in every mode.
+        // Don't ask, Bypass. A line that only reads runs in every mode; one
+        // that only Accept edits would ask about runs sandboxed there
+        // instead, on a system that can confine it.
         let table = [
             (command("ls"), "RRRRR"),
-            (command("cargo test"), "AAXXR"),
+            (command("cargo test"), "ASXXR"),
             (edit("src/new.rs"), "ARXXR"),
             (call("edit_file", changed), "ARXXR"),
             (edit(".git/hooks/pre-commit"), "AAXXR"),
@@ -2473,7 +2551,7 @@ mod tests {
             ..gate(Mode::Auto)
         };
         let sends = batch(serde_json::json!([hover, upload]));
-        let outcome = decide_with(&sends, &auto, Some(&judge));
+        let outcome = decide_with(&sends, &auto, Some(&judge), false);
         assert!(matches!(outcome, Outcome::Refuse(ref why) if why.contains("Step 2")));
         assert_eq!(*judged.borrow(), ["use_page", "browse", "use_page"]);
     }

@@ -32,6 +32,8 @@ use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 pub enum Decision {
     /// Run this call.
     Once,
+    /// Run this call inside the OS sandbox, as the session's mode runs it.
+    Sandboxed,
     /// Run this call, and later calls of the same tool in the same run without asking.
     ForRun,
     /// Do not run it, for the reason the user typed, empty when they gave none.
@@ -122,16 +124,27 @@ pub(crate) fn granted(run: u64, name: &str) -> bool {
     lock(&ASKS).granted.contains(&(run, name.to_owned()))
 }
 
+/// A yes to a call, as `ask` gives it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Allowed {
+    /// The arguments to run in place of the model's, as the program driving
+    /// the run changed them.
+    pub arguments: Option<String>,
+    /// Whether it may run only inside the OS sandbox.
+    pub sandboxed: bool,
+}
+
 /// Whether `call` may run, waiting for the frontend's answer unless the
-/// agent is stopped first: a yes may carry changed arguments to run instead,
-/// and a no the reason given, after who gave it, empty without one.
+/// agent is stopped first: a yes may carry changed arguments to run instead
+/// or hold it to the OS sandbox, and a no the reason given, after who gave
+/// it, empty without one.
 pub(crate) fn ask(
     root: u64,
     run: u64,
     label: &str,
     call: &ToolCall,
     ctx: &ToolContext,
-) -> Result<Option<String>, String> {
+) -> Result<Allowed, String> {
     let (reply, answer) = mpsc::channel();
     let stop = reply.clone();
     // Set up before taking the lock, since a stopped token runs it at once.
@@ -154,7 +167,7 @@ pub(crate) fn ask(
             return Err(String::new());
         }
         if clears && asks.granted.contains(&key) {
-            return Ok(None);
+            return Ok(Allowed::default());
         }
         if asks.asking.insert(key.clone()) {
             break;
@@ -180,11 +193,18 @@ pub(crate) fn ask(
         return Err(String::new());
     }
     match answer.recv() {
-        Ok(Decision::Once) => Ok(None),
-        Ok(Decision::Changed(arguments)) => Ok(Some(arguments)),
+        Ok(Decision::Once) => Ok(Allowed::default()),
+        Ok(Decision::Sandboxed) => Ok(Allowed {
+            sandboxed: true,
+            ..Allowed::default()
+        }),
+        Ok(Decision::Changed(arguments)) => Ok(Allowed {
+            arguments: Some(arguments),
+            ..Allowed::default()
+        }),
         Ok(Decision::ForRun) => {
             lock(&ASKS).granted.insert(key);
-            Ok(None)
+            Ok(Allowed::default())
         }
         Ok(Decision::Deny(reason)) => Err(why("The user said why", &reason)),
         // Not the user's words, so the agent is not told they are.
@@ -401,6 +421,29 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_sandboxed_decision_tells_the_caller_to_confine_the_call() {
+        let _turn = lock(&SERVING);
+        let requests = serve();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(ask(
+                7,
+                1913,
+                "helper",
+                &call("a", "run_command"),
+                &ToolContext::default(),
+            ));
+        });
+        let request = requests.recv_timeout(WAIT).unwrap();
+        request.answer(Decision::Sandboxed);
+        let confined = Allowed {
+            arguments: None,
+            sandboxed: true,
+        };
+        assert_eq!(rx.recv_timeout(WAIT), Ok(Ok(confined)));
+    }
+
+    #[test]
     fn agents_asking_at_once_wait_for_one_answer() {
         let _turn = lock(&SERVING);
         let requests = serve();
@@ -580,7 +623,10 @@ pub(crate) mod tests {
             (
                 1950,
                 Decision::Changed("{}".into()),
-                Ok(Some("{}".to_owned())),
+                Ok(Allowed {
+                    arguments: Some("{}".to_owned()),
+                    sandboxed: false,
+                }),
             ),
             (
                 1951,

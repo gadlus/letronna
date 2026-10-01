@@ -37,6 +37,9 @@ pub struct ToolContext {
     /// The user said yes to this very call on its card, which lets a read
     /// the gate asked about reach a file of keys.
     pub approved: bool,
+    /// The gate let this call run only inside the OS sandbox, which a
+    /// command must then run in or not at all.
+    pub sandboxed: bool,
     /// Who is calling, for tools that start other agents. Crate-private, so
     /// a plugin's tool never sees the connection's key.
     pub(crate) caller: Caller,
@@ -76,6 +79,7 @@ impl ToolContext {
             cancel: Cancel::default(),
             plan: connection.plan,
             approved: false,
+            sandboxed: false,
             caller: Caller {
                 connection: Some(Arc::new(connection.clone())),
                 root: connection.conversation,
@@ -1114,7 +1118,7 @@ fn with_utf8_output(command: &str) -> String {
 
 #[cfg(test)]
 fn run_shell(command: &str, cwd: Option<&Path>, cancel: &Cancel) -> Result<String, String> {
-    run_shell_saving(command, cwd, cancel, None)
+    run_shell_saving(shell(command, cwd), cancel, None)
 }
 
 /// Where a command's output is saved whole when it is too long to keep, and
@@ -1124,15 +1128,31 @@ struct SaveTo {
     cap: usize,
 }
 
-/// `run_shell`, with output cut while it was read saved whole to `save`, up
-/// to its cap, and the cut saying where.
-fn run_shell_saving(
+/// Runs `command` in the sandbox for `cwd`, the project, as
+/// `run_shell_saving` runs any other, and says in the result that it did.
+fn run_sandboxed(
     command: &str,
-    cwd: Option<&Path>,
+    cwd: &Path,
     cancel: &Cancel,
     save: Option<SaveTo>,
 ) -> Result<String, String> {
-    let result = run_shell_into(command, cwd, cancel, save.as_ref());
+    let (policy, _scratch) = crate::sandbox::Policy::for_project(cwd)?;
+    let wrapped = crate::sandbox::here().wrap(&shell(command, Some(cwd)), &policy)?;
+    match run_shell_saving(wrapped, cancel, save) {
+        Ok(text) => Ok(crate::sandbox::noted(&text)),
+        Err(e) => Err(crate::sandbox::noted(&e)),
+    }
+}
+
+/// Runs the shell `cmd` until it exits, is stopped or times out, with
+/// output cut while it was read saved whole to `save`, up to its cap, and
+/// the cut saying where.
+fn run_shell_saving(
+    cmd: std::process::Command,
+    cancel: &Cancel,
+    save: Option<SaveTo>,
+) -> Result<String, String> {
+    let result = run_shell_into(cmd, cancel, save.as_ref());
     // What the pipes were streamed to only goes into the saved file.
     if let Some(save) = &save {
         for pipe in PIPE_NAMES {
@@ -1146,13 +1166,12 @@ fn run_shell_saving(
 const PIPE_NAMES: [&str; 2] = ["stdout", "stderr"];
 
 fn run_shell_into(
-    command: &str,
-    cwd: Option<&Path>,
+    mut cmd: std::process::Command,
     cancel: &Cancel,
     save: Option<&SaveTo>,
 ) -> Result<String, String> {
     use std::process::Stdio;
-    let mut child = shell(command, cwd)
+    let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1789,7 +1808,8 @@ impl Tool for RunCommand {
         json!({"type": "object", "properties": {
             "command": {"type": "string"},
             "background": {"type": "boolean", "description": "Leave the command running and return a job number straight away. A notice comes when it exits; read its output meanwhile with read_job, and end it with stop_job."},
-            "notify_on": {"type": "array", "items": {"type": "string"}, "description": "With background: a notice when an output line contains one of these, such as \"ready\" or \"error\". At most one notice every 15 s; exiting always sends one."}
+            "notify_on": {"type": "array", "items": {"type": "string"}, "description": "With background: a notice when an output line contains one of these, such as \"ready\" or \"error\". At most one notice every 15 s; exiting always sends one."},
+            "unsandboxed": {"type": "boolean", "description": "Run it outside the sandbox. Only after a sandboxed run of it failed for want of the network or of writing outside the project; it needs the user's approval."}
         }, "required": ["command"]})
     }
     fn needs_approval(&self) -> bool {
@@ -1810,7 +1830,12 @@ impl Tool for RunCommand {
         } else {
             ""
         };
-        format!("Command, run in {folder}{background}:\n{line}")
+        let outside = if args["unsandboxed"].as_bool().unwrap_or(false) {
+            ", asked to run outside the sandbox (network, writes anywhere)"
+        } else {
+            ""
+        };
+        format!("Command, run in {folder}{background}{outside}:\n{line}")
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         let command = args["command"].as_str().ok_or("`command` is required.")?;
@@ -1830,13 +1855,22 @@ impl Tool for RunCommand {
                 path,
                 cap: PIPE_SPILL_BYTES,
             });
-            let out = run_shell_saving(command, Some(cwd), &ctx.cancel, save);
+            let out = if ctx.sandboxed {
+                run_sandboxed(command, cwd, &ctx.cancel, save)
+            } else {
+                run_shell_saving(shell(command, Some(cwd)), &ctx.cancel, save)
+            };
             let note = crate::filestate::note(ctx.conversation, before, cwd);
             // The note goes first, so cutting long output short cannot drop it.
             return match out {
                 Ok(text) => Ok(note + &text),
                 Err(e) => Err(note + &e),
             };
+        }
+        // The gate never sandboxes a job, which could outlive its temp
+        // folder; one that got here anyway does not start unconfined.
+        if ctx.sandboxed {
+            return Err("A command left running in the background cannot run sandboxed.".into());
         }
         let id = crate::jobs::start_watching(command, cwd, ctx.conversation, &notify_on)?;
         // Give it a moment to fail or announce a port, so the first reply says
@@ -3091,6 +3125,34 @@ mod tests {
         );
         set_plugin_tools(Vec::new());
         assert!(run("extra", "{}", &ctx).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `ctx.sandboxed`, which only the gate sets, runs `run_command` through
+    /// the OS sandbox and says so in front of its output.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_sandboxed_command_runs_confined_and_says_so() {
+        let dir =
+            std::env::temp_dir().join(format!("letronna-tools-sandboxed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            sandboxed: true,
+            ..Default::default()
+        };
+        let out = run(
+            "run_command",
+            r#"{"command":"echo hi > sandboxed.txt"}"#,
+            &ctx,
+        )
+        .unwrap();
+        assert!(out.starts_with(crate::sandbox::NOTE), "{out}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("sandboxed.txt")).unwrap(),
+            "hi\n"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -4744,7 +4806,8 @@ mod tests {
             path: dir.join("out.txt"),
             cap,
         };
-        let out = run_shell_saving("seq 1 999999", None, &Cancel::default(), Some(save)).unwrap();
+        let out =
+            run_shell_saving(shell("seq 1 999999", None), &Cancel::default(), Some(save)).unwrap();
         let path = dir.join("out.txt");
         let note = format!("; its first {cap} bytes are in {}, which", path.display());
         assert!(out.contains(&note), "{out}");

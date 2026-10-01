@@ -415,7 +415,7 @@ fn work_through(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result
                     !(approvals::granted(spec.run, &call.name)
                         && crate::gate::cleared(call, &context(spec)))
                 }
-                crate::gate::Outcome::Refuse(_) => true,
+                crate::gate::Outcome::Sandboxed | crate::gate::Outcome::Refuse(_) => true,
             },
         };
         let batch = turn.next_batch(waits, MAX_BATCH);
@@ -454,13 +454,19 @@ fn work_through(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result
                 }
                 return save(&mut spec.transcript);
             }
-            Next::Run(call) => dispatch(spec, &call, report),
+            Next::Run(call) => dispatch(spec, &call, report, false),
+            Next::Sandboxed(call) => dispatch(spec, &call, report, true),
             Next::Refuse(_, why) => Some(Err(why)),
             Next::AskUser(call) => {
                 match approvals::ask(spec.root, spec.run, &spec.label, &call, &context(spec)) {
-                    Ok(None) => dispatch(spec, &call, report),
-                    // Only what was agreed to runs, never the model's own.
-                    Ok(Some(arguments)) => dispatch(spec, &ToolCall { arguments, ..call }, report),
+                    Ok(allowed) => {
+                        let call = match allowed.arguments {
+                            // Only what was agreed to runs, never the model's own.
+                            Some(arguments) => ToolCall { arguments, ..call },
+                            None => call,
+                        };
+                        dispatch(spec, &call, report, allowed.sandboxed)
+                    }
                     Err(_) if spec.cancel.is_set() => None,
                     Err(why) if why.is_empty() => Some(Err(NOT_APPROVED.into())),
                     Err(why) => Some(Err(format!("{NOT_APPROVED} {why}"))),
@@ -474,11 +480,13 @@ fn work_through(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result
     }
 }
 
-/// Makes one call the way this agent may, or gives None when a stop came before it began.
+/// Makes one call the way this agent may, inside the OS sandbox when
+/// `sandboxed`, or gives None when a stop came before it began.
 fn dispatch(
     spec: &mut Spec,
     call: &ToolCall,
     report: &mut Report,
+    sandboxed: bool,
 ) -> Option<Result<String, String>> {
     // Ahead of the allow list, which names only the tools that really run.
     if call.name == STRUCTURED_OUTPUT
@@ -496,7 +504,11 @@ fn dispatch(
         tell(spec, Step::Checklist(todos));
         return Some(outcome);
     }
-    let outcome = off_thread(call, &context(spec))?;
+    let ctx = ToolContext {
+        sandboxed,
+        ..context(spec)
+    };
+    let outcome = off_thread(call, &ctx)?;
     if outcome.is_ok() && matches!(call.name.as_str(), "write_file" | "edit_file") {
         let args = tools::parse_args(&call.arguments).unwrap_or_default();
         if let Some(path) = args["path"].as_str()

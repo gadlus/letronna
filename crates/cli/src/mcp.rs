@@ -350,6 +350,7 @@ fn decided(call: &ToolCall, root: u64, yes: bool, rules: &Result<Vec<Rule>, Stri
     let none = Grants::new();
     match gate::decide(call, &Gate::for_terminal(&ctx, &none, rules, mode, false)) {
         gate::Outcome::Run => Decision::Once,
+        gate::Outcome::Sandboxed => Decision::Sandboxed,
         gate::Outcome::Refuse(why) => Decision::Deny(why),
         // With nobody to answer the gate refuses rather than asks; a card
         // here would be a yes nobody gave.
