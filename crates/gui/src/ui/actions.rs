@@ -7,6 +7,11 @@
 //! rewind record the store appends (`Conversation::rewind`), so the terminal
 //! sees the shorter session too. It can also put back the files the agent's
 //! tools wrote since, from the copies `history` kept of them.
+//!
+//! The newest finished turn ends with the files it changed: each with the
+//! lines it added and removed, its diff a key away, and a button that puts
+//! them all back without leaving the conversation. What the card lists is
+//! read off the UI thread once per session and length, never on a timer.
 
 use crate::prelude::*;
 use gpui_component::checkbox::Checkbox;
@@ -14,7 +19,13 @@ use gpui_component::menu::PopupMenu;
 use gpui_component::notification::Notification;
 use gpui_component::{button::ButtonVariant, dialog::DialogButtonProps};
 use letronna_core::history;
-use std::{cell::Cell, rc::Rc};
+use std::{cell::Cell, collections::HashSet, rc::Rc};
+
+actions!(turn_files, [ToggleDiff]);
+
+/// Diff lines drawn under a file at most; a file rewritten whole says how
+/// many more rather than laying out thousands of rows.
+const DIFF_ROWS: usize = 300;
 
 /// A turn's place in its session: your message on its own, or everything
 /// the model did in reply to it.
@@ -45,6 +56,22 @@ impl Span {
             self.last + 1
         }
     }
+}
+
+/// The files the newest finished turn of a session changed, as last read.
+pub(crate) struct TurnFiles {
+    /// The session and its length when they were read: any new message,
+    /// or a rewind, means another read.
+    key: (u64, usize),
+    /// Where the turn's reply starts.
+    first: usize,
+    files: Vec<history::Changed>,
+    /// Whether the turn ran commands, whose changes are not put back.
+    ran_commands: bool,
+    /// Makes each file a tab stop, so Enter can open its diff.
+    focus: Vec<FocusHandle>,
+    /// The files whose diffs are open, by place in `files`.
+    open: HashSet<usize>,
 }
 
 /// An action on a turn, as the menu and the buttons both call it.
@@ -378,6 +405,9 @@ impl Chat {
             let done = restored.await;
             let said = done.lines().join("\n");
             let _ = this.update_in(cx, |this, window, cx| {
+                // The files are not what the card read any more.
+                this.turn_files_for = None;
+                cx.notify();
                 if !done.left.is_empty() {
                     window.push_notification(Notification::warning(said), cx);
                 } else if !said.is_empty() {
@@ -597,6 +627,286 @@ impl Chat {
             "Retry"
         }
     }
+}
+
+impl Chat {
+    /// Read what the newest finished turn of the open session changed,
+    /// once for each session and length; a turn that wrote no file with
+    /// the file tools costs no read at all.
+    pub(crate) fn watch_turn_files(&mut self, cx: &mut Context<Self>) {
+        let open = &self.store.conversations[self.store.active];
+        let key = (open.id, open.messages.len());
+        let streaming_here = self.busy && self.streaming_id == Some(open.id);
+        if streaming_here || self.turn_files_for == Some(key) {
+            return;
+        }
+        self.turn_files_for = Some(key);
+        let first = open
+            .messages
+            .iter()
+            .rposition(|m| m.role == "user")
+            .map_or(0, |at| at + 1);
+        let turn = open.messages[first..].to_vec();
+        if turn.iter().all(|m| m.files.is_empty()) {
+            self.show_turn_files(None);
+            return;
+        }
+        let folder = open.workspace.clone();
+        let read = cx.background_executor().spawn(async move {
+            let files = history::changed(key.0, &turn, folder.as_deref());
+            (files, history::ran_commands(&turn))
+        });
+        cx.spawn(async move |this, cx| {
+            let (files, ran_commands) = read.await;
+            let _ = this.update(cx, |this, cx| {
+                // Another read has started since, for what is there now.
+                if this.turn_files_for != Some(key) {
+                    return;
+                }
+                let card = (!files.is_empty()).then(|| TurnFiles {
+                    key,
+                    first,
+                    focus: files
+                        .iter()
+                        .map(|_| cx.focus_handle().tab_stop(true))
+                        .collect(),
+                    files,
+                    ran_commands,
+                    open: HashSet::new(),
+                });
+                this.show_turn_files(card);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Put `card` after its turn in place of the one there, and have the
+    /// chat's list measure both turns again: it keeps the height a turn off
+    /// screen was last drawn at, which the card arriving or going changes.
+    fn show_turn_files(&mut self, card: Option<TurnFiles>) {
+        let was = std::mem::replace(&mut self.turn_files, card);
+        // The list holds one session; a card read for another has no turn
+        // in it.
+        let turns = [&was, &self.turn_files]
+            .into_iter()
+            .flatten()
+            .filter(|card| card.key.0 == self.listed.0)
+            .filter_map(|card| {
+                let mut turns = self.turns.iter();
+                turns.position(|turn| turn.first == card.first && !turn.yours)
+            });
+        for n in turns {
+            self.list.splice(n..n + 1, 1);
+        }
+    }
+
+    /// The card that ends the turn at `span` when it is the newest finished
+    /// one and changed files: each file, its diff when open, and Undo.
+    pub(crate) fn files_card(&self, span: Span, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let open = &self.store.conversations[self.store.active];
+        let card = self
+            .turn_files
+            .as_ref()
+            .filter(|card| card.key == (open.id, open.messages.len()))
+            .filter(|card| !span.yours && card.first == span.first)?;
+        let undoable = card.files.iter().any(|file| file.restore.fate.touches());
+        let muted = cx.theme().muted_foreground;
+        let heading = match card.files.len() {
+            1 => "1 file changed".to_owned(),
+            n => format!("{n} files changed"),
+        };
+        let rows: Vec<_> = card
+            .files
+            .iter()
+            .enumerate()
+            .map(|(n, file)| {
+                let shown = card.open.contains(&n);
+                let path = history::label(&file.restore.path, open.workspace.as_deref());
+                v_flex()
+                    .w_full()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .child(self.changed_file_row(n, file, &path, shown, &card.focus[n], cx))
+                    .when_some(file.lines.as_ref().filter(|_| shown), |row, lines| {
+                        row.child(diff_rows(lines, cx))
+                    })
+            })
+            .collect();
+        let session = open.id;
+        let files: Vec<history::Restore> =
+            card.files.iter().map(|file| file.restore.clone()).collect();
+        Some(
+            v_flex()
+                .w_full()
+                .rounded(cx.theme().radius_lg)
+                .border_1()
+                .border_color(cx.theme().border)
+                .child(
+                    h_flex()
+                        .h(px(30.))
+                        .px_2()
+                        .gap_2()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_family(HEADING_FONT)
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(heading),
+                        )
+                        .child(
+                            Button::new(self.row_id("undo-files", span.first))
+                                .plain(cx)
+                                .xsmall()
+                                .icon(Icon::new(IconName::Undo))
+                                .label("Undo these")
+                                .tooltip("Put these files back as they were before this turn")
+                                .disabled(self.busy || !undoable)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    if !this.busy
+                                        && this.store.conversations[this.store.active].id == session
+                                    {
+                                        this.put_files_back(session, files.clone(), window, cx);
+                                    }
+                                })),
+                        ),
+                )
+                .children(rows)
+                .when(card.ran_commands, |this| {
+                    this.child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .border_t_1()
+                            .border_color(cx.theme().border)
+                            .text_xs()
+                            .text_color(muted)
+                            .child(history::COMMANDS_NOTE),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
+    /// One file of the card: its path and the lines the turn added and
+    /// removed, or why they cannot be told. Enter or a click opens its diff.
+    fn changed_file_row(
+        &self,
+        n: usize,
+        file: &history::Changed,
+        path: &str,
+        shown: bool,
+        focus: &FocusHandle,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme();
+        let (muted, green, danger) = (theme.muted_foreground, theme.green, theme.danger);
+        let lines = file.lines.as_ref();
+        let why = match file.restore.fate {
+            history::Fate::Changed => "changed since",
+            history::Fate::NoCopy => "no copy kept",
+            history::Fate::Outside => "outside the project",
+            history::Fate::Back | history::Fate::Remove => "not text",
+        };
+        h_flex()
+            .id(self.row_id("changed-file", n))
+            .track_focus(focus)
+            .key_context("ChangedFile")
+            .h(px(26.))
+            .min_w_0()
+            .w_full()
+            .px_2()
+            .gap_1p5()
+            .items_center()
+            .text_xs()
+            .when(lines.is_some(), |row| row.cursor_pointer())
+            .focus(|s| s.bg(theme.secondary))
+            .child(
+                Icon::new(if shown {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .size_3()
+                .text_color(if lines.is_some() { muted } else { theme.border }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font_family(MONO_FONT)
+                    .child(path.to_owned()),
+            )
+            .map(|row| match lines {
+                Some(lines) => row
+                    .child(div().text_color(green).child(format!("+{}", lines.added)))
+                    .child(
+                        div()
+                            .text_color(danger)
+                            .child(format!("−{}", lines.removed)),
+                    ),
+                None => row.child(div().text_color(muted).child(why)),
+            })
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_diff(n, cx)))
+            .on_action(cx.listener(move |this, _: &ToggleDiff, _, cx| this.toggle_diff(n, cx)))
+    }
+
+    /// Open or close the diff of the card's `n`th file, if it has one.
+    fn toggle_diff(&mut self, n: usize, cx: &mut Context<Self>) {
+        let Some(card) = self.turn_files.as_mut() else {
+            return;
+        };
+        if card.files.get(n).is_none_or(|file| file.lines.is_none()) {
+            return;
+        }
+        if !card.open.remove(&n) {
+            card.open.insert(n);
+        }
+        cx.notify();
+    }
+}
+
+/// A file's diff under its row: additions and removals in their colours,
+/// long unchanged stretches as a count.
+fn diff_rows(lines: &history::Lines, cx: &Context<Chat>) -> impl IntoElement {
+    let theme = cx.theme();
+    let row = |mark: &str, text: &str, color: Hsla| {
+        div()
+            .truncate()
+            .text_color(color)
+            .child(format!("{mark} {}", text.replace('\t', "    ")))
+    };
+    let hidden = lines.rows.len().saturating_sub(DIFF_ROWS);
+    v_flex()
+        .ml_4()
+        .mb_2()
+        .pl_3()
+        .min_w_0()
+        .border_l_2()
+        .border_color(theme.border)
+        .text_xs()
+        .font_family(MONO_FONT)
+        .line_height(crate::ui::CODE_LINE)
+        .children(lines.rows.iter().take(DIFF_ROWS).map(|line| match line {
+            history::Row::Same(text) => row(" ", text, theme.muted_foreground),
+            history::Row::Added(text) => row("+", text, theme.green),
+            history::Row::Removed(text) => row("-", text, theme.danger),
+            history::Row::Folded(n) => row(
+                " ",
+                &format!("⋯ {n} unchanged {}", if *n == 1 { "line" } else { "lines" }),
+                theme.muted_foreground,
+            ),
+        }))
+        .when(hidden > 0, |this| {
+            this.child(row(
+                " ",
+                &format!("⋯ {hidden} more"),
+                theme.muted_foreground,
+            ))
+        })
 }
 
 /// Whether a turn shows its buttons: the newest one once nothing is coming

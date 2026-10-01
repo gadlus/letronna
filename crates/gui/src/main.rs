@@ -185,6 +185,7 @@ fn main() {
                 ui::changes::LeaveMessage,
                 Some("CommitMessage > Input"),
             ),
+            KeyBinding::new("enter", ui::actions::ToggleDiff, Some("ChangedFile")),
         ]);
         // Windows hands Shift and a digit over as the character they type,
         // Ctrl+Shift+4 as "ctrl-$", which a binding written "shift-4" never
