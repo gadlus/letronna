@@ -5,6 +5,9 @@
 //! instead. The process keeps running, its output collects in a buffer the
 //! agent can read back, and the chat shows a chip until it is stopped.
 //!
+//! A foreground command still running at the timeout comes here too, with
+//! what it printed so far, rather than being stopped and started again.
+//!
 //! A job can also be watched for the lines that matter, such as "ready" or
 //! "error". The threads that read its output match each line as it comes, so
 //! nothing polls the log, and the owner hears in batches at a limited rate:
@@ -110,7 +113,7 @@ pub struct Job {
 
 /// What a job has printed: its newest bytes, and how many it printed in all.
 #[derive(Default)]
-struct Log {
+pub(crate) struct Log {
     tail: VecDeque<u8>,
     /// Counted from the start, so a place in the output stays put while the
     /// oldest bytes are dropped.
@@ -119,9 +122,17 @@ struct Log {
 
 impl Log {
     /// Add output, counting it, and keep the tail as `append` does.
-    fn add(&mut self, bytes: &[u8]) {
+    pub(crate) fn add(&mut self, bytes: &[u8]) {
         self.written += bytes.len() as u64;
         append(&mut self.tail, bytes);
+    }
+
+    /// Put output printed before anything the log holds ahead of it.
+    pub(crate) fn lead_with(&mut self, bytes: &[u8]) {
+        let newer: Vec<u8> = self.tail.drain(..).collect();
+        self.written += bytes.len() as u64;
+        append(&mut self.tail, bytes);
+        append(&mut self.tail, &newer);
     }
 }
 
@@ -503,25 +514,38 @@ pub(crate) struct Tree(std::os::windows::io::OwnedHandle);
 impl Tree {
     /// Put a just-started shell in a new Job Object that ends its processes when closed.
     pub(crate) fn of(child: &Child) -> Result<Tree, String> {
+        let tree = Tree::leaving(child)?;
+        tree.end_on_close()?;
+        Ok(tree)
+    }
+
+    /// Put a just-started shell in a new Job Object that leaves its
+    /// processes running when closed, until `end_on_close` is called.
+    pub(crate) fn leaving(child: &Child) -> Result<Tree, String> {
         use std::os::windows::io::{AsRawHandle, HandleOrNull, OwnedHandle};
-        use windows_sys::Win32::System::JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-            SetInformationJobObject,
-        };
-        let failed = || {
-            format!(
-                "Cannot group the processes it starts: {}",
-                std::io::Error::last_os_error()
-            )
-        };
+        use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
         // SAFETY: no attributes and no name are both allowed, and the handle
         // it returns, or null, is ours alone.
         let job = unsafe {
             HandleOrNull::from_raw_handle(CreateJobObjectW(std::ptr::null(), std::ptr::null()))
         };
         let Ok(job) = OwnedHandle::try_from(job) else {
-            return Err(failed());
+            return Err(grouping_failed());
+        };
+        // SAFETY: both handles are open: the job's is owned here and the
+        // child is borrowed.
+        if unsafe { AssignProcessToJobObject(job.as_raw_handle(), child.as_raw_handle()) } == 0 {
+            return Err(grouping_failed());
+        }
+        Ok(Tree(job))
+    }
+
+    /// Make closing the tree end every process in it.
+    pub(crate) fn end_on_close(&self) -> Result<(), String> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JobObjectExtendedLimitInformation, SetInformationJobObject,
         };
         // SAFETY: all zeroes is a valid value of this plain C struct.
         let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
@@ -532,21 +556,16 @@ impl Tree {
         // names, passed with its own size.
         let limited = unsafe {
             SetInformationJobObject(
-                job.as_raw_handle(),
+                self.0.as_raw_handle(),
                 JobObjectExtendedLimitInformation,
                 std::ptr::from_ref(&limits).cast(),
                 size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             )
         };
         if limited == 0 {
-            return Err(failed());
+            return Err(grouping_failed());
         }
-        // SAFETY: both handles are open: the job's is owned here and the
-        // child is borrowed.
-        if unsafe { AssignProcessToJobObject(job.as_raw_handle(), child.as_raw_handle()) } == 0 {
-            return Err(failed());
-        }
-        Ok(Tree(job))
+        Ok(())
     }
 
     /// End every process in the tree, with the exit code a killed child gets.
@@ -565,6 +584,15 @@ impl Tree {
     }
 }
 
+/// Why a Job Object call just failed, read before anything else can change it.
+#[cfg(windows)]
+fn grouping_failed() -> String {
+    format!(
+        "Cannot group the processes it starts: {}",
+        std::io::Error::last_os_error()
+    )
+}
+
 /// A job's shell, or an MCP server, and everything it starts, as the
 /// process group the shell leads.
 #[cfg(unix)]
@@ -575,6 +603,16 @@ impl Tree {
     /// The group a shell started with `process_group(0)` leads.
     pub(crate) fn of(child: &Child) -> Result<Tree, String> {
         Ok(Tree(child.id() as libc::pid_t))
+    }
+
+    /// The same group as `of`, which on Unix ends only when it is signalled.
+    pub(crate) fn leaving(child: &Child) -> Result<Tree, String> {
+        Tree::of(child)
+    }
+
+    /// Nothing to do on Unix, where a group ends only when it is signalled.
+    pub(crate) fn end_on_close(&self) -> Result<(), String> {
+        Ok(())
     }
 
     /// End every process in the tree, with the signal a killed child gets.
@@ -649,18 +687,86 @@ fn launch(
     let log = Arc::new(Mutex::new(Log::default()));
     let out = pump(child.stdout.take().unwrap(), log.clone(), watch.clone());
     let err = pump(child.stderr.take().unwrap(), log.clone(), watch.clone());
+    let job = Job {
+        id,
+        command: command.to_owned(),
+        cwd: Some(cwd.to_owned()),
+        yours,
+        stopped: AtomicBool::new(false),
+        log,
+        ends: Ends::Tree(tree),
+        finished: Arc::default(),
+        exit_code: Arc::default(),
+        watch,
+        started: Instant::now(),
+        ended: Arc::default(),
+    };
+    keep(job, child, owner, move || {
+        let waited = Instant::now();
+        while !(out.is_finished() && err.is_finished()) && waited.elapsed() < DRAIN_WAIT {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    })
+}
 
-    crate::tasks::register(Task::new(Key::Job(id), owner, None, command));
-    let finished = Arc::new(AtomicBool::new(false));
-    let exit_code = Arc::new(Mutex::new(None));
-    let (started, ended) = (Instant::now(), Arc::new(OnceLock::new()));
+/// Make a foreground command that is still running a job told to `owner`
+/// when it exits: it began at `started`, `log` holds what it printed so far,
+/// its readers go on adding to it, and `open` disconnects once both of them
+/// are done.
+pub(crate) fn adopt(
+    command: &str,
+    owner: u64,
+    started: Instant,
+    mut child: Child,
+    tree: Tree,
+    log: Arc<Mutex<Log>>,
+    open: std::sync::mpsc::Receiver<()>,
+) -> Result<u64, String> {
+    // A foreground command's tree leaves what it started running, as it
+    // always has; a job's ends with Letronna.
+    if let Err(e) = tree.end_on_close() {
+        tree.kill();
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e);
+    }
+    let job = Job {
+        id: next_id(),
+        command: command.to_owned(),
+        // The agent's, run where its session works, which the job does not keep.
+        cwd: None,
+        yours: false,
+        stopped: AtomicBool::new(false),
+        log,
+        ends: Ends::Tree(tree),
+        finished: Arc::default(),
+        exit_code: Arc::default(),
+        watch: None,
+        started,
+        ended: Arc::default(),
+    };
+    keep(job, child, owner, move || {
+        let _ = open.recv_timeout(DRAIN_WAIT);
+    })
+}
+
+/// List a started job and reap its process on a thread of its own, which
+/// tells `owner` how it ended once `drained` has waited for the last output.
+fn keep(
+    job: Job,
+    mut child: Child,
+    owner: u64,
+    drained: impl FnOnce() + Send + 'static,
+) -> Result<u64, String> {
+    let id = job.id;
+    crate::tasks::register(Task::new(Key::Job(id), owner, None, &job.command));
 
     // Reap the process so `running` turns false on its own. Stopping goes
     // through the tree, so this can own the child and wait for it.
     {
-        let (finished, exit_code, ended) = (finished.clone(), exit_code.clone(), ended.clone());
-        let (log, command) = (log.clone(), command.to_owned());
-        let watch = watch.clone();
+        let (finished, exit_code) = (job.finished.clone(), job.exit_code.clone());
+        let (log, command, ended) = (job.log.clone(), job.command.clone(), job.ended.clone());
+        let watch = job.watch.clone();
         std::thread::spawn(move || {
             let Ok(status) = child.wait() else { return };
             if let Ok(mut code) = exit_code.lock() {
@@ -669,12 +775,9 @@ fn launch(
             let _ = ended.set(Instant::now());
             finished.store(true, Ordering::Relaxed);
             ring();
-            // The pumps can still be reading the last lines, which are the
-            // ones the notice is for.
-            let waited = std::time::Instant::now();
-            while !(out.is_finished() && err.is_finished()) && waited.elapsed() < DRAIN_WAIT {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
+            // The readers can still be taking in the last lines, which are
+            // the ones the notice is for.
+            drained();
             if let Some(watch) = &watch {
                 close(watch);
             }
@@ -684,23 +787,7 @@ fn launch(
 
     let mut jobs = registry().lock().map_err(|_| "Job list is poisoned.")?;
     prune(&mut jobs, Instant::now());
-    jobs.insert(
-        id,
-        Job {
-            id,
-            command: command.to_owned(),
-            cwd: Some(cwd.to_owned()),
-            yours,
-            log,
-            ends: Ends::Tree(tree),
-            finished,
-            exit_code,
-            stopped: AtomicBool::new(false),
-            watch,
-            started,
-            ended,
-        },
-    );
+    jobs.insert(id, job);
     drop(jobs);
     ring();
     Ok(id)
