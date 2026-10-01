@@ -99,6 +99,14 @@ pub fn command(
             }
             Flow::Handled
         }
+        "/decisions" => {
+            render::blank();
+            let id = runner.store.conversations[*session].id;
+            for line in crate::session::decided(&runner.decisions, id, runner.mode) {
+                render::line(&render::dim(&line));
+            }
+            Flow::Handled
+        }
         "/model" => {
             switch_model(runner, Some(*session), rest);
             Flow::Handled
@@ -2850,11 +2858,14 @@ pub fn gateways(runner: &mut Runner) {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_rows, choice_label, from_match, last_prompt, name_label, typed_path, with_files,
+        Flow, agent_rows, choice_label, command, from_match, last_prompt, name_label, typed_path,
+        with_files,
     };
+    use crate::session::Runner;
     use letronna_core::agents::Seen;
     use letronna_core::chat::Message;
     use letronna_core::driver::Status;
+    use letronna_core::gate::Mode;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
@@ -3041,5 +3052,28 @@ mod tests {
         let long = name_label(&"t".repeat(10_000));
         assert_eq!(long.chars().count(), 40);
         assert!(long.ends_with('…'));
+    }
+
+    #[test]
+    fn slash_mode_auto_hands_what_would_ask_to_the_judge() {
+        let mut runner = Runner {
+            store: Default::default(),
+            allowed: Default::default(),
+            mode: Mode::Default,
+            human: true,
+            trouble: None,
+            bar: crate::bar::Bar::new(String::new()),
+            stopped: false,
+            images: Vec::new(),
+            notices: letronna_core::notify::Notices::new(Box::new(crate::notify::Silent)),
+            ended: None,
+            voice: None,
+            decisions: Vec::new(),
+        };
+        let flow = command(&mut runner, "/mode auto", &mut 0, None);
+        assert!(matches!(flow, Flow::Handled));
+        assert_eq!(runner.mode, Mode::Auto);
+        command(&mut runner, "/mode fast", &mut 0, None);
+        assert_eq!(runner.mode, Mode::Auto);
     }
 }

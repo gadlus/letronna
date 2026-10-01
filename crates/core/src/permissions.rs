@@ -124,6 +124,8 @@ pub struct Ruling {
     pub ask: Option<Rule>,
     /// Allow rules cover all of it.
     pub allow: bool,
+    /// The first allow rule that reaches it, to name when `allow` holds.
+    pub allowed_by: Option<Rule>,
     /// The first deny rule on the tool, whether or not it reaches the call.
     pub denies: Option<Rule>,
     /// Why the project's rules file could not be read, if it could not.
@@ -178,6 +180,7 @@ pub fn check(rules: &[Rule], tool: &dyn Tool, args: &Value, ctx: &ToolContext) -
         deny: first(Effect::Deny),
         ask: first(Effect::Ask),
         allow: covered(&found, &target),
+        allowed_by: first(Effect::Allow),
         denies: found
             .iter()
             .find(|rule| rule.effect == Effect::Deny)

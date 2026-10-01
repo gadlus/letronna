@@ -1,5 +1,4 @@
 use crate::prelude::*;
-use letronna_core::gate::Mode;
 
 type ApplyMode = std::rc::Rc<dyn Fn(plugins::PresenceMode, &mut App)>;
 
@@ -828,7 +827,7 @@ fn privacy_page(
                 .dropdown_menu({
                     let chat = chat.clone();
                     move |menu, _, _| {
-                        Mode::OFFERED.into_iter().fold(menu, |menu, choice| {
+                        super::composer::offered().fold(menu, |menu, choice| {
                             let chat = chat.clone();
                             menu.item(
                                 PopupMenuItem::new(choice.label())

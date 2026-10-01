@@ -449,6 +449,12 @@ impl Turn {
         })
     }
 
+    /// The call waiting in front of the queue, for a gate that needs it
+    /// decided off this thread before `next`.
+    pub fn front(&self) -> Option<&ToolCall> {
+        self.queue.front()
+    }
+
     /// What to do next, given what the gate makes of the call in front.
     pub fn next(&self, gate: impl Fn(&ToolCall) -> Outcome) -> Next {
         let Some(call) = self.queue.front() else {

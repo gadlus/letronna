@@ -4,6 +4,12 @@ use letronna_core::gate::Mode;
 
 actions!(composer, [LeaveComposer]);
 
+/// The modes the window offers. Auto waits until the window has its judge:
+/// here it would be Accept edits under a label that promises more.
+pub(crate) fn offered() -> impl Iterator<Item = Mode> {
+    Mode::OFFERED.into_iter().filter(|mode| *mode != Mode::Auto)
+}
+
 impl Chat {
     /// The (gateway, model) pairs the picker shows for what is typed in its
     /// search box.
@@ -577,7 +583,7 @@ impl Chat {
         let back = self.composer.focus_handle(cx);
         let menu = PopupMenu::build(window, cx, move |menu, _, _| {
             let menu = menu.action_context(back);
-            Mode::OFFERED.into_iter().fold(menu, |menu, choice| {
+            offered().fold(menu, |menu, choice| {
                 let chat = chat.clone();
                 menu.item(
                     PopupMenuItem::new(choice.label())

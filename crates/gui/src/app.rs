@@ -1472,6 +1472,7 @@ impl Chat {
             role: "user".into(),
             content,
             images,
+            remote: from_chat_app,
             ..Default::default()
         });
         let target_id = conversation.id;

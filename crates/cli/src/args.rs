@@ -24,7 +24,7 @@ Options
   -c, --continue           resume the most recent session
   -r, --resume [id]        choose a session, or open the one with this id
       --mode <mode>        how much runs without asking: default, accept-edits,
-                           plan, dont-ask or bypass
+                           plan, auto, dont-ask or bypass
       --yes                --mode bypass: run tools without asking, bar risky ones
       --plan               --mode plan: read and search only; never write or run
       --model <id>         this session's model, leaving the default as it is
@@ -363,7 +363,7 @@ mod tests {
         let edits = args(&["--mode", "accept-edits", "tidy up"]);
         assert_eq!(edits.mode, Ok(Mode::AcceptEdits));
         assert_eq!(edits.prompt.as_deref(), Some("tidy up"));
-        assert!(args(&["--mode", "auto"]).mode.is_err());
+        assert_eq!(args(&["--mode", "auto"]).mode, Ok(Mode::Auto));
         assert!(args(&["--mode"]).mode.is_err());
         assert!(args(&["-h"]).help);
         assert!(args(&["--version"]).version && args(&["-V"]).version);

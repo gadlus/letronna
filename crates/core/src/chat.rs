@@ -95,6 +95,10 @@ pub struct Message {
     /// For `role: "failure"`: what went wrong, for the window to explain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed: Option<Box<crate::failure::Kept>>,
+    /// For `role: "user"`: it came in from a chat app, so whoever is in
+    /// that chat wrote it, not necessarily the user.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub remote: bool,
 }
 
 fn is_zero(n: &u64) -> bool {

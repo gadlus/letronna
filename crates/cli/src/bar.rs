@@ -55,6 +55,10 @@ pub const COMMANDS: &[Command<'static>] = &[
         blurb: "show or change how much runs without asking",
     },
     Command {
+        name: "/decisions",
+        blurb: "what auto mode's judge let run or blocked in this session",
+    },
+    Command {
         name: "/model",
         blurb: "show or change the model; add image, speech or video for those",
     },

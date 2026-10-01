@@ -327,7 +327,10 @@ fn start(
     budget: Option<Arc<Budget>>,
     events: &Sender<Event>,
 ) -> Result<Running, String> {
-    let (spec, _, before) = crate::begin(runner, session, text, args, budget)?;
+    let (mut spec, _, before) = crate::begin(runner, session, text, args, budget)?;
+    // A call the judge is unsure of goes out to the program, as any other
+    // call the user's gate leaves open does.
+    spec.decide = crate::judged_in_auto(runner.mode, &spec, args.ask_stdio);
     let turn = Running {
         turn: 0,
         id: spec.id,
