@@ -3,6 +3,7 @@ pub(crate) mod actions;
 pub(crate) mod activity;
 pub(crate) mod approval;
 pub(crate) mod artifacts;
+pub(crate) mod auto;
 pub(crate) mod browser;
 pub(crate) mod capabilities;
 pub(crate) mod changes;

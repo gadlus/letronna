@@ -883,6 +883,16 @@ impl Chat {
                         cx.notify();
                     })),
             )
+            // What let the call run in Auto mode, lined up with its name.
+            .when_some(self.row_tag(index), |this, tag| {
+                this.child(
+                    div()
+                        .pl(px(26.))
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(tag),
+                )
+            })
             .when_some(made, |this, path| {
                 let playing = self.video.as_ref().is_some_and(|v| v.path == path);
                 let frame = self.video_frame.clone().filter(|_| playing);

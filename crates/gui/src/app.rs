@@ -198,6 +198,18 @@ pub(crate) struct Chat {
     /// The rule "Always allow" keeps for the call the card is up for, worked
     /// out once when the card came up rather than on every frame.
     pub(crate) offer: Option<letronna_core::permissions::Rule>,
+    /// Why Auto mode's judge left the call the card is up for to the user.
+    pub(crate) why: Option<String>,
+    /// The call in front that the judge is deciding off the UI thread, and
+    /// the number its verdict comes back with.
+    pub(crate) judging: Option<(String, u64)>,
+    /// How many calls have gone to the judge, which numbers their verdicts.
+    pub(crate) judged: u64,
+    /// What let each call in Auto mode run, by session, for the tag under
+    /// its row; the judge's own are kept in the session instead.
+    pub(crate) tags: std::collections::HashMap<u64, Vec<Judged>>,
+    /// A call the judge blocked, for a toast at the next frame.
+    pub(crate) blocked: Option<String>,
     /// Tools the user allowed for the rest of this run of the app, by the
     /// session they were allowed in: "stop asking" about a tool in one chat
     /// is not a yes to it in every other chat.
@@ -783,6 +795,11 @@ impl Chat {
             streaming_id: None,
             asking: None,
             offer: None,
+            why: None,
+            judging: None,
+            judged: 0,
+            tags: Default::default(),
+            blocked: None,
             session_allow: letronna_core::gate::Grants::new(),
             rules_trouble: None,
             rules: Ok(Vec::new()),
@@ -2121,8 +2138,10 @@ impl Chat {
         let Some(turn) = self.turn.as_ref() else {
             return;
         };
+        let auto = self.turn_mode() == letronna_core::gate::Mode::Auto;
         // A call the gate would not simply run ends the batch, and is dealt
-        // with below once the batch is back.
+        // with below once the batch is back. The judge is never asked here:
+        // a call it would decide ends the batch too.
         let batch = until_repeated_id(turn.next_batch(
             |call| self.decide(call, &self.rules) != letronna_core::gate::Outcome::Run,
             agent::MAX_BATCH,
@@ -2130,12 +2149,28 @@ impl Chat {
         if !batch.is_empty() {
             self.asking = None;
             for call in batch {
+                if auto {
+                    self.tag_unjudged(&call);
+                }
                 self.execute_call(call, false, cx);
             }
             cx.notify();
             return;
         }
+        // Auto mode's judge waits on the network, so it decides off this
+        // thread; every other mode decides here.
+        if auto && let Some(call) = turn.front().cloned() {
+            self.judge_front(call, cx);
+            return;
+        }
         let next = turn.next(|call| self.decide(call, &self.rules));
+        self.go_on(next, None, cx);
+    }
+
+    /// Does what `next` says; `why` is the judge's reason for a call it
+    /// leaves to the user.
+    pub(crate) fn go_on(&mut self, next: agent::Next, why: Option<String>, cx: &mut Context<Self>) {
+        self.why = why;
         let asking = match &next {
             agent::Next::AskUser(call) => Some(call.id.clone()),
             _ => None,
@@ -2858,9 +2893,7 @@ impl Chat {
         rules: &Result<Vec<letronna_core::permissions::Rule>, String>,
     ) -> letronna_core::gate::Outcome {
         let unattended = self.streaming_id.and_then(|id| self.unattended(id));
-        let mode = self
-            .streaming_id
-            .map_or(self.store.settings.mode, |id| self.mode(id));
+        let mode = self.turn_mode();
         // A chat app is kept in plan mode by its owner's setting, which nobody
         // on the far end may lift, so nobody there can approve a plan either:
         // run, the tool refuses and says so.
@@ -3003,6 +3036,12 @@ impl Chat {
         letronna_core::schedule::running(session).and_then(|run| run.unattended())
     }
 
+    /// The mode the session running now is in.
+    pub(crate) fn turn_mode(&self) -> letronna_core::gate::Mode {
+        self.streaming_id
+            .map_or(self.store.settings.mode, |id| self.mode(id))
+    }
+
     /// The mode the session on screen is in.
     pub(crate) fn active_mode(&self) -> letronna_core::gate::Mode {
         let session = self.store.conversations.get(self.store.active);
@@ -3032,6 +3071,13 @@ impl Chat {
     /// Decide the call the card is up for again after an approval setting
     /// changed, so it runs at once if it no longer needs the user.
     pub(crate) fn approvals_changed(&mut self, cx: &mut Context<Self>) {
+        // A verdict on its way was asked for in Auto: out of Auto it is
+        // dropped when it lands, and the call is decided again now.
+        if self.judging.is_some() && self.turn_mode() != letronna_core::gate::Mode::Auto {
+            self.judging = None;
+            self.advance_tools(cx);
+            return;
+        }
         let waiting = self
             .turn
             .as_ref()
@@ -3372,6 +3418,9 @@ impl Chat {
         {
             self.tell_remote(&source, "Stopped.", cx);
         }
+        // While the call the judge decides is still in front, before
+        // `keep_stopped` answers it as never started.
+        self.stop_judge();
         self.keep_stopped();
         self.stopping = true;
         self.finish(cx);
@@ -3468,6 +3517,7 @@ impl Chat {
         self.busy = false;
         self.streaming_id = None;
         self.turn = None;
+        self.judging = None;
         // Calls a stop left running come back to a generation that is gone,
         // so the next turn must not wait for them.
         self.outstanding = 0;
@@ -3842,6 +3892,7 @@ impl Render for Chat {
             })
             .detach();
         }
+        self.toast_block(window, cx);
         // Helpers work off the UI thread too, and a timer reads them while a
         // turn runs or one works.
         self.watch_helpers(cx);

@@ -104,6 +104,13 @@ pub struct Conversation {
     /// Codex rather than started here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub imported_from: Option<crate::import::Source>,
+    /// What Auto mode's judge made of calls in this session, oldest first.
+    #[serde(default)]
+    pub decisions: Vec<Judged>,
+    /// Decisions already on disk; the rest are appended on save. Only the
+    /// store should touch it; it is visible for the same reason as `flushed`.
+    #[serde(skip)]
+    pub decided: usize,
 }
 
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -173,6 +180,45 @@ fn parse_todos(arguments: &str) -> Result<Vec<Todo>, String> {
         .collect())
 }
 
+/// What Auto mode's judge made of a call, kept in the session file so the
+/// list of them outlives the program.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Judged {
+    /// The call's id and the place its result takes among the messages:
+    /// models that send no ids get `call_0` and so on in every reply.
+    pub call_id: String,
+    pub at: usize,
+    /// The call as its tool line shows it, such as `run_command(cargo test)`.
+    pub call: String,
+    /// Its tag, such as "auto: allowed", or "stopped" when the user stopped
+    /// it before the judge answered.
+    pub tag: String,
+}
+
+impl Judged {
+    /// `tag` for the call with `call_id`, shown as `call`, one of the calls
+    /// of the last reply in `messages` that made it.
+    pub fn of(messages: &[Message], call_id: &str, call: String, tag: String) -> Self {
+        // Results follow the reply that asked for them, in the order it
+        // made its calls.
+        let at = messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, message)| {
+                let place = message.tool_calls.iter().position(|c| c.id == call_id)?;
+                Some(i + 1 + place)
+            })
+            .unwrap_or(messages.len());
+        Self {
+            call_id: call_id.to_owned(),
+            at,
+            call,
+            tag,
+        }
+    }
+}
+
 /// A line in a session file.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -200,6 +246,8 @@ enum Record {
         upto: usize,
         text: String,
     },
+    /// A judge decision, appended as it is made.
+    Auto(Judged),
 }
 
 /// Everything that is not a session.
@@ -474,9 +522,9 @@ impl Conversation {
         self.counted > 0 && self.messages.is_empty()
     }
 
-    /// Take in the messages and summary read from this session's file, unless
-    /// it has been filled since the read began.
-    pub fn filled_with(&mut self, (messages, summary): Contents) {
+    /// Take in the messages, summary and decisions read from this session's
+    /// file, unless it has been filled since the read began.
+    pub fn filled_with(&mut self, (messages, summary, decisions): Contents) {
         if !self.unfilled() {
             return;
         }
@@ -486,6 +534,8 @@ impl Conversation {
         self.messages = messages;
         self.summary = summary;
         self.summary_saved = true;
+        self.decided = decisions.len();
+        self.decisions = decisions;
         // What has been written is what was just read, so a flush appends
         // only what is said from here on rather than the whole history again.
         // `written` stays as the listing or the last save left it, so a
@@ -497,6 +547,7 @@ impl Conversation {
     /// again. Only a session with all of it on disk can; false otherwise.
     pub fn unload(&mut self) -> bool {
         let saved = self.flushed == self.messages.len()
+            && self.decided == self.decisions.len()
             && self.rewound.is_none()
             && (self.summary.is_none() || self.summary_saved)
             && self.written.as_ref() == Some(&self.meta());
@@ -802,12 +853,12 @@ impl Conversation {
         // Every session is flushed on every save, and most have nothing new.
         // Those are known without the file system: taking the lock and
         // checking the file first made each save touch every session on disk.
-        if self.written.is_some()
-            && self.flushed == self.messages.len()
+        let settled = self.flushed == self.messages.len()
+            && self.decided == self.decisions.len()
             && self.rewound.is_none()
             && !meta_changed
-            && !summary_new
-        {
+            && !summary_new;
+        if self.written.is_some() && settled {
             return Ok(());
         }
         let _lock = Lock::take(path)?;
@@ -822,12 +873,7 @@ impl Conversation {
             self.gone = true;
             return Ok(());
         }
-        if !fresh
-            && self.flushed == self.messages.len()
-            && self.rewound.is_none()
-            && !meta_changed
-            && !summary_new
-        {
+        if !fresh && settled {
             return Ok(());
         }
 
@@ -893,6 +939,9 @@ impl Conversation {
         for message in &self.messages[self.flushed.min(self.messages.len())..] {
             push(&mut out, &Record::Message(message.clone()));
         }
+        for decision in &self.decisions[self.decided.min(self.decisions.len())..] {
+            push(&mut out, &Record::Auto(decision.clone()));
+        }
         // After the rewind and the messages, which it may have been made
         // from: before them, the rewind would take it back on replay.
         if summary_new && let Some((upto, text)) = &self.summary {
@@ -915,6 +964,7 @@ impl Conversation {
             crate::prefilter::appended(path, before, (after.len(), modified(&after)), &out);
         }
         self.flushed = self.messages.len();
+        self.decided = self.decisions.len();
         self.written = Some(meta);
         self.rewound = None;
         self.summary_saved = true;
@@ -984,6 +1034,7 @@ impl Conversation {
                     summaries.push((upto, text));
                 }
             }
+            Record::Auto(decision) => self.decisions.push(decision),
         }
     }
 
@@ -991,6 +1042,7 @@ impl Conversation {
     /// just read from, with the newest of `summaries` standing.
     fn caught_up(&mut self, mut summaries: Vec<(usize, String)>) {
         self.flushed = self.messages.len();
+        self.decided = self.decisions.len();
         self.written = Some(self.meta());
         self.summary = summaries.pop();
         self.summary_saved = true;
@@ -1007,6 +1059,7 @@ impl Conversation {
     /// all of it again when it was replaced. Whether anything changed.
     fn follow(&mut self) -> bool {
         let unsaved = self.flushed != self.messages.len()
+            || self.decided != self.decisions.len()
             || self.rewound.is_some()
             || self.written.as_ref() != Some(&self.meta())
             || (self.summary.is_some() && !self.summary_saved);
@@ -1445,7 +1498,7 @@ fn tally(summary: &mut Summary, bytes: &[u8]) {
             }
             Ok(Record::Message(_)) => summary.messages += 1,
             Ok(Record::Rewind { to }) => summary.messages = summary.messages.min(to),
-            Ok(Record::Summary { .. }) | Err(_) => {}
+            Ok(Record::Summary { .. } | Record::Auto(_)) | Err(_) => {}
         }
     }
 }
@@ -2451,14 +2504,14 @@ pub fn fill(conversation: &mut Conversation) {
     }
 }
 
-/// A session's messages as its file has them, and the summary saved of the
-/// first of them.
-pub type Contents = (Vec<Message>, Option<(usize, String)>);
+/// A session's messages as its file has them, the summary saved of the
+/// first of them, and what Auto mode's judge made of its calls.
+pub type Contents = (Vec<Message>, Option<(usize, String)>, Vec<Judged>);
 
-/// Session `id`'s messages and summary as its file has them, for filling it
-/// off the thread that holds it; None when the file cannot be read.
+/// Session `id`'s messages, summary and decisions as its file has them, for
+/// filling it off the thread that holds it; None when the file cannot be read.
 pub fn messages(id: u64) -> Option<Contents> {
-    replay(&session_path(id)).map(|conversation| (conversation.messages, conversation.summary))
+    replay(&session_path(id)).map(|c| (c.messages, c.summary, c.decisions))
 }
 
 /// The settings as the file has them now.
@@ -2755,9 +2808,9 @@ pub(crate) mod tests {
     #[cfg(unix)]
     use super::write_private;
     use super::{
-        ASIDE_STALE, Conversation, Lock, SNIPPET_SIDE, Store, Todo, Transcript, Within, apply_todo,
-        fill, load, load_listing, modified, replay, search, search_in, search_through, summaries,
-        todos_in,
+        ASIDE_STALE, Conversation, Judged, Lock, SNIPPET_SIDE, Store, Todo, Transcript, Within,
+        apply_todo, fill, load, load_listing, modified, replay, search, search_in, search_through,
+        summaries, todos_in,
     };
     use crate::chat::{Message, ToolCall};
 
@@ -3064,6 +3117,103 @@ pub(crate) mod tests {
         let hits = search_in(&dir, "hello", &Within::default(), 10);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, 7);
+    }
+
+    /// A reply from the model making calls with these ids.
+    fn calling(ids: &[&str]) -> Message {
+        Message {
+            role: "assistant".into(),
+            tool_calls: ids
+                .iter()
+                .map(|id| crate::chat::ToolCall {
+                    id: (*id).into(),
+                    name: "run_command".into(),
+                    arguments: "{}".into(),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_decision_takes_the_place_of_its_calls_result() {
+        // Models that send no ids get the same ones in every reply.
+        let mut result = said("tool", "done");
+        result.tool_call_id = "call_0".into();
+        let messages = [
+            said("user", "build it"),
+            calling(&["call_0"]),
+            result,
+            calling(&["call_0", "call_1"]),
+        ];
+        let decided = |id: &str| Judged::of(&messages, id, String::new(), String::new()).at;
+        assert_eq!(decided("call_0"), 4);
+        assert_eq!(decided("call_1"), 5);
+        assert_eq!(decided("unknown"), 4);
+    }
+
+    #[test]
+    fn judge_decisions_are_appended_and_read_back_after_a_restart() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("decisions");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        let messages = vec![said("user", "build it"), calling(&["a"])];
+        let made = Judged::of(
+            &messages,
+            "a",
+            "run_command(cargo build)".into(),
+            "auto: allowed".into(),
+        );
+        store.conversations.push(Conversation {
+            id: 1,
+            title: "judged".into(),
+            updated: 100,
+            messages,
+            decisions: vec![made.clone()],
+            ..Default::default()
+        });
+        store.save().unwrap();
+        let path = dir.join("sessions/1.jsonl");
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written
+                .lines()
+                .last()
+                .unwrap()
+                .starts_with("{\"type\":\"auto\"")
+        );
+        store.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
+
+        assert_eq!(
+            replay(&path).unwrap().decisions,
+            std::slice::from_ref(&made)
+        );
+        // Listed, opened and saved again, as a restart does, adds nothing.
+        let mut listed = load_listing();
+        fill(&mut listed.conversations[0]);
+        assert_eq!(listed.conversations[0].decisions, [made]);
+        listed.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_session_file_from_before_decisions_still_loads() {
+        let dir = scratch("undecided");
+        let path = dir.join("old.jsonl");
+        std::fs::write(
+            &path,
+            "{\"type\":\"head\",\"id\":3,\"created\":5}\n\
+             {\"type\":\"meta\",\"title\":\"old\",\"updated\":5,\"pinned\":false,\"workspace\":null,\"todos\":[]}\n\
+             {\"type\":\"message\",\"role\":\"user\",\"content\":\"one\"}\n",
+        )
+        .unwrap();
+        let back = replay(&path).unwrap();
+        assert_eq!(back.messages.len(), 1);
+        assert!(back.decisions.is_empty());
     }
 
     #[test]
@@ -5215,7 +5365,7 @@ pub(crate) mod tests {
         // Something was said before the read came back: the session now
         // holds more than its file did, and the read would lose it.
         open.messages.push(said("user", "new"));
-        open.filled_with((numbered(2).messages, None));
+        open.filled_with((numbered(2).messages, None, Vec::new()));
         assert_eq!(open.messages.len(), 1);
         assert_eq!(open.messages[0].content, "new");
 
@@ -5225,7 +5375,7 @@ pub(crate) mod tests {
             counted: 2,
             ..Default::default()
         };
-        emptied.filled_with((Vec::new(), None));
+        emptied.filled_with((Vec::new(), None, Vec::new()));
         assert!(!emptied.unfilled());
         assert_eq!(emptied.length(), 0);
     }
@@ -5668,6 +5818,31 @@ pub(crate) mod tests {
         assert_eq!(contents(&window.conversations[0]), ["0"]);
         assert!(window.follow(|_| false));
         assert_eq!(contents(&window.conversations[0]), ["0", "meanwhile"]);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_decision_the_terminal_keeps_is_followed_into_the_window() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("follow-decision");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let (mut window, mut terminal) = window_and_terminal(2);
+        let path = dir.join("sessions/1.jsonl");
+
+        let made = Judged::of(
+            &terminal.conversations[0].messages,
+            "a",
+            "run_command(cargo build)".into(),
+            "auto: allowed".into(),
+        );
+        terminal.conversations[0].decisions.push(made.clone());
+        terminal.save().unwrap();
+        assert!(window.follow(|_| false));
+        assert_eq!(window.conversations[0].decisions, [made]);
+        // Taken in as already written, so the window's save adds nothing.
+        let before = std::fs::read(&path).unwrap();
+        window.save().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 

@@ -45,10 +45,12 @@ impl Chat {
         let summary = tools::summary(&call.name, &call.arguments);
         if !waiting {
             // Calls from one reply that run together get a line each, which
-            // goes as its result comes back.
+            // goes as its result comes back; one Auto mode's judge is still
+            // deciding says so.
             let lines = running_calls(turn, self.outstanding)
                 .into_iter()
                 .map(|call| {
+                    let checking = self.judging.as_ref().is_some_and(|(id, _)| *id == call.id);
                     h_flex()
                         .gap_2()
                         .items_center()
@@ -65,6 +67,7 @@ impl Chat {
                                 .font_family(MONO_FONT)
                                 .child(tools::summary(&call.name, &call.arguments)),
                         )
+                        .when(checking, |row| row.child("checking…"))
                 });
             return Some(v_flex().gap_1().children(lines).into_any_element());
         }
@@ -303,7 +306,16 @@ impl Chat {
                                     .child(format!("In {}", folder.display())),
                             )
                         },
-                    ),
+                    )
+                    // Why Auto mode's judge left it to the user.
+                    .when_some(self.why.clone(), |this, why| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(why),
+                        )
+                    }),
             )
             .child(
                 // Scrolls only once the preview is long, so a one-line command

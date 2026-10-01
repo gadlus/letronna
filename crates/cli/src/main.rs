@@ -168,7 +168,6 @@ fn main() {
         ended: None,
         images: Vec::new(),
         voice: None,
-        decisions: Vec::new(),
     };
     letronna_core::diag::mark("listed");
     runner.match_voice();
