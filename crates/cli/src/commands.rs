@@ -2,6 +2,7 @@
 //! than of the model.
 
 use letronna_core::agents::Seen;
+use letronna_core::chat::{self, Message};
 use letronna_core::fallback::Fallback;
 use letronna_core::gate::Mode;
 use letronna_core::skills::{Skill, Source};
@@ -278,6 +279,10 @@ pub fn command(
         }
         "/branch" => {
             branch(runner, session, rest);
+            Flow::Handled
+        }
+        "/compact" => {
+            compact(runner, *session, rest);
             Flow::Handled
         }
         "/init" => {
@@ -2356,6 +2361,79 @@ fn undo(runner: &mut Runner, session: usize, workspace: Option<&std::path::Path>
     }
 }
 
+/// Summarize the session now, all but its last `rest` turns, the latest one
+/// when no number is given, and say how much smaller the next request is.
+fn compact(runner: &mut Runner, session: usize, rest: &str) {
+    let keep = match rest {
+        "" => Some(1),
+        n => n.parse::<usize>().ok().filter(|n| *n > 0),
+    };
+    render::blank();
+    let Some(keep) = keep else {
+        render::line(&render::red(
+            "Usage: /compact, or /compact 3 to keep the last three turns word for word.",
+        ));
+        return;
+    };
+    let conversation = &runner.store.conversations[session];
+    let messages = conversation.messages.clone();
+    let upto = turn_starts(&messages).nth_back(keep - 1).unwrap_or(0);
+    let floor = conversation.floor();
+    let summary = conversation.summary.as_ref().map(|(_, text)| text.clone());
+    let connection = runner.connection(session);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopped = stop.clone();
+    let label = "summarizing the earlier turns · esc to stop";
+    let done = runner.bar.busy_cancellable(label, stop, move || {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let done = chat::compact(&connection, &messages, floor, summary.as_deref(), upto);
+            let _ = sender.send(done);
+        });
+        // A request cannot hear a stop, so it is left to end on its own and
+        // what it makes goes unused.
+        loop {
+            match receiver.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(done) => return done,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    if !stopped.load(Ordering::Relaxed) => {}
+                Err(_) => return Err("Stopped, so every turn is kept as it was.".into()),
+            }
+        }
+    });
+    let done = match done {
+        Ok(done) => done,
+        Err(why) => {
+            render::line(&render::red(&why));
+            return;
+        }
+    };
+    let conversation = &mut runner.store.conversations[session];
+    let kept = turn_starts(&conversation.messages)
+        .filter(|at| *at >= done.upto)
+        .count();
+    let report = done.report();
+    if let Err(why) = conversation.compacted(done) {
+        render::line(&render::red(&why));
+        return;
+    }
+    runner.persist();
+    let kept = match kept {
+        1 => "The latest turn stays".to_owned(),
+        n => format!("The last {n} turns stay"),
+    };
+    render::line(&render::dim(&format!("{report}. {kept} word for word.")));
+}
+
+/// Where each of the session's turns starts.
+fn turn_starts(messages: &[Message]) -> impl DoubleEndedIterator<Item = usize> + '_ {
+    messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| chat::opens_turn(m))
+        .map(|(at, _)| at)
+}
+
 /// Take the session back to just before the last thing you said, and the
 /// screen with it. Returns what you said -- a command as it was typed -- or
 /// `None` when nothing has been.
@@ -2514,7 +2592,7 @@ fn branch(runner: &mut Runner, session: &mut usize, name: &str) {
         "" => format!("{} (branch)", from.title),
         name => name.to_owned(),
     };
-    let copy = store::Conversation {
+    let mut copy = store::Conversation {
         id: runner.store.reserve_id(),
         title: title.clone(),
         messages: from.messages.clone(),
@@ -2524,9 +2602,9 @@ fn branch(runner: &mut Runner, session: &mut usize, name: &str) {
         model: from.model.clone(),
         gateway: from.gateway.clone(),
         effort: from.effort.clone(),
-        summary: from.summary.clone(),
         ..Default::default()
     };
+    copy.copy_summaries(from);
     history::share(from.id, copy.id);
     runner.store.conversations.push(copy);
     *session = runner.store.conversations.len() - 1;

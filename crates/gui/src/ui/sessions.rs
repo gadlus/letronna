@@ -230,6 +230,16 @@ impl Chat {
                         cx.notify();
                         return;
                     }
+                    // Its id can be handed out again before the summary lands.
+                    if this
+                        .compacting
+                        .contains(&this.store.conversations[index].id)
+                    {
+                        this.error =
+                            Some("Wait for the summary before deleting the session.".into());
+                        cx.notify();
+                        return;
+                    }
                     // Through the store, so the session's file goes too,
                     // and its private browser and draft with it.
                     let id = this.store.conversations[index].id;

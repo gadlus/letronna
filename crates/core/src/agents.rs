@@ -60,7 +60,7 @@ use crate::chat::{Connection, Message, trim};
 use crate::driver::{self, AgentId, Allow, Outcome, Report, Spec, Status};
 use crate::inbox::{self, LINE_BREAKS, Notice, When};
 use crate::mcp_find;
-use crate::store::Transcript;
+use crate::store::{Conversation, Transcript};
 use crate::tasks::{self, Key, State, Task};
 use crate::timers::{self, TimerId};
 use crate::tools::{self, Caller, Tool, ToolContext};
@@ -483,8 +483,8 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
     }
     let def = agent_defs::find(kind, parent.workspace.as_deref())?;
     // Read before a place is taken, so a fork with nothing to start from takes none.
-    let history = if forking {
-        Some(parent_messages(caller)?)
+    let mut history = if forking {
+        Some(parent_conversation(caller)?)
     } else {
         None
     };
@@ -498,11 +498,15 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
     let waiting = if background { 0 } else { owner };
     let cancel = cancel_for(background, ctx);
     let slot = reserve(caller.root, waiting, wanted, limits.at_once, cancel.clone())?;
-    let (mut connection, first, allow) = match history {
-        Some(messages) => (
+    let (mut connection, first, allow) = match history.as_mut() {
+        Some(from) => (
             // Narrowed as any helper's is, but on its parent's model.
             child(parent, &def, Some(&parent.model), limits, slot.id),
-            forked(messages, Some(args), directive(prompt)),
+            forked(
+                std::mem::take(&mut from.messages),
+                Some(args),
+                directive(prompt),
+            ),
             // Never more than its parent may call, whatever its type allows.
             caller.allow.clone(),
         ),
@@ -527,6 +531,11 @@ fn start(args: &Value, ctx: &ToolContext, limits: &Limits) -> Result<String, Str
     }
     let from = if forking { first.len() } else { 0 };
     transcript.conversation.messages = first;
+    // Its window starts where its parent's does, so the parent's bytes lead
+    // its requests too, and a restart of it still starts there.
+    if let Some(source) = &history {
+        transcript.conversation.copy_summaries(source);
+    }
     let label = if forking { "fork" } else { def.name.as_str() };
     let sidecar = transcript.path.with_extension("json");
     Sidecar {
@@ -1452,10 +1461,11 @@ fn indented(text: &str) -> String {
     lines.join("\n")
 }
 
-/// The messages the calling agent has so far, as its own file holds them: a
-/// session's, which both front ends save before running tools, or a helper's
-/// transcript, which the driver saves before each round.
-fn parent_messages(caller: &Caller) -> Result<Vec<Message>, String> {
+/// The conversation the calling agent has so far, as its own file holds it:
+/// a session's, which both front ends save before running tools, or a
+/// helper's transcript, which the driver saves before each round. Its
+/// messages, and the summaries the user asked for, where its window starts.
+fn parent_conversation(caller: &Caller) -> Result<Conversation, String> {
     let conversation = match caller.agent {
         None => crate::store::session(caller.root),
         Some(id) => {
@@ -1465,8 +1475,7 @@ fn parent_messages(caller: &Caller) -> Result<Vec<Message>, String> {
         }
     };
     conversation
-        .map(|conversation| conversation.messages)
-        .filter(|messages| !messages.is_empty())
+        .filter(|conversation| !conversation.messages.is_empty())
         .ok_or_else(|| {
             "This conversation could not be read, so it cannot be forked. Start a helper with \
              the whole task instead."
@@ -1534,13 +1543,15 @@ fn directive(prompt: &str) -> Message {
     }
 }
 
-/// Answers `question` about a conversation from its `messages`, on a fork of
+/// Answers `question` about a conversation from its `messages`, whose window
+/// starts where the summaries the user `asked` for say, on a fork of
 /// `connection` that may call no tool and makes one request, until `cancel`
 /// stops it, giving back the reply with what it cost. Nothing it says is
 /// added to the conversation.
 pub fn btw(
     connection: &Connection,
     messages: Vec<Message>,
+    asked: Vec<(usize, String)>,
     question: &str,
     cancel: Cancel,
 ) -> Result<Message, String> {
@@ -1560,6 +1571,8 @@ pub fn btw(
     let first = forked(messages, None, aside);
     let from = first.len();
     transcript.conversation.messages = first;
+    // The session's own summaries, so the window starts where its does.
+    transcript.conversation.asked = asked;
     let model = Some(connection.model.as_str());
     let report = driver::run(Spec {
         connection: child(
@@ -3844,6 +3857,64 @@ mod tests {
     }
 
     #[test]
+    fn a_fork_of_a_session_the_user_summarized_starts_where_its_parent_does() {
+        let session = Session::new("fork-floor");
+        let (endpoint, stub) = Stub::start(vec![reply("", None), reply("Forked and done.", None)]);
+        let ctx = session.context(endpoint);
+        let parent = ctx.caller.connection.as_deref().unwrap().clone();
+        let summary = "The user pasted a log and it was read.";
+        let mut messages = vec![
+            said("user", "SUMMED-UP PASTE"),
+            said("assistant", "Read it."),
+            said("user", "What does notes.txt say? Check it two ways."),
+        ];
+        crate::compact::remember(&messages[..2], summary);
+        let extra = crate::chat::Extra {
+            floor: 2,
+            ..Default::default()
+        };
+        let events = crate::chat::start_with(parent, messages.clone(), extra);
+        while let Ok(event) = events.recv_blocking() {
+            if matches!(event, crate::chat::Event::Finished(_)) {
+                break;
+            }
+        }
+        let args = fork_args();
+        messages.extend(forking(&args));
+        std::fs::create_dir_all(crate::store::sessions_dir()).unwrap();
+        Transcript {
+            path: crate::store::sessions_dir().join("4242.jsonl"),
+            conversation: crate::store::Conversation {
+                id: 4242,
+                messages,
+                asked: vec![(2, summary.into())],
+                summary: Some((2, summary.into())),
+                ..Default::default()
+            },
+        }
+        .save()
+        .unwrap();
+        let answer = call(ctx, args).unwrap();
+        assert!(answer.contains("Forked and done."), "{answer}");
+        let sent = stub.sent();
+        let (parent, fork) = (&sent[0], &sent[1]);
+        let before = parent["messages"].as_array().unwrap();
+        let after = fork["messages"].as_array().unwrap();
+        assert_eq!(
+            serde_json::to_string(&after[..before.len()]).unwrap(),
+            serde_json::to_string(before).unwrap()
+        );
+        let fork = fork.to_string();
+        assert!(
+            fork.contains(summary) && !fork.contains("SUMMED-UP PASTE"),
+            "{fork}"
+        );
+        // Picked back up from its own file, it still starts there.
+        let kept = Transcript::open(4242, 1).unwrap().conversation;
+        assert_eq!(kept.floor(), 2);
+    }
+
+    #[test]
     fn a_fork_that_says_nothing_reports_no_answer_and_not_its_parents_words() {
         let session = Session::new("fork-silent");
         let args = fork_args();
@@ -3880,6 +3951,7 @@ mod tests {
             let answer = btw(
                 connection,
                 messages.clone(),
+                Vec::new(),
                 "what is in it?",
                 Cancel::default(),
             );
@@ -3910,7 +3982,15 @@ mod tests {
         let (endpoint, stub) = Stub::start(vec![reply("Hello, from the notes.", None)]);
         let ctx = session.context(endpoint);
         let connection = ctx.caller.connection.as_deref().unwrap();
-        let answer = btw(connection, messages, "what did it say?", Cancel::default()).unwrap();
+        let asked = Vec::new();
+        let answer = btw(
+            connection,
+            messages,
+            asked,
+            "what did it say?",
+            Cancel::default(),
+        );
+        let answer = answer.unwrap();
         assert_eq!(answer.content, "Hello, from the notes.");
         // What it cost, for the front end to show as it does a reply's.
         assert_eq!((answer.tokens, answer.prompt_tokens), (50, 1_000));

@@ -1,6 +1,6 @@
 //! Old turns, summarized instead of forgotten.
 //!
-//! The context window (`chat::window_start`) drops the oldest messages in
+//! The context window (`chat::window_from`) drops the oldest messages in
 //! steps once a conversation outgrows its budget, and whatever it dropped was
 //! simply gone: a long session lost its goal, its decisions and the files it
 //! had touched. Here the dropped messages are folded into a short summary
@@ -33,12 +33,18 @@
 //! such summary at most, made or being made, keyed by how many messages it
 //! covers and a hash of them, so one made for messages since edited or
 //! taken back is never used; without one the request asks as it did.
+//!
+//! The user can also ask for a summary up to a turn of their choosing
+//! (`manual`), which is made at once and kept like the others, marked as
+//! theirs: the window never starts before its end, so what it sums up stays
+//! out even of a window that could hold it. One that fails is an error
+//! they see, with nothing summarized, rather than a digest.
 
 use crate::chat::{Connection, Message};
 use crate::usage::Usage;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hasher};
+use std::hash::Hasher;
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -376,6 +382,62 @@ fn forget_in(prepared: &Prepared, session: u64, kept: usize) {
     prepared.settled.notify_all();
 }
 
+/// A summary of `covered` the user asked for, made now whether or not one
+/// failed a moment ago, for a model that holds `window` tokens. No digest
+/// stands in for a failure: the error is the user's to see, and nothing
+/// is summarized. With it, what the call took, or None when none was made.
+pub fn manual(
+    connection: &Connection,
+    covered: &[Message],
+    window: usize,
+) -> Result<(String, Option<Usage>), String> {
+    let mut spent = None;
+    let text = manual_in(
+        cache(),
+        covered,
+        INPUT_TOKENS.max(window),
+        |earlier, transcript| {
+            let (text, usage) = ask(connection, earlier, transcript)?;
+            spent = Some(usage);
+            Ok(text)
+        },
+    )?;
+    Ok((text, spent))
+}
+
+/// `manual`, with the cache, the most tokens read and the model call
+/// handed in.
+fn manual_in(
+    cache: &Cache,
+    covered: &[Message],
+    input: usize,
+    ask: impl FnOnce(Option<&str>, &str) -> Result<String, String>,
+) -> Result<String, String> {
+    if covered.is_empty() {
+        return Err("Nothing to summarize yet.".into());
+    }
+    let keys = keys(covered);
+    let whole = keys[covered.len()];
+    if let Some(Entry::Made(text)) = cache.lock().ok().and_then(|c| c.get(&whole).cloned()) {
+        return Ok(text);
+    }
+    let (from, earlier) = earlier_in(cache, covered, &keys);
+    // Nothing before it carries the session's start, which the window will
+    // never send again, so a cut keeps that start as well as the end.
+    let read = match earlier {
+        Some(_) => transcript(&covered[from..], input),
+        None => from_both_ends(&covered[from..], input),
+    };
+    let text = cut(ask(earlier.as_deref(), &read)?.trim(), SUMMARY_CHARS);
+    if text.is_empty() {
+        return Err("The model gave back an empty summary.".into());
+    }
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(whole, Entry::Made(text.clone()));
+    }
+    Ok(text)
+}
+
 /// `summary`, with the cache, the most tokens read, the time and the model
 /// call handed in.
 fn summary_in(
@@ -468,8 +530,10 @@ fn earlier_in(cache: &Cache, dropped: &[Message], keys: &[u64]) -> (usize, Optio
 }
 
 /// A key for every start of `messages`: `keys[n]` stands for the first `n`.
-fn keys(messages: &[Message]) -> Vec<u64> {
-    let mut hasher = DefaultHasher::new();
+/// The same in every build, since a session file keeps the key of what the
+/// user had summarized.
+pub(crate) fn keys(messages: &[Message]) -> Vec<u64> {
+    let mut hasher = Fnv::default();
     let mut keys = vec![hasher.finish()];
     for m in messages {
         for part in [&m.role, &m.content, &m.tool_call_id] {
@@ -487,9 +551,56 @@ fn keys(messages: &[Message]) -> Vec<u64> {
     keys
 }
 
+/// FNV-1a: `DefaultHasher` may change between Rust releases, and a key
+/// kept in a file has to outlive the build that wrote it.
+struct Fnv(u64);
+
+impl Default for Fnv {
+    fn default() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl Hasher for Fnv {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 = (self.0 ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+}
+
 /// The messages as the summarizer reads them, the most recent `max` tokens
 /// of them when it is longer.
 fn transcript(messages: &[Message], max: usize) -> String {
+    let out = written(messages);
+    if crate::chat::tokens(&out) <= max {
+        return out;
+    }
+    // A fence the cut goes through opens again, so what a page wrote still
+    // reads as the page's.
+    let tail = crate::untrusted::reopened(tail(&out, max).to_owned());
+    format!("[the earliest part is left out]\n{tail}")
+}
+
+/// `transcript`, but a cut keeps the start as well: as many characters of it
+/// as `max` has tokens, a quarter of `max` in English, and then the end.
+fn from_both_ends(messages: &[Message], max: usize) -> String {
+    let out = written(messages);
+    if crate::chat::tokens(&out) <= max {
+        return out;
+    }
+    let start = cut(&out, max);
+    let room = max.saturating_sub(crate::chat::tokens(&start));
+    let end = crate::untrusted::reopened(tail(&out, room).to_owned());
+    format!("{start}\n\n[the middle is left out]\n{end}")
+}
+
+/// Every message as the summarizer reads it, however long.
+fn written(messages: &[Message]) -> String {
     let mut out = String::new();
     for m in messages {
         match m.role.as_str() {
@@ -516,13 +627,7 @@ fn transcript(messages: &[Message], max: usize) -> String {
             }
         }
     }
-    if crate::chat::tokens(&out) <= max {
-        return out;
-    }
-    // A fence the cut goes through opens again, so what a page wrote still
-    // reads as the page's.
-    let tail = crate::untrusted::reopened(tail(&out, max).to_owned());
-    format!("[the earliest part is left out]\n{tail}")
+    out
 }
 
 /// The longest end of `text` estimated at no more than `max` tokens. Counted
@@ -1422,5 +1527,100 @@ mod tests {
             |_, _| panic!("asked again right after the ask it waited for failed"),
         );
         assert_eq!(again, digest);
+    }
+
+    #[test]
+    fn a_summary_asked_for_is_made_at_once_even_after_a_failure_and_then_kept() {
+        let cache = Cache::default();
+        let messages = turns(3);
+        let failed = summary_in(
+            &cache,
+            &messages[..4],
+            INPUT_TOKENS,
+            Instant::now(),
+            |_, _| Err("busy".into()),
+        );
+        assert!(failed.is_some_and(|digest| digest.contains("question 1")));
+
+        // No wait for the retry, and no digest: the model is asked.
+        let made = manual_in(
+            &cache,
+            &messages[..4],
+            INPUT_TOKENS,
+            |earlier, transcript| {
+                assert_eq!(earlier, None);
+                assert!(transcript.contains("question 0"), "{transcript}");
+                Ok("  two turns, summed up  ".into())
+            },
+        );
+        assert_eq!(made.as_deref(), Ok("two turns, summed up"));
+        // The window that later drops the same turns takes it as it is.
+        let later = summary_in(
+            &cache,
+            &messages[..4],
+            INPUT_TOKENS,
+            Instant::now(),
+            |_, _| panic!("asked again"),
+        );
+        assert_eq!(later.as_deref(), Some("two turns, summed up"));
+        // Asked for the same turns again, it is not made again either.
+        let again = manual_in(&cache, &messages[..4], INPUT_TOKENS, |_, _| {
+            panic!("asked again")
+        });
+        assert_eq!(again.as_deref(), Ok("two turns, summed up"));
+    }
+
+    #[test]
+    fn a_summary_asked_for_that_fails_is_an_error_and_leaves_nothing_behind() {
+        let cache = Cache::default();
+        let messages = turns(3);
+        let failed = manual_in(&cache, &messages[..4], INPUT_TOKENS, |_, _| {
+            Err("busy".into())
+        });
+        assert_eq!(failed, Err("busy".into()));
+        let empty = manual_in(&cache, &messages[..4], INPUT_TOKENS, |_, _| Ok("  ".into()));
+        assert!(empty.is_err());
+        assert!(manual_in(&cache, &[], INPUT_TOKENS, |_, _| panic!("asked")).is_err());
+        // No summary and no failure is remembered for the window to use.
+        assert!(cache.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_summary_asked_for_folds_in_only_what_came_after_the_last_one() {
+        let cache = Cache::default();
+        let messages = turns(3);
+        remember_in(&cache, &messages[..2], "the first turn");
+        let made = manual_in(
+            &cache,
+            &messages[..4],
+            INPUT_TOKENS,
+            |earlier, transcript| {
+                assert_eq!(earlier, Some("the first turn"));
+                assert!(!transcript.contains("question 0"), "{transcript}");
+                assert!(transcript.starts_with("User: question 1"), "{transcript}");
+                Ok("two turns".into())
+            },
+        );
+        assert_eq!(made.as_deref(), Ok("two turns"));
+    }
+
+    #[test]
+    fn a_summary_asked_for_after_a_failure_keeps_the_sessions_start_when_cut() {
+        let cache = Cache::default();
+        let mut messages = turns(40);
+        messages[0].content = format!("question 0, the goal {}", "x".repeat(400));
+        let failed = summary_in(&cache, &messages[..78], 300, Instant::now(), |_, _| {
+            Err("busy".into())
+        });
+        assert!(failed.is_some());
+        let made = manual_in(&cache, &messages[..78], 300, |earlier, transcript| {
+            assert_eq!(earlier, None);
+            assert!(transcript.starts_with("User: question 0, the goal"));
+            assert!(transcript.contains("[the middle is left out]"));
+            assert!(transcript.contains("answer 38"), "{transcript}");
+            assert!(crate::chat::tokens(transcript) <= 320, "{transcript}");
+            Ok("forty turns".into())
+        });
+        assert_eq!(made.as_deref(), Ok("forty turns"));
     }
 }
