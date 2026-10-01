@@ -58,6 +58,7 @@ use crate::budget::{Budget, short};
 use crate::cancel::Cancel;
 use crate::chat::{Connection, Message, trim};
 use crate::driver::{self, AgentId, Allow, Outcome, Report, Spec, Status};
+use crate::gate::Mode;
 use crate::inbox::{self, LINE_BREAKS, Notice, When};
 use crate::mcp_find;
 use crate::store::{Conversation, Transcript};
@@ -1315,12 +1316,13 @@ fn child(
         .or(setting)
         .unwrap_or(&parent.model)
         .to_owned();
+    let mode = helper_mode(parent, def.plan);
     Connection {
         model,
-        // Only ever narrowed: a session in plan mode keeps its helpers in it,
-        // whatever their type says.
-        plan: parent.plan || def.plan,
+        mode,
+        plan: helper_plan(parent, def.plan, mode),
         conversation: id,
+        session_model: parent.judge_model().to_owned(),
         ..parent.clone()
     }
 }
@@ -1397,6 +1399,22 @@ pub fn on_end(hook: fn(u64, &str)) {
 /// as a run of it ends, in place of any hook set before.
 pub fn on_idle(hook: fn(u64, &str)) {
     *ON_IDLE.lock().unwrap_or_else(PoisonError::into_inner) = Some(hook);
+}
+
+/// The mode a helper of `parent` runs in, `plan` when its type or its start
+/// put it in plan mode: only ever narrowed from the parent's, and never
+/// Bypass.
+pub(crate) fn helper_mode(parent: &Connection, plan: bool) -> Mode {
+    // A connection put in plan mode by the flag alone is in Plan all the same.
+    let from = if parent.plan { Mode::Plan } else { parent.mode };
+    Mode::narrow(from, if plan { Mode::Plan } else { from })
+}
+
+/// Whether a helper in `mode` of `parent` is held to plan mode's tools:
+/// when either one is, whichever mode won. A plan type under a Don't ask
+/// session keeps Don't ask's refusals and plan mode's tools both.
+pub(crate) fn helper_plan(parent: &Connection, plan: bool, mode: Mode) -> bool {
+    plan || parent.plan || mode == Mode::Plan
 }
 
 /// The tools a helper may use, in the order it is offered them: those its
@@ -2211,14 +2229,17 @@ fn rerun(
 ) -> Spec {
     let (fork, from) = (what.fork, what.from);
     let allowed = what.allow.clone();
+    // Only ever narrowed, as when it started.
+    let mode = helper_mode(sender, what.plan);
     let connection = Connection {
         model: what.model,
-        // Only ever narrowed, as when it started.
-        plan: sender.plan || what.plan,
+        mode,
+        plan: helper_plan(sender, what.plan, mode),
         workspace: (what.worktree.as_ref())
             .map(Worktree::workspace)
             .or_else(|| sender.workspace.clone()),
         conversation: claimed.slot.id,
+        session_model: sender.judge_model().to_owned(),
         ..sender.clone()
     };
     let tools = usable(&connection, def);
@@ -2939,6 +2960,50 @@ mod tests {
     }
 
     #[test]
+    fn a_helper_runs_in_its_parents_mode_narrowed_and_never_bypass() {
+        let def = |plan| AgentDef {
+            name: "t".into(),
+            plan,
+            ..Default::default()
+        };
+        let parent = |mode| Connection {
+            mode,
+            plan: mode == Mode::Plan,
+            human: true,
+            typed: vec!["fix the tests".to_owned()].into(),
+            conversation: 7,
+            ..Default::default()
+        };
+        for (parents, types, helpers, planning) in [
+            (Mode::Bypass, false, Mode::Auto, false),
+            (Mode::Bypass, true, Mode::Plan, true),
+            (Mode::Auto, false, Mode::Auto, false),
+            (Mode::AcceptEdits, false, Mode::AcceptEdits, false),
+            (Mode::AcceptEdits, true, Mode::Plan, true),
+            (Mode::Default, false, Mode::Default, false),
+            (Mode::Plan, false, Mode::Plan, true),
+            // Neither is inside the other, so the parent's mode holds, and
+            // the type's plan flag with it.
+            (Mode::DontAsk, true, Mode::DontAsk, true),
+            (Mode::DontAsk, false, Mode::DontAsk, false),
+        ] {
+            let helper = child(&parent(parents), &def(types), None, &usual(), FIRST_ID);
+            let seen = (helper.mode, helper.plan);
+            assert_eq!(seen, (helpers, planning), "{parents:?} {types}");
+            // What changes things is offered only outside plan mode.
+            let tools = usable(&helper, &def(types));
+            assert_eq!(
+                tools.contains(&"write_file".to_owned()),
+                !planning,
+                "{parents:?} {types}: {tools:?}"
+            );
+            // Who can answer and what the user typed go with it, for its gate.
+            assert!(helper.human);
+            assert_eq!(&*helper.typed, ["fix the tests".to_owned()]);
+        }
+    }
+
+    #[test]
     fn a_helper_can_only_narrow_plan_mode() {
         let def = |plan| AgentDef {
             name: "t".into(),
@@ -2991,6 +3056,34 @@ mod tests {
         assert_eq!(model(Some("call-model"), &typed), "call-model");
         assert_eq!(model(None, &typed), "type-model");
         assert_eq!(model(None, &def(false)), "setting-model");
+        // Whatever model it works on, the session's own judges its calls,
+        // and its own helpers' too.
+        let helper = child(&parent(false), &typed, Some("call-model"), &limits, 1);
+        assert_eq!(helper.judge_model(), "parent-model");
+        let nested = child(&helper, &def(false), None, &limits, 2);
+        assert_eq!(
+            (nested.model.as_str(), nested.judge_model()),
+            ("setting-model", "parent-model")
+        );
+    }
+
+    #[test]
+    fn a_helper_started_after_a_mode_switch_narrows_from_the_new_mode() {
+        let def = AgentDef {
+            name: "t".into(),
+            ..Default::default()
+        };
+        let mut session = Connection {
+            mode: Mode::Auto,
+            ..Default::default()
+        };
+        session.switch_to(Mode::Plan);
+        let helper = child(&session, &def, None, &usual(), FIRST_ID);
+        assert_eq!((helper.mode, helper.plan), (Mode::Plan, true));
+        assert!(!usable(&helper, &def).contains(&"write_file".to_owned()));
+        session.switch_to(Mode::Bypass);
+        let helper = child(&session, &def, None, &usual(), FIRST_ID);
+        assert_eq!((helper.mode, helper.plan), (Mode::Auto, false));
     }
 
     #[test]

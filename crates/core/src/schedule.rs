@@ -919,6 +919,12 @@ fn open(job: &Schedule) -> Result<Spec, String> {
         conversation: 0,
         unattended: true,
         wrap_up: false,
+        // Its calls are decided by `decide` in its own mode; its helpers'
+        // narrow from it, and ask nobody unless it is Default.
+        mode: job.mode,
+        human: job.mode == Mode::Default,
+        typed: [job.prompt.clone()].into(),
+        session_model: settings.model.clone(),
     };
     // Before the session is made, so a run that cannot start leaves none.
     backend::validate(&connection)?;

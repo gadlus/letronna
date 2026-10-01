@@ -475,12 +475,12 @@ impl Turn {
     }
 
     /// The calls at the front of the queue that may run at once, at most
-    /// `max`, left queued until `finish_id` records each.
-    /// `gate` says whether a call must wait for the user, from the whole call.
-    pub fn next_batch(&self, gate: impl Fn(&ToolCall) -> bool, max: usize) -> Vec<ToolCall> {
+    /// `max`, up to the first one `held` says the gate does not run as it
+    /// stands; left queued until `finish_id` records each.
+    pub fn next_batch(&self, held: impl Fn(&ToolCall) -> bool, max: usize) -> Vec<ToolCall> {
         self.queue
             .iter()
-            .take_while(|call| tools::concurrent(&call.name) && !gate(call))
+            .take_while(|call| tools::concurrent(&call.name) && !held(call))
             .take(max)
             .cloned()
             .collect()
@@ -722,8 +722,7 @@ mod tests {
             effort: String::new(),
             search: false,
             conversation: 0,
-            unattended: false,
-            wrap_up: false,
+            ..Default::default()
         })
     }
 

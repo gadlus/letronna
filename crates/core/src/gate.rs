@@ -174,8 +174,8 @@ impl Mode {
     }
 
     /// The mode a helper started from a session in `parent` runs in, when
-    /// it asks for `wanted`: never more than the parent lets through, and
-    /// the parent's own when one is Plan and the other Don't ask.
+    /// it asks for `wanted`: never more than the parent lets through nor
+    /// Bypass, and the parent's own when one is Plan and the other Don't ask.
     pub fn narrow(parent: Mode, wanted: Mode) -> Mode {
         // Neither of those is inside the other: Plan asks for a fetch that
         // Don't ask refuses, and Don't ask runs an allowed write that Plan
@@ -186,11 +186,11 @@ impl Mode {
         ) {
             return parent;
         }
-        // Helpers run unseen, several at once, so they never bypass. A
-        // Bypass parent's are to run in Auto once the judge lands (auto-mode
-        // step 11); until then they run in Default.
+        // Helpers run unseen, several at once, so they never bypass: a
+        // Bypass parent's run in Auto, where the judge looks at what would
+        // ask.
         let ceiling = if parent == Mode::Bypass {
-            Mode::Default
+            Mode::Auto
         } else {
             parent
         };
@@ -549,6 +549,19 @@ fn ladder(
             Outcome::Ask
         } else {
             Outcome::Run
+        };
+    }
+    // A workflow sets many helpers off at once, so a person looks at its
+    // card in every mode: no setting, grant, rule or judge starts one.
+    if tool.name() == "workflow" {
+        return if gate.human {
+            Outcome::Ask
+        } else {
+            Outcome::Refuse(
+                "Refused: a workflow starts only with the user's yes, and nobody is \
+                 here to give it. Do the work another way, or say what was left undone."
+                    .into(),
+            )
         };
     }
     // A rules file that cannot be read could deny this call, so no setting,
@@ -1761,6 +1774,35 @@ mod tests {
     }
 
     #[test]
+    fn a_workflow_waits_for_a_person_in_every_mode() {
+        let ctx = ToolContext::default();
+        let granted = Grants::from([(0, HashSet::from(["workflow".to_owned()]))]);
+        let launch = call("workflow", serde_json::json!({ "script": "x" }));
+        let unasked = |_: &ToolCall, _: &str| -> Verdict { panic!("the judge was asked") };
+        for mode in [Mode::Default, Mode::AcceptEdits, Mode::Auto, Mode::Bypass] {
+            for human in [true, false] {
+                let gate = Gate {
+                    ctx: &ctx,
+                    mode,
+                    grants: &granted,
+                    rules: &[],
+                    broken: None,
+                    human,
+                };
+                let outcome = decide_with(&launch, &gate, Some(&unasked), false);
+                if human {
+                    assert_eq!(outcome, Outcome::Ask, "{mode:?}");
+                } else {
+                    assert!(
+                        matches!(outcome, Outcome::Refuse(_)),
+                        "{mode:?}: {outcome:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_deny_rule_beats_a_session_grant() {
         let rules = [Rule {
             tool: "run_command".into(),
@@ -2497,10 +2539,16 @@ mod tests {
                 assert_ne!(narrowed, Mode::Bypass);
             }
         }
-        // Helpers reach the judge with auto-helpers; until then a Bypass
-        // parent's ask.
-        assert_eq!(Mode::narrow(Mode::Bypass, Mode::Bypass), Mode::Default);
+        // A Bypass parent's helpers run in Auto, or in less if they ask for it.
+        assert_eq!(Mode::narrow(Mode::Bypass, Mode::Bypass), Mode::Auto);
+        assert_eq!(Mode::narrow(Mode::Bypass, Mode::Auto), Mode::Auto);
+        assert_eq!(
+            Mode::narrow(Mode::Bypass, Mode::AcceptEdits),
+            Mode::AcceptEdits
+        );
         assert_eq!(Mode::narrow(Mode::Bypass, Mode::Plan), Mode::Plan);
+        assert_eq!(Mode::narrow(Mode::Auto, Mode::Auto), Mode::Auto);
+        assert_eq!(Mode::narrow(Mode::Default, Mode::Auto), Mode::Default);
         assert_eq!(
             Mode::narrow(Mode::AcceptEdits, Mode::Bypass),
             Mode::AcceptEdits

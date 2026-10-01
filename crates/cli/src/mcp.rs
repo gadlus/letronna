@@ -369,6 +369,7 @@ fn turn(prompt: &str, yes: bool) -> Result<String, String> {
         allowed: Default::default(),
         mode: if yes { Mode::Bypass } else { Mode::Default },
         human: false,
+        helpers_answered: false,
         trouble: None,
         bar: Bar::new(String::new()),
         stopped: false,

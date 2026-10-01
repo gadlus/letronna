@@ -41,6 +41,7 @@ pub use runlog::{Event, LogEntry};
 pub use tool::{pause, resume, retry, run, run_log, runs, skip, transcript};
 
 use crate::agent_defs::{self, AgentDef};
+use crate::agents;
 use crate::budget::{Budget, short};
 use crate::cancel::{Cancel, Waker};
 use crate::chat::{self, Connection, Message};
@@ -491,14 +492,23 @@ impl Run {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let (settings, _) = crate::store::settings();
         let helper_model = (!settings.helper_model.is_empty()).then_some(settings.helper_model);
+        let mode = agents::helper_mode(&self.connection, def.plan);
         let mut connection = Connection {
             model: (asked.model.or(def.model.clone()).or(helper_model))
                 .unwrap_or_else(|| self.connection.model.clone()),
             effort: (asked.effort.or(def.effort.clone()))
                 .unwrap_or_else(|| self.connection.effort.clone()),
             // Only ever narrowed, as a helper's is.
-            plan: self.connection.plan || def.plan,
+            mode,
+            plan: agents::helper_plan(&self.connection, def.plan, mode),
+            // What the user asked for launched the run, so the judge reads
+            // that and never a script's prompt.
+            typed: [self.request.clone()]
+                .into_iter()
+                .filter(|request| !request.is_empty())
+                .collect(),
             conversation: id,
+            session_model: self.connection.judge_model().to_owned(),
             ..self.connection.clone()
         };
         let tools = usable(&connection, &def);
@@ -1089,6 +1099,7 @@ fn indented(text: &str) -> String {
 mod tests {
     use super::journal::{canonical, key};
     use super::*;
+    use crate::gate::Mode;
     use crate::store::tests::Scratch;
     use serde_json::json;
     use std::io::Read;
@@ -2160,5 +2171,61 @@ mod tests {
             ["List the files.", "Review List the files. -> done."]
         );
         assert_eq!(states(&run.board), [Done, Done, Replayed]);
+    }
+
+    #[test]
+    fn a_workflow_agent_is_gated_in_its_sessions_mode_narrowed_on_the_request() {
+        let data = Data::new("gated");
+        // Each agent's task, and the mode, plan flag, intent and judge model
+        // it ran with.
+        type Seen = (String, Mode, bool, Vec<String>, String);
+        let seen: Arc<Mutex<Vec<Seen>>> = Arc::default();
+        let log = seen.clone();
+        let mut run = data.run(
+            None,
+            Box::new(move |spec, then| {
+                let task = asked(&spec);
+                let connection = &spec.connection;
+                let typed = connection.typed.to_vec();
+                let judge = connection.judge_model().to_owned();
+                log.lock().unwrap().push((
+                    task.clone(),
+                    connection.mode,
+                    connection.plan,
+                    typed,
+                    judge,
+                ));
+                std::thread::spawn(move || then(&done(&task)));
+                Ok(())
+            }),
+        );
+        // A session running everything, where the user said more than once.
+        run.connection.mode = Mode::Bypass;
+        run.connection.model = "session-model".into();
+        run.connection.typed = vec!["earlier".to_owned(), "later".to_owned()].into();
+        run.request = "Tidy the docs.".into();
+        let weaker = json!({"model": "weak-model"});
+        run.agent("Fix a.rs.", &weaker).unwrap();
+        run.agent("Read b.rs.", &explore()).unwrap();
+        let (_run, done) = steps(run, usize::MAX);
+        assert_eq!(done.len(), 2);
+
+        let mut seen = seen.lock().unwrap().clone();
+        seen.sort_by(|a, b| a.0.cmp(&b.0));
+        let asked = vec!["Tidy the docs.".to_owned()];
+        let by = "session-model".to_owned();
+        assert_eq!(
+            seen,
+            [
+                (
+                    "Fix a.rs.".into(),
+                    Mode::Auto,
+                    false,
+                    asked.clone(),
+                    by.clone()
+                ),
+                ("Read b.rs.".into(), Mode::Plan, true, asked, by),
+            ]
+        );
     }
 }

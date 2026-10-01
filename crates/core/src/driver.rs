@@ -3,15 +3,17 @@
 //! A helper, a `letronna -p` run or a workflow's agent has nobody watching it
 //! stream and nobody to click a card, so this is one more caller of
 //! `agent::Turn` beside the window and the terminal: the same loop, with the
-//! parts that need a person swapped for what works without one. Every call
-//! is put to the gate first, as the window's and the terminal's own are, so
-//! the floor and the user's deny rules hold for a tool that needs no yes
-//! too; one that still needs a yes goes to `approvals`, where the session's
-//! own rules or its user answer it; a question is refused with advice,
-//! since nobody is there to answer it; the checklist is kept on the agent's
-//! transcript; the browser is used unseen, with no panel to open; and
-//! messages sent meanwhile are read from the inbox after each batch of
-//! results and before the run counts as done.
+//! parts that need a person swapped for what works without one. Each call
+//! goes through the whole gate in the agent's own mode, narrowed from its
+//! session's: the floor, the user's rules and what was allowed for the run,
+//! and in Auto mode the judge, on the agent's own thread and connection, so
+//! judges run side by side and off every screen. Only a call that still
+//! needs a yes goes to `approvals`, where the user answers it, with why the
+//! gate could not; a question is refused with advice, since nobody is there
+//! to answer it; the checklist is kept on the agent's transcript; the
+//! browser is used unseen, with no panel to open; and messages sent
+//! meanwhile are read from the inbox after each batch of results and before
+//! the run counts as done.
 //!
 //! A frontend that shows the run as it goes, as an editor does over ACP,
 //! gives it a `Watch`, which hears each step as it is made. A run that is a
@@ -41,8 +43,9 @@ use crate::approvals;
 use crate::budget::Budget;
 use crate::cancel::Cancel;
 use crate::chat::{self, Connection, Event, Extra, Message, ToolCall};
-use crate::gate::{Gate, Grants, Mode};
+use crate::gate::{self, Gate, Grants, Layer};
 use crate::inbox::{self, Notice, When};
+use crate::judge;
 use crate::limits::{self, Permit};
 use crate::permissions::{self, Rule};
 use crate::store::{Todo, Transcript};
@@ -50,6 +53,7 @@ use crate::structured;
 use crate::tasks::{self, Key};
 use crate::tools::{self, Caller, ToolContext};
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -405,7 +409,7 @@ fn steps(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result<Outcom
 /// Works through one reply's calls, running together the ones that may, then
 /// hands back their results and any mail that cannot wait, leaving early at a stop.
 fn work_through(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result<(), String> {
-    // Read once a reply, so a rule the user adds holds from the next one.
+    // Read once a reply, so a rule the user keeps meanwhile holds from the next.
     let rules = permissions::load(&permissions::user_file());
     loop {
         if spec.cancel.is_set() {
@@ -420,22 +424,13 @@ fn work_through(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result
             }
             Some(decide(call, &context(spec)))
         };
-        // A tool allowed for the whole run would get its yes at once from
-        // `approvals::ask`, so it counts as allowed here and can join a batch.
-        let waits = |call: &ToolCall| match decide(call) {
-            Some(outcome) => outcome != crate::gate::Outcome::Run,
-            None => match gated(spec, call, &rules) {
-                crate::gate::Outcome::Run => false,
-                // A grant covers the tool, not a call it does not clear, such as a
-                // read of a secret file.
-                crate::gate::Outcome::Ask => {
-                    !(approvals::granted(spec.run, &call.name)
-                        && crate::gate::cleared(call, &context(spec)))
-                }
-                crate::gate::Outcome::Sandboxed | crate::gate::Outcome::Refuse(_) => true,
-            },
+        // Only what the gate runs as the call stands joins a batch; one it
+        // would put to the judge or the user, or refuse, is taken alone.
+        let held = |call: &ToolCall| {
+            let outcome = decide(call).unwrap_or_else(|| gated(spec, call, &rules, false).0);
+            outcome != gate::Outcome::Run
         };
-        let batch = turn.next_batch(waits, MAX_BATCH);
+        let batch = turn.next_batch(held, MAX_BATCH);
         if !batch.is_empty() {
             for call in &batch {
                 tell(spec, Step::Running(call.id.clone()));
@@ -448,12 +443,14 @@ fn work_through(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result
             }
             continue;
         }
-        let gate = |call: &ToolCall| match decide(call) {
-            Some(outcome) if call_refusal(spec, call).is_none() => outcome,
-            // A call this agent may not make runs into its refusal in `dispatch`.
-            _ => gated(spec, call, &rules),
+        let (outcome, layer) = match turn.front() {
+            Some(call) => match decide(call) {
+                Some(outcome) if call_refusal(spec, call).is_none() => (outcome, None),
+                _ => gated(spec, call, &rules, true),
+            },
+            None => (gate::Outcome::Run, None),
         };
-        let outcome = match turn.next(gate) {
+        let outcome = match turn.next(|_| outcome.clone()) {
             Next::Done => return Ok(()),
             Next::Ask => {
                 keep_results(spec, turn.take_results());
@@ -471,22 +468,33 @@ fn work_through(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result
                 }
                 return save(&mut spec.transcript);
             }
-            Next::Run(call) => dispatch(spec, &call, report, false),
-            Next::Sandboxed(call) => dispatch(spec, &call, report, true),
+            Next::Run(call) => dispatch(spec, &call, false, report, false),
+            Next::Sandboxed(call) => dispatch(spec, &call, false, report, true),
             Next::Refuse(_, why) => Some(Err(why)),
             Next::AskUser(call) => {
-                match approvals::ask(spec.root, spec.run, &spec.label, &call, &context(spec)) {
-                    Ok(allowed) => {
-                        let call = match allowed.arguments {
-                            // Only what was agreed to runs, never the model's own.
-                            Some(arguments) => ToolCall { arguments, ..call },
-                            None => call,
-                        };
-                        dispatch(spec, &call, report, allowed.sandboxed)
-                    }
+                // Only the judge's word says why, when it was unsure.
+                let why = layer.as_ref().map(Layer::tag).unwrap_or_default();
+                let (ctx, lasting) = (context(spec), lasting(spec, &call, &rules));
+                match approvals::ask(spec.root, spec.run, &spec.label, &call, &ctx, &why, lasting) {
+                    // Only what was agreed to runs, never the model's own,
+                    // and a yes to the model's call is none to a changed one.
+                    Ok(allowed) => match allowed.arguments {
+                        None => dispatch(spec, &call, true, report, allowed.sandboxed),
+                        Some(arguments) => {
+                            let changed = ToolCall { arguments, ..call };
+                            dispatch(spec, &changed, false, report, allowed.sandboxed)
+                        }
+                    },
                     Err(_) if spec.cancel.is_set() => None,
-                    Err(why) if why.is_empty() => Some(Err(NOT_APPROVED.into())),
-                    Err(why) => Some(Err(format!("{NOT_APPROVED} {why}"))),
+                    Err(why) => {
+                        // So the same call from any agent of the run asks
+                        // again rather than being judged afresh.
+                        judge::stop(&call, &spec.connection.typed, spec.run);
+                        match why.as_str() {
+                            "" => Some(Err(NOT_APPROVED.into())),
+                            why => Some(Err(format!("{NOT_APPROVED} {why}"))),
+                        }
+                    }
                 }
             }
         };
@@ -497,11 +505,87 @@ fn work_through(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result
     }
 }
 
-/// Makes one call the way this agent may, inside the OS sandbox when
-/// `sandboxed`, or gives None when a stop came before it began.
+/// What the gate makes of `call` from this agent: in the agent's own mode,
+/// with `rules`, the user's, and what was allowed for its run or by its
+/// session. `judged` puts what would ask to Auto mode's judge, on the
+/// session's own model and given what the user typed in its session, with
+/// the judge's word; otherwise the judge is never waited on.
+fn gated(
+    spec: &Spec,
+    call: &ToolCall,
+    rules: &Result<Vec<Rule>, String>,
+    judged: bool,
+) -> (gate::Outcome, Option<Layer>) {
+    // Not a tool: `dispatch` checks the answer instead.
+    if call.name == STRUCTURED_OUTPUT && spec.schema.is_some() {
+        return (gate::Outcome::Run, None);
+    }
+    if let Some(refused) = call_refusal(spec, call) {
+        return (gate::Outcome::Refuse(refused), None);
+    }
+    let ctx = context(spec);
+    let yes = approvals::granted(spec.run, call, &ctx)
+        || approvals::allowed_by_session(spec.root, call, &ctx);
+    let grants = granting(&ctx, call, yes);
+    let gate = gate_of(spec, &ctx, rules, &grants);
+    if !judged {
+        return (gate::decide(call, &gate), None);
+    }
+    // The session's own model judges, never one a helper's caller picked,
+    // and what the judge keeps, a No and the limits on denials, holds for
+    // the whole run rather than one helper.
+    let judging = Connection {
+        model: spec.connection.judge_model().to_owned(),
+        conversation: spec.run,
+        ..spec.connection.clone()
+    };
+    gate::settle(call, &gate, &judging, &spec.connection.typed)
+}
+
+/// Whether a yes to `call` for the run would let the gate run the calls it
+/// covers, as a grant does; not where the floor, an ask rule or a rules file
+/// that cannot be read asks every time.
+fn lasting(spec: &Spec, call: &ToolCall, rules: &Result<Vec<Rule>, String>) -> bool {
+    let ctx = context(spec);
+    let grants = granting(&ctx, call, true);
+    gate::decide(call, &gate_of(spec, &ctx, rules, &grants)) == gate::Outcome::Run
+}
+
+/// `call` allowed in `ctx`'s conversation when `yes`, as a yes for the run
+/// counts: after the floor and the rules, before the judge, and kept as the
+/// session's own grant keeps it, by `gate::grant`.
+fn granting(ctx: &ToolContext, call: &ToolCall, yes: bool) -> Grants {
+    let mut grants = Grants::new();
+    if yes {
+        grants.insert(ctx.conversation, HashSet::from([gate::grant(call)]));
+    }
+    grants
+}
+
+/// The gate for this agent's calls in `ctx`, with `rules` and `grants`.
+fn gate_of<'a>(
+    spec: &Spec,
+    ctx: &'a ToolContext,
+    rules: &'a Result<Vec<Rule>, String>,
+    grants: &'a Grants,
+) -> Gate<'a> {
+    Gate {
+        ctx,
+        mode: spec.connection.mode,
+        grants,
+        rules: rules.as_deref().unwrap_or_default(),
+        broken: rules.as_ref().err().map(String::as_str),
+        human: spec.connection.human,
+    }
+}
+
+/// Makes one call the way this agent may, `approved` when the user said yes
+/// to it on its card and inside the OS sandbox when `sandboxed`, or gives
+/// None when a stop came before it began.
 fn dispatch(
     spec: &mut Spec,
     call: &ToolCall,
+    approved: bool,
     report: &mut Report,
     sandboxed: bool,
 ) -> Option<Result<String, String>> {
@@ -525,6 +609,7 @@ fn dispatch(
         return Some(outcome);
     }
     let ctx = ToolContext {
+        approved,
         sandboxed,
         ..context(spec)
     };
@@ -611,34 +696,6 @@ fn refused(spec: &Spec, name: &str) -> Option<String> {
             Some(format!("`{name}` is not available in a scheduled run."))
         }
         _ => None,
-    }
-}
-
-/// What the gate makes of this agent's `call` under the user's `rules`,
-/// except that a tool needing a yes still goes to `approvals` rather than run.
-fn gated(spec: &Spec, call: &ToolCall, rules: &Result<Vec<Rule>, String>) -> crate::gate::Outcome {
-    // A call this agent may not make runs into its refusal in `dispatch`,
-    // and its answer is no tool the gate knows.
-    let answer = call.name == STRUCTURED_OUTPUT && spec.schema.is_some();
-    if answer || call_refusal(spec, call).is_some() {
-        return crate::gate::Outcome::Run;
-    }
-    let ctx = context(spec);
-    // The session's mode and what its user allowed are known where the
-    // approval is answered. The default mode refuses only what every mode
-    // does, and with someone to ask what the floor holds back waits for
-    // `approvals` too, which says no at once when nobody is serving.
-    let gate = Gate {
-        ctx: &ctx,
-        mode: Mode::Default,
-        grants: &Grants::new(),
-        rules: rules.as_deref().unwrap_or_default(),
-        broken: rules.as_ref().err().map(String::as_str),
-        human: true,
-    };
-    match crate::gate::decide(call, &gate) {
-        crate::gate::Outcome::Run if tools::needs_approval(&call.name) => crate::gate::Outcome::Ask,
-        outcome => outcome,
     }
 }
 
@@ -964,6 +1021,7 @@ fn save(transcript: &mut Transcript) -> Result<(), String> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::gate::Mode;
     use crate::inbox::When;
     use crate::store::Conversation;
     use crate::store::tests::Scratch;
@@ -1160,6 +1218,12 @@ pub(crate) mod tests {
             .filter(|message| message["role"] == "tool")
             .map(|message| message["content"].as_str().unwrap())
             .collect()
+    }
+
+    /// A command's output as words on one line: PowerShell's `echo` puts
+    /// each word on a line of its own, where sh's keeps them on one.
+    fn words(output: &str) -> String {
+        output.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
     /// The records in a transcript file, in the order they were written.
@@ -1515,24 +1579,29 @@ pub(crate) mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let dir = scratch("fetches");
         let id = AGENTS + 90;
-        // What answering a card with "allow for this run" leaves behind.
+        let pages = TcpListener::bind("127.0.0.1:0").unwrap();
+        let site = format!("http://{}", pages.local_addr().unwrap());
+        // What answering a card with "allow for this run" leaves behind, for
+        // the site's host.
         let requests = approvals::serve();
         let earlier = ToolCall {
             id: "earlier".into(),
             name: "web_fetch".into(),
-            arguments: "{}".into(),
+            arguments: json!({"url": format!("{site}/earlier")}).to_string(),
         };
-        let asked = std::thread::spawn(move || {
-            approvals::ask(7, id, "helper", &earlier, &ToolContext::default())
-        });
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let asked =
+            std::thread::spawn(move || approvals::ask(7, id, "helper", &earlier, &ctx, "", true));
         let request = requests.recv_timeout(WAIT).unwrap();
+        assert_eq!(request.for_run(), Some("127.0.0.1"));
         request.answer(approvals::Decision::ForRun);
         assert!(asked.join().unwrap().is_ok());
 
         // Both requests are taken before either is answered, so fetches made
         // one after another fail: the first waits out its timeout unanswered.
-        let pages = TcpListener::bind("127.0.0.1:0").unwrap();
-        let site = format!("http://{}", pages.local_addr().unwrap());
         std::thread::spawn(move || {
             let mut asked = Vec::new();
             for _ in 0..2 {
@@ -1747,7 +1816,7 @@ pub(crate) mod tests {
             arguments: "{}".into(),
         };
         let asked = std::thread::spawn(move || {
-            approvals::ask(7, id, "helper", &earlier, &ToolContext::default())
+            approvals::ask(7, id, "helper", &earlier, &ToolContext::default(), "", true)
         });
         let request = requests.recv_timeout(WAIT).unwrap();
         request.answer(approvals::Decision::ForRun);
@@ -2582,5 +2651,313 @@ pub(crate) mod tests {
         provider.sent();
 
         assert_eq!((report.status, report.value), (Outcome::Done, Some(given)));
+    }
+
+    /// `provider`, that also answers each request from Auto mode's judge,
+    /// which streams nothing: with the code the judge was given and then
+    /// `verdict`, or, for `None`, with no code, as a confused judge would.
+    fn judged(replies: Vec<String>, verdict: Option<&'static str>) -> (String, Stub) {
+        judged_in_turn(replies, vec![verdict])
+    }
+
+    /// `judged`, with the judge giving `verdicts` in turn, then the last again.
+    fn judged_in_turn(replies: Vec<String>, verdicts: Vec<Option<&'static str>>) -> (String, Stub) {
+        let (server, endpoint) = listen();
+        let address = server.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let mut replies = replies.into_iter();
+            let (mut verdicts, mut verdict) = (verdicts.into_iter(), None);
+            let mut sent = Vec::new();
+            while replies.len() > 0 {
+                let (mut socket, _) = server.accept().unwrap();
+                let body = request(&mut socket);
+                if body["stream"] == false {
+                    verdict = verdicts.next().unwrap_or(verdict);
+                    let prompt = body["messages"][1]["content"].as_str().unwrap();
+                    let code = prompt.strip_prefix("Code: ").unwrap();
+                    let code = code.split_whitespace().next().unwrap();
+                    let said =
+                        verdict.map_or("ALLOW".into(), |verdict| format!("{code} {verdict}"));
+                    let said = json!({"choices": [{"message": {"content": said}}]});
+                    answer(&mut socket, &said.to_string());
+                } else if let Some(reply) = replies.next() {
+                    answer(&mut socket, &reply);
+                }
+                sent.push(body);
+            }
+            sent
+        });
+        (endpoint, Stub { address, worker })
+    }
+
+    /// A helper of a session in Auto mode, where the user typed `typed`.
+    fn in_auto(endpoint: String, dir: &Path, id: AgentId, typed: &str) -> Spec {
+        let mut spec = spec(endpoint, dir, id);
+        spec.connection.mode = crate::gate::Mode::Auto;
+        spec.connection.human = true;
+        spec.connection.typed = vec![typed.to_owned()].into();
+        spec
+    }
+
+    fn command(line: &str) -> (&'static str, Value) {
+        ("run_command", json!({"command": line}))
+    }
+
+    #[test]
+    fn a_helper_in_auto_runs_what_the_judge_allows_on_what_the_user_typed() {
+        let dir = scratch("judge-allows");
+        let (endpoint, provider) = judged(
+            vec![reply("", &[command("echo judged")]), reply("Ran it.", &[])],
+            Some("ALLOW"),
+        );
+        let mut spec = in_auto(endpoint, &dir, AGENTS + 200, "Say judged in the shell.");
+        // A helper given a weaker model than the session's own.
+        spec.connection.model = "weak-model".into();
+        spec.connection.session_model = "session-model".into();
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        let sent = provider.sent();
+
+        // The model, its judge on the session's model, the model again.
+        assert_eq!(sent.len(), 3);
+        assert_eq!(
+            [&sent[0]["model"], &sent[1]["model"]],
+            ["weak-model", "session-model"]
+        );
+        let prompt = sent[1]["messages"][1]["content"].as_str().unwrap();
+        assert!(prompt.contains("Say judged in the shell."), "{prompt}");
+        // The helper's task is not the user's word.
+        assert!(!prompt.contains("Read notes.txt"), "{prompt}");
+        let ran = results(&sent[2]);
+        assert!(ran[0].contains("judged"), "{ran:?}");
+    }
+
+    #[test]
+    fn a_helper_in_auto_asks_with_the_judges_doubt_or_refuses_with_nobody_there() {
+        let _serving = crate::approvals::tests::SERVING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let requests = approvals::serve();
+        let dir = scratch("judge-unsure");
+        let replies = || vec![reply("", &[command("echo unsure")]), reply("Gave up.", &[])];
+        let (endpoint, provider) = judged(replies(), None);
+        let spec = in_auto(endpoint, &dir, AGENTS + 210, "Say unsure in the shell.");
+        let running = spawn(spec, |_| ()).unwrap();
+        let request = requests.recv_timeout(WAIT).unwrap();
+        assert!(
+            request.why.starts_with("auto: unsure — "),
+            "{}",
+            request.why
+        );
+        request.answer(approvals::Decision::Deny(String::new()));
+        assert_eq!(running.join().unwrap().status, Outcome::Done);
+        let sent = provider.sent();
+        assert_eq!(results(&sent[2]), [NOT_APPROVED]);
+
+        // With nobody to answer, the judge's doubt is a refusal, and no card.
+        let (endpoint, provider) = judged(replies(), None);
+        let mut spec = in_auto(endpoint, &dir, AGENTS + 220, "Say unsure in the shell.");
+        spec.connection.human = false;
+        assert_eq!(finished(spec).status, Outcome::Done);
+        let sent = provider.sent();
+        let refused = results(&sent[2]);
+        assert!(
+            refused[0].contains("nobody is here to decide"),
+            "{refused:?}"
+        );
+        assert!(requests.try_recv().is_err(), "a card with nobody there");
+    }
+
+    #[test]
+    fn a_call_the_user_said_no_to_asks_again_in_the_run_rather_than_being_judged() {
+        let _serving = crate::approvals::tests::SERVING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let requests = approvals::serve();
+        let dir = scratch("judge-denied");
+        let retried = || reply("", &[command("echo retried")]);
+        // The judge is unsure of the first, and would allow it after.
+        let (endpoint, provider) = judged_in_turn(
+            vec![retried(), retried(), reply("Gave up.", &[])],
+            vec![None, Some("ALLOW")],
+        );
+        let run = AGENTS + 230;
+        let running = spawn(in_auto(endpoint, &dir, run, "Tidy up."), |_| ()).unwrap();
+        requests
+            .recv_timeout(WAIT)
+            .unwrap()
+            .answer(approvals::Decision::Deny(String::new()));
+        let again = requests.recv_timeout(WAIT).unwrap();
+        assert!(again.why.contains("stopped"), "{}", again.why);
+        again.answer(approvals::Decision::Deny(String::new()));
+        assert_eq!(running.join().unwrap().status, Outcome::Done);
+        let sent = provider.sent();
+        let judged = sent.iter().filter(|body| body["stream"] == false).count();
+        assert_eq!(judged, 1);
+        assert_eq!(results(&sent[3]), [NOT_APPROVED, NOT_APPROVED]);
+
+        // Another helper of the run is not judged on it either.
+        let (endpoint, provider) =
+            judged_in_turn(vec![retried(), reply("Ran it.", &[])], vec![Some("ALLOW")]);
+        let mut spec = in_auto(endpoint, &dir, run + 1, "Tidy up.");
+        spec.run = run;
+        let running = spawn(spec, |_| ()).unwrap();
+        requests
+            .recv_timeout(WAIT)
+            .unwrap()
+            .answer(approvals::Decision::Once);
+        assert_eq!(running.join().unwrap().status, Outcome::Done);
+        let sent = provider.sent();
+        assert_eq!(sent.len(), 2, "the judge was asked");
+        assert!(results(&sent[1])[0].contains("retried"));
+    }
+
+    #[test]
+    fn the_floor_rules_protected_paths_and_dont_ask_refuse_a_helper_with_no_card() {
+        let _serving = crate::approvals::tests::SERVING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let requests = approvals::serve();
+        let dir = scratch("refused");
+        std::fs::write(dir.join("secret.txt"), "the secret").unwrap();
+        std::fs::create_dir_all(dir.join(".letronna")).unwrap();
+        let denied = r#"[{"tool": "read_file", "pattern": "secret.txt", "effect": "deny"}]"#;
+        std::fs::write(dir.join(permissions::PROJECT_FILE), denied).unwrap();
+        let write = |path: &str| ("write_file", json!({"path": path, "content": "x"}));
+        let (endpoint, stub) = provider(vec![
+            reply(
+                "",
+                &[
+                    command("rm -rf /"),
+                    ("read_file", json!({"path": "secret.txt"})),
+                    write("notes/new.txt"),
+                    write(".git/hooks/pre-commit"),
+                ],
+            ),
+            reply("Done what I could.", &[]),
+        ]);
+        // Edits in the project run; anything else would ask, and nobody can answer.
+        let mut editing = spec(endpoint, &dir, AGENTS + 230);
+        editing.connection.mode = crate::gate::Mode::AcceptEdits;
+        assert_eq!(finished(editing).status, Outcome::Done);
+        let sent = stub.sent();
+        let got = results(&sent[1]);
+        assert!(got[0].contains("Letronna never runs that"), "{got:?}");
+        assert!(got[1].contains("a permission rule denies"), "{got:?}");
+        assert!(!got[2].starts_with("Refused"), "{got:?}");
+        assert!(dir.join("notes/new.txt").exists());
+        assert!(got[3].contains("nobody is here"), "{got:?}");
+        assert!(!dir.join(".git/hooks/pre-commit").exists());
+
+        // Don't ask refuses what would ask, with someone there to answer.
+        let (endpoint, provider) = provider(vec![
+            reply("", &[write("notes/other.txt")]),
+            reply("Could not.", &[]),
+        ]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 240);
+        spec.connection.mode = crate::gate::Mode::DontAsk;
+        spec.connection.human = true;
+        assert_eq!(finished(spec).status, Outcome::Done);
+        let got = results(&provider.sent()[1]).join("");
+        assert!(got.contains("Don't ask mode"), "{got}");
+        assert!(
+            requests.try_recv().is_err(),
+            "a card for what the gate settled"
+        );
+    }
+
+    #[test]
+    fn a_yes_for_the_run_covers_its_rule_and_not_the_tools_other_calls() {
+        let _serving = crate::approvals::tests::SERVING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("for-run");
+        let id = AGENTS + 250;
+        // What answering a card on `echo ran` with "allow for this run" leaves behind.
+        let requests = approvals::serve();
+        let earlier = ToolCall {
+            id: "earlier".into(),
+            name: "run_command".into(),
+            arguments: json!({"command": "echo ran"}).to_string(),
+        };
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let asked =
+            std::thread::spawn(move || approvals::ask(7, id, "helper", &earlier, &ctx, "", true));
+        requests
+            .recv_timeout(WAIT)
+            .unwrap()
+            .answer(approvals::Decision::ForRun);
+        assert!(asked.join().unwrap().is_ok());
+
+        let (endpoint, provider) = provider(vec![
+            reply("", &[command("echo ran again"), command("echo other")]),
+            reply("One ran.", &[]),
+        ]);
+        assert_eq!(finished(spec(endpoint, &dir, id)).status, Outcome::Done);
+        let sent = provider.sent();
+        let got = results(&sent[1]);
+        assert!(words(got[0]).contains("ran again"), "{got:?}");
+        assert!(got[1].contains("nobody is here"), "{got:?}");
+    }
+
+    #[test]
+    fn a_batch_stops_at_a_call_the_gate_would_not_run() {
+        let dir = scratch("batch-gate");
+        std::fs::write(dir.join("secret.txt"), "the secret").unwrap();
+        std::fs::create_dir_all(dir.join(".letronna")).unwrap();
+        let denied = r#"[{"tool": "read_file", "pattern": "secret.txt", "effect": "deny"}]"#;
+        std::fs::write(dir.join(permissions::PROJECT_FILE), denied).unwrap();
+        let (endpoint, provider) = provider(vec![
+            reply(
+                "",
+                &[
+                    read_notes(),
+                    ("read_file", json!({"path": "secret.txt"})),
+                    ("list_dir", json!({"path": "."})),
+                ],
+            ),
+            reply("Read what I may.", &[]),
+        ]);
+        let report = finished(spec(endpoint, &dir, AGENTS + 260));
+        assert_eq!(report.status, Outcome::Done);
+        let sent = provider.sent();
+        let got = results(&sent[1]);
+        assert_eq!(got[0], "1|hello from the notes");
+        assert!(got[1].contains("a permission rule denies"), "{got:?}");
+        assert!(got[2].contains("notes.txt"), "{got:?}");
+    }
+
+    #[test]
+    fn a_yes_for_the_run_does_not_last_where_an_ask_rule_asks_every_time() {
+        let _serving = crate::approvals::tests::SERVING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let requests = approvals::serve();
+        let dir = scratch("ask-rule");
+        std::fs::create_dir_all(dir.join(".letronna")).unwrap();
+        let asks = r#"[{"tool": "run_command", "pattern": "echo asked", "effect": "ask"}]"#;
+        std::fs::write(dir.join(permissions::PROJECT_FILE), asks).unwrap();
+        let (endpoint, provider) = provider(vec![
+            reply("", &[command("echo asked once")]),
+            reply("", &[command("echo asked twice")]),
+            reply("Asked twice.", &[]),
+        ]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 270);
+        spec.connection.human = true;
+        let running = spawn(spec, |_| ()).unwrap();
+        let request = requests.recv_timeout(WAIT).unwrap();
+        // So the card offers no yes for the run, and one given anyway is a yes once.
+        assert_eq!(request.for_run(), None);
+        request.answer(approvals::Decision::ForRun);
+        let request = requests.recv_timeout(WAIT).unwrap();
+        assert!(request.preview.contains("twice"), "{}", request.preview);
+        request.answer(approvals::Decision::Deny(String::new()));
+        assert_eq!(running.join().unwrap().status, Outcome::Done);
+        let sent = provider.sent();
+        assert!(words(results(&sent[1])[0]).contains("asked once"));
+        assert_eq!(results(&sent[2])[1], NOT_APPROVED);
     }
 }

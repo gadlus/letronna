@@ -2650,7 +2650,7 @@ pub(crate) fn resolve(raw: &str, ctx: &ToolContext) -> Result<PathBuf, String> {
         ));
     }
     // The gate asks before such a read; a call that reached here without
-    // that yes, such as a helper's, is refused as before.
+    // that yes is refused as before.
     if secret(&path) && !ctx.approved {
         return Err(format!(
             "`{raw}` holds keys, passwords or tokens, so it stays out of reach. Ask the user to paste what you need from it."

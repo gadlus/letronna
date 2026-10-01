@@ -1,5 +1,6 @@
 use crate::cancel::Cancel;
 use crate::failure::{Failure, FailureKind, classify};
+use crate::gate::Mode;
 use crate::models::Limit;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -9,7 +10,7 @@ use std::{
     io::{BufRead, BufReader},
     ops::Range,
     path::PathBuf,
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
@@ -223,6 +224,37 @@ pub struct Connection {
     /// The turn reached its round cap: the tools are still offered, so the
     /// cached prefix holds, but the reply is asked to use none of them.
     pub wrap_up: bool,
+    /// How much the session lets run without asking, which its helpers'
+    /// mode is narrowed from; `plan` is set for Plan too.
+    pub mode: Mode,
+    /// Someone can answer a helper's card for the session now: false for an
+    /// unattended schedule, for `-p` and in a chat app's session, where its
+    /// helpers are refused what would ask.
+    pub human: bool,
+    /// What the user typed in the session, oldest first, which Auto mode's
+    /// judge reads as their wishes when it decides a helper's call.
+    pub typed: Arc<[String]>,
+    /// The session's own model, set on its helpers' connections: Auto mode's
+    /// judge runs on it whichever model a helper was given.
+    pub session_model: String,
+}
+
+impl Connection {
+    /// Puts the session in `mode` mid-turn, so the helpers it starts from
+    /// now on narrow from the new mode rather than the one the turn began in.
+    pub fn switch_to(&mut self, mode: Mode) {
+        self.mode = mode;
+        self.plan = mode == Mode::Plan;
+    }
+
+    /// The model Auto mode's judge runs on for calls made on this connection.
+    pub fn judge_model(&self) -> &str {
+        if self.session_model.is_empty() {
+            &self.model
+        } else {
+            &self.session_model
+        }
+    }
 }
 
 /// Where a remote conversation is happening, and what that allows.
@@ -2988,8 +3020,7 @@ mod tests {
             effort: String::new(),
             search: false,
             conversation: 0,
-            unattended: false,
-            wrap_up: false,
+            ..Default::default()
         }
     }
     #[test]
@@ -3067,8 +3098,7 @@ mod tests {
             effort: String::new(),
             search: false,
             conversation: 0,
-            unattended: false,
-            wrap_up: false,
+            ..Default::default()
         };
         let ctx = crate::tools::ToolContext::of(&connection);
         let mut messages = vec![Message {

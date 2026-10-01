@@ -99,6 +99,7 @@ pub fn run() -> i32 {
         allowed: Default::default(),
         mode: letronna_core::gate::Mode::Default,
         human: false,
+        helpers_answered: false,
         trouble: None,
         bar: crate::bar::Bar::new(String::new()),
         stopped: false,
@@ -132,7 +133,9 @@ fn open_session(runner: &mut Runner, cwd: &Path) -> Result<(Connection, Transcri
     // Worked out as the terminal does for a new session, then taken back
     // out, so the conversation has one writer: its transcript.
     let index = runner.store.conversations.len() - 1;
-    let connection = runner.connection(index);
+    let mut connection = runner.connection(index);
+    // An editor always has someone to answer its helpers' cards too.
+    connection.human = true;
     let conversation = runner.store.conversations.remove(index);
     let path = store::sessions_dir().join(format!("{id}.jsonl"));
     if let Err(error) = chat::validate(&connection) {
