@@ -157,6 +157,7 @@ impl Chat {
                     AppIcon::Pin,
                     Chat::toggle_pin,
                 ))
+                .item(item("Decisions", AppIcon::Shield, Chat::show_decisions))
                 .separator()
                 .item(item(
                     "Export as Markdown",

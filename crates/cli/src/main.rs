@@ -176,7 +176,6 @@ fn main() {
         images: Vec::new(),
         voice: None,
         review: Default::default(),
-        decisions: Vec::new(),
     };
     letronna_core::diag::mark("listed");
     runner.match_voice();

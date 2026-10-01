@@ -111,8 +111,8 @@ pub fn command(
         }
         "/decisions" => {
             render::blank();
-            let id = runner.store.conversations[*session].id;
-            for line in crate::session::decided(&runner.decisions, id, runner.mode) {
+            let decisions = &runner.store.conversations[*session].decisions;
+            for line in crate::session::decided(decisions, runner.mode) {
                 render::line(&render::dim(&line));
             }
             Flow::Handled
@@ -3844,7 +3844,6 @@ mod tests {
             notices: letronna_core::notify::Notices::new(Box::new(crate::notify::Silent)),
             ended: None,
             voice: None,
-            decisions: Vec::new(),
             review: Default::default(),
         };
         let flow = command(&mut runner, "/mode auto", &mut 0, None);
