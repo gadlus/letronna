@@ -1021,6 +1021,15 @@ impl<'a> Saving<'a> {
     }
 }
 
+/// The address a browse or use_page call acts on: the page it opens, or the
+/// one the session's browser is on, if the browser is free to say.
+pub(crate) fn acts_on(args: &Value, ctx: &ToolContext) -> Option<String> {
+    if args["action"] == "open" {
+        return address(args["url"].as_str()?, &[]).ok();
+    }
+    current_address(ctx.conversation)
+}
+
 /// How much of a page to show.
 #[derive(Default)]
 struct View {

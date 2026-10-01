@@ -359,7 +359,16 @@ impl Chat {
             &request.preview,
             window,
             cx,
-        );
+        )
+        // Why its gate could not decide it, such as the judge being unsure.
+        .when(!request.why.is_empty(), |card| {
+            card.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(request.why.clone()),
+            )
+        });
         Some(
             card.child(
                 h_flex()
@@ -371,15 +380,20 @@ impl Chat {
                             .label("Allow")
                             .on_click(once),
                     )
-                    .child(
-                        // Core remembers this for the tool, for the helper
-                        // and the helpers it starts, so they ask no more.
-                        Button::new("helper-allow-run")
-                            .outline()
-                            .small()
-                            .label("Allow for this run")
-                            .on_click(for_run),
-                    )
+                    .when_some(request.for_run(), |row, pattern| {
+                        // Core remembers this for the rule the call falls
+                        // under, for the helper and the helpers it starts,
+                        // so they ask no more about it; a call no rule
+                        // covers safely is offered no such answer.
+                        let label = format!("Allow `{pattern}` for this run");
+                        row.child(
+                            Button::new("helper-allow-run")
+                                .outline()
+                                .small()
+                                .label(label)
+                                .on_click(for_run),
+                        )
+                    })
                     .child(
                         Button::new("helper-deny")
                             .ghost()

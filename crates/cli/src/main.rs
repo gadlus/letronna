@@ -39,9 +39,8 @@ use letronna_core::budget::Budget;
 use letronna_core::cancel::Cancel;
 use letronna_core::chat::{self, Message};
 use letronna_core::driver::{self, Allow, Outcome, Report, Spec, Status};
-use letronna_core::gate::{self, Gate, Grants, Mode};
 use letronna_core::store::Transcript;
-use letronna_core::{agent, hooks, permissions, store, tools, update};
+use letronna_core::{agent, hooks, store, tools, update};
 use serde_json::{Value, json};
 use session::Runner;
 use std::io::IsTerminal;
@@ -160,6 +159,8 @@ fn main() {
         // With the question piped in or the answer piped out, a card would be
         // drawn or read where nobody sees it, and wait forever.
         human: !args.once() || (std::io::stdin().is_terminal() && std::io::stdout().is_terminal()),
+        // Set by `serve_helpers`.
+        helpers_answered: false,
         trouble: None,
         bar: bar::Bar::new(String::new()),
         stopped: false,
@@ -395,8 +396,9 @@ fn ask_once(runner: &mut Runner, session: usize, prompt: &str, args: &Args) -> b
     // Served before the run starts, since a request with nobody serving is
     // declined at once.
     let keyboard = args.output == Output::Text && render::interactive();
-    spec.decide = judged_in_auto(runner.mode, &spec, keyboard);
-    answer_approvals(runner.mode, keyboard, context, spec.cancel.clone());
+    // Its own gate asks only when someone can answer.
+    spec.connection.human = keyboard;
+    answer_approvals(keyboard, context, spec.cancel.clone());
     let report = run_following(spec, args.output);
     finish(runner, session, id, before, report, args.output)
 }
@@ -450,6 +452,8 @@ fn begin(
     // comes back only when the run is over, so that file has one writer.
     let conversation = runner.store.conversations.remove(session);
     let (id, before) = (conversation.id, conversation.messages.len());
+    // What the user asked for, which Auto mode's judge reads as their wishes.
+    connection.typed = letronna_core::judge::typed(&conversation.messages).into();
     let context = tools::ToolContext::of(&connection);
     let spec = Spec {
         connection,
@@ -477,39 +481,6 @@ fn begin(
         status: Arc::default(),
     };
     Ok((spec, context, before))
-}
-
-/// The run's own gate in Auto mode: the whole gate, with what would ask put
-/// to the judge on the session's own model, which reads what the user typed
-/// in the session. `human` says whether a call the judge is unsure of can be
-/// put to someone; with nobody, it is refused. `None` in any other mode,
-/// whose calls go through the driver's gate and `approvals` as before.
-fn judged_in_auto(mode: Mode, spec: &Spec, human: bool) -> Option<driver::Decide> {
-    // Read once for the run, as `answer_approvals` reads them.
-    let rules = permissions::load(&permissions::user_file());
-    let messages = &spec.transcript.conversation.messages;
-    auto_gate(mode, &spec.connection, messages, rules, human)
-}
-
-/// `judged_in_auto` for a session on `connection` that holds `messages`,
-/// under the user's `rules`.
-fn auto_gate(
-    mode: Mode,
-    connection: &chat::Connection,
-    messages: &[Message],
-    rules: Result<Vec<permissions::Rule>, String>,
-    human: bool,
-) -> Option<driver::Decide> {
-    if mode != Mode::Auto {
-        return None;
-    }
-    let connection = connection.clone();
-    let typed = letronna_core::judge::typed(messages);
-    Some(Arc::new(move |call, ctx| {
-        let none = Grants::new();
-        let gate = Gate::for_terminal(ctx, &none, &rules, Mode::Auto, human);
-        gate::settle(call, &gate, &connection, &typed).0
-    }))
 }
 
 /// Runs `spec` to its end on this thread, with progress lines while it runs
@@ -612,38 +583,19 @@ fn emit(line: &Value) -> bool {
     writeln!(std::io::stdout().lock(), "{line}").is_ok()
 }
 
-/// Answers the run's calls that need a yes: what `mode` and the permission
-/// rules settle, then by asking when there is a keyboard to ask at, and
-/// otherwise no, saying why.
-fn answer_approvals(mode: Mode, keyboard: bool, context: tools::ToolContext, cancel: Cancel) {
+/// Answers the run's calls that its own gate, and its helpers', left to a
+/// person: by asking when there is a keyboard to ask at, and otherwise no,
+/// saying why. The run's mode, the permission rules and the judge have
+/// settled the rest before anything is asked.
+fn answer_approvals(keyboard: bool, context: tools::ToolContext, cancel: Cancel) {
     let requests = approvals::serve();
-    let rules = permissions::load(&permissions::user_file());
     std::thread::spawn(move || {
-        // The run asks for every call that needs a yes, so without the gate
-        // here `--mode accept-edits` was never heard and every edit refused.
-        // Bypass goes through it too: it only skips the asking, and `--yes`
-        // is to bar risky calls and honour deny rules as a session does.
-        let none = Grants::new();
         for request in requests {
-            let workspace = context.workspace.clone();
-            let settled = session::judged(
-                &request.call,
-                request.root,
-                workspace,
-                mode,
-                &none,
-                &rules,
-                keyboard,
-            );
-            let decision = match settled {
-                Some(Decision::Deny(why)) => {
-                    if !keyboard {
-                        say_refused(&request.call.name, &why);
-                    }
-                    Decision::Deny(why)
-                }
-                Some(decision) => decision,
-                None => consult(&request, &context, &cancel),
+            let decision = if keyboard {
+                consult(&request, &context, &cancel)
+            } else {
+                say_refused(&request.call.name, "");
+                Decision::Deny(String::new())
             };
             request.answer(decision);
         }
@@ -987,6 +939,7 @@ fn installed_name() -> &'static str {
 mod tests {
     use super::*;
     use letronna_core::chat::ToolCall;
+    use letronna_core::gate::{self, Gate, Grants, Mode};
     use letronna_core::permissions::{self, Rule};
 
     fn report(status: Outcome) -> Report {
@@ -1067,7 +1020,9 @@ mod tests {
         call("run_command", json!({ "command": line }))
     }
 
-    /// How `-p` answers `call`: the gate in `mode`, as `answer_helpers` asks it.
+    /// How `-p`'s run decides `call`: its own gate in `mode`, as the driver
+    /// puts each call to it, someone being there only with a keyboard;
+    /// `None` when it is left to the person.
     fn answered(
         call: &ToolCall,
         ctx: &tools::ToolContext,
@@ -1075,8 +1030,13 @@ mod tests {
         mode: Mode,
         keyboard: bool,
     ) -> Option<Decision> {
-        let none = letronna_core::gate::Grants::new();
-        crate::session::judged(call, 0, ctx.workspace.clone(), mode, &none, rules, keyboard)
+        let none = Grants::new();
+        let gate = Gate::for_terminal(ctx, &none, rules, mode, keyboard);
+        match gate::decide(call, &gate) {
+            gate::Outcome::Run => Some(Decision::Once),
+            gate::Outcome::Refuse(why) => Some(Decision::Deny(why)),
+            gate::Outcome::Ask => None,
+        }
     }
 
     fn write() -> ToolCall {
@@ -1173,55 +1133,5 @@ mod tests {
             1,
             "kept again by the turn after it"
         );
-    }
-
-    #[test]
-    fn only_auto_mode_gives_a_print_run_the_judge() {
-        let connection = chat::Connection::default();
-        for mode in Mode::OFFERED.into_iter().filter(|mode| *mode != Mode::Auto) {
-            assert!(auto_gate(mode, &connection, &[], Ok(Vec::new()), true).is_none());
-        }
-        assert!(auto_gate(Mode::Auto, &connection, &[], Ok(Vec::new()), true).is_some());
-    }
-
-    #[test]
-    fn a_print_run_in_auto_keeps_to_the_rules_and_refuses_what_nobody_can_judge() {
-        let rules = Ok(vec![Rule {
-            tool: "run_command".into(),
-            pattern: "git push".into(),
-            effect: permissions::Effect::Deny,
-            project: None,
-        }]);
-        // No endpoint, so the judge cannot answer: unsure, with nobody to ask.
-        let connection = chat::Connection {
-            conversation: 9_153_001,
-            ..Default::default()
-        };
-        let said = [Message {
-            role: "user".into(),
-            content: "build it".into(),
-            ..Default::default()
-        }];
-        let Some(gate) = auto_gate(Mode::Auto, &connection, &said, rules, false) else {
-            panic!("Auto mode gave no gate");
-        };
-        let ctx = tools::ToolContext::of(&connection);
-        let call = |name: &str, arguments: Value| ToolCall {
-            id: "c".into(),
-            name: name.into(),
-            arguments: arguments.to_string(),
-        };
-        let read = call("read_file", json!({ "path": "notes.txt" }));
-        assert_eq!(gate(&read, &ctx), gate::Outcome::Run);
-        let push = call("run_command", json!({ "command": "git push origin main" }));
-        let gate::Outcome::Refuse(why) = gate(&push, &ctx) else {
-            panic!("a denied push was not refused");
-        };
-        assert!(why.contains("permission rule"), "{why}");
-        let build = call("run_command", json!({ "command": "cargo build" }));
-        let gate::Outcome::Refuse(why) = gate(&build, &ctx) else {
-            panic!("a call nobody could judge was not refused");
-        };
-        assert!(why.contains("auto mode could not approve"), "{why}");
     }
 }

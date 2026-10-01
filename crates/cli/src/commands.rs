@@ -3061,6 +3061,7 @@ mod tests {
             allowed: Default::default(),
             mode: Mode::Default,
             human: true,
+            helpers_answered: true,
             trouble: None,
             bar: crate::bar::Bar::new(String::new()),
             stopped: false,

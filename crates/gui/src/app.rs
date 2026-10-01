@@ -1479,6 +1479,10 @@ impl Chat {
         let model = connection.model.clone();
         self.busy = true;
         self.streaming_id = Some(target_id);
+        // What the user asked for, for the judge that decides the calls of
+        // the helpers the session wakes; `run_turn` keeps it current.
+        let mut connection = connection;
+        connection.typed = letronna_core::judge::typed(&conversation.messages).into();
         // What the session's kept helpers wake on from now on.
         agents::connected(&connection);
         // Off this thread, as it may read hooks.json; long before the model
@@ -1573,13 +1577,14 @@ impl Chat {
             .unwrap_or_default();
         let (endpoint, key) = resolve(gateway, &self.store.settings.custom_endpoint, &saved);
         let session = self.store.conversations[ix].id;
+        let mode = self.mode(session);
         let connection = Connection {
             endpoint,
             model: model.to_owned(),
             key,
             tools: true,
             workspace: None,
-            plan: self.mode(session) == letronna_core::gate::Mode::Plan,
+            plan: mode == letronna_core::gate::Mode::Plan,
             effort: self.store.effort(ix).to_owned(),
             search: self.store.settings.search,
             // A schedule's run and a chat app's turn may have nobody watching.
@@ -1587,6 +1592,15 @@ impl Chat {
             remote,
             conversation: session,
             wrap_up: false,
+            mode,
+            // Nobody sees a helper's card in a chat app's session, so its
+            // helpers are refused rather than left asking.
+            human: !self.unattended.contains_key(&session)
+                && !self.remote_session.values().any(|&id| id == session),
+            // Filled in by `run_turn`, once the prompt is in.
+            typed: Default::default(),
+            // Its own: the judge runs on `model`.
+            session_model: String::new(),
         };
         backend::validate(&connection)?;
         Ok(connection)
@@ -1783,13 +1797,12 @@ impl Chat {
         self.tell(id, why);
     }
 
-    /// A helper's call waiting on a yes: answered at once where its session's
-    /// rules already decide it, otherwise put up as a card in that session.
+    /// A helper's call its own gate put to the user, put up as a card in its
+    /// session.
     fn on_agent_ask(&mut self, request: approvals::Request, cx: &mut Context<Self>) {
-        // Core has one request out per run and tool at a time, so a card
+        // Core has one request out per run and rule at a time, so a card
         // still up for the same was given up on: its helper stopped waiting.
-        self.agent_asks
-            .retain(|queued| queued.run != request.run || queued.call.name != request.call.name);
+        self.agent_asks.retain(|queued| !request.repeats(queued));
         cx.notify();
         // With its session gone no card could show; dropped, it is declined.
         let Some(ix) = self.store.index_of(request.root) else {
@@ -1800,8 +1813,9 @@ impl Chat {
         if run_ended(request.root, request.run) {
             return;
         }
-        if let Some(decision) = self.decided(&request.call, request.root) {
-            request.answer(decision);
+        // A schedule that decides without the user has nobody at its cards;
+        // dropped, the request is declined.
+        if self.unattended.contains_key(&request.root) {
             return;
         }
         // Nobody in a chat app sees a helper's card, and one waiting here
@@ -1823,42 +1837,6 @@ impl Chat {
         let why = notify::Why::Waiting(&request.call, Some(&request.label));
         self.tell(request.root, why);
         self.agent_asks.push_back(request);
-    }
-
-    /// What session `root`'s own rules make of a helper's `call`, or None
-    /// when only the user can say: the gate the session itself goes through,
-    /// in its mode and with what was allowed there.
-    fn decided(&self, call: &backend::ToolCall, root: u64) -> Option<approvals::Decision> {
-        let mut ctx = letronna_core::tools::ToolContext::default();
-        ctx.conversation = root;
-        ctx.workspace = self
-            .store
-            .index_of(root)
-            .and_then(|ix| self.store.conversations[ix].workspace.clone());
-        let gate = letronna_core::gate::Gate::for_window(
-            &ctx,
-            &self.session_allow,
-            &self.rules,
-            self.mode(root),
-            self.unattended.get(&root).copied(),
-        );
-        match letronna_core::gate::decide(call, &gate) {
-            letronna_core::gate::Outcome::Run => Some(approvals::Decision::Once),
-            letronna_core::gate::Outcome::Refuse(why) => Some(approvals::Decision::Deny(why)),
-            letronna_core::gate::Outcome::Ask => None,
-        }
-    }
-
-    /// Answer the helpers' cards their sessions' rules now decide, after a
-    /// rule changed under them.
-    fn decide_agent_asks(&mut self, cx: &mut Context<Self>) {
-        for request in std::mem::take(&mut self.agent_asks) {
-            match self.decided(&request.call, request.root) {
-                Some(decision) => request.answer(decision),
-                None => self.agent_asks.push_back(request),
-            }
-        }
-        cx.notify();
     }
 
     /// Take down the cards of helpers that have ended, since nothing waits
@@ -1961,6 +1939,9 @@ impl Chat {
             return;
         };
         turn.connection.workspace = self.store.conversations[ix].workspace.clone();
+        // What the user asked for, for the judge that decides its helpers' calls.
+        let typed = letronna_core::judge::typed(&self.store.conversations[ix].messages);
+        turn.connection.typed = typed.into();
         let receiver = backend::start(
             turn.connection.clone(),
             self.store.conversations[ix].messages.clone(),
@@ -3060,8 +3041,8 @@ impl Chat {
                         .entry(id)
                         .or_default()
                         .insert(letronna_core::gate::grant(&call));
-                    // Its helpers waiting on the same tool are allowed too.
-                    self.decide_agent_asks(cx);
+                    // Its helpers are let through by the rule of the call.
+                    approvals::allow_for_session(id, &call, &self.call_context());
                 }
                 self.execute_call(call, true, cx);
             }
@@ -3098,7 +3079,15 @@ impl Chat {
         let Some(session) = self.store.conversations.get(self.store.active) else {
             return;
         };
-        self.modes.insert(session.id, mode);
+        let id = session.id;
+        self.modes.insert(id, mode);
+        // Helpers the turn starts from now on narrow from the new mode.
+        let mode = self.mode(id);
+        if let Some(turn) = self.turn.as_mut()
+            && turn.connection.conversation == id
+        {
+            turn.connection.switch_to(mode);
+        }
         agents::set_plan(mode == letronna_core::gate::Mode::Plan);
         self.approvals_changed(cx);
         cx.notify();
@@ -3107,7 +3096,6 @@ impl Chat {
     /// Decide the call the card is up for again after an approval setting
     /// changed, so it runs at once if it no longer needs the user.
     pub(crate) fn approvals_changed(&mut self, cx: &mut Context<Self>) {
-        self.decide_agent_asks(cx);
         let waiting = self
             .turn
             .as_ref()
@@ -3763,9 +3751,14 @@ impl Chat {
     }
 
     /// Run a turn in the session `id` on what it already holds.
-    fn begin_turn(&mut self, id: u64, connection: Connection, cx: &mut Context<Self>) {
+    fn begin_turn(&mut self, id: u64, mut connection: Connection, cx: &mut Context<Self>) {
         self.busy = true;
         self.streaming_id = Some(id);
+        // What the user asked for, for the judge, as `run_turn` keeps it.
+        if let Some(ix) = self.store.index_of(id) {
+            let typed = letronna_core::judge::typed(&self.store.conversations[ix].messages);
+            connection.typed = typed.into();
+        }
         agents::connected(&connection);
         let conversation = connection.conversation;
         std::thread::spawn(move || letronna_core::hooks::new_turn(conversation));

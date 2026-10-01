@@ -295,6 +295,34 @@ pub fn suggest(call: &ToolCall, ctx: &ToolContext) -> Option<Rule> {
     })
 }
 
+/// The tool and pattern a yes for the rest of a run to `call` covers: the
+/// rule `suggest` offers, or for a page the host it is on; `None` for a call
+/// no rule short of the whole tool would cover safely.
+pub fn scope(call: &ToolCall, ctx: &ToolContext) -> Option<(String, String)> {
+    if let Some(rule) = suggest(call, ctx) {
+        return Some((rule.tool, rule.pattern));
+    }
+    // A yes to fetching the docs must not let the run send what it read to
+    // any address, so a page is kept by its host. Other tools, such as MCP
+    // servers' and media, have no argument a yes could be kept by.
+    let args = tools::parse_args(&call.arguments).ok()?;
+    let address = match call.name.as_str() {
+        "web_fetch" => args["url"].as_str().map(str::to_owned),
+        crate::browser::BROWSE | "use_page" => crate::browser::acts_on(&args, ctx),
+        _ => None,
+    }?;
+    let url = reqwest::Url::parse(address.trim()).ok()?;
+    Some((call.name.clone(), url.host_str()?.to_owned()))
+}
+
+/// Whether no argument of the tool named `name` could narrow a rule or a
+/// yes, as for MCP servers' tools and media: a yes covers one call or all.
+pub fn shapeless(name: &str) -> bool {
+    let pages = matches!(name, "web_fetch" | crate::browser::BROWSE | "use_page");
+    let narrowed = name == "run_command" || pages;
+    !narrowed && !tools::find(name).is_some_and(|tool| has_path(tool.as_ref()))
+}
+
 /// The user's rules file in the data folder.
 pub fn user_file() -> PathBuf {
     crate::chat::data_dir().join(USER_FILE)
@@ -1166,5 +1194,35 @@ mod tests {
         assert_eq!(switched_off(&rules), ["speak"]);
         assert!(kept.iter().all(|rule| rules.contains(rule)));
         std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn a_yes_for_the_run_keeps_a_page_by_its_host_and_other_tools_by_nothing() {
+        let ctx = ToolContext::default();
+        let called = |name: &str, args: serde_json::Value| ToolCall {
+            id: format!("{name}-1"),
+            name: name.into(),
+            arguments: args.to_string(),
+        };
+        let fetch = |url: &str| called("web_fetch", serde_json::json!({ "url": url }));
+        let docs = scope(&fetch("https://docs.rs/serde"), &ctx);
+        assert_eq!(docs, Some(("web_fetch".to_owned(), "docs.rs".to_owned())));
+        assert_eq!(scope(&fetch("https://docs.rs/tokio/latest"), &ctx), docs);
+        assert_ne!(scope(&fetch("https://evil.example/?k=secret"), &ctx), docs);
+        let open = serde_json::json!({ "action": "open", "url": "docs.rs/serde" });
+        assert_eq!(
+            scope(&called("browse", open), &ctx),
+            Some(("browse".to_owned(), "docs.rs".to_owned()))
+        );
+        // Nothing narrows these, so a yes covers the one call alone.
+        let click = serde_json::json!({ "action": "click", "ref": "e1" });
+        let image = serde_json::json!({ "prompt": "a lighthouse" });
+        for other in [
+            fetch("not a web address"),
+            called("use_page", click),
+            called("make_image", image),
+        ] {
+            assert_eq!(scope(&other, &ctx), None, "{}", other.name);
+        }
     }
 }

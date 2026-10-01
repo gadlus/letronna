@@ -207,36 +207,31 @@ pub fn run(runner: &mut Runner, session: usize, args: &Args) -> i32 {
                 open = false;
                 asked.clear();
             }
-            // The user's own gate first, as the terminal has it, `--yes`
-            // (Bypass) included: what it runs or refuses is not the
-            // program's to say.
+            // The asking agent's own gate settled all it could first, in its
+            // own mode with the user's rules, `--yes` (Bypass) included, and a
+            // helper's mode is never more than the run's: what it ran or
+            // refused is not the program's to say, and what is left is.
             Event::Asked(request) => {
-                let answerable = args.ask_stdio && open;
-                match gated(&request.call, request.root, mode, &rules, answerable) {
-                    gate::Outcome::Run => request.answer(Decision::Once),
-                    gate::Outcome::Refuse(why) => request.answer(Decision::Deny(why)),
-                    gate::Outcome::Ask if !answerable => {
-                        crate::say_refused(&request.call.name, "");
-                        request.answer(Decision::Deny(String::new()));
-                    }
-                    gate::Outcome::Ask => {
-                        asks += 1;
-                        let id = format!("letronna-{asks}");
-                        if crate::emit(&can_use_tool(&id, &request)) {
-                            asked.insert(id, request);
-                            continue;
-                        }
-                        // Nobody can read the question, so nobody will answer
-                        // it: the call is declined and the run ends.
-                        eprintln!("Stdout was closed, so the run ends.");
-                        drop(request);
-                        if let Some(turn) = &running {
-                            turn.cancel.set();
-                        }
-                        waiting.clear();
-                        (open, failed) = (false, true);
-                    }
+                if !(args.ask_stdio && open) {
+                    crate::say_refused(&request.call.name, "");
+                    request.answer(Decision::Deny(String::new()));
+                    continue;
                 }
+                asks += 1;
+                let id = format!("letronna-{asks}");
+                if crate::emit(&can_use_tool(&id, &request)) {
+                    asked.insert(id, request);
+                    continue;
+                }
+                // Nobody can read the question, so nobody will answer it: the
+                // call is declined and the run ends.
+                eprintln!("Stdout was closed, so the run ends.");
+                drop(request);
+                if let Some(turn) = &running {
+                    turn.cancel.set();
+                }
+                waiting.clear();
+                (open, failed) = (false, true);
             }
             Event::Ended(report) => {
                 asked.clear();
@@ -328,9 +323,9 @@ fn start(
     events: &Sender<Event>,
 ) -> Result<Running, String> {
     let (mut spec, _, before) = crate::begin(runner, session, text, args, budget)?;
-    // A call the judge is unsure of goes out to the program, as any other
-    // call the user's gate leaves open does.
-    spec.decide = crate::judged_in_auto(runner.mode, &spec, args.ask_stdio);
+    // What the run's own gate leaves open, the judge's doubts included, goes
+    // out to the program when it answers, and is refused when it does not.
+    spec.connection.human = args.ask_stdio;
     let turn = Running {
         turn: 0,
         id: spec.id,

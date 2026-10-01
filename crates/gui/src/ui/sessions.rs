@@ -242,6 +242,7 @@ impl Chat {
                     // this one's mode.
                     this.session_allow
                         .remove(&this.store.conversations[index].id);
+                    letronna_core::approvals::forget_session(this.store.conversations[index].id);
                     // Nor with this one's loop, whose ticks would go there.
                     letronna_core::wake::stop(this.store.conversations[index].id);
                     this.modes.remove(&this.store.conversations[index].id);

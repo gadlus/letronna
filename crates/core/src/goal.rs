@@ -36,9 +36,12 @@
 use crate::approvals;
 use crate::cancel::Cancel;
 use crate::chat::{Connection, Message, ToolCall};
+use crate::gate::{self, Gate, Grants, Layer};
+use crate::permissions;
 use crate::tools::{self, ToolContext};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashSet;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -514,7 +517,7 @@ fn prompt(goal: &Goal, reply: &str, checked: Option<(&str, String)>) -> Result<S
 }
 
 /// Runs the goal's check command as a helper's command runs: refused where
-/// the session could not run it, asked about where its rules do not already
+/// the session could not run it, asked about where its gate does not already
 /// allow it, and put to the user's hooks. It runs here rather than through
 /// `tools::run`, whose limit is shorter than a test run and whose stop
 /// loses what was printed. Whatever happens is output for the judge.
@@ -539,9 +542,43 @@ fn check(connection: &Connection, command: &str, cancel: &Cancel) -> String {
         return format!("The check command was not run: {why}");
     }
     let run = check_run(connection.conversation, command);
-    if tools::needs_approval(&call.name)
-        && let Err(why) = approvals::ask(connection.conversation, run, "goal check", &call, &ctx)
-    {
+    // The frontends only ask now, so the session's own gate decides first,
+    // as it does a helper's call: in the session's mode, with the user's
+    // rules and what the session allowed its helpers, and in Auto with the
+    // judge. Only what is left goes to the user.
+    let rules = permissions::load(&permissions::user_file());
+    let gate_with = |grants| Gate {
+        ctx: &ctx,
+        mode: connection.mode,
+        grants,
+        rules: rules.as_deref().unwrap_or_default(),
+        broken: rules.as_ref().err().map(String::as_str),
+        human: connection.human,
+    };
+    let granted = Grants::from([(ctx.conversation, HashSet::from([gate::grant(&call)]))]);
+    let allowed = approvals::allowed_by_session(connection.conversation, &call, &ctx);
+    let none = Grants::new();
+    let grants = if allowed { &granted } else { &none };
+    let (outcome, layer) = gate::settle(&call, &gate_with(grants), connection, &connection.typed);
+    let asked = match outcome {
+        gate::Outcome::Run => Ok(None),
+        gate::Outcome::Refuse(why) => return format!("The check command was not run: {why}"),
+        gate::Outcome::Ask => {
+            let why = layer.as_ref().map(Layer::tag).unwrap_or_default();
+            // A yes for the run lasts only where a grant would let it run.
+            let lasting = gate::decide(&call, &gate_with(&granted)) == gate::Outcome::Run;
+            approvals::ask(
+                connection.conversation,
+                run,
+                "goal check",
+                &call,
+                &ctx,
+                &why,
+                lasting,
+            )
+        }
+    };
+    if let Err(why) = asked {
         return match why.trim() {
             "" => "The check command was not run: it was not approved.".to_owned(),
             why => format!("The check command was not run: {why}"),

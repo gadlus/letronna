@@ -37,6 +37,8 @@ pub struct Runner {
     /// Someone can see a card and answer it; false for `-p` with no
     /// terminal on either end.
     pub human: bool,
+    /// Helpers' cards reach someone; false for `-p`, which declines them.
+    pub helpers_answered: bool,
     /// The rules file error last shown, so that one is shown once.
     pub trouble: Option<String>,
     /// The box at the foot of the window, pumped while a reply streams so
@@ -97,6 +99,12 @@ impl Runner {
             conversation: self.store.conversations[session].id,
             unattended: false,
             wrap_up: false,
+            mode: self.mode,
+            human: self.human && self.helpers_answered,
+            // Filled in by `run`, once the prompt is in.
+            typed: Default::default(),
+            // Its own: the judge runs on `model`.
+            session_model: String::new(),
         }
     }
 
@@ -287,7 +295,9 @@ impl Runner {
     }
 
     /// Run the agent to completion on the conversation as it stands.
-    fn run(&mut self, connection: Connection, session: usize) -> Result<String, String> {
+    fn run(&mut self, mut connection: Connection, session: usize) -> Result<String, String> {
+        // What the user asked for, for the judge that decides its helpers' calls.
+        connection.typed = self.typed(session).into();
         self.bar.show_helpers_of(connection.conversation);
         // What the session's kept helpers wake on from now on.
         agents::connected(&connection);
@@ -1075,6 +1085,7 @@ impl Runner {
                     .entry(turn.connection.conversation)
                     .or_default()
                     .insert(gate::grant(&call));
+                approvals::allow_for_session(turn.connection.conversation, &call, &ctx);
                 Ok(self.run_call(turn, call, true, None))
             }
             Some("No, and stop here") | None => Ok(false),
@@ -1156,49 +1167,39 @@ impl Runner {
     /// says whether there is someone to ask without the box.
     pub fn serve_helpers(&mut self, terminal: bool) {
         if self.bar.serve() {
+            self.helpers_answered = true;
             return;
         }
-        let mode = self.mode;
-        let rules = letronna_core::permissions::load(&letronna_core::permissions::user_file());
+        self.helpers_answered = terminal;
         let requests = approvals::serve();
         std::thread::spawn(move || {
-            // The session's grants are kept on the main thread, so here only
-            // the mode and the rules answer for the user.
-            let none = Grants::new();
+            // Each helper's own gate settled all else, so only the user is left.
             for request in requests {
-                let decision = match settled(&request, mode, &none, &rules, terminal) {
-                    Some(Decision::Deny(why)) => {
-                        declined(&request, &why);
-                        Decision::Deny(why)
-                    }
-                    Some(decision) => decision,
+                let decision = if terminal {
                     // A bar that was never installed asks on the line, as the
                     // session's own cards are asked without the box.
-                    None => ask_about(&mut Bar::new(String::new()), &request),
+                    ask_about(&mut Bar::new(String::new()), &request)
+                } else {
+                    declined(&request);
+                    Decision::Deny(String::new())
                 };
                 request.answer(decision);
             }
         });
     }
 
-    /// Answer every helper waiting on a yes that the session's own rules
-    /// settle, and ask the user about the rest -- or, when `ask` is false,
-    /// keep the first of those back for a later call to ask.
+    /// Ask the user about every helper waiting on a yes -- or, when `ask` is
+    /// false, keep the first back for a later call to ask. Each helper's own
+    /// gate has settled all else.
     pub fn answer_helpers(&mut self, ask: bool) {
         while let Some(request) = self.bar.asked() {
-            let rules = letronna_core::permissions::load(&letronna_core::permissions::user_file());
-            let decision = match settled(&request, self.mode, &self.allowed, &rules, true) {
-                Some(decision) => decision,
-                None if ask => {
-                    let why = Why::Waiting(&request.call, Some(&request.label));
-                    self.tell(request.root, why);
-                    ask_about(&mut self.bar, &request)
-                }
-                None => {
-                    self.bar.hold(request);
-                    return;
-                }
-            };
+            if !ask {
+                self.bar.hold(request);
+                return;
+            }
+            let why = Why::Waiting(&request.call, Some(&request.label));
+            self.tell(request.root, why);
+            let decision = ask_about(&mut self.bar, &request);
             request.answer(decision);
         }
     }
@@ -1599,50 +1600,6 @@ pub fn intent(name: &str, summary: &str) -> String {
     }
 }
 
-/// What the session's own gate makes of a helper's call, or `None` when
-/// only the user can say: with no terminal to ask on, that is a no.
-pub fn settled(
-    request: &Request,
-    mode: Mode,
-    allowed: &Grants,
-    rules: &Result<Vec<letronna_core::permissions::Rule>, String>,
-    terminal: bool,
-) -> Option<Decision> {
-    let workspace = std::env::current_dir().ok();
-    judged(
-        &request.call,
-        request.root,
-        workspace,
-        mode,
-        allowed,
-        rules,
-        terminal,
-    )
-}
-
-/// `settled` for a call made by session `root` working in `workspace`,
-/// which after `-c` or `-r` is the folder the session was made in, not the
-/// one the program was started from.
-pub fn judged(
-    call: &ToolCall,
-    root: u64,
-    workspace: Option<std::path::PathBuf>,
-    mode: Mode,
-    allowed: &Grants,
-    rules: &Result<Vec<letronna_core::permissions::Rule>, String>,
-    terminal: bool,
-) -> Option<Decision> {
-    let mut ctx = tools::ToolContext::default();
-    ctx.conversation = root;
-    ctx.workspace = workspace;
-    let gate = Gate::for_terminal(&ctx, allowed, rules, mode, terminal);
-    match gate::decide(call, &gate) {
-        gate::Outcome::Run => Some(Decision::Once),
-        gate::Outcome::Refuse(why) => Some(Decision::Deny(why)),
-        gate::Outcome::Ask => (!terminal).then(|| Decision::Deny(String::new())),
-    }
-}
-
 /// Put a helper's request to the user: in the box when `bar` is up, on the
 /// line when not.
 fn ask_about(bar: &mut Bar, request: &Request) -> Decision {
@@ -1656,37 +1613,36 @@ fn ask_about(bar: &mut Bar, request: &Request) -> Decision {
         request.label,
         intent(&call.name, &summary)
     );
-    let detail = card_lines(&request.preview);
-    let picked = bar.interject(
-        &question,
-        detail,
-        &["Yes", "Yes, and stop asking it for this", "No"],
-    );
-    match picked {
+    // Why its gate could not decide it, such as the judge being unsure, first.
+    let why = (!request.why.is_empty()).then(|| request.why.clone());
+    let detail = why
+        .into_iter()
+        .chain(card_lines(&request.preview))
+        .collect();
+    // Offered only where a rule could cover later calls, naming it.
+    let for_run = request
+        .for_run()
+        .map(|pattern| format!("Yes, and stop asking it for `{pattern}`"));
+    let mut choices = vec!["Yes"];
+    choices.extend(for_run.as_deref());
+    choices.push("No");
+    match bar.interject(&question, detail, &choices) {
         Some(0) => Decision::Once,
-        Some(1) => Decision::ForRun,
+        Some(1) if for_run.is_some() => Decision::ForRun,
         _ => Decision::Deny(String::new()),
     }
 }
 
-/// Say under the tool that a helper's call was declined, for `why` or for
-/// want of anyone to ask, since nothing else would show why the helper came
-/// back without what it went for.
-fn declined(request: &Request, why: &str) {
+/// Say under the tool that a helper's call was declined for want of anyone
+/// to ask, since nothing else would show why the helper came back without
+/// what it went for.
+fn declined(request: &Request) {
     let call = &request.call;
     let summary = tools::summary(&call.name, &call.arguments);
-    let why = if why.is_empty() {
-        format!(
-            "declined for helper {}: nobody is here to ask (a mode that allows it would)",
-            request.label
-        )
-    } else {
-        format!(
-            "declined for helper {}: {}",
-            request.label,
-            tools::one_line(why)
-        )
-    };
+    let why = format!(
+        "declined for helper {}: nobody is here to ask",
+        request.label
+    );
     render::blank();
     render::tool(&call.name, &summary, &why, true);
 }
@@ -1995,70 +1951,6 @@ mod tests {
                 ok("c", &path("c"))
             ]
         );
-    }
-
-    fn made(name: &str, arguments: serde_json::Value) -> ToolCall {
-        ToolCall {
-            id: format!("{name}-1"),
-            name: name.into(),
-            arguments: arguments.to_string(),
-        }
-    }
-
-    #[test]
-    fn an_edit_is_judged_in_the_folder_the_session_works_in() {
-        let dir = std::env::temp_dir().join(format!("letronna-judged-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let (project, elsewhere) = (dir.join("project"), dir.join("elsewhere"));
-        std::fs::create_dir_all(&project).unwrap();
-        std::fs::create_dir_all(&elsewhere).unwrap();
-        let rules = Ok(Vec::new());
-        let judge = |workspace: &std::path::Path, path: &str| {
-            let call = made("write_file", json!({ "path": path, "content": "x" }));
-            let (none, mode) = (Grants::new(), Mode::AcceptEdits);
-            judged(
-                &call,
-                1,
-                Some(workspace.to_owned()),
-                mode,
-                &none,
-                &rules,
-                false,
-            )
-        };
-        assert_eq!(judge(&project, "new.txt"), Some(Decision::Once));
-        let inside = project.join("new.txt").display().to_string();
-        assert_eq!(judge(&project, &inside), Some(Decision::Once));
-        // The same path is another folder's when the session is not here.
-        assert!(matches!(
-            judge(&elsewhere, &inside),
-            Some(Decision::Deny(_))
-        ));
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn bypass_still_holds_back_a_denied_or_risky_call() {
-        use letronna_core::permissions::{Effect, Rule};
-        let dir = std::env::temp_dir().join(format!("letronna-bypass-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let rules = Ok(vec![Rule {
-            tool: "run_command".into(),
-            pattern: "git push".into(),
-            effect: Effect::Deny,
-            project: None,
-        }]);
-        let judge = |line: &str| {
-            let call = made("run_command", json!({ "command": line }));
-            let (none, mode) = (Grants::new(), Mode::Bypass);
-            judged(&call, 1, Some(dir.clone()), mode, &none, &rules, false)
-        };
-        assert_eq!(judge("echo hi"), Some(Decision::Once));
-        assert!(
-            matches!(judge("git push origin main"), Some(Decision::Deny(why)) if !why.is_empty())
-        );
-        assert!(matches!(judge("git reset --hard"), Some(Decision::Deny(why)) if !why.is_empty()));
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
