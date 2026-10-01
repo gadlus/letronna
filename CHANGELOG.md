@@ -72,6 +72,16 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **App** — A first-run setup page, data-folder profiles, and sidebar filters for session state and project grouping.
 - **App** — HTML and SVG artifacts can be previewed, and a failed turn says why in the chat and offers the fix.
 - **App** — Set up Slack from the Messaging page and pair a member by code.
+- **All** — Auto mode: a judge on your own model decides what would otherwise ask, with a tag on each call and a list of its decisions (`/decisions` in the terminal, a Decisions list in the window).
+- **All** — On macOS and Linux, a command can run confined by the OS (no network, writes only in the project) instead of asking, in Accept edits and Auto.
+- **All** — Saved workflows become slash commands, and `/review` ships built in; watch, pause, stop, resume, skip and retry workflow runs and their agents, in the terminal and the window, and read one agent's transcript or a run's log.
+- **All** — Schedules run from core in whichever Letronna is open, never twice, each in a mode of its own; the model can add, list and remove them, and schedules, chat apps and `/bg` run beside the chat.
+- **All** — `letronna serve` answers the chat apps with no window open, and the window takes over from it.
+- **All** — Letronna can look back every 10 messages for what to remember; see and edit memory with `/memory` or the Memory page in Settings.
+- **All** — Summarize earlier turns on demand, now or up to a chosen turn.
+- **All** — Old sessions can be deleted after a number of days, and a rewind leaves nothing of what it took back in the file.
+- **All** — A command still running at its time limit keeps running as a background job.
+- **App** — Every part of the window can be reached from the keyboard; a run of tool calls folds into one line; a finished turn lists the files it changed; a Jobs tab shows background jobs live; a status-bar popover shows what fills the context.
 
 ### Changed
 - **All** — A failed model request says what went wrong: the key, credit, a rate limit, a busy provider, a conversation too long, and so on.
@@ -98,6 +108,7 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — Summaries reuse the chat connection, and a busy background job no longer copies its whole log on every read.
 - **All** — Runs without a window (`-p`, helpers, workflows) keep to deny rules and the safety floor, and a yes for the run no longer covers a worse call after it.
 - **All** — Unattended runs that repeat one call with the same result are stopped.
+- **All** — Helpers and workflow agents go through the whole gate, in their session's mode, with its rules, grants and judge.
 - **All** — Jobs are listed, waits match only new output, and a session sees only its own jobs.
 - **All** — A command printing past 4 MiB is saved whole for `read_file`.
 - **All** — Chat-app, web and media calls reuse one warm connection each; cache misses are named with the part that changed.
@@ -121,6 +132,7 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — `/btw` shares the session's cache and leaves no stale locks.
 - **App** — The window opens again on a session that has messages.
 - **Terminal** — A bad update is put back, and a good one is kept.
+- **Terminal** — A Ctrl-C of `letronna -p` ends the command it was running.
 
 ## [0.1.0-alpha.2] - 2026-09-27
 
