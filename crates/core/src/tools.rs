@@ -291,6 +291,7 @@ pub fn all() -> Vec<Arc<dyn Tool>> {
         Arc::new(StopJob),
         Arc::new(Wait),
         Arc::new(crate::wake::WakeMe),
+        Arc::new(crate::schedule::Scheduler),
         Arc::new(AskUser),
         Arc::new(ExitPlan),
         Arc::new(Todo),
@@ -920,6 +921,11 @@ pub fn summary(name: &str, args: &str) -> String {
         "skill" => match v["file"].as_str() {
             Some(file) => format!("{} {file}", v["name"].as_str().unwrap_or_default()),
             None => v["name"].as_str().unwrap_or_default().to_owned(),
+        },
+        "schedule" => match (v["name"].as_str(), v["id"].as_u64()) {
+            (Some(name), _) => format!("{} {name}", v["action"].as_str().unwrap_or_default()),
+            (None, Some(id)) => format!("{} #{id}", v["action"].as_str().unwrap_or_default()),
+            (None, None) => v["action"].as_str().unwrap_or_default().to_owned(),
         },
         #[cfg(feature = "workflows")]
         "workflow" => crate::workflow::tool::summary(&v),

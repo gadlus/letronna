@@ -39,6 +39,9 @@ impl Chat {
                     if page == Page::Capabilities {
                         return this.open_capabilities(window, cx);
                     }
+                    if page == Page::Jobs {
+                        return this.open_jobs(window, cx);
+                    }
                     this.page = page;
                     if page == Page::Artifacts {
                         this.read_artifacts(cx);
