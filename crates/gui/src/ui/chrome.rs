@@ -527,11 +527,16 @@ fn context_popover(report: Option<backend::ContextReport>, cx: &App) -> Div {
                 div()
                     .text_sm()
                     .font_weight(FontWeight::MEDIUM)
-                    .child(format!(
-                        "{} of {}",
-                        letronna_core::usage::count(report.used),
-                        letronna_core::usage::count(report.window)
-                    )),
+                    .child(if report.window == 0 {
+                        // A model whose window is not known has no "of".
+                        letronna_core::usage::count(report.used)
+                    } else {
+                        format!(
+                            "{} of {}",
+                            letronna_core::usage::count(report.used),
+                            letronna_core::usage::count(report.window)
+                        )
+                    }),
             )
             .child(bar)
             .children(rows.into_iter().filter(|(_, value, _)| *value > 0).map(
