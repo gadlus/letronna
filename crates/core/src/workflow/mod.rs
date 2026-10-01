@@ -23,15 +23,23 @@
 //! with create_new and touched every 30 s from the host's own wait, so it is
 //! kept fresh only while the run is really being driven, and one nobody has
 //! touched for two minutes belongs to a run that is gone and can be taken over.
+//!
+//! Its session steers it from outside through its board (`board.rs`): a pause
+//! holds queued agents back, a skip answers one with null, and a retry drops
+//! one's answer from the journal for the next resume to run it again.
 
+mod board;
 pub mod host;
 mod journal;
 pub mod saved;
 pub mod tool;
 
+pub use board::{AgentState, AgentView, PhaseView, RunState, RunView};
+pub use tool::{pause, resume, retry, run, runs, skip};
+
 use crate::agent_defs::{self, AgentDef};
 use crate::budget::{Budget, short};
-use crate::cancel::Cancel;
+use crate::cancel::{Cancel, Waker};
 use crate::chat::{self, Connection, Message};
 use crate::driver::{self, AgentId, Allow, Outcome, Report, Spec};
 use crate::inbox::{self, LINE_BREAKS, Notice, When};
@@ -41,13 +49,14 @@ use crate::timers::{self, TimerId};
 use crate::tools;
 use crate::worktree::{self, Worktree};
 use async_channel::{Receiver, Sender};
+use board::{Board, Go};
 use journal::{Journal, Line};
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 /// Where workflow agents' ids start. Helpers count up from 2^40, and no
@@ -137,8 +146,8 @@ pub struct Run {
     permits: usize,
     spawn: Spawn,
     /// Answers earlier launches of the run left, by key, with the launch each
-    /// came from.
-    answers: HashMap<String, (Value, usize)>,
+    /// came from; None for a skip.
+    answers: HashMap<String, (Option<Value>, usize)>,
     /// Worktrees earlier launches' agents started in, by key, for a rerun to
     /// carry on in.
     worktrees: HashMap<String, Worktree>,
@@ -166,20 +175,11 @@ pub struct Run {
     /// The words the user typed that asked for the run, which every agent is
     /// told first; empty for none.
     request: String,
-    /// How far the run has got, for the list of runs.
-    tally: Arc<Tally>,
-}
-
-/// How far a run has got, counted as its thread goes and read by whoever
-/// lists it.
-#[derive(Default)]
-struct Tally {
-    /// `agent` calls taken, replayed ones included.
-    calls: AtomicUsize,
-    /// Calls answered, replayed ones included.
-    answered: AtomicUsize,
-    /// Calls that ended with no answer, other than by a stop.
-    failed: AtomicUsize,
+    /// Its calls as the list of runs shows them, and the controls asked of it.
+    board: Arc<Board>,
+    /// Wakes the run when it is stopped, which a pause may have left waiting
+    /// with nothing running.
+    _woken: Waker,
 }
 
 /// A call waiting for a permit: a plain struct rather than a thread.
@@ -216,6 +216,8 @@ enum Arrival {
     },
     /// Time to touch the lock.
     Beat,
+    /// The board changed, or the run was stopped: look again.
+    Wake,
 }
 
 /// How an agent came out, as the journal and the breaker see it.
@@ -229,6 +231,8 @@ enum Ended {
     Unfinished,
     /// It was stopped, which leaves it to run again on a resume.
     Stopped,
+    /// A skip gave the script null for it, which a resume gives again.
+    Skipped,
 }
 
 impl Run {
@@ -262,6 +266,11 @@ impl Run {
         // The budget is the run's, not a launch's: a resume only raises it
         // by naming a larger one.
         let earlier = journal::spent(&lines);
+        let cancel = cancel.child();
+        let wake = arrivals.0.clone();
+        let woken = cancel.on_set(move || {
+            let _ = wake.try_send(Arrival::Wake);
+        });
         Ok(Self {
             transcripts: last_transcript(&dir.join("agents")),
             name,
@@ -270,7 +279,7 @@ impl Run {
             lock,
             connection: connection.clone(),
             id,
-            cancel: cancel.child(),
+            cancel,
             budget: Arc::new(Budget::new(budget.saturating_sub(earlier), None)),
             limit: budget,
             earlier,
@@ -285,13 +294,14 @@ impl Run {
             queue: VecDeque::new(),
             ready: VecDeque::new(),
             running: 0,
+            board: Arc::new(Board::new(arrivals.0.clone())),
             arrivals,
             beat,
             streak: None,
             paused: None,
             told: false,
             request: String::new(),
-            tally: Arc::default(),
+            _woken: woken,
         })
     }
 
@@ -336,8 +346,8 @@ impl Run {
         *seen += 1;
         let slot = self.calls;
         self.calls += 1;
-        self.tally.calls.fetch_add(1, Ordering::Relaxed);
         let writes = !(self.connection.plan || def.plan);
+        let (label, phase) = (self.label(slot, &asked), asked.phase.clone());
         if !self.live
             && let Some((value, launch)) = self.answers.get(&key)
             && *launch >= self.floor
@@ -345,14 +355,20 @@ impl Run {
             if writes {
                 self.floor = *launch;
             }
+            let state = match value {
+                Some(_) => AgentState::Replayed,
+                None => AgentState::Skipped,
+            };
+            self.board.add(label, phase, key, state);
             // Given out by `step`, never by this call, so the script's awaits
             // behave as they do for an agent that runs.
-            self.ready.push_back((slot, Some(value.clone())));
-            self.tally.answered.fetch_add(1, Ordering::Relaxed);
+            self.ready.push_back((slot, value.clone()));
             return Ok(slot);
         }
         // What it writes may change what any agent after it would find.
         self.live |= writes;
+        self.board
+            .add(label, phase, key.clone(), AgentState::Waiting);
         self.queue.push_back(Queued {
             slot,
             key,
@@ -376,41 +392,83 @@ impl Run {
                 }
                 return (!std::mem::replace(&mut self.told, true)).then_some(Step::Paused(reason));
             }
+            self.skip_queued();
             self.fill();
             if let Some((slot, value)) = self.ready.pop_front() {
                 return Some(Step::Answer(slot, value));
             }
-            if self.running == 0 {
+            // A pause leaves queued calls to wait for a resume, a skip or a stop.
+            let held = self.board.held() && !self.queue.is_empty();
+            if self.running == 0 && !held {
                 return None;
             }
             self.wait();
         }
     }
 
-    /// Starts queued agents while permits are free; once the run is stopped,
-    /// answers them with null instead.
+    /// Answers null for each queued call a skip was asked for.
+    fn skip_queued(&mut self) {
+        let asked = self.board.skips();
+        if asked.is_empty() {
+            return;
+        }
+        let queue = std::mem::take(&mut self.queue);
+        let (skipped, kept) = queue.into_iter().partition(|q| asked.contains(&q.slot));
+        self.queue = kept;
+        for queued in skipped {
+            self.record(queued.slot, queued.key, Ended::Skipped, None);
+        }
+    }
+
+    /// Starts queued agents while permits are free and no pause holds them;
+    /// once the run is stopped, answers them all with null instead.
     fn fill(&mut self) {
-        while self.running < self.permits && self.paused.is_none() {
-            let Some(queued) = self.queue.pop_front() else {
+        while self.paused.is_none() {
+            let stopped = self.cancel.is_set();
+            if !stopped && self.running >= self.permits {
+                return;
+            }
+            let Some(slot) = self.queue.front().map(|queued| queued.slot) else {
                 return;
             };
-            if self.cancel.is_set() {
-                self.ready.push_back((queued.slot, None));
+            if stopped {
+                self.queue.pop_front();
+                self.board.end(slot, AgentState::Stopped);
+                self.ready.push_back((slot, None));
                 continue;
             }
             if self.spendable().is_err() {
                 return;
             }
-            let (slot, key) = (queued.slot, queued.key.clone());
-            match self.start(queued) {
+            let cancel = self.cancel.child();
+            let charged = Arc::new(Budget::new(agent_budget(), Some(self.budget.clone())));
+            let go = self.board.begin(slot, &cancel, &charged);
+            if go == Go::Wait {
+                return;
+            }
+            let Some(queued) = self.queue.pop_front() else {
+                return;
+            };
+            let key = queued.key.clone();
+            if go == Go::Skip {
+                self.record(slot, key, Ended::Skipped, None);
+                continue;
+            }
+            match self.start(queued, cancel, charged) {
                 Ok(()) => self.running += 1,
                 Err(error) => self.record(slot, key, Ended::Failed(error), None),
             }
         }
     }
 
-    /// Sets one queued agent off on a thread of its own, to report on the run's channel.
-    fn start(&mut self, queued: Queued) -> Result<(), String> {
+    /// Sets one queued agent off on a thread of its own, stopped by `cancel`
+    /// and charged on `charged`, to report on the run's channel.
+    fn start(
+        &mut self,
+        queued: Queued,
+        cancel: Cancel,
+        charged: Arc<Budget>,
+    ) -> Result<(), String> {
         let Queued {
             slot,
             key,
@@ -418,6 +476,7 @@ impl Run {
             def,
             asked,
         } = queued;
+        let label = self.label(slot, &asked);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let (settings, _) = crate::store::settings();
         let helper_model = (!settings.helper_model.is_empty()).then_some(settings.helper_model);
@@ -432,11 +491,6 @@ impl Run {
             ..self.connection.clone()
         };
         let tools = usable(&connection, &def);
-        let label = if asked.label.is_empty() {
-            format!("{} #{}", self.name, slot + 1)
-        } else {
-            asked.label.clone()
-        };
         self.transcripts += 1;
         let transcript = Transcript {
             path: self
@@ -485,11 +539,6 @@ impl Run {
         let at_top = (worktree.as_ref())
             .zip(connection.workspace.as_deref())
             .and_then(|(tree, given)| tree.at_top(given));
-        let agent_budget = match settings.helper_budget {
-            0 => AGENT_BUDGET,
-            n => n,
-        };
-        let charged = Arc::new(Budget::new(agent_budget, Some(self.budget.clone())));
         let spec = Spec {
             connection,
             transcript,
@@ -500,7 +549,7 @@ impl Run {
             label,
             allow: Allow::Only(tools),
             rounds: def.rounds.unwrap_or(ROUNDS),
-            cancel: self.cancel.child(),
+            cancel,
             budget: Some(charged.clone()),
             status: Arc::default(),
             depth: 1,
@@ -520,6 +569,16 @@ impl Run {
         };
         (self.spawn)(spec, Box::new(move |report| owed.pay(report)))
             .inspect_err(|_| unstarted(&worktree))
+    }
+
+    /// What call `slot` shows as: the label its options give, or the run's
+    /// name and the call's number.
+    fn label(&self, slot: Slot, asked: &Options) -> String {
+        if asked.label.is_empty() {
+            format!("{} #{}", self.name, slot + 1)
+        } else {
+            asked.label.clone()
+        }
     }
 
     /// Waits for what comes next on the run's channel and deals with it.
@@ -543,6 +602,7 @@ impl Run {
                 self.running -= 1;
                 self.record(slot, key, ended, kept);
             }
+            Arrival::Wake => {}
         }
     }
 
@@ -550,25 +610,31 @@ impl Run {
     /// journal, readies its answer, and pauses the run at the third failure in
     /// a row with one error.
     fn record(&mut self, slot: Slot, key: String, ended: Ended, kept: Option<String>) {
+        // An answer wins over a skip that came too late for it; any other end
+        // of an agent the user skipped is the skip's.
+        let ended = match ended {
+            Ended::Answered(..) | Ended::Skipped => ended,
+            _ if self.board.skipping(slot) => Ended::Skipped,
+            ended => ended,
+        };
         // A line that cannot be written costs only a rerun on the next resume,
-        // so the answer still goes to the script.
+        // so the answer still goes to the script. The line goes before the
+        // board says how the call ended, so a retry's line comes after it.
         if let Some(line) = kept {
             let key = key.clone();
             let _ = self.journal.write(&Line::Kept { key, line });
         }
-        let value = match ended {
+        let (value, state) = match ended {
             Ended::Answered(value, tokens) => {
                 self.streak = None;
-                self.tally.answered.fetch_add(1, Ordering::Relaxed);
                 let _ = self.journal.write(&Line::Result {
                     key,
                     value: value.clone(),
                     tokens,
                 });
-                Some(value)
+                (Some(value), AgentState::Done)
             }
             Ended::Failed(error) => {
-                self.tally.failed.fetch_add(1, Ordering::Relaxed);
                 let _ = self.journal.write(&Line::Failed { key });
                 let count = match &self.streak {
                     Some((same, count)) if *same == error => count + 1,
@@ -580,15 +646,19 @@ impl Run {
                     ));
                 }
                 self.streak = Some((error, count));
-                None
+                (None, AgentState::Failed)
             }
             Ended::Unfinished => {
-                self.tally.failed.fetch_add(1, Ordering::Relaxed);
                 let _ = self.journal.write(&Line::Failed { key });
-                None
+                (None, AgentState::Failed)
             }
-            Ended::Stopped => None,
+            Ended::Stopped => (None, AgentState::Stopped),
+            Ended::Skipped => {
+                let _ = self.journal.write(&Line::Skipped { key });
+                (None, AgentState::Skipped)
+            }
         };
+        self.board.end(slot, state);
         self.ready.push_back((slot, value));
     }
 
@@ -613,7 +683,9 @@ impl Run {
             return;
         }
         self.cancel.set();
-        self.queue.clear();
+        for queued in self.queue.drain(..) {
+            self.board.end(queued.slot, AgentState::Stopped);
+        }
         let _ = self.journal.write(&Line::Paused {
             reason: reason.clone(),
         });
@@ -924,6 +996,14 @@ fn ended(report: &Report, tokens: u64) -> Ended {
         Outcome::Failed(error) => Ended::Failed(error.clone()),
         Outcome::RoundLimit | Outcome::OverBudget => Ended::Unfinished,
         Outcome::Stopped => Ended::Stopped,
+    }
+}
+
+/// What one agent may spend: the helper budget Settings names, or AGENT_BUDGET.
+fn agent_budget() -> u64 {
+    match crate::store::settings().0.helper_budget {
+        0 => AGENT_BUDGET,
+        n => n,
     }
 }
 
@@ -1843,5 +1923,227 @@ mod tests {
             .map(|line| line["value"].clone())
             .collect();
         assert_eq!(results, [json!({"real": true})]);
+    }
+
+    /// An agent the test ends when it likes: its task, its stop, and where
+    /// its report goes.
+    type Held = (String, Cancel, Then);
+
+    /// Stands in for the driver, handing each agent to the test as it starts.
+    fn handed() -> (Spawn, mpsc::Receiver<Held>) {
+        let (sent, got) = mpsc::channel();
+        let spawn: Spawn = Box::new(move |spec, then| {
+            let held = (asked(&spec), spec.cancel.clone(), then);
+            sent.send(held).map_err(|e| e.to_string())
+        });
+        (spawn, got)
+    }
+
+    /// Steps `run` on a thread of its own until it has nothing more, then
+    /// gives it back with its steps.
+    fn driven(mut run: Run) -> mpsc::Receiver<(Run, Vec<Step>)> {
+        let (sent, got) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut steps = Vec::new();
+            while let Some(step) = run.step() {
+                steps.push(step);
+            }
+            let _ = sent.send((run, steps));
+        });
+        got
+    }
+
+    /// Each call's state on `board`, in the order the calls came.
+    fn states(board: &Board) -> Vec<AgentState> {
+        let phases = board.phases().into_iter();
+        let mut agents: Vec<AgentView> = phases.flat_map(|phase| phase.agents).collect();
+        agents.sort_by_key(|agent| agent.number);
+        agents.iter().map(|agent| agent.state).collect()
+    }
+
+    /// Waits until the calls on `board` stand as `want`, failing rather than
+    /// hanging.
+    fn until(board: &Board, want: &[AgentState]) {
+        let deadline = Instant::now() + WAIT;
+        while states(board) != want {
+            assert!(
+                Instant::now() < deadline,
+                "the calls stand {:?}",
+                states(board)
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_pause_holds_queued_agents_back_while_running_ones_answer() {
+        use AgentState::{Done, Running, Stopped, Waiting};
+        let data = Data::new("pause");
+        let (spawn, started) = handed();
+        let mut run = data.run(None, spawn);
+        run.permits = 1;
+        run.agent("Read a.rs.", &explore()).unwrap();
+        run.agent("Read b.rs.", &explore()).unwrap();
+        let board = run.board.clone();
+        let got = driven(run);
+        let (task, _, then) = started.recv_timeout(WAIT).unwrap();
+        assert_eq!(task, "Read a.rs.");
+        board.pause("wf-1").unwrap();
+        assert_eq!(board.pause("wf-1"), Err("wf-1 is paused already.".into()));
+        // The running one finishes and answers; the queued one waits.
+        then(&done(&task));
+        until(&board, &[Done, Waiting]);
+        assert!(started.recv_timeout(Duration::from_millis(200)).is_err());
+        let journal = data.folder("wf-1").join("journal.jsonl");
+        assert_eq!(
+            board.retry("wf-1", "#2", &journal),
+            Err("wf-1 #2 is waiting; skip it first, then retry it for the next resume.".into())
+        );
+        board.resume("wf-1").unwrap();
+        assert_eq!(board.resume("wf-1"), Err("wf-1 is not paused.".into()));
+        let (task, _, then) = started.recv_timeout(WAIT).unwrap();
+        assert_eq!(task, "Read b.rs.");
+        until(&board, &[Done, Running]);
+        then(&done(&task));
+        let (_first, steps) = got.recv_timeout(WAIT).unwrap();
+        assert_eq!(
+            by_slot(&steps),
+            [text("Read a.rs. -> done"), text("Read b.rs. -> done")]
+        );
+
+        // Paused with nothing running, a stop still ends it at once.
+        let (spawn, started) = handed();
+        let mut run = data.run(None, spawn);
+        run.agent("Read c.rs.", &explore()).unwrap();
+        run.agent("Read d.rs.", &explore()).unwrap();
+        run.board.pause("wf-2").unwrap();
+        let cancel = run.cancel.clone();
+        let got = driven(run);
+        assert!(got.recv_timeout(Duration::from_millis(200)).is_err());
+        cancel.set();
+        let (run, steps) = got.recv_timeout(WAIT).unwrap();
+        assert_eq!(by_slot(&steps), [None, None]);
+        assert_eq!(states(&run.board), [Stopped, Stopped]);
+        assert!(started.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_skip_answers_null_for_a_waiting_or_running_agent_and_a_resume_skips_it_again() {
+        use AgentState::{Done, Replayed, Running, Skipped};
+        let data = Data::new("skip");
+        let (spawn, started) = handed();
+        let mut run = data.run(None, spawn);
+        run.permits = 2;
+        let tasks = ["Read a.rs.", "Read b.rs.", "Read c.rs."];
+        for task in tasks {
+            run.agent(task, &explore()).unwrap();
+        }
+        let board = run.board.clone();
+        let got = driven(run);
+        let (_, a_stop, a_then) = started.recv_timeout(WAIT).unwrap();
+        let (b, b_stop, b_then) = started.recv_timeout(WAIT).unwrap();
+        until(&board, &[Running, Running, AgentState::Waiting]);
+        // The waiting one is answered at once and never starts.
+        board.skip("wf-1", "#3").unwrap();
+        until(&board, &[Running, Running, Skipped]);
+        // A running one is stopped, and its stop is the skip's.
+        board.skip("wf-1", "wf-1 #1").unwrap();
+        assert!(a_stop.is_set());
+        assert_eq!(
+            board.skip("wf-1", "#1"),
+            Err("wf-1 #1 is being skipped already.".into())
+        );
+        a_then(&report(Outcome::Stopped, ""));
+        // One that answers before the stop reaches it keeps its answer.
+        board.skip("wf-1", "#2").unwrap();
+        assert!(b_stop.is_set());
+        b_then(&done(&b));
+        let (run, first) = got.recv_timeout(WAIT).unwrap();
+        assert_eq!(by_slot(&first), [None, text("Read b.rs. -> done"), None]);
+        assert_eq!(states(&run.board), [Skipped, Done, Skipped]);
+        assert!(started.try_recv().is_err());
+        let refused = |agent: &str| run.board.skip("wf-1", agent).unwrap_err();
+        assert_eq!(
+            refused("#2"),
+            "wf-1 #2 has answered; there is nothing to skip."
+        );
+        assert_eq!(
+            refused("#3"),
+            "wf-1 #3 has ended (skipped); there is nothing to skip."
+        );
+        assert_eq!(refused("#4"), "wf-1 has no agent #4: it has made 3 calls.");
+        assert_eq!(refused("reader"), "wf-1 has no agent labelled \"reader\".");
+        drop(run);
+        assert_eq!(keys(&data.journal("wf-1"), "skipped").len(), 2);
+
+        // A resume gives the script null for them again, running neither.
+        let asked_again = Asked::default();
+        let mut run = data.run(Some("wf-1"), answering(&asked_again, done));
+        for task in tasks {
+            run.agent(task, &explore()).unwrap();
+        }
+        let (run, again) = steps(run, usize::MAX);
+        assert_eq!(by_slot(&again), [None, text("Read b.rs. -> done"), None]);
+        assert!(asked_again.lock().unwrap().is_empty());
+        assert_eq!(states(&run.board), [Skipped, Replayed, Skipped]);
+    }
+
+    #[test]
+    fn a_retry_drops_a_skip_so_a_resume_reruns_it_and_what_embeds_its_answer() {
+        use AgentState::{Done, Replayed, Retry};
+        let data = Data::new("retry");
+        let lister = json!({"type": "explore", "label": "lister"});
+        let notes = json!({"type": "explore", "label": "notes"});
+        let mut run = data.run(None, answering(&Asked::default(), done));
+        run.agent("List the files.", &lister).unwrap();
+        run.board.skip("wf-1", "lister").unwrap();
+        let (mut run, first) = steps(run, 1);
+        assert_eq!(by_slot(&first), [None]);
+        // Each embeds the answer it had, as a script does.
+        run.agent("Review null.", &notes).unwrap();
+        run.agent("Read the notes.", &notes).unwrap();
+        let (run, rest) = steps(run, usize::MAX);
+        assert_eq!(rest.len(), 2);
+        let journal = data.folder("wf-1").join("journal.jsonl");
+        let retry = |agent: &str| run.board.retry("wf-1", agent, &journal);
+        assert_eq!(
+            retry("#2"),
+            Err(
+                "notes answered; only an agent that failed, stopped or was skipped runs again."
+                    .into()
+            )
+        );
+        assert_eq!(
+            retry("notes"),
+            Err("2 agents of wf-1 are labelled \"notes\"; name one by its number: #2, #3.".into())
+        );
+        retry("lister").unwrap();
+        assert_eq!(
+            retry("lister"),
+            Err("lister runs again at the next resume already.".into())
+        );
+        assert_eq!(states(&run.board), [Retry, Done, Done]);
+        drop(run);
+        // The retry has the last word on the skip's key.
+        let lines = data.journal("wf-1");
+        assert_eq!(keys(&lines, "retry"), keys(&lines, "skipped"));
+        assert_eq!(lines.last().unwrap()["type"], "retry");
+
+        // Resumed, it runs, and so does the call its answer now goes into;
+        // the one that does not embed it is replayed.
+        let asked_again = Asked::default();
+        let mut run = data.run(Some("wf-1"), answering(&asked_again, done));
+        run.agent("List the files.", &lister).unwrap();
+        let (mut run, first) = steps(run, 1);
+        assert_eq!(by_slot(&first), [text("List the files. -> done")]);
+        run.agent("Review List the files. -> done.", &notes)
+            .unwrap();
+        run.agent("Read the notes.", &notes).unwrap();
+        let (run, _) = steps(run, usize::MAX);
+        assert_eq!(
+            *asked_again.lock().unwrap(),
+            ["List the files.", "Review List the files. -> done."]
+        );
+        assert_eq!(states(&run.board), [Done, Done, Replayed]);
     }
 }

@@ -1,16 +1,17 @@
 //! The slash commands: everything you can ask of Letronna itself rather
 //! than of the model.
 
-use letronna_core::agents::Seen;
+use letronna_core::agents::{Seen, took};
+use letronna_core::budget::short;
 use letronna_core::chat::Connection;
 use letronna_core::fallback::Fallback;
 use letronna_core::gate::Mode;
 use letronna_core::inbox::{self, Notice, When};
 use letronna_core::skills::{Skill, Source};
 use letronna_core::slash::{self, Origin};
-use letronna_core::tasks::{self, Key, State};
 use letronna_core::tools::{Tool, ToolContext};
 use letronna_core::workflow::tool::{LeftOpen, left_open};
+use letronna_core::workflow::{self, RunState, RunView};
 use letronna_core::{goal, history, store};
 use serde_json::{Value, json};
 use std::sync::atomic::Ordering;
@@ -1216,7 +1217,8 @@ fn jobs(rest: &str) {
 
 /// Words that go with `/workflows`, shown after a list and for words it
 /// could not read.
-const RUN_USAGE: &str = "/workflows <run>  ·  /workflows stop <run>  ·  /workflows resume <run>";
+const RUN_USAGE: &str = "/workflows <run>  ·  /workflows stop|pause|resume <run>  ·  /workflows \
+                         skip|retry <run> <agent>";
 
 /// What `/workflows` was asked, read from the words after it.
 #[derive(Debug, PartialEq)]
@@ -1225,23 +1227,31 @@ enum Asked<'a> {
     Show(String),
     Stop(String),
     Resume(String),
+    Pause(String),
+    /// A run and one of its agents, by label or `#N`.
+    Skip(String, String),
+    Retry(String, String),
     /// A verb that works on a run, given none.
     Which(&'a str),
-    /// Pause, skip or retry, which Letronna cannot do to a run yet.
-    NotYet,
+    /// A verb that works on an agent, given a run but no agent.
+    WhichAgent(&'a str, String),
     Unclear,
 }
 
 /// Reads the words after `/workflows`: nothing to list the runs, a run to
-/// show it, or a verb and a run. A run is `wf-3`, or just `3`.
+/// show it, a verb and a run, or for skip and retry a run and one of its
+/// agents, whose label may take several words. A run is `wf-3`, or just `3`.
 fn asked(rest: &str) -> Asked<'_> {
     let words: Vec<&str> = rest.split_whitespace().collect();
     match words[..] {
         [] => Asked::List,
-        ["pause" | "skip" | "retry", ..] => Asked::NotYet,
-        [verb @ ("show" | "stop" | "resume")] => Asked::Which(verb),
+        [verb @ ("show" | "stop" | "resume" | "pause" | "skip" | "retry")] => Asked::Which(verb),
+        [verb @ ("skip" | "retry"), run] => Asked::WhichAgent(verb, run_name(run)),
+        ["skip", run, ref agent @ ..] => Asked::Skip(run_name(run), agent.join(" ")),
+        ["retry", run, ref agent @ ..] => Asked::Retry(run_name(run), agent.join(" ")),
         ["show", run] | [run] => Asked::Show(run_name(run)),
         ["stop", run] => Asked::Stop(run_name(run)),
+        ["pause", run] => Asked::Pause(run_name(run)),
         ["resume", run] => Asked::Resume(run_name(run)),
         _ => Asked::Unclear,
     }
@@ -1263,7 +1273,7 @@ struct Run {
     title: String,
     /// How it stands, with how far it has got while it runs.
     state: String,
-    /// What it has spent, as the `agents` list puts it.
+    /// What it has spent, as a notice puts it.
     tokens: String,
     stage: Stage,
 }
@@ -1271,6 +1281,8 @@ struct Run {
 /// Where a run is, as far as what can be done with it goes.
 enum Stage {
     Running,
+    /// Held by a pause, until a resume lets it go on where it is.
+    Paused,
     Finished,
     /// Stopped, failed or paused, so a resume picks it up.
     Ended,
@@ -1281,8 +1293,9 @@ enum Stage {
 /// Session `id`'s workflow runs, and what can be done with them.
 ///
 /// A run goes on in the background and says nothing until it ends, so this
-/// is where the user looks in on one, stops it or picks it back up. Only the
-/// session that started a run is shown it, as only its own agent may stop it.
+/// is where the user looks in on one, pauses or stops it, skips or retries
+/// one of its agents, or picks it back up. Only the session that started a
+/// run is shown it, as only its own agent may stop it.
 fn workflows(runner: &mut Runner, session: usize, rest: &str) {
     let id = runner.store.conversations[session].id;
     render::blank();
@@ -1297,14 +1310,22 @@ fn workflows(runner: &mut Runner, session: usize, rest: &str) {
                 runner.stopped = false;
             }
         }
+        Asked::Pause(name) => pause_run(id, &name),
+        Asked::Skip(name, agent) => skip_agent(id, &name, &agent),
+        Asked::Retry(name, agent) => retry_agent(id, &name, &agent),
         Asked::Which(verb) => render::said(
             &render::blue("●"),
             &render::bold(&format!("Which one? /workflows {verb} <run>")),
         ),
-        Asked::NotYet => render::line(&render::dim(
-            "Pausing a run, or skipping or retrying one of its agents, is not in Letronna \
-             yet. /workflows stop <run> keeps its finished agents' answers for a resume.",
-        )),
+        Asked::WhichAgent(verb, name) => {
+            render::said(
+                &render::blue("●"),
+                &render::bold(&format!("Which agent? /workflows {verb} {name} <agent>")),
+            );
+            render::line(&render::dim(&format!(
+                "An agent is its label or #N, as /workflows {name} lists them."
+            )));
+        }
         Asked::Unclear => render::line(&render::dim(&format!(
             "/workflows to list the runs  ·  {RUN_USAGE}"
         ))),
@@ -1314,32 +1335,18 @@ fn workflows(runner: &mut Runner, session: usize, rest: &str) {
 /// Session `id`'s workflow runs, oldest first, then those Letronna closed on
 /// while they ran.
 fn runs(id: u64) -> Vec<Run> {
-    let listed = agents_call(id, json!({"action": "list"})).unwrap_or_default();
-    let cells = run_cells(&listed);
-    let mut runs: Vec<Run> = (tasks::list(id).into_iter())
-        .filter(|task| matches!(task.key, Key::Workflow(_)))
-        .map(|task| {
-            // Labelled `wf-3 "title"` by the tool that started it.
-            let label = task.label.as_str();
-            let (name, title) = label.split_once(' ').unwrap_or((label, ""));
-            let stage = match task.state {
-                State::Running | State::Idle => Stage::Running,
-                State::Done(_) => Stage::Finished,
-                State::Failed(_) | State::Stopped => Stage::Ended,
-            };
-            // The task says only how it stands; the list says how far it
-            // got and what it spent.
-            let (state, tokens) = match cells.iter().find(|[run, ..]| run == name) {
-                Some([_, state, tokens]) => (state.clone(), tokens.clone()),
-                None => (standing(&task.state), "-".to_owned()),
-            };
-            Run {
-                name: name.to_owned(),
-                title: title.trim_matches('"').to_owned(),
-                state,
-                tokens,
-                stage,
-            }
+    let mut runs: Vec<Run> = (workflow::runs(id).iter())
+        .map(|view| Run {
+            name: view.name.clone(),
+            title: view.title.clone(),
+            state: standing(view),
+            tokens: short(view.spent),
+            stage: match view.state {
+                RunState::Running => Stage::Running,
+                RunState::Paused => Stage::Paused,
+                RunState::Finished => Stage::Finished,
+                RunState::Ended(_) => Stage::Ended,
+            },
         })
         .collect();
     let closed = (left_open().into_iter()).filter(|run| run.session == id);
@@ -1354,7 +1361,7 @@ fn runs(id: u64) -> Vec<Run> {
 }
 
 /// Asks the `agents` tool something as session `id`'s own agent, which is
-/// who may list, stop and report its workflow runs.
+/// who may stop and report its workflow runs.
 fn agents_call(id: u64, args: Value) -> Result<String, String> {
     let connection = Connection {
         conversation: id,
@@ -1363,30 +1370,47 @@ fn agents_call(id: u64, args: Value) -> Result<String, String> {
     letronna_core::agents::Agents.run(&args, &ToolContext::of(&connection))
 }
 
-/// Each workflow run's name, state and spend in the `agents` list, whose
-/// columns -- name, type, state, rounds, tokens -- are two spaces or more
-/// apart.
-fn run_cells(listed: &str) -> Vec<[String; 3]> {
-    let cells = listed.lines().filter_map(|line| {
-        let cells: Vec<&str> = (line.split("  ").map(str::trim))
-            .filter(|cell| !cell.is_empty())
-            .collect();
-        match cells[..] {
-            [name, "workflow", state, _, tokens] => Some([name, state, tokens].map(String::from)),
-            _ => None,
-        }
+/// How a run stands and for how long, with how far it has got while it
+/// goes: "running · 1m02s · 3 of 9 done", "stopped · 9s".
+fn standing(view: &RunView) -> String {
+    let agents = view.phases.iter().flat_map(|phase| &phase.agents);
+    let (calls, done) = agents.fold((0, 0), |(calls, done), agent| {
+        (calls + 1, done + usize::from(agent.state.answered()))
     });
-    cells.collect()
+    let took = took(view.seconds);
+    match &view.state {
+        RunState::Running => format!("running · {took} · {done} of {calls} done"),
+        RunState::Paused => format!("paused · {took} · {done} of {calls} done"),
+        RunState::Finished => format!("finished · {took}"),
+        RunState::Ended(how) => format!("{how} · {took}"),
+    }
 }
 
-/// How a task stands, in a word or a few.
-fn standing(state: &State) -> String {
-    match state {
-        State::Running => "running".into(),
-        State::Idle => "idle".into(),
-        State::Done(how) | State::Failed(how) => how.clone(),
-        State::Stopped => "stopped".into(),
+/// A run's agents under their phases, one line apiece with its number,
+/// label, state and spend, the labels lined up.
+fn agent_lines(view: &RunView) -> Vec<String> {
+    let agents = || view.phases.iter().flat_map(|phase| &phase.agents);
+    let wide = (agents().map(|agent| agent.label.chars().count()).max()).unwrap_or(0);
+    let mut lines = Vec::new();
+    for phase in &view.phases {
+        if !phase.title.is_empty() {
+            lines.push(phase.title.clone());
+        }
+        for agent in &phase.agents {
+            let tokens = match agent.tokens {
+                0 => "-".to_owned(),
+                tokens => short(tokens),
+            };
+            let number = format!("#{}", agent.number);
+            let line = format!(
+                "  {number:<4} {:<wide$}  {:<9} {tokens}",
+                agent.label,
+                agent.state.word()
+            );
+            lines.push(line);
+        }
     }
+    lines
 }
 
 /// The runs as a table, a header first, each row cut to `width`. The title
@@ -1437,7 +1461,7 @@ fn list_runs(id: u64) {
     for (row, run) in rows.iter().zip(&runs) {
         // One that is not going stands back from those at work.
         render::line(&match run.stage {
-            Stage::Running => row.clone(),
+            Stage::Running | Stage::Paused => row.clone(),
             _ => render::dim(row),
         });
     }
@@ -1458,7 +1482,8 @@ fn named_run<'a>(runs: &'a [Run], name: &str) -> Option<&'a Run> {
     found
 }
 
-/// One run: how it stands, then its result once it has one.
+/// One run: how it stands, its agents under their phases, then its result
+/// once it has one.
 fn show_run(id: u64, name: &str) {
     let runs = runs(id);
     let Some(run) = named_run(&runs, name) else {
@@ -1479,6 +1504,12 @@ fn show_run(id: u64, name: &str) {
         )));
         return;
     }
+    if let Ok(view) = workflow::run(id, name) {
+        let width = render::width().saturating_sub(render::PAD.len());
+        for line in agent_lines(&view) {
+            render::line(&render::dim(&render::clip(&line, width)));
+        }
+    }
     match agents_call(id, json!({"action": "report", "to": name})) {
         Ok(report) => report.lines().for_each(render::line),
         Err(error) => render::line(&render::red(&error)),
@@ -1492,7 +1523,7 @@ fn stop_run(id: u64, name: &str) {
         return;
     };
     let not_going = match run.stage {
-        Stage::Running => None,
+        Stage::Running | Stage::Paused => None,
         Stage::Closed(_) => Some(format!(
             "{name} is not running: Letronna closed while it ran."
         )),
@@ -1520,9 +1551,9 @@ fn stop_run(id: u64, name: &str) {
     }
 }
 
-/// Asks the model to pick run `name` back up, and says whether it did: the
-/// run shows its launch card again, and its finished agents' answers come
-/// back at no cost.
+/// Picks run `name` back up, and says whether the model was asked to: a
+/// paused run goes on where it is, and one that ended shows its launch card
+/// again, its finished agents' answers coming back at no cost.
 fn resume_run(id: u64, name: &str) -> bool {
     let runs = runs(id);
     let Some(run) = named_run(&runs, name) else {
@@ -1531,6 +1562,16 @@ fn resume_run(id: u64, name: &str) -> bool {
     match &run.stage {
         Stage::Running => {
             render::line(&render::dim(&format!("{name} is still running.")));
+            return false;
+        }
+        Stage::Paused => {
+            match workflow::resume(id, name) {
+                Ok(()) => render::said(
+                    &render::blue("●"),
+                    &render::bold(&format!("Resuming {name}")),
+                ),
+                Err(error) => render::line(&render::dim(&error)),
+            }
             return false;
         }
         Stage::Finished => {
@@ -1563,6 +1604,61 @@ fn resume_run(id: u64, name: &str) -> bool {
         &render::bold(&format!("Resuming {name}")),
     );
     true
+}
+
+/// Holds run `name` where it is: its running agents finish, and no other
+/// starts until a resume.
+fn pause_run(id: u64, name: &str) {
+    if let Err(error) = workflow::pause(id, name) {
+        render::line(&render::dim(&error));
+        return;
+    }
+    render::said(
+        &render::blue("●"),
+        &render::bold(&format!("Pausing {name}")),
+    );
+    render::line(&render::dim(&format!(
+        "Its running agents finish; no other starts until /workflows resume {name}."
+    )));
+}
+
+/// Gives run `name`'s script null for `agent`, stopping it if it runs.
+fn skip_agent(id: u64, name: &str, agent: &str) {
+    if let Err(error) = workflow::skip(id, name, agent) {
+        render::line(&render::dim(&error));
+        return;
+    }
+    render::said(
+        &render::blue("●"),
+        &render::bold(&format!("Skipping {agent} of {name}")),
+    );
+    render::line(&render::dim(
+        "Its script goes on without its answer, and a resume skips it again.",
+    ));
+}
+
+/// Sets `agent` of run `name` to run again when the run is next resumed.
+fn retry_agent(id: u64, name: &str, agent: &str) {
+    if let Err(error) = workflow::retry(id, name, agent) {
+        render::line(&render::dim(&error));
+        return;
+    }
+    render::said(
+        &render::blue("●"),
+        &render::bold(&format!("{agent} of {name} runs again at its next resume")),
+    );
+    // The script has gone on without its answer, so only a resume, which
+    // runs the script again, can use a new one.
+    let going = workflow::run(id, name)
+        .is_ok_and(|view| matches!(view.state, RunState::Running | RunState::Paused));
+    render::line(&render::dim(&if going {
+        format!(
+            "{name} is still going: /workflows stop {name}, then /workflows resume {name}, \
+             runs it now."
+        )
+    } else {
+        format!("/workflows resume {name} runs it, and whatever used its answer.")
+    }));
 }
 
 /// Whether `/crew` with `rest` after it turns Crew on or off in a session
@@ -3257,12 +3353,13 @@ pub fn gateways(runner: &mut Runner) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Asked, Run, Stage, agent_rows, asked, choice_label, crew_switch, from_match, last_prompt,
-        name_label, run_cells, run_rows, typed_path, with_files,
+        Asked, Run, Stage, agent_lines, agent_rows, asked, choice_label, crew_switch, from_match,
+        last_prompt, name_label, run_rows, standing, typed_path, with_files,
     };
     use letronna_core::agents::Seen;
     use letronna_core::chat::Message;
     use letronna_core::driver::Status;
+    use letronna_core::workflow::{AgentState, AgentView, PhaseView, RunState, RunView};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
@@ -3459,27 +3556,75 @@ mod tests {
         assert_eq!(asked("stop 4"), Asked::Stop("wf-4".into()));
         assert_eq!(asked("resume  wf-1"), Asked::Resume("wf-1".into()));
         assert_eq!(asked("stop"), Asked::Which("stop"));
-        assert_eq!(asked("pause wf-1"), Asked::NotYet);
-        assert_eq!(asked("skip wf-1 explore-2"), Asked::NotYet);
+        assert_eq!(asked("pause 1"), Asked::Pause("wf-1".into()));
+        assert_eq!(asked("pause"), Asked::Which("pause"));
+        assert_eq!(
+            asked("skip wf-1 #2"),
+            Asked::Skip("wf-1".into(), "#2".into())
+        );
+        // A label may take several words.
+        assert_eq!(
+            asked("retry 3 src/a.rs:12  vote 2"),
+            Asked::Retry("wf-3".into(), "src/a.rs:12 vote 2".into())
+        );
+        assert_eq!(
+            asked("retry wf-3"),
+            Asked::WhichAgent("retry", "wf-3".into())
+        );
+        assert_eq!(asked("skip"), Asked::Which("skip"));
         // A typo is not taken for a run's name, which would seem to have worked.
         assert_eq!(asked("stpo wf-3"), Asked::Unclear);
         assert_eq!(asked("stop wf-1 wf-2"), Asked::Unclear);
     }
 
     #[test]
-    fn the_agents_list_gives_each_runs_state_and_spend() {
-        let listed = "name       type      state                         rounds  tokens\n\
-                      explore-1  explore   running · 12s                 3       4.1k\n\
-                      wf-3       workflow  running · 1m02s · 3 of 9 done  -       120k\n\
-                      wf-4       workflow  finished · 5s                 -       0";
+    fn a_runs_view_gives_its_state_and_its_agents_under_their_phases() {
+        let agent = |number: usize, label: &str, phase: &str, state, tokens| AgentView {
+            number,
+            label: label.into(),
+            phase: phase.into(),
+            state,
+            tokens,
+        };
+        let mut view = RunView {
+            name: "wf-3".into(),
+            title: "audit".into(),
+            state: RunState::Paused,
+            phases: vec![
+                PhaseView {
+                    title: "Find".into(),
+                    agents: vec![agent(1, "finder", "Find", AgentState::Done, 12_300)],
+                },
+                PhaseView {
+                    title: "Check".into(),
+                    agents: vec![
+                        agent(2, "src/a.rs", "Check", AgentState::Replayed, 0),
+                        agent(3, "wf-3 #3", "Check", AgentState::Running, 900),
+                    ],
+                },
+                PhaseView {
+                    title: "Report".into(),
+                    agents: Vec::new(),
+                },
+            ],
+            spent: 13_200,
+            budget: 3_000_000,
+            seconds: 62,
+        };
+        assert_eq!(standing(&view), "paused · 1m02s · 2 of 3 done");
         assert_eq!(
-            run_cells(listed),
+            agent_lines(&view),
             [
-                ["wf-3", "running · 1m02s · 3 of 9 done", "120k"].map(String::from),
-                ["wf-4", "finished · 5s", "0"].map(String::from),
+                "Find",
+                "  #1   finder    done      12k",
+                "Check",
+                "  #2   src/a.rs  replayed  -",
+                "  #3   wf-3 #3   running   900",
+                "Report",
             ]
         );
-        assert!(run_cells("You have started no helpers.").is_empty());
+        view.state = RunState::Ended("stopped".into());
+        assert_eq!(standing(&view), "stopped · 1m02s");
     }
 
     #[test]

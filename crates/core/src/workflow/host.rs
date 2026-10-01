@@ -290,11 +290,13 @@ fn turns(ctx: &Ctx, host: &Rc<RefCell<Host>>, clock: &Clock, body: &str, args: &
         let step = {
             let mut host = host.borrow_mut();
             let run = &mut host.run;
-            if let Some(end) = settled {
-                return end;
-            }
+            // A stop wins over a script that returned on the nulls it left,
+            // as one stopped while paused does: it ends stopped, telling nobody.
             if run.cancel.is_set() {
                 return End::Failed(format!("Workflow {} was stopped.", run.name));
+            }
+            if let Some(end) = settled {
+                return end;
             }
             run.step()
         };

@@ -55,6 +55,10 @@ pub(super) enum Line {
     Failed { key: String },
     /// An agent's worktree was kept as it ended, as this line says.
     Kept { key: String, line: String },
+    /// A skip gave the script null for an agent, which a resume gives again.
+    Skipped { key: String },
+    /// A retry dropped an agent's answer, so the next resume runs it again.
+    Retry { key: String },
     /// The run paused, and why.
     Paused { reason: String },
 }
@@ -95,6 +99,16 @@ impl Journal {
     }
 }
 
+/// Appends `line` to the journal at `path` without reading it, as its run may
+/// be writing to it meanwhile: each line is one write, so the two never mix.
+pub(super) fn append(path: &Path, line: &Line) -> Result<(), String> {
+    let file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("Could not open the workflow's journal: {e}"))?;
+    Journal { file }.write(line)
+}
+
 /// The lines of the journal at `path`, read without taking it for writing;
 /// none when it cannot be read.
 pub(super) fn read(path: &Path) -> Vec<Line> {
@@ -112,18 +126,22 @@ fn parse(bytes: &[u8]) -> Vec<Line> {
 }
 
 /// The answers `lines` hold, by key, each with the launch of the run that gave
-/// it, counted from 1. The last word on a key wins, so one that ran live again
-/// after it answered, and was in flight or failed, has none.
-pub(super) fn answers(lines: &[Line]) -> HashMap<String, (Value, usize)> {
+/// it, counted from 1, and None for a skip. The last word on a key wins, so one
+/// that ran live again after it answered, and was in flight or failed, or that
+/// a retry dropped, has none.
+pub(super) fn answers(lines: &[Line]) -> HashMap<String, (Option<Value>, usize)> {
     let mut answers = HashMap::new();
     let mut launch = 0;
     for line in lines {
         match line {
             Line::Launched { .. } => launch += 1,
             Line::Result { key, value, .. } => {
-                answers.insert(key.clone(), (value.clone(), launch));
+                answers.insert(key.clone(), (Some(value.clone()), launch));
             }
-            Line::Started { key, .. } | Line::Failed { key } => {
+            Line::Skipped { key } => {
+                answers.insert(key.clone(), (None, launch));
+            }
+            Line::Started { key, .. } | Line::Failed { key } | Line::Retry { key } => {
                 answers.remove(key);
             }
             Line::Kept { .. } | Line::Paused { .. } => {}
