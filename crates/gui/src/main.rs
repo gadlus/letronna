@@ -385,6 +385,12 @@ pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Opti
             KeyBinding::new("enter", ui::jobs::AddLines, Some("JobLog")),
             Some("In a job's output: add the picked lines to the message"),
         ),
+        // Saves the Memory page's box with focus; nothing else there has a
+        // save key.
+        (
+            KeyBinding::new("secondary-s", ui::memory::Save, Some("MemoryPage")),
+            Some("On the Memory page: save"),
+        ),
         (
             KeyBinding::new("enter", ui::actions::ToggleDiff, Some("ChangedFile")),
             Some("On a changed file under a turn: show or hide its diff"),

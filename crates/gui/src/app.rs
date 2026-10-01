@@ -159,6 +159,8 @@ pub(crate) struct Chat {
     /// percentage's popover; added up when it was last opened, and `None`
     /// while it is closed.
     pub(crate) context_report: Option<letronna_core::chat::ContextReport>,
+    /// Settings' Memory page, which keeps its own state.
+    pub(crate) memory: Entity<crate::ui::memory::MemoryPage>,
     pub(crate) settings_open: bool,
     /// Held by the settings panel while it is open, so escape reaches it.
     pub(crate) settings_focus: FocusHandle,
@@ -599,6 +601,7 @@ impl Chat {
         let gateway_pick = cx.new(|_| store.settings.gateway.clone());
         let presence_pick = cx.new(|_| store.settings.presence.clone());
         let settings_page = cx.new(|_| "Gateways");
+        let memory = cx.new(|cx| crate::ui::memory::MemoryPage::new(window, cx));
         let rename = cx.new(|cx| InputState::new(window, cx).placeholder("Session name"));
         let answer = cx.new(|cx| InputState::new(window, cx).placeholder("Your answer…"));
         let deny_reason =
@@ -828,6 +831,7 @@ impl Chat {
             usage_report: None,
             usage_insights: None,
             context_report: None,
+            memory,
             settings_open: false,
             settings_focus: cx.focus_handle(),
             page_focus: cx.focus_handle(),

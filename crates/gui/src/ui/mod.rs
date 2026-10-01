@@ -15,6 +15,7 @@ pub(crate) mod import;
 pub(crate) mod jobs;
 pub(crate) mod keys;
 pub(crate) mod mcp;
+pub(crate) mod memory;
 pub(crate) mod messages;
 pub(crate) mod messaging;
 pub(crate) mod palette;
