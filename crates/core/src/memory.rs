@@ -58,6 +58,10 @@ const INSTRUCTIONS_LIMIT: usize = 30_000;
 /// five, since the files that use imports are written for it.
 const IMPORT_DEPTH: usize = 5;
 
+/// What a call that changed nothing because its adds were there already
+/// answers.
+pub(crate) const ALREADY_KEPT: &str = "Already kept.";
+
 /// How the model is told to use its memory, when it has the tool to.
 const GUIDANCE: &str = " You have a memory that outlasts this session: what you know about the user (USER.md), your own notes (MEMORY.md) and, when a project folder is attached, your notes on that project (Project memory), shown below when there is anything in them, and kept with the memory tool. Save what will still matter in a later session -- the user's name and preferences, their setup, corrections they gave you -- and not the progress of the task at hand. Keep what is true of one project alone, such as how to build and test it, in its project memory. Write facts, not instructions to yourself.";
 
@@ -804,14 +808,10 @@ fn which(op: &Op, ops: &[Op]) -> String {
     }
 }
 
-/// Make every change to one store, or none, and report how full it is now.
-/// Over budget, nothing is written and the model is shown the store so it
-/// can make room. Every write to a store, whichever it is, comes through
-/// here.
-fn change(dir: &Path, target: Target, ops: &[Op]) -> Result<String, String> {
-    // Every later session reads what is kept, so an entry carrying what an
-    // attacker would plant there -- or a key -- is refused whole. The model
-    // is told what kind of thing was found, never the text.
+/// Refuses the changes when an entry they keep carries what an attacker
+/// would plant in memory, or a key, since every later session reads it.
+fn screen(ops: &[Op]) -> Result<(), String> {
+    // The model is told what kind of thing was found, never the text.
     for op in ops {
         if !matches!(op.action, "add" | "replace") {
             continue;
@@ -825,6 +825,15 @@ fn change(dir: &Path, target: Target, ops: &[Op]) -> Result<String, String> {
             ));
         }
     }
+    Ok(())
+}
+
+/// Make every change to one store, or none, and report how full it is now.
+/// Over budget, nothing is written and the model is shown the store so it
+/// can make room. Every write to a store, whichever it is, comes through
+/// here.
+fn change(dir: &Path, target: Target, ops: &[Op]) -> Result<String, String> {
+    screen(ops)?;
     let path = dir.join(target.file());
     // The lock is kept beside the store, and a project's folder is only made
     // for its first note.
@@ -863,7 +872,7 @@ fn change(dir: &Path, target: Target, ops: &[Op]) -> Result<String, String> {
         // say it is kept; a remove that undid an earlier add would otherwise
         // read as that add being kept.
         let said = if ops.len() == 1 || ops.iter().all(|op| op.action == "add") {
-            "Already kept."
+            ALREADY_KEPT
         } else {
             "No change: the operations cancel out, so nothing was saved."
         };
@@ -982,6 +991,74 @@ fn step(entries: &mut Vec<String>, op: &Op) -> Result<Option<String>, String> {
     }
 }
 
+/// What the store is called to the model, for the `target` a call names.
+pub(crate) fn store_name(target: &str) -> Option<&'static str> {
+    Target::parse(target).ok().map(Target::name)
+}
+
+/// The folder `target` is kept in for a session in `workspace`, and the
+/// project's root when it is a project's.
+fn place(target: Target, workspace: Option<&Path>) -> Result<(PathBuf, Option<PathBuf>), String> {
+    let data = crate::chat::data_dir();
+    let Target::Project = target else {
+        return Ok((data, None));
+    };
+    let Some(workspace) = workspace else {
+        return Err("No project folder is attached, so there is no project memory.".into());
+    };
+    let root = project_root(workspace);
+    Ok((project_dir(&data, &root), Some(root)))
+}
+
+/// Whether a call adding the `pending` entries to `target` and then
+/// `content`, in that order, would change the store with its last add,
+/// without writing anything: `Ok(false)` when that one is kept already, and
+/// the refusal the write would give when it could not go in. For a caller
+/// that may only add, so cannot make room.
+pub(crate) fn would_add(
+    target: &str,
+    content: &str,
+    pending: &[&str],
+    workspace: Option<&Path>,
+) -> Result<bool, String> {
+    let target = Target::parse(target)?;
+    let (dir, _) = place(target, workspace)?;
+    let add = |content| Op {
+        action: "add",
+        content,
+        old_text: "",
+        number: None,
+    };
+    let last = add(content);
+    screen(std::slice::from_ref(&last))?;
+    if pending.len() >= MAX_OPERATIONS {
+        return Err(format!(
+            "One call makes at most {MAX_OPERATIONS} changes, and that many are waiting for {} already, so it cannot be kept.",
+            target.name()
+        ));
+    }
+    let raw = read_store(&dir.join(target.file()))
+        .map_err(|e| format!("{} could not be read: {e}", target.name()))?;
+    let mut entries = split(&raw);
+    for entry in pending {
+        step(&mut entries, &add(entry))?;
+    }
+    let before = entries.len();
+    step(&mut entries, &last)?;
+    if entries.len() == before {
+        return Ok(false);
+    }
+    let used = size(&entries);
+    if used > target.limit() {
+        return Err(format!(
+            "That would make {} {used} of {} characters, and nothing can be replaced or removed now, so it cannot be kept.",
+            target.name(),
+            target.limit()
+        ));
+    }
+    Ok(true)
+}
+
 /// The model's hand on USER.md, MEMORY.md and the project's memory.
 pub struct Remember;
 
@@ -1009,19 +1086,7 @@ impl Tool for Remember {
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         let target = Target::parse(args["target"].as_str().unwrap_or_default())?;
-        let data = crate::chat::data_dir();
-        let (dir, root) = match target {
-            Target::Project => {
-                let Some(workspace) = ctx.workspace.as_deref() else {
-                    return Err(
-                        "No project folder is attached, so there is no project memory.".into(),
-                    );
-                };
-                let root = project_root(workspace);
-                (project_dir(&data, &root), Some(root))
-            }
-            Target::User | Target::Memory => (data, None),
-        };
+        let (dir, root) = place(target, ctx.workspace.as_deref())?;
         let out = change(&dir, target, &operations(args)?)?;
         // Says whose notes the folder holds to a person who opens it. Without
         // it the notes still work, so a failure is not the model's to handle.

@@ -216,6 +216,21 @@ pub fn command(
             }));
             Flow::Handled
         }
+        "/memory-review" => {
+            let on = !runner.store.settings.memory_review;
+            runner.store.settings.memory_review = on;
+            runner.persist();
+            render::blank();
+            render::line(&render::dim(&if on {
+                format!(
+                    "Every {} of your messages, Letronna looks back over the session and adds what is worth remembering to memory. Each look is a model call on your account.",
+                    letronna_core::review::EVERY
+                )
+            } else {
+                "Memory reviews off.".into()
+            }));
+            Flow::Handled
+        }
         "/jobs" => {
             jobs(rest);
             Flow::Handled
@@ -2323,6 +2338,8 @@ fn take_back(
     workspace: Option<&std::path::Path>,
 ) -> Option<String> {
     let (at, prompt) = last_prompt(&runner.store.conversations[session].messages)?;
+    // A review of what is taken back must not keep any of it.
+    letronna_core::review::stop(&runner.review);
     let conversation = &mut runner.store.conversations[session];
     // Its pictures come back with its words, to go with them again.
     runner.images = std::mem::take(&mut conversation.messages[at].images);
@@ -2487,6 +2504,7 @@ fn branch(runner: &mut Runner, session: &mut usize, name: &str) {
     };
     history::share(from.id, copy.id);
     runner.store.conversations.push(copy);
+    letronna_core::review::stop(&runner.review);
     *session = runner.store.conversations.len() - 1;
     runner.store.active = *session;
     runner.persist();

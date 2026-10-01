@@ -146,6 +146,7 @@ impl Chat {
         let Some(index) = self.store.conversations.iter().position(|c| c.id == id) else {
             return;
         };
+        self.leave_for(index);
         self.store.active = index;
         self.error = None;
         self.page = Page::Chat;

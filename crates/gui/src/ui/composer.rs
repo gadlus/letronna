@@ -415,6 +415,7 @@ impl Chat {
                             let Some(index) = this.store.index_of(id) else {
                                 return;
                             };
+                            this.leave_for(index);
                             this.store.active = index;
                             this.error = None;
                             this.page = Page::Chat;

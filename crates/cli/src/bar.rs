@@ -111,6 +111,10 @@ pub const COMMANDS: &[Command<'static>] = &[
         blurb: "ask the model to build or test after it changes files, or not",
     },
     Command {
+        name: "/memory-review",
+        blurb: "look back now and then for what to remember, or stop",
+    },
+    Command {
         name: "/jobs",
         blurb: "commands still running in the background",
     },
@@ -397,6 +401,8 @@ pub enum Waited {
     Rang,
     /// A helper asked for a yes, which `asked` hands over.
     Asked,
+    /// Work that went on after a turn has something to say, on a line of its own.
+    Note(String),
 }
 
 /// A setting with a natural order, picked by sliding along a track rather
@@ -463,6 +469,8 @@ pub struct Bar {
     looked: std::time::Instant,
     /// The doorbell for notices, once the conversation listens for them.
     bell: Option<async_channel::Receiver<()>>,
+    /// Where a note comes from work that went on after the last turn.
+    notes: Option<async_channel::Receiver<String>>,
     /// Helpers' requests for a yes, once the terminal answers them.
     asks: Option<Receiver<Request>>,
     /// A request taken but not yet answered: one that ended a wait at the
@@ -511,6 +519,7 @@ impl Bar {
             relay: Vec::new(),
             looked: std::time::Instant::now(),
             bell: None,
+            notes: None,
             asks: None,
             held: None,
             guard: None,
@@ -601,6 +610,11 @@ impl Bar {
         self.live && self.focus.away(now)
     }
 
+    /// Show at the prompt what comes on `notes`, in place of any before it.
+    pub fn hear(&mut self, notes: async_channel::Receiver<String>) {
+        self.notes = Some(notes);
+    }
+
     /// Take helpers' requests for a yes from now on, to put to the user in the
     /// box. False, taking nothing, when the box is not up.
     pub fn serve(&mut self) -> bool {
@@ -624,8 +638,8 @@ impl Bar {
         self.held = Some(request);
     }
 
-    /// Wait at the prompt for a whole line, for the doorbell, or for a
-    /// helper's request. `None` when the user is done.
+    /// Wait at the prompt for a whole line, for the doorbell, for a helper's
+    /// request or for a note. `None` when the user is done.
     pub fn wait(&mut self) -> Option<Waited> {
         loop {
             if self.done {
@@ -641,10 +655,15 @@ impl Bar {
         }
     }
 
-    /// A line already entered, a helper's request, or else a ring, taken
-    /// without waiting for any: what the user typed goes first, and the
-    /// notices it rang for go in ahead of it anyway.
+    /// A note, a line already entered, a helper's request, or else a ring,
+    /// taken without waiting for any: what the user typed goes before a
+    /// ring, and the notices it rang for go in ahead of it anyway.
     fn waited(&mut self) -> Option<Waited> {
+        // Before a line, whose turn would push it below its answer: a note
+        // only prints, so it holds nothing up.
+        if let Some(note) = self.notes.as_ref().and_then(|notes| notes.try_recv().ok()) {
+            return Some(Waited::Note(note));
+        }
         if let Some(line) = self.next_line() {
             return Some(Waited::Line(line));
         }
@@ -2237,6 +2256,22 @@ mod tests {
         bar.queued.push_back("and the docs".into());
         assert_eq!(bar.waited(), Some(Waited::Line("and the docs".into())));
         assert_eq!(bar.waited(), Some(Waited::Rang));
+    }
+
+    #[test]
+    fn a_note_ends_the_wait_ahead_of_what_was_typed() {
+        let mut bar = Bar::new(String::new());
+        let (say, notes) = async_channel::bounded(1);
+        bar.hear(notes);
+        assert_eq!(bar.waited(), None);
+        say.try_send("Memory review kept a note".into()).unwrap();
+        bar.queued.push_back("and the docs".into());
+        assert_eq!(
+            bar.waited(),
+            Some(Waited::Note("Memory review kept a note".into()))
+        );
+        assert_eq!(bar.waited(), Some(Waited::Line("and the docs".into())));
+        assert_eq!(bar.waited(), None);
     }
 
     #[test]

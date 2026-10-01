@@ -10,12 +10,12 @@ use letronna_core::approvals::{self, Decision, Request};
 use letronna_core::cancel::Cancel;
 use letronna_core::chat::{self, Connection, Event, Message, ToolCall};
 use letronna_core::gate::{self, Gate, Grants, Mode};
-use letronna_core::inbox;
 use letronna_core::notify::{self, Why};
 use letronna_core::speech::{self, Voice};
 use letronna_core::store::{Conversation, Store};
 use letronna_core::wake;
 use letronna_core::{goal, hooks, permissions, tools};
+use letronna_core::{inbox, review};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -52,6 +52,9 @@ pub struct Runner {
     pub images: Vec<std::path::PathBuf>,
     /// The queue that reads replies aloud, there only while `/voice` is on.
     pub voice: Option<Voice>,
+    /// Stops the memory review a turn started, when the next one begins, the
+    /// exchange it read is taken back or the session is left.
+    pub review: Cancel,
 }
 
 impl Runner {
@@ -274,6 +277,8 @@ impl Runner {
 
     /// Run the agent to completion on the conversation as it stands.
     fn run(&mut self, connection: Connection, session: usize) -> Result<String, String> {
+        // The review read the conversation as it was; this turn goes first.
+        review::stop(&self.review);
         self.bar.show_helpers_of(connection.conversation);
         // What the session's kept helpers wake on from now on.
         agents::connected(&connection);
@@ -316,6 +321,9 @@ impl Runner {
             // Nothing else paints until the next key.
             crate::screen::settle();
         }
+        if answer.is_ok() && !self.stopped {
+            self.look_back(session);
+        }
         answer
     }
 
@@ -343,6 +351,24 @@ impl Runner {
             .unwrap_or_default();
         for ended in ended {
             self.tell(ended.session, Why::Ended(&ended.what));
+        }
+    }
+
+    /// Start a memory review in the background when the user chose them and
+    /// this turn made one due; what it kept comes to the prompt as a note.
+    fn look_back(&mut self, session: usize) {
+        let messages = &self.store.conversations[session].messages;
+        if !self.store.settings.memory_review || !review::due(messages) {
+            return;
+        }
+        self.review = Cancel::default();
+        // One that cannot start is skipped; the next is due in as many turns.
+        if let Ok(notes) = review::spawn(
+            self.connection(session),
+            messages.clone(),
+            self.review.clone(),
+        ) {
+            self.bar.hear(notes);
         }
     }
 
@@ -1117,6 +1143,8 @@ impl Runner {
     /// lists the sessions without reading any of them, so this is where a
     /// conversation actually comes off the disk.
     pub fn enter(&mut self, index: usize) {
+        // A review of the session left behind would note into this one.
+        review::stop(&self.review);
         self.store.active = index;
         if let Some(conversation) = self.store.conversations.get_mut(index) {
             letronna_core::store::fill(conversation);
@@ -1138,6 +1166,7 @@ impl Runner {
 
     /// A session of its own.
     pub fn start(&mut self, workspace: Option<std::path::PathBuf>) -> usize {
+        review::stop(&self.review);
         self.store.conversations.push(Conversation {
             id: self.store.reserve_id(),
             title: String::new(),

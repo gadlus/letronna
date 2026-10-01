@@ -469,6 +469,7 @@ impl Chat {
                 let Some(ix) = self.store.index_of(id) else {
                     return;
                 };
+                self.leave_for(ix);
                 self.store.active = ix;
                 self.error = None;
                 self.page = Page::Chat;

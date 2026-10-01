@@ -1,5 +1,5 @@
 use crate::prelude::*;
-use letronna_core::{agent, agents, approvals, goal, inbox, notify};
+use letronna_core::{agent, agents, approvals, goal, inbox, notify, review};
 
 pub(crate) const BRAND: &str = "Letronna";
 
@@ -187,6 +187,10 @@ pub(crate) struct Chat {
     pub(crate) turn: Option<agent::Turn>,
     /// Stops the tool the turn in flight is running, when set.
     pub(crate) turn_stop: letronna_core::cancel::Cancel,
+    /// The session the last memory review looks back over, and what stops it
+    /// when the next turn begins, the exchange it read is taken back or the
+    /// user leaves the session.
+    pub(crate) review: (u64, letronna_core::cancel::Cancel),
     /// Whether the call at the front of the turn is running, rather than
     /// waiting on its card; a stop answers the two differently.
     pub(crate) call_running: bool,
@@ -781,6 +785,7 @@ impl Chat {
             busy: false,
             turn: None,
             turn_stop: Default::default(),
+            review: Default::default(),
             call_running: false,
             streaming_id: None,
             asking: None,
@@ -1118,6 +1123,7 @@ impl Chat {
         let workspace = self.store.conversations[self.store.active]
             .workspace
             .clone();
+        self.leave_for(self.store.conversations.len());
         self.store.conversations.push(Conversation {
             id: self.store.reserve_id(),
             title: "New session".into(),
@@ -1738,6 +1744,7 @@ impl Chat {
         let Some(index) = self.store.index_of(id) else {
             return;
         };
+        self.leave_for(index);
         self.store.active = index;
         self.error = None;
         self.page = Page::Chat;
@@ -1959,6 +1966,8 @@ impl Chat {
             self.finish(cx);
             return;
         };
+        // The review read the conversation as it was; this turn goes first.
+        review::stop(&self.review.1);
         turn.connection.workspace = self.store.conversations[ix].workspace.clone();
         let receiver = backend::start(
             turn.connection.clone(),
@@ -3527,6 +3536,7 @@ impl Chat {
     fn finish(&mut self, cx: &mut Context<Self>) {
         let stopped = std::mem::take(&mut self.stopping);
         let session = self.streaming_id;
+        let connection = self.turn.as_ref().map(|turn| turn.connection.clone());
         // Before the chat app is answered and the schedule reported, which
         // forget that the session was theirs.
         if let Some(id) = session.filter(|_| !stopped) {
@@ -3584,6 +3594,14 @@ impl Chat {
             && !session.is_some_and(|id| self.review_goal(id, cx))
         {
             self.wake_idle(cx);
+            // Not when a follow-up or a notice started the next turn already,
+            // nor after a stop that only a loop's tick carried past.
+            if let (Some(id), Some(connection)) = (session, connection)
+                && !stopped
+                && !self.busy
+            {
+                self.look_back(id, connection, cx);
+            }
         }
         if self.error.is_none()
             && let Some(why) = self.voice.as_ref().and_then(|v| v.trouble())
@@ -3684,6 +3702,52 @@ impl Chat {
             goal::Step::Cleared => self.wake_idle(cx),
         }
         cx.notify();
+    }
+
+    /// Start a memory review in the background when the user chose them and
+    /// the turn that ended in session `id` made one due; what it kept shows as
+    /// a passing note. Never where a chat app or a schedule drives the session.
+    fn look_back(&mut self, id: u64, connection: Connection, cx: &mut Context<Self>) {
+        let Some(ix) = self.store.index_of(id) else {
+            return;
+        };
+        let messages = &self.store.conversations[ix].messages;
+        let unwatched = connection.remote.is_some()
+            || connection.unattended
+            || self.remote_session.values().any(|&s| s == id);
+        if !self.store.settings.memory_review || unwatched || !review::due(messages) {
+            return;
+        }
+        self.review = (id, Default::default());
+        // One that cannot start is skipped; the next is due in as many turns.
+        let Ok(notes) = review::spawn(connection, messages.clone(), self.review.1.clone()) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            if let Ok(note) = notes.recv().await {
+                let _ = this.update(cx, |this, cx| {
+                    this.note = Some(note);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Stops the memory review of session `id`, if one runs: the user took
+    /// back what it read, or left the session.
+    pub(crate) fn stop_review(&self, id: u64) {
+        if self.review.0 == id {
+            review::stop(&self.review.1);
+        }
+    }
+
+    /// Stops the memory review of the session on screen when the user goes
+    /// to the one at `index` instead.
+    pub(crate) fn leave_for(&self, index: usize) {
+        if index != self.store.active {
+            self.stop_review(self.store.conversations[self.store.active].id);
+        }
     }
 
     /// Start a turn for notices that came while nothing ran: in the session

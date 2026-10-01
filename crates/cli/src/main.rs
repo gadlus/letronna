@@ -167,6 +167,7 @@ fn main() {
         ended: None,
         images: Vec::new(),
         voice: None,
+        review: Default::default(),
     };
     letronna_core::diag::mark("listed");
     runner.match_voice();
@@ -290,6 +291,12 @@ fn main() {
         runner.tell_ended();
         if waited == bar::Waited::Asked {
             runner.answer_helpers(true);
+            continue;
+        }
+        if let bar::Waited::Note(note) = &waited {
+            render::blank();
+            render::line(&render::dim(note));
+            screen::settle();
             continue;
         }
         let bar::Waited::Line(line) = waited else {

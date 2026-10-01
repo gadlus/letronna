@@ -326,6 +326,11 @@ pub struct Settings {
     /// medium.
     #[serde(default)]
     pub crew: String,
+    /// Every few of the user's messages, look back over the session and add
+    /// what is worth keeping to memory. Off unless chosen, since each look is
+    /// a model call on the user's account.
+    #[serde(default)]
+    pub memory_review: bool,
 }
 
 // Written out rather than derived so the film grain and notifications start
@@ -344,6 +349,7 @@ impl Default for Settings {
             computer_use: false,
             keys_in: String::new(),
             fallbacks: Vec::new(),
+            memory_review: false,
             gateway: String::new(),
             custom_endpoint: String::new(),
             presence: String::new(),
@@ -1168,8 +1174,12 @@ impl Transcript {
         Some(Self { path, conversation })
     }
 
-    /// Append whatever is new, as saving a session does.
+    /// Append whatever is new, as saving a session does. One with no path,
+    /// for a run nobody picks up again, is kept in memory only.
     pub fn save(&mut self) -> std::io::Result<()> {
+        if self.path.as_os_str().is_empty() {
+            return Ok(());
+        }
         self.conversation.flush_to(&self.path)
     }
 }
