@@ -114,7 +114,9 @@ impl Runner {
         {
             let conversation = &mut self.store.conversations[session];
             if conversation.messages.is_empty() && conversation.title.is_empty() {
-                let shown = letronna_core::init::typed(prompt).unwrap_or(prompt);
+                let saved = letronna_core::workflow::saved::typed(prompt);
+                let shown = letronna_core::init::typed(prompt).or(saved.as_deref());
+                let shown = shown.unwrap_or(prompt);
                 conversation.title = shown.chars().take(40).collect();
             }
             conversation.updated = chat::now();

@@ -26,6 +26,7 @@
 
 pub mod host;
 mod journal;
+pub mod saved;
 pub mod tool;
 
 use crate::agent_defs::{self, AgentDef};

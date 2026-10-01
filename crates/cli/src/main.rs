@@ -42,7 +42,7 @@ use letronna_core::chat::{self, Message};
 use letronna_core::driver::{self, Allow, Outcome, Report, Spec, Status};
 use letronna_core::gate::{Grants, Mode};
 use letronna_core::store::Transcript;
-use letronna_core::{agent, hooks, permissions, store, tools, update};
+use letronna_core::{agent, crew, hooks, inbox, permissions, store, tools, update};
 use serde_json::{Value, json};
 use session::Runner;
 use std::io::IsTerminal;
@@ -338,8 +338,10 @@ fn main() {
             continue;
         }
         let mut prompt = bar::unescaped(&line);
-        // What an MCP server's prompt came to, when the command was one.
+        // What an MCP server's prompt or a saved workflow's command came to,
+        // when the command was one.
         let sent: String;
+        let mut run = false;
         if bar::is_command(&line) {
             let flow = command(&mut runner, &line, &mut session, workspace.as_deref());
             // Read again after each command, so a command file made or
@@ -374,8 +376,21 @@ fn main() {
                 }
                 // The command stays on screen as typed; the model gets its prompt.
                 Flow::Ask(asked) => prompt = asked,
+                Flow::Run(asked) => {
+                    sent = asked;
+                    prompt = &sent;
+                    run = true;
+                }
                 _ => continue,
             }
+        }
+        let id = runner.store.conversations[session].id;
+        for notice in crew::prompt(id, &line, crew::Source::Bar) {
+            inbox::push(id, notice);
+        }
+        // After `prompt`, which ends what the last command granted.
+        if run {
+            crew::grant(id);
         }
         match runner.ask(session, prompt) {
             Ok(_) => keep.now(),

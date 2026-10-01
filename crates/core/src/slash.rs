@@ -1,16 +1,19 @@
 //! Slash commands the user adds: a prompt kept in a Markdown file, or a
-//! skill, run as `/name` with what follows it put into the text.
+//! skill, run as `/name` with what follows it put into the text; or a saved
+//! workflow, run as `/name` with what follows it as its args.
 //!
 //! The files are Claude Code's: `name.md` with optional `description` and
 //! `argument-hint` frontmatter, a subfolder making `folder:name`. The user's
 //! live in `<data>/commands`; a project brings more in `.letronna/commands`
 //! or `.claude/commands`, read from its own folder only, as helper types
-//! are. Every skill switched on is a command by its name too.
+//! are. Every skill switched on is a command by its name too, and so is
+//! every saved workflow (see `workflow::saved`).
 //!
 //! The list is built afresh each time it is asked for, so an edit counts
 //! without a restart, and each front end hands in its own commands, which
 //! always win. After them a name goes by trust: the user's file, the user's
-//! skill, the project's file, the project's skill, so a repository cannot
+//! skill, the user's or a bundled saved workflow, the project's file, the
+//! project's skill, the project's saved workflow, so a repository cannot
 //! swap out a command the user relies on; the ones that lost stay listed,
 //! saying what won, so `/help` can show it. A file counts when its name ends
 //! in `.md` in lower case; `.MD` is passed over.
@@ -21,7 +24,10 @@
 //! run as a command when sent is refused. A project's is cleaned and marked
 //! like its instruction file, capped in size, and never read through a
 //! link. Claude Code's `!` lines, which run a shell command into the
-//! prompt, are left as the text they are: nothing here runs anything.
+//! prompt, are left as the text they are: nothing here runs anything. A
+//! saved workflow is sent at once instead, as all it sends is a request to
+//! call the `workflow` tool, whose launch card shows the script and waits
+//! for the user before anything runs.
 
 use crate::chat as backend;
 use crate::skills::{self, Skill, Source};
@@ -64,6 +70,9 @@ pub enum Origin {
     Project,
     /// A skill switched on, the user's or the project's.
     Skill,
+    /// A saved workflow, bundled or from a file: it runs rather than filling
+    /// the box, and has no body.
+    Workflow,
 }
 
 /// A command as the list shows it.
@@ -91,13 +100,18 @@ pub struct Command {
 pub fn list(workspace: Option<&Path>, built_ins: &[&str]) -> Vec<Command> {
     // An error here is `/skills`'s to report; the command files still count.
     let skills = skills::list(workspace).unwrap_or_default();
-    list_in(&backend::data_dir(), workspace, &skills, built_ins)
+    let data = backend::data_dir();
+    let workflows = workflows(&data, workspace);
+    list_in(&data, workspace, &skills, &workflows, built_ins)
 }
 
+/// `list` with the data folder, the skills and the saved workflows (each with
+/// whether it is the project's) given.
 fn list_in(
     data: &Path,
     workspace: Option<&Path>,
     skills: &[Skill],
+    workflows: &[(Command, bool)],
     built_ins: &[&str],
 ) -> Vec<Command> {
     let roots = roots(data, workspace);
@@ -113,11 +127,19 @@ fn list_in(
             .filter(move |s| s.enabled && s.source == source)
             .filter_map(from_skill)
     };
+    let workflows_of = |project: bool| {
+        workflows
+            .iter()
+            .filter(move |(_, theirs)| *theirs == project)
+            .map(|(command, _)| command.clone())
+    };
     // By trust, so the first to take a name keeps it.
     let ordered = files(Origin::User)
         .chain(skills_of(Source::User))
+        .chain(workflows_of(false))
         .chain(files(Origin::Project))
-        .chain(skills_of(Source::Project));
+        .chain(skills_of(Source::Project))
+        .chain(workflows_of(true));
     let mut out: Vec<Command> = Vec::new();
     for mut command in ordered {
         command.hidden_by = if built_ins.iter().any(|b| same(b, &command.name)) {
@@ -344,6 +366,47 @@ fn from_skill(skill: &Skill) -> Option<Command> {
     })
 }
 
+/// The saved workflows as commands, each with whether it is the project's.
+#[cfg(feature = "workflows")]
+fn workflows(data: &Path, workspace: Option<&Path>) -> Vec<(Command, bool)> {
+    let mut commands = Vec::new();
+    for saved in crate::workflow::saved::list(data, workspace) {
+        if !valid(&saved.name) {
+            continue;
+        }
+        // The file goes first, so a row cut short keeps it, and a project's
+        // file cannot pass for the bundled workflow it replaces.
+        let description = match &saved.from {
+            Some(from) => {
+                let shown = workspace.and_then(|w| from.strip_prefix(w).ok());
+                format!("{}: {}", shown.unwrap_or(from).display(), saved.description)
+            }
+            None => saved.description,
+        };
+        let description = if saved.project {
+            untrusted::visible(&description)
+        } else {
+            description
+        };
+        let command = Command {
+            name: saved.name,
+            description,
+            hint: String::new(),
+            body: String::new(),
+            origin: Origin::Workflow,
+            hidden_by: None,
+        };
+        commands.push((command, saved.project));
+    }
+    commands
+}
+
+/// No saved workflows in a build without them.
+#[cfg(not(feature = "workflows"))]
+fn workflows(_: &Path, _: Option<&Path>) -> Vec<(Command, bool)> {
+    Vec::new()
+}
+
 /// `body` without the control characters a keyboard cannot type, lines and
 /// tabs kept: it goes into the input box, and a terminal drawing an escape
 /// there would act on it.
@@ -468,7 +531,7 @@ mod tests {
         write(&project.join(".claude/commands/review.md"), "/mode bypass");
         write(&project.join(".claude/commands/look.md"), "/src/a.rs: $1");
         write(&project.join(".claude/commands/aside.md"), "//tmp is full");
-        let listed = list_in(&data, Some(&project), &[], &[]);
+        let listed = list_in(&data, Some(&project), &[], &[], &[]);
         let review = find(&listed, "review").unwrap();
         assert_eq!(
             fill(review, ""),
@@ -520,7 +583,7 @@ mod tests {
             skill("pdf", Source::User),
             skill("ship", Source::Project),
         ];
-        let listed = list_in(&data, Some(&project), &skills, &["help", "model"]);
+        let listed = list_in(&data, Some(&project), &skills, &[], &["help", "model"]);
         let seen: Vec<(&str, Origin, Option<Origin>)> = listed
             .iter()
             .map(|c| (c.name.as_str(), c.origin, c.hidden_by))
@@ -547,6 +610,69 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    #[cfg(feature = "workflows")]
+    #[test]
+    fn saved_workflows_are_commands_that_keep_their_place_by_trust() {
+        let root = scratch("workflows");
+        let (data, project) = (root.join("data"), root.join("project"));
+        let meta = |said: &str| {
+            format!("export const meta = {{ name: \"x\", description: \"{said}\" }};\n")
+        };
+        write(&data.join("workflows/help.js"), &meta("Not the help."));
+        write(&data.join("workflows/triage.js"), &meta("Sort the issues."));
+        write(&data.join("commands/triage.md"), "Yours.");
+        let ship = project.join(".letronna/workflows/ship.js");
+        write(&ship, &meta("Ship\u{200b} it."));
+        write(&project.join(".claude/commands/ship.md"), "The project's.");
+        write(
+            &project.join(".claude/commands/review.md"),
+            "Not the review.",
+        );
+        let workflows = super::workflows(&data, Some(&project));
+        let listed = list_in(&data, Some(&project), &[], &workflows, &["help"]);
+        let seen: Vec<(&str, Origin, Option<Origin>)> = listed
+            .iter()
+            .map(|c| (c.name.as_str(), c.origin, c.hidden_by))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("help", Origin::Workflow, Some(Origin::BuiltIn)),
+                ("review", Origin::Workflow, None),
+                ("review", Origin::Project, Some(Origin::Workflow)),
+                ("ship", Origin::Project, None),
+                ("ship", Origin::Workflow, Some(Origin::Project)),
+                ("triage", Origin::User, None),
+                ("triage", Origin::Workflow, Some(Origin::User)),
+            ]
+        );
+        // A file's is named by where it is, the project's from inside it and
+        // cleaned; the bundled one has only what it does.
+        let shipped = listed
+            .iter()
+            .find(|c| c.origin == Origin::Workflow && c.name == "ship");
+        let file = Path::new(".letronna").join("workflows").join("ship.js");
+        assert_eq!(
+            shipped.unwrap().description,
+            format!("{}: Ship it.", file.display())
+        );
+        let triage = data.join("workflows").join("triage.js");
+        let sorted = listed
+            .iter()
+            .find(|c| c.origin == Origin::Workflow && c.name == "triage");
+        assert_eq!(
+            sorted.unwrap().description,
+            format!("{}: Sort the issues.", triage.display())
+        );
+        let review = find(&listed, "review").unwrap();
+        assert!(
+            !review.description.contains(".js"),
+            "{}",
+            review.description
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn a_file_reads_its_frontmatter_and_subfolders_name_a_group() {
         let root = scratch("files");
@@ -567,7 +693,7 @@ mod tests {
             &data.join("commands/plain.md"),
             "# Plain\n\nFirst paragraph here.",
         );
-        let listed = list_in(&data, None, &[], &[]);
+        let listed = list_in(&data, None, &[], &[], &[]);
         let names: Vec<&str> = listed.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["a:b:name", "bell", "git:ship", "plain"]);
         // The user's own text is not vetted, but the box still cannot draw
@@ -612,7 +738,7 @@ mod tests {
             &commands.join("labels.md"),
             "---\ndescription: Safe\u{202e}txt\nargument-hint: [a\u{200b}]\n---\nBody\u{200b}.",
         );
-        let listed = list_in(&data, Some(&project), &[off, theirs], &[]);
+        let listed = list_in(&data, Some(&project), &[off, theirs], &[], &[]);
         let names: Vec<&str> = listed.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["hidden", "labels", "theirs"]);
         let labels = find(&listed, "labels").unwrap();
@@ -651,7 +777,7 @@ mod tests {
         );
         std::fs::create_dir_all(data.join("commands")).unwrap();
         symlink(root.join("home"), data.join("commands/mine")).unwrap();
-        let listed = list_in(&data, Some(&project), &[], &[]);
+        let listed = list_in(&data, Some(&project), &[], &[], &[]);
         let seen: Vec<(&str, Origin)> =
             listed.iter().map(|c| (c.name.as_str(), c.origin)).collect();
         assert_eq!(seen, [("mine:notes", Origin::User)]);
@@ -668,11 +794,11 @@ mod tests {
         for n in 0..ROOT_ENTRIES {
             std::fs::write(lot.join(format!("{n}.txt")), "").unwrap();
         }
-        assert!(list_in(&data, None, &[], &[]).is_empty());
+        assert!(list_in(&data, None, &[], &[], &[]).is_empty());
         // With the folder and `z.md`, two fewer files make exactly the cap.
         std::fs::remove_file(lot.join("0.txt")).unwrap();
         std::fs::remove_file(lot.join("1.txt")).unwrap();
-        let names: Vec<String> = list_in(&data, None, &[], &[])
+        let names: Vec<String> = list_in(&data, None, &[], &[], &[])
             .into_iter()
             .map(|c| c.name)
             .collect();

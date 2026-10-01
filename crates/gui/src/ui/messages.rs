@@ -132,11 +132,13 @@ impl Chat {
                 )
                 .into_any_element()
         } else if is_user {
-            // `/init` and `@` references show as typed, not as what they
-            // sent; a chat app's message can quote someone else's, fenced.
+            // `/init`, a saved workflow's command and `@` references show
+            // as typed, not as what they sent; a chat app's message can quote
+            // someone else's, fenced.
             let content = letronna_core::references::typed(&message.content);
-            let said = match letronna_core::init::typed(content) {
-                Some(typed) => typed.to_owned(),
+            let typed = letronna_core::init::typed(content).map(str::to_owned);
+            let said = match typed.or_else(|| letronna_core::workflow::saved::typed(content)) {
+                Some(typed) => typed,
                 None => letronna_core::untrusted::shown("", content).0,
             };
             TextView::markdown(md, said, window, cx)

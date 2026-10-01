@@ -2,11 +2,11 @@
 //! approved it, as one run in the background whose result comes back as a
 //! notice.
 //!
-//! It is offered only to a session that opted in, which Crew and saved
-//! workflows will do, since one approval can start dozens of helpers and
-//! spend millions of tokens. Front ends also hand it the words the user last
-//! typed, and every agent of a run is told them first, indented under a
-//! header of their own, as the one part of its task the user wrote.
+//! It is offered only to a session that opted in, through Crew or for the
+//! turn of a saved workflow's command, since one approval can start dozens of
+//! helpers and spend millions of tokens. Front ends also hand it the words
+//! the user last typed, and every agent of a run is told them first, indented
+//! under a header of their own, as the one part of its task the user wrote.
 //!
 //! The approval card shows what the script says of itself -- its name, its
 //! phases, what it may cost -- from its meta, read without running any of it,
@@ -17,7 +17,7 @@
 //! runs it again unchanged, and a run Letronna closed on, known by a lock
 //! nobody holds, can be offered for resuming.
 
-use super::host::{self, End, Find};
+use super::host::{self, End};
 use super::journal::{self, Line};
 use super::{BUDGET, Run, Tally};
 use crate::agents;
@@ -63,8 +63,9 @@ const DESCRIPTION: &str = "Run a JavaScript workflow that starts many helpers, i
      null ends that item: the default choice. await parallel(items.map(x => () => agent(...))) \
      waits for them all, and a failure becomes null. phase(title) groups the agents after it, \
      log(message) keeps a line in the run's log, args is the JSON given here, and budget.total, \
-     budget.spent() and budget.remaining() count tokens. There is no Math.random, Date.now, \
-     timer, eval, import, file or process: helpers read and write files. At most 1000 agent() \
+     budget.spent() and budget.remaining() count tokens, and await workflow(name, args) runs a \
+     saved workflow inside this one. There is no Math.random, Date.now, timer, eval, import, \
+     file or process: helpers read and write files. At most 1000 agent() \
      calls a run and 4096 items a parallel or pipeline. The result is what the script returns, \
      as JSON. The call returns at once with the run's name, such as wf-3, and a notice brings \
      the result when it ends: do not poll. agents list, stop and report work on runs by name. \
@@ -81,6 +82,10 @@ static TYPED: Mutex<BTreeMap<u64, String>> = Mutex::new(BTreeMap::new());
 /// Runs started in this process, kept after they end so `agents` can still
 /// report them.
 static RUNS: Mutex<Vec<Live>> = Mutex::new(Vec::new());
+
+/// The saved workflows' scripts as their approval cards last showed them, by
+/// session and name, so a file changed while its card waited does not run.
+static SHOWN: Mutex<BTreeMap<(u64, String), String>> = Mutex::new(BTreeMap::new());
 
 /// Offers the `workflow` tool to `session` until `opt_out`, beside what Crew
 /// offers; a run's notice ends in a resume call, which needs it still on.
@@ -118,6 +123,10 @@ fn runs() -> MutexGuard<'static, Vec<Live>> {
     RUNS.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+fn shown() -> MutexGuard<'static, BTreeMap<(u64, String), String>> {
+    SHOWN.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// The `workflow` tool. Each run asks for approval, since it starts helpers
 /// that change things, and it is withheld where others read the replies.
 pub struct Workflow;
@@ -132,6 +141,7 @@ impl Tool for Workflow {
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
             "script": {"type": "string", "description": "The whole script, meta first. On a resume, leave it out to run the run's own again."},
+            "name": {"type": "string", "description": "A saved workflow to run instead of a script, such as review."},
             "args": {"description": "Any JSON, given to the script as args. On a resume, the run's own unless given."},
             "resume": {"type": "string", "description": "A run to pick up, such as wf-3: its finished helpers' answers replay and the rest run."},
             "budget": {"type": "integer", "description": "Tokens the whole run may spend; 3000000 unless given, and a resume keeps the run's own."}
@@ -141,7 +151,16 @@ impl Tool for Workflow {
         let Some(connection) = &ctx.caller.connection else {
             return Err("A workflow can only be started from a session.".into());
         };
-        let launch = Launch::read(args)?;
+        let launch = Launch::read(args, connection.workspace.as_deref())?;
+        if let Some(name) = named(args) {
+            let shown = shown().remove(&(connection.conversation, name.to_owned()));
+            if shown.is_some_and(|shown| shown != launch.script) {
+                return Err(format!(
+                    "The saved workflow {name} changed after its card was shown, so it did not \
+                     start: call it again to show the new one."
+                ));
+            }
+        }
         let run = Run::open(
             launch.resume.as_deref(),
             connection,
@@ -164,8 +183,15 @@ impl Tool for Workflow {
     }
     fn preview(&self, args: &Value, ctx: &ToolContext) -> String {
         let connection = ctx.caller.connection.as_deref().cloned();
-        match preview(args, &connection.unwrap_or_default()) {
-            Ok(preview) => preview.text(),
+        let connection = connection.unwrap_or_default();
+        match preview(args, &connection) {
+            Ok(preview) => {
+                if let Some(name) = named(args) {
+                    let key = (connection.conversation, name.to_owned());
+                    shown().insert(key, preview.script.clone());
+                }
+                preview.text()
+            }
             Err(e) => format!("This workflow cannot start: {e}"),
         }
     }
@@ -198,6 +224,10 @@ pub struct Preview {
     /// Whether `args` are the resumed run's own, the call naming none.
     pub kept_args: bool,
     pub script: String,
+    /// The file of the saved workflow it runs, unless that is a bundled one.
+    pub from: Option<PathBuf>,
+    /// The saved workflows from files its `workflow()` calls may run, by name.
+    pub nests: Vec<(String, PathBuf)>,
 }
 
 impl Preview {
@@ -213,6 +243,18 @@ impl Preview {
             one_line(&self.name),
             one_line(&self.description)
         );
+        if let Some(from) = &self.from {
+            text.push_str(&format!("\nFrom {}", from.display()));
+        }
+        if !self.nests.is_empty() {
+            let nests: Vec<String> = (self.nests.iter())
+                .map(|(name, from)| format!("{name} from {}", from.display()))
+                .collect();
+            text.push_str(&format!(
+                "\nIts workflow() calls may run {}",
+                nests.join(", ")
+            ));
+        }
         if !self.phases.is_empty() {
             text.push_str(&format!("\nPhases: {}", self.phases.join(" → ")));
         }
@@ -254,7 +296,7 @@ impl Preview {
 
 /// The card for the run `args` asks for on `connection`, or why it cannot start.
 pub fn preview(args: &Value, connection: &Connection) -> Result<Preview, String> {
-    let launch = Launch::read(args)?;
+    let launch = Launch::read(args, connection.workspace.as_deref())?;
     let phases = launch.meta["phases"]
         .as_array()
         .cloned()
@@ -269,6 +311,13 @@ pub fn preview(args: &Value, connection: &Connection) -> Result<Preview, String>
         answered => (journal::spent(&launch.lines) / answered).max(1),
     };
     let resume = (launch.resume.clone()).map(|name| (name, journal::answers(&launch.lines).len()));
+    // Which saved workflow a call runs can depend on the script's own
+    // values, so every one from a file is named.
+    let nests = if launch.script.contains("workflow(") {
+        super::saved::files(connection.workspace.as_deref())
+    } else {
+        Vec::new()
+    };
     Ok(Preview {
         name: text(&launch.meta["name"]),
         description: text(&launch.meta["description"]),
@@ -290,7 +339,16 @@ pub fn preview(args: &Value, connection: &Connection) -> Result<Preview, String>
         args: launch.args,
         kept_args: launch.kept_args,
         script: launch.script,
+        from: launch.from,
+        nests,
     })
+}
+
+/// The saved workflow `args` name, when they give no script to run instead.
+fn named(args: &Value) -> Option<&str> {
+    let script = (args["script"].as_str()).is_some_and(|script| !script.trim().is_empty());
+    let name = (args["name"].as_str()).map(str::trim);
+    name.filter(|name| !script && !name.is_empty())
 }
 
 /// A JSON string's text on one line, or nothing for anything else.
@@ -302,6 +360,8 @@ fn text(value: &Value) -> String {
 /// run was launched with where the call leaves something out.
 struct Launch {
     script: String,
+    /// The file of the saved workflow it runs, unless that is a bundled one.
+    from: Option<PathBuf>,
     meta: Value,
     args: Value,
     /// Whether `args` are the resumed run's own.
@@ -325,8 +385,8 @@ struct Saved {
 }
 
 impl Launch {
-    /// The launch `args` ask for, or why there is none.
-    fn read(args: &Value) -> Result<Self, String> {
+    /// The launch `args` ask for in a session in `workspace`, or why there is none.
+    fn read(args: &Value, workspace: Option<&Path>) -> Result<Self, String> {
         let resume = match &args["resume"] {
             Value::Null => None,
             Value::String(name) if !name.trim().is_empty() => Some(name.trim().to_owned()),
@@ -341,15 +401,25 @@ impl Launch {
             lines = journal::read(&dir.join("journal.jsonl"));
             kept = std::fs::read_to_string(dir.join(SCRIPT)).ok();
         }
-        let script = match args["script"].as_str() {
-            Some(script) if !script.trim().is_empty() => script.to_owned(),
+        let found = named(args).map(|name| super::saved::find(workspace, name));
+        let (found, from) = match found.transpose()? {
+            Some((script, from)) => (Some(script), from),
+            None => (None, None),
+        };
+        let script = match (args["script"].as_str(), found) {
+            (Some(script), _) if !script.trim().is_empty() => script.to_owned(),
+            (_, Some(script)) => script,
             _ => match (kept, &resume) {
                 (Some(script), _) => script,
                 (None, Some(name)) => {
                     return Err(format!("{name} kept no script: give it again as `script`."));
                 }
                 (None, None) => {
-                    return Err("`script` is required: the workflow's script, meta first.".into());
+                    return Err(
+                        "`script` is required: the workflow's script, meta first, or the `name` \
+                         of a saved one."
+                            .into(),
+                    );
                 }
             },
         };
@@ -371,6 +441,7 @@ impl Launch {
         };
         Ok(Self {
             script,
+            from,
             meta,
             args: script_args,
             kept_args,
@@ -483,7 +554,8 @@ fn set_off(mut run: Run, launch: &Launch) -> Result<String, String> {
         &format!("{name} \"{title}\""),
     ));
     let then = move |end| ended(id, key, end);
-    if let Err(e) = host::start(run, &launch.script, &launch.args, not_saved(), then) {
+    let find = super::saved::finder(run.connection.workspace.clone());
+    if let Err(e) = host::start(run, &launch.script, &launch.args, find, then) {
         // It never started, so there is no end to tell.
         runs().retain(|live| live.id != id);
         tasks::finish(&key, State::Failed(e.clone()), None);
@@ -505,16 +577,6 @@ fn set_off(mut run: Run, launch: &Launch) -> Result<String, String> {
 fn number(name: &str) -> u64 {
     let digits = name.strip_prefix("wf-").unwrap_or(name);
     digits.parse().unwrap_or_default()
-}
-
-/// Finds no saved workflow for a script to nest: saving them comes later.
-fn not_saved() -> Find {
-    Box::new(|name| {
-        Err(format!(
-            "There is no saved workflow \"{name}\": saved workflows are not available yet, so \
-             write its agents into this script."
-        ))
-    })
 }
 
 /// Records how the run with `id` ended and tells its session, once; a stop
@@ -675,7 +737,10 @@ pub(crate) fn summary(args: &Value) -> String {
         return format!("resume {name}");
     }
     let meta = (args["script"].as_str()).and_then(|script| host::meta(script).ok());
-    meta.map(|meta| text(&meta["name"])).unwrap_or_default()
+    let saved = || args["name"].as_str().map(one_line);
+    meta.map(|meta| text(&meta["name"]))
+        .or_else(saved)
+        .unwrap_or_default()
 }
 
 /// Where a report page starts, in characters.
@@ -856,6 +921,52 @@ return await agent("Look");
     }
 
     #[test]
+    fn a_saved_workflow_card_names_its_file_and_runs_only_what_it_showed() {
+        let data = Data::new("tool-saved");
+        let connection = data.connection("http://127.0.0.1:9/v1");
+        let ctx = ToolContext::of(&connection);
+        let work = connection.workspace.clone().unwrap();
+        let folder = work.join(".letronna").join("workflows");
+        std::fs::create_dir_all(&folder).unwrap();
+        let file = folder.join("review.js");
+        let meta = "export const meta = { name: \"review\", description: \"Reviews.\" };\n";
+        std::fs::write(&file, format!("{meta}return 1;\n")).unwrap();
+
+        // The bundled one comes from no file.
+        let bundled = ToolContext::of(&Connection {
+            workspace: None,
+            ..connection.clone()
+        });
+        assert!(
+            !Workflow
+                .preview(&json!({"name": "review"}), &bundled)
+                .contains("\nFrom ")
+        );
+        // A script that nests one names every saved workflow from a file.
+        let nesting = format!("{meta}return await workflow(\"re\" + \"view\");\n");
+        let card = Workflow.preview(&json!({"script": nesting}), &ctx);
+        let nests = format!(
+            "\nIts workflow() calls may run review from {}\n",
+            file.display()
+        );
+        assert!(card.contains(&nests), "{card}");
+        let card = Workflow.preview(&json!({"name": "review"}), &ctx);
+        let from = format!("Workflow: review — Reviews.\nFrom {}\n", file.display());
+        assert!(card.starts_with(&from), "{card}");
+
+        // The file changed while its card waited, so the run does not start.
+        std::fs::write(&file, format!("{meta}return 2;\n")).unwrap();
+        assert_eq!(
+            Workflow.run(&json!({"name": "review"}), &ctx),
+            Err(
+                "The saved workflow review changed after its card was shown, so it did not \
+                 start: call it again to show the new one."
+                    .into()
+            )
+        );
+    }
+
+    #[test]
     fn the_users_words_are_relayed_indented() {
         let data = Data::new("tool-relay");
         let connection = data.connection("http://127.0.0.1:9/v1");
@@ -880,7 +991,7 @@ return await agent("Look");
             std::thread::spawn(move || then(&done("Look")));
             Ok(())
         });
-        let launch = Launch::read(&json!({"script": AUDIT})).unwrap();
+        let launch = Launch::read(&json!({"script": AUDIT}), None).unwrap();
         let said = set_off(run, &launch).unwrap();
         assert!(said.starts_with("Started workflow wf-1 (\"unwrap-audit\") in the background."));
         let first = got.recv_timeout(WAIT).unwrap();
@@ -916,7 +1027,7 @@ return `${said}\n${"x".repeat(9000)}\nthe end`;
         )
         .unwrap();
         run.spawn = answering(&Asked::default(), done);
-        let launch = Launch::read(&json!({"script": script})).unwrap();
+        let launch = Launch::read(&json!({"script": script}), None).unwrap();
         set_off(run, &launch).unwrap();
         let text = notice(session, "wf-1").text;
         let lines: Vec<&str> = text.lines().collect();
@@ -979,7 +1090,7 @@ return `${said}\n${"x".repeat(9000)}\nthe end`;
             });
             Ok(())
         });
-        set_off(run, &Launch::read(&json!({"script": AUDIT})).unwrap()).unwrap();
+        set_off(run, &Launch::read(&json!({"script": AUDIT}), None).unwrap()).unwrap();
         let caller = Caller {
             root: session,
             ..Default::default()
@@ -1028,7 +1139,7 @@ return await agent(args.ask);
         .unwrap();
         run.spawn = answering(&Asked::default(), done);
         let asked = json!({"script": script, "args": args, "budget": 2_000_000});
-        set_off(run, &Launch::read(&asked).unwrap()).unwrap();
+        set_off(run, &Launch::read(&asked, None).unwrap()).unwrap();
         notice(session, "wf-1");
         // Ended, it let its lock go.
         assert!(left_open().is_empty());
@@ -1063,7 +1174,7 @@ return await agent(args.ask);
         );
         // A resume keeps the run's own script, args, budget and request.
         typed(session, "Resume it.");
-        let launch = Launch::read(&json!({"resume": "wf-1"})).unwrap();
+        let launch = Launch::read(&json!({"resume": "wf-1"}), None).unwrap();
         assert_eq!(launch.script, script);
         assert_eq!((&launch.args, launch.kept_args), (&args, true));
         assert_eq!(launch.budget, 2_000_000);

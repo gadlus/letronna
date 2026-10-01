@@ -1,5 +1,5 @@
 use crate::prelude::*;
-use letronna_core::{agent, agents, approvals, goal, inbox, notify, review};
+use letronna_core::{agent, agents, approvals, crew, goal, inbox, notify, review};
 
 pub(crate) const BRAND: &str = "Letronna";
 
@@ -1283,11 +1283,30 @@ impl Chat {
         // An added command fills the composer, as a skill's Use does, so what
         // it gives is read before the next send sends it.
         match self.added_command(&prompt) {
-            Some(Ok(given)) => {
+            Some(Ok(Given::Text(given))) => {
                 self.composer.update(cx, |input, cx| {
                     input.set_value("", window, cx);
                     input.insert(given, window, cx);
                 });
+                return;
+            }
+            Some(Ok(Given::Run(asked))) => {
+                if self.busy {
+                    // Folded into a turn as it runs, it would reach the model
+                    // as typed.
+                    self.error = Some(
+                        "A saved workflow starts a turn of its own. Send it when this one is \
+                         done."
+                            .into(),
+                    );
+                    cx.notify();
+                    return;
+                }
+                self.composer
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                if self.run_saved(&prompt, asked, cx).is_err() {
+                    self.open_settings(window, cx);
+                }
                 return;
             }
             Some(Err(error)) => {
@@ -1314,12 +1333,13 @@ impl Chat {
             cx.notify();
             return;
         }
+        let session = self.store.conversations[self.store.active].id;
+        tell_crew(session, &prompt, crew::Source::Composer);
         let Some(prompt) = self.prompt_for(prompt, cx) else {
             return;
         };
         self.composer
             .update(cx, |input, cx| input.set_value("", window, cx));
-        let session = self.store.conversations[self.store.active].id;
         if self.dispatch(prompt, images, None, cx).is_err() {
             self.open_settings(window, cx);
         } else {
@@ -1381,6 +1401,7 @@ impl Chat {
                     (Ok(text), None) => {
                         this.composer
                             .update(cx, |input, cx| input.set_value("", window, cx));
+                        tell_crew(session, &typed, crew::Source::Composer);
                         // Pictures attached go with it, as with a typed message.
                         let images = this.attached().to_vec();
                         if this.dispatch(text, images, None, cx).is_err() {
@@ -1396,16 +1417,37 @@ impl Chat {
     }
 
     /// What `/name args` gives, or why it was refused, when the user, the
-    /// project or a skill added a command by that name and the window has
-    /// none of its own.
-    fn added_command(&self, prompt: &str) -> Option<Result<String, String>> {
-        use letronna_core::slash;
+    /// project or a skill added a command by that name, or a saved workflow
+    /// has it, and the window has none of its own.
+    pub(crate) fn added_command(&self, prompt: &str) -> Option<Result<Given, String>> {
+        use letronna_core::slash::{self, Origin};
         let (name, args) = slash::split(prompt)?;
         let workspace = self.store.conversations[self.store.active]
             .workspace
             .as_deref();
         let commands = slash::list(workspace, OWN_COMMANDS);
-        slash::find(&commands, name).map(|command| slash::fill(command, args))
+        let command = slash::find(&commands, name)?;
+        if command.origin == Origin::Workflow {
+            let asked = letronna_core::workflow::saved::prompt(&command.name, args);
+            return Some(Ok(Given::Run(asked)));
+        }
+        Some(slash::fill(command, args).map(Given::Text))
+    }
+
+    /// Sends `asked`, the prompt a saved workflow's command `typed` gives,
+    /// with the `workflow` tool granted for its turn, so the model can show
+    /// the run's launch card; `Err` as [`Self::dispatch`] gives it.
+    pub(crate) fn run_saved(
+        &mut self,
+        typed: &str,
+        asked: String,
+        cx: &mut Context<Self>,
+    ) -> std::result::Result<(), ()> {
+        let session = self.store.conversations[self.store.active].id;
+        tell_crew(session, typed, crew::Source::Composer);
+        // After `tell_crew`, which ends what the last command granted.
+        crew::grant(session);
+        self.dispatch(asked, Vec::new(), None, cx)
     }
 
     /// What sending `text` in the active session asks the model: `/init`
@@ -1531,7 +1573,9 @@ impl Chat {
         if conversation.messages.is_empty()
             && (conversation.title.is_empty() || conversation.title == "New session")
         {
-            let shown = letronna_core::init::typed(&prompt).unwrap_or(&prompt);
+            let saved = letronna_core::workflow::saved::typed(&prompt);
+            let shown = letronna_core::init::typed(&prompt).or(saved.as_deref());
+            let shown = shown.unwrap_or(&prompt);
             conversation.title = shown.chars().take(40).collect();
         }
         conversation.updated = backend::now();
@@ -1615,6 +1659,8 @@ impl Chat {
             });
             self.store.active = self.store.conversations.len() - 1;
         }
+        let session = self.store.conversations[self.store.active].id;
+        tell_crew(session, &prompt, crew::Source::Composer);
         let sent = match self.prompt_for(prompt, cx) {
             Some(prompt) => self.dispatch(prompt, images, None, cx).is_ok(),
             None => false,
@@ -2852,6 +2898,8 @@ impl Chat {
             Mode::Plan
         };
         self.modes.insert(id, mode);
+        // Ends what a command typed in this session granted its own turn.
+        tell_crew(id, &message.text, crew::Source::ChatApp);
         let (prompt, pictures) = files::prompt(&message);
         if self
             .dispatch(prompt, pictures, Some(message.remote), cx)
@@ -4462,6 +4510,24 @@ fn goal_command(prompt: &str) -> Option<&str> {
 fn side_question(prompt: &str) -> Option<&str> {
     let rest = prompt.strip_prefix("/btw")?;
     (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim())
+}
+
+/// What an added command gives.
+pub(crate) enum Given {
+    /// Text for the composer, read before it is sent.
+    Text(String),
+    /// A saved workflow's prompt, sent at once with the `workflow` tool
+    /// granted for its turn.
+    Run(String),
+}
+
+/// Hands Crew what was said from `source` as a turn starts in `session`,
+/// putting the notices it gives in the inbox ahead of the prompt; any such
+/// prompt ends what a saved workflow's command granted.
+pub(crate) fn tell_crew(session: u64, said: &str, source: crew::Source) {
+    for notice in crew::prompt(session, said, source) {
+        inbox::push(session, notice);
+    }
 }
 
 #[cfg(test)]
