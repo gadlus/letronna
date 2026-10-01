@@ -274,8 +274,8 @@ pub struct Gate<'a> {
     /// Why the user's rules file could not be read, if it could not: what it
     /// denies is unknown, so no approval is taken as given.
     pub broken: Option<&'a str>,
-    /// Someone can answer right now; false for an unattended schedule and
-    /// for `-p` with no terminal to answer in.
+    /// Someone can answer right now; false for a scheduled run and for `-p`
+    /// with no terminal to answer in.
     pub human: bool,
 }
 

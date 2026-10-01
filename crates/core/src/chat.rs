@@ -227,9 +227,9 @@ pub struct Connection {
     /// How much the session lets run without asking, which its helpers'
     /// mode is narrowed from; `plan` is set for Plan too.
     pub mode: Mode,
-    /// Someone can answer a helper's card for the session now: false for an
-    /// unattended schedule, for `-p` and in a chat app's session, where its
-    /// helpers are refused what would ask.
+    /// Someone can answer a card for the session now: false for a scheduled
+    /// run, for `-p` and in a chat app's session, where what would ask is
+    /// refused.
     pub human: bool,
     /// What the user typed in the session, oldest first, which Auto mode's
     /// judge reads as their wishes when it decides a helper's call.
