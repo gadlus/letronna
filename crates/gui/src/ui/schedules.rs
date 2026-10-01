@@ -1,6 +1,7 @@
 //! The Scheduled jobs page: prompts that run on a timer.
 
 use crate::prelude::*;
+use chrono::{Local, TimeZone};
 use letronna_core::gate::Mode;
 use letronna_core::schedule::{self, Schedule, Trigger};
 
@@ -326,11 +327,7 @@ impl Chat {
         let job = &self.schedules[index];
         let id = job.id;
         let enabled = job.enabled;
-        let last = if job.last_run == 0 {
-            "never run".to_owned()
-        } else {
-            format!("last run {} ago", age_label(job.last_run, backend::now()))
-        };
+        let last = runs_label(job, backend::now());
         let folder = job
             .workspace
             .as_ref()
@@ -520,4 +517,66 @@ fn label(text: &'static str, cx: &App) -> impl IntoElement {
 
 fn field(text: &'static str, input: impl IntoElement, cx: &App) -> impl IntoElement {
     v_flex().gap_1p5().child(label(text, cx)).child(input)
+}
+
+/// What a job's row says of its runs as of `now`. Adding a job sets
+/// `last_run` to start its clock, so a one-off has run only once `last_run`
+/// reaches its time.
+fn runs_label(job: &Schedule, now: u64) -> String {
+    match job.trigger {
+        Trigger::Once { at } if job.last_run < at => {
+            let time = Local.timestamp_opt(at as i64, 0).single();
+            match time.filter(|_| at > now) {
+                Some(time) => format!("not run yet, runs at {}", time.format("%H:%M")),
+                None => "not run yet".into(),
+            }
+        }
+        _ if job.last_run == 0 => "not run yet".into(),
+        _ => format!("last run {} ago", age_label(job.last_run, now)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
+    // would shadow the built-in attribute.
+    use super::runs_label;
+    use chrono::{Local, TimeZone};
+    use letronna_core::schedule::{Schedule, Trigger};
+
+    fn job(trigger: Trigger, last_run: u64) -> Schedule {
+        Schedule {
+            id: 1,
+            name: "Check the deploy".into(),
+            prompt: "Check the deploy".into(),
+            workspace: None,
+            trigger,
+            enabled: true,
+            last_run,
+            mode: Default::default(),
+            by_model: true,
+        }
+    }
+
+    #[test]
+    fn a_one_off_added_a_minute_ago_says_when_it_runs_not_that_it_ran() {
+        let now = 1_790_000_000;
+        let at = now + 5 * 60;
+        let armed = job(Trigger::Once { at }, now - 60);
+        let time = Local.timestamp_opt(at as i64, 0).unwrap().format("%H:%M");
+        let expected = format!("not run yet, runs at {time}");
+        assert_eq!(runs_label(&armed, now), expected);
+        // Its time passed before a run took it.
+        assert_eq!(runs_label(&armed, at + 1), "not run yet");
+        let ran = job(Trigger::Once { at }, at + 2);
+        assert_eq!(runs_label(&ran, at + 62), "last run 1m ago");
+    }
+
+    #[test]
+    fn a_job_that_never_ran_says_not_yet_and_one_that_ran_says_when() {
+        let now = 1_790_000_000;
+        let every = Trigger::Every { minutes: 30 };
+        assert_eq!(runs_label(&job(every.clone(), 0), now), "not run yet");
+        assert_eq!(runs_label(&job(every, now - 7200), now), "last run 2h ago");
+    }
 }
