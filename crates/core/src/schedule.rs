@@ -35,11 +35,11 @@
 //! decides it with nobody asked.
 
 use crate::chat::{self as backend, Connection, Message};
-use crate::driver::{self, Allow, Decide, Outcome, Spec};
-use crate::gate::{Gate, Grants, Mode};
+use crate::driver::{self, Allow, Outcome, Spec};
+use crate::gate::Mode;
 use crate::store::Transcript;
 use crate::timers::{self, TimerId};
-use crate::{agent, gateway, messaging, permissions, store};
+use crate::{agent, gateway, messaging, store};
 use chrono::{DateTime, Datelike, Local, TimeZone, Timelike};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -122,9 +122,9 @@ pub struct Schedule {
     /// Epoch seconds of the last run; 0 if it has never run.
     #[serde(default)]
     pub last_run: u64,
-    /// The mode a run decides in without the user, for this schedule only;
-    /// Default waits for the user at each card, as a chat does. Saves from
-    /// before the modes kept `unattended` here, which reads as Bypass.
+    /// The mode each run decides in, and the only one: nobody is there to
+    /// answer, so what would ask in it is refused. Saves from before the
+    /// modes kept `unattended` here, which reads as Bypass when true.
     #[serde(default, alias = "unattended")]
     pub mode: Mode,
 }
@@ -906,38 +906,47 @@ fn open(job: &Schedule) -> Result<Spec, String> {
         .cloned()
         .unwrap_or_default();
     let (endpoint, key) = gateway::resolve(&settings.gateway, &settings.custom_endpoint, &saved);
-    let mut connection = Connection {
+    let connection = Connection {
         endpoint,
         model: settings.model.clone(),
         key,
         tools: true,
         workspace: job.workspace.clone(),
-        plan: job.mode == Mode::Plan,
-        remote: None,
         effort: settings.effort.clone(),
         search: settings.search,
-        conversation: 0,
-        unattended: true,
-        wrap_up: false,
-        // Its helpers narrow from the schedule's mode, and ask the user
-        // only where its own calls would, in Default.
-        mode: job.mode,
-        human: job.mode == Mode::Default,
-        // The job's prompt is what Auto mode's judge reads as the user's wishes.
-        typed: [job.prompt.clone()].into(),
-        session_model: String::new(),
+        ..Default::default()
     };
     // Before the session is made, so a run that cannot start leaves none.
     backend::validate(&connection)?;
-    let mut transcript = Transcript::session(&job.name, job.workspace.clone())?;
+    let transcript = Transcript::session(&job.name, job.workspace.clone())?;
+    Ok(run_of(job, connection, transcript))
+}
+
+/// The run of `job` as the session `transcript` begins, on `connection`: in
+/// the job's own mode with nobody to answer, so whatever would ask is
+/// refused, and in Auto whatever the judge does not allow.
+pub(crate) fn run_of(job: &Schedule, connection: Connection, mut transcript: Transcript) -> Spec {
     let id = transcript.conversation.id;
-    connection.conversation = id;
     transcript.conversation.messages.push(Message {
         role: "user".into(),
         content: job.prompt.clone(),
         ..Default::default()
     });
-    Ok(Spec {
+    let connection = Connection {
+        conversation: id,
+        // Never the Default mode setting nor a session's chip: those say
+        // what someone watching lets through, and nobody watches this.
+        mode: job.mode,
+        plan: job.mode == Mode::Plan,
+        human: false,
+        // Nobody may be watching, so a failed call is tried more times.
+        unattended: true,
+        // What Auto mode's judge reads as the user's wishes; it judges on
+        // the model the run is on.
+        typed: [job.prompt.clone()].into(),
+        ..connection
+    };
+    Spec {
         connection,
         transcript,
         id,
@@ -955,22 +964,11 @@ fn open(job: &Schedule) -> Result<Spec, String> {
         from: 0,
         schema: None,
         watch: None,
-        decide: Some(gate_of(job.mode)),
-    })
-}
-
-/// A scheduled run's own gate, which decides its calls in `mode` as the
-/// window decided them when it ran the schedules itself. What still asks goes
-/// to `approvals`, where the frontend decides it in the same mode.
-pub(crate) fn gate_of(mode: Mode) -> Decide {
-    Arc::new(move |call, ctx| {
-        // Read afresh each time, as a run can go on for a long while.
-        let rules = permissions::load(&permissions::user_file());
-        let none = Grants::new();
-        let unattended = (mode != Mode::Default).then_some(mode);
-        let gate = Gate::for_window(ctx, &none, &rules, mode, unattended);
-        crate::gate::decide(call, &gate)
-    })
+        // The driver puts every call through the whole gate in the run's
+        // mode, and with nobody to answer no call reaches a frontend,
+        // whose answer would come from whatever mode it is in.
+        decide: None,
+    }
 }
 
 /// What a finished run came to: its answer, or why there is none.
@@ -1545,5 +1543,48 @@ mod tests {
         assert_eq!(cut(&probe(&dir)), 0, "said twice");
         assert!(next.started.recv_timeout(QUIET).is_err(), "run again");
         running.finish.send(()).unwrap();
+    }
+
+    #[test]
+    fn a_file_from_before_the_modes_reads_its_switch_as_bypass_or_default_and_saves_modes() {
+        use crate::gate::Mode;
+        let dir = scratch("old-switch");
+        let job = |id: u64, switch: &str| {
+            format!(
+                r#"{{"id": {id}, "name": "tidy", "prompt": "tidy up", "workspace": null,
+                "trigger": {{"Every": {{"minutes": 60}}}}, "enabled": true,
+                "last_run": 0{switch}}}"#
+            )
+        };
+        let old = [
+            job(1, r#", "unattended": true"#),
+            job(2, r#", "unattended": false"#),
+            job(3, ""),
+        ];
+        std::fs::write(path(&dir), format!("[{}]", old.join(", "))).unwrap();
+        let modes =
+            |dir: &Path| -> Vec<Mode> { load(dir).unwrap().iter().map(|job| job.mode).collect() };
+        let read = [Mode::Bypass, Mode::Default, Mode::Default];
+        assert_eq!(modes(&dir), read);
+
+        save(&dir, &load(&dir).unwrap()).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path(&dir)).unwrap()).unwrap();
+        assert_eq!(saved[0]["mode"], "bypass");
+        assert!(saved[0].get("unattended").is_none(), "{saved}");
+        assert_eq!(modes(&dir), read);
+    }
+
+    #[test]
+    fn a_mode_from_a_newer_letronna_reads_as_default_and_the_rest_of_the_file_stands() {
+        use crate::gate::Mode;
+        let dir = scratch("newer-mode");
+        let mut saved = serde_json::to_value([every(1, 60, 0), every(2, 60, 0)]).unwrap();
+        saved[0]["mode"] = "auto".into();
+        saved[1]["mode"] = "sideways".into();
+        std::fs::write(path(&dir), serde_json::to_vec(&saved).unwrap()).unwrap();
+        let read = load(&dir).unwrap();
+        let modes: Vec<Mode> = read.iter().map(|job| job.mode).collect();
+        assert_eq!(modes, [Mode::Auto, Mode::Default]);
     }
 }

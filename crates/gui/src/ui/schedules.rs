@@ -8,6 +8,16 @@ use letronna_core::schedule::{self, Schedule, Trigger};
 /// validation and buys little; these are the ones people actually pick.
 const INTERVALS: &[u32] = &[15, 30, 60, 180, 360, 720];
 
+/// The modes a job can run in, as the editor names them. Don't ask is left
+/// out: with nobody there to answer, Default already refuses what would ask.
+const MODES: [(Mode, &str); 5] = [
+    (Mode::Default, "Default"),
+    (Mode::AcceptEdits, "Accept edits"),
+    (Mode::Plan, "Plan"),
+    (Mode::Auto, "Auto"),
+    (Mode::Bypass, "Bypass"),
+];
+
 impl Chat {
     /// Change the schedules through the runner, which reads them afresh and
     /// saves at once, so a run's `last_run` is never written back over.
@@ -73,10 +83,26 @@ impl Chat {
         let job = &self.schedules[index];
         let id = job.id;
         let trigger = job.trigger.clone();
-        // Until Auto is offered the switch is "Run everything" or "Wait
-        // for me"; a mode set in the file by hand reads as off, since only
-        // Bypass runs everything.
-        let unattended = job.mode == Mode::Bypass;
+        // Don't ask, set in the file by hand, refuses what would ask as a
+        // run in Default does with nobody there, so it shows as Default.
+        let mode = match job.mode {
+            Mode::DontAsk => Mode::Default,
+            mode => mode,
+        };
+        let modes: Vec<_> = MODES
+            .iter()
+            .enumerate()
+            .map(|(ix, &(choice, name))| {
+                Button::new(("mode", ix))
+                    .xsmall()
+                    .when(choice == mode, |b| b.primary())
+                    .when(choice != mode, |b| b.framed(cx))
+                    .label(name)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.change_schedule(id, |job| job.mode = choice, cx)
+                    }))
+            })
+            .collect();
 
         let every: Vec<_> = INTERVALS
             .iter()
@@ -185,46 +211,15 @@ impl Chat {
                     .child(h_flex().flex_wrap().gap_2().children(every)),
             )
             .child(
-                h_flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
+                v_flex()
+                    .gap_1p5()
+                    .child(label("Mode", cx))
+                    .child(h_flex().flex_wrap().gap_2().children(modes))
                     .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .gap_0p5()
-                            .child(div().text_sm().child("Run without asking"))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(
-                                        "Approve writes and commands automatically, except some \
-                                         commands that are hard to undo, such as recursive deletes \
-                                         and force pushes, which are skipped. Without this a job \
-                                         that needs approval waits until you are back.",
-                                    ),
-                            ),
-                    )
-                    .child(
-                        div().flex_shrink_0().cursor_pointer().child(
-                            gpui_component::switch::Switch::new("unattended")
-                                .checked(unattended)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.change_schedule(
-                                        id,
-                                        |job| {
-                                            job.mode = if unattended {
-                                                Mode::Default
-                                            } else {
-                                                Mode::Bypass
-                                            };
-                                        },
-                                        cx,
-                                    );
-                                })),
-                        ),
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(about(mode)),
                     ),
             )
             .child(
@@ -480,6 +475,29 @@ impl Chat {
                     .overflow_y_scroll()
                     .child(v_flex().children(rows)),
             )
+    }
+}
+
+/// What a run of a job in `mode` does, where nobody is there to say yes.
+fn about(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Default | Mode::DontAsk => {
+            "Runs only what your permission rules allow. Nobody is there to say yes, so \
+             anything else is refused and the job says what it left undone."
+        }
+        Mode::AcceptEdits => {
+            "Also edits files in the job's folder. Commands your rules do not allow are \
+             refused."
+        }
+        Mode::Plan => "Reads and searches only: nothing is written or run.",
+        Mode::Auto => {
+            "Your model judges what your rules do not settle, taking the job's prompt as \
+             what you want. Whatever it does not allow is refused."
+        }
+        Mode::Bypass => {
+            "Runs everything except what your rules deny and commands that are hard to \
+             undo, such as recursive deletes and force pushes."
+        }
     }
 }
 

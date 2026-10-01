@@ -1579,17 +1579,7 @@ mod tests {
         for (n, mode) in [Mode::Bypass, Mode::Default].into_iter().enumerate() {
             let dir = scratch(&format!("scheduled-{}", mode.name()));
             let session = AGENTS + 300 + n as u64;
-            let job = crate::schedule::Schedule {
-                id: 1,
-                name: "Nightly".into(),
-                prompt: "Write it down.".into(),
-                workspace: Some(dir.to_path_buf()),
-                trigger: crate::schedule::Trigger::Every { minutes: 60 },
-                enabled: true,
-                last_run: 0,
-                mode,
-            };
-            let _listed = crate::schedule::Listed::new(session, &job);
+            let _listed = crate::schedule::Listed::new(session, &job(&dir, mode));
             // A frontend serves the approvals, and turns down what reaches it.
             let requests = approvals::serve();
             let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1611,26 +1601,21 @@ mod tests {
                 ),
                 reply("Done.", &[]),
             ]);
-            let mut spec = spec(endpoint, &dir, session);
-            (spec.root, spec.run, spec.depth) = (session, session, 0);
-            spec.decide = Some(crate::schedule::gate_of(mode));
-            let report = finished(spec);
+            let report = finished(scheduled(endpoint, &dir, session, mode));
             assert_eq!(report.status, Outcome::Done);
             let sent = provider.sent();
             let got = results(&sent[1]);
             assert_eq!(got[1], NOBODY_TO_ASK);
             assert_eq!(got[2], "`wake_me` is not available in a scheduled run.");
 
-            // Bypass runs the write with nobody asked; Default puts it to the
-            // frontend, whose no stands.
-            let asked = asked.lock().unwrap().clone();
+            // Bypass runs the write; Default refuses it, as nobody is there
+            // to say yes. Neither asks a frontend.
+            assert!(asked.lock().unwrap().is_empty(), "a frontend was asked");
             if mode == Mode::Bypass {
-                assert!(asked.is_empty(), "a frontend was asked");
                 assert!(dir.join("made.txt").exists(), "{got:?}");
             } else {
-                assert_eq!(asked, [session]);
                 assert!(!dir.join("made.txt").exists());
-                assert!(got[0].starts_with(NOT_APPROVED), "{got:?}");
+                assert!(got[0].contains("nobody is here"), "{got:?}");
             }
         }
     }
@@ -2879,5 +2864,134 @@ mod tests {
         let sent = provider.sent();
         assert!(words(results(&sent[1])[0]).contains("asked once"));
         assert_eq!(results(&sent[2])[1], NOT_APPROVED);
+    }
+
+    /// A job in `mode` working in `dir`.
+    fn job(dir: &Path, mode: gate::Mode) -> crate::schedule::Schedule {
+        crate::schedule::Schedule {
+            id: 1,
+            name: "nightly".into(),
+            prompt: "Tidy the notes folder.".into(),
+            workspace: Some(dir.to_owned()),
+            trigger: crate::schedule::Trigger::Every { minutes: 60 },
+            enabled: true,
+            last_run: 0,
+            mode,
+        }
+    }
+
+    /// Job `id` in `mode`, working in `dir`, as `schedule::run_of` sets its
+    /// run up against the provider at `endpoint`.
+    fn scheduled(endpoint: String, dir: &Path, id: AgentId, mode: gate::Mode) -> Spec {
+        let job = job(dir, mode);
+        let connection = Connection {
+            endpoint,
+            model: "test-model".into(),
+            tools: true,
+            workspace: Some(dir.to_owned()),
+            ..Default::default()
+        };
+        let transcript = Transcript {
+            path: dir.join("scheduled.jsonl"),
+            conversation: Conversation {
+                id,
+                title: job.name.clone(),
+                ..Default::default()
+            },
+        };
+        crate::schedule::run_of(&job, connection, transcript)
+    }
+
+    /// An edit in the project, a command that changes things and one that
+    /// throws work away, as a scheduled run's model makes them.
+    fn tidying() -> Vec<String> {
+        let calls = [
+            ("write_file", json!({"path": "made.txt", "content": "made"})),
+            command("mkdir made-dir"),
+            command("git reset --hard HEAD~1"),
+        ];
+        vec![reply("", &calls), reply("Tidied what I could.", &[])]
+    }
+
+    /// Whether the edit and the command of `tidying` ran in `dir`, after
+    /// checking that the last call was refused: by the floor, or by plan
+    /// mode before the floor looked.
+    fn tidied(dir: &Path, sent: &[Value]) -> (bool, bool) {
+        let results = results(sent.last().unwrap());
+        assert_eq!(results.len(), 3, "{results:?}");
+        let refused = [
+            "Refused: this command",
+            "`run_command` in plan mode only runs commands that just read",
+        ];
+        assert!(
+            refused.iter().any(|why| results[2].starts_with(why)),
+            "{results:?}"
+        );
+        (dir.join("made.txt").exists(), dir.join("made-dir").exists())
+    }
+
+    #[test]
+    fn a_scheduled_run_runs_what_its_mode_lets_through_and_refuses_the_rest() {
+        use gate::Mode;
+        let _serving = crate::approvals::tests::SERVING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let requests = approvals::serve();
+        let table = [
+            (Mode::Default, (false, false)),
+            (Mode::AcceptEdits, (true, false)),
+            (Mode::Plan, (false, false)),
+            (Mode::DontAsk, (false, false)),
+            (Mode::Bypass, (true, true)),
+        ];
+        for (at, (mode, expected)) in (AGENTS + 400..).step_by(10).zip(table) {
+            let dir = scratch(&format!("scheduled-each-{}", mode.name()));
+            let (endpoint, provider) = provider(tidying());
+            let report = finished(scheduled(endpoint, &dir, at, mode));
+            assert_eq!(report.status, Outcome::Done, "{mode:?}");
+            assert_eq!(tidied(&dir, &provider.sent()), expected, "{mode:?}");
+        }
+        assert!(requests.try_recv().is_err(), "a frontend was asked");
+    }
+
+    #[test]
+    fn a_scheduled_run_in_auto_runs_what_the_judge_allows_on_the_jobs_prompt() {
+        let _serving = crate::approvals::tests::SERVING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let requests = approvals::serve();
+        let dir = scratch("scheduled-auto");
+        let (endpoint, provider) = judged(tidying(), Some("ALLOW"));
+        let spec = scheduled(endpoint, &dir, AGENTS + 460, gate::Mode::Auto);
+        assert_eq!(finished(spec).status, Outcome::Done);
+        let sent = provider.sent();
+
+        // The edit ran unjudged, the command on the judge's word, and the
+        // floor refused the last before any judge saw it.
+        assert_eq!(tidied(&dir, &sent), (true, true));
+        let judge: Vec<&Value> = sent.iter().filter(|body| body["stream"] == false).collect();
+        assert_eq!(judge.len(), 1);
+        assert_eq!(judge[0]["model"], "test-model");
+        let prompt = judge[0]["messages"][1]["content"].as_str().unwrap();
+        assert!(prompt.contains("Tidy the notes folder."), "{prompt}");
+        assert!(requests.try_recv().is_err(), "a frontend was asked");
+    }
+
+    #[test]
+    fn a_scheduled_run_in_auto_refuses_what_the_judge_is_unsure_of() {
+        let _serving = crate::approvals::tests::SERVING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let requests = approvals::serve();
+        let dir = scratch("scheduled-unsure");
+        let (endpoint, provider) = judged(tidying(), None);
+        let spec = scheduled(endpoint, &dir, AGENTS + 470, gate::Mode::Auto);
+        assert_eq!(finished(spec).status, Outcome::Done);
+        let sent = provider.sent();
+
+        assert_eq!(tidied(&dir, &sent), (true, false));
+        let refused = results(sent.last().unwrap())[1];
+        assert!(refused.contains("nobody is here to decide"), "{refused}");
+        assert!(requests.try_recv().is_err(), "a card with nobody there");
     }
 }
