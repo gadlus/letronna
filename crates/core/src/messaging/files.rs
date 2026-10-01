@@ -229,7 +229,7 @@ pub fn unfetched(message: &Incoming) -> bool {
 /// project `into`, or Letronna's own. One that cannot be had is left out,
 /// and the message says so.
 pub fn fetch(config: &Config, message: Incoming, into: Option<PathBuf>) -> Incoming {
-    fetch_via(super::API, config, message, into)
+    fetch_via(&super::api(), config, message, into)
 }
 
 fn fetch_via(api: &str, config: &Config, mut message: Incoming, into: Option<PathBuf>) -> Incoming {
@@ -498,10 +498,10 @@ impl To {
         }
     }
 
-    fn api(&self) -> &'static str {
+    fn api(&self) -> String {
         match self {
-            To::Telegram { .. } => super::API,
-            To::Discord { .. } => super::DISCORD_API,
+            To::Telegram { .. } => super::api(),
+            To::Discord { .. } => super::DISCORD_API.into(),
         }
     }
 
@@ -673,7 +673,7 @@ pub fn send_files(config: &Config, source: &Source, paths: &[PathBuf]) -> Vec<St
         Ok(to) => to,
         Err(why) => return vec![why],
     };
-    send_files_via(to.api(), &to, paths)
+    send_files_via(&to.api(), &to, paths)
 }
 
 /// Send the turn's reply to `source`, then what it made, then a line on
@@ -776,7 +776,7 @@ impl Tool for SendFile {
         let to = To::session(ctx, &super::load())?;
         let path = pick(raw, ctx)?;
         let caption = args["caption"].as_str().unwrap_or_default();
-        upload(to.api(), &to, &path, caption)?;
+        upload(&to.api(), &to, &path, caption)?;
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         let place = ctx
             .remote

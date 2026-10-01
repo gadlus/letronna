@@ -419,7 +419,7 @@ pub mod files;
 /// is paired: that is the one the bot may talk to. Returns what failed to
 /// send.
 pub fn report(config: &Config, title: &str, body: &str) -> Vec<String> {
-    report_via(API, config, title, body)
+    report_via(&api(), config, title, body)
 }
 
 fn report_via(api: &str, config: &Config, title: &str, body: &str) -> Vec<String> {
@@ -558,6 +558,18 @@ fn client() -> Option<&'static reqwest::blocking::Client> {
         .as_ref()
 }
 
+/// Where the Telegram Bot API is. A debug build takes `LETRONNA_TELEGRAM_API`
+/// instead, so a hand test can talk to a local fake; a release build never
+/// does, so nothing in its environment can send a bot's token elsewhere.
+fn api() -> String {
+    if cfg!(debug_assertions)
+        && let Ok(base) = std::env::var("LETRONNA_TELEGRAM_API")
+    {
+        return base;
+    }
+    API.into()
+}
+
 /// Send `text` to the chat `source` names, in as many messages as the
 /// service needs. `card`, the id of a call waiting for approval, puts Allow
 /// and Deny buttons under the last one; a typed yes or no still answers it.
@@ -568,7 +580,7 @@ pub fn tell(
     card: Option<&str>,
 ) -> Result<(), String> {
     match source {
-        Source::Telegram(chat) => send_via(API, &config.telegram.token, *chat, text, card),
+        Source::Telegram(chat) => send_via(&api(), &config.telegram.token, *chat, text, card),
         Source::Discord(channel) => {
             discord_post_via(DISCORD_API, &config.discord.bot_token, channel, text, card)
         }
@@ -636,7 +648,7 @@ fn send_via(
 /// Show the chat `source` names that a reply is being written. The service
 /// stops showing it after a few seconds, or when the next message arrives.
 pub fn typing(config: &Config, source: &Source) -> Result<(), String> {
-    typing_via((API, DISCORD_API), config, source)
+    typing_via((&api(), DISCORD_API), config, source)
 }
 
 fn typing_via(
@@ -673,7 +685,7 @@ fn typing_via(
 /// cannot be answered twice. `answered` says whether the tap answered the
 /// card, or came after it had been answered some other way.
 pub fn settle(config: &Config, press: &Press, answered: bool) -> Result<(), String> {
-    settle_via((API, DISCORD_API), config, press, answered)
+    settle_via((&api(), DISCORD_API), config, press, answered)
 }
 
 fn settle_via(
@@ -751,7 +763,7 @@ fn trim_to(text: &str, max: usize) -> String {
 pub fn check(token: &str) -> Result<String, String> {
     let client = client().ok_or("Cannot initialize connection.")?;
     let body: serde_json::Value = client
-        .get(format!("{API}/bot{}/getMe", token.trim()))
+        .get(format!("{}/bot{}/getMe", api(), token.trim()))
         .send()
         .map_err(|_| "Cannot reach Telegram.".to_owned())?
         .json()
@@ -775,10 +787,11 @@ pub fn poll(
     std::thread::spawn(move || {
         use std::sync::atomic::Ordering;
         let Some(client) = client() else { return };
+        let api = api();
         let mut offset: Option<u64> = None;
         while !stop.load(Ordering::Relaxed) {
             let mut request = client
-                .get(format!("{API}/bot{}/getUpdates", token.trim()))
+                .get(format!("{api}/bot{}/getUpdates", token.trim()))
                 .query(&[("timeout", POLL_SECONDS.to_string())])
                 // Said every time: Telegram keeps whatever was asked for
                 // last, and taps on a card's buttons come as callback queries.

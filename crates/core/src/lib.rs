@@ -39,6 +39,7 @@ pub mod gateway;
 pub mod git;
 pub mod goal;
 mod grep;
+pub mod headless;
 pub mod history;
 pub mod hooks;
 pub mod import;

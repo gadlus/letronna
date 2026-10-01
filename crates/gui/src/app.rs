@@ -2390,7 +2390,11 @@ impl Chat {
         }
         let open_slack = slack.ready() && !unchanged;
         let (tx, rx) = async_channel::unbounded();
-        let stop = letronna_core::remote::listen(&self.messaging, tx.clone());
+        // Telegram and Discord are not heard here while another Letronna
+        // hears them; Slack is the window's own.
+        let stop = letronna_core::remote::listen(&self.messaging, tx.clone())
+            .ok()
+            .flatten();
         if open_slack {
             let slack_stop = std::sync::Arc::new(AtomicBool::new(false));
             let (state, states) = async_channel::unbounded();

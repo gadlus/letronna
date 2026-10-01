@@ -11,21 +11,35 @@
 //! run starts and stops, and how a chat asking to be paired is shown.
 
 use crate::approvals;
-use crate::chat::{Message, Remote};
+use crate::chat::{self as backend, Message, Remote};
 use crate::driver::{self, Outcome};
 use crate::gate::Mode;
 use crate::inbox::{self, Notice, When};
 use crate::messaging::pairing::{self, Attempt};
 use crate::messaging::{self, CardAnswer, Config, Incoming, Press, Source, files};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::fs::{File, TryLockError};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// Runs started at once: a few chats and `/bg` tasks side by side, without
 /// crowding the provider's rate limit. The rest wait for a place rather than
 /// being refused, since somebody asked for each.
 pub const AT_ONCE: usize = 4;
+
+/// Why a Letronna does not hear the chat apps while another does.
+const ELSEWHERE: &str = "Another Letronna already answers the chat apps: a window with them \
+set up, or another `letronna serve`.";
+
+/// The lock held by the Letronna that hears the chat apps, for as long as
+/// any is set up. Telegram hands each message to one poller only and turns
+/// a second away, and two Discord listeners would answer every message
+/// twice, so only one Letronna may hear them. The system lets the lock go
+/// when that Letronna quits, crashes or is killed. Kept with the data folder
+/// it is in, since a profile switched to is a data folder with a lock of its
+/// own.
+static HEARING: Mutex<Option<(PathBuf, File)>> = Mutex::new(None);
 
 /// What a host keeps for the chats between their messages.
 #[derive(Default)]
@@ -107,11 +121,25 @@ pub trait Host {
 
 /// Start hearing Telegram and Discord as set up in `config`, each message
 /// going to `sender`, on threads that end once the flag handed back is set;
-/// `None` when neither is set up to hear.
-pub fn listen(config: &Config, sender: async_channel::Sender<Incoming>) -> Option<Arc<AtomicBool>> {
+/// `None` when neither is set up to hear. Only one Letronna hears them at a
+/// time, so this holds `HEARING` while either is set up, and says so when
+/// another Letronna holds it.
+pub fn listen(
+    config: &Config,
+    sender: async_channel::Sender<Incoming>,
+) -> Result<Option<Arc<AtomicBool>>, String> {
     let (telegram, discord) = (&config.telegram, &config.discord);
+    let mut held = HEARING.lock().unwrap_or_else(PoisonError::into_inner);
     if !telegram.ready() && !discord.bot_ready() {
-        return None;
+        // So another Letronna can hear them.
+        *held = None;
+        return Ok(None);
+    }
+    let dir = backend::data_dir();
+    if held.as_ref().is_none_or(|(at, _)| *at != dir) {
+        // The last profile's goes first: its chat apps are not heard here now.
+        *held = None;
+        *held = Some((dir.clone(), take_lock(&dir)?));
     }
     let stop = Arc::new(AtomicBool::new(false));
     if telegram.ready() {
@@ -120,7 +148,19 @@ pub fn listen(config: &Config, sender: async_channel::Sender<Incoming>) -> Optio
     if discord.bot_ready() {
         messaging::discord_listen(discord.clone(), stop.clone(), sender);
     }
-    Some(stop)
+    Ok(Some(stop))
+}
+
+/// Take the lock in data folder `dir` that says this Letronna hears the chat
+/// apps, or say why it cannot.
+fn take_lock(dir: &Path) -> Result<File, String> {
+    let refused = |e: std::io::Error| format!("Cannot hear the chat apps: {e}");
+    let file = crate::schedule::open_lock(&dir.join("messaging.lock")).map_err(refused)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err(ELSEWHERE.into()),
+        Err(TryLockError::Error(e)) => Err(refused(e)),
+    }
 }
 
 /// Deal with a message from a chat app. A Telegram chat that is not paired
@@ -391,7 +431,7 @@ pub fn said(report: &driver::Report) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Dispatcher, Host, ask, dispatch, ended};
+    use super::{Dispatcher, Host, ask, dispatch, ended, take_lock};
     use crate::approvals::{self, tests::SERVING};
     use crate::chat::{Message, Remote, ToolCall};
     use crate::gate::Mode;
@@ -526,6 +566,16 @@ mod tests {
             .last()
             .map(|(_, text)| text.as_str())
             .unwrap_or("")
+    }
+
+    #[test]
+    fn only_one_letronna_hears_the_chat_apps_until_it_lets_go() {
+        let dir = crate::store::tests::Scratch::new("remote-hearing");
+        let first = take_lock(&dir).unwrap();
+        let second = take_lock(&dir).map(|_| ()).unwrap_err();
+        assert!(second.starts_with("Another Letronna already answers the chat apps"));
+        drop(first);
+        assert!(take_lock(&dir).is_ok(), "let go when the first went");
     }
 
     #[test]

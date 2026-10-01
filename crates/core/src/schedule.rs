@@ -739,7 +739,7 @@ fn later(shared: &Arc<Shared>, wait: Duration) -> TimerId {
 
 /// Open (or make) the lock file at `path`. std opens it close-on-exec, so a
 /// command this Letronna started does not hold the lock after it quits.
-fn open_lock(path: &Path) -> std::io::Result<File> {
+pub(crate) fn open_lock(path: &Path) -> std::io::Result<File> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }

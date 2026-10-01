@@ -25,6 +25,7 @@ mod mcp;
 mod notify;
 mod render;
 mod screen;
+mod serve;
 mod session;
 mod setup;
 mod spinner;
@@ -180,12 +181,16 @@ fn main() {
     }
     // With nothing set up there is nothing to talk to, so the first run is
     // the setup -- the same one the installers hand over to. Asking a
-    // question from a pipe cannot wait for answers, so that one stops here.
+    // question from a pipe cannot wait for answers, so that one stops here,
+    // and so does serving, which nobody sits at.
     let first_run = runner.store.settings.model.is_empty();
-    if first_run && args.once() {
+    if first_run && (args.once() || args.serve) {
         let error = "Nothing is set up yet. Run `letronna setup` first.";
         show(args.output, &failed(error.into()));
         std::process::exit(1);
+    }
+    if args.serve {
+        std::process::exit(serve::run());
     }
 
     // Setup is printed straight into the terminal, like an installer, not
