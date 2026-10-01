@@ -2,7 +2,7 @@ use crate::prelude::*;
 use gpui_component::{Selectable, menu::PopupMenu, popover::Popover};
 use letronna_core::gate::Mode;
 
-actions!(composer, [LeaveComposer]);
+actions!(composer, [LeaveComposer, KeysOrType]);
 
 impl Chat {
     /// The (gateway, model) pairs the picker shows for what is typed in its
@@ -347,6 +347,35 @@ impl Chat {
             .update(cx, |input, cx| input.focus(window, cx));
     }
 
+    /// A key that typed nothing where the focus is, on a turn, the sidebar
+    /// or the panel, starts a message instead, as long as it is a character.
+    /// Not on another page, which has no composer to take it.
+    pub(crate) fn type_into_composer(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.page != Page::Chat || self.settings_open || window.has_active_dialog(cx) {
+            return;
+        }
+        // A text box, a menu or the browser's page has the key already.
+        let taken = window.context_stack().iter().any(|context| {
+            ["Input", "PopupMenu", "Browser"]
+                .iter()
+                .any(|name| context.contains(name))
+        });
+        let Some(text) = typed(&event.keystroke).filter(|_| !taken) else {
+            return;
+        };
+        let text = text.to_owned();
+        self.region = None;
+        self.focus_composer(window, cx);
+        self.composer
+            .update(cx, |input, cx| input.insert(text, window, cx));
+        cx.stop_propagation();
+    }
+
     /// Keep what was typed for the session the composer was showing, and
     /// bring back what was typed for the one on screen now.
     pub(crate) fn swap_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -655,6 +684,13 @@ impl Chat {
             .min_w_0()
             .key_context("Composer")
             .capture_action(cx.listener(Self::paste_picture))
+            // ? in an empty box lists the keys; otherwise it is typed.
+            .on_action(cx.listener(|this, _: &KeysOrType, window, cx| {
+                if !this.composer_empty {
+                    return cx.propagate();
+                }
+                this.show_keys(window, cx);
+            }))
             // Ctrl+Enter sends now what Enter would queue for the next step.
             // With nothing running it stays the new line it always was.
             .on_action(cx.listener(|this, _: &SendNow, window, cx| {
@@ -768,7 +804,12 @@ impl Chat {
         .border_color(cx.theme().border)
         .bg(cx.theme().secondary.opacity(0.4))
         .px_2()
-        .py_1();
+        .py_1()
+        .relative()
+        .children(
+            self.ring(crate::ui::keys::Region::Composer, cx)
+                .map(|ring| ring.rounded(cx.theme().radius)),
+        );
         // Narrow, the text takes the whole width and the controls go under
         // it, rather than the text being squeezed to a few words a line.
         let frame = if compact {
@@ -790,5 +831,42 @@ impl Chat {
             .children(self.accepted_row(cx))
             .child(frame)
             .children(self.completion_list(cx))
+    }
+}
+
+/// What a key adds to a message when typed outside any text box: its
+/// character, if it has one that shows, and no shortcut modifier.
+fn typed(keystroke: &Keystroke) -> Option<&str> {
+    let held = keystroke.modifiers;
+    if held.control || held.platform || held.function {
+        return None;
+    }
+    // Space and Enter press buttons, which must not type as well.
+    keystroke
+        .key_char
+        .as_deref()
+        .filter(|text| text.chars().any(|c| !c.is_whitespace() && !c.is_control()))
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
+    // would shadow the built-in attribute.
+    use super::typed;
+    use gpui::Keystroke;
+
+    #[test]
+    fn a_character_typed_outside_a_box_is_kept_and_a_shortcut_is_not() {
+        let key = |source| Keystroke::parse(source).unwrap_or_default();
+        assert_eq!(typed(&key("x->x")), Some("x"));
+        assert_eq!(typed(&key("shift-x->X")), Some("X"));
+        assert_eq!(typed(&key("ctrl-x->x")), None);
+        assert_eq!(typed(&key("f5")), None);
+        let space = Keystroke {
+            key: "space".into(),
+            key_char: Some(" ".into()),
+            ..Default::default()
+        };
+        assert_eq!(typed(&space), None);
     }
 }

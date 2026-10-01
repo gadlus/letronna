@@ -1,7 +1,8 @@
 //! What can be done with a turn once it is there: copy it, change your
 //! message and ask again, ask the same again, go back to it, carry on from
 //! it in a copy of the session, or have everything up to it summarized.
-//! Each turn offers these in a row of small buttons and on right-click.
+//! Each turn offers these in a row of small buttons and on right-click, and
+//! to the keyboard once Alt+Up or Alt+Down has stepped to it.
 //!
 //! Everything works by place in the session. Going back is saved as a
 //! rewind record the store appends (`Conversation::rewind`), so the terminal
@@ -15,6 +16,20 @@ use gpui_component::notification::Notification;
 use gpui_component::{button::ButtonVariant, dialog::DialogButtonProps};
 use letronna_core::history;
 use std::{cell::Cell, rc::Rc};
+
+actions!(
+    turn,
+    [
+        PreviousTurn,
+        NextTurn,
+        CopyTurn,
+        EditTurn,
+        RetryTurn,
+        RewindTurn,
+        ForkTurn,
+        TurnMenu
+    ]
+);
 
 /// A turn's place in its session: your message on its own, or everything
 /// the model did in reply to it.
@@ -49,6 +64,15 @@ impl Span {
 
 /// An action on a turn, as the menu and the buttons both call it.
 type Act = fn(&mut Chat, Span, &mut Window, &mut Context<Chat>);
+
+/// A place Alt+Up and Alt+Down stop at.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Stop {
+    /// A turn with a menu, by its first message.
+    Turn(usize),
+    /// The question waiting on its card, at the end.
+    Question,
+}
 
 impl Chat {
     fn open_messages(&self) -> &[Message] {
@@ -556,6 +580,177 @@ impl Chat {
         }
     }
 
+    /// Where Alt+Up and Alt+Down stop in the session on screen, oldest
+    /// first. Read from its turns rather than from what is drawn, as the
+    /// list draws only the turns on screen.
+    pub(crate) fn stops(&self) -> Vec<Stop> {
+        let conversation = &self.store.conversations[self.store.active];
+        let streaming_here = self.busy && self.streaming_id == Some(conversation.id);
+        let asking = streaming_here && self.question_options().is_some();
+        stops(&self.turns, &conversation.messages, streaming_here, asking)
+    }
+
+    /// Step from `from` to the stop before, or with `down` the one after;
+    /// from outside the stops, to the newest.
+    pub(crate) fn step_turn(
+        &mut self,
+        from: Option<Stop>,
+        down: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.page != Page::Chat
+            || !self.transcript_shown()
+            || self.settings_open
+            || window.has_active_dialog(cx)
+        {
+            return;
+        }
+        let stops = self.stops();
+        let at = from.and_then(|from| stops.iter().position(|&stop| stop == from));
+        let Some(next) = step_stop(stops.len(), at, down) else {
+            return;
+        };
+        self.go_to_stop(stops[next], true, window);
+        self.region = Some(crate::ui::keys::Region::Transcript);
+        cx.notify();
+    }
+
+    /// Give `stop` the keys, and with `reveal` scroll a turn into sight. A
+    /// turn's focus lives only while the list draws it, so the transcript
+    /// holds the keys until `turn_row` hands them over at the next draw.
+    pub(crate) fn go_to_stop(&mut self, stop: Stop, reveal: bool, window: &mut Window) {
+        match stop {
+            Stop::Turn(first) => {
+                let session = self.store.conversations[self.store.active].id;
+                window.focus(&self.transcript_focus);
+                self.focus_turn = Some((session, first));
+                // Held there as a search hit is, until scrolled by hand.
+                if reveal {
+                    self.following = false;
+                    self.reveal = Some((session, first));
+                    self.revealed = None;
+                    self.hit_at = None;
+                }
+            }
+            // Always brought into sight: the card is at the end, where the
+            // newest is, and out of sight it could not be answered.
+            Stop::Question => {
+                window.focus(&self.question_focus);
+                self.follow();
+            }
+        }
+    }
+
+    /// `turn` answering its keys: C copies, E edits, R retries, W rewinds,
+    /// F forks and Enter opens its menu; Alt+Up and Alt+Down step from it.
+    pub(crate) fn turn_keys(
+        &self,
+        turn: Stateful<Div>,
+        span: Span,
+        focus: FocusHandle,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let here = Some(Stop::Turn(span.first));
+        turn.key_context("Turn")
+            .on_action(cx.listener(move |this, _: &PreviousTurn, window, cx| {
+                this.step_turn(here, false, window, cx)
+            }))
+            .on_action(cx.listener(move |this, _: &NextTurn, window, cx| {
+                this.step_turn(here, true, window, cx)
+            }))
+            .on_action(Self::turn_key::<CopyTurn>(
+                &focus,
+                span,
+                Chat::copy_turn,
+                cx,
+            ))
+            .on_action(Self::turn_key::<EditTurn>(
+                &focus,
+                span,
+                Chat::edit_turn,
+                cx,
+            ))
+            .on_action(Self::turn_key::<RetryTurn>(
+                &focus,
+                span,
+                Chat::retry_turn,
+                cx,
+            ))
+            .on_action(Self::turn_key::<RewindTurn>(
+                &focus,
+                span,
+                Chat::rewind_turn,
+                cx,
+            ))
+            .on_action(Self::turn_key::<ForkTurn>(
+                &focus,
+                span,
+                Chat::fork_turn,
+                cx,
+            ))
+            .on_action(Self::turn_key::<TurnMenu>(
+                &focus,
+                span,
+                Chat::open_turn_menu,
+                cx,
+            ))
+    }
+
+    /// A turn's key, which acts only while the turn itself has the focus:
+    /// in the box your message is changed in, the key is typed instead.
+    fn turn_key<A: Action>(
+        focus: &FocusHandle,
+        span: Span,
+        act: Act,
+        cx: &Context<Self>,
+    ) -> impl Fn(&A, &mut Window, &mut App) + 'static {
+        let focus = focus.clone();
+        cx.listener(move |this, _: &A, window, cx| {
+            if !focus.is_focused(window) {
+                return cx.propagate();
+            }
+            act(this, span, window, cx)
+        })
+    }
+
+    /// The turn's menu, opened from the keyboard under its buttons, with
+    /// the keys in it.
+    fn open_turn_menu(&mut self, span: Span, window: &mut Window, cx: &mut Context<Self>) {
+        // turn_key calls this only while the turn has the focus, and
+        // turn_focus's keyed state can be read only while drawing: from a
+        // key it aborted the window.
+        let Some(turn) = window.focused(cx) else {
+            return;
+        };
+        let build = self.turn_menu(span, cx);
+        let menu = PopupMenu::build(window, cx, build);
+        menu.focus_handle(cx).focus(window);
+        cx.subscribe_in(
+            &menu,
+            window,
+            move |this, menu, _: &DismissEvent, window, cx| {
+                // Escape gives the keys back to the turn; an item that moved
+                // them, to the composer or a dialog, keeps them there.
+                if menu.focus_handle(cx).contains_focused(window, cx) {
+                    window.focus(&turn);
+                }
+                this.turn_menu = None;
+                cx.notify();
+            },
+        )
+        .detach();
+        // The menu closes only on Escape, a click outside or an item, so
+        // F6, Alt+Up or Ctrl+L left it hung open under the turn, for the
+        // same place in whichever session was opened next.
+        let left = cx.on_focus_out(&menu.focus_handle(cx), window, |this, _, _, cx| {
+            this.turn_menu = None;
+            cx.notify();
+        });
+        self.turn_menu = Some((span.first, menu, left));
+        cx.notify();
+    }
+
     /// What lets a turn be picked out with Tab, kept per session and place
     /// so it lives as long as the turn is drawn.
     pub(crate) fn turn_focus(
@@ -576,6 +771,29 @@ impl Chat {
     /// turns get one quiet button with the same actions in a menu, so an
     /// earlier turn still shows that it has them.
     pub(crate) fn turn_bar(&self, span: Span, shown: bool, cx: &Context<Self>) -> AnyElement {
+        let bar = self.bar_buttons(span, shown, cx);
+        let Some((_, menu, _)) = self
+            .turn_menu
+            .as_ref()
+            .filter(|(first, _, _)| *first == span.first)
+        else {
+            return bar;
+        };
+        v_flex()
+            .child(bar)
+            .child(
+                deferred(
+                    anchored()
+                        .snap_to_window_with_margin(px(8.))
+                        .child(menu.clone()),
+                )
+                .with_priority(1),
+            )
+            .into_any_element()
+    }
+
+    /// The buttons, or the one quiet button, without a menu hung from them.
+    fn bar_buttons(&self, span: Span, shown: bool, cx: &Context<Self>) -> AnyElement {
         if !shown {
             // Your prompt's sits at the right end of its label.
             let corner = if span.yours {
@@ -698,6 +916,34 @@ pub(crate) fn shows_bar(span: Span, messages: usize, streaming: bool, focused: b
     focused || (!streaming && span.last + 1 == messages)
 }
 
+/// Where Alt+Up and Alt+Down stop among `turns`: each with a menu, which
+/// leaves out a notice and, while `streaming`, the turn the reply is coming
+/// in to; then, while `asking`, the question on that turn's card.
+fn stops(turns: &[Span], messages: &[Message], streaming: bool, asking: bool) -> Vec<Stop> {
+    let live = turns.len().checked_sub(1).filter(|_| streaming);
+    let mut stops: Vec<Stop> = turns
+        .iter()
+        .enumerate()
+        .filter(|&(n, span)| live != Some(n) && !messages.get(span.first).is_some_and(|m| m.notice))
+        .map(|(_, span)| Stop::Turn(span.first))
+        .collect();
+    if asking {
+        stops.push(Stop::Question);
+    }
+    stops
+}
+
+/// Where Alt+Up, or with `down` Alt+Down, goes among `count` stops from
+/// the one `at`: no further than the ends, and from none to the newest.
+fn step_stop(count: usize, at: Option<usize>, down: bool) -> Option<usize> {
+    let last = count.checked_sub(1)?;
+    Some(match at {
+        None => last,
+        Some(at) if down => (at + 1).min(last),
+        Some(at) => at.saturating_sub(1),
+    })
+}
+
 /// The session's turns, one per prompt as in Claude Code: your message on
 /// its own, then everything the model did in reply to it. A reply still
 /// coming in to your message is a turn already, with nothing in it yet.
@@ -741,7 +987,7 @@ fn message_count(n: usize) -> String {
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
-    use super::{Span, message_count, shows_bar, turns};
+    use super::{Span, Stop, message_count, shows_bar, step_stop, stops, turns};
     use letronna_core::chat::Message;
 
     #[test]
@@ -781,6 +1027,52 @@ mod tests {
         assert!(shows_bar(prompt, 5, true, true));
         // An earlier reply stays bare until it is picked.
         assert!(!shows_bar(turn(0, 3, false), 9, false, false));
+    }
+
+    #[test]
+    fn alt_steps_stop_at_the_ends_and_start_from_the_newest() {
+        assert_eq!(step_stop(4, None, false), Some(3));
+        assert_eq!(step_stop(4, None, true), Some(3));
+        assert_eq!(step_stop(4, Some(2), false), Some(1));
+        assert_eq!(step_stop(4, Some(0), false), Some(0));
+        assert_eq!(step_stop(4, Some(2), true), Some(3));
+        assert_eq!(step_stop(4, Some(3), true), Some(3));
+        assert_eq!(step_stop(0, None, false), None);
+    }
+
+    #[test]
+    fn every_turn_with_a_menu_is_a_stop_drawn_or_not_and_the_question_last() {
+        let said = |role: &str, notice| Message {
+            role: role.into(),
+            notice,
+            ..Default::default()
+        };
+        let session = [
+            said("user", false),
+            said("assistant", false),
+            said("user", true),
+            said("assistant", false),
+            said("user", false),
+        ];
+        // The notice is no place to go back to.
+        let finished = turns(&session, false);
+        assert_eq!(
+            stops(&finished, &session, false, false),
+            [Stop::Turn(0), Stop::Turn(1), Stop::Turn(3), Stop::Turn(4)]
+        );
+        // The turn a reply is coming in to is not one yet; its card is.
+        let replying = turns(&session, true);
+        assert_eq!(
+            stops(&replying, &session, true, true),
+            [
+                Stop::Turn(0),
+                Stop::Turn(1),
+                Stop::Turn(3),
+                Stop::Turn(4),
+                Stop::Question
+            ]
+        );
+        assert!(stops(&[], &[], false, false).is_empty());
     }
 
     #[test]

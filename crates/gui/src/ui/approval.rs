@@ -3,10 +3,40 @@
 //! call gets a card of its own under the helper's name.
 
 use crate::prelude::*;
+use crate::ui::actions::{NextTurn, PreviousTurn, Stop};
 use letronna_core::approvals::Decision;
 use letronna_core::{gate, tools};
 
+/// Picks a question card's answer by its place, for the letter keys.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = question, no_json)]
+pub(crate) struct PickOption(pub(crate) usize);
+
 impl Chat {
+    /// The answers offered by the question waiting on its card, if one is.
+    pub(crate) fn question_options(&self) -> Option<Vec<String>> {
+        let turn = self.turn.as_ref()?;
+        let (call, waiting) = front_call(turn, self.asking.as_deref())?;
+        if !waiting || call.name != tools::ASK_USER {
+            return None;
+        }
+        let args = tools::parse_args_for(&call.name, &call.arguments).unwrap_or_default();
+        Some(options_in(&args))
+    }
+
+    /// Answer the question waiting with its answer at `n`, if it has one.
+    fn pick_option(&mut self, n: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pick) = self
+            .question_options()
+            .and_then(|options| options.into_iter().nth(n))
+        else {
+            return;
+        };
+        // What had the keys is about to go with the card.
+        self.focus_composer(window, cx);
+        self.resolve_call(Verdict::Answer(pick), cx);
+    }
+
     pub(crate) fn submit_answer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.answer.read(cx).value().trim().to_owned();
         if text.is_empty() {
@@ -81,27 +111,41 @@ impl Chat {
 
         if call.name == tools::ASK_USER {
             let question = args["question"].as_str().unwrap_or_default().to_owned();
-            let options: Vec<String> = args["options"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str())
-                        .map(str::to_owned)
-                        .collect()
-                })
-                .unwrap_or_default();
-            let mut chips = h_flex().flex_wrap().gap_2();
-            for (i, option) in options.into_iter().enumerate() {
+            // Its own focus, beside the answer box rather than round it, so
+            // the letters pick here and type there.
+            let mut chips = h_flex()
+                .id("question")
+                .track_focus(&self.question_focus)
+                .key_context("Question")
+                .on_action(cx.listener(|this, PickOption(n): &PickOption, window, cx| {
+                    this.pick_option(*n, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &PreviousTurn, window, cx| {
+                    this.step_turn(Some(Stop::Question), false, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &NextTurn, window, cx| {
+                    this.step_turn(Some(Stop::Question), true, window, cx)
+                }))
+                .flex_wrap()
+                .gap_2();
+            for (i, option) in options_in(&args).into_iter().enumerate() {
                 let pick = option.clone();
-                chips = chips.child(
-                    Button::new(("option", i))
-                        .framed(cx)
-                        .small()
-                        .label(option)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.resolve_call(Verdict::Answer(pick.clone()), cx)
-                        })),
-                );
+                let mut chip = Button::new(("option", i)).framed(cx).small();
+                // Its letter, while the keys are on the answers to press it.
+                if let Some(letter) =
+                    option_letter(i).filter(|_| self.question_focus.is_focused(window))
+                {
+                    chip = chip.child(
+                        Kbd::new(Keystroke {
+                            key: letter.to_string(),
+                            ..Default::default()
+                        })
+                        .text_xs(),
+                    );
+                }
+                chips = chips.child(chip.label(option).on_click(cx.listener(
+                    move |this, _, _, cx| this.resolve_call(Verdict::Answer(pick.clone()), cx),
+                )));
             }
             return Some(
                 card.child(div().text_sm().child(question))
@@ -393,6 +437,27 @@ impl Chat {
     }
 }
 
+/// The answers an `ask_user` call offers, in order.
+fn options_in(args: &serde_json::Value) -> Vec<String> {
+    args["options"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The letter that picks the answer at `n`, for the first 26.
+fn option_letter(n: usize) -> Option<char> {
+    u8::try_from(n)
+        .ok()
+        .filter(|&n| n < 26)
+        .map(|n| char::from(b'a' + n))
+}
+
 /// The box an approval card sits in.
 fn frame(cx: &App) -> Div {
     v_flex()
@@ -450,4 +515,21 @@ fn permission(
                 cx,
             )),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
+    // would shadow the built-in attribute.
+    use super::{option_letter, options_in};
+
+    #[test]
+    fn a_question_offers_its_answers_in_order_each_under_a_letter() {
+        let args = serde_json::json!({"question": "Which?", "options": ["Red", 3, "Blue"]});
+        assert_eq!(options_in(&args), ["Red", "Blue"]);
+        assert_eq!(options_in(&serde_json::json!({})), Vec::<String>::new());
+        assert_eq!(option_letter(0), Some('a'));
+        assert_eq!(option_letter(25), Some('z'));
+        assert_eq!(option_letter(26), None);
+    }
 }

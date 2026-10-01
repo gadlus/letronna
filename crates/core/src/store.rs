@@ -1373,7 +1373,26 @@ fn cut(bytes: &[u8], to: usize) -> String {
                 }
                 false
             }
-            Kept::Summary(upto, _) => *upto <= to,
+            Kept::Summary(upto, _) if *upto <= to => true,
+            // The call that made one the user asked for was paid for too.
+            Kept::Summary(_, line) => {
+                if let Ok(Record::Summary {
+                    call: Some(call), ..
+                }) = serde_json::from_str::<Record>(line)
+                {
+                    let mut line = String::new();
+                    let made = Message {
+                        role: "summary".into(),
+                        model: call.model,
+                        at: call.at,
+                        summary_usage: Some(call.usage),
+                        ..Default::default()
+                    };
+                    push(&mut line, &Record::Paid(made));
+                    paid.push(line);
+                }
+                false
+            }
             Kept::Paid(_) => true,
         });
     }

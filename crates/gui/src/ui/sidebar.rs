@@ -64,10 +64,12 @@ impl Chat {
             .child(label)
     }
 
+    /// A session row; `picked` rings it as the one the sidebar's keys are on.
     pub(crate) fn session_row(
         &self,
         index: usize,
         now: u64,
+        picked: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let c = &self.store.conversations[index];
@@ -75,6 +77,7 @@ impl Chat {
         let menu = self.session_menu(index, cx);
         h_flex()
             .id(("session", index))
+            .relative()
             .h(px(26.))
             .px_2()
             .gap_2()
@@ -140,6 +143,16 @@ impl Chat {
                     .child(age_label(c.updated, now))
                     .into_any_element()
             })
+            .when(picked, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .rounded(cx.theme().radius)
+                        .border_1()
+                        .border_color(cx.theme().ring),
+                )
+            })
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 if event.modifiers().shift {
                     this.store.conversations[index].pinned ^= true;
@@ -157,11 +170,12 @@ impl Chat {
             .context_menu(menu)
     }
 
-    pub(crate) fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let now = backend::now();
+    /// The sessions the search and the filter let through, by index, the
+    /// newest first.
+    fn visible_sessions(&self, cx: &App) -> Vec<usize> {
         let query = self.search.read(cx).value().to_lowercase();
         let filter = self.session_filter();
-        let visible: Vec<usize> = (0..self.store.conversations.len())
+        (0..self.store.conversations.len())
             .rev()
             .filter(|&i| {
                 query.is_empty()
@@ -171,7 +185,85 @@ impl Chat {
                         .contains(&query)
             })
             .filter(|&i| filter.is_none_or(|f| passes(self.session_state(i), f)))
-            .collect();
+            .collect()
+    }
+
+    /// The sessions the sidebar lists, by index, in the order it draws
+    /// them: pinned first, then by project or the newest first.
+    fn listed_sessions(&self, cx: &App) -> Vec<usize> {
+        drawn_order(
+            &self.store.conversations,
+            self.visible_sessions(cx),
+            self.store.settings.group_by_project,
+        )
+    }
+
+    /// Move the sidebar's keys to the session above, or with `down` below.
+    fn pick_session(&mut self, down: bool, cx: &mut Context<Self>) {
+        let listed = self.listed_sessions(cx);
+        let at = self.picked.and_then(|id| self.store.index_of(id));
+        self.picked = move_in(&listed, at, down).map(|index| self.store.conversations[index].id);
+        cx.notify();
+    }
+
+    /// Open the session the sidebar's keys are on. The keys stay there, as
+    /// on a search hit, for the next.
+    fn open_picked_session(&mut self, cx: &mut Context<Self>) {
+        let Some(index) = self.picked_session(cx) else {
+            return;
+        };
+        self.store.active = index;
+        self.error = None;
+        self.page = Page::Chat;
+        self.follow();
+        self.save();
+        cx.notify();
+    }
+
+    /// The session the sidebar's keys are on, if it is still listed.
+    fn picked_session(&self, cx: &App) -> Option<usize> {
+        self.picked
+            .and_then(|id| self.store.index_of(id))
+            .filter(|index| self.listed_sessions(cx).contains(index))
+    }
+
+    /// A sidebar key, which acts only while the sidebar itself has the
+    /// focus: in its search box, the key is typed instead.
+    fn session_key<A: Action>(
+        act: fn(&mut Chat, usize, &mut Window, &mut Context<Chat>),
+        cx: &Context<Self>,
+    ) -> impl Fn(&A, &mut Window, &mut App) + 'static {
+        cx.listener(move |this, _: &A, window, cx| {
+            if !this.sidebar_focus.is_focused(window) {
+                return cx.propagate();
+            }
+            if let Some(index) = this.picked_session(cx) {
+                act(this, index, window, cx);
+            }
+        })
+    }
+
+    /// A sidebar key that moves its keys, which acts only while the sidebar
+    /// itself has the focus.
+    fn session_move<A: Action>(
+        act: fn(&mut Chat, &mut Context<Chat>),
+        cx: &Context<Self>,
+    ) -> impl Fn(&A, &mut Window, &mut App) + 'static {
+        cx.listener(move |this, _: &A, window, cx| {
+            if !this.sidebar_focus.is_focused(window) {
+                return cx.propagate();
+            }
+            act(this, cx)
+        })
+    }
+
+    pub(crate) fn sidebar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let now = backend::now();
+        let visible = self.visible_sessions(cx);
+        let keyed = self
+            .picked
+            .and_then(|id| self.store.index_of(id))
+            .filter(|_| self.sidebar_focus.is_focused(window));
         let pinned: Vec<usize> = visible
             .iter()
             .copied()
@@ -184,7 +276,7 @@ impl Chat {
             .collect();
         let mut sessions = v_flex().gap_0p5();
         for &i in &pinned {
-            sessions = sessions.child(self.session_row(i, now, cx));
+            sessions = sessions.child(self.session_row(i, now, keyed == Some(i), cx));
         }
         if self.store.settings.group_by_project {
             for (workspace, indices) in group_by_project(&self.store.conversations, &not_pinned) {
@@ -199,7 +291,7 @@ impl Chat {
                         .child(project_label(workspace.as_deref())),
                 );
                 for i in indices {
-                    sessions = sessions.child(self.session_row(i, now, cx));
+                    sessions = sessions.child(self.session_row(i, now, keyed == Some(i), cx));
                 }
             }
         } else {
@@ -219,7 +311,7 @@ impl Chat {
                             .child(b),
                     );
                 }
-                sessions = sessions.child(self.session_row(i, now, cx));
+                sessions = sessions.child(self.session_row(i, now, keyed == Some(i), cx));
             }
         }
         if visible.is_empty() {
@@ -234,7 +326,36 @@ impl Chat {
         }
 
         v_flex()
+            .id("sidebar")
+            .track_focus(&self.sidebar_focus)
             .key_context("Sessions")
+            // Only F6 gives the sidebar itself the keys; a click leaves
+            // them where they were, or with what was clicked.
+            .on_any_mouse_down(|_, window, _| window.prevent_default())
+            .on_action(Self::session_move::<sessions::PreviousSession>(
+                |this, cx| this.pick_session(false, cx),
+                cx,
+            ))
+            .on_action(Self::session_move::<sessions::NextSession>(
+                |this, cx| this.pick_session(true, cx),
+                cx,
+            ))
+            .on_action(Self::session_move::<sessions::OpenSession>(
+                Chat::open_picked_session,
+                cx,
+            ))
+            .on_action(Self::session_key::<sessions::PinSession>(
+                Chat::toggle_pin,
+                cx,
+            ))
+            .on_action(Self::session_key::<sessions::RenameSession>(
+                Chat::rename_session,
+                cx,
+            ))
+            .on_action(Self::session_key::<sessions::DeleteSession>(
+                Chat::delete_session,
+                cx,
+            ))
             .on_action(cx.listener(|this, _: &sessions::FilterNeedsYou, _, cx| {
                 this.toggle_session_filter(SessionFilter::NeedsYou, cx);
             }))
@@ -344,5 +465,82 @@ impl Chat {
                     .children(self.message_hits(cx)),
             )
             .children(self.grain(&self.grains.sidebar))
+            .children(self.ring(crate::ui::keys::Region::Sidebar, cx))
+    }
+}
+
+/// The `visible` sessions in the order the sidebar draws them: pinned
+/// first, then by project with `by_project`, else as they come.
+fn drawn_order(
+    conversations: &[Conversation],
+    visible: Vec<usize>,
+    by_project: bool,
+) -> Vec<usize> {
+    let (mut listed, not_pinned): (Vec<usize>, Vec<usize>) =
+        visible.into_iter().partition(|&i| conversations[i].pinned);
+    if by_project {
+        let groups = group_by_project(conversations, &not_pinned);
+        listed.extend(groups.into_iter().flat_map(|(_, indices)| indices));
+    } else {
+        listed.extend(not_pinned);
+    }
+    listed
+}
+
+/// The session after `picked` in `listed`, or with `down` false the one
+/// before, no further than the ends; from none, the first.
+fn move_in(listed: &[usize], picked: Option<usize>, down: bool) -> Option<usize> {
+    let last = listed.len().checked_sub(1)?;
+    let at = picked.and_then(|index| listed.iter().position(|&i| i == index));
+    let next = match at {
+        None => 0,
+        Some(at) if down => (at + 1).min(last),
+        Some(at) => at.saturating_sub(1),
+    };
+    Some(listed[next])
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
+    // would shadow the built-in attribute.
+    use super::{drawn_order, move_in};
+    use letronna_core::store::Conversation;
+    use std::path::PathBuf;
+
+    #[test]
+    fn the_sidebar_keys_move_in_its_order_and_stop_at_the_ends() {
+        // Listed newest first, so index 7 is at the top.
+        let listed = [7, 2, 5];
+        assert_eq!(move_in(&listed, Some(7), true), Some(2));
+        assert_eq!(move_in(&listed, Some(2), false), Some(7));
+        assert_eq!(move_in(&listed, Some(7), false), Some(7));
+        assert_eq!(move_in(&listed, Some(5), true), Some(5));
+        // From a session the search has hidden, or none, to the top.
+        assert_eq!(move_in(&listed, Some(9), true), Some(7));
+        assert_eq!(move_in(&listed, None, false), Some(7));
+        assert_eq!(move_in(&[], None, true), None);
+    }
+
+    #[test]
+    fn the_sidebar_keys_go_in_the_order_it_draws_pinned_first() {
+        let session = |pinned, workspace: Option<&str>| Conversation {
+            pinned,
+            workspace: workspace.map(PathBuf::from),
+            ..Default::default()
+        };
+        let conversations = [
+            session(false, Some("/code/a")),
+            session(false, Some("/code/b")),
+            session(true, Some("/code/b")),
+            session(false, Some("/code/a")),
+        ];
+        // As the sidebar has them, newest first.
+        let visible = vec![3, 2, 1, 0];
+        assert_eq!(
+            drawn_order(&conversations, visible.clone(), false),
+            [2, 3, 1, 0]
+        );
+        assert_eq!(drawn_order(&conversations, visible, true), [2, 3, 0, 1]);
     }
 }

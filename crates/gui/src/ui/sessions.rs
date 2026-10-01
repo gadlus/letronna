@@ -9,7 +9,13 @@ actions!(
         FilterWorking,
         FilterUnseen,
         FilterPinned,
-        ToggleGrouping
+        ToggleGrouping,
+        PreviousSession,
+        NextSession,
+        OpenSession,
+        PinSession,
+        RenameSession,
+        DeleteSession
     ]
 );
 

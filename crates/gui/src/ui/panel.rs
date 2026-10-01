@@ -308,10 +308,14 @@ impl Chat {
                     .on_click(cx.listener(|this, _, window, cx| this.hide_panel(window, cx))),
             );
         let panel = v_flex()
+            .track_focus(&self.panel_focus)
+            // As on the sidebar: a click leaves the keys where they were.
+            .on_any_mouse_down(|_, window, _| window.prevent_default())
             .bg(cx.theme().background)
             .border_color(cx.theme().border)
             .child(bar)
-            .child(self.tab_body(open, window, cx));
+            .child(self.tab_body(open, window, cx))
+            .children(self.ring(crate::ui::keys::Region::Panel, cx));
         Some(match width {
             Some(width) => panel
                 .relative()
