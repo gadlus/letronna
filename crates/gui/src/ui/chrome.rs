@@ -458,9 +458,10 @@ impl Chat {
         connection.workspace = self.store.conversations[ix].workspace.clone();
         let session = self.store.conversations[ix].id;
         let messages = self.store.conversations[ix].messages.clone();
+        let floor = self.store.conversations[ix].floor();
         let added = cx
             .background_executor()
-            .spawn(async move { backend::context_report(&connection, &messages) });
+            .spawn(async move { backend::context_report(&connection, &messages, floor) });
         cx.spawn(async move |this, cx| {
             let report = added.await;
             let _ = this.update(cx, |this, cx| {

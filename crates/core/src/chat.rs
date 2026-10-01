@@ -558,7 +558,7 @@ impl ContextParts {
 /// conversation from the window a request this size would open at. The
 /// summary of what the window dropped is left out, as making one can take
 /// a model call.
-fn context_parts(connection: &Connection, messages: &[Message]) -> ContextParts {
+fn context_parts(connection: &Connection, messages: &[Message], floor: usize) -> ContextParts {
     let prompt = system_prompt(connection, None);
     let text = prompt.text.as_str();
     let part = |range: &Range<usize>| tokens(&text[range.clone()]) as u64;
@@ -589,7 +589,7 @@ fn context_parts(connection: &Connection, messages: &[Message]) -> ContextParts 
         (0, 0)
     };
     let request_budget = budget(connection, crate::store::context_cap());
-    let start = window_start(messages, &request_budget);
+    let start = window_from(messages, &request_budget, floor);
     let sums = token_sums(&messages[start..], request_budget.tool_chars);
     let conversation = *sums.last().unwrap_or(&0) as u64;
     ContextParts {
@@ -616,8 +616,13 @@ pub struct ContextReport {
 }
 
 /// `ContextReport` for `connection`'s session, holding `messages`.
-pub fn context_report(connection: &Connection, messages: &[Message]) -> ContextReport {
-    let parts = context_parts(connection, messages);
+/// `floor` is where the session's own summary ends, if the user asked for one.
+pub fn context_report(
+    connection: &Connection,
+    messages: &[Message],
+    floor: usize,
+) -> ContextReport {
+    let parts = context_parts(connection, messages, floor);
     let last = messages
         .iter()
         .rev()
@@ -4264,7 +4269,7 @@ mod tests {
             ..connection()
         };
         let messages = [said("user", "hello"), said("assistant", "hi there")];
-        let parts = context_parts(&c, &messages);
+        let parts = context_parts(&c, &messages, 0);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
         std::fs::remove_dir_all(&dir).unwrap();
 
@@ -4290,12 +4295,12 @@ mod tests {
             tools: true,
             ..connection()
         };
-        let plain = context_parts(&c, &[]);
+        let plain = context_parts(&c, &[], 0);
         let settings = serde_json::json!({"endpoint": "", "model": "m", "style": "concise"});
         std::fs::write(dir.join("settings.json"), settings.to_string()).unwrap();
         let prompt = system_prompt(&c, None);
         let sent = body(&c, &[], None, None)["messages"][0]["content"].clone();
-        let styled = context_parts(&c, &[]);
+        let styled = context_parts(&c, &[], 0);
         let memory = crate::memory::context(&c);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
         std::fs::remove_dir_all(&dir).unwrap();
@@ -4327,7 +4332,7 @@ mod tests {
                 ..said("assistant", "answer")
             },
         ];
-        let report = context_report(&connection(), &messages);
+        let report = context_report(&connection(), &messages, 0);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
         std::fs::remove_dir_all(&dir).unwrap();
 
@@ -4341,7 +4346,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let dir = empty_data_dir("estimate");
         unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
-        let report = context_report(&connection(), &[said("user", "hello")]);
+        let report = context_report(&connection(), &[said("user", "hello")], 0);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
         std::fs::remove_dir_all(&dir).unwrap();
 

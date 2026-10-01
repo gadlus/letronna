@@ -76,6 +76,7 @@ fn scratch() -> Result<Scratch, String> {
     static MADE: AtomicU64 = AtomicU64::new(0);
     let base = std::fs::canonicalize(std::env::temp_dir())
         .map_err(|e| format!("Cannot find the temp folder: {e}"))?;
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
