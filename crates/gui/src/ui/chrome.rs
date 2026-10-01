@@ -439,9 +439,9 @@ impl Chat {
     }
 
     /// Add up what fills the active session's context afresh, for the
-    /// popover to show. Cheap enough -- reading memory and skills off disk,
-    /// listing the built-in tools -- to do on the window's own thread, the
-    /// same cost a turn already pays before it can send.
+    /// popover to show. Reading memory and skills off disk and listing the
+    /// tools is done off the window's thread, so a slow disk or a big
+    /// project cannot stall a frame; the popover opens when it is done.
     pub(crate) fn open_context_popover(&mut self, cx: &mut Context<Self>) {
         if self.context_report.is_some() {
             return;
@@ -456,9 +456,22 @@ impl Chat {
             }
         };
         connection.workspace = self.store.conversations[ix].workspace.clone();
-        let messages = &self.store.conversations[ix].messages;
-        self.context_report = Some(backend::context_report(&connection, messages));
-        cx.notify();
+        let session = self.store.conversations[ix].id;
+        let messages = self.store.conversations[ix].messages.clone();
+        let added = cx
+            .background_executor()
+            .spawn(async move { backend::context_report(&connection, &messages) });
+        cx.spawn(async move |this, cx| {
+            let report = added.await;
+            let _ = this.update(cx, |this, cx| {
+                // The user may have moved to another session meanwhile.
+                if this.store.conversations[this.store.active].id == session {
+                    this.context_report = Some(report);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 }
 
