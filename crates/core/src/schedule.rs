@@ -44,7 +44,7 @@ use chrono::{DateTime, Datelike, Local, TimeZone, Timelike};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, TryLockError};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -836,16 +836,22 @@ fn report_cut_off(shared: &Shared) {
         if path.extension().is_none_or(|ext| ext != "json") {
             continue;
         }
-        let Ok(file) = File::open(&path) else {
+        let Ok(mut file) = File::open(&path) else {
             continue;
         };
         if file.try_lock().is_err() {
             continue;
         }
         // Gone by now means its run finished as this looked.
-        let Ok(bytes) = std::fs::read(&path) else {
+        if !path.exists() {
             continue;
-        };
+        }
+        // Through the handle that holds the lock: Windows keeps a locked
+        // file's bytes from every other handle, this process's included.
+        let mut bytes = Vec::new();
+        if file.read_to_end(&mut bytes).is_err() {
+            continue;
+        }
         let _ = std::fs::remove_file(&path);
         let Ok(marker) = serde_json::from_slice::<Marker>(&bytes) else {
             continue;
