@@ -17,15 +17,17 @@
 //! runs it again unchanged, and a run Letronna closed on, known by a lock
 //! nobody holds, can be offered for resuming.
 
-use super::board::{Board, RunState, RunView};
+use super::board::{AgentState, AgentTranscript, Board, RunState, RunView};
 use super::host::{self, End};
 use super::journal::{self, Line};
+use super::runlog::{self, Event, LogEntry};
 use super::{BUDGET, Run};
 use crate::agents;
 use crate::budget::{Budget, short};
 use crate::cancel::Cancel;
-use crate::chat::{self, Connection, trim};
+use crate::chat::{self, Connection, Message, trim};
 use crate::inbox::{Notice, When};
+use crate::store::Transcript;
 use crate::tasks::{self, Key, State, Task};
 use crate::tools::{Caller, Tool, ToolContext, one_line};
 use serde::{Deserialize, Serialize};
@@ -48,6 +50,13 @@ const LAUNCH: &str = "launch.json";
 /// What a run's script returned, kept for a report on disk rather than in
 /// memory, which a window left open for days would fill.
 const RETURNED: &str = "result.txt";
+/// Messages of an agent's transcript given to be shown, its task among them:
+/// an agent has at most 50 rounds, each a reply and its tools' results, so
+/// this is most of a long one, and a bound on one that fans out.
+const TRANSCRIPT: usize = 200;
+/// The characters of one shown message kept, its two ends, as a request
+/// keeps of a tool's result: a file read whole is not read on a page.
+const MESSAGE: usize = 8_000;
 /// What the model is told of the tool: the script API, its limits and how a
 /// run is followed, fixed so the tools array stays the same between turns.
 const DESCRIPTION: &str = "Run a JavaScript workflow that starts many helpers, in the background. \
@@ -636,7 +645,7 @@ fn ended(id: u64, key: Key, end: End) {
         let head = format!("workflow {name} \"{}\"", live.title);
         let about = live.about();
         let resume = json!({"resume": name});
-        let (how, state, text) = match end {
+        let (how, state, text, why) = match end {
             End::Returned(value) => {
                 let whole = match value {
                     Value::String(text) => text,
@@ -651,19 +660,29 @@ fn ended(id: u64, key: Key, end: End) {
                 );
                 // Kept whole for a report; without it, the notice's part is all there is.
                 live.returned = std::fs::write(live.dir.join(RETURNED), &whole).is_ok();
-                ("finished", State::Done("finished".into()), Some(text))
+                let state = State::Done("finished".into());
+                ("finished", state, Some(text), String::new())
             }
-            End::Failed(_) if live.stopped => ("stopped", State::Stopped, None),
+            End::Failed(_) if live.stopped => ("stopped", State::Stopped, None, String::new()),
             End::Failed(error) => {
                 let text = format!(
                     "{head} failed: {about}\n{error}\nFinished helpers' answers are kept: \
                      workflow {resume} picks it up."
                 );
-                ("failed", State::Failed(error), Some(text))
+                ("failed", State::Failed(error.clone()), Some(text), error)
             }
-            End::Paused(reason) => ("paused", State::Failed(format!("paused: {reason}")), None),
+            End::Paused(reason) => {
+                let state = State::Failed(format!("paused: {reason}"));
+                ("paused", state, None, reason)
+            }
         };
         live.ended = Some((how, live.started.elapsed().as_secs()));
+        let why = if why.is_empty() {
+            how.to_owned()
+        } else {
+            format!("{how}: {why}")
+        };
+        live.board.note(Event::Ended, None, &why);
         (name, state, text)
     };
     let notice = text.map(|text| Notice {
@@ -785,6 +804,89 @@ pub fn runs(session: u64) -> Vec<RunView> {
 /// Session `session`'s run `name` as it stands now.
 pub fn run(session: u64, name: &str) -> Result<RunView, String> {
     yours(session, name, |live| Ok(live.view()))
+}
+
+/// Agent `number`, from 1, of session `session`'s run `name`, as it is opened:
+/// its transcript so far and its answer once it has one. Both are read from
+/// the run's folder, which its agents write as they go, so it serves a run
+/// still going as well as one that ended.
+pub fn transcript(session: u64, name: &str, number: usize) -> Result<AgentTranscript, String> {
+    let (called, dir) = yours(session, name, |live| {
+        let called = live.board.call(name, &format!("#{number}"))?;
+        Ok((called, live.dir.clone()))
+    })?;
+    let lines = journal::read(&dir.join("journal.jsonl"));
+    let mut answers = journal::answers(&lines);
+    let answer = (called.state.answered())
+        .then(|| answers.remove(&called.key))
+        .flatten()
+        .and_then(|(value, _)| value);
+    // Its key's last start is its own only if it started in this launch or
+    // replays that start's answer: one still queued may share its key with
+    // a start of a launch before that failed.
+    let own = called.began || called.state == AgentState::Replayed;
+    let started = lines.iter().rev().find_map(|line| match line {
+        Line::Started {
+            key, transcript, ..
+        } if *key == called.key => Some(*transcript),
+        _ => None,
+    });
+    let messages = match started {
+        Some(n) if own && n > 0 => {
+            let path = dir.join("agents").join(format!("{n}.jsonl"));
+            Transcript::at(path).map(|kept| kept.conversation.messages)
+        }
+        _ => None,
+    };
+    let (messages, cut) = capped(messages.unwrap_or_default());
+    Ok(AgentTranscript {
+        number,
+        label: called.label,
+        state: called.state,
+        messages,
+        cut,
+        answer,
+    })
+}
+
+/// `messages` as a transcript shows them: the task and the newest ones,
+/// TRANSCRIPT in all, each text cut to its two ends past MESSAGE characters
+/// (a tool call's arguments with them, which then no longer parse); with how
+/// many were left out between.
+fn capped(mut messages: Vec<Message>) -> (Vec<Message>, usize) {
+    let cut = messages.len().saturating_sub(TRANSCRIPT);
+    if cut > 0 {
+        messages.drain(1..=cut);
+    }
+    for message in &mut messages {
+        message.content = trim(&message.content, MESSAGE);
+        message.reasoning = trim(&message.reasoning, MESSAGE);
+        message.args = trim(&message.args, MESSAGE);
+        for call in &mut message.tool_calls {
+            call.arguments = trim(&call.arguments, MESSAGE);
+        }
+    }
+    (messages, cut)
+}
+
+/// Session `session`'s run `name`'s log, oldest first: when each agent
+/// started and how it ended, each pause, resume, skip and retry, and each
+/// launch and end, with why. It is kept in the run's folder, so a run from
+/// before Letronna last opened still has it.
+pub fn run_log(session: u64, name: &str) -> Result<Vec<LogEntry>, String> {
+    let dir = match yours(session, name, |live| Ok(live.dir.clone())) {
+        Ok(dir) => dir,
+        Err(refused) => earlier(session, name).ok_or(refused)?,
+    };
+    Ok(runlog::read(&dir.join(runlog::FILE)))
+}
+
+/// The folder of session `session`'s run `name`, launched before Letronna
+/// last opened.
+fn earlier(session: u64, name: &str) -> Option<PathBuf> {
+    let (_, dir) = super::existing(&folder(), name).ok()?;
+    let saved: Saved = serde_json::from_slice(&std::fs::read(dir.join(LAUNCH)).ok()?).ok()?;
+    (saved.session == session).then_some(dir)
 }
 
 /// Holds session `session`'s run `name`: its running agents finish and
@@ -1527,5 +1629,224 @@ return await agent("Two");
         assert_eq!(view.state, RunState::Ended("stopped".into()));
         let told = inbox::take(session, true);
         assert!(told.iter().all(|notice| notice.from != "workflow wf-1"));
+    }
+
+    /// Waits until agent `number` of session `session`'s run wf-1 has
+    /// `messages` messages, failing rather than hanging.
+    fn transcribed(session: u64, number: usize, messages: usize) -> AgentTranscript {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let opened = transcript(session, "wf-1", number).unwrap();
+            if opened.messages.len() == messages {
+                return opened;
+            }
+            let got = opened.messages.len();
+            assert!(Instant::now() < deadline, "it has {got} messages");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Each entry of `log` as its event, agent number and reason.
+    fn events(log: &[LogEntry]) -> Vec<(Event, Option<usize>, &str)> {
+        let entries = log.iter();
+        let events = entries.map(|entry| (entry.event.clone(), entry.agent, entry.why.as_str()));
+        events.collect()
+    }
+
+    #[test]
+    fn an_agents_transcript_reads_while_it_runs_and_its_answer_once_it_has_one() {
+        use AgentState::{Done, Running, Skipped, Stopped, Waiting};
+        let data = Data::new("tool-transcript");
+        let connection = data.connection("http://127.0.0.1:9/v1");
+        let session = connection.conversation;
+        let script = r#"export const meta = { name: "three", description: "One by one." };
+await agent("Read a.rs", { label: "reader" });
+await agent("Two");
+return await agent("Three");
+"#;
+        let mut run = Run::open(
+            None,
+            &connection,
+            script,
+            &json!({}),
+            BUDGET,
+            &Cancel::default(),
+        )
+        .unwrap();
+        // The first agent calls a tool, then answers once the test opens its
+        // gate; the others are held by a pause and never run.
+        let (open, gate) = mpsc::channel::<()>();
+        let gate = Mutex::new(Some(gate));
+        run.spawn = Box::new(move |mut spec, then| {
+            let gate = gate.lock().unwrap().take();
+            std::thread::spawn(move || {
+                let messages = &mut spec.transcript.conversation.messages;
+                messages.push(Message {
+                    role: "assistant".into(),
+                    tool_calls: vec![chat::ToolCall {
+                        id: "1".into(),
+                        name: "read_file".into(),
+                        arguments: r#"{"path":"a.rs"}"#.into(),
+                    }],
+                    ..Default::default()
+                });
+                messages.push(Message {
+                    role: "tool".into(),
+                    content: "fn main() {}".into(),
+                    tool_call_id: "1".into(),
+                    name: "read_file".into(),
+                    ..Default::default()
+                });
+                spec.transcript.save().unwrap();
+                if let Some(gate) = gate {
+                    let _ = gate.recv();
+                }
+                let said = "It is one line.";
+                spec.transcript.conversation.messages.push(Message {
+                    role: "assistant".into(),
+                    content: said.into(),
+                    ..Default::default()
+                });
+                spec.transcript.save().unwrap();
+                then(&report(Outcome::Done, said));
+            });
+            Ok(())
+        });
+        set_off(
+            run,
+            &Launch::read(&json!({"script": script}), None).unwrap(),
+        )
+        .unwrap();
+        standing(session, &[Running]);
+        let during = transcribed(session, 1, 3);
+        assert_eq!(
+            (during.number, during.label.as_str(), during.state),
+            (1, "reader", Running)
+        );
+        assert!(during.messages[0].content.ends_with("Task:\n    Read a.rs"));
+        assert_eq!(during.messages[1].tool_calls[0].name, "read_file");
+        assert_eq!(during.messages[2].content, "fn main() {}");
+        assert_eq!((during.cut, during.answer), (0, None));
+        assert_eq!(
+            transcript(session, "wf-1", 2).err().as_deref(),
+            Some("wf-1 has no agent #2: it has made 1 calls.")
+        );
+        pause(session, "wf-1").unwrap();
+        open.send(()).unwrap();
+        standing(session, &[Done, Waiting]);
+        let two = transcript(session, "wf-1", 2).unwrap();
+        assert_eq!(
+            (two.state, two.messages.len(), two.answer),
+            (Waiting, 0, None)
+        );
+        skip(session, "wf-1", "#2").unwrap();
+        standing(session, &[Done, Skipped, Waiting]);
+        let caller = Caller {
+            root: session,
+            ..Default::default()
+        };
+        let stop = json!({"action": "stop", "to": "wf-1"});
+        control(&stop, &caller).unwrap().unwrap();
+        let deadline = Instant::now() + WAIT;
+        while !matches!(
+            super::run(session, "wf-1").unwrap().state,
+            RunState::Ended(_)
+        ) {
+            assert!(Instant::now() < deadline, "the stop never reached it");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        retry(session, "wf-1", "#2").unwrap();
+        let after = transcript(session, "wf-1", 1).unwrap();
+        assert_eq!(after.state, Done);
+        assert_eq!(after.messages.len(), 4);
+        assert_eq!(after.messages[3].content, "It is one line.");
+        assert_eq!(after.answer, Some(json!("It is one line.")));
+        let three = transcript(session, "wf-1", 3).unwrap();
+        assert_eq!(
+            (three.state, three.messages.len(), three.answer),
+            (Stopped, 0, None)
+        );
+        let log = run_log(session, "wf-1").unwrap();
+        assert_eq!(
+            events(&log),
+            [
+                (Event::Launched, None, "started"),
+                (Event::Started, Some(1), ""),
+                (Event::Paused, None, "asked for by the user"),
+                (Event::Finished, Some(1), ""),
+                (Event::Skipped, Some(2), "skipped by the user"),
+                (Event::Stopped, Some(3), "the run was stopped"),
+                (Event::Ended, None, "stopped"),
+                (Event::Retried, Some(2), "runs again at the next resume"),
+            ]
+        );
+        assert_eq!(log[1].label, "reader");
+        assert!(log.windows(2).all(|pair| pair[0].at <= pair[1].at));
+    }
+
+    #[test]
+    fn a_run_with_no_agents_has_no_transcripts_and_a_log_that_outlives_its_process() {
+        let data = Data::new("tool-no-agents");
+        let connection = data.connection("http://127.0.0.1:9/v1");
+        let session = connection.conversation;
+        let script = r#"export const meta = { name: "none", description: "Asks nobody." };
+return "nothing to do";
+"#;
+        let run = Run::open(
+            None,
+            &connection,
+            script,
+            &json!({}),
+            BUDGET,
+            &Cancel::default(),
+        )
+        .unwrap();
+        set_off(
+            run,
+            &Launch::read(&json!({"script": script}), None).unwrap(),
+        )
+        .unwrap();
+        notice(session, "wf-1");
+        assert!(super::run(session, "wf-1").unwrap().phases.is_empty());
+        assert_eq!(
+            transcript(session, "wf-1", 1).err().as_deref(),
+            Some("wf-1 has no agent #1: it has made 0 calls.")
+        );
+        let log = run_log(session, "wf-1").unwrap();
+        assert_eq!(
+            events(&log),
+            [
+                (Event::Launched, None, "started"),
+                (Event::Ended, None, "finished")
+            ]
+        );
+        // As after a restart: the run is no longer one this process started.
+        registry().retain(|live| live.name != "wf-1");
+        assert_eq!(run_log(session, "wf-1"), Ok(log));
+        assert_eq!(
+            run_log(session + 1, "wf-1"),
+            Err("wf-1 has not run since Letronna opened; only a resume picks it up.".into())
+        );
+    }
+
+    #[test]
+    fn a_long_transcript_keeps_its_task_and_newest_messages_each_cut_to_its_ends() {
+        let said = |n: usize| Message {
+            role: "assistant".into(),
+            content: format!("message {n}"),
+            ..Default::default()
+        };
+        let mut messages: Vec<Message> = (0..TRANSCRIPT + 50).map(said).collect();
+        messages[TRANSCRIPT + 49].content = "x".repeat(MESSAGE * 2);
+        let (kept, cut) = capped(messages);
+        assert_eq!((kept.len(), cut), (TRANSCRIPT, 50));
+        assert_eq!(kept[0].content, "message 0");
+        assert_eq!(kept[1].content, "message 51");
+        let last = &kept[TRANSCRIPT - 1].content;
+        assert!(last.contains("[middle trimmed]"), "{last}");
+        assert!(last.chars().count() < MESSAGE + 30);
+        let (none, cut) = capped(Vec::new());
+        assert!(none.is_empty());
+        assert_eq!(cut, 0);
     }
 }

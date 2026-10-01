@@ -8,12 +8,16 @@
 //! agent when it runs. A retry cannot give the script anything, as the script
 //! has had its null already, so it works through the journal instead: it
 //! drops the call's answer there, and the run's next resume runs it again.
+//! Each of these, and each call's start and end, goes into the run's log.
 
 use super::Arrival;
 use super::journal::{self, Line};
+use super::runlog::{Event, Log};
 use crate::budget::Budget;
 use crate::cancel::Cancel;
+use crate::chat::Message;
 use async_channel::Sender;
+use serde_json::Value;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -56,6 +60,26 @@ pub struct AgentView {
     pub state: AgentState,
     /// Tokens it has spent in this launch; none when replayed.
     pub tokens: u64,
+}
+
+/// One `agent()` call of a run as it is opened: what it did and what it
+/// answered.
+#[derive(Clone)]
+pub struct AgentTranscript {
+    pub number: usize,
+    pub label: String,
+    pub state: AgentState,
+    /// Its task, then what it said, the tools it called and what they gave
+    /// back, as far as it has got: the task and the newest messages, each
+    /// cut to its two ends when long. Empty for an agent that has not started
+    /// in this launch, or whose replayed answer came from a launch that kept
+    /// no transcript.
+    pub messages: Vec<Message>,
+    /// Messages left out between the task and the newest ones.
+    pub cut: usize,
+    /// Its final answer once it has one: its text, or the object its schema
+    /// asked for.
+    pub answer: Option<Value>,
 }
 
 /// How a run stands.
@@ -131,6 +155,20 @@ pub(super) struct Board {
     shared: Mutex<Shared>,
     /// Wakes the run from its wait, so a control is acted on at once.
     wake: Sender<Arrival>,
+    /// Written under the board's lock, so events land in the order they
+    /// happened.
+    log: Mutex<Log>,
+}
+
+/// One call as it is looked up to be opened.
+pub(super) struct Called {
+    pub(super) label: String,
+    /// Its journal key.
+    pub(super) key: String,
+    pub(super) state: AgentState,
+    /// Whether it started in this launch, rather than coming from the journal
+    /// or being answered before it could start.
+    pub(super) began: bool,
 }
 
 #[derive(Default)]
@@ -158,15 +196,29 @@ struct Call {
 }
 
 impl Board {
-    pub(super) fn new(wake: Sender<Arrival>) -> Self {
+    pub(super) fn new(wake: Sender<Arrival>, log: Log) -> Self {
         Self {
             shared: Mutex::default(),
             wake,
+            log: Mutex::new(log),
         }
     }
 
     fn shared(&self) -> MutexGuard<'_, Shared> {
         self.shared.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Logs `event` for the run, or for the call in `slot`, because of `why`.
+    pub(super) fn note(&self, event: Event, slot: Option<usize>, why: &str) {
+        let shared = self.shared();
+        self.write(&shared, event, slot, why);
+    }
+
+    /// Logs `event` as `note` does, for a caller holding the lock.
+    fn write(&self, shared: &Shared, event: Event, slot: Option<usize>, why: &str) {
+        let agent = slot.and_then(|slot| Some((slot + 1, shared.calls.get(slot)?.label.as_str())));
+        let mut log = self.log.lock().unwrap_or_else(PoisonError::into_inner);
+        log.note(event, agent, why);
     }
 
     /// Names the meta's phases, which show in that order before any agent runs.
@@ -211,15 +263,26 @@ impl Board {
         call.state = AgentState::Running;
         call.cancel = Some(cancel.clone());
         call.charged = Some(charged.clone());
+        self.write(&shared, Event::Started, Some(slot), "");
         Go::Start
     }
 
-    /// Marks how the call in `slot` ended.
-    pub(super) fn end(&self, slot: usize, state: AgentState) {
-        if let Some(call) = self.shared().calls.get_mut(slot) {
-            call.state = state;
-            call.cancel = None;
-        }
+    /// Marks how the call in `slot` ended, logging it with `why`.
+    pub(super) fn end(&self, slot: usize, state: AgentState, why: &str) {
+        let mut shared = self.shared();
+        let Some(call) = shared.calls.get_mut(slot) else {
+            return;
+        };
+        call.state = state;
+        call.cancel = None;
+        let event = match state {
+            AgentState::Done => Event::Finished,
+            AgentState::Failed => Event::Failed,
+            AgentState::Stopped => Event::Stopped,
+            AgentState::Skipped => Event::Skipped,
+            _ => return,
+        };
+        self.write(&shared, event, Some(slot), why);
     }
 
     /// Whether a pause holds the run's queued agents back.
@@ -238,6 +301,20 @@ impl Board {
         let calls = shared.calls.iter().enumerate();
         let asked = calls.filter(|(_, call)| call.skip && call.state == AgentState::Waiting);
         asked.map(|(slot, _)| slot).collect()
+    }
+
+    /// The call `agent` names among run `name`'s -- its label, or `#N` --
+    /// as it stands now.
+    pub(super) fn call(&self, name: &str, agent: &str) -> Result<Called, String> {
+        let shared = self.shared();
+        let slot = find(&shared.calls, name, agent)?;
+        let call = &shared.calls[slot];
+        Ok(Called {
+            label: call.label.clone(),
+            key: call.key.clone(),
+            state: call.state,
+            began: call.charged.is_some(),
+        })
     }
 
     /// Calls taken, calls answered, and calls that failed.
@@ -281,6 +358,7 @@ impl Board {
             return Err(format!("{name} is paused already."));
         }
         shared.held = true;
+        self.write(&shared, Event::Paused, None, "asked for by the user");
         Ok(())
     }
 
@@ -292,6 +370,7 @@ impl Board {
             return Err(format!("{name} is not paused."));
         }
         shared.held = false;
+        self.write(&shared, Event::Resumed, None, "");
         drop(shared);
         self.poke();
         Ok(())
@@ -365,6 +444,12 @@ impl Board {
         let key = call.key.clone();
         journal::append(path, &Line::Retry { key })?;
         call.state = AgentState::Retry;
+        self.write(
+            &shared,
+            Event::Retried,
+            Some(slot),
+            "runs again at the next resume",
+        );
         Ok(())
     }
 
