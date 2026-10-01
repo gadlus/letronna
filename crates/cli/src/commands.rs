@@ -2353,10 +2353,11 @@ fn take_back(
     // After the redraw, so a failure to save is not cleared off the screen.
     runner.persist();
     let prompt = letronna_core::references::typed(&prompt);
+    let typed = letronna_core::init::typed(prompt).map(str::to_owned);
     Some(
-        letronna_core::init::typed(prompt)
-            .unwrap_or(prompt)
-            .to_owned(),
+        typed
+            .or_else(|| letronna_core::workflow::saved::typed(prompt))
+            .unwrap_or_else(|| prompt.to_owned()),
     )
 }
 

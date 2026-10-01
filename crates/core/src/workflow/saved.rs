@@ -95,6 +95,18 @@ pub fn prompt(name: &str, args: &str) -> String {
     format!("{ASK}{name}{CALL}{call}")
 }
 
+/// What the user typed for `prompt` when [`prompt`] made it -- `/name` and
+/// its args -- so a front end can show that while the model keeps `prompt`.
+pub fn typed(prompt: &str) -> Option<String> {
+    let (_, call) = prompt.strip_prefix(ASK)?.split_once(CALL)?;
+    let call: serde_json::Value = serde_json::from_str(call).ok()?;
+    let name = call["name"].as_str()?;
+    Some(match call["args"].as_str() {
+        Some(args) => format!("/{name} {args}"),
+        None => format!("/{name}"),
+    })
+}
+
 /// The script of the saved workflow called `name` for a session in
 /// `workspace`, with the file it comes from unless it is bundled, or why
 /// there is none.
@@ -280,6 +292,15 @@ mod tests {
         };
         assert_eq!(call("  main "), json!({"name": "review", "args": "main"}));
         assert_eq!(call(""), json!({"name": "review"}));
+    }
+
+    #[test]
+    fn a_saved_workflow_prompt_shows_as_it_was_typed() {
+        for (args, shown) in [("  main ", "/review main"), ("", "/review")] {
+            assert_eq!(typed(&prompt("review", args)).as_deref(), Some(shown));
+        }
+        assert_eq!(typed("review this"), None);
+        assert_eq!(typed("Run the saved workflow \"review\" now"), None);
     }
 
     #[test]

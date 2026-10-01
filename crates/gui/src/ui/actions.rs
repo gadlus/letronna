@@ -8,6 +8,7 @@
 //! sees the shorter session too. It can also put back the files the agent's
 //! tools wrote since, from the copies `history` kept of them.
 
+use crate::app::Given;
 use crate::prelude::*;
 use gpui_component::checkbox::Checkbox;
 use gpui_component::menu::PopupMenu;
@@ -56,16 +57,18 @@ impl Chat {
     }
 
     /// The text of your message at `at`, if that is what is there, with
-    /// `/init` and `@` references as they were typed.
+    /// `/init`, a saved workflow's command and `@` references as they were
+    /// typed.
     fn prompt_text(&self, at: usize) -> Option<String> {
         self.open_messages()
             .get(at)
             .filter(|m| m.role == "user" && !m.notice)
             .map(|m| {
-                let typed = letronna_core::references::typed(&m.content);
-                letronna_core::init::typed(typed)
-                    .unwrap_or(typed)
-                    .to_owned()
+                let content = letronna_core::references::typed(&m.content);
+                let typed = letronna_core::init::typed(content).map(str::to_owned);
+                typed
+                    .or_else(|| letronna_core::workflow::saved::typed(content))
+                    .unwrap_or_else(|| content.to_owned())
             })
     }
 
@@ -209,6 +212,15 @@ impl Chat {
     ) {
         // What had the keys, the edit box or the turn's buttons, is gone.
         self.focus_composer(window, cx);
+        // A saved workflow's command runs again as it did, granted its turn.
+        if let Some(Ok(Given::Run(asked))) = self.added_command(&text) {
+            if self.run_saved(&text, asked, cx).is_err() {
+                self.composer
+                    .update(cx, |input, cx| input.set_value(text, window, cx));
+                self.open_settings(window, cx);
+            }
+            return;
+        }
         let Some(prompt) = self.prompt_for(text.clone(), cx) else {
             self.composer
                 .update(cx, |input, cx| input.set_value(text, window, cx));

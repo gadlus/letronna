@@ -1213,7 +1213,25 @@ impl Chat {
                 });
                 return;
             }
-            Some(Ok(Given::Run(asked))) => return self.run_saved(&prompt, asked, window, cx),
+            Some(Ok(Given::Run(asked))) => {
+                if self.busy {
+                    // Folded into a turn as it runs, it would reach the model
+                    // as typed.
+                    self.error = Some(
+                        "A saved workflow starts a turn of its own. Send it when this one is \
+                         done."
+                            .into(),
+                    );
+                    cx.notify();
+                    return;
+                }
+                self.composer
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                if self.run_saved(&prompt, asked, cx).is_err() {
+                    self.open_settings(window, cx);
+                }
+                return;
+            }
             Some(Err(error)) => {
                 self.error = Some(error);
                 cx.notify();
@@ -1324,7 +1342,7 @@ impl Chat {
     /// What `/name args` gives, or why it was refused, when the user, the
     /// project or a skill added a command by that name, or a saved workflow
     /// has it, and the window has none of its own.
-    fn added_command(&self, prompt: &str) -> Option<Result<Given, String>> {
+    pub(crate) fn added_command(&self, prompt: &str) -> Option<Result<Given, String>> {
         use letronna_core::slash::{self, Origin};
         let (name, args) = slash::split(prompt)?;
         let workspace = self.store.conversations[self.store.active]
@@ -1341,31 +1359,18 @@ impl Chat {
 
     /// Sends `asked`, the prompt a saved workflow's command `typed` gives,
     /// with the `workflow` tool granted for its turn, so the model can show
-    /// the run's launch card.
-    fn run_saved(
+    /// the run's launch card; `Err` as [`Self::dispatch`] gives it.
+    pub(crate) fn run_saved(
         &mut self,
         typed: &str,
         asked: String,
-        window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        if self.busy {
-            // Folded into a turn as it runs, it would reach the model as typed.
-            self.error = Some(
-                "A saved workflow starts a turn of its own. Send it when this one is done.".into(),
-            );
-            cx.notify();
-            return;
-        }
-        self.composer
-            .update(cx, |input, cx| input.set_value("", window, cx));
+    ) -> std::result::Result<(), ()> {
         let session = self.store.conversations[self.store.active].id;
         tell_crew(session, typed, crew::Source::Composer);
         // After `tell_crew`, which ends what the last command granted.
         crew::grant(session);
-        if self.dispatch(asked, Vec::new(), None, cx).is_err() {
-            self.open_settings(window, cx);
-        }
+        self.dispatch(asked, Vec::new(), None, cx)
     }
 
     /// What sending `text` in the active session asks the model: `/init`
@@ -1489,7 +1494,9 @@ impl Chat {
         if conversation.messages.is_empty()
             && (conversation.title.is_empty() || conversation.title == "New session")
         {
-            let shown = letronna_core::init::typed(&prompt).unwrap_or(&prompt);
+            let saved = letronna_core::workflow::saved::typed(&prompt);
+            let shown = letronna_core::init::typed(&prompt).or(saved.as_deref());
+            let shown = shown.unwrap_or(&prompt);
             conversation.title = shown.chars().take(40).collect();
         }
         conversation.updated = backend::now();
@@ -4328,7 +4335,7 @@ fn side_question(prompt: &str) -> Option<&str> {
 }
 
 /// What an added command gives.
-enum Given {
+pub(crate) enum Given {
     /// Text for the composer, read before it is sent.
     Text(String),
     /// A saved workflow's prompt, sent at once with the `workflow` tool
