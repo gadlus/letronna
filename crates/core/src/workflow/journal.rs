@@ -44,6 +44,10 @@ pub(super) enum Line {
         /// The worktree it works in, which a rerun carries on in.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         worktree: Option<Worktree>,
+        /// The number of its transcript in the run's `agents` folder; 0 in
+        /// journals written before it was kept.
+        #[serde(default)]
+        transcript: u64,
     },
     /// An agent answered, with what that took.
     Result {

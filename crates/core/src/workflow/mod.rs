@@ -26,16 +26,19 @@
 //!
 //! Its session steers it from outside through its board (`board.rs`): a pause
 //! holds queued agents back, a skip answers one with null, and a retry drops
-//! one's answer from the journal for the next resume to run it again.
+//! one's answer from the journal for the next resume to run it again. What
+//! happens to it goes into its log (`runlog.rs`), kept beside the journal.
 
 mod board;
 pub mod host;
 mod journal;
+mod runlog;
 pub mod saved;
 pub mod tool;
 
-pub use board::{AgentState, AgentView, PhaseView, RunState, RunView};
-pub use tool::{pause, resume, retry, run, runs, skip};
+pub use board::{AgentState, AgentTranscript, AgentView, PhaseView, RunState, RunView};
+pub use runlog::{Event, LogEntry};
+pub use tool::{pause, resume, retry, run, run_log, runs, skip, transcript};
 
 use crate::agent_defs::{self, AgentDef};
 use crate::budget::{Budget, short};
@@ -51,6 +54,7 @@ use crate::worktree::{self, Worktree};
 use async_channel::{Receiver, Sender};
 use board::{Board, Go};
 use journal::{Journal, Line};
+use runlog::Log;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
@@ -271,6 +275,12 @@ impl Run {
         let woken = cancel.on_set(move || {
             let _ = wake.try_send(Arrival::Wake);
         });
+        let board = Board::new(arrivals.0.clone(), Log::open(&dir));
+        let launched = match resume {
+            Some(_) => "resumed",
+            None => "started",
+        };
+        board.note(runlog::Event::Launched, None, launched);
         Ok(Self {
             transcripts: last_transcript(&dir.join("agents")),
             name,
@@ -294,7 +304,7 @@ impl Run {
             queue: VecDeque::new(),
             ready: VecDeque::new(),
             running: 0,
-            board: Arc::new(Board::new(arrivals.0.clone())),
+            board: Arc::new(board),
             arrivals,
             beat,
             streak: None,
@@ -433,7 +443,8 @@ impl Run {
             };
             if stopped {
                 self.queue.pop_front();
-                self.board.end(slot, AgentState::Stopped);
+                self.board
+                    .end(slot, AgentState::Stopped, "the run was stopped");
                 self.ready.push_back((slot, None));
                 continue;
             }
@@ -528,6 +539,7 @@ impl Run {
             label: asked.label,
             phase: asked.phase,
             worktree: worktree.clone(),
+            transcript: self.transcripts,
         });
         if started.is_err() {
             unstarted(&worktree);
@@ -624,7 +636,7 @@ impl Run {
             let key = key.clone();
             let _ = self.journal.write(&Line::Kept { key, line });
         }
-        let (value, state) = match ended {
+        let (value, state, why) = match ended {
             Ended::Answered(value, tokens) => {
                 self.streak = None;
                 let _ = self.journal.write(&Line::Result {
@@ -632,7 +644,7 @@ impl Run {
                     value: value.clone(),
                     tokens,
                 });
-                (Some(value), AgentState::Done)
+                (Some(value), AgentState::Done, String::new())
             }
             Ended::Failed(error) => {
                 let _ = self.journal.write(&Line::Failed { key });
@@ -645,20 +657,21 @@ impl Run {
                         "{BREAKER} helpers in a row failed with the same error: {error}"
                     ));
                 }
-                self.streak = Some((error, count));
-                (None, AgentState::Failed)
+                self.streak = Some((error.clone(), count));
+                (None, AgentState::Failed, error)
             }
             Ended::Unfinished => {
                 let _ = self.journal.write(&Line::Failed { key });
-                (None, AgentState::Failed)
+                let why = "it used its rounds or its budget".to_owned();
+                (None, AgentState::Failed, why)
             }
-            Ended::Stopped => (None, AgentState::Stopped),
+            Ended::Stopped => (None, AgentState::Stopped, "the run was stopped".into()),
             Ended::Skipped => {
                 let _ = self.journal.write(&Line::Skipped { key });
-                (None, AgentState::Skipped)
+                (None, AgentState::Skipped, "skipped by the user".into())
             }
         };
-        self.board.end(slot, state);
+        self.board.end(slot, state, &why);
         self.ready.push_back((slot, value));
     }
 
@@ -682,9 +695,11 @@ impl Run {
         if self.paused.is_some() {
             return;
         }
+        self.board.note(runlog::Event::Paused, None, &reason);
         self.cancel.set();
         for queued in self.queue.drain(..) {
-            self.board.end(queued.slot, AgentState::Stopped);
+            self.board
+                .end(queued.slot, AgentState::Stopped, "the run paused");
         }
         let _ = self.journal.write(&Line::Paused {
             reason: reason.clone(),

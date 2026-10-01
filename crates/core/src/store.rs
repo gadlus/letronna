@@ -1644,6 +1644,13 @@ impl Transcript {
         Some(Self { path, conversation })
     }
 
+    /// Read back the conversation kept at `path`, such as a workflow agent's,
+    /// if it is there.
+    pub(crate) fn at(path: PathBuf) -> Option<Self> {
+        let conversation = replay(&path)?;
+        Some(Self { path, conversation })
+    }
+
     /// Append whatever is new, as saving a session does. One with no path,
     /// for a run nobody picks up again, is kept in memory only.
     pub fn save(&mut self) -> std::io::Result<()> {
