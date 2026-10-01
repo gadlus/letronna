@@ -149,6 +149,10 @@ pub(crate) struct Chat {
     pub(crate) usage_report: Option<letronna_core::usage::Report>,
     /// The Usage page's insights over the last weeks, added up beside it.
     pub(crate) usage_insights: Option<letronna_core::insights::Insights>,
+    /// What fills the active session's context, for its status-bar
+    /// percentage's popover; added up when it was last opened, and `None`
+    /// while it is closed.
+    pub(crate) context_report: Option<letronna_core::chat::ContextReport>,
     pub(crate) settings_open: bool,
     /// Held by the settings panel while it is open, so escape reaches it.
     pub(crate) settings_focus: FocusHandle,
@@ -771,6 +775,7 @@ impl Chat {
             settings_page,
             usage_report: None,
             usage_insights: None,
+            context_report: None,
             settings_open: false,
             settings_focus: cx.focus_handle(),
             page_focus: cx.focus_handle(),
