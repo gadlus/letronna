@@ -156,6 +156,8 @@ impl Chat {
     fn cut_to(&mut self, keep: usize) {
         let ix = self.store.active;
         let id = self.store.conversations[ix].id;
+        // A review of what is taken back must not keep any of it.
+        self.stop_review(id);
         let conversation = &mut self.store.conversations[ix];
         conversation.rewind(keep);
         // The checklist is the one the last `todo` left standing.
@@ -552,6 +554,7 @@ impl Chat {
         };
         fork.copy_summaries(source);
         history::share(source.id, id);
+        self.leave_for(self.store.conversations.len());
         self.store.conversations.push(fork);
         self.store.active = self.store.conversations.len() - 1;
         self.page = Page::Chat;

@@ -17,6 +17,9 @@
 //! gives it a `Watch`, which hears each step as it is made. A run that is a
 //! session's own turn, as an editor's is, gives it the session's whole gate
 //! as `Decide`, which then settles each call in place of the one above.
+//! A run that keeps a tool its own way, as a memory review does, gives
+//! `Allow::Own`: each call the gate lets through goes to its function
+//! rather than to the tool.
 //!
 //! A run given a schema answers through one more tool, `structured_output`,
 //! offered after the rest so the tools before it keep their cached bytes. Its
@@ -120,7 +123,13 @@ pub enum Allow {
     #[default]
     All,
     Only(Vec<String>),
+    /// Every call the gate lets through goes to the caller's own function,
+    /// which makes it its own way, as a memory review keeps memory.
+    Own(Arc<Call>),
 }
+
+/// A caller's own way of making a call, giving its result.
+pub type Call = dyn Fn(&ToolCall) -> Result<String, String> + Send + Sync;
 
 /// Everything a run needs, decided by whoever starts it.
 pub struct Spec {
@@ -501,6 +510,9 @@ fn dispatch(
         return Some(Err(refused));
     }
     tell(spec, Step::Running(call.id.clone()));
+    if let Allow::Own(own) = &spec.allow {
+        return made(own.as_ref(), call, &spec.cancel);
+    }
     if call.name == tools::TODO {
         let outcome = checklist(&mut spec.transcript, &call.arguments);
         let todos = spec.transcript.conversation.todos.clone();
@@ -542,9 +554,11 @@ fn together(spec: &Spec, batch: &[ToolCall]) -> Vec<Option<Result<String, String
                 // write is one, so nothing here needs `dispatch`'s special cases.
                 let refused = refused(spec, &call.name);
                 let ctx = context(spec);
-                scope.spawn(move || match refused {
-                    Some(refused) => Some(Err(refused)),
-                    None => off_thread(call, &ctx),
+                let allow = &spec.allow;
+                scope.spawn(move || match (refused, allow) {
+                    (Some(refused), _) => Some(Err(refused)),
+                    (None, Allow::Own(own)) => made(own.as_ref(), call, &ctx.cancel),
+                    (None, _) => off_thread(call, &ctx),
                 })
             })
             .collect();
@@ -568,6 +582,9 @@ pub(crate) fn refusal(allow: &Allow, name: &str) -> Option<String> {
     let allowed = match allow {
         Allow::All => true,
         Allow::Only(names) => names.iter().any(|allowed| allowed == name),
+        // No tool runs by its name: the caller's function makes every call
+        // the gate lets through, and refuses what it will not make.
+        Allow::Own(_) => return None,
     };
     if DENY.contains(&name) || !allowed {
         return Some(format!("`{name}` is not available to this helper."));
@@ -646,6 +663,7 @@ fn context(spec: &Spec) -> ToolContext {
             allowed: match &spec.allow {
                 Allow::All => None,
                 Allow::Only(names) => Some(names.as_slice().into()),
+                Allow::Own(_) => Some(Arc::from([])),
             },
             fork: spec.fork,
             allow: spec.allow.clone(),
@@ -653,6 +671,12 @@ fn context(spec: &Spec) -> ToolContext {
         },
         ..ctx
     }
+}
+
+/// Makes a call the caller's own way, or gives None when a stop came before
+/// it began, as `off_thread` does.
+fn made(own: &Call, call: &ToolCall, cancel: &Cancel) -> Option<Result<String, String>> {
+    (!cancel.is_set()).then(|| own(call))
 }
 
 /// Runs a tool on a thread of its own, so a stop ends the wait even for a
@@ -933,7 +957,7 @@ fn save(transcript: &mut Transcript) -> Result<(), String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::inbox::When;
     use crate::store::Conversation;
@@ -1002,14 +1026,14 @@ mod tests {
         }
     }
 
-    fn listen() -> (TcpListener, String) {
+    pub(crate) fn listen() -> (TcpListener, String) {
         let server = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}/v1", server.local_addr().unwrap());
         (server, endpoint)
     }
 
     /// The body of the request coming in on `socket`.
-    fn request(socket: &mut TcpStream) -> Value {
+    pub(crate) fn request(socket: &mut TcpStream) -> Value {
         let mut bytes = Vec::new();
         let mut block = [0; 65536];
         loop {
@@ -1033,12 +1057,12 @@ mod tests {
     }
 
     /// Sends `reply` whole and closes, as a provider's finished stream does.
-    fn answer(socket: &mut TcpStream, reply: &str) {
+    pub(crate) fn answer(socket: &mut TcpStream, reply: &str) {
         write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
     }
 
     /// A local provider at work on its thread, and where to reach it.
-    struct Stub {
+    pub(crate) struct Stub {
         address: SocketAddr,
         worker: JoinHandle<Vec<Value>>,
     }
@@ -1046,7 +1070,7 @@ mod tests {
     impl Stub {
         /// What each request carried, failing rather than hanging when the
         /// run asked for fewer replies than the stub was given.
-        fn sent(self) -> Vec<Value> {
+        pub(crate) fn sent(self) -> Vec<Value> {
             if !self.worker.is_finished() {
                 // An empty request ends the wait for one the run will never send.
                 let _ = TcpStream::connect(self.address);
@@ -1059,7 +1083,7 @@ mod tests {
 
     /// A provider that answers one request with each of `replies` in turn,
     /// and hands back what each request carried.
-    fn provider(replies: Vec<String>) -> (String, Stub) {
+    pub(crate) fn provider(replies: Vec<String>) -> (String, Stub) {
         let (server, endpoint) = listen();
         let address = server.local_addr().unwrap();
         let worker = std::thread::spawn(move || {
@@ -1077,7 +1101,7 @@ mod tests {
     }
 
     /// A streamed reply that says `text` and makes `calls`, taking 1,000 tokens in and 50 out.
-    fn reply(text: &str, calls: &[(&str, Value)]) -> String {
+    pub(crate) fn reply(text: &str, calls: &[(&str, Value)]) -> String {
         let calls: Vec<Value> = calls
             .iter()
             .enumerate()
@@ -1235,6 +1259,53 @@ mod tests {
             results(&provider.sent()[1]),
             ["`browse` is not available to this helper."]
         );
+    }
+
+    #[test]
+    fn a_run_of_its_own_makes_only_what_the_gate_lets_through() {
+        let dir = scratch("own");
+        let (endpoint, provider) = provider(vec![
+            reply(
+                "",
+                &[
+                    read_notes(),
+                    read_notes(),
+                    ("write_file", json!({"path": "made.txt", "content": "made"})),
+                    (
+                        "memory",
+                        json!({"action": "add", "target": "user", "content": "x"}),
+                    ),
+                ],
+            ),
+            reply("Done.", &[]),
+        ]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 120);
+        let made = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let making = made.clone();
+        spec.allow = Allow::Own(Arc::new(move |call| {
+            making.lock().unwrap().push(call.name.clone());
+            Ok(format!("made {}", call.name))
+        }));
+        spec.decide = Some(Arc::new(|call, _| match call.name.as_str() {
+            "write_file" => crate::gate::Outcome::Refuse("Not here.".into()),
+            _ => crate::gate::Outcome::Run,
+        }));
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        // The reads ran together, and a tool in the deny set is the
+        // function's to make or refuse.
+        assert_eq!(
+            results(&provider.sent()[1]),
+            [
+                "made read_file",
+                "made read_file",
+                "Not here.",
+                "made memory"
+            ]
+        );
+        assert_eq!(*made.lock().unwrap(), ["read_file", "read_file", "memory"]);
+        assert!(!dir.join("made.txt").exists());
+        assert!(report.files.is_empty());
     }
 
     #[test]

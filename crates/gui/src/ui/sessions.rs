@@ -249,6 +249,7 @@ impl Chat {
                     // Through the store, so the session's file goes too,
                     // and its private browser and draft with it.
                     let id = this.store.conversations[index].id;
+                    this.stop_review(id);
                     letronna_core::browser::forget(id);
                     this.drafts.remove(&id);
                     this.open.retain(|&open| open != id);

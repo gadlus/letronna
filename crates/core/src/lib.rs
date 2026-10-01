@@ -73,6 +73,7 @@ pub mod profiles;
 mod redact;
 pub mod references;
 pub mod retry;
+pub mod review;
 pub mod sandbox;
 mod scan;
 pub mod schedule;

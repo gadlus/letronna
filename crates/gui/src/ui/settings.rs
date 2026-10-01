@@ -1470,6 +1470,16 @@ fn thinking_page(chat: &Entity<Chat>, store: &Store, window: &mut Window, cx: &m
         cx,
         std::rc::Rc::new(move |this: &mut Chat| this.store.settings.verify_edits = !verifying),
     );
+    let reviewing = settings.memory_review;
+    let review = toggle_row(
+        "memory-review",
+        "Review memory",
+        "Every 10 of your messages, look back over the session and add what is worth remembering. Each look is a model call on your account.",
+        reviewing,
+        chat,
+        cx,
+        std::rc::Rc::new(move |this: &mut Chat| this.store.settings.memory_review = !reviewing),
+    );
 
     v_flex()
         .gap_4()
@@ -1484,6 +1494,7 @@ fn thinking_page(chat: &Entity<Chat>, store: &Store, window: &mut Window, cx: &m
         .child(search)
         .child(voice)
         .child(verify)
+        .child(review)
 }
 
 /// A switch with a name and a line about what it does.

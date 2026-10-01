@@ -157,6 +157,7 @@ impl Chat {
                 if event.modifiers().shift {
                     this.store.conversations[index].pinned ^= true;
                 } else {
+                    this.leave_for(index);
                     this.store.active = index;
                     this.error = None;
                     this.page = Page::Chat;

@@ -294,6 +294,7 @@ impl Chat {
     /// Show the session at `index` as the current one, as picking it in the
     /// sidebar does.
     fn open_imported(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.leave_for(index);
         self.store.active = index;
         self.error = None;
         self.page = Page::Chat;
