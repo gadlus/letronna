@@ -104,7 +104,8 @@ fn start(dir: &Path) -> (Child, mpsc::Receiver<String>) {
             &mut slave,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut size,
+            // Linux takes the size as `*const`, macOS as `*mut`.
+            &raw mut size,
         )
     };
     assert_eq!(
