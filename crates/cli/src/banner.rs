@@ -157,7 +157,9 @@ pub fn footer(runner: &Runner) -> String {
     if runner.mode != Mode::Default {
         parts.push(format!("{} mode", runner.mode.label().to_lowercase()));
     }
-    if letronna_core::crew::on(runner.store.conversations[session].id) {
+    let crew =
+        (runner.store.conversations.get(session)).is_some_and(|c| letronna_core::crew::on(c.id));
+    if crew {
         parts.push("crew".into());
     }
     let effort = runner.store.effort(session);

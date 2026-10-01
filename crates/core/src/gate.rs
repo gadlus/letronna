@@ -17,7 +17,8 @@
 //! between the rules and what the user allowed: Plan and Don't ask refuse,
 //! Bypass runs what the floor and the rules let through, and Accept edits
 //! runs changes to the project's own files. Only `settle`, auto mode's way
-//! in, waits on the judge.
+//! in, waits on the judge; it also says which layer let a call run, for the
+//! tag under the call.
 
 use crate::chat::{Connection, ToolCall};
 use crate::command::{self, Dialect, Risk};
@@ -47,6 +48,49 @@ pub enum Outcome {
     Refuse(String),
 }
 
+/// What let a call run in Auto mode, or the judge's word on it, for the tag
+/// under the call's row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Layer {
+    /// The tool needs nobody's yes: it only looks, or does something as
+    /// small, such as noting a memory or stopping a job it started.
+    NoApproval,
+    /// The user stopped being asked about it in this session.
+    Granted,
+    /// An allow rule covers it: the rule's pattern, or its tool for a rule
+    /// on every call.
+    Rule(String),
+    /// A command that only reads, inside the workspace.
+    ReadOnly,
+    /// An edit that stays among the project's own files.
+    Workspace,
+    /// The judge was asked, and this was its verdict.
+    Judge(Verdict),
+}
+
+impl Layer {
+    /// The tag, such as "rule: cargo test" or "auto: blocked — it sends data out".
+    pub fn tag(&self) -> String {
+        match self {
+            Layer::NoApproval => "no approval needed".into(),
+            Layer::Granted => "allowed this session".into(),
+            Layer::Rule(rule) => format!("rule: {rule}"),
+            Layer::ReadOnly => "only reads".into(),
+            Layer::Workspace => "in workspace".into(),
+            Layer::Judge(Verdict::Allow) => "auto: allowed".into(),
+            Layer::Judge(Verdict::Block(category)) => {
+                format!("auto: blocked — {}", category.meaning())
+            }
+            Layer::Judge(Verdict::Unsure(why)) => format!("auto: unsure — {why}"),
+        }
+    }
+
+    /// Whether this is the judge's verdict rather than a layer below it.
+    fn judged(&self) -> bool {
+        matches!(self, Layer::Judge(_))
+    }
+}
+
 /// How much a session lets run without asking, as its mode chip shows it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Mode {
@@ -57,8 +101,8 @@ pub enum Mode {
     AcceptEdits,
     /// Looks and proposes only: whatever changes things is refused.
     Plan,
-    /// Accept edits with a judge for the rest; not offered until the judge
-    /// exists, so until then what it would judge asks.
+    /// Accept edits with a judge for the rest, where the caller brings one
+    /// through `settle`; without it, what it would judge asks.
     Auto,
     /// Refuses whatever would ask.
     DontAsk,
@@ -68,10 +112,11 @@ pub enum Mode {
 
 impl Mode {
     /// The modes a person can pick, in the order they are listed.
-    pub const OFFERED: [Mode; 5] = [
+    pub const OFFERED: [Mode; 6] = [
         Mode::Default,
         Mode::AcceptEdits,
         Mode::Plan,
+        Mode::Auto,
         Mode::DontAsk,
         Mode::Bypass,
     ];
@@ -106,7 +151,7 @@ impl Mode {
             Mode::Default => "asks before writing or running",
             Mode::AcceptEdits => "edits in the project run; commands still ask",
             Mode::Plan => "reads and searches only; never writes or runs",
-            Mode::Auto => "edits in the project run; the rest asks",
+            Mode::Auto => "edits in the project run; your model judges the rest",
             Mode::DontAsk => "runs only what is allowed; refuses what would ask",
             Mode::Bypass => "runs without asking, bar risky calls and your rules",
         }
@@ -120,9 +165,6 @@ impl Mode {
         };
         if let Some(mode) = Mode::OFFERED.into_iter().find(named) {
             return Ok(mode);
-        }
-        if named(&Mode::Auto) {
-            return Err("Auto mode is not available yet.".into());
         }
         let names: Vec<&str> = Mode::OFFERED.iter().map(|mode| mode.name()).collect();
         Err(format!(
@@ -197,7 +239,6 @@ impl<'de> Deserialize<'de> for Mode {
             Saved::Switch(false) => Mode::Default,
             Saved::Name(name) => Mode::OFFERED
                 .into_iter()
-                .chain([Mode::Auto])
                 .find(|mode| mode.name() == name)
                 .unwrap_or_default(),
         })
@@ -284,16 +325,34 @@ pub fn decide(call: &ToolCall, gate: &Gate) -> Outcome {
     decide_with(call, gate, None, confines(call, gate))
 }
 
-/// `decide` in auto mode: what would ask is put to the judge on the
+/// `decide` in Auto mode: what would ask is put to the judge on the
 /// session's own model instead, given `typed`, every message the user typed
-/// in the session. It waits on the network, so it never runs on a UI thread.
-pub fn settle(call: &ToolCall, gate: &Gate, connection: &Connection, typed: &[String]) -> Outcome {
+/// in the session; with what let the call run, or the judge's verdict. It
+/// waits on the network, so it never runs on a UI thread. In any other mode
+/// it is `decide`, with no layer.
+pub fn settle(
+    call: &ToolCall,
+    gate: &Gate,
+    connection: &Connection,
+    typed: &[String],
+) -> (Outcome, Option<Layer>) {
     // Other people's messages would count as the user's wishes there.
-    if gate.ctx.shared() {
-        return decide(call, gate);
+    if gate.mode != Mode::Auto || gate.ctx.shared() {
+        return (decide(call, gate), None);
     }
-    let judge = |call: &ToolCall, why: &str| judge::judge(call, why, typed, connection, gate.ctx);
-    decide_with(call, gate, Some(&judge), confines(call, gate))
+    let judge = |call: &ToolCall, why: &str| {
+        judge::judge(call, why, typed, connection, gate.ctx, gate.mode)
+    };
+    traced(call, gate, Some(&judge), confines(call, gate))
+}
+
+/// What lets `call` run under `gate` with no judge asked, for its tag; `None`
+/// when it would not run.
+pub fn reason(call: &ToolCall, gate: &Gate) -> Option<Layer> {
+    match traced(call, gate, None, confines(call, gate)) {
+        (Outcome::Run, layer) => layer,
+        _ => None,
+    }
 }
 
 /// Whether `call` would run confined where this system can confine it. The
@@ -311,6 +370,16 @@ type Judge<'a> = &'a dyn Fn(&ToolCall, &str) -> Verdict;
 /// `decide`, with the judge for what no earlier layer settles, if there is
 /// one, and commands confined when `sandbox` says this system can.
 fn decide_with(call: &ToolCall, gate: &Gate, judge: Option<Judge>, sandbox: bool) -> Outcome {
+    traced(call, gate, judge, sandbox).0
+}
+
+/// `decide_with`, with what let the call run or what the judge made of it.
+fn traced(
+    call: &ToolCall,
+    gate: &Gate,
+    judge: Option<Judge>,
+    sandbox: bool,
+) -> (Outcome, Option<Layer>) {
     match crate::browser::batch_calls(call) {
         Some(steps) => batched(call, steps, gate, judge, sandbox),
         None => decide_one(call, gate, judge, sandbox),
@@ -321,63 +390,86 @@ fn decide_with(call: &ToolCall, gate: &Gate, judge: Option<Judge>, sandbox: bool
 /// own and each step would run alone: the strictest of those stands. So no
 /// step gets past a refusal or a card it would have met by itself -- an
 /// upload, an action in another site's frame, a tool not allowed -- and a
-/// card, asked for any step, shows them all.
+/// card, asked for any step, shows them all. A step the judge looked at
+/// names the batch's layer, since its verdict says more than what let the
+/// batch's own tool run.
 fn batched(
     call: &ToolCall,
     steps: Result<Vec<ToolCall>, String>,
     gate: &Gate,
     judge: Option<Judge>,
     sandbox: bool,
-) -> Outcome {
+) -> (Outcome, Option<Layer>) {
     let steps = match steps {
         Ok(steps) => steps,
-        Err(why) => return Outcome::Refuse(why),
+        Err(why) => return (Outcome::Refuse(why), None),
     };
-    let mut outcome = decide_one(call, gate, judge, sandbox);
+    let (mut outcome, own) = decide_one(call, gate, judge, sandbox);
     if let Outcome::Refuse(_) = outcome {
-        return outcome;
+        return (outcome, own);
     }
+    let mut asked_by = own.clone().filter(|_| outcome == Outcome::Ask);
+    let mut run_by = own.filter(|_| outcome == Outcome::Run);
     for (at, step) in steps.iter().enumerate() {
-        match decide_one(step, gate, judge, sandbox) {
+        let (decided, layer) = decide_one(step, gate, judge, sandbox);
+        let verdict = layer.filter(Layer::judged);
+        match decided {
             Outcome::Refuse(why) => {
                 let what = tools::summary(&step.name, &step.arguments);
-                return Outcome::Refuse(format!(
+                let why = format!(
                     "Step {} of the batch ({what}) would be refused on its own, so none of it \
                      ran: {why}",
                     at + 1
-                ));
+                );
+                return (Outcome::Refuse(why), verdict);
             }
             // The batch runs as one call, which cannot be confined in part.
-            Outcome::Ask | Outcome::Sandboxed => outcome = Outcome::Ask,
-            Outcome::Run => {}
+            Outcome::Ask | Outcome::Sandboxed => {
+                outcome = Outcome::Ask;
+                asked_by = asked_by.or(verdict);
+            }
+            Outcome::Run => run_by = verdict.or(run_by),
         }
     }
-    outcome
+    let layer = if outcome == Outcome::Ask {
+        asked_by
+    } else {
+        run_by
+    };
+    (outcome, layer)
 }
 
 /// `decide_with` for a call that is not a batch.
-fn decide_one(call: &ToolCall, gate: &Gate, judge: Option<Judge>, sandbox: bool) -> Outcome {
+fn decide_one(
+    call: &ToolCall,
+    gate: &Gate,
+    judge: Option<Judge>,
+    sandbox: bool,
+) -> (Outcome, Option<Layer>) {
     let judged = judge.map(|judge| move |why: &str| judge(call, why));
     let judged = judged
         .as_ref()
         .map(|judged| judged as &dyn Fn(&str) -> Verdict);
-    let outcome = ladder(call, gate, judged, sandbox);
+    let mut layer = None;
+    let outcome = ladder(call, gate, judged, sandbox, &mut layer);
     // Layer 3's Don't ask turns every card into a refusal, the floor's too.
     // A question, or a plan put for approval, is not an approval to give
     // unasked, so those still ask.
     let question = [tools::ASK_USER, tools::EXIT_PLAN].contains(&call.name.as_str());
     if gate.mode == Mode::DontAsk && outcome == Outcome::Ask && !question {
-        return Outcome::Refuse(unasked(&call.name));
+        return (Outcome::Refuse(unasked(&call.name)), None);
     }
-    outcome
+    (outcome, layer)
 }
 
-/// `decide_with`'s layers, before Don't ask turns a card into a refusal.
+/// `decide_with`'s layers, before Don't ask turns a card into a refusal;
+/// `layer` is set to what let the call run, or to the judge's verdict.
 fn ladder(
     call: &ToolCall,
     gate: &Gate,
     judge: Option<&dyn Fn(&str) -> Verdict>,
     sandbox: bool,
+    layer: &mut Option<Layer>,
 ) -> Outcome {
     let Some(tool) = tools::find(&call.name) else {
         return Outcome::Refuse(format!("Unknown tool `{}`.", call.name));
@@ -446,6 +538,7 @@ fn ladder(
     // be anything, so a yes to other commands does not cover it.
     let opaque = matches!(risk, Some(Risk::Opaque));
     if !tool.needs_approval() {
+        *layer = Some(Layer::NoApproval);
         return Outcome::Run;
     }
     // A question, or a plan put for approval, is not an action to allow, so
@@ -491,7 +584,13 @@ fn ladder(
         && matches!(gate.mode, Mode::AcceptEdits | Mode::Auto);
     let confined = jailed && !opaque && confinable(&args, gate.ctx);
     if !opaque && !apart && (granted || ruling.allow) {
+        let by = match &ruling.allowed_by {
+            _ if granted => Layer::Granted,
+            Some(rule) if !rule.whole() => Layer::Rule(rule.pattern.clone()),
+            _ => Layer::Rule(tool.name().into()),
+        };
         if !jailed {
+            *layer = Some(by);
             return Outcome::Run;
         }
         if confined {
@@ -501,11 +600,13 @@ fn ladder(
     // Layer 5: a command that only reads, inside the workspace, needs no
     // more of a yes than `read_file` does.
     if risk == Some(Risk::ReadOnly) {
+        *layer = Some(Layer::ReadOnly);
         return Outcome::Run;
     }
     // Layer 6: an edit that stays among the project's own files.
     let edits = matches!(gate.mode, Mode::AcceptEdits | Mode::Auto);
     if edits && editable(tool.name(), &args, gate.ctx) {
+        *layer = Some(Layer::Workspace);
         return Outcome::Run;
     }
     // Layer 7: a command that would otherwise ask runs confined instead,
@@ -522,7 +623,9 @@ fn ladder(
         } else {
             "no rule or allowance covers it"
         };
-        return self::ruling(tool.name(), judge(why), gate.human);
+        let verdict = judge(why);
+        *layer = Some(Layer::Judge(verdict.clone()));
+        return self::ruling(tool.name(), verdict, gate.human);
     }
     if gate.human {
         return Outcome::Ask;
@@ -551,7 +654,7 @@ pub(crate) fn cleared(call: &ToolCall, ctx: &ToolContext) -> bool {
         broken: None,
         human: true,
     };
-    ladder(call, &gate, None, false) == Outcome::Run
+    ladder(call, &gate, None, false, &mut None) == Outcome::Run
 }
 
 /// What "Yes, and stop asking for this" on `call`'s card allows for the
@@ -1549,10 +1652,14 @@ mod tests {
             "web_fetch",
             serde_json::json!({ "url": "https://example.com" }),
         );
-        let Outcome::Refuse(why) = settle(&fetch, &gate, &Connection::default(), &[]) else {
-            panic!("a fetch nobody can approve was not refused");
-        };
-        assert!(!why.contains("auto mode"), "{why}");
+        for mode in [Mode::Default, Mode::Auto] {
+            let gate = Gate { mode, ..gate };
+            let (Outcome::Refuse(why), None) = settle(&fetch, &gate, &Connection::default(), &[])
+            else {
+                panic!("a fetch nobody can approve was not refused in {mode:?}");
+            };
+            assert!(!why.contains("auto mode"), "{why}");
+        }
     }
 
     /// A session working in a project folder, where a read needs no yes.
@@ -1905,25 +2012,26 @@ mod tests {
         let changed = serde_json::json!({ "path": "notes.txt", "old": "a", "new": "b" });
         let learn = serde_json::json!({ "action": "create", "name": "n", "body": "b" });
         // In the order of `Mode::OFFERED`: Default, Accept edits, Plan,
-        // Don't ask, Bypass. A line that only reads runs in every mode; one
-        // that only Accept edits would ask about runs sandboxed there
+        // Auto, Don't ask, Bypass. A line that only reads runs in every mode;
+        // Auto without the judge, as the window runs it, is Accept edits. One
+        // that only Accept edits or Auto would ask about runs sandboxed there
         // instead, on a system that can confine it.
         let confined = if crate::sandbox::available() {
-            "ASXXR"
+            "ASXSXR"
         } else {
-            "AAXXR"
+            "AAXAXR"
         };
         let table = [
-            (command("ls"), "RRRRR"),
+            (command("ls"), "RRRRRR"),
             (command("cargo test"), confined),
-            (edit("src/new.rs"), "ARXXR"),
-            (call("edit_file", changed), "ARXXR"),
-            (edit(".git/hooks/pre-commit"), "AAXXR"),
-            (edit("../outside.txt"), "AAXXR"),
+            (edit("src/new.rs"), "ARXRXR"),
+            (call("edit_file", changed), "ARXRXR"),
+            (edit(".git/hooks/pre-commit"), "AAXAXR"),
+            (edit("../outside.txt"), "AAXAXR"),
             // Learned skills live in Letronna's folder, never the project's.
-            (call("skill_manage", learn), "AAXXR"),
-            (command(DANGEROUS), "AAXXA"),
-            (command("git push origin main"), "XXXXX"),
+            (call("skill_manage", learn), "AAXAXR"),
+            (command(DANGEROUS), "AAXAXA"),
+            (command("git push origin main"), "XXXXXX"),
         ];
         for (queued, expected) in table {
             let got: String = Mode::OFFERED
@@ -2331,7 +2439,7 @@ mod tests {
             let read: Schedule = serde_json::from_value(old.clone().into()).unwrap();
             assert_eq!(read.mode, mode);
         }
-        for mode in Mode::OFFERED.into_iter().chain([Mode::Auto]) {
+        for mode in Mode::OFFERED {
             let text = serde_json::to_string(&mode).unwrap();
             assert_eq!(serde_json::from_str::<Mode>(&text).unwrap(), mode);
         }
@@ -2375,7 +2483,7 @@ mod tests {
 
     #[test]
     fn a_helper_never_runs_in_more_than_its_parent_nor_in_bypass() {
-        let every = Mode::OFFERED.into_iter().chain([Mode::Auto]);
+        let every = Mode::OFFERED.into_iter();
         for parent in every.clone() {
             for wanted in every.clone() {
                 let narrowed = Mode::narrow(parent, wanted);
@@ -2389,7 +2497,8 @@ mod tests {
                 assert_ne!(narrowed, Mode::Bypass);
             }
         }
-        // Auto is not offered yet, so a Bypass parent's helpers ask.
+        // Helpers reach the judge with auto-helpers; until then a Bypass
+        // parent's ask.
         assert_eq!(Mode::narrow(Mode::Bypass, Mode::Bypass), Mode::Default);
         assert_eq!(Mode::narrow(Mode::Bypass, Mode::Plan), Mode::Plan);
         assert_eq!(
@@ -2415,15 +2524,16 @@ mod tests {
     }
 
     #[test]
-    fn a_mode_is_picked_by_its_name_or_its_chip_but_auto_is_not_offered() {
+    fn a_mode_is_picked_by_its_name_or_its_chip_auto_included() {
         assert_eq!(Mode::parse("accept-edits"), Ok(Mode::AcceptEdits));
         assert_eq!(Mode::parse("Edits"), Ok(Mode::AcceptEdits));
         assert_eq!(Mode::parse(" don't ask "), Ok(Mode::DontAsk));
         assert_eq!(Mode::parse("BYPASS"), Ok(Mode::Bypass));
         assert_eq!(Mode::parse("ask"), Ok(Mode::Default));
-        assert!(Mode::parse("auto").unwrap_err().contains("not available"));
+        assert_eq!(Mode::parse("auto"), Ok(Mode::Auto));
+        assert_eq!(Mode::parse(" AUTO"), Ok(Mode::Auto));
         let unknown = Mode::parse("fast").unwrap_err();
-        assert!(unknown.contains("accept-edits, plan"), "{unknown}");
+        assert!(unknown.contains("accept-edits, plan, auto"), "{unknown}");
     }
 
     /// A project folder for one test holding `notes.txt` and a `.git`
@@ -2689,5 +2799,196 @@ mod tests {
         // The two writes count the file's markers instead.
         let kept = serde_json::json!({ "path": "notes.txt", "content": marker });
         assert_eq!(decide(&call("write_file", kept), &gate), Outcome::Run);
+    }
+
+    #[test]
+    fn the_tag_under_a_call_names_the_layer_that_let_it_run() {
+        let dir = project_dir("tags");
+        let ctx = ToolContext {
+            workspace: Some(dir.join("project")),
+            conversation: 7,
+            ..Default::default()
+        };
+        let granted = Grants::from([(7, HashSet::from(["web_fetch".to_owned()]))]);
+        let rules = [
+            Rule {
+                tool: "run_command".into(),
+                pattern: "cargo test".into(),
+                effect: permissions::Effect::Allow,
+                project: None,
+            },
+            Rule {
+                tool: "use_page".into(),
+                pattern: String::new(),
+                effect: permissions::Effect::Allow,
+                project: None,
+            },
+        ];
+        let gate = Gate {
+            ctx: &ctx,
+            mode: Mode::Auto,
+            grants: &granted,
+            rules: &rules,
+            broken: None,
+            human: true,
+        };
+        let allow = |_: &ToolCall, _: &str| Verdict::Allow;
+        let block = |_: &ToolCall, _: &str| Verdict::Block(Category::SendsOut);
+        let tag = |queued: &ToolCall, judge: Judge| {
+            traced(queued, &gate, Some(judge), false)
+                .1
+                .map(|layer| layer.tag())
+        };
+        let read = call("read_file", serde_json::json!({ "path": "notes.txt" }));
+        let fetch = call(
+            "web_fetch",
+            serde_json::json!({ "url": "https://example.com" }),
+        );
+        let click = call(
+            "use_page",
+            serde_json::json!({ "action": "click", "ref": "e1" }),
+        );
+        let tagged = [
+            (read, "no approval needed"),
+            (fetch, "allowed this session"),
+            (command("cargo test --release"), "rule: cargo test"),
+            (click, "rule: use_page"),
+            (command("ls"), "only reads"),
+            (edit("src/new.rs"), "in workspace"),
+        ];
+        for (queued, expected) in tagged {
+            // A layer below the judge settles it, so the judge is never asked.
+            assert_eq!(tag(&queued, &block).as_deref(), Some(expected));
+            assert_eq!(
+                reason(&queued, &gate).map(|layer| layer.tag()).as_deref(),
+                Some(expected)
+            );
+        }
+        let build = command("cargo build");
+        assert_eq!(tag(&build, &allow).as_deref(), Some("auto: allowed"));
+        let (outcome, layer) = traced(&build, &gate, Some(&block), false);
+        assert!(matches!(outcome, Outcome::Refuse(_)), "{outcome:?}");
+        assert_eq!(
+            layer.map(|layer| layer.tag()).as_deref(),
+            Some("auto: blocked — it sends data out")
+        );
+        let unsure = |_: &ToolCall, _: &str| Verdict::Unsure("no answer".into());
+        assert_eq!(
+            traced(&build, &gate, Some(&unsure), false),
+            (
+                Outcome::Ask,
+                Some(Layer::Judge(Verdict::Unsure("no answer".into())))
+            )
+        );
+        // What the floor stops before any layer lets it by has no tag, nor
+        // does what asks with no judge to ask.
+        assert_eq!(tag(&command(DANGEROUS), &allow), None);
+        assert_eq!(traced(&build, &gate, None, false), (Outcome::Ask, None));
+        assert_eq!(reason(&build, &gate), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_batch_is_tagged_by_the_judge_when_a_step_went_to_it() {
+        let ctx = ToolContext::default();
+        let granted = Grants::from([(0, HashSet::from(["use_page".to_owned()]))]);
+        let gate = Gate {
+            ctx: &ctx,
+            mode: Mode::Auto,
+            grants: &granted,
+            rules: &[],
+            broken: None,
+            human: true,
+        };
+        let batch = |steps: serde_json::Value| {
+            call(
+                "use_page",
+                serde_json::json!({ "action": "batch", "steps": steps }),
+            )
+        };
+        let click = serde_json::json!({ "action": "click", "ref": "e1" });
+        let upload = serde_json::json!({ "action": "upload", "ref": "e3", "files": ["cv.pdf"] });
+        let allow = |_: &ToolCall, _: &str| Verdict::Allow;
+        let unsure = |_: &ToolCall, _: &str| Verdict::Unsure("no answer".into());
+        let block = |_: &ToolCall, _: &str| Verdict::Block(Category::SendsOut);
+        // Every step allowed this session: the batch is too.
+        let plain = batch(serde_json::json!([click]));
+        assert_eq!(
+            traced(&plain, &gate, Some(&block), false),
+            (Outcome::Run, Some(Layer::Granted))
+        );
+        // The upload is asked about, or judged, on its own, and its verdict
+        // is the batch's.
+        let sends = batch(serde_json::json!([click, upload]));
+        assert_eq!(
+            traced(&sends, &gate, Some(&allow), false),
+            (Outcome::Run, Some(Layer::Judge(Verdict::Allow)))
+        );
+        let (asked, layer) = traced(&sends, &gate, Some(&unsure), false);
+        assert_eq!(asked, Outcome::Ask);
+        assert!(matches!(layer, Some(Layer::Judge(Verdict::Unsure(_)))));
+        let (refused, layer) = traced(&sends, &gate, Some(&block), false);
+        assert!(matches!(refused, Outcome::Refuse(ref why) if why.contains("Step 2")));
+        assert_eq!(
+            layer,
+            Some(Layer::Judge(Verdict::Block(Category::SendsOut)))
+        );
+        // With no judge the batch asks, and nothing is named for it.
+        assert_eq!(traced(&sends, &gate, None, false), (Outcome::Ask, None));
+    }
+
+    #[test]
+    fn settle_judges_only_in_auto_mode() {
+        let ctx = ToolContext::default();
+        let none = Grants::new();
+        for mode in Mode::OFFERED.into_iter().filter(|mode| *mode != Mode::Auto) {
+            let gate = Gate {
+                ctx: &ctx,
+                mode,
+                grants: &none,
+                rules: &[],
+                broken: None,
+                human: true,
+            };
+            // No endpoint: a judge asked would say it could not answer.
+            let settled = settle(&command("cargo build"), &gate, &Connection::default(), &[]);
+            assert_eq!(
+                settled,
+                (decide(&command("cargo build"), &gate), None),
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_judge_that_cannot_be_reached_asks_or_refuses() {
+        let ctx = ToolContext {
+            conversation: 9_153,
+            ..Default::default()
+        };
+        let none = Grants::new();
+        let typed = ["build it".to_owned()];
+        for human in [true, false] {
+            let gate = Gate {
+                ctx: &ctx,
+                mode: Mode::Auto,
+                grants: &none,
+                rules: &[],
+                broken: None,
+                human,
+            };
+            // No endpoint, so the judge's call fails before it is sent.
+            let (outcome, layer) = settle(
+                &command("cargo build"),
+                &gate,
+                &Connection::default(),
+                &typed,
+            );
+            assert_eq!(outcome == Outcome::Ask, human, "{outcome:?}");
+            assert_eq!(matches!(outcome, Outcome::Refuse(_)), !human);
+            let Some(Layer::Judge(Verdict::Unsure(_))) = layer else {
+                panic!("the judge's failure was not noted: {layer:?}");
+            };
+        }
     }
 }

@@ -109,6 +109,14 @@ pub fn command(
             }
             Flow::Handled
         }
+        "/decisions" => {
+            render::blank();
+            let id = runner.store.conversations[*session].id;
+            for line in crate::session::decided(&runner.decisions, id, runner.mode) {
+                render::line(&render::dim(&line));
+            }
+            Flow::Handled
+        }
         "/model" => {
             switch_model(runner, Some(*session), rest);
             Flow::Handled
@@ -3496,12 +3504,15 @@ pub fn gateways(runner: &mut Runner) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Asked, Run, Stage, agent_lines, agent_rows, asked, choice_label, crew_switch, from_match,
-        keep_days, last_prompt, name_label, run_rows, standing, typed_path, with_files,
+        Asked, Flow, Run, Stage, agent_lines, agent_rows, asked, choice_label, command,
+        crew_switch, from_match, keep_days, last_prompt, name_label, run_rows, standing,
+        typed_path, with_files,
     };
+    use crate::session::Runner;
     use letronna_core::agents::Seen;
     use letronna_core::chat::Message;
     use letronna_core::driver::Status;
+    use letronna_core::gate::Mode;
     use letronna_core::workflow::{AgentState, AgentView, PhaseView, RunState, RunView};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
@@ -3816,5 +3827,29 @@ mod tests {
         assert_eq!(crew_switch("on", true), Some(true));
         assert_eq!(crew_switch("off", false), Some(false));
         assert_eq!(crew_switch("maybe", false), None);
+    }
+
+    #[test]
+    fn slash_mode_auto_hands_what_would_ask_to_the_judge() {
+        let mut runner = Runner {
+            store: Default::default(),
+            allowed: Default::default(),
+            mode: Mode::Default,
+            human: true,
+            trouble: None,
+            bar: crate::bar::Bar::new(String::new()),
+            stopped: false,
+            images: Vec::new(),
+            notices: letronna_core::notify::Notices::new(Box::new(crate::notify::Silent)),
+            ended: None,
+            voice: None,
+            decisions: Vec::new(),
+            review: Default::default(),
+        };
+        let flow = command(&mut runner, "/mode auto", &mut 0, None);
+        assert!(matches!(flow, Flow::Handled));
+        assert_eq!(runner.mode, Mode::Auto);
+        command(&mut runner, "/mode fast", &mut 0, None);
+        assert_eq!(runner.mode, Mode::Auto);
     }
 }

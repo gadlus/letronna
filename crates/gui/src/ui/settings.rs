@@ -1,5 +1,4 @@
 use crate::prelude::*;
-use letronna_core::gate::Mode;
 
 type ApplyMode = std::rc::Rc<dyn Fn(plugins::PresenceMode, &mut App)>;
 
@@ -787,7 +786,8 @@ fn privacy_page(
     settings: &Settings,
     cx: &App,
 ) -> Div {
-    let (default_mode, shared) = (settings.mode, settings.browser_shared);
+    let default_mode = super::composer::shown(settings.mode);
+    let shared = settings.browser_shared;
     let unseen = settings.browse_unseen;
     let notifications = settings.notifications;
     let current = plugins::PresenceMode::from_str(presence.read(cx));
@@ -907,7 +907,7 @@ fn privacy_page(
                 .dropdown_menu({
                     let chat = chat.clone();
                     move |menu, _, _| {
-                        Mode::OFFERED.into_iter().fold(menu, |menu, choice| {
+                        super::composer::offered().fold(menu, |menu, choice| {
                             let chat = chat.clone();
                             menu.item(
                                 PopupMenuItem::new(choice.label())

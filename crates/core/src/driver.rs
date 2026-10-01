@@ -413,6 +413,11 @@ fn work_through(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result
         }
         let decide = |call: &ToolCall| {
             let decide = spec.decide.as_ref()?;
+            // The run's answer is no tool a session's gate knows; `gated`
+            // lets it through to `dispatch`, which takes it.
+            if call.name == STRUCTURED_OUTPUT && spec.schema.is_some() {
+                return None;
+            }
             Some(decide(call, &context(spec)))
         };
         // A tool allowed for the whole run would get its yes at once from
@@ -2328,6 +2333,23 @@ pub(crate) mod tests {
             (last["name"].as_str(), last["content"].as_str()),
             (Some("structured_output"), Some("Answer received."))
         );
+    }
+
+    #[test]
+    fn a_sessions_own_gate_lets_the_answer_through() {
+        let dir = scratch("answer-gate");
+        let given = json!({"real": true, "reason": "the notes say hello"});
+        let (endpoint, _provider) = provider(vec![reply("", &[answering(given.clone())])]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 111);
+        spec.schema = Some(vote());
+        // A gate that runs nothing, as Auto mode's would refuse a tool it
+        // does not know: the answer is not a tool, so it never meets it.
+        spec.decide = Some(Arc::new(|_, _| {
+            crate::gate::Outcome::Refuse("Refused: nothing runs.".into())
+        }));
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(report.value, Some(given));
     }
 
     #[test]

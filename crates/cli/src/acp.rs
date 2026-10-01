@@ -107,6 +107,7 @@ pub fn run() -> i32 {
         ended: None,
         voice: None,
         review: Default::default(),
+        decisions: Vec::new(),
     };
     let open: Open = Box::new(move |cwd| open_session(&mut runner, cwd));
     let stdin = std::io::stdin();
