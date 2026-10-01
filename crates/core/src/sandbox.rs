@@ -15,8 +15,11 @@
 //! to `sandbox-exec`. It starts from nothing allowed, so a command also
 //! cannot ask another program to act for it (`open`, `osascript`,
 //! `launchctl`) or reach the keychain, and it cannot run a setuid program
-//! such as `sudo`. Linux and Windows report no sandbox until their own
-//! backends come, and there the gate asks as before.
+//! such as `sudo`. On Linux, Landlock and a seccomp filter, in `linux`.
+//! Windows reports no sandbox until its own backend comes, and so does a
+//! Linux kernel without Landlock; there the gate asks as before.
+
+mod linux;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -98,7 +101,7 @@ pub fn here() -> &'static dyn Sandbox {
     if cfg!(target_os = "macos") {
         &Seatbelt
     } else {
-        &Unavailable
+        linux::here().unwrap_or(&Unavailable)
     }
 }
 
@@ -119,11 +122,14 @@ const STOPPED: &str = "(this looks like the sandbox stopped it: it has no networ
      user's approval.)";
 
 /// What the kernel and common tools print when the sandbox refuses a file or
-/// the network, lowercased: EPERM from any call, and a host name that cannot
-/// be looked up or connected to, as curl, git, cargo, Python and Node word it.
+/// the network, lowercased: EPERM from any call, EACCES, which Landlock gives
+/// for a file, and a host name that cannot be looked up or connected to, as
+/// curl, git, cargo, Python and Node word it.
 const REFUSALS: &[&str] = &[
     "operation not permitted",
     "eperm",
+    "permission denied",
+    "eacces",
     "resolve host",
     "nodename nor servname",
     "enotfound",
@@ -145,7 +151,8 @@ pub fn noted(output: &str) -> String {
     }
 }
 
-/// No sandbox: Linux and Windows until their own backends come.
+/// No sandbox: Windows until its own backend comes, and Linux on a
+/// processor the network filter does not know.
 struct Unavailable;
 
 impl Sandbox for Unavailable {
@@ -338,6 +345,12 @@ mod tests {
     fn noted_adds_the_way_out_when_output_looks_like_a_refusal() {
         let said = noted("curl: (6) Could not resolve host: example.com");
         assert!(said.starts_with(NOTE));
+        assert!(said.contains("run_command again"), "{said}");
+    }
+
+    #[test]
+    fn noted_adds_the_way_out_when_landlock_refused_a_file() {
+        let said = noted("sh: 1: cannot create ../outside.txt: Permission denied");
         assert!(said.contains("run_command again"), "{said}");
     }
 

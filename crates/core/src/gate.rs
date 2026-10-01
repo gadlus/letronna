@@ -1190,19 +1190,35 @@ fn landing(target: &Path) -> Option<PathBuf> {
 
 /// Whether `path`, taken from the project folder, is or lies in one of
 /// `PROTECTED` or `SECRETS`.
-fn protected(path: &Path) -> bool {
+pub(crate) fn protected(path: &Path) -> bool {
     let names: Vec<String> = path.iter().map(fold).collect();
-    PROTECTED.iter().chain(tools::SECRETS).any(|entry| {
-        let parts: Vec<String> = entry.split('/').map(str::to_ascii_lowercase).collect();
-        names.windows(parts.len()).any(|run| {
-            run.iter()
-                .zip(&parts)
-                .all(|(name, part)| match part.strip_suffix('*') {
-                    Some(start) => name.starts_with(start),
-                    None => name == part,
-                })
+    guarded_entries().any(|parts| names.windows(parts.len()).any(|run| same(run, &parts)))
+}
+
+/// Whether a path that `PROTECTED` or `SECRETS` names from the project
+/// folder itself lies beneath `path`, also taken from there: the project
+/// folder always, `.github` for `.github/workflows`, but not `src`.
+pub(crate) fn leads_to_protected(path: &Path) -> bool {
+    let names: Vec<String> = path.iter().map(fold).collect();
+    guarded_entries().any(|parts| parts.len() > names.len() && same(&names, &parts))
+}
+
+/// Each entry of `PROTECTED` and `SECRETS` as its lowercased names.
+fn guarded_entries() -> impl Iterator<Item = Vec<String>> {
+    (PROTECTED.iter().chain(tools::SECRETS))
+        .map(|entry| entry.split('/').map(str::to_ascii_lowercase).collect())
+}
+
+/// Whether `names` match the first of `parts`, one by one, where a part
+/// ending in `*` takes any name that starts with the rest of it.
+fn same(names: &[String], parts: &[String]) -> bool {
+    names
+        .iter()
+        .zip(parts)
+        .all(|(name, part)| match part.strip_suffix('*') {
+            Some(start) => name.starts_with(start),
+            None => name == part,
         })
-    })
 }
 
 /// `name` as the file system finds it, for matching: without case, and
@@ -2205,6 +2221,28 @@ mod tests {
             decide_with(&command("cargo test"), &gate, None, true),
             Outcome::Ask
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_command_asks_where_the_system_cannot_sandbox_it() {
+        let dir = project_dir("unsandboxed");
+        let ctx = ToolContext {
+            workspace: Some(dir.join("project")),
+            ..Default::default()
+        };
+        let none = Grants::new();
+        let gate = Gate {
+            ctx: &ctx,
+            mode: Mode::AcceptEdits,
+            grants: &none,
+            human: true,
+            rules: &[],
+            broken: None,
+        };
+        let test = command("cargo test");
+        assert_eq!(decide_with(&test, &gate, None, true), Outcome::Sandboxed);
+        assert_eq!(decide_with(&test, &gate, None, false), Outcome::Ask);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
