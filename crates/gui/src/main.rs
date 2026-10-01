@@ -108,6 +108,7 @@ fn main() {
             KeyBinding::new("escape", ui::browser::CancelPoint, Some("Browser")),
             KeyBinding::new("tab", ui::composer::LeaveComposer, Some("Composer > Input")),
             KeyBinding::new("enter", ui::search::OpenHit, Some("SearchHit")),
+            KeyBinding::new("enter", ui::messages::ToggleRun, Some("ToolRun")),
             // The sidebar's own filters, so a shortcut typed elsewhere is
             // never swallowed by one narrowing a list it cannot see.
             KeyBinding::new(

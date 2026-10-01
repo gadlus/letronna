@@ -1,6 +1,9 @@
 use crate::prelude::*;
 use gpui_component::notification::Notification;
 use letronna_core::failure::{self, Failure, FailureKind, Fix, Kept};
+use letronna_core::tool_runs::Run;
+
+actions!(messages, [ToggleRun]);
 
 /// A failed turn set to be asked again when its provider's wait is over.
 pub(crate) struct WaitingRetry {
@@ -910,6 +913,124 @@ impl Chat {
                         )),
                 )
             })
+    }
+
+    /// A run of tool calls as one line, which Enter or a click opens into
+    /// its rows and folds again. While the run is `going`, the line shows
+    /// the call running now rather than what the run has done.
+    pub(crate) fn run_row(
+        &self,
+        run: Run,
+        going: bool,
+        tools: &[std::sync::Arc<dyn letronna_core::tools::Tool>],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let conversation = &self.store.conversations[self.store.active];
+        let key = (conversation.id, run.first);
+        let open = self.runs_open.contains(&key);
+        let focus = window
+            .use_keyed_state(self.row_id("run-focus", run.first), cx, |_, cx| {
+                cx.focus_handle().tab_stop(true)
+            })
+            .read(cx)
+            .clone();
+        // Only a call that runs without asking: one waiting on the user has
+        // its card below, which says so.
+        let running = self.turn.as_ref().filter(|_| going).and_then(|turn| {
+            match turn.next(|call| self.decide(call, &self.rules)) {
+                letronna_core::agent::Next::Run(call) => Some(call),
+                _ => None,
+            }
+        });
+        let theme = cx.theme();
+        let (muted, plain, danger) = (theme.muted_foreground, theme.foreground, theme.danger);
+        let line: Vec<AnyElement> = match running {
+            Some(call) => vec![
+                gpui_component::spinner::Spinner::new()
+                    .xsmall()
+                    .color(theme.primary)
+                    .into_any_element(),
+                div()
+                    .flex_none()
+                    .text_color(plain)
+                    .child(call.name.clone())
+                    .into_any_element(),
+                div()
+                    .font_family(MONO_FONT)
+                    .min_w_0()
+                    .truncate()
+                    .child(letronna_core::tools::summary(&call.name, &call.arguments))
+                    .into_any_element(),
+            ],
+            None => {
+                let told = letronna_core::tool_runs::tell(&conversation.messages, run, tools);
+                let coloured = [(told.did, plain), (told.failed, danger), (told.took, muted)];
+                let mut parts = Vec::new();
+                for (text, color) in coloured {
+                    if text.is_empty() {
+                        continue;
+                    }
+                    if !parts.is_empty() {
+                        parts.push(div().flex_none().child("·").into_any_element());
+                    }
+                    parts.push(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(color)
+                            .child(text)
+                            .into_any_element(),
+                    );
+                }
+                parts
+            }
+        };
+        let toggle = move |this: &mut Self, cx: &mut Context<Self>| {
+            if !this.runs_open.remove(&key) {
+                this.runs_open.insert(key);
+            }
+            cx.notify();
+        };
+        h_flex()
+            .id(self.row_id("run", run.first))
+            .track_focus(&focus)
+            .key_context("ToolRun")
+            .h(px(26.))
+            // As a tool row's: its nowrap text must not widen the column.
+            .min_w_0()
+            .w_full()
+            .px_2()
+            .gap_1p5()
+            .items_center()
+            .rounded(theme.radius)
+            .cursor_pointer()
+            .text_xs()
+            .font_family(HEADING_FONT)
+            .text_color(muted)
+            .focus(|s| s.bg(theme.secondary))
+            .active(|s| s.bg(theme.secondary.opacity(0.5)))
+            .child(
+                Icon::new(if open {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .size_3(),
+            )
+            .children(line)
+            // As on a tool row, a press leaves the keys in the composer;
+            // Tab is what picks the line out.
+            .on_any_mouse_down(|_, window, _| window.prevent_default())
+            // gpui also clicks a focused element when Enter comes back up,
+            // which after ToggleRun folded the line straight back again.
+            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                if !event.is_keyboard() {
+                    toggle(this, cx);
+                }
+            }))
+            .on_action(cx.listener(move |this, _: &ToggleRun, _, cx| toggle(this, cx)))
+            .into_any_element()
     }
 
     fn thinking_block(

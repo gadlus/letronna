@@ -100,6 +100,8 @@ impl Chat {
         conversation.todos = todos_in(&conversation.messages);
         self.thinking_open
             .retain(|&(session, at)| session != id || at < keep);
+        self.runs_open
+            .retain(|&(session, at)| session != id || at < keep);
         self.save();
     }
 
