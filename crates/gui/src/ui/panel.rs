@@ -1,6 +1,7 @@
 //! The panel on the right of the chat: what goes on beside the
-//! conversation, a tab each -- the browser, the session's changes and the
-//! project's files now; the helpers' activity and the jobs join them later.
+//! conversation, a tab each -- the browser, the session's changes, the
+//! project's files and the background jobs now; the helpers' activity joins
+//! them later.
 //!
 //! It is one fixed panel, not a layout of docks: there are no zones to
 //! drag tabs into and nothing to arrange or break. A tab shows only while
@@ -45,17 +46,24 @@ pub(crate) enum PanelTab {
     Browser,
     Changes,
     Files,
+    Jobs,
 }
 
 impl PanelTab {
     /// Every tab, in the order the bar shows them.
-    const ALL: [PanelTab; 3] = [PanelTab::Browser, PanelTab::Changes, PanelTab::Files];
+    const ALL: [PanelTab; 4] = [
+        PanelTab::Browser,
+        PanelTab::Changes,
+        PanelTab::Files,
+        PanelTab::Jobs,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             PanelTab::Browser => "Browser",
             PanelTab::Changes => "Changes",
             PanelTab::Files => "Files",
+            PanelTab::Jobs => "Jobs",
         }
     }
 }
@@ -159,6 +167,13 @@ impl Chat {
                 (chosen || self.has_changes()).then_some(0)
             }
             PanelTab::Files => self.has_files().then_some(0),
+            // Once there is a job, or while it is the tab asked for, which
+            // is where a first job of your own is started. Nothing in it
+            // waits on you.
+            PanelTab::Jobs => {
+                let chosen = self.panel.tabs.get(&self.session_on_screen()) == Some(&tab);
+                (chosen || !letronna_core::jobs::list().is_empty()).then_some(0)
+            }
         }
     }
 
@@ -167,6 +182,7 @@ impl Chat {
             PanelTab::Browser => self.browser.clone().into_any_element(),
             PanelTab::Changes => self.changes_tab(cx),
             PanelTab::Files => self.files_tab(window, cx),
+            PanelTab::Jobs => self.jobs_tab(window, cx),
         }
     }
 
@@ -244,6 +260,9 @@ impl Chat {
         }
         if tab == PanelTab::Files {
             self.focus_files(window);
+        }
+        if tab == PanelTab::Jobs {
+            self.focus_jobs(window);
         }
         cx.notify();
     }
@@ -427,7 +446,8 @@ mod tests {
             vec![
                 (PanelTab::Browser, 0),
                 (PanelTab::Changes, 0),
-                (PanelTab::Files, 0)
+                (PanelTab::Files, 0),
+                (PanelTab::Jobs, 0)
             ]
         );
         assert_eq!(
@@ -436,6 +456,7 @@ mod tests {
         );
         assert_eq!(title(PanelTab::Browser, 0), "Browser");
         assert_eq!(title(PanelTab::Browser, 1), "Browser 1");
+        assert_eq!(title(PanelTab::Jobs, 0), "Jobs");
     }
 
     #[test]

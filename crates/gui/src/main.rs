@@ -346,6 +346,46 @@ pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Opti
             Some("In the changes: undo this session's edits to it"),
         ),
         (
+            KeyBinding::new("secondary-shift-j", ui::jobs::JobsTab, Some("Chat")),
+            Some("Show the Jobs tab"),
+        ),
+        (
+            KeyBinding::new("down", ui::jobs::NextJob, Some("JobList")),
+            Some("In the jobs: the next job"),
+        ),
+        (
+            KeyBinding::new("up", ui::jobs::PreviousJob, Some("JobList")),
+            Some("In the jobs: the job before"),
+        ),
+        (
+            KeyBinding::new("down", ui::jobs::LineDown, Some("JobLog")),
+            None,
+        ),
+        (
+            KeyBinding::new("up", ui::jobs::LineUp, Some("JobLog")),
+            None,
+        ),
+        (
+            KeyBinding::new("shift-down", ui::jobs::PickDown, Some("JobLog")),
+            Some("In a job's output: pick lines down"),
+        ),
+        (
+            KeyBinding::new("shift-up", ui::jobs::PickUp, Some("JobLog")),
+            Some("In a job's output: pick lines up"),
+        ),
+        (
+            KeyBinding::new("secondary-a", ui::jobs::PickAll, Some("JobLog")),
+            Some("In a job's output: pick it all"),
+        ),
+        (
+            KeyBinding::new("escape", ui::jobs::Unpick, Some("JobLog")),
+            None,
+        ),
+        (
+            KeyBinding::new("enter", ui::jobs::AddLines, Some("JobLog")),
+            Some("In a job's output: add the picked lines to the message"),
+        ),
+        (
             KeyBinding::new("enter", ui::actions::ToggleDiff, Some("ChangedFile")),
             Some("On a changed file under a turn: show or hide its diff"),
         ),

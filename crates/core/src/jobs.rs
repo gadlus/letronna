@@ -20,17 +20,23 @@
 //! process, such as a video that renders for minutes: it writes to the same
 //! log, is read, waited for and stopped the same way, and its end reaches the
 //! owner as a process's exit does.
+//!
+//! The window hears of a job starting, printing and ending through a
+//! doorbell rather than by reading the list on a timer, so while no job
+//! prints it has nothing to do.
 
 use crate::cancel::Cancel;
 use crate::inbox::{Notice, When};
 use crate::tasks::{Key, State, Task};
 use std::collections::{BTreeMap, VecDeque};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+use async_channel::{Receiver, Sender};
 
 /// Output kept per job. Enough to see what a server is doing without letting a
 /// chatty process grow without bound.
@@ -82,12 +88,20 @@ const MAX_JOBS: usize = 64;
 pub struct Job {
     pub id: u64,
     pub command: String,
+    /// The folder a process runs in, where a terminal opened for it starts
+    /// too; work on a thread has none.
+    cwd: Option<PathBuf>,
+    /// Whether the user started it from the window rather than the agent.
+    yours: bool,
     log: Arc<Mutex<Log>>,
     ends: Ends,
     /// Set once the process has exited and the reader threads are done, or
     /// the work has returned.
     finished: Arc<AtomicBool>,
     exit_code: Arc<Mutex<Option<i32>>>,
+    /// Set when it was stopped while it ran, as its exit code cannot say:
+    /// a killed process on Windows exits with a code like any other.
+    stopped: AtomicBool,
     watch: Option<Arc<Mutex<Watch>>>,
     started: Instant,
     /// When the process exited, which starts the time until it is cleared.
@@ -118,9 +132,9 @@ enum Ends {
     Token(Cancel),
 }
 
-/// What the UI needs to draw a chip, and the agent to list jobs. Cloned out
-/// so callers hold no locks.
-#[derive(Clone)]
+/// What the UI needs to draw a chip or a row, and the agent to list jobs.
+/// Cloned out so callers hold no locks.
+#[derive(Clone, Debug)]
 pub struct JobInfo {
     pub id: u64,
     pub command: String,
@@ -131,6 +145,52 @@ pub struct JobInfo {
     pub took: Duration,
     /// Bytes it has printed in all, kept or not.
     pub written: u64,
+    /// The folder a process runs in; None for work on a thread.
+    pub cwd: Option<PathBuf>,
+    pub yours: bool,
+    pub stopped: bool,
+}
+
+impl JobInfo {
+    /// Where it stands in words: "running since 14:02", "exited with code 1
+    /// after 3m12s" or "stopped after 5m00s". A running job gives the time it
+    /// started rather than how long it has run, which would need redrawing
+    /// every second to stay true.
+    pub fn state(&self) -> String {
+        if self.running {
+            let since = chrono::Local::now() - self.took;
+            return format!("running since {}", since.format("%H:%M"));
+        }
+        let after = crate::agents::took(self.took.as_secs());
+        match (self.stopped, self.exit_code) {
+            (true, _) => format!("stopped after {after}"),
+            (false, Some(code)) => format!("exited with code {code} after {after}"),
+            (false, None) => format!("ended after {after}"),
+        }
+    }
+
+    /// Whether it ended badly: stopped jobs and clean exits did not.
+    pub fn failed(&self) -> bool {
+        !self.running && !self.stopped && self.exit_code != Some(0)
+    }
+}
+
+/// The doorbell holds a receiver of its own, so a ring with nobody listening
+/// is kept rather than refused; rings while nobody answers merge into one.
+fn doorbell() -> &'static (Sender<()>, Receiver<()>) {
+    static DOORBELL: OnceLock<(Sender<()>, Receiver<()>)> = OnceLock::new();
+    DOORBELL.get_or_init(|| async_channel::bounded(1))
+}
+
+/// Say that a job started, printed, stopped or ended.
+fn ring() {
+    let _ = doorbell().0.try_send(());
+}
+
+/// The doorbell a front end waits on to redraw its jobs, rung whenever one
+/// starts, prints, stops or ends.
+pub fn listen() -> Receiver<()> {
+    doorbell().1.clone()
 }
 
 fn registry() -> &'static Mutex<BTreeMap<u64, Job>> {
@@ -161,11 +221,14 @@ fn pump(
                 Ok(n) => {
                     // Under the log's lock, so a line the watch passes over
                     // before `first_output` is in the text that returns.
-                    let Ok(mut log) = log.lock() else { break };
-                    if let Some(watch) = &watch {
-                        partial.feed(&block[..n], |line| check(watch, line));
+                    {
+                        let Ok(mut log) = log.lock() else { break };
+                        if let Some(watch) = &watch {
+                            partial.feed(&block[..n], |line| check(watch, line));
+                        }
+                        log.add(&block[..n]);
                     }
-                    log.add(&block[..n]);
+                    ring();
                 }
             }
         }
@@ -536,6 +599,13 @@ pub fn start_for(command: &str, cwd: &Path, owner: u64) -> Result<u64, String> {
     start_watching(command, cwd, owner, &[])
 }
 
+/// Start a job the user asked for from the window, once the approval gate
+/// has let it through. Its exit is told to nobody, since no agent is waiting
+/// on it.
+pub fn start_yours(command: &str, cwd: &Path) -> Result<u64, String> {
+    launch(command, cwd, 0, &[], true)
+}
+
 /// Start a job as `start_for` does, telling `owner` too of the output lines
 /// after `first_output` that contain one of `needles`.
 pub fn start_watching(
@@ -543,6 +613,16 @@ pub fn start_watching(
     cwd: &Path,
     owner: u64,
     needles: &[String],
+) -> Result<u64, String> {
+    launch(command, cwd, owner, needles, false)
+}
+
+fn launch(
+    command: &str,
+    cwd: &Path,
+    owner: u64,
+    needles: &[String],
+    yours: bool,
 ) -> Result<u64, String> {
     let mut shell = crate::tools::shell(command, Some(cwd));
     #[cfg(unix)]
@@ -588,6 +668,7 @@ pub fn start_watching(
             }
             let _ = ended.set(Instant::now());
             finished.store(true, Ordering::Relaxed);
+            ring();
             // The pumps can still be reading the last lines, which are the
             // ones the notice is for.
             let waited = std::time::Instant::now();
@@ -608,15 +689,20 @@ pub fn start_watching(
         Job {
             id,
             command: command.to_owned(),
+            cwd: Some(cwd.to_owned()),
+            yours,
             log,
             ends: Ends::Tree(tree),
             finished,
             exit_code,
+            stopped: AtomicBool::new(false),
             watch,
             started,
             ended,
         },
     );
+    drop(jobs);
+    ring();
     Ok(id)
 }
 
@@ -699,6 +785,7 @@ impl Work {
         if let Ok(mut log) = self.log.lock() {
             log.add(format!("{line}\n").as_bytes());
         }
+        ring();
     }
 
     /// Whether the job has been stopped.
@@ -738,15 +825,19 @@ pub fn start_work(
             Job {
                 id,
                 command: label.to_owned(),
+                cwd: None,
+                yours: false,
                 log: log.clone(),
                 ends: Ends::Token(token.clone()),
                 finished: finished.clone(),
                 exit_code: exit_code.clone(),
+                stopped: AtomicBool::new(false),
                 watch: None,
                 started: Instant::now(),
                 ended: ended.clone(),
             },
         );
+    ring();
     let label = crate::tools::one_line(label);
     std::thread::spawn(move || {
         let job = Work { log, token };
@@ -763,6 +854,7 @@ pub fn start_work(
         }
         finished.store(true, Ordering::Relaxed);
         let _ = ended.set(Instant::now());
+        ring();
         let state = if code == 0 {
             State::Done(how.to_owned())
         } else {
@@ -872,11 +964,15 @@ pub fn stop(id: u64) -> Result<(), String> {
         crate::tasks::finish(&Key::Job(id), State::Stopped, None);
         end(job);
     })?;
+    ring();
     Ok(())
 }
 
 /// End a job's process tree, or tell its work to stop.
 fn end(job: &Job) {
+    if !job.finished.load(Ordering::Relaxed) {
+        job.stopped.store(true, Ordering::Relaxed);
+    }
     match &job.ends {
         // Once the shell is reaped, its Unix process group id can pass to an
         // unrelated process, so there a finished job is left alone, as it
@@ -910,8 +1006,84 @@ pub fn list() -> Vec<JobInfo> {
                 .map_or(now, |at| *at)
                 .saturating_duration_since(job.started),
             written: job.log.lock().map_or(0, |log| log.written),
+            cwd: job.cwd.clone(),
+            yours: job.yours,
+            stopped: job.stopped.load(Ordering::Relaxed),
         })
         .collect()
+}
+
+/// Open the user's own terminal in `folder`, for work that wants a person at
+/// the keyboard: Windows Terminal, Terminal.app, or `$TERMINAL` elsewhere.
+pub fn open_terminal(folder: &Path) -> Result<(), String> {
+    let mut tried = Vec::new();
+    for (program, args) in terminals(folder, std::env::var("TERMINAL").ok()) {
+        let mut command = std::process::Command::new(&program);
+        command.args(&args).current_dir(folder);
+        // PowerShell is a console program, so it needs a window of its own,
+        // and that window's input and output: given none, it reads the end
+        // of its input at once and closes. The app has no console handles to
+        // hand down, so PowerShell gets its new console's.
+        if program != "powershell.exe" {
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+            if program == "powershell.exe" {
+                command.creation_flags(CREATE_NEW_CONSOLE);
+            }
+        }
+        match command.spawn() {
+            Ok(mut child) => {
+                // Reaped on a thread of its own, so an exited launcher is
+                // not left behind until Letronna quits.
+                std::thread::spawn(move || child.wait());
+                return Ok(());
+            }
+            Err(_) => tried.push(program),
+        }
+    }
+    Err(if cfg!(any(windows, target_os = "macos")) {
+        format!(
+            "Cannot open a terminal: {} did not start.",
+            tried.join(" or ")
+        )
+    } else {
+        "Cannot open a terminal. Set TERMINAL to yours, such as gnome-terminal or kitty.".to_owned()
+    })
+}
+
+/// The terminals to try in `folder`, in order, as program and arguments;
+/// `terminal` is `$TERMINAL`, which may carry arguments of its own.
+fn terminals(folder: &Path, terminal: Option<String>) -> Vec<(String, Vec<String>)> {
+    let folder = folder.display().to_string();
+    if cfg!(windows) {
+        // Windows Terminal is not on every Windows 10, where PowerShell's
+        // own console is.
+        return vec![
+            ("wt.exe".into(), vec!["-d".into(), folder.clone()]),
+            // The folder goes to it as its working directory, not on a
+            // cmd line, where a `&` in a folder name would start a command.
+            ("powershell.exe".into(), vec!["-NoExit".into()]),
+        ];
+    }
+    if cfg!(target_os = "macos") {
+        return vec![("open".into(), vec!["-a".into(), "Terminal".into(), folder])];
+    }
+    let mut found = Vec::new();
+    if let Some(mut words) = terminal.as_deref().map(str::split_whitespace)
+        && let Some(program) = words.next()
+    {
+        found.push((program.to_owned(), words.map(str::to_owned).collect()));
+    }
+    // Debian's and Ubuntu's name for whichever terminal is the default.
+    found.push(("x-terminal-emulator".into(), Vec::new()));
+    found
 }
 
 /// Kill every job. Called when the app quits so nothing is left running.
@@ -1075,6 +1247,100 @@ mod tests {
             log(id).unwrap()
         );
         assert_eq!(log(id).unwrap().trim_end(), "done");
+    }
+
+    #[test]
+    fn a_job_you_stop_says_so_and_who_started_it() {
+        let dir = std::env::temp_dir();
+        let id = start_yours(&sleep_command(30), &dir).unwrap();
+        let find = || list().into_iter().find(|job| job.id == id).unwrap();
+        let running = find();
+        assert!(running.yours && running.running && !running.stopped);
+        assert_eq!(running.cwd.as_deref(), Some(dir.as_path()));
+        assert!(running.state().starts_with("running since "), "{running:?}");
+        stop(id).unwrap();
+        assert!(until(|| !find().running), "job kept running after stop");
+        let stopped = find();
+        assert!(stopped.stopped && !stopped.failed(), "{stopped:?}");
+        assert!(stopped.state().starts_with("stopped after "), "{stopped:?}");
+    }
+
+    #[test]
+    fn stopped_work_says_so_and_has_no_folder() {
+        let id = start_work("render", 0, |work| {
+            while work.sleep(Duration::from_millis(20)) {}
+            Ok("stopped".into())
+        })
+        .unwrap();
+        let find = || list().into_iter().find(|job| job.id == id).unwrap();
+        let running = find();
+        assert!(running.cwd.is_none() && !running.yours);
+        stop(id).unwrap();
+        assert!(until(|| !find().running), "work kept running after stop");
+        assert!(find().stopped);
+    }
+
+    #[test]
+    fn a_job_rings_the_doorbell_when_it_prints_and_ends() {
+        let doorbell = listen();
+        let id = start(say_done(), &std::env::temp_dir()).unwrap();
+        assert!(until(|| !running(id).unwrap()), "job never finished");
+        // Other tests' jobs ring too, so this says only that it rang.
+        assert!(doorbell.try_recv().is_ok());
+    }
+
+    #[test]
+    fn a_finished_job_reads_as_how_it_ended_and_after_how_long() {
+        let job = |exit_code, stopped, secs| JobInfo {
+            id: 4,
+            command: "npm test".into(),
+            running: false,
+            exit_code,
+            took: Duration::from_secs(secs),
+            written: 0,
+            cwd: None,
+            yours: false,
+            stopped,
+        };
+        assert_eq!(
+            job(Some(0), false, 9).state(),
+            "exited with code 0 after 9s"
+        );
+        assert_eq!(
+            job(Some(1), false, 192).state(),
+            "exited with code 1 after 3m12s"
+        );
+        assert_eq!(job(Some(1), true, 7_500).state(), "stopped after 2h05m");
+        assert_eq!(job(None, false, 60).state(), "ended after 1m00s");
+        assert!(job(Some(1), false, 1).failed());
+        assert!(!job(Some(0), false, 1).failed());
+        assert!(!job(Some(137), true, 1).failed());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_folder_name_never_reaches_a_command_line() {
+        let folder = Path::new(r"C:\work\a&calc");
+        let tried = terminals(folder, None);
+        assert_eq!(tried[1], ("powershell.exe".into(), vec!["-NoExit".into()]));
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn the_terminal_named_in_terminal_goes_first_with_its_arguments() {
+        let folder = Path::new("/work/site");
+        let named = terminals(folder, Some("kitty --single-instance".into()));
+        assert_eq!(
+            named,
+            [
+                ("kitty".into(), vec!["--single-instance".to_owned()]),
+                ("x-terminal-emulator".into(), Vec::new()),
+            ]
+        );
+        assert_eq!(
+            terminals(folder, Some("  ".into())),
+            [("x-terminal-emulator".to_owned(), Vec::new())]
+        );
     }
 
     #[test]
