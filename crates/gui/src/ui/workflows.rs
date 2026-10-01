@@ -4,8 +4,9 @@
 //!
 //! Core keeps a run's board behind a lock and tells nobody when one of its
 //! agents moves on, so the page reads the board as it draws and is drawn
-//! again only when something happens: a notice arrives (a run ended or held
-//! itself), a turn streams, or a button is pressed, Refresh among them.
+//! again only when something happens: the inbox rings (a run ended, held
+//! itself or was stopped), a turn streams, or a button is pressed, Refresh
+//! among them.
 //! Nothing ticks while a run works unwatched, so a row can lag until the
 //! next of those. Core keeps no one agent's transcript or answer, and no log
 //! of a run, where the window can read them, so Open shows the run's result

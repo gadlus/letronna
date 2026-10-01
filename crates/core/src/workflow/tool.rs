@@ -25,7 +25,7 @@ use crate::agents;
 use crate::budget::{Budget, short};
 use crate::cancel::Cancel;
 use crate::chat::{self, Connection, trim};
-use crate::inbox::{Notice, When};
+use crate::inbox::{self, Notice, When};
 use crate::tasks::{self, Key, State, Task};
 use crate::tools::{Caller, Tool, ToolContext, one_line};
 use serde::{Deserialize, Serialize};
@@ -623,7 +623,7 @@ fn number(name: &str) -> u64 {
 
 /// Records how the run with `id` ended and tells its session, once; a stop
 /// and a pause tell nobody, since whoever stopped it knows and a pause has
-/// told.
+/// told, and only ring, so a page showing the run draws its end.
 fn ended(id: u64, key: Key, end: End) {
     let (name, state, text) = {
         let mut runs = registry();
@@ -671,7 +671,11 @@ fn ended(id: u64, key: Key, end: End) {
         when: When::Next,
         text,
     });
+    let told = notice.is_some();
     tasks::finish(&key, state, notice);
+    if !told {
+        inbox::ring();
+    }
 }
 
 /// The caller's runs as rows of the `agents` list; only a session's own
@@ -1188,7 +1192,7 @@ return `${said}\n${"x".repeat(9000)}\nthe end`;
     }
 
     #[test]
-    fn a_stopped_run_sends_no_notice_and_lists_as_stopped() {
+    fn a_stopped_run_sends_no_notice_but_rings_and_lists_as_stopped() {
         let data = Data::new("tool-stop");
         let connection = data.connection("http://127.0.0.1:9/v1");
         let session = connection.conversation;
@@ -1216,6 +1220,9 @@ return `${said}\n${"x".repeat(9000)}\nthe end`;
             root: session,
             ..Default::default()
         };
+        let bell = inbox::listen();
+        // A ring from an earlier test, kept because the inbox holds a receiver.
+        let _ = bell.try_recv();
         let stop = json!({"action": "stop", "to": "wf-1"});
         let said = control(&stop, &caller).unwrap().unwrap();
         assert!(said.starts_with("Stopping wf-1."), "{said}");
@@ -1231,6 +1238,7 @@ return `${said}\n${"x".repeat(9000)}\nthe end`;
         assert!(state.starts_with("stopped · "), "{state}");
         let told = inbox::take(session, true);
         assert!(told.iter().all(|notice| notice.from != "workflow wf-1"));
+        assert!(bell.try_recv().is_ok(), "its end rang nothing to draw on");
         assert_eq!(
             control(&stop, &caller),
             Some(Ok(

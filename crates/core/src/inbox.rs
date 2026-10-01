@@ -117,11 +117,17 @@ pub fn push(to: u64, notice: Notice) {
         }
         wake = inbox.wakes.remove(&to);
     }
-    let _ = doorbell().0.try_send(());
+    ring();
     // Unlocked, since what it wakes may take or leave mail of its own.
     if let Some(wake) = wake {
         wake();
     }
+}
+
+/// Rings the doorbell with no notice, for a change a front end shows but
+/// nobody has to hear, such as the end of a run the user stopped.
+pub fn ring() {
+    let _ = doorbell().0.try_send(());
 }
 
 /// Have the next notice for `to` run `wake` on the thread that leaves it, in

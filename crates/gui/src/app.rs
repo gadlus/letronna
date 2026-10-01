@@ -1670,7 +1670,8 @@ impl Chat {
                     this.drop_ended_asks(cx);
                     this.wake_idle(cx);
                     // A run that ended or held itself says so in a notice,
-                    // which is when the Workflows page has news to show.
+                    // and one the user stopped rings without one, which is
+                    // when the Workflows page has news to show.
                     if this.page == Page::Workflows {
                         cx.notify();
                     }
