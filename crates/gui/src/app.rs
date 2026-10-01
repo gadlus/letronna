@@ -1140,6 +1140,8 @@ impl Chat {
         {
             cx.notify();
         }
+        // The terminal's new sessions come in read whole.
+        self.let_go();
     }
 
     /// Read in the session on screen, off the UI thread, the first time it
@@ -1197,6 +1199,14 @@ impl Chat {
     /// app is writing to: added to while let go of, it would hold only the
     /// new messages, and the next step would be sent those alone.
     fn let_go(&mut self) {
+        // Sessions read in without being opened -- started by a run, a chat
+        // app or the terminal -- are first in line, or nothing would ever
+        // let go of them.
+        for conversation in &self.store.conversations {
+            if !conversation.messages.is_empty() && !self.open.contains(&conversation.id) {
+                self.open.push_back(conversation.id);
+            }
+        }
         let mut at = self.open.len();
         // The front is the session on screen.
         while self.open.len() > OPEN_SESSIONS && at > 1 {
