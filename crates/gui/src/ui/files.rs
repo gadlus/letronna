@@ -47,6 +47,9 @@ const INDENT: f32 = 14.;
 const FLOAT_HEIGHT: Pixels = px(440.);
 /// The share of the tab the tree keeps while a file is previewed under it.
 const TREE_SHARE: f32 = 0.4;
+/// The longest side a previewed picture is decoded at: more than the panel
+/// shows it at on a sharp screen, a fraction of a photo's.
+const PREVIEW_SIDE: u32 = 2048;
 
 /// The tree, the file previewed and whether either is out of date.
 pub(crate) struct Files {
@@ -632,7 +635,7 @@ impl Chat {
                     .into_any_element()
             }
             Look::Lines(lines, widest) => self.numbered_lines(lines.len(), *widest, cx),
-            Look::Picture(path) => div()
+            Look::Picture(path) => crate::ui::pictures::held_while_shown(path, PREVIEW_SIDE)
                 .flex_1()
                 .min_h_0()
                 .p_3()
