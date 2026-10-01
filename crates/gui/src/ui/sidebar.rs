@@ -159,6 +159,10 @@ impl Chat {
 
     pub(crate) fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let now = backend::now();
+        // Kept while the page is open, so the entry it was opened from stays.
+        let session = self.store.conversations[self.store.active].id;
+        let workflows =
+            self.page == Page::Workflows || !letronna_core::workflow::runs(session).is_empty();
         let query = self.search.read(cx).value().to_lowercase();
         let filter = self.session_filter();
         let visible: Vec<usize> = (0..self.store.conversations.len())
@@ -315,7 +319,22 @@ impl Chat {
                         "Scheduled jobs",
                         Some(Page::Jobs),
                         cx,
-                    )),
+                    ))
+                    // Only once the session on screen has a run to show.
+                    .when(workflows, |this| {
+                        this.child(
+                            self.nav_item(
+                                "workflows",
+                                AppIcon::Workflow,
+                                "Workflows",
+                                Some(Page::Workflows),
+                                cx,
+                            )
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.open_workflows(window, cx)),
+                            ),
+                        )
+                    }),
             )
             .child(
                 div().px_2().pt_3().child(

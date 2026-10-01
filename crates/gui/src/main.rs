@@ -185,6 +185,10 @@ fn main() {
                 ui::changes::LeaveMessage,
                 Some("CommitMessage > Input"),
             ),
+            // On the Workflows page, Escape leaves an open run for the list,
+            // and the refresh key reads the runs again.
+            KeyBinding::new("escape", ui::workflows::Back, Some("Workflows")),
+            KeyBinding::new("secondary-r", ui::workflows::Refresh, Some("Workflows")),
         ]);
         // Windows hands Shift and a digit over as the character they type,
         // Ctrl+Shift+4 as "ctrl-$", which a binding written "shift-4" never
