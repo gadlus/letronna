@@ -62,6 +62,7 @@ impl Chat {
             enabled: false,
             last_run: 0,
             mode: Mode::Default,
+            by_model: false,
         };
         schedule::armed_now(&mut fresh);
         let mut id = 0;

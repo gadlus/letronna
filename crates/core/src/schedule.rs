@@ -33,15 +33,21 @@
 //! never in whatever mode it is in itself: in Default the call waits for the
 //! user at a card in the run's session, as a chat's does, and any other mode
 //! decides it with nobody asked.
+//!
+//! The model adds, lists and removes schedules through the `schedule` tool
+//! at the bottom. A job it adds runs later with nobody there, so each add
+//! and remove waits for a person's yes in every mode.
 
 use crate::chat::{self as backend, Connection, Message};
 use crate::driver::{self, Allow, Outcome, Spec};
 use crate::gate::Mode;
 use crate::store::Transcript;
 use crate::timers::{self, TimerId};
+use crate::tools::{self, Tool, ToolContext};
 use crate::{agent, gateway, messaging, store};
 use chrono::{DateTime, Datelike, Local, TimeZone, Timelike};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, TryLockError};
 use std::io::{Read, Write};
@@ -68,6 +74,11 @@ const BEAT: Duration = Duration::from_secs(60);
 /// up when it takes over.
 const RETRY: Duration = Duration::from_secs(5 * 60);
 
+/// The most schedules the `schedule` tool fills the list to. Far more than
+/// anyone keeps by hand, fifty bounds what a model asked again and again
+/// can pile up, each behind a card; the window is not held to it.
+const LIMIT: usize = 50;
+
 #[derive(Clone, Serialize, Deserialize)]
 pub enum Trigger {
     /// Every N minutes since the last run.
@@ -78,6 +89,10 @@ pub enum Trigger {
         minute: u32,
         weekdays_only: bool,
     },
+    /// Once, at an epoch second. It is kept after its run, which set
+    /// `last_run` past it, so the list shows it ran; a Letronna from before
+    /// it reads it as `Unknown` and never runs it.
+    Once { at: u64 },
     /// A kind this build does not know, from a newer Letronna sharing the
     /// data folder: kept as it was written, and never run here.
     #[serde(untagged)]
@@ -104,6 +119,10 @@ impl Trigger {
                 "{} at {hour:02}:{minute:02}",
                 if *weekdays_only { "Weekdays" } else { "Daily" }
             ),
+            Trigger::Once { at } => match Local.timestamp_opt(*at as i64, 0).single() {
+                Some(at) => format!("Once at {}", at.format("%H:%M on %a %-d %b %Y")),
+                None => "Once".into(),
+            },
             Trigger::Unknown(_) => "Set in a newer Letronna".into(),
         }
     }
@@ -127,6 +146,10 @@ pub struct Schedule {
     /// modes kept `unattended` here, which reads as Bypass when true.
     #[serde(default, alias = "unattended")]
     pub mode: Mode,
+    /// Added by the model through the `schedule` tool, which may remove only
+    /// these: the ones the user made stay theirs to remove.
+    #[serde(default)]
+    pub by_model: bool,
 }
 
 fn yes() -> bool {
@@ -173,6 +196,7 @@ fn due_at(schedule: &Schedule, now: DateTime<Local>) -> Option<u64> {
             let at = Local.from_local_datetime(&at).single()?;
             Some(at.timestamp().max(0) as u64)
         }
+        Trigger::Once { at } => (now.timestamp().max(0) as u64 >= at).then_some(at),
         Trigger::Unknown(_) => None,
     }
 }
@@ -193,7 +217,7 @@ pub fn is_due(schedule: &Schedule, now: DateTime<Local>) -> bool {
 pub fn armed_now(schedule: &mut Schedule) {
     if matches!(
         schedule.trigger,
-        Trigger::Every { .. } | Trigger::DailyAt { .. }
+        Trigger::Every { .. } | Trigger::DailyAt { .. } | Trigger::Once { .. }
     ) {
         schedule.last_run = backend::now();
     }
@@ -232,6 +256,9 @@ pub fn next_due(schedule: &Schedule, now: DateTime<Local>) -> Option<u64> {
                 day = day.succ_opt()?;
             }
             None
+        }
+        Trigger::Once { at } => {
+            (at > now.timestamp().max(0) as u64 && schedule.last_run < at).then_some(at)
         }
         Trigger::Unknown(_) => None,
     }
@@ -336,9 +363,9 @@ type Work = Box<dyn Fn(&Schedule) -> Ended + Send + Sync>;
 /// A clone is one more handle on the same runner.
 ///
 /// Every change to the list goes through `change`, which reads the file
-/// afresh under the list's lock and saves at once: the window's edits now,
-/// and the model's `schedule` tool's when it comes, through `current`. What
-/// happens comes on the receiver `start` hands back.
+/// afresh under the list's lock and saves at once: the window's edits, and
+/// the model's `schedule` tool's through `current`. What happens comes on
+/// the receiver `start` hands back.
 #[derive(Clone)]
 pub struct Runner(Arc<Shared>);
 
@@ -980,15 +1007,272 @@ fn said(report: &driver::Report) -> String {
     }
 }
 
+/// The model's tool on the schedules: add one, list them, or remove one it
+/// added. The gate puts every add and remove before a person in every
+/// mode, since a job runs later with nobody there; the driver refuses it
+/// to helpers and scheduled runs, so no run schedules more of itself.
+pub struct Scheduler;
+
+impl Tool for Scheduler {
+    fn name(&self) -> &'static str {
+        "schedule"
+    }
+    fn description(&self) -> &'static str {
+        "Run a prompt later on this computer, each time in a fresh session with nobody there to answer: every N minutes, daily at a time, or once in N minutes. Also lists the schedules and removes one you added. Adding or removing waits for the user's yes."
+    }
+    fn parameters(&self) -> Value {
+        json!({"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["add", "list", "remove"]},
+            "name": {"type": "string", "description": "For add: a few words for the list; defaults to the prompt's start."},
+            "prompt": {"type": "string", "description": "For add: what each run is told. It starts with no memory of this chat, so say everything it needs."},
+            "every_minutes": {"type": "integer", "description": "For add: run every N minutes."},
+            "daily_at": {"type": "string", "description": "For add: HH:MM each day, in this computer's time zone."},
+            "weekdays_only": {"type": "boolean", "description": "With daily_at: Monday to Friday only."},
+            "in_minutes": {"type": "integer", "description": "For add: run once, N minutes from now."},
+            "mode": {"type": "string", "enum": ["default", "accept-edits", "plan", "auto", "bypass"], "description": "For add: what each run may do unasked; with nobody there, what would ask is refused. Defaults to default; pick more only when the user asked for it."},
+            "id": {"type": "integer", "description": "For remove: the schedule's number from list."}
+        }, "required": ["action"]})
+    }
+    fn needs_approval(&self) -> bool {
+        true
+    }
+    fn mutates(&self) -> bool {
+        true
+    }
+    fn preview(&self, args: &Value, ctx: &ToolContext) -> String {
+        card(current(), args, ctx)
+    }
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
+        act(current(), args, ctx)
+    }
+}
+
+/// What a call with `args` does through `runner`, this Letronna's if it
+/// started one.
+fn act(runner: Option<Runner>, args: &Value, ctx: &ToolContext) -> Result<String, String> {
+    // The driver refuses such calls already; this holds should one come
+    // another way, since a run that schedules itself could go on for ever.
+    if ctx.caller.depth > 0 || running(ctx.caller.root).is_some() {
+        return Err(
+            "Only the user's own session changes the schedules, not a helper or a \
+             scheduled run."
+                .into(),
+        );
+    }
+    let Some(runner) = runner else {
+        return Err(
+            "Schedules are not run by this Letronna, as under -p, so they cannot be \
+             changed here. The window and the terminal run them."
+                .into(),
+        );
+    };
+    match args["action"].as_str() {
+        Some("list") => Ok(listed(&load(&runner.0.dir)?)),
+        Some("add") => {
+            let job = drafted(args, ctx, Local::now())?;
+            runner.change(|list| added(list, job))?
+        }
+        Some("remove") => {
+            let id = args["id"]
+                .as_u64()
+                .ok_or("`id` is required: the schedule's number from list.")?;
+            runner.change(|list| removed(list, id))?
+        }
+        _ => Err("`action` is add, list or remove.".into()),
+    }
+}
+
+/// The schedule an add's `args` ask for as of `now`, in the session's
+/// folder; numbered and armed as it is added.
+fn drafted(args: &Value, ctx: &ToolContext, now: DateTime<Local>) -> Result<Schedule, String> {
+    let prompt = args["prompt"].as_str().map(str::trim).unwrap_or_default();
+    if prompt.is_empty() {
+        return Err("`prompt` is required: what each run is told.".into());
+    }
+    let trigger = trigger(args, now)?;
+    let mode = match args["mode"].as_str() {
+        Some(mode) => Mode::parse(mode)?,
+        None => Mode::Default,
+    };
+    let name = match args["name"].as_str().map(tools::one_line) {
+        Some(name) if !name.is_empty() => name,
+        _ => tools::one_line(prompt).chars().take(40).collect(),
+    };
+    Ok(Schedule {
+        id: 0,
+        name,
+        prompt: prompt.into(),
+        workspace: ctx.workspace.clone(),
+        trigger,
+        enabled: true,
+        last_run: 0,
+        mode,
+        by_model: true,
+    })
+}
+
+/// When an add's `args` say to run, as of `now`: exactly one of
+/// `every_minutes`, `daily_at` and `in_minutes`.
+fn trigger(args: &Value, now: DateTime<Local>) -> Result<Trigger, String> {
+    let minutes = |key: &str| match &args[key] {
+        Value::Null => Ok(None),
+        given => given
+            .as_u64()
+            .filter(|&minutes| minutes > 0)
+            .and_then(|minutes| u32::try_from(minutes).ok())
+            .map(Some)
+            .ok_or(format!("`{key}` is a whole number of minutes, 1 or more.")),
+    };
+    let daily = args["daily_at"].as_str();
+    match (minutes("every_minutes")?, daily, minutes("in_minutes")?) {
+        (Some(minutes), None, None) => Ok(Trigger::Every { minutes }),
+        (None, Some(time), None) => {
+            let time = chrono::NaiveTime::parse_from_str(time.trim(), "%H:%M")
+                .map_err(|_| format!("`daily_at` is HH:MM, such as 09:30, not `{time}`."))?;
+            Ok(Trigger::DailyAt {
+                hour: time.hour(),
+                minute: time.minute(),
+                weekdays_only: args["weekdays_only"].as_bool().unwrap_or(false),
+            })
+        }
+        (None, None, Some(minutes)) => Ok(Trigger::Once {
+            at: now.timestamp().max(0) as u64 + u64::from(minutes) * 60,
+        }),
+        _ => Err("Give exactly one of `every_minutes`, `daily_at` and `in_minutes`.".into()),
+    }
+}
+
+/// Add `job` to `list` under the next number, its clock started now: what
+/// the model reads back, or why it was not added.
+fn added(list: &mut Vec<Schedule>, mut job: Schedule) -> Result<String, String> {
+    if list.len() >= LIMIT {
+        return Err(format!(
+            "There are {} schedules already, the most there can be. Remove one first.",
+            list.len()
+        ));
+    }
+    job.id = next_id(list);
+    armed_now(&mut job);
+    let text = format!(
+        "Added schedule #{}, \"{}\": {}, in {} mode. Each run starts a fresh session.",
+        job.id,
+        job.name,
+        job.trigger.label(),
+        job.mode.name()
+    );
+    list.push(job);
+    Ok(text)
+}
+
+/// Remove schedule `id` from `list` if the model added it: what the model
+/// reads back, or why not.
+fn removed(list: &mut Vec<Schedule>, id: u64) -> Result<String, String> {
+    let Some(ix) = list.iter().position(|job| job.id == id) else {
+        return Err(format!("There is no schedule #{id}."));
+    };
+    if !list[ix].by_model {
+        return Err(format!(
+            "Schedule #{id} was made by the user, so only they remove it, in the \
+             window's schedules."
+        ));
+    }
+    let job = list.remove(ix);
+    Ok(format!("Removed schedule #{id}, \"{}\".", job.name))
+}
+
+/// The schedules in `list` as the model reads them.
+fn listed(list: &[Schedule]) -> String {
+    if list.is_empty() {
+        return "There are no schedules.".into();
+    }
+    let mut text = format!("{} of at most {LIMIT} schedules:", list.len());
+    for job in list {
+        let who = if job.by_model {
+            "added by you"
+        } else {
+            "made by the user"
+        };
+        let done = matches!(job.trigger, Trigger::Once { at } if job.last_run >= at);
+        let state = match (job.enabled, done) {
+            (_, true) => ", done",
+            (false, false) => ", off",
+            (true, false) => "",
+        };
+        text.push_str(&format!(
+            "\n#{} \"{}\": {}, {} mode, {who}{state}",
+            job.id,
+            job.name,
+            job.trigger.label(),
+            job.mode.name()
+        ));
+    }
+    text
+}
+
+/// The approval card for a call with `args`, in plain words: what is added
+/// or removed, when it runs, and above all what it may do with nobody there.
+fn card(runner: Option<Runner>, args: &Value, ctx: &ToolContext) -> String {
+    match args["action"].as_str() {
+        Some("add") => match drafted(args, ctx, Local::now()) {
+            Ok(job) => adding(&job, args["in_minutes"].as_u64()),
+            Err(why) => format!("Add a schedule, which will be refused: {why}"),
+        },
+        Some("remove") => {
+            let id = args["id"].as_u64().unwrap_or_default();
+            let found =
+                runner.and_then(|runner| runner.list().into_iter().find(|job| job.id == id));
+            match found {
+                Some(job) => format!(
+                    "Remove schedule #{id}, \"{}\": {}, in {} mode.",
+                    job.name,
+                    job.trigger.label(),
+                    job.mode.name()
+                ),
+                None => format!("Remove schedule #{id}."),
+            }
+        }
+        _ => "List the schedules.".into(),
+    }
+}
+
+/// What the card says of `job` about to be added, where `in_minutes` is a
+/// `Once`'s wait, counted from the yes.
+fn adding(job: &Schedule, in_minutes: Option<u64>) -> String {
+    let when = match (&job.trigger, in_minutes) {
+        (Trigger::Once { .. }, Some(1)) => "Once, a minute after your yes".into(),
+        (Trigger::Once { .. }, Some(minutes)) => format!("Once, {minutes} minutes after your yes"),
+        (Trigger::DailyAt { .. }, _) => format!("{}, this computer's time", job.trigger.label()),
+        _ => job.trigger.label(),
+    };
+    let unasked = match job.mode {
+        Mode::Bypass | Mode::Auto => "It acts without asking anyone.",
+        _ => "Nobody is there to answer, so what would ask is refused.",
+    };
+    let folder = job
+        .workspace
+        .as_ref()
+        .map_or("none".into(), |dir| dir.display().to_string());
+    format!(
+        "Add schedule \"{}\"\nWhen: {when}\nMode: {} -- {}. {unasked}\nFolder: {folder}\n\
+         Each run starts a fresh session and is told:\n{}",
+        job.name,
+        job.mode.name(),
+        job.mode.about(),
+        job.prompt
+    )
+}
+
 #[cfg(test)]
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute here.
     use super::{
-        AT_ONCE, Ended, Event, Runner, Schedule, Trigger, armed_now, is_due, load, lock, next_due,
-        path, runs_dir, save, step,
+        AT_ONCE, Ended, Event, LIMIT, Listed, Runner, Schedule, Trigger, act, armed_now, is_due,
+        load, lock, next_due, path, runs_dir, save, step,
     };
+    use crate::tools::ToolContext;
     use chrono::{DateTime, Local, TimeZone};
+    use serde_json::json;
     use std::path::{Path, PathBuf};
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::sync::{Arc, Mutex};
@@ -1100,6 +1384,7 @@ mod tests {
             enabled: true,
             last_run: 0,
             mode: Default::default(),
+            by_model: false,
         }
     }
 
@@ -1414,9 +1699,9 @@ mod tests {
     #[test]
     fn a_trigger_from_a_newer_letronna_is_kept_as_it_was_and_never_run() {
         let dir = scratch("newer");
-        let once = serde_json::json!({"Once": {"at": 1, "here": true}});
+        let monthly = serde_json::json!({"Monthly": {"day": 1, "here": true}});
         let mut newer = every(2, 1, 120);
-        newer.trigger = serde_json::from_value(once.clone()).unwrap();
+        newer.trigger = serde_json::from_value(monthly.clone()).unwrap();
         save(&dir, &[every(1, 60, 0), newer]).unwrap();
         let probe = probe(&dir);
         probe.runner.run_now(2);
@@ -1429,7 +1714,7 @@ mod tests {
             .unwrap();
         let saved: serde_json::Value =
             serde_json::from_slice(&std::fs::read(path(&dir)).unwrap()).unwrap();
-        assert_eq!(saved[1]["trigger"], once);
+        assert_eq!(saved[1]["trigger"], monthly);
         assert_eq!(
             probe.runner.list()[1].trigger.label(),
             "Set in a newer Letronna"
@@ -1586,5 +1871,182 @@ mod tests {
         let read = load(&dir).unwrap();
         let modes: Vec<Mode> = read.iter().map(|job| job.mode).collect();
         assert_eq!(modes, [Mode::Auto, Mode::Default]);
+    }
+
+    #[test]
+    fn a_once_job_waits_for_its_time_runs_once_and_is_kept_as_done() {
+        let at = now() + 3600;
+        let mut once = schedule(Trigger::Once { at });
+        armed_now(&mut once);
+        assert!(!is_due(&once, Local::now()));
+        assert_eq!(next_due(&once, Local::now()), Some(at));
+        let then = Local.timestamp_opt(at as i64 + 1, 0).unwrap();
+        assert!(is_due(&once, then));
+        once.last_run = at + 1;
+        assert!(!is_due(&once, then) && next_due(&once, then).is_none());
+        assert!(once.trigger.label().starts_with("Once at "));
+
+        // Its time came while it waited: the runner runs it, then never again.
+        let dir = scratch("once");
+        let due = Schedule {
+            last_run: now() - 120,
+            ..schedule(Trigger::Once { at: now() - 60 })
+        };
+        save(&dir, &[due]).unwrap();
+        let probe = probe(&dir);
+        assert_eq!(probe.started.recv_timeout(WAIT).unwrap(), 1);
+        probe.finish.send(()).unwrap();
+        until("the run ended", || {
+            lock(&probe.runner.0.state).running.is_empty()
+        });
+        probe.runner.change(|_| ()).unwrap();
+        assert!(probe.started.recv_timeout(QUIET).is_err(), "it ran twice");
+        let kept = load(&dir).unwrap();
+        assert!(matches!(kept[0].trigger, Trigger::Once { at } if kept[0].last_run >= at));
+        assert!(lock(&probe.runner.0.state).due.is_none());
+    }
+
+    #[test]
+    fn a_letronna_from_before_once_keeps_it_as_unknown_and_writes_it_back_as_it_was() {
+        /// `Trigger` as builds before `Once` have it.
+        #[derive(serde::Serialize, serde::Deserialize)]
+        enum Older {
+            Every {
+                minutes: u32,
+            },
+            DailyAt {
+                hour: u32,
+                minute: u32,
+                weekdays_only: bool,
+            },
+            #[serde(untagged)]
+            Unknown(serde_json::Value),
+        }
+        let written = serde_json::to_value(Trigger::Once { at: 1_900_000_000 }).unwrap();
+        assert_eq!(
+            written,
+            serde_json::json!({"Once": {"at": 1_900_000_000u64}})
+        );
+        let older: Older = serde_json::from_value(written.clone()).unwrap();
+        assert!(matches!(older, Older::Unknown(_)));
+        assert_eq!(serde_json::to_value(&older).unwrap(), written);
+    }
+
+    #[test]
+    fn the_tool_adds_lists_and_removes_only_the_schedules_the_model_added() {
+        let dir = scratch("tool");
+        save(&dir, &[every(1, 60, 0)]).unwrap();
+        let probe = probe(&dir);
+        let runner = || Some(probe.runner.clone());
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..ToolContext::default()
+        };
+        let add = json!({"action": "add", "name": "Digest", "prompt": "Sum up the news.",
+            "daily_at": "07:30", "weekdays_only": true});
+        let said = act(runner(), &add, &ctx).unwrap();
+        assert_eq!(
+            said,
+            "Added schedule #2, \"Digest\": Weekdays at 07:30, in default mode. Each run \
+             starts a fresh session."
+        );
+        let list = load(&dir).unwrap();
+        assert!(list[1].by_model && list[1].workspace == Some(dir.clone()));
+        assert!(list[1].last_run > 0, "a new job waits for its next time");
+
+        let listed = act(runner(), &json!({"action": "list"}), &ctx).unwrap();
+        assert!(listed.contains("#1 \"test\": Every hour, default mode, made by the user"));
+        assert!(listed.contains("#2 \"Digest\": Weekdays at 07:30, default mode, added by you"));
+
+        let remove = |id: u64| act(runner(), &json!({"action": "remove", "id": id}), &ctx);
+        assert!(remove(1).unwrap_err().contains("made by the user"));
+        assert!(remove(7).unwrap_err().contains("no schedule #7"));
+        assert_eq!(remove(2).unwrap(), "Removed schedule #2, \"Digest\".");
+        assert_eq!(load(&dir).unwrap().len(), 1);
+
+        for wrong in [
+            json!({"action": "add", "prompt": "x"}),
+            json!({"action": "add", "prompt": "x", "every_minutes": 5, "in_minutes": 5}),
+            json!({"action": "add", "prompt": "x", "daily_at": "25:00"}),
+            json!({"action": "add", "prompt": "x", "every_minutes": 0}),
+            json!({"action": "add", "prompt": " ", "in_minutes": 5}),
+            json!({"action": "add", "prompt": "x", "in_minutes": 5, "mode": "reckless"}),
+        ] {
+            assert!(act(runner(), &wrong, &ctx).is_err(), "{wrong}");
+        }
+        assert_eq!(load(&dir).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_tool_adds_no_more_than_fifty_schedules() {
+        let dir = scratch("tool-limit");
+        let full: Vec<Schedule> = (1..=LIMIT as u64).map(|id| every(id, 60, 0)).collect();
+        save(&dir, &full).unwrap();
+        let probe = probe(&dir);
+        let add = json!({"action": "add", "prompt": "One more.", "in_minutes": 10});
+        let refused = act(Some(probe.runner.clone()), &add, &ToolContext::default());
+        assert!(refused.unwrap_err().contains("the most there can be"));
+        assert_eq!(load(&dir).unwrap().len(), LIMIT);
+
+        probe
+            .runner
+            .change(|list| list.truncate(LIMIT - 1))
+            .unwrap();
+        act(Some(probe.runner.clone()), &add, &ToolContext::default()).unwrap();
+        assert_eq!(load(&dir).unwrap().len(), LIMIT);
+    }
+
+    #[test]
+    fn the_tool_is_refused_to_helpers_and_scheduled_runs_and_without_a_runner() {
+        let dir = scratch("tool-refused");
+        let probe = probe(&dir);
+        let list = json!({"action": "list"});
+        let mut helper = ToolContext::default();
+        helper.caller.depth = 1;
+        // A session number no other test lists a run in.
+        let session = 9_000_001;
+        let _listed = Listed::new(session, &every(1, 60, 0));
+        let mut scheduled = ToolContext::default();
+        scheduled.caller.root = session;
+        for ctx in [helper, scheduled] {
+            let refused = act(Some(probe.runner.clone()), &list, &ctx).unwrap_err();
+            assert!(
+                refused.contains("not a helper or a scheduled run"),
+                "{refused}"
+            );
+        }
+        let alone = act(None, &list, &ToolContext::default()).unwrap_err();
+        assert!(alone.contains("not run by this Letronna"), "{alone}");
+    }
+
+    #[test]
+    fn the_card_says_when_where_and_in_what_mode_in_plain_words() {
+        let ctx = ToolContext {
+            workspace: Some(PathBuf::from("/work")),
+            ..ToolContext::default()
+        };
+        let card = |args: serde_json::Value| super::card(None, &args, &ctx);
+        let bypass = card(
+            json!({"action": "add", "name": "Deploy", "prompt": "Ship it.",
+            "in_minutes": 30, "mode": "bypass"}),
+        );
+        assert_eq!(
+            bypass,
+            "Add schedule \"Deploy\"\nWhen: Once, 30 minutes after your yes\nMode: bypass -- \
+             runs without asking, bar risky calls and your rules. It acts without asking \
+             anyone.\nFolder: /work\nEach run starts a fresh session and is told:\nShip it."
+        );
+        let daily = card(json!({"action": "add", "prompt": "Tidy up.", "daily_at": "9:05"}));
+        assert!(
+            daily.contains("When: Daily at 09:05, this computer's time\n"),
+            "{daily}"
+        );
+        assert!(daily.contains("what would ask is refused"), "{daily}");
+        let wrong = card(json!({"action": "add", "prompt": "Tidy up."}));
+        assert!(wrong.starts_with("Add a schedule, which will be refused"));
+        assert_eq!(
+            card(json!({"action": "remove", "id": 3})),
+            "Remove schedule #3."
+        );
     }
 }

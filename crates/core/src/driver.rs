@@ -2877,6 +2877,7 @@ mod tests {
             enabled: true,
             last_run: 0,
             mode,
+            by_model: false,
         }
     }
 
@@ -2928,6 +2929,18 @@ mod tests {
             "{results:?}"
         );
         (dir.join("made.txt").exists(), dir.join("made-dir").exists())
+    }
+
+    #[test]
+    fn the_schedule_tool_is_refused_to_a_scheduled_run_and_to_helpers() {
+        let dir = scratch("schedule-tool");
+        let mut spec = scheduled(String::new(), &dir, AGENTS + 380, gate::Mode::Bypass);
+        let _listed = crate::schedule::Listed::new(spec.root, &job(&dir, gate::Mode::Bypass));
+        let why = refused(&spec, "schedule");
+        assert!(why.is_some_and(|why| why.contains("not available in a scheduled run")));
+        spec.depth = 1;
+        let why = refused(&spec, "schedule");
+        assert!(why.is_some_and(|why| why.contains("not available to this helper")));
     }
 
     #[test]

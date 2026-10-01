@@ -538,6 +538,24 @@ fn ladder(
             )
         };
     }
+    // A schedule runs later with nobody there, in the mode it names, so a
+    // person looks at each one added or removed in every mode, as at a
+    // workflow; listing them only looks.
+    if tool.name() == "schedule" {
+        if args["action"] == "list" {
+            *layer = Some(Layer::NoApproval);
+            return Outcome::Run;
+        }
+        return if gate.human {
+            Outcome::Ask
+        } else {
+            Outcome::Refuse(
+                "Refused: the schedules change only with the user's yes, and nobody \
+                 is here to give it. Say what you would have scheduled instead."
+                    .into(),
+            )
+        };
+    }
     // A rules file that cannot be read could deny this call, so no setting,
     // grant or allow answers for it.
     if let Some(why) = gate.broken.or(ruling.broken.as_deref()) {
@@ -1680,6 +1698,49 @@ mod tests {
     }
 
     #[test]
+    fn a_schedule_added_or_removed_waits_for_a_person_in_every_mode_and_a_list_runs() {
+        let ctx = ToolContext::default();
+        let granted = Grants::from([(0, HashSet::from(["schedule".to_owned()]))]);
+        let unasked = |_: &ToolCall, _: &str| -> Verdict { panic!("the judge was asked") };
+        let add =
+            serde_json::json!({"action": "add", "prompt": "x", "in_minutes": 5, "mode": "bypass"});
+        let remove = serde_json::json!({"action": "remove", "id": 1});
+        let modes = [
+            Mode::Default,
+            Mode::AcceptEdits,
+            Mode::Auto,
+            Mode::Bypass,
+            Mode::DontAsk,
+        ];
+        for mode in modes {
+            for human in [true, false] {
+                let gate = Gate {
+                    ctx: &ctx,
+                    mode,
+                    grants: &granted,
+                    rules: &[],
+                    broken: None,
+                    human,
+                };
+                for args in [&add, &remove] {
+                    let outcome =
+                        decide_with(&call("schedule", args.clone()), &gate, Some(&unasked));
+                    if human && mode != Mode::DontAsk {
+                        assert_eq!(outcome, Outcome::Ask, "{mode:?}");
+                    } else {
+                        assert!(
+                            matches!(outcome, Outcome::Refuse(_)),
+                            "{mode:?}: {outcome:?}"
+                        );
+                    }
+                }
+                let list = call("schedule", serde_json::json!({"action": "list"}));
+                assert_eq!(decide_with(&list, &gate, Some(&unasked)), Outcome::Run);
+            }
+        }
+    }
+
+    #[test]
     fn a_workflow_waits_for_a_person_in_every_mode() {
         let ctx = ToolContext::default();
         let granted = Grants::from([(0, HashSet::from(["workflow".to_owned()]))]);
@@ -2313,6 +2374,7 @@ mod tests {
             enabled: true,
             last_run: 0,
             mode: Mode::DontAsk,
+            by_model: false,
         };
         let mut saved = serde_json::to_value(&schedule).unwrap();
         assert_eq!(saved["mode"], "dont-ask");
