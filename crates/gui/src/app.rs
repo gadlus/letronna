@@ -183,6 +183,8 @@ pub(crate) struct Chat {
     pub(crate) loading_models: bool,
     pub(crate) gateway_error: Option<String>,
     pub(crate) busy: bool,
+    /// The sessions a summary the user asked for is being made of.
+    pub(crate) compacting: std::collections::HashSet<u64>,
     /// The turn in flight, if any. Owns the streamed reply and the tool queue.
     pub(crate) turn: Option<agent::Turn>,
     /// Stops the tool the turn in flight is running, when set.
@@ -779,6 +781,7 @@ impl Chat {
             settings_closing: false,
             rename,
             busy: false,
+            compacting: Default::default(),
             turn: None,
             turn_stop: Default::default(),
             call_running: false,
@@ -1364,6 +1367,7 @@ impl Chat {
         };
         connection.workspace = self.store.conversations[ix].workspace.clone();
         let messages = self.store.conversations[ix].messages.clone();
+        let summaries = self.store.conversations[ix].asked.clone();
         if let Some(earlier) = self.aside.take() {
             earlier.cancel.set();
         }
@@ -1378,7 +1382,8 @@ impl Chat {
         });
         let (sender, receiver) = async_channel::bounded(1);
         std::thread::spawn(move || {
-            let answer = letronna_core::agents::btw(&connection, messages, &question, cancel);
+            let answer =
+                letronna_core::agents::btw(&connection, messages, summaries, &question, cancel);
             let _ = sender.send_blocking(answer);
         });
         cx.spawn(async move |this, cx| {
@@ -1960,9 +1965,11 @@ impl Chat {
             return;
         };
         turn.connection.workspace = self.store.conversations[ix].workspace.clone();
-        let receiver = backend::start(
+        let conversation = &self.store.conversations[ix];
+        let receiver = backend::start_from(
             turn.connection.clone(),
-            self.store.conversations[ix].messages.clone(),
+            conversation.messages.clone(),
+            conversation.floor(),
         );
         turn.live = agent::Live::default();
         cx.notify();

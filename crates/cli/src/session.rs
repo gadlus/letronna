@@ -244,12 +244,14 @@ impl Runner {
     pub fn btw(&mut self, session: usize, question: &str) -> Result<Message, String> {
         let connection = self.connection(session);
         chat::validate(&connection)?;
-        let messages = self.store.conversations[session].messages.clone();
+        let conversation = &self.store.conversations[session];
+        let (messages, asked) = (conversation.messages.clone(), conversation.asked.clone());
         let cancel = Cancel::default();
         let (stop, question) = (cancel.clone(), question.to_owned());
         let (sender, receiver) = async_channel::bounded(1);
         std::thread::spawn(move || {
-            let _ = sender.send_blocking(agents::btw(&connection, messages, &question, stop));
+            let answer = agents::btw(&connection, messages, asked, &question, stop);
+            let _ = sender.send_blocking(answer);
         });
         self.bar.working(true);
         self.bar.wait_line_about("btw");
@@ -472,9 +474,11 @@ impl Runner {
     /// One model call, printed as it streams. `None` when the user stopped
     /// waiting for it.
     fn stream_once(&mut self, turn: &mut Turn, session: usize) -> Result<Option<Message>, String> {
-        let receiver = waitable(chat::start(
+        let conversation = &self.store.conversations[session];
+        let receiver = waitable(chat::start_from(
             turn.connection.clone(),
-            self.store.conversations[session].messages.clone(),
+            conversation.messages.clone(),
+            conversation.floor(),
         ));
         // The model's name lives under the input box, so an answer only needs
         // its bullet here.

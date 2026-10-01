@@ -163,6 +163,10 @@ pub const COMMANDS: &[Command<'static>] = &[
         blurb: "carry on in a copy of this session",
     },
     Command {
+        name: "/compact",
+        blurb: "summarize earlier turns now; a number keeps that many last turns",
+    },
+    Command {
         name: "/init",
         blurb: "have the model write or fill in the project's AGENTS.md",
     },

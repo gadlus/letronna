@@ -597,22 +597,26 @@ fn sized(context: Option<u64>, output: Option<u64>, cap: usize, fixed: usize) ->
 ///
 /// This is deliberately stateless: the same message list always yields the same
 /// start, so nothing needs saving and two requests over the same history agree.
-fn window_start(messages: &[Message], budget: &Budget) -> usize {
+/// The one exception is `floor`, the end of a summary the user asked for,
+/// which the session's file keeps with it: the window starts no earlier, at
+/// the turn it ends on, and steps on from there as from any other place.
+fn window_from(messages: &[Message], budget: &Budget, floor: usize) -> usize {
     let last_user = messages.iter().rposition(opens_turn).unwrap_or(0);
-    start_before(messages, budget, last_user, 0, 0)
+    start_before(messages, budget, floor, last_user, 0, 0)
 }
 
 /// Where the window would start for the request after a reply to `messages`
 /// and a turn following it, which add `ahead` tokens between them.
-fn start_ahead(messages: &[Message], budget: &Budget, ahead: usize) -> usize {
-    start_before(messages, budget, messages.len(), ahead, 2)
+fn start_ahead(messages: &[Message], budget: &Budget, floor: usize, ahead: usize) -> usize {
+    start_before(messages, budget, floor, messages.len(), ahead, 2)
 }
 
-/// `window_start`, where the turn at `last_user` goes in whatever its size,
+/// `window_from`, where the turn at `last_user` goes in whatever its size,
 /// and `more` messages of `ahead` tokens come after `messages`.
 fn start_before(
     messages: &[Message],
     budget: &Budget,
+    floor: usize,
     last_user: usize,
     ahead: usize,
     more: usize,
@@ -629,7 +633,7 @@ fn start_before(
     for (i, m) in messages.iter().enumerate() {
         marks.push(marks[i] + message_tokens(m, budget.tool_chars).max(least));
     }
-    let mut start = 0;
+    let mut start = summary_end(messages, floor);
     while start < last_user
         && (total - sums[start] > budget.tokens || messages.len() + more - start > budget.messages)
     {
@@ -652,10 +656,42 @@ pub(crate) fn window_start_within(context: u64, messages: &[Message]) -> usize {
 }
 
 /// Whether a message starts a turn: the user's, and not folded into one running.
-pub(crate) fn opens_turn(message: &Message) -> bool {
+pub fn opens_turn(message: &Message) -> bool {
     // Roles alone cannot tell a follow-up folded in after tool results from a
     // prompt sent after a step was stopped or failed, which follows them too.
     message.role == "user" && !message.folded
+}
+
+/// `window_from` with no summary the user asked for.
+#[cfg(test)]
+fn window_start(messages: &[Message], budget: &Budget) -> usize {
+    window_from(messages, budget, 0)
+}
+
+/// Where a summary of the first `upto` messages can end: the start of the
+/// turn at or before it, never past the latest turn's, which always goes
+/// out whole, nor between a tool call and its result. 0 when no turn but
+/// the first starts early enough.
+fn summary_end(messages: &[Message], upto: usize) -> usize {
+    let anchor = messages.iter().rposition(opens_turn).unwrap_or(0);
+    (1..=upto.min(anchor))
+        .rev()
+        .find(|&at| opens_turn(&messages[at]) && !answered_after(messages, at))
+        .unwrap_or(0)
+}
+
+/// Whether a call made before `at` has its result at or after it.
+fn answered_after(messages: &[Message], at: usize) -> bool {
+    let (before, after) = messages.split_at(at);
+    let calls: HashSet<&str> = before
+        .iter()
+        .flat_map(|m| &m.tool_calls)
+        .map(|call| call.id.as_str())
+        .filter(|id| !id.is_empty())
+        .collect();
+    after
+        .iter()
+        .any(|m| m.role == "tool" && calls.contains(m.tool_call_id.as_str()))
 }
 
 #[cfg(test)]
@@ -1970,12 +2006,28 @@ pub struct Extra {
     pub cancel: Cancel,
     /// Held until the stream is over, so whatever it carries lasts as long as the call.
     pub guard: Option<Box<dyn Any + Send>>,
+    /// The session's `Conversation::floor`, which the window never starts before.
+    pub floor: usize,
 }
 
 /// A reply to `messages`, streamed, after which the summary the next turn's
 /// request is likely to need is made ahead, since someone usually answers.
 pub fn start(connection: Connection, messages: Vec<Message>) -> async_channel::Receiver<Event> {
-    begin(connection, messages, Extra::default(), true)
+    start_from(connection, messages, 0)
+}
+
+/// `start`, for a session whose window never starts before `floor`, its
+/// `Conversation::floor`.
+pub fn start_from(
+    connection: Connection,
+    messages: Vec<Message>,
+    floor: usize,
+) -> async_channel::Receiver<Event> {
+    let extra = Extra {
+        floor,
+        ..Default::default()
+    };
+    begin(connection, messages, extra, true)
 }
 
 /// `start`, with tools, a stop signal and a guard of the caller's own, and
@@ -1997,7 +2049,7 @@ fn begin(
 ) -> async_channel::Receiver<Event> {
     let budget = budget(&connection, crate::store::context_cap());
     // Before the reply exists, so every call it makes is stamped with it.
-    let window = window_start(&messages, &budget);
+    let window = window_from(&messages, &budget, extra.floor);
     crate::filestate::asked(connection.conversation, messages.len(), window);
     let (sender, receiver) = async_channel::bounded(64);
     std::thread::spawn(move || {
@@ -2047,7 +2099,7 @@ fn begin(
         // moment it is finds the summary being made and waits for it rather
         // than asking for another.
         let making = if ahead && result.is_ok() {
-            claim_next(&connection, &messages, &budget)
+            claim_next(&connection, &messages, &budget, extra.floor)
         } else {
             None
         };
@@ -2090,20 +2142,21 @@ fn budget_for(connection: &Connection, primary: &Connection, own: Budget) -> Bud
 
 /// The place claimed for the summary of what the window drops at its next
 /// step, when the next turn after a reply to `messages` is likely to take it
-/// there, and the provider's turn it is asked on.
+/// there, and the provider's turn it is asked on. `floor` is the session's.
 fn claim_next<'a>(
     connection: &Connection,
     messages: &'a [Message],
     budget: &Budget,
+    floor: usize,
 ) -> Option<(crate::compact::Making<'a>, crate::limits::Permit)> {
     // A quarter of the window: more than most replies and results, so the
     // summary is ready in time, and not so much that it is made long before.
     // The places the window starts at stay put, so one made early is used
     // when it gets there, unless the session ends or is taken back first.
-    let next = start_ahead(messages, budget, budget.tokens / 4);
+    let next = start_ahead(messages, budget, floor, budget.tokens / 4);
     // Only a place among the messages sent: where the reply's own turn falls
     // is not known yet.
-    if next <= window_start(messages, budget) || next >= messages.len() {
+    if next <= window_from(messages, budget, floor) || next >= messages.len() {
         return None;
     }
     // Nobody waits for it yet, so it is a background call: without a permit
@@ -2128,11 +2181,97 @@ fn send_window(
     if let Some(failure) = doomed(connection, messages, budget) {
         return Err(failure);
     }
-    let start = window_start(messages, budget);
+    let start = window_from(messages, budget, extra.floor);
     // A fallback or a refit can start later than the window stamped before
     // the call, and a read it leaves out must not let an edit through.
     crate::filestate::asked(connection.conversation, messages.len(), start);
     stream(connection, messages, start, budget, extra, lsp, sender)
+}
+
+/// A summary the user asked for, and about what the next request comes to
+/// before and after it, in tokens.
+pub struct Compacted {
+    /// How many of the session's first messages it covers.
+    pub upto: usize,
+    pub text: String,
+    pub before: usize,
+    pub after: usize,
+    /// `compact::keys` of the messages it covers, as they were when it was
+    /// asked for, so it is kept only by a session that still starts so.
+    pub key: u64,
+    /// The model that made it, and what that took; None when it was made
+    /// already and no call was needed.
+    pub model: String,
+    pub usage: Option<crate::usage::Usage>,
+}
+
+impl Compacted {
+    /// What it did, as the user is told.
+    pub fn report(&self) -> String {
+        format!(
+            "Compacted: {} → {} tokens",
+            crate::usage::count(self.before as u64),
+            crate::usage::count(self.after as u64)
+        )
+    }
+}
+
+/// Summarize the session's first `upto` messages now, as far as
+/// `summary_end` allows, rather than once the window drops them; the turns
+/// after stay word for word. `floor` and `summary` are the session's own.
+/// An error, with nothing summarized, when nothing is left to summarize or
+/// the model made no summary.
+pub fn compact(
+    connection: &Connection,
+    messages: &[Message],
+    floor: usize,
+    summary: Option<&str>,
+    upto: usize,
+) -> Result<Compacted, String> {
+    let end = summary_end(messages, upto);
+    if end == 0 {
+        return Err("Nothing to summarize: no turn comes before it.".into());
+    }
+    validate(connection)?;
+    let budget = budget(connection, crate::store::context_cap());
+    let start = window_from(messages, &budget, floor);
+    if end <= start {
+        return Err("Nothing to summarize: the turns before it are summarized already.".into());
+    }
+    let sums = token_sums(messages, budget.tool_chars);
+    let fixed = fixed_tokens(connection);
+    // A summary goes out only when the window leaves something out.
+    let cost = |start: usize, summary: Option<&str>| {
+        let summary = summary.filter(|_| start > 0).map_or(0, tokens);
+        fixed + summary + sums[messages.len()] - sums[start]
+    };
+    let (text, usage) = crate::compact::manual(connection, &messages[..end], budget.tokens)
+        .map_err(|e| format!("The summary failed, so every turn is kept as it was: {e}"))?;
+    let (before, after) = (
+        cost(start, summary),
+        cost(window_from(messages, &budget, end), Some(&text)),
+    );
+    // A summary as long as what it stands for would still keep the turns
+    // from a bigger model's window, for nothing.
+    if after >= before {
+        return Err("The summary would not save anything, so every turn is kept.".into());
+    }
+    Ok(Compacted {
+        upto: end,
+        before,
+        after,
+        key: crate::compact::keys(&messages[..end])[end],
+        model: connection.model.clone(),
+        usage,
+        text,
+    })
+}
+
+/// Whether summarizing up to `upto` has anything to sum up: a turn before
+/// it, not summarized already up to `floor`. A window that left the turns
+/// out can still refuse it.
+pub fn summarizable(messages: &[Message], floor: usize, upto: usize) -> bool {
+    summary_end(messages, upto) > summary_end(messages, floor)
 }
 
 /// A refusal, when the model's window is known, for a request whose fixed
@@ -4085,6 +4224,237 @@ mod tests {
         assert_eq!(window_start(&messages, &Budget::SMALL), 4);
     }
 
+    /// Three turns, `tag` in the first two, the first calling a tool.
+    fn three_turns(tag: &str) -> Vec<Message> {
+        vec![
+            said("user", &format!("first {tag} {}", "x".repeat(4_000))),
+            Message {
+                role: "assistant".into(),
+                tool_calls: vec![ToolCall {
+                    id: "c".into(),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                }],
+                ..Default::default()
+            },
+            Message {
+                role: "tool".into(),
+                tool_call_id: "c".into(),
+                content: "fn main() {}".into(),
+                ..Default::default()
+            },
+            said("assistant", "Read it."),
+            said("user", &format!("second {tag}")),
+            said("assistant", "Sure."),
+            said("user", "third"),
+            said("assistant", "Done."),
+        ]
+    }
+
+    #[test]
+    fn a_summary_ends_where_a_turn_starts_and_never_past_the_latest() {
+        let messages = three_turns("ends");
+        assert_eq!(summary_end(&messages, 8), 6);
+        assert_eq!(summary_end(&messages, 99), 6);
+        assert_eq!(summary_end(&messages, 6), 6);
+        assert_eq!(summary_end(&messages, 5), 4);
+        assert_eq!(summary_end(&messages, 3), 0);
+        assert_eq!(summary_end(&messages, 0), 0);
+        assert_eq!(summary_end(&[], 3), 0);
+    }
+
+    #[test]
+    fn a_summary_never_ends_between_a_call_and_its_result_or_inside_a_turn() {
+        let mut messages = three_turns("pairs");
+        // A prompt sent while a call was still unanswered.
+        messages.insert(2, said("user", "wait"));
+        assert_eq!(summary_end(&messages, 3), 0);
+        // A follow-up folded into a running turn does not start one.
+        messages[5].folded = true;
+        assert_eq!(summary_end(&messages, 6), 0);
+        assert_eq!(summary_end(&messages, 7), 7);
+    }
+
+    #[test]
+    fn the_window_never_starts_before_the_users_summary() {
+        let messages = three_turns("floor");
+        assert_eq!(window_start(&messages, &Budget::SMALL), 0);
+        assert_eq!(window_from(&messages, &Budget::SMALL, 4), 4);
+        // Only ever where a turn starts, and never past the latest one.
+        assert_eq!(window_from(&messages, &Budget::SMALL, 5), 4);
+        assert_eq!(window_from(&messages, &Budget::SMALL, 99), 6);
+        assert_eq!(window_from(&messages, &Budget::SMALL, 2), 0);
+    }
+
+    #[test]
+    fn past_the_users_summary_the_window_still_steps_on_and_holds_still() {
+        let mut messages = Vec::new();
+        let mut starts = Vec::new();
+        for i in 0..40 {
+            messages.push(said("user", &format!("question {i} {}", "x".repeat(600))));
+            messages.push(said(
+                "assistant",
+                &format!("answer {i} {}", "y".repeat(600)),
+            ));
+            starts.push(window_from(&messages, &Budget::SMALL, 4));
+        }
+        assert!(starts[2..].iter().all(|&start| start >= 4), "{starts:?}");
+        assert!(starts.windows(2).all(|w| w[0] <= w[1]), "{starts:?}");
+        let moves = starts.windows(2).filter(|w| w[0] != w[1]).count();
+        assert!((3..10).contains(&moves), "{starts:?}");
+        let sums = token_sums(&messages, MAX_TOOL_CHARS);
+        let start = starts[39];
+        assert!(sums[messages.len()] - sums[start] <= Budget::SMALL.tokens);
+    }
+
+    /// A provider that answers one summary request with `status` and `reply`,
+    /// and gives back what it was sent.
+    fn summarizer(
+        status: &'static str,
+        reply: &'static str,
+    ) -> (String, std::thread::JoinHandle<String>) {
+        use std::io::Write;
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1", server.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = server.accept().unwrap();
+            let sent = request_body(&mut socket);
+            write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+            sent
+        });
+        (endpoint, worker)
+    }
+
+    #[test]
+    fn compacting_now_sums_up_all_but_the_latest_turn_and_says_by_how_much() {
+        let (endpoint, worker) = summarizer(
+            "200 OK",
+            r#"{"choices":[{"message":{"content":"Read main.rs."}}]}"#,
+        );
+        let c = Connection {
+            endpoint,
+            ..connection()
+        };
+        let messages = three_turns("now");
+        let done = compact(&c, &messages, 0, None, messages.len()).unwrap();
+        assert_eq!((done.upto, done.text.as_str()), (6, "Read main.rs."));
+        assert!(done.before > done.after + 900, "{}", done.report());
+        assert!(
+            done.report().starts_with("Compacted: "),
+            "{}",
+            done.report()
+        );
+        let sent = worker.join().unwrap();
+        assert!(
+            sent.contains("first now") && sent.contains("second now"),
+            "{sent}"
+        );
+        assert!(!sent.contains("third"), "{sent}");
+        // Nothing is left to sum up until another turn comes.
+        let again = compact(&c, &messages, 6, Some(&done.text), messages.len());
+        assert!(again.is_err_and(|e| e.contains("summarized already")));
+    }
+
+    #[test]
+    fn a_failed_summary_keeps_every_turn_and_nothing_to_sum_up_is_not_asked() {
+        let (endpoint, worker) = summarizer("500 Internal Server Error", r#"{"error":"down"}"#);
+        let c = Connection {
+            endpoint,
+            ..connection()
+        };
+        let messages = three_turns("fails");
+        let failed = compact(&c, &messages, 0, None, 4);
+        assert!(
+            failed
+                .as_ref()
+                .is_err_and(|e| e.contains("every turn is kept")),
+            "{:?}",
+            failed.err()
+        );
+        worker.join().unwrap();
+        // With the provider gone, these would fail differently if asked.
+        let nothing = |e: String| e.starts_with("Nothing to summarize");
+        assert!(compact(&c, &messages[..4], 0, None, 4).is_err_and(nothing));
+        assert!(compact(&c, &messages, 0, None, 3).is_err_and(nothing));
+        let unset = Connection {
+            endpoint: String::new(),
+            ..connection()
+        };
+        assert!(compact(&unset, &messages, 0, None, 4).is_err());
+    }
+
+    #[test]
+    fn a_summary_that_saves_nothing_is_refused() {
+        let long = "y".repeat(3_000);
+        let reply: &'static str =
+            format!(r#"{{"choices":[{{"message":{{"content":"{long}"}}}}]}}"#).leak();
+        let (endpoint, worker) = summarizer("200 OK", reply);
+        let c = Connection {
+            endpoint,
+            ..connection()
+        };
+        let messages = vec![
+            said("user", "hi"),
+            said("assistant", "Hello."),
+            said("user", "and then?"),
+            said("assistant", "Done."),
+        ];
+        let done = compact(&c, &messages, 0, None, 2);
+        assert!(
+            done.as_ref()
+                .is_err_and(|e| e.contains("would not save anything")),
+            "{:?}",
+            done.err()
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn only_turns_past_the_users_summary_are_offered_for_summing_up() {
+        let messages = three_turns("offered");
+        assert!(!summarizable(&messages, 0, 0));
+        assert!(!summarizable(&messages, 0, 3));
+        assert!(summarizable(&messages, 0, 4));
+        assert!(!summarizable(&messages, 4, 5));
+        assert!(summarizable(&messages, 4, 8));
+        assert!(!summarizable(&messages, 6, 8));
+    }
+
+    #[test]
+    fn a_summary_never_ends_between_parallel_calls_and_their_results() {
+        let call = |id: &str| ToolCall {
+            id: id.into(),
+            name: "read_file".into(),
+            arguments: "{}".into(),
+        };
+        let result = |id: &str| Message {
+            role: "tool".into(),
+            tool_call_id: id.into(),
+            content: "ok".into(),
+            ..Default::default()
+        };
+        let mut messages = vec![
+            said("user", "read both"),
+            Message {
+                role: "assistant".into(),
+                tool_calls: vec![call("a"), call("b")],
+                ..Default::default()
+            },
+            result("a"),
+            result("b"),
+            said("assistant", "Both read."),
+            said("user", "next"),
+            said("assistant", "Sure."),
+            said("user", "last"),
+        ];
+        assert_eq!(summary_end(&messages, 5), 5);
+        assert_eq!(window_from(&messages, &Budget::SMALL, 5), 5);
+        // A prompt sent while the second call was still running.
+        messages.insert(3, said("user", "wait"));
+        assert_eq!(summary_end(&messages, 4), 0);
+        assert_eq!(summary_end(&messages, 6), 6);
+    }
+
     #[test]
     fn a_request_sends_its_window_and_a_summary_of_the_rest() {
         use std::io::Write;
@@ -4139,6 +4509,42 @@ mod tests {
         assert!(!bodies[1].contains("write the big file"));
         assert!(bodies[1].contains("A big file was written."));
         assert!(bodies[1].contains("thanks"));
+    }
+
+    #[test]
+    fn a_request_with_the_users_summary_starts_at_its_floor() {
+        use std::io::Write;
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1", server.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let reply =
+                "data: {\"choices\":[{\"delta\":{\"content\":\"Welcome\"}}]}\n\ndata: [DONE]\n\n";
+            let (mut socket, _) = server.accept().unwrap();
+            let sent = request_body(&mut socket);
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+            sent
+        });
+        let c = Connection {
+            endpoint,
+            ..connection()
+        };
+        let messages = three_turns("floor sent");
+        crate::compact::remember(&messages[..4], "The user had main.rs read.");
+        let extra = Extra {
+            floor: 4,
+            ..Default::default()
+        };
+        let rx = start_with(c, messages, extra);
+        while let Ok(event) = rx.recv_blocking() {
+            if let Event::Finished(done) = event {
+                assert!(done.is_ok(), "{done:?}");
+            }
+        }
+        // It fits the window whole, yet what the user summed up stays out.
+        let sent = worker.join().unwrap();
+        assert!(!sent.contains("first floor sent"), "{sent}");
+        assert!(sent.contains("The user had main.rs read."), "{sent}");
+        assert!(sent.contains("second floor sent") && sent.contains("third"));
     }
 
     #[test]
@@ -4358,7 +4764,7 @@ mod tests {
         let dropped = window_start(&crossing, &Budget::SMALL);
         assert_eq!(window_start(&quiet, &Budget::SMALL), 0);
         assert_eq!(
-            start_ahead(&quiet, &Budget::SMALL, Budget::SMALL.tokens / 4),
+            start_ahead(&quiet, &Budget::SMALL, 0, Budget::SMALL.tokens / 4),
             dropped
         );
         first_words(&c, quiet);
@@ -4404,9 +4810,9 @@ mod tests {
         // A helper's stream: the one left is the next round's.
         let helper = crate::limits::gate(&endpoint).try_acquire();
         assert!(helper.is_some());
-        assert!(claim_next(&c, &quiet, &Budget::SMALL).is_none());
+        assert!(claim_next(&c, &quiet, &Budget::SMALL, 0).is_none());
         drop(helper);
-        assert!(claim_next(&c, &quiet, &Budget::SMALL).is_some());
+        assert!(claim_next(&c, &quiet, &Budget::SMALL, 0).is_some());
     }
 
     #[test]

@@ -104,6 +104,46 @@ pub struct Conversation {
     /// Codex rather than started here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub imported_from: Option<crate::import::Source>,
+    /// The summaries the user asked for that still hold, oldest first: how
+    /// many of the first messages each covers, and the summary. The context
+    /// window never starts before the newest one's end (`floor`).
+    #[serde(skip)]
+    pub asked: Vec<(usize, String)>,
+    /// The model call that made the newest of them, until the file has it.
+    /// Only the store should touch it; it is visible for the same reason as
+    /// `flushed`.
+    #[serde(skip)]
+    pub call: Option<Call>,
+}
+
+/// A summary read from a session's file, while the file is played.
+struct Found {
+    /// How many of the first messages it covers.
+    upto: usize,
+    text: String,
+    /// Whether the user asked for it.
+    manual: bool,
+    /// For the user's, `compact::keys` of the messages it covers as its
+    /// writer had them.
+    key: Option<u64>,
+}
+
+impl Found {
+    /// Whether it sums up the messages `keys` stand for, as its writer had
+    /// them: always, but for one of the user's made from another view.
+    fn holds(&self, keys: &[u64]) -> bool {
+        self.key.is_none_or(|key| keys.get(self.upto) == Some(&key))
+    }
+}
+
+/// A model call no reply carries -- a summary the user asked for -- kept
+/// with its summary so the usage report counts it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Call {
+    /// Seconds since 1970.
+    pub at: u64,
+    pub model: String,
+    pub usage: crate::usage::Usage,
 }
 
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -195,10 +235,22 @@ enum Record {
     },
     /// A summary the model made of the first `upto` messages, which stands
     /// in for them once the context window no longer holds them. The newest
-    /// one a later rewind has not cut into is used.
+    /// one a later rewind has not cut into is used. `manual` when the user
+    /// asked for it, which the context window then never starts before.
     Summary {
         upto: usize,
         text: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        manual: bool,
+        /// For the user's, `compact::keys` of the messages it covers as its
+        /// writer had them: one made from a view of the session another
+        /// Letronna has since changed does not match the file, and is not used.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<u64>,
+        /// The call that made the user's newest summary, which no reply
+        /// carries, written with the first summary saved after it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call: Option<Call>,
     },
 }
 
@@ -448,6 +500,40 @@ impl Conversation {
         if self.summary.as_ref().is_some_and(|(upto, _)| *upto > len) {
             self.summary = None;
         }
+        // Nor do the user's, and the window goes back to an earlier one of
+        // theirs that still holds, as replay does.
+        self.asked.retain(|(upto, _)| *upto <= len);
+    }
+
+    /// Where the context window starts at the earliest: the end of the
+    /// newest summary the user asked for, or 0.
+    pub fn floor(&self) -> usize {
+        self.asked.last().map_or(0, |(upto, _)| *upto)
+    }
+
+    /// Keep the summary the user asked for, which the context window never
+    /// starts before from now on. An error, with nothing kept, when the
+    /// session no longer starts with the messages it was made of: they were
+    /// rewound or edited, or the session was deleted and its id reused.
+    pub fn compacted(&mut self, done: crate::chat::Compacted) -> Result<(), String> {
+        let covered = self.messages.get(..done.upto).filter(|_| done.upto > 0);
+        if covered.is_none_or(|covered| crate::compact::keys(covered)[done.upto] != done.key) {
+            return Err(
+                "The session changed while it was being summarized, so every turn is kept.".into(),
+            );
+        }
+        // Saved again even when the same text is kept, so the file says
+        // the user asked for it.
+        self.asked.retain(|(upto, _)| *upto < done.upto);
+        self.asked.push((done.upto, done.text.clone()));
+        self.summary = Some((done.upto, done.text));
+        self.summary_saved = false;
+        self.call = done.usage.map(|usage| Call {
+            at: crate::chat::now(),
+            model: done.model,
+            usage,
+        });
+        Ok(())
     }
 
     /// Keep the summary the model made of the first `upto` messages, which
@@ -474,9 +560,9 @@ impl Conversation {
         self.counted > 0 && self.messages.is_empty()
     }
 
-    /// Take in the messages and summary read from this session's file, unless
-    /// it has been filled since the read began.
-    pub fn filled_with(&mut self, (messages, summary): Contents) {
+    /// Take in the messages and summaries read from this session's file,
+    /// unless it has been filled since the read began.
+    pub fn filled_with(&mut self, (messages, summary, asked): Contents) {
         if !self.unfilled() {
             return;
         }
@@ -485,6 +571,7 @@ impl Conversation {
         self.counted = messages.len();
         self.messages = messages;
         self.summary = summary;
+        self.asked = asked;
         self.summary_saved = true;
         // What has been written is what was just read, so a flush appends
         // only what is said from here on rather than the whole history again.
@@ -510,6 +597,20 @@ impl Conversation {
         // nothing to append.
         self.flushed = 0;
         true
+    }
+
+    /// Start this copy of `source`'s first messages with the summaries of it
+    /// the copy holds all of: the user's, so its window starts where the
+    /// source's does, and for its file the newest -- the user's newest when
+    /// there is one, so that a restart keeps the floor too.
+    pub fn copy_summaries(&mut self, source: &Conversation) {
+        let len = self.messages.len();
+        self.asked = (source.asked.iter())
+            .filter(|(upto, _)| *upto <= len)
+            .cloned()
+            .collect();
+        self.summary = (self.asked.last().cloned()).or_else(|| source.summary_within(len));
+        self.summary_saved = false;
     }
 }
 
@@ -874,11 +975,18 @@ impl Conversation {
         // After the rewind and the messages, which it may have been made
         // from: before them, the rewind would take it back on replay.
         if summary_new && let Some((upto, text)) = &self.summary {
+            let manual = *upto > 0 && *upto == self.floor();
+            let key = (self.messages.get(..*upto))
+                .filter(|_| manual)
+                .map(|covered| crate::compact::keys(covered)[*upto]);
             push(
                 &mut out,
                 &Record::Summary {
                     upto: *upto,
                     text: text.clone(),
+                    manual,
+                    key,
+                    call: self.call.take(),
                 },
             );
         }
@@ -911,7 +1019,7 @@ impl Conversation {
     /// of them were taken. A line that will not parse is skipped rather than
     /// failing the session: losing one message is better than losing the
     /// conversation it was part of.
-    fn apply(&mut self, bytes: &[u8], summaries: &mut Vec<(usize, String)>) -> usize {
+    fn apply(&mut self, bytes: &[u8], summaries: &mut Vec<Found>) -> usize {
         let end = whole_lines(bytes);
         // Read leniently: a write cut part way through a character leaves
         // bytes that are not UTF-8, which would otherwise fail the whole
@@ -934,7 +1042,7 @@ impl Conversation {
     }
 
     /// Carry this copy on over one record of its file.
-    fn play(&mut self, record: Record, summaries: &mut Vec<(usize, String)>) {
+    fn play(&mut self, record: Record, summaries: &mut Vec<Found>) {
         match record {
             Record::Head { id, created } => {
                 self.id = id;
@@ -955,29 +1063,79 @@ impl Conversation {
             Record::Message(message) => self.messages.push(message),
             Record::Rewind { to } => {
                 self.messages.truncate(to);
-                summaries.retain(|(upto, _)| *upto <= to);
+                summaries.retain(|found| found.upto <= to);
             }
-            Record::Summary { upto, text } => {
+            Record::Summary {
+                upto,
+                text,
+                manual,
+                key,
+                ..
+            } => {
                 if upto <= self.messages.len() {
-                    summaries.push((upto, text));
+                    summaries.push(Found {
+                        upto,
+                        text,
+                        manual: manual && upto > 0,
+                        key,
+                    });
                 }
             }
         }
     }
 
     /// Mark everything in this copy as already in the file, which it was
-    /// just read from, with the newest of `summaries` standing.
-    fn caught_up(&mut self, mut summaries: Vec<(usize, String)>) {
+    /// just read from, with the newest of `summaries` standing and the
+    /// user's among them kept as theirs.
+    fn caught_up(&mut self, mut summaries: Vec<Found>) {
         self.flushed = self.messages.len();
         self.written = Some(self.meta());
-        self.summary = summaries.pop();
-        self.summary_saved = true;
-        // The model is not asked again for what the file already has.
-        if let Some((upto, text)) = &self.summary
-            && let Some(covered) = self.messages.get(..*upto)
-        {
-            crate::compact::remember(covered, text);
+        // One of the user's made from messages the file does not have --
+        // another Letronna summed up its out-of-date view -- would hold the
+        // window off turns it never saw.
+        if summaries.iter().any(|found| found.key.is_some()) {
+            let keys = crate::compact::keys(&self.messages);
+            summaries.retain(|found| found.holds(&keys));
         }
+        self.asked = (summaries.iter())
+            .filter(|found| found.manual)
+            .map(|found| (found.upto, found.text.clone()))
+            .collect();
+        self.summary = summaries.pop().map(|found| (found.upto, found.text));
+        self.summary_saved = true;
+        // The model is not asked again for what the file already has: the
+        // newest, and the user's own when newer ones follow, as the window
+        // still starts at one for a model that holds more, or after a rewind.
+        for (upto, text) in self.asked.iter().chain(&self.summary) {
+            if let Some(covered) = self.messages.get(..*upto) {
+                crate::compact::remember(covered, text);
+            }
+        }
+    }
+
+    /// The summaries this copy holds, as `play` carries them on: the user's,
+    /// already checked against the messages, then the newest when it is not
+    /// the last of theirs.
+    fn holding(&self) -> Vec<Found> {
+        let mut summaries: Vec<Found> = (self.asked.iter())
+            .map(|(upto, text)| Found {
+                upto: *upto,
+                text: text.clone(),
+                manual: true,
+                key: None,
+            })
+            .collect();
+        if let Some((upto, text)) = &self.summary
+            && self.asked.last() != self.summary.as_ref()
+        {
+            summaries.push(Found {
+                upto: *upto,
+                text: text.clone(),
+                manual: false,
+                key: None,
+            });
+        }
+        summaries
     }
 
     /// Take in what another process added to the file since this copy was
@@ -1015,7 +1173,7 @@ impl Conversation {
         let Some((from, start, bytes)) = resumed else {
             return self.read_again(&path);
         };
-        let mut summaries = self.summary.take().into_iter().collect();
+        let mut summaries = self.holding();
         let taken = start + self.apply(&bytes[start..], &mut summaries);
         self.seen = Some(Seen {
             size,
@@ -1800,6 +1958,16 @@ fn spent_in(
                     }),
                 )
             }
+            // Only the file it was made in has the call: a copy's has not.
+            Ok(Record::Summary {
+                call: Some(call), ..
+            }) => spent.push(crate::usage::Spent {
+                session,
+                at: call.at,
+                model: call.model,
+                usage: call.usage,
+                copy: false,
+            }),
             _ => {}
         }
     }
@@ -2408,14 +2576,14 @@ pub fn fill(conversation: &mut Conversation) {
     }
 }
 
-/// A session's messages as its file has them, and the summary saved of the
-/// first of them.
-pub type Contents = (Vec<Message>, Option<(usize, String)>);
+/// A session's messages as its file has them, the summary saved of the
+/// first of them, and the summaries the user asked for that still hold.
+pub type Contents = (Vec<Message>, Option<(usize, String)>, Vec<(usize, String)>);
 
-/// Session `id`'s messages and summary as its file has them, for filling it
-/// off the thread that holds it; None when the file cannot be read.
+/// Session `id`'s messages and summaries as its file has them, for filling
+/// it off the thread that holds it; None when the file cannot be read.
 pub fn messages(id: u64) -> Option<Contents> {
-    replay(&session_path(id)).map(|conversation| (conversation.messages, conversation.summary))
+    replay(&session_path(id)).map(|read| (read.messages, read.summary, read.asked))
 }
 
 /// The settings as the file has them now.
@@ -4692,6 +4860,194 @@ pub(crate) mod tests {
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 
+    /// The user's summary of the first `upto` of `c`'s messages as they are.
+    fn asked_for(c: &Conversation, upto: usize, text: &str) -> crate::chat::Compacted {
+        crate::chat::Compacted {
+            upto,
+            text: text.into(),
+            before: 0,
+            after: 0,
+            key: (c.messages.get(..upto)).map_or(0, |m| crate::compact::keys(m)[upto]),
+            model: "m".into(),
+            usage: Some(crate::usage::Usage {
+                input: 900,
+                output: 60,
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn a_summary_the_user_asked_for_keeps_its_floor_across_restarts_until_a_rewind() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("manual summary");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let mut store = Store::default();
+        store.conversations.push(tagged(8, "asked for"));
+        let path = dir.join("sessions/1.jsonl");
+        let state = |c: &Conversation| (c.floor(), c.summary.clone());
+        let ask = |c: &mut Conversation, upto, text| c.compacted(asked_for(c, upto, text));
+
+        // None of nothing, nor of more than the session has.
+        assert!(ask(&mut store.conversations[0], 0, "nothing").is_err());
+        assert!(ask(&mut store.conversations[0], 9, "too far").is_err());
+        assert_eq!(state(&store.conversations[0]), (0, None));
+        ask(&mut store.conversations[0], 4, "The first four.").unwrap();
+        store.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let line = r#"{"type":"summary","upto":4,"text":"The first four.","manual":true,"key":"#;
+        assert!(text.lines().last().unwrap().starts_with(line), "{text}");
+        let four = Some((4, "The first four.".to_owned()));
+        assert_eq!(state(&replay(&path).unwrap()), (4, four.clone()));
+
+        // One the window makes later goes on from it, and the floor stays.
+        store.conversations[0].summarized(6, "The first six.".into());
+        store.save().unwrap();
+        let six = Some((6, "The first six.".to_owned()));
+        assert_eq!(state(&replay(&path).unwrap()), (4, six));
+
+        // A rewind into a later one of theirs goes back to this one.
+        ask(&mut store.conversations[0], 7, "The first seven.").unwrap();
+        store.save().unwrap();
+        assert_eq!(replay(&path).unwrap().floor(), 7);
+        store.conversations[0].rewind(5);
+        assert_eq!(state(&store.conversations[0]), (4, None));
+        store.save().unwrap();
+        assert_eq!(state(&replay(&path).unwrap()), (4, four));
+
+        // One into it drops it, in memory and in the file alike.
+        store.conversations[0].rewind(3);
+        assert_eq!(state(&store.conversations[0]), (0, None));
+        store.save().unwrap();
+        assert_eq!(state(&replay(&path).unwrap()), (0, None));
+
+        // Both calls are counted, once each, though no reply carries them.
+        let mut seen = Default::default();
+        let calls = super::spent_in(&path, 1, &mut seen);
+        assert_eq!(calls.len(), 2, "{text}");
+        assert!(
+            calls
+                .iter()
+                .all(|c| (c.usage.input, c.model.as_str()) == (900, "m"))
+        );
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_summary_of_messages_the_session_no_longer_starts_with_is_not_kept() {
+        let mut c = tagged(6, "landing");
+        let done = asked_for(&c, 4, "Old four.");
+        // Deleted with its id reused, say, or rewound and said again.
+        c.messages[2].content = "something else".into();
+        let kept = c.compacted(done);
+        assert!(kept.is_err_and(|e| e.contains("changed")));
+        assert_eq!((c.floor(), c.summary.clone()), (0, None));
+        assert!(c.call.is_none());
+    }
+
+    #[test]
+    fn a_summary_made_from_an_out_of_date_view_is_not_used_on_replay() {
+        let dir = scratch("stale floor");
+        let path = dir.join("1.jsonl");
+        let mut c = tagged(6, "stale");
+        c.compacted(asked_for(&c, 4, "Four.")).unwrap();
+        c.flush_to(&path).unwrap();
+        // Another Letronna's, over messages the file does not have.
+        let wrong = r#"{"type":"summary","upto":5,"text":"Wrong.","manual":true,"key":1}"#;
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, format!("{text}{wrong}\n")).unwrap();
+        let back = replay(&path).unwrap();
+        assert_eq!((back.floor(), back.summary), (4, Some((4, "Four.".into()))));
+    }
+
+    #[test]
+    fn a_copy_starts_where_the_users_summary_ends_and_keeps_it_in_its_file() {
+        let dir = scratch("summary-fork-floor");
+        let mut source = tagged(8, "fork floor");
+        source.compacted(asked_for(&source, 4, "Four.")).unwrap();
+        source.summarized(6, "Six.".into());
+        let mut copy = Conversation {
+            id: 2,
+            messages: source.messages[..7].to_vec(),
+            ..Default::default()
+        };
+        copy.copy_summaries(&source);
+        assert_eq!(
+            (copy.floor(), copy.summary.clone()),
+            (4, Some((4, "Four.".into())))
+        );
+        let path = dir.join("2.jsonl");
+        copy.flush_to(&path).unwrap();
+        let back = replay(&path).unwrap();
+        assert_eq!((back.floor(), back.summary), (4, Some((4, "Four.".into()))));
+        // Its file holds no call: the source's counts it.
+        assert!(super::spent_in(&path, 2, &mut Default::default()).is_empty());
+        // A copy from before the user's summary has none of it.
+        copy.messages.truncate(3);
+        copy.copy_summaries(&source);
+        assert_eq!((copy.floor(), copy.summary), (0, None));
+    }
+
+    #[test]
+    fn a_followed_session_keeps_the_users_summary_and_its_floor() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("follow-asked");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let (mut window, mut terminal) = window_and_terminal(6);
+        let state = |store: &Store| {
+            let open = &store.conversations[0];
+            (open.floor(), open.summary.clone())
+        };
+        let four = Some((4, "The first four.".to_owned()));
+
+        let asked = asked_for(&terminal.conversations[0], 4, "The first four.");
+        terminal.conversations[0].compacted(asked).unwrap();
+        terminal.save().unwrap();
+        assert!(window.follow(|_| false));
+        assert_eq!(state(&window), (4, four.clone()));
+
+        // A later one the window makes goes on from it, and the floor stays.
+        terminal.conversations[0].messages.push(said("user", "6"));
+        terminal.conversations[0].summarized(6, "The first six.".into());
+        terminal.save().unwrap();
+        assert!(window.follow(|_| false));
+        assert_eq!(state(&window), (4, Some((6, "The first six.".to_owned()))));
+
+        // A rewind into that one goes back to the user's.
+        terminal.conversations[0].rewind(5);
+        terminal.save().unwrap();
+        assert!(window.follow(|_| false));
+        assert_eq!(state(&window), (4, four));
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_session_read_in_only_when_opened_keeps_the_users_summary() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("fill-asked");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let mut store = Store::default();
+        store.conversations.push(tagged(6, "filled"));
+        let asked = asked_for(&store.conversations[0], 4, "Four.");
+        store.conversations[0].compacted(asked).unwrap();
+        store.save().unwrap();
+        let four = (4, Some((4, "Four.".to_owned())));
+
+        // Off the thread that holds it, as the window reads it.
+        let mut listed = load_listing();
+        assert!(listed.conversations[0].unfilled());
+        listed.conversations[0].filled_with(super::messages(1).unwrap());
+        let open = &listed.conversations[0];
+        assert_eq!((open.floor(), open.summary.clone()), four);
+
+        // And on it, as the terminal does.
+        let mut listed = load_listing();
+        fill(&mut listed.conversations[0]);
+        let open = &listed.conversations[0];
+        assert_eq!((open.floor(), open.summary.clone()), four);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
     #[test]
     fn a_restart_uses_the_kept_summary_rather_than_asking_again() {
         let dir = scratch("summary-restart");
@@ -5172,7 +5528,7 @@ pub(crate) mod tests {
         // Something was said before the read came back: the session now
         // holds more than its file did, and the read would lose it.
         open.messages.push(said("user", "new"));
-        open.filled_with((numbered(2).messages, None));
+        open.filled_with((numbered(2).messages, None, Vec::new()));
         assert_eq!(open.messages.len(), 1);
         assert_eq!(open.messages[0].content, "new");
 
@@ -5182,7 +5538,7 @@ pub(crate) mod tests {
             counted: 2,
             ..Default::default()
         };
-        emptied.filled_with((Vec::new(), None));
+        emptied.filled_with((Vec::new(), None, Vec::new()));
         assert!(!emptied.unfilled());
         assert_eq!(emptied.length(), 0);
     }

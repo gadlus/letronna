@@ -688,6 +688,8 @@ fn ask(spec: &Spec, turn: &mut Turn, permit: Permit) -> Result<Option<Message>, 
         tools: spec.schema.iter().map(answer_tool).collect(),
         cancel: spec.cancel.clone(),
         guard: Some(Box::new(permit)),
+        // A fork's is its parent's, so its requests start as the parent's do.
+        floor: spec.transcript.conversation.floor(),
     };
     let events = chat::start_with(
         spec.connection.clone(),

@@ -1,7 +1,7 @@
 //! What can be done with a turn once it is there: copy it, change your
-//! message and ask again, ask the same again, go back to it, or carry on
-//! from it in a copy of the session. Each turn offers these in a row of
-//! small buttons and on right-click.
+//! message and ask again, ask the same again, go back to it, carry on from
+//! it in a copy of the session, or have everything up to it summarized.
+//! Each turn offers these in a row of small buttons and on right-click.
 //!
 //! Everything works by place in the session. Going back is saved as a
 //! rewind record the store appends (`Conversation::rewind`), so the terminal
@@ -111,7 +111,7 @@ impl Chat {
     /// Change your message where it is. Nothing is taken back until it is
     /// sent, so looking and cancelling costs nothing.
     pub(crate) fn edit_turn(&mut self, span: Span, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy {
+        if !self.idle() {
             return;
         }
         let Some(text) = self.prompt_text(span.first) else {
@@ -138,7 +138,7 @@ impl Chat {
         let Some((session, at)) = self.editing_message else {
             return;
         };
-        if self.busy {
+        if !self.idle() {
             return;
         }
         let text = self.edit_message.read(cx).value().trim().to_owned();
@@ -186,7 +186,7 @@ impl Chat {
 
     /// Ask the turn's prompt again, dropping what came of it last time.
     pub(crate) fn retry_turn(&mut self, span: Span, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy {
+        if !self.idle() {
             return;
         }
         let Some(at) = span.prompt() else {
@@ -225,7 +225,7 @@ impl Chat {
     /// Go back to this turn, once asked: what follows it leaves the session.
     /// From your message, its text comes back to the box, as in Claude Code.
     pub(crate) fn rewind_turn(&mut self, span: Span, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy {
+        if !self.idle() {
             return;
         }
         let keep = span.keep();
@@ -249,7 +249,7 @@ impl Chat {
         cx.spawn_in(window, async move |this, cx| {
             let (files, rows) = planned.await;
             let _ = this.update_in(cx, |this, window, cx| {
-                if this.busy || this.store.conversations[this.store.active].id != session {
+                if !this.idle() || this.store.conversations[this.store.active].id != session {
                     return;
                 }
                 this.ask_rewind(keep, back, files, rows, window, cx);
@@ -337,9 +337,10 @@ impl Chat {
                 })
                 .on_ok(move |_, window, cx| {
                     chat.update(cx, |this, cx| {
-                        // A reply may have started, or the session changed,
-                        // while the question was up.
-                        if this.busy || this.store.conversations[this.store.active].id != session {
+                        // A reply or a summary may have started, or the
+                        // session changed, while the question was up.
+                        let open = this.store.conversations[this.store.active].id;
+                        if !this.idle() || open != session {
                             return;
                         }
                         this.cut_to(keep);
@@ -403,13 +404,74 @@ impl Chat {
         cx.notify();
     }
 
+    /// Summarize the session up to this turn now: everything before your
+    /// message, or up to the end of the reply, as far as a turn starts
+    /// there. The turns after stay word for word.
+    pub(crate) fn summarize_turn(
+        &mut self,
+        span: Span,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.idle() {
+            return;
+        }
+        let mut connection = match self.connection_for(self.store.active, None) {
+            Ok(connection) => connection,
+            Err(error) => {
+                window.push_notification(Notification::error(error), cx);
+                return;
+            }
+        };
+        let open = &self.store.conversations[self.store.active];
+        // What the system prompt says of the folder counts toward the sizes.
+        connection.workspace = open.workspace.clone();
+        let (session, messages, floor) = (open.id, open.messages.clone(), open.floor());
+        let summary = open.summary.as_ref().map(|(_, text)| text.clone());
+        let upto = span.keep();
+        self.compacting.insert(session);
+        // Up to a minute's model call, so on a thread of its own.
+        let (sender, receiver) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let done = backend::compact(&connection, &messages, floor, summary.as_deref(), upto);
+            let _ = sender.send_blocking(done);
+        });
+        window.push_notification(Notification::info("Summarizing the earlier turns…"), cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let done = receiver
+                .recv()
+                .await
+                .unwrap_or_else(|_| Err("The summary stopped part way.".into()));
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.compacting.remove(&session);
+                // Kept only by the session it was made of, as it still starts.
+                let kept = done.and_then(|done| {
+                    let report = done.report();
+                    let ix = this.store.index_of(session).ok_or("The session is gone.")?;
+                    this.store.conversations[ix].compacted(done)?;
+                    Ok(report)
+                });
+                match kept {
+                    Ok(report) => {
+                        this.save();
+                        window.push_notification(Notification::success(report), cx);
+                    }
+                    Err(why) => window.push_notification(Notification::warning(why), cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     /// Open a copy of the session's first `keep` messages, leaving the
     /// session itself as it is.
     fn fork_at(&mut self, keep: usize, window: &mut Window, cx: &mut Context<Self>) {
         let id = self.store.reserve_id();
         let source = &self.store.conversations[self.store.active];
         let messages = source.messages[..keep.min(source.messages.len())].to_vec();
-        let fork = Conversation {
+        let mut fork = Conversation {
             id,
             title: format!("{} (fork)", source.title),
             updated: backend::now(),
@@ -418,10 +480,10 @@ impl Chat {
             model: source.model.clone(),
             gateway: source.gateway.clone(),
             effort: source.effort.clone(),
-            summary: source.summary_within(messages.len()),
             messages,
             ..Default::default()
         };
+        fork.copy_summaries(source);
         history::share(source.id, id);
         self.store.conversations.push(fork);
         self.store.active = self.store.conversations.len() - 1;
@@ -440,6 +502,7 @@ impl Chat {
     ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
         let chat = cx.entity();
         let (retry, rewind) = self.can_retry_and_rewind(span);
+        let summarize = self.can_summarize(span);
         let retry_label = self.retry_label(span);
         move |menu, _, _| {
             let item = |label: &'static str, icon: Icon, enabled: bool, act: Act| {
@@ -483,6 +546,12 @@ impl Chat {
                 Icon::new(IconName::Undo),
                 rewind,
                 Chat::rewind_turn,
+            ))
+            .item(item(
+                "Summarize up to here",
+                Icon::new(AppIcon::FileText),
+                summarize,
+                Chat::summarize_turn,
             ))
         }
     }
@@ -574,18 +643,41 @@ impl Chat {
                 rewind,
                 Chat::rewind_turn,
             ))
+            .child(button(
+                "summarize",
+                Icon::new(AppIcon::FileText),
+                "Summarize up to here",
+                self.can_summarize(span),
+                Chat::summarize_turn,
+            ))
             .into_any_element()
     }
 
     /// Whether the turn can be asked again, and gone back to. Neither while
-    /// a reply runs, which owns the session until it stops.
+    /// a reply runs, which owns the session until it stops, nor while a
+    /// summary is made.
     fn can_retry_and_rewind(&self, span: Span) -> (bool, bool) {
-        let retry = !self.busy
+        let retry = self.idle()
             && span
                 .prompt()
                 .is_some_and(|at| self.prompt_text(at).is_some());
-        let rewind = !self.busy && (span.yours || self.open_messages().len() > span.keep());
+        let rewind = self.idle() && (span.yours || self.open_messages().len() > span.keep());
         (retry, rewind)
+    }
+
+    /// Whether summing up to the turn would sum anything up: a turn comes
+    /// before it that the user has not had summarized already. Nor while
+    /// something holds the session.
+    fn can_summarize(&self, span: Span) -> bool {
+        let open = &self.store.conversations[self.store.active];
+        self.idle() && backend::summarizable(&open.messages, open.floor(), span.keep())
+    }
+
+    /// Whether nothing holds the session: no reply running, and no summary
+    /// being made, which a rewind or another summary would cut under.
+    fn idle(&self) -> bool {
+        let open = self.store.conversations[self.store.active].id;
+        !self.busy && !self.compacting.contains(&open)
     }
 
     /// What Retry does here: ask again in place, or in a fork when more was
