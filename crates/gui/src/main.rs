@@ -5,6 +5,7 @@ mod highlight;
 mod platform;
 mod plugins;
 mod prelude;
+mod runs;
 mod theme;
 mod ui;
 

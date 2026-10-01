@@ -230,6 +230,12 @@ impl Chat {
                         cx.notify();
                         return;
                     }
+                    // Its end would come for a session no longer there.
+                    if this.runs.contains_key(&this.store.conversations[index].id) {
+                        this.error = Some("Stop its run before deleting this session.".into());
+                        cx.notify();
+                        return;
+                    }
                     // Through the store, so the session's file goes too,
                     // and its private browser and draft with it.
                     let id = this.store.conversations[index].id;

@@ -34,8 +34,9 @@
 //! user at a card in the run's session, as a chat's does, and any other mode
 //! decides it with nobody asked.
 
+use crate::cancel::Cancel;
 use crate::chat::{self as backend, Connection, Message};
-use crate::driver::{self, Allow, Outcome, Spec};
+use crate::driver::{self, Allow, Outcome, Spec, Status};
 use crate::gate::Mode;
 use crate::store::Transcript;
 use crate::timers::{self, TimerId};
@@ -318,19 +319,52 @@ pub struct Ended {
     pub failed_early: bool,
 }
 
-/// What a runner tells the Letronna it runs in. Row 55 adds a run's start
-/// here, with its session, `Status` and `Cancel`, to show and stop it beside
-/// the chat.
+/// A scheduled run as it starts, for the Letronna running it to show beside
+/// the chat and stop.
+pub struct Started {
+    pub schedule: u64,
+    pub name: String,
+    /// The session it runs in, which only the run writes until it ends.
+    pub session: u64,
+    pub status: Arc<Status>,
+    /// Stops the run, which then ends as any other does.
+    pub cancel: Cancel,
+}
+
+// By hand, since a status and a stop have neither: a run is the same run
+// whatever its status says by now.
+impl PartialEq for Started {
+    fn eq(&self, other: &Self) -> bool {
+        (self.schedule, &self.name, self.session) == (other.schedule, &other.name, other.session)
+    }
+}
+
+impl Eq for Started {}
+
+impl std::fmt::Debug for Started {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Started")
+            .field("schedule", &self.schedule)
+            .field("name", &self.name)
+            .field("session", &self.session)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What a runner tells the Letronna it runs in.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Event {
+    /// A run here started in its session.
+    Started(Started),
     /// A run here ended, or one a quit cut off was found.
     Ended(Ended),
     /// Why the schedules are not running, said once until it changes.
     Trouble(String),
 }
 
-/// Runs one schedule to its end on the thread it is called on.
-type Work = Box<dyn Fn(&Schedule) -> Ended + Send + Sync>;
+/// Runs one schedule to its end on the thread it is called on, handing its
+/// start to the function it is given once its session is open.
+type Work = Box<dyn Fn(&Schedule, &dyn Fn(Started)) -> Ended + Send + Sync>;
 
 /// Runs the schedules as they come due, while this Letronna holds the lock.
 /// A clone is one more handle on the same runner.
@@ -629,9 +663,12 @@ fn launch(shared: &Arc<Shared>, state: &mut State, job: Schedule, previous: u64)
         .name(format!("schedule-{id}"))
         .spawn(move || {
             let marker = mark(&shared.dir, &job);
+            let started = |started: Started| {
+                let _ = shared.events.try_send(Event::Started(started));
+            };
             // A run that panicked must still give its place back.
-            let mut ended =
-                catch_unwind(AssertUnwindSafe(|| (shared.work)(&job))).unwrap_or_else(|_| Ended {
+            let mut ended = catch_unwind(AssertUnwindSafe(|| (shared.work)(&job, &started)))
+                .unwrap_or_else(|_| Ended {
                     schedule: id,
                     name: job.name.clone(),
                     session: None,
@@ -872,14 +909,21 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Runs `job` in a session of its own as a driver run, then tells the chat
-/// apps how it went, as the window did when it ran schedules itself.
-fn run_in_session(job: &Schedule) -> Ended {
+/// Runs `job` in a session of its own as a driver run, saying so to
+/// `started` once the session is open, then tells the chat apps how it went.
+fn run_in_session(job: &Schedule, started: &dyn Fn(Started)) -> Ended {
     let (session, text, failed_early) = match open(job) {
         Ok(spec) => {
             let session = spec.root;
             // Before it starts, so its first call is decided in its mode.
             let _listed = Listed::new(session, job);
+            started(Started {
+                schedule: job.id,
+                name: job.name.clone(),
+                session,
+                status: Arc::clone(&spec.status),
+                cancel: spec.cancel.clone(),
+            });
             let report = driver::run(spec);
             let early = matches!(report.status, Outcome::Failed(_))
                 && report.rounds == 0
@@ -975,6 +1019,7 @@ pub(crate) fn run_of(job: &Schedule, connection: Connection, mut transcript: Tra
 fn said(report: &driver::Report) -> String {
     match &report.status {
         Outcome::Failed(error) => format!("Did not finish: {error}"),
+        Outcome::Stopped => "Stopped before it finished.".into(),
         _ if report.text.trim().is_empty() => "That did not produce an answer.".into(),
         _ => report.text.clone(),
     }
@@ -985,9 +1030,10 @@ mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute here.
     use super::{
-        AT_ONCE, Ended, Event, Runner, Schedule, Trigger, armed_now, is_due, load, lock, next_due,
-        path, runs_dir, save, step,
+        AT_ONCE, Ended, Event, Runner, Schedule, Started, Trigger, armed_now, is_due, load, lock,
+        next_due, path, runs_dir, save, step,
     };
+    use crate::cancel::Cancel;
     use chrono::{DateTime, Local, TimeZone};
     use std::path::{Path, PathBuf};
     use std::sync::mpsc::{self, Receiver, Sender};
@@ -1038,7 +1084,7 @@ mod tests {
             std::iter::from_fn(|| self.events.try_recv().ok())
                 .filter_map(|event| match event {
                     Event::Trouble(trouble) => Some(trouble),
-                    Event::Ended(_) => None,
+                    Event::Started(_) | Event::Ended(_) => None,
                 })
                 .collect()
         }
@@ -1056,7 +1102,7 @@ mod tests {
         let (started, heard) = mpsc::channel();
         let (finish, finished) = mpsc::channel::<()>();
         let (started, finished) = (Mutex::new(started), Arc::new(Mutex::new(finished)));
-        let work = Box::new(move |job: &Schedule| {
+        let work = Box::new(move |job: &Schedule, _: &dyn Fn(Started)| {
             let _ = started.lock().unwrap().send(job.id);
             let _ = finished.lock().unwrap().recv();
             Ended {
@@ -1350,6 +1396,41 @@ mod tests {
         other.runner.run_now(1);
         assert_eq!(other.started.recv_timeout(WAIT).unwrap(), 1);
         assert!(owner.started.recv_timeout(QUIET).is_err());
+    }
+
+    #[test]
+    fn a_run_says_it_started_in_its_session_with_a_stop_that_ends_it() {
+        let dir = scratch("started");
+        save(&dir, &[every(1, 1, 120)]).unwrap();
+        let work = Box::new(|job: &Schedule, started: &dyn Fn(Started)| {
+            let cancel = Cancel::default();
+            started(Started {
+                schedule: job.id,
+                name: job.name.clone(),
+                session: 41,
+                status: Default::default(),
+                cancel: cancel.clone(),
+            });
+            let slept = cancel.sleep(WAIT);
+            Ended {
+                schedule: job.id,
+                name: job.name.clone(),
+                session: Some(41),
+                text: if slept { "ran out" } else { "stopped" }.into(),
+                failed_early: false,
+            }
+        });
+        let (_runner, events) = Runner::with(dir, work);
+        let Ok(Event::Started(started)) = events.recv_blocking() else {
+            panic!("the start was not said first");
+        };
+        assert_eq!((started.schedule, started.session), (1, 41));
+
+        started.cancel.set();
+        let Ok(Event::Ended(ended)) = events.recv_blocking() else {
+            panic!("the stopped run did not end");
+        };
+        assert_eq!((ended.session, ended.text.as_str()), (Some(41), "stopped"));
     }
 
     #[test]

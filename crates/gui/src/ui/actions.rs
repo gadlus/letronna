@@ -111,7 +111,7 @@ impl Chat {
     /// Change your message where it is. Nothing is taken back until it is
     /// sent, so looking and cancelling costs nothing.
     pub(crate) fn edit_turn(&mut self, span: Span, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy {
+        if self.busy || self.run_holds_open() {
             return;
         }
         let Some(text) = self.prompt_text(span.first) else {
@@ -138,7 +138,7 @@ impl Chat {
         let Some((session, at)) = self.editing_message else {
             return;
         };
-        if self.busy {
+        if self.busy || self.run_holds_open() {
             return;
         }
         let text = self.edit_message.read(cx).value().trim().to_owned();
@@ -186,7 +186,7 @@ impl Chat {
 
     /// Ask the turn's prompt again, dropping what came of it last time.
     pub(crate) fn retry_turn(&mut self, span: Span, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy {
+        if self.busy || self.run_holds_open() {
             return;
         }
         let Some(at) = span.prompt() else {
@@ -337,9 +337,12 @@ impl Chat {
                 })
                 .on_ok(move |_, window, cx| {
                     chat.update(cx, |this, cx| {
-                        // A reply may have started, or the session changed,
-                        // while the question was up.
-                        if this.busy || this.store.conversations[this.store.active].id != session {
+                        // A reply or a run may have started, or the session
+                        // changed, while the question was up.
+                        if this.busy
+                            || this.run_holds_open()
+                            || this.store.conversations[this.store.active].id != session
+                        {
                             return;
                         }
                         this.cut_to(keep);

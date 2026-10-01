@@ -781,14 +781,17 @@ fn choose_by_flags(runner: &mut Runner, session: usize, gateway: Option<&str>, a
 fn scheduled(event: letronna_core::schedule::Event) {
     /// Enough of an answer to recognise it by on one line.
     const PREVIEW: usize = 60;
-    render::blank();
     let run = match event {
         letronna_core::schedule::Event::Ended(run) => run,
         letronna_core::schedule::Event::Trouble(trouble) => {
+            render::blank();
             render::line(&render::red(&trouble));
             return;
         }
+        // A run is said once, when it ends.
+        letronna_core::schedule::Event::Started(_) => return,
     };
+    render::blank();
     let text = letronna_core::tools::one_line(&run.text);
     let mut preview: String = text.chars().take(PREVIEW).collect();
     if preview.len() < text.len() {
