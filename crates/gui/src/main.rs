@@ -85,6 +85,8 @@ fn main() {
                 Some("Capabilities"),
             ),
             KeyBinding::new("secondary-shift-d", ui::changes::ChangesTab, Some("Chat")),
+            KeyBinding::new("alt-u", ToggleCrew, Some("Chat")),
+            KeyBinding::new("alt-w", DismissCrew, Some("Chat")),
             KeyBinding::new(
                 "shift-enter",
                 gpui_component::input::Enter { secondary: true },
