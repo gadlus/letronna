@@ -3502,6 +3502,11 @@ impl Chat {
             self.model_open = false;
             self.focus_composer(window, cx);
             cx.notify();
+        } else if self.context_report.is_some() {
+            // Opened by a key, the context popover never has the focus its
+            // own Escape needs; the status bar's chip keeps it.
+            self.context_report = None;
+            cx.notify();
         } else if let Some(aside) = self.aside_to_close() {
             aside.cancel.set();
             cx.notify();
