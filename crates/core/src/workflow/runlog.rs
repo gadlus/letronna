@@ -103,7 +103,9 @@ impl Log {
             at: chat::now(),
             event,
             agent: agent.map(|(number, _)| number),
-            label: agent.map(|(_, label)| label.to_owned()).unwrap_or_default(),
+            // A script names its agents, so a label is as long as it likes;
+            // cut, or every event of a run would carry it whole.
+            label: agent.map(|(_, label)| reason(label)).unwrap_or_default(),
             why: reason(why),
         };
         let Ok(mut line) = serde_json::to_vec(&entry) else {
@@ -141,7 +143,7 @@ impl Log {
 }
 
 /// `why` on one line, cut after REASON characters: the start of an error
-/// says what it was.
+/// says what it was. A label is cut the same way.
 fn reason(why: &str) -> String {
     let why = one_line(why);
     match why.char_indices().nth(REASON) {
@@ -259,6 +261,19 @@ mod tests {
         assert!(!kept[0].why.contains('\n'));
         assert_eq!(kept[0].why.chars().count(), REASON + 1);
         assert!(read(&dir.join("missing.jsonl")).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_long_label_is_cut_like_a_reason() {
+        let dir = folder("label");
+        let mut log = Log::open(&dir);
+        log.note(Event::Started, Some((1, &"a\nb ".repeat(50_000))), "");
+        let size = std::fs::metadata(dir.join(FILE)).unwrap().len();
+        assert!(size < 1_000, "one event took {size} bytes");
+        let kept = read(&dir.join(FILE));
+        assert_eq!(kept[0].label.chars().count(), REASON + 1);
+        assert!(!kept[0].label.contains('\n'));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
