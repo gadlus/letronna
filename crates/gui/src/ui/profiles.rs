@@ -284,7 +284,7 @@ impl Chat {
         self.editing_message = None;
         // Sessions the old profile opened for a chat app, by ids that another
         // profile's sessions may share.
-        self.remote_session.clear();
+        self.remote = Default::default();
         self.follow_ups.clear();
         self.returned_follow_ups = None;
         // The rules file is re-read by its date, which may match.
