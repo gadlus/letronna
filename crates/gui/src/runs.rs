@@ -510,7 +510,12 @@ impl Chat {
                         .icon(Icon::new(AppIcon::Stop))
                         .tooltip("Stop")
                         .disabled(stopping)
-                        .on_click(cx.listener(move |this, _, _, cx| this.stop_run(id, cx))),
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            // Stopping it is not opening it: the row's own
+                            // click must not follow.
+                            cx.stop_propagation();
+                            this.stop_run(id, cx)
+                        })),
                 )
                 .when(run.held, |row| {
                     row.cursor_pointer()
