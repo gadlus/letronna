@@ -88,6 +88,7 @@ pub(crate) enum Page {
     Artifacts,
     Jobs,
     Activity,
+    Workflows,
 }
 impl Page {
     pub(crate) fn title(self) -> &'static str {
@@ -99,6 +100,7 @@ impl Page {
             Page::Artifacts => "Artifacts",
             Page::Jobs => "Scheduled jobs",
             Page::Activity => "Activity",
+            Page::Workflows => "Workflows",
         }
     }
     pub(crate) fn blurb(self) -> &'static str {
@@ -114,6 +116,8 @@ impl Page {
                 "Helpers your agents handed part of their work to: what each is doing, and a way \
                  to read, steer or stop it."
             }
+            // Workflows renders its own page too.
+            Page::Workflows => "Runs of helpers Letronna started.",
         }
     }
 }
@@ -255,6 +259,7 @@ pub(crate) struct Chat {
     pub(crate) profile_name: Entity<InputState>,
     /// The active profile's name for the title bar, once there are several.
     pub(crate) profile_label: Option<String>,
+    pub(crate) workflows: crate::ui::workflows::Workflows,
     pub(crate) messaging: letronna_core::messaging::Config,
     /// The code the Messaging page shows for pairing a Telegram chat.
     pub(crate) pairing: Option<letronna_core::messaging::pairing::Code>,
@@ -865,6 +870,7 @@ impl Chat {
             job_prompt,
             profile_name,
             profile_label: crate::ui::profiles::title_label(),
+            workflows: crate::ui::workflows::Workflows::new(cx),
             messaging: letronna_core::messaging::load(),
             pairing: None,
             slack_code: None,
@@ -1749,7 +1755,13 @@ impl Chat {
                 // A helper that ended rings too, and its card goes with it.
                 let rang = this.update(cx, |this, cx| {
                     this.drop_ended_asks(cx);
-                    this.wake_idle(cx)
+                    this.wake_idle(cx);
+                    // A run that ended or held itself says so in a notice,
+                    // and one the user stopped rings without one, which is
+                    // when the Workflows page has news to show.
+                    if this.page == Page::Workflows {
+                        cx.notify();
+                    }
                 });
                 if rang.is_err() {
                     break;
@@ -4174,6 +4186,8 @@ impl Render for Chat {
 
         let body: AnyElement = if self.page == Page::Jobs {
             self.schedules_page(cx).into_any_element()
+        } else if self.page == Page::Workflows {
+            self.workflows_page(window, cx).into_any_element()
         } else if self.page == Page::Artifacts {
             self.artifacts_page(cx).into_any_element()
         } else if self.page == Page::Capabilities {

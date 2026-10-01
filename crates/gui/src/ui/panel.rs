@@ -195,7 +195,7 @@ impl Chat {
         (shown, open)
     }
 
-    fn session_on_screen(&self) -> u64 {
+    pub(crate) fn session_on_screen(&self) -> u64 {
         self.store.conversations[self.store.active].id
     }
 

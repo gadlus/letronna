@@ -78,7 +78,10 @@ impl AssetSource for Assets {
                 "eye",
                 "keyboard",
                 "cursor-click",
-                "terminal"
+                "terminal",
+                "pause",
+                "skip-forward",
+                "tree-structure"
             ),
             ("telegram", "discord", "slack", "whatsapp")
         ))
@@ -126,6 +129,9 @@ pub(crate) enum AppIcon {
     Keyboard,
     Point,
     Terminal,
+    Pause,
+    Skip,
+    Workflow,
 }
 impl IconNamed for AppIcon {
     fn path(self) -> SharedString {
@@ -166,6 +172,9 @@ impl IconNamed for AppIcon {
             AppIcon::Keyboard => "icons/keyboard.svg",
             AppIcon::Point => "icons/cursor-click.svg",
             AppIcon::Terminal => "icons/terminal.svg",
+            AppIcon::Pause => "icons/pause.svg",
+            AppIcon::Skip => "icons/skip-forward.svg",
+            AppIcon::Workflow => "icons/tree-structure.svg",
         }
         .into()
     }

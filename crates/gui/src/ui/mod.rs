@@ -34,6 +34,7 @@ pub(crate) mod skills;
 pub(crate) mod update;
 pub(crate) mod usage;
 pub(crate) mod voice;
+pub(crate) mod workflows;
 
 use crate::prelude::*;
 use gpui_component::{

@@ -391,6 +391,16 @@ pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Opti
             KeyBinding::new("secondary-s", ui::memory::Save, Some("MemoryPage")),
             Some("On the Memory page: save"),
         ),
+        // On the Workflows page, Escape leaves an open run for the list, and
+        // the refresh key reads the runs again.
+        (
+            KeyBinding::new("escape", ui::workflows::Back, Some("Workflows")),
+            Some("On the Workflows page: back to the list"),
+        ),
+        (
+            KeyBinding::new("secondary-r", ui::workflows::Refresh, Some("Workflows")),
+            Some("On the Workflows page: read the runs again"),
+        ),
         (
             KeyBinding::new("enter", ui::actions::ToggleDiff, Some("ChangedFile")),
             Some("On a changed file under a turn: show or hide its diff"),
