@@ -1112,6 +1112,41 @@ fn with_utf8_output(command: &str) -> String {
     format!("{UTF8_PRELUDE}{command}")
 }
 
+/// Set once Letronna is leaving, so a command still running in the
+/// foreground ends with everything it started rather than outlive it.
+static LEAVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// How many commands are running in the foreground, for `end_commands`.
+static RUNNING: Mutex<usize> = Mutex::new(0);
+/// Told each time a foreground command returns.
+static RETURNED: std::sync::Condvar = std::sync::Condvar::new();
+
+/// Counts a foreground command as running for as long as it is held.
+struct Running;
+
+impl Running {
+    fn start() -> Running {
+        *RUNNING.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        Running
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        *RUNNING.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        RETURNED.notify_all();
+    }
+}
+
+/// End every command running in the foreground, with everything it started,
+/// and wait up to `limit` for them to be gone. Each runs in a process group
+/// or Job Object of its own, where neither a Ctrl-C at the terminal nor
+/// Letronna exiting reaches it, so leaving has to end it.
+pub fn end_commands(limit: Duration) {
+    LEAVING.store(true, std::sync::atomic::Ordering::Relaxed);
+    let running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = RETURNED.wait_timeout_while(running, limit, |running| *running > 0);
+}
+
 #[cfg(test)]
 fn run_shell(command: &str, cwd: Option<&Path>, cancel: &Cancel) -> Result<String, String> {
     run_shell_saving(command, cwd, cancel, None, COMMAND_TIMEOUT, None)
@@ -1158,6 +1193,7 @@ fn run_shell_into(
     owner: Option<u64>,
 ) -> Result<String, String> {
     use std::process::Stdio;
+    let _running = Running::start();
     let mut cmd = shell(command, cwd);
     // Grouped the way a job's shell is, so one moved to the background can
     // be stopped with everything it started.
@@ -1209,7 +1245,14 @@ fn run_shell_into(
                 limit.as_secs()
             ));
         }
-        if !cancel.sleep(std::time::Duration::from_millis(50)) {
+        let leaving = LEAVING.load(std::sync::atomic::Ordering::Relaxed);
+        if leaving || !cancel.sleep(std::time::Duration::from_millis(50)) {
+            // All of it, as stopping a job ends it: in a tree of its own,
+            // what the command started hears no Ctrl-C and would run on. Not
+            // reaped yet, so its group is still its own.
+            if let Some(tree) = &tree {
+                tree.kill();
+            }
             let _ = child.kill();
             break Err("Stopped, and the command was ended before it finished.".into());
         }
@@ -4296,6 +4339,48 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
         }
         assert!(!alive(), "process {pid} outlived its job");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stopping_a_command_ends_what_it_started() {
+        let dir = std::env::temp_dir().join(format!("letronna-stop-tree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // To a file, since a stopped command's output is not given back.
+        let command = "sleep 60 & echo $! > grandchild; wait";
+        let cancel = Cancel::default();
+        let (stop, file) = (cancel.clone(), dir.join("grandchild"));
+        let stopper = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let pid = std::fs::read_to_string(&file).ok();
+                if let Some(pid) = pid.and_then(|pid| pid.trim().parse::<libc::pid_t>().ok()) {
+                    stop.set();
+                    return pid;
+                }
+                assert!(Instant::now() < deadline, "the command never started");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let out = run_shell_saving(
+            command,
+            Some(&dir),
+            &cancel,
+            None,
+            COMMAND_TIMEOUT,
+            Some(7_703),
+        );
+        assert!(out.unwrap_err().contains("Stopped"));
+        let pid = stopper.join().unwrap();
+        // SAFETY: signal 0 only asks whether the process is there.
+        let alive = || unsafe { libc::kill(pid, 0) == 0 };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while alive() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(!alive(), "process {pid} outlived the stop");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
