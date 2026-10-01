@@ -256,6 +256,10 @@ pub fn command(
             plugins(runner, rest);
             Flow::Handled
         }
+        "/memory" => {
+            crate::memory::memory(runner, rest, workspace);
+            Flow::Handled
+        }
         "/resume" => {
             resume(runner, session, workspace, rest);
             Flow::Handled

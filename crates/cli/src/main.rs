@@ -22,6 +22,7 @@ mod edit;
 mod input;
 mod install;
 mod mcp;
+mod memory;
 mod notify;
 mod render;
 mod screen;

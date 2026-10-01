@@ -45,6 +45,7 @@ pub mod import;
 pub mod inbox;
 pub mod init;
 pub mod insights;
+pub mod interrupt;
 pub mod jobs;
 pub mod judge;
 pub mod limits;
