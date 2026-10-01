@@ -1166,6 +1166,12 @@ mod tests {
             .collect()
     }
 
+    /// A command's output as words on one line: PowerShell's `echo` puts
+    /// each word on a line of its own, where sh's keeps them on one.
+    fn words(output: &str) -> String {
+        output.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
     /// The records in a transcript file, in the order they were written.
     fn written(path: &Path) -> Vec<Value> {
         std::fs::read_to_string(path)
@@ -2728,7 +2734,7 @@ mod tests {
         assert_eq!(finished(spec(endpoint, &dir, id)).status, Outcome::Done);
         let sent = provider.sent();
         let got = results(&sent[1]);
-        assert!(got[0].contains("ran again"), "{got:?}");
+        assert!(words(got[0]).contains("ran again"), "{got:?}");
         assert!(got[1].contains("nobody is here"), "{got:?}");
     }
 
@@ -2786,7 +2792,7 @@ mod tests {
         request.answer(approvals::Decision::Deny(String::new()));
         assert_eq!(running.join().unwrap().status, Outcome::Done);
         let sent = provider.sent();
-        assert!(results(&sent[1])[0].contains("asked once"));
+        assert!(words(results(&sent[1])[0]).contains("asked once"));
         assert_eq!(results(&sent[2])[1], NOT_APPROVED);
     }
 }
