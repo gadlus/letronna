@@ -269,6 +269,7 @@ impl Chat {
         self.agent_asks.clear();
         self.unattended.clear();
         self.thinking_open.clear();
+        self.runs_open.clear();
         self.unseen.clear();
         self.found.clear();
         self.editing_message = None;

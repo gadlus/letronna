@@ -406,6 +406,9 @@ pub(crate) struct Chat {
     pub(crate) edit_message: Entity<InputState>,
     /// Thoughts and tool outputs shown open, by session id and place.
     pub(crate) thinking_open: std::collections::HashSet<(u64, usize)>,
+    /// Runs of tool calls shown as their rows rather than one line, by
+    /// session id and the place of the run's first call.
+    pub(crate) runs_open: std::collections::HashSet<(u64, usize)>,
     /// The video playing in the chat, if one is, and its newest frame.
     pub(crate) video: Option<crate::platform::video::Playing>,
     pub(crate) video_frame: Option<std::sync::Arc<RenderImage>>,
@@ -915,6 +918,7 @@ impl Chat {
             editing_message: None,
             edit_message,
             thinking_open: std::collections::HashSet::new(),
+            runs_open: std::collections::HashSet::new(),
             video: None,
             video_frame: None,
             panel: Default::default(),
@@ -3248,12 +3252,14 @@ impl Chat {
 
     /// Turn `n` of the session on screen, as the list draws it. The turn a
     /// reply is coming in to also has the reply so far, the card it waits
-    /// on and what was queued behind it.
+    /// on and what was queued behind it. `tools` is the registry's, looked
+    /// up by the first turn that has a run of calls to tell.
     fn turn_row(
         &mut self,
         n: usize,
         column: Pixels,
         in_menu: bool,
+        tools: &std::cell::OnceCell<Vec<std::sync::Arc<dyn letronna_core::tools::Tool>>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -3281,6 +3287,15 @@ impl Chat {
         let mut hit = self
             .reveal
             .filter(|&(id, at)| id == conversation.id && (span.first..=span.last).contains(&at));
+        // Runs of tool calls, each drawn as one line until it is opened.
+        let shown_thinking = self.store.settings.thinking;
+        let runs =
+            letronna_core::tool_runs::find(messages, span.first..span.last + 1, shown_thinking);
+        let tools = if runs.is_empty() {
+            &[]
+        } else {
+            tools.get_or_init(letronna_core::tools::all).as_slice()
+        };
         let said = messages.iter().enumerate();
         for (i, m) in said.skip(span.first).take(span.last + 1 - span.first) {
             let labeled = i == span.first;
@@ -3305,6 +3320,28 @@ impl Chat {
                 let shown = shows_bar(span, messages.len(), streaming_here, focused);
                 self.turn_bar(span, shown, cx)
             });
+            let run = letronna_core::tool_runs::holding(&runs, i);
+            let folded = run.filter(|run| !self.runs_open.contains(&(conversation.id, run.first)));
+            if let Some(run) = run.filter(|run| run.first == i) {
+                let going =
+                    live && letronna_core::tool_runs::at_the_end(messages, run, shown_thinking);
+                let line = self.run_row(run, going, tools, window, cx);
+                // A hit inside a folded run is its line's alone, the failed
+                // calls kept in sight under it included.
+                let marked =
+                    folded.is_some() && hit.take_if(|&mut (_, at)| at <= run.last).is_some();
+                rows.push(if marked {
+                    self.mark_hit(line, cx)
+                } else {
+                    line
+                });
+            }
+            // A failure is never folded away: it is what needs reading.
+            if folded.is_some() && !letronna_core::tool_runs::failed(m) {
+                // A run that ends a stopped turn still carries its buttons.
+                rows.extend(bar);
+                continue;
+            }
             let row = self.message_row(i, m, labeled, false, bar, window, cx);
             rows.push(if hit.take_if(|&mut (_, at)| i >= at).is_some() {
                 self.mark_hit(row, cx)
@@ -4111,8 +4148,11 @@ impl Render for Chat {
                     .context_stack()
                     .iter()
                     .any(|context| context.contains("PopupMenu"));
+            // Looked up at most once a frame, and only for a turn with a run
+            // of calls to tell: each lookup reads the disk.
+            let tools = std::cell::OnceCell::new();
             let row = cx.processor(move |this, n: usize, window, cx| {
-                this.turn_row(n, column, in_menu, window, cx)
+                this.turn_row(n, column, in_menu, &tools, window, cx)
             });
             // The scrollbar must sit outside the list, or it scrolls away
             // with the content. The list spans the pane, so the bar is at
