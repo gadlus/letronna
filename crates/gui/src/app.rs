@@ -19,7 +19,11 @@ actions!(
         ToggleSidebar,
         OpenSettings,
         SendNow,
-        OpenActivity
+        OpenActivity,
+        NextRegion,
+        PreviousRegion,
+        FocusComposer,
+        ShowKeys
     ]
 );
 
@@ -369,6 +373,29 @@ pub(crate) struct Chat {
     pub(crate) steer: Entity<InputState>,
     /// The Activity page's, for the keyboard to land on.
     pub(crate) activity_focus: FocusHandle,
+    /// The sidebar's, the transcript's and the panel's, which F6 moves
+    /// between with the composer's own.
+    pub(crate) sidebar_focus: FocusHandle,
+    pub(crate) transcript_focus: FocusHandle,
+    pub(crate) panel_focus: FocusHandle,
+    /// The question card's answers, which take letter keys.
+    pub(crate) question_focus: FocusHandle,
+    /// The part of the window F6 last moved to, ringed while it keeps the
+    /// focus; a click anywhere takes the ring away.
+    pub(crate) region: Option<crate::ui::keys::Region>,
+    /// The session the sidebar's keys are on, by id: an index would move
+    /// the keys to another session when one before it was deleted.
+    pub(crate) picked: Option<u64>,
+    /// The turn the keys were sent to, by session and first message. Its
+    /// focus lives only while the list draws it, so it is handed over as
+    /// the turn is drawn: kept here until the next draw, then `focusing`
+    /// through that draw alone, so a turn off screen does not take the
+    /// keys later, when it is scrolled to.
+    pub(crate) focus_turn: Option<(u64, usize)>,
+    pub(crate) focusing: Option<(u64, usize)>,
+    /// A turn's menu opened from the keyboard, by the turn's first message,
+    /// with what closes it once the keys leave it.
+    pub(crate) turn_menu: Option<(usize, Entity<gpui_component::menu::PopupMenu>, Subscription)>,
     /// Your message being changed in place, by session id and place.
     pub(crate) editing_message: Option<(u64, usize)>,
     /// The box a message is changed in.
@@ -859,6 +886,15 @@ impl Chat {
             steering: None,
             steer,
             activity_focus: cx.focus_handle(),
+            sidebar_focus: cx.focus_handle(),
+            transcript_focus: cx.focus_handle(),
+            panel_focus: cx.focus_handle(),
+            question_focus: cx.focus_handle(),
+            region: None,
+            picked: None,
+            focus_turn: None,
+            focusing: None,
+            turn_menu: None,
             editing_message: None,
             edit_message,
             thinking_open: std::collections::HashSet::new(),
@@ -3123,6 +3159,19 @@ impl Chat {
         }
     }
 
+    /// Whether the chat page shows the conversation rather than the empty
+    /// state, the blank of a session still being read in, or the setup page:
+    /// once anything is said, a reply starts, or a helper asks.
+    pub(crate) fn transcript_shown(&self) -> bool {
+        let conversation = &self.store.conversations[self.store.active];
+        let streaming_here = self.busy && self.streaming_id == Some(conversation.id);
+        self.show_setup != Some(conversation.id)
+            && (!conversation.messages.is_empty()
+                || streaming_here
+                // A helper's card needs the chat body even with nothing said.
+                || self.agent_asks.iter().any(|ask| ask.root == conversation.id))
+    }
+
     /// How far above the bottom of the chat, in pixels.
     pub(crate) fn distance_from_bottom(&self) -> Pixels {
         self.list.max_offset_for_scrollbar().height + self.list.scroll_px_offset_for_scrollbar().y
@@ -3180,7 +3229,7 @@ impl Chat {
     /// reply is coming in to also has the reply so far, the card it waits
     /// on and what was queued behind it.
     fn turn_row(
-        &self,
+        &mut self,
         n: usize,
         column: Pixels,
         in_menu: bool,
@@ -3191,13 +3240,20 @@ impl Chat {
         let Some(&span) = self.turns.get(n) else {
             return self.under_turns(column, window, cx);
         };
-        let conversation = &self.store.conversations[self.store.active];
-        let messages = &conversation.messages;
-        let streaming_here = self.busy && self.streaming_id == Some(conversation.id);
+        let session = self.store.conversations[self.store.active].id;
+        let streaming_here = self.busy && self.streaming_id == Some(session);
         // The turn a reply is still coming in to has no buttons or menu:
         // it is not finished, and it owns the session until it is.
         let live = streaming_here && n + 1 == self.turns.len();
         let focus = self.turn_focus(span.first, window, cx);
+        // Stepped to from the keyboard, and drawn: only now is its focus
+        // there to take the keys.
+        if !live && self.focusing == Some((session, span.first)) {
+            self.focusing = None;
+            window.focus(&focus);
+        }
+        let conversation = &self.store.conversations[self.store.active];
+        let messages = &conversation.messages;
         let mut rows = Vec::new();
         // The message a search hit opened, marked on the first row drawn
         // from it on: a reply that only called tools has none of its own.
@@ -3291,13 +3347,13 @@ impl Chat {
             // a turn out; a press on it does not, or opening a tool's output
             // would take the keys from the composer (text inside still takes
             // focus to select).
-            div()
+            let turn = div()
                 .id(self.row_id("turn", span.first))
                 .w_full()
                 .track_focus(&focus)
                 .on_any_mouse_down(|_, window, _| window.prevent_default())
-                .child(group.context_menu(self.turn_menu(span, cx)))
-                .into_any_element()
+                .child(group.context_menu(self.turn_menu(span, cx)));
+            self.turn_keys(turn, span, focus, cx).into_any_element()
         };
         h_flex()
             .w_full()
@@ -3889,6 +3945,10 @@ impl Render for Chat {
         self.open_on_screen(cx);
         self.lay_out_turns();
         self.keep_files_current(window, cx);
+        self.keep_region(window, cx);
+        // The turn the keys were sent to since the last draw takes them in
+        // this one if the list draws it; if not, the transcript keeps them.
+        self.focusing = self.focus_turn.take();
         // What a stopped or failed reply did not take goes back in the box,
         // ahead of anything typed since.
         if let Some(text) = self.returned_follow_ups.take() {
@@ -3980,8 +4040,6 @@ impl Render for Chat {
         }
         let active = self.store.active;
         let conversation = &self.store.conversations[active];
-        // Only the session the reply was sent from shows the live row.
-        let streaming_here = self.busy && self.streaming_id == Some(conversation.id);
         // The column is given a width outright, from the window's, rather
         // than a maximum: the markdown renderer reports an intrinsic width
         // that beats a max width and drags the chat past the composer, but
@@ -4013,11 +4071,7 @@ impl Render for Chat {
             self.page_view(self.page, cx).into_any_element()
         } else if self.show_setup == Some(conversation.id) {
             self.setup_page(window, cx).into_any_element()
-        } else if conversation.messages.is_empty()
-            && !streaming_here
-            // A helper's card needs the chat body even with nothing said.
-            && !self.agent_asks.iter().any(|ask| ask.root == conversation.id)
-        {
+        } else if !self.transcript_shown() {
             if conversation.unfilled() {
                 // Still being read in, which takes a moment: blank rather
                 // than the greeting of a new session.
@@ -4049,9 +4103,14 @@ impl Render for Chat {
                 .min_h_0()
                 .min_w_0()
                 .w_full()
+                .track_focus(&self.transcript_focus)
+                // As on the sidebar: a click leaves the keys where they
+                // were, in the composer most often.
+                .on_any_mouse_down(|_, window, _| window.prevent_default())
                 .child(list(self.list.clone(), row).size_full())
                 .vertical_scrollbar(&self.list)
                 .children(self.jump_to_latest(cx))
+                .children(self.ring(crate::ui::keys::Region::Transcript, cx))
                 .into_any_element()
         };
 
@@ -4086,6 +4145,11 @@ impl Render for Chat {
                 )
             })
             .child(self.status_bar(cx))
+            // The chat draws its own over the conversation; a page has
+            // nowhere else to show that F6 put the keys on it.
+            .when(self.page != Page::Chat, |this| {
+                this.children(self.ring(crate::ui::keys::Region::Transcript, cx))
+            })
             .children(Root::render_notification_layer(window, cx));
 
         v_flex()
@@ -4163,6 +4227,39 @@ impl Render for Chat {
                     this.step_capability(-1, window, cx)
                 },
             ))
+            .on_action(
+                cx.listener(|this, _: &NextRegion, window, cx| {
+                    this.cycle_region(false, window, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &PreviousRegion, window, cx| {
+                this.cycle_region(true, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FocusComposer, window, cx| {
+                this.focus_composer_anywhere(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ShowKeys, window, cx| this.show_keys(window, cx)))
+            // From outside the turns, to the newest; a turn or the question
+            // card steps from itself before this.
+            .on_action(
+                cx.listener(|this, _: &crate::ui::actions::PreviousTurn, window, cx| {
+                    this.step_turn(None, false, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::ui::actions::NextTurn, window, cx| {
+                    this.step_turn(None, true, window, cx)
+                }),
+            )
+            // Last, after every binding had its chance: a key that typed
+            // nothing where the focus is goes to the composer.
+            .on_key_down(cx.listener(Self::type_into_composer))
+            // The ring is for the keyboard; a click puts the keys elsewhere.
+            .capture_any_mouse_down(cx.listener(|this, _, _, cx| {
+                if this.region.take().is_some() {
+                    cx.notify();
+                }
+            }))
             .child(
                 div()
                     .relative()
@@ -4174,7 +4271,9 @@ impl Render for Chat {
                 h_flex()
                     .flex_1()
                     .min_h_0()
-                    .when(self.sidebar_open, |this| this.child(self.sidebar(cx)))
+                    .when(self.sidebar_open, |this| {
+                        this.child(self.sidebar(window, cx))
+                    })
                     .child(main)
                     .children(self.right_panel(window, cx)),
             )
