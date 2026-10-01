@@ -35,7 +35,8 @@ toml = { version = "1", default-features = false, features = ["std", "parse", "s
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 
 # Stopping a background job ends everything it started: a Job Object on
-# Windows, a process group elsewhere. Both are already in the lock file,
+# Windows, a process group elsewhere; a Ctrl-C is heard by a console handler
+# on one and a signal on the other. Both are already in the lock file,
 # windows-sys at the version the window uses. Credential Manager keeps the
 # keys and tokens on Windows. Both also keep Letronna alive through Ctrl-C
 # while an editor has the terminal (interrupt.rs).

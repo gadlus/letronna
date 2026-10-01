@@ -54,6 +54,9 @@ use std::sync::{Arc, mpsc};
 const LOOK_FOR_UPDATES: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 /// How long a question asked once waits for MCP servers still starting.
 const MCP_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+/// How long leaving waits for the commands it ends. Each sees it within
+/// 50 ms, so only a machine under load comes near this.
+const END_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 /// A frontend reads a run's status at most four times a second, and
 /// stream-json follows it no more often.
 const PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
@@ -235,9 +238,14 @@ fn main() {
     if args.once() {
         // It goes out at once, so the MCP servers' tools would miss it.
         letronna_core::mcp::ready(MCP_WAIT);
+        let interrupted = Cancel::default();
         let code = match &args.prompt {
             Some(prompt) => {
-                let finished = ask_once(&mut runner, session, prompt, &args);
+                // From here a Ctrl-C stops the run instead, so what it
+                // started is ended below before the process goes. Not during
+                // the wait above, which would not hear it.
+                letronna_core::cancel::on_interrupt(interrupted.clone());
+                let finished = ask_once(&mut runner, session, prompt, &args, &interrupted);
                 if finished {
                     keep.now();
                 }
@@ -245,14 +253,19 @@ fn main() {
             }
             None => control::run(&mut runner, session, &args),
         };
-        // A browser with no window, or a job started in the background, would
-        // outlive this run unseen.
+        // A command still running, a browser with no window, or a job started
+        // in the background, would outlive this run unseen.
+        letronna_core::tools::end_commands(END_WAIT);
         letronna_core::browser::close_hidden();
         letronna_core::jobs::stop_all();
         letronna_core::mcp::stop_all();
         letronna_core::lsp::stop_all();
         runner.store.release_unused();
         letronna_core::diag::stop();
+        if interrupted.is_set() {
+            // What a shell reports for a program a Ctrl-C ended.
+            std::process::exit(130);
+        }
         if code != 0 {
             std::process::exit(code);
         }
@@ -419,7 +432,10 @@ fn main() {
     }
     runner.bar.uninstall();
     // A job's process is not ended with ours, so a dev server left running
-    // would carry on with nobody left to stop it.
+    // would carry on with nobody left to stop it. A foreground command is in
+    // a group of its own too, so one still running, or still being stopped
+    // after a Ctrl-C, is ended and waited for first.
+    letronna_core::tools::end_commands(END_WAIT);
     letronna_core::jobs::stop_all();
     letronna_core::mcp::stop_all();
     letronna_core::lsp::stop_all();
@@ -431,9 +447,16 @@ fn main() {
     letronna_core::diag::stop();
 }
 
-/// Runs one prompt on the driver and prints what came of it in the form
-/// asked for, saying whether it ended without failing.
-fn ask_once(runner: &mut Runner, session: usize, prompt: &str, args: &Args) -> bool {
+/// Runs one prompt on the driver, stopped when `interrupted` is set, and
+/// prints what came of it in the form asked for, saying whether it ended
+/// without failing.
+fn ask_once(
+    runner: &mut Runner,
+    session: usize,
+    prompt: &str,
+    args: &Args,
+    interrupted: &Cancel,
+) -> bool {
     let budget = args.budget.map(|limit| Arc::new(Budget::new(limit, None)));
     let (mut spec, context, before) = match begin(runner, session, prompt, args, budget) {
         Ok(begun) => begun,
@@ -442,6 +465,9 @@ fn ask_once(runner: &mut Runner, session: usize, prompt: &str, args: &Args) -> b
             return false;
         }
     };
+    // A child, so a decline at the keyboard that stops the run does not read
+    // as a Ctrl-C.
+    spec.cancel = interrupted.child();
     let id = spec.id;
     // Served before the run starts, since a request with nobody serving is
     // declined at once.
