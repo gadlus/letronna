@@ -13,6 +13,8 @@
 //! A run of another Letronna's runner, such as a terminal's, is seen only
 //! through its session file, which the window follows as it does every
 //! session another Letronna writes: with no running mark and no stop.
+//! A chat's session that a `letronna serve` carries on is followed the
+//! same way.
 
 use crate::prelude::*;
 use letronna_core::approvals;

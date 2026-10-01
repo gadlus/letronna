@@ -379,6 +379,11 @@ impl Chat {
             .child(self.workspace_chip(cx))
             .child(self.job_chips(cx))
             .children(self.loop_chip(cx))
+            .children(
+                self.heard_elsewhere
+                    .as_ref()
+                    .map(|holder| div().min_w_0().truncate().child(holder.line())),
+            )
             .children(self.helper_pill(cx))
             .child(div().flex_1())
             .children(self.update_chip(cx))

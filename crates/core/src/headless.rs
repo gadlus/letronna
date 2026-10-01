@@ -107,7 +107,7 @@ pub struct Headless {
 /// set up; an error when another Letronna already hears them.
 pub fn hear(config: &Config, inputs: Sender<Input>) -> Result<Option<Arc<AtomicBool>>, String> {
     let (sender, heard) = async_channel::unbounded();
-    let listening = remote::listen(config, sender)?;
+    let listening = remote::listen(config, sender, remote::By::Serve).map_err(|e| e.to_string())?;
     forward(heard, inputs, Input::Heard);
     Ok(listening)
 }

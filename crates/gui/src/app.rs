@@ -271,6 +271,11 @@ pub(crate) struct Chat {
     /// the sound device is held open only then.
     pub(crate) voice: Option<letronna_core::speech::Voice>,
     pub(crate) messaging_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Who answers the chat apps instead of this window, such as a
+    /// `letronna serve`, while it does.
+    pub(crate) heard_elsewhere: Option<letronna_core::remote::Holder>,
+    /// A thread is waiting for the chat apps to be let go, to take them over.
+    pub(crate) waiting_to_hear: bool,
     /// The Slack listener's own off switch and the settings it runs with:
     /// reopening its socket costs a call Slack limits, so a save that leaves
     /// Slack alone leaves it running.
@@ -803,6 +808,8 @@ impl Chat {
             typing: Default::default(),
             outstanding: 0,
             messaging_stop: None,
+            heard_elsewhere: None,
+            waiting_to_hear: false,
             slack_listener: None,
             voice: None,
             token_input,
@@ -2372,8 +2379,11 @@ impl Chat {
 
     /// Stop any running poller and start one if messaging is set up. Called
     /// whenever the settings change, so the worker always matches them; the
-    /// Slack listener is reopened only when its own settings changed.
+    /// Slack listener is reopened only when its own settings changed. While
+    /// another Letronna answers Telegram and Discord, such as a `letronna
+    /// serve`, the window says so and takes them over once it lets go.
     pub(crate) fn restart_messaging(&mut self, cx: &mut Context<Self>) {
+        use letronna_core::remote::{self, By, NotHeard};
         use std::sync::atomic::{AtomicBool, Ordering};
         if let Some(stop) = self.messaging_stop.take() {
             stop.store(true, Ordering::Relaxed);
@@ -2390,11 +2400,20 @@ impl Chat {
         }
         let open_slack = slack.ready() && !unchanged;
         let (tx, rx) = async_channel::unbounded();
-        // Telegram and Discord are not heard here while another Letronna
-        // hears them; Slack is the window's own.
-        let stop = letronna_core::remote::listen(&self.messaging, tx.clone())
-            .ok()
-            .flatten();
+        let heard = remote::listen(&self.messaging, tx.clone(), By::Window);
+        let elsewhere = match &heard {
+            Err(NotHeard::Elsewhere(holder)) => Some(holder.clone()),
+            _ => None,
+        };
+        if elsewhere != self.heard_elsewhere {
+            self.heard_elsewhere = elsewhere;
+            cx.notify();
+        }
+        if self.heard_elsewhere.is_some() {
+            self.hear_when_free(cx);
+        }
+        // Slack is the window's own, heard beside whoever hears the rest.
+        let stop = heard.ok().flatten();
         if open_slack {
             let slack_stop = std::sync::Arc::new(AtomicBool::new(false));
             let (state, states) = async_channel::unbounded();
@@ -2430,6 +2449,35 @@ impl Chat {
                     break;
                 }
             }
+        })
+        .detach();
+    }
+
+    /// Take the chat apps over, as at startup, once the Letronna answering
+    /// them lets them go. A thread blocks on their lock meanwhile, so nothing
+    /// here ticks while the window waits.
+    fn hear_when_free(&mut self, cx: &mut Context<Self>) {
+        if self.waiting_to_hear {
+            return;
+        }
+        let (tx, rx) = async_channel::bounded(1);
+        let free = move || {
+            let _ = tx.send_blocking(());
+        };
+        if letronna_core::remote::hear_when_free(letronna_core::remote::By::Window, free).is_err() {
+            return;
+        }
+        self.waiting_to_hear = true;
+        cx.spawn(async move |this, cx| {
+            let free = rx.recv().await.is_ok();
+            let _ = this.update(cx, |this, cx| {
+                // A thread that ended without the lock is not waiting any
+                // more; the next change to the settings starts another.
+                this.waiting_to_hear = false;
+                if free {
+                    this.restart_messaging(cx);
+                }
+            });
         })
         .detach();
     }
