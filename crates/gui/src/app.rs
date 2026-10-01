@@ -222,8 +222,6 @@ pub(crate) struct Chat {
     pub(crate) answer: Entity<InputState>,
     /// Text field on a tool's card for why it was denied.
     pub(crate) deny_reason: Entity<InputState>,
-    /// Whether the footer is already polling background jobs.
-    pub(crate) job_tick: bool,
     /// Whether the message box holds nothing to send.
     pub(crate) composer_empty: bool,
     /// What the composer offers for a `/` or `@` being typed.
@@ -388,6 +386,8 @@ pub(crate) struct Chat {
     pub(crate) browser_for: u64,
     /// The Files tab's tree and preview.
     pub(crate) files: crate::ui::files::Files,
+    /// The Jobs tab's choice of job, its output and the Run line.
+    pub(crate) jobs: crate::ui::jobs::Jobs,
     /// The composer holds the draft of the session `draft_for`; the other
     /// sessions' drafts wait here, by session id.
     pub(crate) drafts: std::collections::HashMap<u64, String>,
@@ -793,7 +793,6 @@ impl Chat {
             agent_asks: std::collections::VecDeque::new(),
             answer,
             deny_reason,
-            job_tick: false,
             composer_empty: true,
             completer: Default::default(),
             modes: std::collections::HashMap::new(),
@@ -869,6 +868,7 @@ impl Chat {
             browser: cx.new(|cx| crate::ui::browser::BrowserView::new(window, cx)),
             browser_for: 0,
             files: crate::ui::files::Files::new(cx),
+            jobs: crate::ui::jobs::Jobs::new(window, cx),
             drafts: std::collections::HashMap::new(),
             draft_for,
             attachments: std::collections::HashMap::new(),
@@ -904,6 +904,8 @@ impl Chat {
         this._subscriptions.push(front);
         let point_comment = this.follow_point_comments(window, cx);
         this._subscriptions.push(point_comment);
+        let run_line = this.follow_run_line(window, cx);
+        this._subscriptions.push(run_line);
         // The tab getting the keys is a moment the user may have committed
         // or edited elsewhere, like the window coming to the front.
         let focus = this.changes.focus.clone();
@@ -921,6 +923,7 @@ impl Chat {
         Self::serve_approvals(cx);
         Self::watch_ended(cx);
         Self::watch_clicks(window, cx);
+        Self::watch_jobs(window, cx);
         this.restart_messaging(cx);
         if this.store.settings.presence == "off" {
             plugins::set_enabled(cx, plugins::DISCORD, false);
@@ -1827,7 +1830,11 @@ impl Chat {
     /// What session `root`'s own rules make of a helper's `call`, or None
     /// when only the user can say: the gate the session itself goes through,
     /// in its mode and with what was allowed there.
-    fn decided(&self, call: &backend::ToolCall, root: u64) -> Option<approvals::Decision> {
+    pub(crate) fn decided(
+        &self,
+        call: &backend::ToolCall,
+        root: u64,
+    ) -> Option<approvals::Decision> {
         let mut ctx = letronna_core::tools::ToolContext::default();
         ctx.conversation = root;
         ctx.workspace = self
@@ -3889,6 +3896,7 @@ impl Render for Chat {
         self.open_on_screen(cx);
         self.lay_out_turns();
         self.keep_files_current(window, cx);
+        self.keep_jobs_current(window, cx);
         // What a stopped or failed reply did not take goes back in the box,
         // ahead of anything typed since.
         if let Some(text) = self.returned_follow_ups.take() {
@@ -3901,27 +3909,6 @@ impl Render for Chat {
                 };
                 input.set_value(value, window, cx);
             });
-        }
-        // A job starting or exiting happens off the UI thread, so the footer
-        // chips need a poll while any of them is alive. It stops on its own.
-        if !self.job_tick && letronna_core::jobs::list().iter().any(|job| job.running) {
-            self.job_tick = true;
-            cx.spawn(async move |this, cx| {
-                loop {
-                    cx.background_executor()
-                        .timer(std::time::Duration::from_secs(1))
-                        .await;
-                    let alive = letronna_core::jobs::list().iter().any(|job| job.running);
-                    let sent = this.update(cx, |this, cx| {
-                        this.job_tick = alive;
-                        cx.notify();
-                    });
-                    if sent.is_err() || !alive {
-                        break;
-                    }
-                }
-            })
-            .detach();
         }
         // Helpers work off the UI thread too, and a timer reads them while a
         // turn runs or one works.
@@ -4137,6 +4124,13 @@ impl Render for Chat {
                 cx.listener(|this, _: &crate::ui::changes::ChangesTab, window, cx| {
                     if !window.has_active_dialog(cx) && !this.settings_open {
                         this.show_changes(window, cx)
+                    }
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::ui::jobs::JobsTab, window, cx| {
+                    if !window.has_active_dialog(cx) && !this.settings_open {
+                        this.show_tab(crate::ui::panel::PanelTab::Jobs, window, cx)
                     }
                 }),
             )

@@ -12,6 +12,7 @@ pub(crate) mod composer;
 pub(crate) mod files;
 pub(crate) mod grain;
 pub(crate) mod import;
+pub(crate) mod jobs;
 pub(crate) mod mcp;
 pub(crate) mod messages;
 pub(crate) mod messaging;

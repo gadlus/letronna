@@ -66,6 +66,7 @@ fn main() {
             KeyBinding::new("secondary-j", ui::panel::TogglePanel, Some("Chat")),
             KeyBinding::new("secondary-shift-l", ui::panel::BrowserTab, Some("Chat")),
             KeyBinding::new("secondary-shift-e", ui::files::FilesTab, Some("Chat")),
+            KeyBinding::new("secondary-shift-j", ui::jobs::JobsTab, Some("Chat")),
             KeyBinding::new("secondary-shift-u", ui::usage::OpenUsage, Some("Chat")),
             KeyBinding::new("secondary-shift-a", OpenActivity, Some("Chat")),
             KeyBinding::new("secondary-k", ui::palette::OpenPalette, Some("Chat")),
@@ -185,6 +186,17 @@ fn main() {
                 ui::changes::LeaveMessage,
                 Some("CommitMessage > Input"),
             ),
+            // The Jobs tab: arrows choose a job, and in its output pick lines,
+            // Shift stretching the pick; Enter adds them to the message.
+            KeyBinding::new("down", ui::jobs::NextJob, Some("JobList")),
+            KeyBinding::new("up", ui::jobs::PreviousJob, Some("JobList")),
+            KeyBinding::new("down", ui::jobs::LineDown, Some("JobLog")),
+            KeyBinding::new("up", ui::jobs::LineUp, Some("JobLog")),
+            KeyBinding::new("shift-down", ui::jobs::PickDown, Some("JobLog")),
+            KeyBinding::new("shift-up", ui::jobs::PickUp, Some("JobLog")),
+            KeyBinding::new("secondary-a", ui::jobs::PickAll, Some("JobLog")),
+            KeyBinding::new("escape", ui::jobs::Unpick, Some("JobLog")),
+            KeyBinding::new("enter", ui::jobs::AddLines, Some("JobLog")),
         ]);
         // Windows hands Shift and a digit over as the character they type,
         // Ctrl+Shift+4 as "ctrl-$", which a binding written "shift-4" never

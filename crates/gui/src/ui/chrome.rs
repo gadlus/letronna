@@ -286,8 +286,8 @@ impl Chat {
             .on_click(cx.listener(|this, _, window, cx| this.show_changes(window, cx)))
     }
 
-    /// One chip per background job, with a stop button. Only running jobs are
-    /// shown: a finished one is history, and the agent can still read its log.
+    /// One chip per running background job, which shows its output in the
+    /// Jobs tab. A finished one is history, and is kept there.
     fn job_chips(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let jobs = letronna_core::jobs::list();
         h_flex().gap_1().children(
@@ -299,20 +299,20 @@ impl Chat {
                         .plain(cx)
                         .xsmall()
                         .text_color(cx.theme().muted_foreground)
-                        .tooltip(format!("Job #{}: {label} — click to stop", job.id))
+                        .tooltip(format!("Job #{}: {label} — see its output", job.id))
                         .child(
                             h_flex()
                                 .gap_1()
                                 .items_center()
                                 .max_w(px(180.))
                                 .child(div().size(px(6.)).rounded_full().bg(cx.theme().green))
-                                .child(div().truncate().child(label))
-                                .child(Icon::new(IconName::Close).size_3()),
+                                .child(div().truncate().child(label)),
                         )
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            let _ = letronna_core::jobs::stop(job.id);
-                            cx.notify();
-                        }))
+                        .on_click(
+                            cx.listener(move |this, _, window, cx| {
+                                this.show_job(job.id, window, cx)
+                            }),
+                        )
                 })
                 .collect::<Vec<_>>(),
         )
