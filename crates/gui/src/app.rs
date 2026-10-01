@@ -409,6 +409,10 @@ pub(crate) struct Chat {
     /// Runs of tool calls shown as their rows rather than one line, by
     /// session id and the place of the run's first call.
     pub(crate) runs_open: std::collections::HashSet<(u64, usize)>,
+    /// The files the newest finished turn changed, for the card after it,
+    /// and the session and length last read for it, read or not yet.
+    pub(crate) turn_files: Option<crate::ui::actions::TurnFiles>,
+    pub(crate) turn_files_for: Option<(u64, usize)>,
     /// The video playing in the chat, if one is, and its newest frame.
     pub(crate) video: Option<crate::platform::video::Playing>,
     pub(crate) video_frame: Option<std::sync::Arc<RenderImage>>,
@@ -919,6 +923,8 @@ impl Chat {
             edit_message,
             thinking_open: std::collections::HashSet::new(),
             runs_open: std::collections::HashSet::new(),
+            turn_files: None,
+            turn_files_for: None,
             video: None,
             video_frame: None,
             panel: Default::default(),
@@ -3353,6 +3359,10 @@ impl Chat {
         if let Some(row) = rows.pop_if(|_| hit.is_some()) {
             rows.push(self.mark_hit(row, cx));
         }
+        // The newest finished turn ends with the files it changed.
+        if !live && let Some(card) = self.files_card(span, cx) {
+            rows.push(card);
+        }
         if live {
             // While tools are queued the card below speaks for the turn;
             // showing a half-built reply as well would be two spinners.
@@ -4002,6 +4012,7 @@ impl Render for Chat {
         }
         self.open_on_screen(cx);
         self.lay_out_turns();
+        self.watch_turn_files(cx);
         self.keep_files_current(window, cx);
         self.keep_region(window, cx);
         // The turn the keys were sent to since the last draw takes them in

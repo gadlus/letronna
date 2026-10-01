@@ -346,6 +346,10 @@ pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Opti
             Some("In the changes: undo this session's edits to it"),
         ),
         (
+            KeyBinding::new("enter", ui::actions::ToggleDiff, Some("ChangedFile")),
+            Some("On a changed file under a turn: show or hide its diff"),
+        ),
+        (
             KeyBinding::new("enter", ui::messages::ToggleRun, Some("ToolRun")),
             Some("On a folded run of tool calls: open or close it"),
         ),

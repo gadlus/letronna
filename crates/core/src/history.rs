@@ -566,6 +566,171 @@ pub fn listing(plan: &[Restore], workspace: Option<&Path>) -> Vec<String> {
     lines
 }
 
+/// One file a turn changed, as the card after the turn lists it.
+#[derive(Clone, Debug)]
+pub struct Changed {
+    /// What undoing the turn would do to it.
+    pub restore: Restore,
+    /// What the turn did to its lines, when that can still be told.
+    pub lines: Option<Lines>,
+}
+
+/// The lines a turn added to and removed from one file, and the diff.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Lines {
+    pub added: usize,
+    pub removed: usize,
+    /// The diff, with long unchanged stretches folded to a count.
+    pub rows: Vec<Row>,
+}
+
+/// One line of a file's diff.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Row {
+    Same(String),
+    Removed(String),
+    Added(String),
+    /// This many unchanged lines, not shown.
+    Folded(usize),
+}
+
+/// Unchanged lines kept either side of a change, so it can be placed.
+const CONTEXT: usize = 2;
+
+/// Past this many changed lines on either side, lines are not matched one
+/// by one: the matching is quadratic, and a rewrite that big reads as a
+/// replacement anyway.
+const MATCHED: usize = 1000;
+
+/// The files the messages of one `turn` of session `session` wrote, in
+/// `workspace`, that are not already as they were before it.
+pub fn changed(session: u64, turn: &[Message], workspace: Option<&Path>) -> Vec<Changed> {
+    changed_in(&folder(session), turn, workspace)
+}
+
+fn changed_in(dir: &Path, turn: &[Message], workspace: Option<&Path>) -> Vec<Changed> {
+    plan_in(dir, turn, workspace)
+        .into_iter()
+        .map(|restore| Changed {
+            lines: lines_of(dir, &restore),
+            restore,
+        })
+        .collect()
+}
+
+/// What the turn did to `file`'s lines: only while the file still holds
+/// what the turn left, as a later change would be counted as the turn's,
+/// and only while what it replaced was kept and both are text. A file the
+/// turn removed counts as empty.
+fn lines_of(dir: &Path, file: &Restore) -> Option<Lines> {
+    // Read as the Changes tab reads it: a link could name a secret outside
+    // the project, and a device or a pipe never ends.
+    let now = read_now(&file.path).ok()?;
+    if now.as_deref().map(hash).as_deref() != present(&file.last) {
+        return None;
+    }
+    let old = match &file.to {
+        Some(to) => kept(dir, to).ok()?,
+        None => Vec::new(),
+    };
+    Some(diff(
+        &String::from_utf8(old).ok()?,
+        &String::from_utf8(now.unwrap_or_default()).ok()?,
+    ))
+}
+
+/// The diff from `old` to `new`, line by line.
+pub fn diff(old: &str, new: &str) -> Lines {
+    // Lines are compared with their endings, so a turn that only added the
+    // last newline or turned CRLF into LF is not counted as no change.
+    let (old, new): (Vec<&str>, Vec<&str>) = (
+        old.split_inclusive('\n').collect(),
+        new.split_inclusive('\n').collect(),
+    );
+    // What both ends share is set aside first, so an edit in a long file is
+    // matched over the few lines around it rather than the whole file.
+    let head = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+    let tail = old[head..]
+        .iter()
+        .rev()
+        .zip(new[head..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let (gone, came) = (&old[head..old.len() - tail], &new[head..new.len() - tail]);
+    let mut rows: Vec<Row> = old[..head].iter().map(|l| Row::Same(text(l))).collect();
+    if gone.len().max(came.len()) > MATCHED {
+        rows.extend(gone.iter().map(|l| Row::Removed(text(l))));
+        rows.extend(came.iter().map(|l| Row::Added(text(l))));
+    } else {
+        rows.extend(matched(gone, came));
+    }
+    rows.extend(old[old.len() - tail..].iter().map(|l| Row::Same(text(l))));
+    let count = |f: fn(&Row) -> bool| rows.iter().filter(|row| f(row)).count();
+    Lines {
+        added: count(|row| matches!(row, Row::Added(_))),
+        removed: count(|row| matches!(row, Row::Removed(_))),
+        rows: fold(rows),
+    }
+}
+
+/// `old` against `new` by their longest common run of lines.
+fn matched(old: &[&str], new: &[&str]) -> Vec<Row> {
+    // common[i][j] is how long a run the tails from i and j share.
+    let mut common = vec![vec![0usize; new.len() + 1]; old.len() + 1];
+    for i in (0..old.len()).rev() {
+        for j in (0..new.len()).rev() {
+            common[i][j] = if old[i] == new[j] {
+                common[i + 1][j + 1] + 1
+            } else {
+                common[i + 1][j].max(common[i][j + 1])
+            };
+        }
+    }
+    let (mut rows, mut i, mut j) = (Vec::new(), 0, 0);
+    while i < old.len() && j < new.len() {
+        if old[i] == new[j] {
+            rows.push(Row::Same(text(old[i])));
+            (i, j) = (i + 1, j + 1);
+        } else if common[i + 1][j] >= common[i][j + 1] {
+            rows.push(Row::Removed(text(old[i])));
+            i += 1;
+        } else {
+            rows.push(Row::Added(text(new[j])));
+            j += 1;
+        }
+    }
+    rows.extend(old[i..].iter().map(|l| Row::Removed(text(l))));
+    rows.extend(new[j..].iter().map(|l| Row::Added(text(l))));
+    rows
+}
+
+/// A line as the diff shows it, without its ending.
+fn text(line: &str) -> String {
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    line.strip_suffix('\r').unwrap_or(line).into()
+}
+
+/// Fold the unchanged lines further than `CONTEXT` from any change.
+fn fold(rows: Vec<Row>) -> Vec<Row> {
+    let near: Vec<bool> = (0..rows.len())
+        .map(|i| {
+            let to = (i + CONTEXT).min(rows.len() - 1);
+            rows[i.saturating_sub(CONTEXT)..=to]
+                .iter()
+                .any(|row| !matches!(row, Row::Same(_)))
+        })
+        .collect();
+    let mut out = Vec::new();
+    for (row, near) in rows.into_iter().zip(near) {
+        match out.last_mut() {
+            _ if near => out.push(row),
+            Some(Row::Folded(n)) => *n += 1,
+            _ => out.push(Row::Folded(1)),
+        }
+    }
+    out
+}
+
 /// How putting the files back went.
 #[derive(Debug, Default)]
 pub struct Restored {
@@ -1396,5 +1561,112 @@ mod tests {
         };
         let files = written(&[wrote], &link);
         assert_eq!(files, vec![Path::new("src").join("a.txt")]);
+    }
+
+    #[test]
+    fn a_turn_lists_its_files_with_the_lines_it_added_and_removed() {
+        let (project, kept) = scratch("changed-lines");
+        std::fs::write(project.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        std::fs::write(project.join("c.txt"), "same\n").unwrap();
+        let ctx = context(&project, &kept);
+        let turn = [
+            call(
+                &ctx,
+                "edit_file",
+                serde_json::json!({"path": "a.txt", "old": "two", "new": "2\nand a half"}),
+            ),
+            call(
+                &ctx,
+                "write_file",
+                serde_json::json!({"path": "b.txt", "content": "new\nfile\n"}),
+            ),
+            call(
+                &ctx,
+                "write_file",
+                serde_json::json!({"path": "c.txt", "content": "other\n"}),
+            ),
+        ];
+        // Written back by hand since: nothing of the turn is left in it.
+        std::fs::write(project.join("c.txt"), "same\n").unwrap();
+
+        let files = changed_in(&kept, &turn, Some(&project));
+        let counts: Vec<_> = files
+            .iter()
+            .map(|file| {
+                let lines = file.lines.as_ref().unwrap();
+                (
+                    label(&file.restore.path, Some(&project)),
+                    lines.added,
+                    lines.removed,
+                )
+            })
+            .collect();
+        assert_eq!(
+            counts,
+            [("a.txt".to_owned(), 2, 1), ("b.txt".to_owned(), 2, 0)]
+        );
+
+        // Changed again after the turn: the lines are no longer the turn's.
+        std::fs::write(project.join("a.txt"), "someone else's\n").unwrap();
+        let files = changed_in(&kept, &turn, Some(&project));
+        assert!(files[0].lines.is_none());
+        assert_eq!(files[0].restore.fate, Fate::Changed);
+    }
+
+    #[test]
+    fn a_turn_that_deleted_a_file_lists_its_lines_as_removed() {
+        let (project, kept) = scratch("changed-deleted");
+        std::fs::write(project.join("gone.txt"), "one\ntwo\n").unwrap();
+        let ctx = context(&project, &kept);
+        let patch = "*** Begin Patch\n*** Delete File: gone.txt\n*** End Patch";
+        let turn = [call(
+            &ctx,
+            "apply_patch",
+            serde_json::json!({ "patch": patch }),
+        )];
+        let files = changed_in(&kept, &turn, Some(&project));
+        assert_eq!(files.len(), 1);
+        let lines = files[0].lines.as_ref().unwrap();
+        assert_eq!((lines.added, lines.removed), (0, 2));
+        assert_eq!(files[0].restore.fate, Fate::Back);
+    }
+
+    #[test]
+    fn a_diff_counts_a_change_to_line_endings_alone() {
+        let lines = diff("one\ntwo", "one\ntwo\n");
+        assert_eq!((lines.added, lines.removed), (1, 1));
+        assert_eq!(
+            lines.rows,
+            [
+                Row::Same("one".into()),
+                Row::Removed("two".into()),
+                Row::Added("two".into()),
+            ]
+        );
+        let lines = diff("a\r\nb\r\n", "a\nb\n");
+        assert_eq!((lines.added, lines.removed), (2, 2));
+        assert_eq!(diff("same\n", "same\n").added, 0);
+    }
+
+    #[test]
+    fn a_diff_folds_what_did_not_change_far_from_the_edit() {
+        let old: String = (1..=20).map(|n| format!("{n}\n")).collect();
+        let new = old.replace("10\n", "ten\n");
+        let lines = diff(&old, &new);
+        assert_eq!((lines.added, lines.removed), (1, 1));
+        let same = |n: usize| Row::Same(n.to_string());
+        assert_eq!(
+            lines.rows,
+            [
+                Row::Folded(7),
+                same(8),
+                same(9),
+                Row::Removed("10".into()),
+                Row::Added("ten".into()),
+                same(11),
+                same(12),
+                Row::Folded(8),
+            ]
+        );
     }
 }
