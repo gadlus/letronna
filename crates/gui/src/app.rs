@@ -1609,10 +1609,11 @@ impl Chat {
             conversation: session,
             wrap_up: false,
             mode,
-            // Nobody sees a helper's card in a chat app's session, so its
-            // helpers are refused rather than left asking.
-            human: self.unattended(session).is_none()
-                && !self.remote_session.values().any(|&id| id == session),
+            // A chat app's session has a human too, just reached through a
+            // card sent to the chat by `on_agent_ask` rather than shown in
+            // this window; only a schedule deciding without the user truly
+            // has nobody there.
+            human: self.unattended(session).is_none(),
             // Filled in by `run_turn`, once the prompt is in.
             typed: Default::default(),
             // Its own: the judge runs on `model`.
@@ -2735,11 +2736,10 @@ impl Chat {
         if message.spoken {
             self.speak_back.insert(id);
         }
-        // Nobody on the far end can answer an approval card, so unless the
-        // user has said otherwise a remote message may look but not touch.
-        // With tools it gets the Default mode setting, but never above
-        // Default: whoever writes in the chat drives it, and the chip that
-        // would say what runs unasked is not in front of them.
+        // Unless the user has said otherwise a remote message may look but
+        // not touch. With tools it gets the Default mode setting, but never
+        // above Default: whoever writes in the chat drives it, and the chip
+        // that would say what runs unasked is not in front of them.
         let mode = if allow_tools {
             Mode::narrow(Mode::Default, self.store.settings.mode)
         } else {

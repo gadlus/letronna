@@ -1325,6 +1325,51 @@ mod tests {
     }
 
     #[test]
+    fn a_chat_apps_call_gets_a_card_but_a_headless_run_still_refuses() {
+        let _serving = crate::approvals::tests::SERVING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let requests = approvals::serve();
+        let dir = scratch("chat-app");
+        let write = || ("write_file", json!({"path": "made.txt", "content": "made"}));
+
+        // A chat app's session has a human too, just reached through a card
+        // sent to the chat, so a call that needs a yes asks rather than
+        // being refused outright.
+        let (endpoint, stub) = provider(vec![reply("", &[write()]), reply("Wrote it.", &[])]);
+        let mut chatting = spec(endpoint, &dir, AGENTS + 300);
+        chatting.connection.remote = Some(chat::Remote {
+            place: "a Telegram chat".into(),
+            ..Default::default()
+        });
+        chatting.connection.human = true;
+        let running = spawn(chatting, |_| ()).unwrap();
+        let request = requests.recv_timeout(WAIT).unwrap();
+        assert_eq!(
+            request.root, 7,
+            "a chat card routes by the session it names"
+        );
+        request.answer(approvals::Decision::Once);
+        assert_eq!(running.join().unwrap().status, Outcome::Done);
+        let _ = stub.sent();
+        assert!(dir.join("made.txt").exists());
+
+        // A headless run -- a schedule, or `-p` with no terminal to answer
+        // in -- has nobody there at all, so it still refuses with no card.
+        let (endpoint, provider) = provider(vec![reply("", &[write()]), reply("Left it.", &[])]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 310);
+        spec.connection.human = false;
+        assert_eq!(finished(spec).status, Outcome::Done);
+        let sent = provider.sent();
+        assert!(
+            results(&sent[1])[0].contains("nobody is here to give it"),
+            "{:?}",
+            results(&sent[1])
+        );
+        assert!(requests.try_recv().is_err(), "a card with nobody there");
+    }
+
+    #[test]
     fn a_message_mid_run_folds_in_after_the_results() {
         let _bell = crate::inbox::tests::DOORBELL
             .lock()
