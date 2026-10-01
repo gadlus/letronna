@@ -41,6 +41,12 @@ set up, or another `letronna serve`.";
 /// own.
 static HEARING: Mutex<Option<(PathBuf, File)>> = Mutex::new(None);
 
+/// The lock's file in the data folder.
+const LOCK: &str = "messaging.lock";
+
+/// Who holds the lock: "serve" or "window", then the process id.
+const RECORD: &str = "messaging.holder";
+
 /// What a host keeps for the chats between their messages.
 #[derive(Default)]
 pub struct Dispatcher {
@@ -119,15 +125,74 @@ pub trait Host {
     fn stop(&mut self, id: u64);
 }
 
+/// Which Letronna hears the chat apps, as the record beside the lock says.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum By {
+    Window,
+    Serve,
+}
+
+impl By {
+    /// The record's word for it.
+    fn word(self) -> &'static str {
+        match self {
+            By::Window => "window",
+            By::Serve => "serve",
+        }
+    }
+}
+
+/// The Letronna holding the lock, as far as its record says; a Letronna from
+/// before the record, or one that could not write it, leaves both unknown.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Holder {
+    pub by: Option<By>,
+    pub pid: Option<u32>,
+}
+
+impl Holder {
+    /// One line saying who answers the chat apps instead of this Letronna.
+    pub fn line(&self) -> String {
+        let who = match self.by {
+            Some(By::Serve) => "letronna serve",
+            Some(By::Window) => "another Letronna window",
+            None => "another Letronna",
+        };
+        match self.pid {
+            Some(pid) => format!("Chat apps answered by {who} (pid {pid})"),
+            None => format!("Chat apps answered by {who}"),
+        }
+    }
+}
+
+/// Why this Letronna does not hear the chat apps.
+#[derive(Debug, PartialEq)]
+pub enum NotHeard {
+    /// Another Letronna does, and may be waited for.
+    Elsewhere(Holder),
+    /// The system will not give the lock to anyone.
+    Failed(String),
+}
+
+impl std::fmt::Display for NotHeard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NotHeard::Elsewhere(_) => f.write_str(ELSEWHERE),
+            NotHeard::Failed(error) => f.write_str(error),
+        }
+    }
+}
+
 /// Start hearing Telegram and Discord as set up in `config`, each message
 /// going to `sender`, on threads that end once the flag handed back is set;
 /// `None` when neither is set up to hear. Only one Letronna hears them at a
-/// time, so this holds `HEARING` while either is set up, and says so when
-/// another Letronna holds it.
+/// time, so this holds `HEARING` while either is set up, recorded as `by`,
+/// and says who does when another Letronna holds it.
 pub fn listen(
     config: &Config,
     sender: async_channel::Sender<Incoming>,
-) -> Result<Option<Arc<AtomicBool>>, String> {
+    by: By,
+) -> Result<Option<Arc<AtomicBool>>, NotHeard> {
     let (telegram, discord) = (&config.telegram, &config.discord);
     let mut held = HEARING.lock().unwrap_or_else(PoisonError::into_inner);
     if !telegram.ready() && !discord.bot_ready() {
@@ -139,7 +204,7 @@ pub fn listen(
     if held.as_ref().is_none_or(|(at, _)| *at != dir) {
         // The last profile's goes first: its chat apps are not heard here now.
         *held = None;
-        *held = Some((dir.clone(), take_lock(&dir)?));
+        *held = Some((dir.clone(), take_lock(&dir, by)?));
     }
     let stop = Arc::new(AtomicBool::new(false));
     if telegram.ready() {
@@ -151,16 +216,91 @@ pub fn listen(
     Ok(Some(stop))
 }
 
+/// Wait on a thread for the Letronna that hears the chat apps to let them
+/// go, then hold the lock as `by` and call `then`, which starts hearing them
+/// as `listen` would. The system hands the lock over only once that
+/// Letronna quits, crashes or lets the chat apps go, so it is never taken
+/// from one still hearing them.
+pub fn hear_when_free(by: By, then: impl FnOnce() + Send + 'static) -> Result<(), String> {
+    let dir = backend::data_dir();
+    wait_for_lock(&dir.clone(), by, move |file| {
+        let mut held = HEARING.lock().unwrap_or_else(PoisonError::into_inner);
+        // Taken meanwhile by `listen`, which already holds it for us.
+        if held.is_none() {
+            *held = Some((dir, file));
+        }
+        drop(held);
+        then();
+    })
+}
+
 /// Take the lock in data folder `dir` that says this Letronna hears the chat
-/// apps, or say why it cannot.
-fn take_lock(dir: &Path) -> Result<File, String> {
-    let refused = |e: std::io::Error| format!("Cannot hear the chat apps: {e}");
-    let file = crate::schedule::open_lock(&dir.join("messaging.lock")).map_err(refused)?;
+/// apps, and record it as `by`, or say who holds it instead.
+fn take_lock(dir: &Path, by: By) -> Result<File, NotHeard> {
+    let refused = |e: std::io::Error| NotHeard::Failed(format!("Cannot hear the chat apps: {e}"));
+    let file = crate::schedule::open_lock(&dir.join(LOCK)).map_err(refused)?;
     match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(TryLockError::WouldBlock) => Err(ELSEWHERE.into()),
+        Ok(()) => {
+            record(dir, by);
+            Ok(file)
+        }
+        Err(TryLockError::WouldBlock) => Err(NotHeard::Elsewhere(holder(dir))),
         Err(TryLockError::Error(e)) => Err(refused(e)),
     }
+}
+
+/// Block a thread of its own on the lock in data folder `dir`, and once it
+/// is had, record it as `by` and hand it to `then`. Where the system cannot
+/// wait on a lock, the thread gives up and nothing is heard until the chat
+/// apps are set up again or Letronna starts again, rather than trying on a
+/// timer.
+fn wait_for_lock(
+    dir: &Path,
+    by: By,
+    then: impl FnOnce(File) + Send + 'static,
+) -> Result<(), String> {
+    let refused = |e: std::io::Error| format!("Cannot wait for the chat apps: {e}");
+    let file = crate::schedule::open_lock(&dir.join(LOCK)).map_err(refused)?;
+    let dir = dir.to_path_buf();
+    std::thread::Builder::new()
+        .name("messaging-lock".into())
+        .spawn(move || {
+            if file.lock().is_err() {
+                return;
+            }
+            record(&dir, by);
+            then(file);
+        })
+        .map(|_| ())
+        .map_err(refused)
+}
+
+/// Say beside the lock in data folder `dir` that this process, as `by`,
+/// holds it. The record is a file of its own because Windows locks a file's
+/// bytes against reading along with the file, so another Letronna could not
+/// read it in the lock itself. Only a Letronna holding the lock writes it,
+/// so while the lock is held it names the holder; one that cannot be
+/// written only leaves the holder unknown. The last holder's record goes
+/// first, so one that cannot be replaced is not left naming somebody else.
+fn record(dir: &Path, by: By) {
+    let _ = std::fs::remove_file(dir.join(RECORD));
+    let _ = std::fs::write(
+        dir.join(RECORD),
+        format!("{} {}\n", by.word(), std::process::id()),
+    );
+}
+
+/// Who holds the lock in data folder `dir`, as its record says.
+fn holder(dir: &Path) -> Holder {
+    let text = std::fs::read_to_string(dir.join(RECORD)).unwrap_or_default();
+    let mut words = text.split_whitespace();
+    let by = match words.next() {
+        Some("serve") => Some(By::Serve),
+        Some("window") => Some(By::Window),
+        _ => None,
+    };
+    let pid = words.next().and_then(|pid| pid.parse().ok());
+    Holder { by, pid }
 }
 
 /// Deal with a message from a chat app. A Telegram chat that is not paired
@@ -436,7 +576,10 @@ pub fn said(report: &driver::Report) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Dispatcher, Host, ask, dispatch, ended, take_lock};
+    use super::{
+        By, Dispatcher, Holder, Host, NotHeard, RECORD, ask, dispatch, ended, holder, take_lock,
+        wait_for_lock,
+    };
     use crate::approvals::{self, tests::SERVING};
     use crate::chat::{Message, Remote, ToolCall};
     use crate::gate::Mode;
@@ -573,14 +716,105 @@ mod tests {
             .unwrap_or("")
     }
 
+    /// An empty scratch data folder of the test's own, removed when dropped.
+    fn scratch(name: &str) -> crate::store::tests::Scratch {
+        crate::store::tests::Scratch::new(&format!("remote-{name}"))
+    }
+
     #[test]
     fn only_one_letronna_hears_the_chat_apps_until_it_lets_go() {
-        let dir = crate::store::tests::Scratch::new("remote-hearing");
-        let first = take_lock(&dir).unwrap();
-        let second = take_lock(&dir).map(|_| ()).unwrap_err();
-        assert!(second.starts_with("Another Letronna already answers the chat apps"));
+        let dir = scratch("hearing");
+        let first = take_lock(&dir, By::Serve).unwrap();
+        let second = take_lock(&dir, By::Window).map(|_| ()).unwrap_err();
+        assert!(
+            second
+                .to_string()
+                .starts_with("Another Letronna already answers the chat apps")
+        );
         drop(first);
-        assert!(take_lock(&dir).is_ok(), "let go when the first went");
+        assert!(
+            take_lock(&dir, By::Window).is_ok(),
+            "let go when the first went"
+        );
+    }
+
+    #[test]
+    fn a_window_hears_the_chat_apps_when_free_and_defers_to_whoever_holds_them() {
+        let dir = scratch("defer");
+        let serve = Holder {
+            by: Some(By::Serve),
+            pid: Some(std::process::id()),
+        };
+        let first = take_lock(&dir, By::Serve).unwrap();
+        assert_eq!(
+            take_lock(&dir, By::Window).map(|_| ()),
+            Err(NotHeard::Elsewhere(serve.clone()))
+        );
+        drop(first);
+        let window = take_lock(&dir, By::Window).unwrap();
+        assert_eq!(holder(&dir).by, Some(By::Window), "the window recorded");
+        drop(window);
+        // As a serve from before the record, which leaves it as it was.
+        let old = take_lock(&dir, By::Serve).unwrap();
+        std::fs::remove_file(dir.join(RECORD)).unwrap();
+        assert_eq!(
+            take_lock(&dir, By::Window).map(|_| ()),
+            Err(NotHeard::Elsewhere(Holder::default()))
+        );
+        drop(old);
+    }
+
+    #[test]
+    fn the_record_names_the_holder_and_its_pid_and_an_old_one_names_nobody() {
+        let dir = scratch("record");
+        assert_eq!(holder(&dir), Holder::default(), "no record at all");
+        let held = take_lock(&dir, By::Serve).unwrap();
+        let written = std::fs::read_to_string(dir.join(RECORD)).unwrap();
+        assert_eq!(written, format!("serve {}\n", std::process::id()));
+        let found = holder(&dir);
+        assert_eq!(found.pid, Some(std::process::id()));
+        assert_eq!(
+            found.line(),
+            format!(
+                "Chat apps answered by letronna serve (pid {})",
+                std::process::id()
+            )
+        );
+        drop(held);
+        std::fs::write(dir.join(RECORD), "").unwrap();
+        assert_eq!(
+            holder(&dir).line(),
+            "Chat apps answered by another Letronna"
+        );
+        std::fs::write(dir.join(RECORD), "window").unwrap();
+        assert_eq!(
+            holder(&dir).line(),
+            "Chat apps answered by another Letronna window"
+        );
+    }
+
+    #[test]
+    fn a_waiting_window_takes_the_chat_apps_over_only_once_serve_lets_go() {
+        let dir = scratch("hand-over");
+        let serve = take_lock(&dir, By::Serve).unwrap();
+        let (tx, rx) = mpsc::channel();
+        wait_for_lock(&dir, By::Window, move |file| {
+            let _ = tx.send(file);
+        })
+        .unwrap();
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "not taken from a serve still holding it"
+        );
+        assert_eq!(holder(&dir).by, Some(By::Serve));
+        drop(serve);
+        let window = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(holder(&dir).by, Some(By::Window));
+        assert!(
+            matches!(take_lock(&dir, By::Serve), Err(NotHeard::Elsewhere(_))),
+            "a serve started now defers to the window"
+        );
+        drop(window);
     }
 
     #[test]
