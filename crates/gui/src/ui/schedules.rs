@@ -9,14 +9,36 @@ use letronna_core::schedule::{self, Schedule, Trigger};
 const INTERVALS: &[u32] = &[15, 30, 60, 180, 360, 720];
 
 impl Chat {
-    fn save_schedules(&mut self, cx: &mut Context<Self>) {
-        schedule::save(&self.schedules);
+    /// Change the schedules through the runner, which reads them afresh and
+    /// saves at once, so a run's `last_run` is never written back over.
+    fn change_schedules(&mut self, edit: impl FnOnce(&mut Vec<Schedule>), cx: &mut Context<Self>) {
+        if let Err(error) = self.schedule_runner.change(edit) {
+            self.error = Some(error);
+        }
+        self.schedules = self.schedule_runner.list();
         cx.notify();
+    }
+
+    /// Change job `id`, if it is still there.
+    fn change_schedule(
+        &mut self,
+        id: u64,
+        edit: impl FnOnce(&mut Schedule),
+        cx: &mut Context<Self>,
+    ) {
+        self.change_schedules(
+            |list| {
+                if let Some(job) = list.iter_mut().find(|s| s.id == id) {
+                    edit(job);
+                }
+            },
+            cx,
+        );
     }
 
     pub(crate) fn new_schedule(&mut self, cx: &mut Context<Self>) {
         let mut fresh = Schedule {
-            id: schedule::next_id(&self.schedules),
+            id: 0,
             name: "New job".into(),
             prompt: String::new(),
             workspace: self.store.conversations[self.store.active]
@@ -32,9 +54,18 @@ impl Chat {
             mode: Mode::Default,
         };
         schedule::armed_now(&mut fresh);
-        self.editing = Some(fresh.id);
-        self.schedules.push(fresh);
-        self.save_schedules(cx);
+        let mut id = 0;
+        self.change_schedules(
+            |list| {
+                // Numbered against the list on disk, which may have grown
+                // since this page last read it.
+                fresh.id = schedule::next_id(list);
+                id = fresh.id;
+                list.push(fresh);
+            },
+            cx,
+        );
+        self.editing = Some(id);
     }
 
     /// The editor for one job, shown in place of its row.
@@ -181,16 +212,17 @@ impl Chat {
                             gpui_component::switch::Switch::new("unattended")
                                 .checked(unattended)
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    if let Some(job) =
-                                        this.schedules.iter_mut().find(|s| s.id == id)
-                                    {
-                                        job.mode = if unattended {
-                                            Mode::Default
-                                        } else {
-                                            Mode::Bypass
-                                        };
-                                    }
-                                    this.save_schedules(cx);
+                                    this.change_schedule(
+                                        id,
+                                        |job| {
+                                            job.mode = if unattended {
+                                                Mode::Default
+                                            } else {
+                                                Mode::Bypass
+                                            };
+                                        },
+                                        cx,
+                                    );
                                 })),
                         ),
                     ),
@@ -215,21 +247,25 @@ impl Chat {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 // A job that was never given a prompt was never
                                 // really created; do not leave the row behind.
-                                this.schedules
-                                    .retain(|s| s.id != id || !s.prompt.is_empty());
                                 this.editing = None;
-                                this.save_schedules(cx);
+                                this.change_schedules(
+                                    |list| list.retain(|s| s.id != id || !s.prompt.is_empty()),
+                                    cx,
+                                );
                             })),
                     ),
             )
     }
 
     pub(crate) fn set_trigger(&mut self, id: u64, trigger: Trigger, cx: &mut Context<Self>) {
-        if let Some(job) = self.schedules.iter_mut().find(|s| s.id == id) {
-            job.trigger = trigger;
-            schedule::armed_now(job);
-        }
-        self.save_schedules(cx);
+        self.change_schedule(
+            id,
+            |job| {
+                job.trigger = trigger;
+                schedule::armed_now(job);
+            },
+            cx,
+        );
     }
 
     fn commit_schedule(&mut self, id: u64, cx: &mut Context<Self>) {
@@ -240,16 +276,19 @@ impl Chat {
             cx.notify();
             return;
         }
-        if let Some(job) = self.schedules.iter_mut().find(|s| s.id == id) {
-            job.name = if name.is_empty() {
-                prompt.chars().take(40).collect()
-            } else {
-                name
-            };
-            job.prompt = prompt;
-        }
         self.editing = None;
-        self.save_schedules(cx);
+        self.change_schedule(
+            id,
+            |job| {
+                job.name = if name.is_empty() {
+                    prompt.chars().take(40).collect()
+                } else {
+                    name
+                };
+                job.prompt = prompt;
+            },
+            cx,
+        );
     }
 
     fn delete_schedule(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
@@ -260,8 +299,7 @@ impl Chat {
         let chat = cx.entity();
         crate::ui::confirm_delete("Delete job", body, window, cx, move |_, cx| {
             chat.update(cx, |this, cx| {
-                this.schedules.retain(|s| s.id != id);
-                this.save_schedules(cx);
+                this.change_schedules(|list| list.retain(|s| s.id != id), cx);
             })
         });
     }
@@ -334,15 +372,9 @@ impl Chat {
                             .xsmall()
                             .label("Run now")
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                let Some(job) = this.schedules.iter().find(|s| s.id == id).cloned()
-                                else {
-                                    return;
-                                };
-                                if let Some(slot) = this.schedules.iter_mut().find(|s| s.id == id) {
-                                    slot.last_run = backend::now();
-                                }
-                                schedule::save(&this.schedules);
-                                this.start_scheduled(&job, cx);
+                                this.schedule_runner.run_now(id);
+                                this.schedules = this.schedule_runner.list();
+                                cx.notify();
                             })),
                     )
                     .child(
@@ -370,13 +402,14 @@ impl Chat {
                             gpui_component::switch::Switch::new(("on", index))
                                 .checked(enabled)
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    if let Some(job) =
-                                        this.schedules.iter_mut().find(|s| s.id == id)
-                                    {
-                                        job.enabled = !enabled;
-                                        schedule::armed_now(job);
-                                    }
-                                    this.save_schedules(cx);
+                                    this.change_schedule(
+                                        id,
+                                        |job| {
+                                            job.enabled = !enabled;
+                                            schedule::armed_now(job);
+                                        },
+                                        cx,
+                                    );
                                 })),
                         ),
                     ),

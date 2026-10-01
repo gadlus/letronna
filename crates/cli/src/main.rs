@@ -239,6 +239,7 @@ fn main() {
         letronna_core::jobs::stop_all();
         letronna_core::mcp::stop_all();
         letronna_core::lsp::stop_all();
+        runner.store.release_unused();
         letronna_core::diag::stop();
         if code != 0 {
             std::process::exit(code);
@@ -283,6 +284,11 @@ fn main() {
     // turn; `-p` has left by now, with its answer.
     runner.bar.listen();
     runner.ended = Some(letronna_core::notify::listen());
+    // Likewise only a terminal that stays open runs the schedules, unless the
+    // window already does. A run lands in the sessions, where /resume finds
+    // it, and is told at the idle prompt when it ends.
+    let (_schedules, events) = letronna_core::schedule::Runner::start();
+    runner.bar.hear_schedules(events);
     offer_added(&mut runner, workspace.as_deref());
     runner
         .bar
@@ -290,6 +296,11 @@ fn main() {
     while let Some(waited) = runner.bar.wait() {
         // Helpers that ended ring the doorbell as they do.
         runner.tell_ended();
+        if let bar::Waited::Scheduled(event) = waited {
+            scheduled(event);
+            screen::settle();
+            continue;
+        }
         if waited == bar::Waited::Asked {
             runner.answer_helpers(true);
             continue;
@@ -376,6 +387,8 @@ fn main() {
     letronna_core::mcp::stop_all();
     letronna_core::lsp::stop_all();
     letronna_core::browser::close_hidden();
+    letronna_core::schedule::stop();
+    runner.store.release_unused();
     render::title("");
     render::blank();
     letronna_core::diag::stop();
@@ -761,6 +774,35 @@ fn choose_by_flags(runner: &mut Runner, session: usize, gateway: Option<&str>, a
         };
         runner.store.conversations[session].effort = Some(effort);
     }
+}
+
+/// Say what the schedules' runner said: a run that ended, with how to open
+/// its session, or why the schedules are not running.
+fn scheduled(event: letronna_core::schedule::Event) {
+    /// Enough of an answer to recognise it by on one line.
+    const PREVIEW: usize = 60;
+    render::blank();
+    let run = match event {
+        letronna_core::schedule::Event::Ended(run) => run,
+        letronna_core::schedule::Event::Trouble(trouble) => {
+            render::line(&render::red(&trouble));
+            return;
+        }
+    };
+    let text = letronna_core::tools::one_line(&run.text);
+    let mut preview: String = text.chars().take(PREVIEW).collect();
+    if preview.len() < text.len() {
+        preview.push('…');
+    }
+    let open = if run.session.is_some() {
+        " · /resume to open it"
+    } else {
+        ""
+    };
+    render::line(&render::dim(&format!(
+        "Scheduled job {}: {preview}{open}",
+        run.name
+    )));
 }
 
 /// Hand the terminal back if we panic. Without this a crash leaves the
