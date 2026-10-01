@@ -1,4 +1,5 @@
 use crate::prelude::*;
+use gpui_component::popover::Popover;
 
 /// The user guide on the website, opened from the account menu.
 const GUIDE: &str = "https://letronna.ai/docs";
@@ -380,6 +381,7 @@ impl Chat {
             .child(self.job_chips(cx))
             .children(self.loop_chip(cx))
             .children(self.helper_pill(cx))
+            .children(self.context_chip(cx))
             .child(div().flex_1())
             .children(self.update_chip(cx))
             .child(concat!("v", env!("CARGO_PKG_VERSION")))
@@ -389,4 +391,164 @@ impl Chat {
                     .child(env!("GIT_HASH")),
             )
     }
+
+    /// How full the active session's context is, from its latest reply,
+    /// which is what a request actually carried rather than an estimate of
+    /// it. Click, or open with the keyboard, for the breakdown. `None`
+    /// before there is a reply to read it from.
+    fn context_chip(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let reply = self.store.conversations[self.store.active]
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant" && m.window > 0 && m.input_tokens() > 0)?;
+        let share = reply.input_tokens().saturating_mul(100) / reply.window;
+        let chip = Button::new("context")
+            .plain(cx)
+            .xsmall()
+            .text_color(cx.theme().muted_foreground)
+            .tooltip("What fills the context")
+            .child(format!("{share}%"))
+            // The popover opens on a mouse press only, so a key opens it here.
+            .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                if event.is_keyboard() {
+                    this.open_context_popover(cx);
+                }
+            }));
+        let (chat, report) = (cx.entity(), self.context_report);
+        Some(
+            Popover::new("context-popover")
+                .anchor(gpui::Corner::BottomRight)
+                // The built-in appearance shadows the panel; a hairline
+                // border says the same thing without one.
+                .appearance(false)
+                .open(self.context_report.is_some())
+                .on_open_change(move |open, _, cx| {
+                    chat.update(cx, |this, cx| {
+                        if *open {
+                            this.open_context_popover(cx);
+                        } else {
+                            this.context_report = None;
+                            cx.notify();
+                        }
+                    })
+                })
+                .trigger(chip)
+                .content(move |_, _, cx| context_popover(report, cx)),
+        )
+    }
+
+    /// Add up what fills the active session's context afresh, for the
+    /// popover to show. Reading memory and skills off disk and listing the
+    /// tools is done off the window's thread, so a slow disk or a big
+    /// project cannot stall a frame; the popover opens when it is done.
+    pub(crate) fn open_context_popover(&mut self, cx: &mut Context<Self>) {
+        if self.context_report.is_some() {
+            return;
+        }
+        let ix = self.store.active;
+        let mut connection = match self.connection_for(ix, None) {
+            Ok(connection) => connection,
+            Err(error) => {
+                self.error = Some(error);
+                cx.notify();
+                return;
+            }
+        };
+        connection.workspace = self.store.conversations[ix].workspace.clone();
+        let session = self.store.conversations[ix].id;
+        let messages = self.store.conversations[ix].messages.clone();
+        let added = cx
+            .background_executor()
+            .spawn(async move { backend::context_report(&connection, &messages) });
+        cx.spawn(async move |this, cx| {
+            let report = added.await;
+            let _ = this.update(cx, |this, cx| {
+                // The user may have moved to another session meanwhile.
+                if this.store.conversations[this.store.active].id == session {
+                    this.context_report = Some(report);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+}
+
+/// The popover's content: the total against the window, a bar split by what
+/// filled it, and a line for each part. `report` is read once, when the
+/// popover is opened; see `open_context_popover`.
+fn context_popover(report: Option<backend::ContextReport>, cx: &App) -> Div {
+    let muted = cx.theme().muted_foreground;
+    // Like `popover_style`, but a hairline border instead of its shadow.
+    let panel = |content: Div| {
+        content
+            .w(px(260.))
+            .bg(cx.theme().popover)
+            .text_color(cx.theme().popover_foreground)
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded(cx.theme().radius)
+            .p_3()
+    };
+    let Some(report) = report else {
+        return panel(div().child(div().text_sm().text_color(muted).child("Adding up…")));
+    };
+    let parts = report.parts;
+    let rows = [
+        ("System", parts.system, cx.theme().chart_1),
+        ("Tools", parts.tools, cx.theme().chart_2),
+        ("MCP", parts.mcp, cx.theme().chart_2.opacity(0.5)),
+        ("Memory", parts.memory, cx.theme().chart_3),
+        ("Skills", parts.skills, cx.theme().chart_4),
+        ("Conversation", parts.conversation, cx.theme().chart_5),
+    ];
+    let total = parts.total().max(1);
+    let bar = rows.iter().fold(
+        h_flex()
+            .w_full()
+            .h(px(6.))
+            .rounded_full()
+            .overflow_hidden()
+            .bg(cx.theme().border),
+        |bar, (_, value, color)| {
+            bar.child(
+                div()
+                    .h_full()
+                    .w(relative(*value as f32 / total as f32))
+                    .bg(*color),
+            )
+        },
+    );
+    panel(
+        v_flex()
+            .gap_3()
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(if report.window == 0 {
+                        // A model whose window is not known has no "of".
+                        letronna_core::usage::count(report.used)
+                    } else {
+                        format!(
+                            "{} of {}",
+                            letronna_core::usage::count(report.used),
+                            letronna_core::usage::count(report.window)
+                        )
+                    }),
+            )
+            .child(bar)
+            .children(rows.into_iter().filter(|(_, value, _)| *value > 0).map(
+                |(name, value, color)| {
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .text_xs()
+                        .child(div().size(px(6.)).rounded_full().flex_shrink_0().bg(color))
+                        .child(div().flex_1().text_color(muted).child(name))
+                        .child(letronna_core::usage::count(value))
+                },
+            )),
+    )
 }

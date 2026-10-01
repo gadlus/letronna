@@ -7,6 +7,7 @@ use std::{
     any::Any,
     collections::{BTreeMap, HashMap, HashSet},
     io::{BufRead, BufReader},
+    ops::Range,
     path::PathBuf,
     sync::{Mutex, OnceLock},
     time::Duration,
@@ -523,6 +524,120 @@ fn fixed_tokens(connection: &Connection) -> usize {
     tokens(&body_with(connection, &[], None, None, &Budget::SMALL, &[]).to_string())
 }
 
+/// How a request over `connection` would spend its tokens, named the way the
+/// context popover in the window shows them.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ContextParts {
+    /// Who Letronna is, its reply style and rules, the date and the model:
+    /// the system prompt less memory, skills and the MCP servers' own
+    /// instructions, which are counted on their own.
+    pub system: u64,
+    /// The built-in tools' schemas, MCP's among them left out.
+    pub tools: u64,
+    /// The MCP servers' own instructions and their tools' schemas, or
+    /// `find_tools` and `call_mcp_tool` once those go out in their place.
+    pub mcp: u64,
+    pub memory: u64,
+    pub skills: u64,
+    /// The messages a request would carry, in the window it would open at.
+    pub conversation: u64,
+}
+
+impl ContextParts {
+    /// All the parts together: about what the next request would spend.
+    pub fn total(&self) -> u64 {
+        self.system + self.tools + self.mcp + self.memory + self.skills + self.conversation
+    }
+}
+
+/// `ContextParts` for the next request over `connection`, were it sent
+/// `messages` now. Estimated the way the budget is, since nothing is sent to
+/// find out: the prompt comes from the same `system_prompt` a request
+/// sends, cut where `body_hashed` hashes its parts, the tools from the same
+/// `offered` split by whether a schema is an MCP server's, and the
+/// conversation from the window a request this size would open at. The
+/// summary of what the window dropped is left out, as making one can take
+/// a model call.
+fn context_parts(connection: &Connection, messages: &[Message]) -> ContextParts {
+    let prompt = system_prompt(connection, None);
+    let text = prompt.text.as_str();
+    let part = |range: &Range<usize>| tokens(&text[range.clone()]) as u64;
+    let system = tokens(&text[..prompt.identity]) + tokens(&text[prompt.skills.end..]);
+    let (tools, mcp) = if connection.tools {
+        let every = crate::tools::all();
+        let on_demand = crate::mcp_find::on_demand(&every);
+        let is_mcp = |spec: &Value| {
+            let name = spec["function"]["name"].as_str().unwrap_or_default();
+            crate::mcp_find::is_mcp(name)
+                || name == crate::mcp_find::FIND_TOOLS
+                || name == crate::mcp_find::CALL_MCP_TOOL
+        };
+        let (mcp_specs, own_specs): (Vec<Value>, Vec<Value>) =
+            offered(connection, &every, on_demand)
+                .into_iter()
+                .partition(is_mcp);
+        // An empty side costs nothing: the brackets of its `[]` are not sent.
+        let specs_tokens = |specs: Vec<Value>| {
+            if specs.is_empty() {
+                0
+            } else {
+                tokens(&Value::Array(specs).to_string()) as u64
+            }
+        };
+        (specs_tokens(own_specs), specs_tokens(mcp_specs))
+    } else {
+        (0, 0)
+    };
+    let request_budget = budget(connection, crate::store::context_cap());
+    let start = window_start(messages, &request_budget);
+    let sums = token_sums(&messages[start..], request_budget.tool_chars);
+    let conversation = *sums.last().unwrap_or(&0) as u64;
+    ContextParts {
+        system: system as u64,
+        tools,
+        mcp: part(&prompt.servers) + mcp,
+        memory: part(&prompt.memory),
+        skills: part(&prompt.skills),
+        conversation,
+    }
+}
+
+/// What fills a session's context, for the popover behind its status-bar
+/// percentage.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ContextReport {
+    /// The most tokens `connection`'s model reads at once; 0 when not known.
+    pub window: u64,
+    /// What of the window is spent: the latest reply's own count, which is
+    /// what a request actually carried rather than an estimate of it, or
+    /// `parts.total()` before there is one to read.
+    pub used: u64,
+    pub parts: ContextParts,
+}
+
+/// `ContextReport` for `connection`'s session, holding `messages`.
+pub fn context_report(connection: &Connection, messages: &[Message]) -> ContextReport {
+    let parts = context_parts(connection, messages);
+    let last = messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "assistant" && m.window > 0 && m.input_tokens() > 0);
+    match last {
+        Some(reply) => ContextReport {
+            window: reply.window,
+            used: reply.input_tokens(),
+            parts,
+        },
+        None => ContextReport {
+            window: crate::models::facts(&connection.endpoint, connection.model.trim())
+                .context
+                .unwrap_or(0),
+            used: parts.total(),
+            parts,
+        },
+    }
+}
+
 /// The budget for a model that reads `context` tokens and writes `output`,
 /// where they are known, under a cap of `cap` tokens, when `fixed` tokens of
 /// every request go to the system prompt and the tools.
@@ -720,6 +835,24 @@ fn identity(style: Option<String>) -> String {
     system
 }
 
+/// The tools a request over `connection` offers out of `every`, before any
+/// a caller adds; `on_demand` when the MCP tools go out behind `find_tools`.
+fn offered(
+    connection: &Connection,
+    every: &[std::sync::Arc<dyn crate::tools::Tool>],
+    on_demand: bool,
+) -> Vec<Value> {
+    let mut tools = crate::tools::specs_of(every, connection, on_demand);
+    crate::mcp_find::fit(&mut tools, connection);
+    if connection.search {
+        // The gateway's own search, alongside our functions rather than
+        // instead of them: the model picks whichever it needs, and the
+        // answer comes back with the pages it read attached.
+        tools.push(json!({"type": "web_search"}));
+    }
+    tools
+}
+
 /// The request, offering `extra` after every tool the connection offers.
 fn body_with(
     connection: &Connection,
@@ -732,17 +865,25 @@ fn body_with(
     body_hashed(connection, window, summary, plan, budget, extra, None)
 }
 
-/// `body_with`, keeping the hashes of its cached prefix in `prefix` when
-/// given one: only a request that is sent needs them.
-fn body_hashed(
-    connection: &Connection,
-    window: &[Message],
-    summary: Option<&str>,
-    plan: Option<&str>,
-    budget: &Budget,
-    extra: &[Value],
-    mut prefix: Option<&mut crate::cache_miss::Prefix>,
-) -> Value {
+/// The system message of a request, and where in it lie the parts its
+/// cached prefix is hashed by.
+struct SystemPrompt {
+    text: String,
+    /// Where who Letronna is, its reply style and its rules end.
+    identity: usize,
+    memory: Range<usize>,
+    /// The MCP servers' own instructions, between memory and skills.
+    servers: Range<usize>,
+    skills: Range<usize>,
+    /// Where the model line starts, after the date and the computer.
+    model: usize,
+}
+
+/// The system message for a request over `connection`, with what a shorter
+/// window already dropped folded in as `summary` at the end. Apart from
+/// `body_hashed` so `context_parts` prices the prompt a request sends
+/// without building one.
+fn system_prompt(connection: &Connection, summary: Option<&str>) -> SystemPrompt {
     let mut system = identity(crate::styles::chosen());
     let shared = connection.remote.as_ref().is_some_and(|r| r.shared);
     if connection.tools && !shared {
@@ -787,13 +928,12 @@ fn body_hashed(
     // stays cacheable; the summary of dropped turns changes as the
     // conversation grows.
     let identity = system.len();
-    let memory = crate::memory::context(connection);
-    let servers = crate::mcp::context(connection);
-    let skills = crate::skills::context(connection);
-    system.push_str(&memory);
-    system.push_str(&servers);
-    system.push_str(&skills);
-    let tail = system.len();
+    system.push_str(&crate::memory::context(connection));
+    let memory = identity..system.len();
+    system.push_str(&crate::mcp::context(connection));
+    let servers = memory.end..system.len();
+    system.push_str(&crate::skills::context(connection));
+    let skills = servers.end..system.len();
     // Models reckon "today" from their training and guess who they are. The
     // date alone changes once a day, so the prefix above stays cached; the OS
     // says something about this computer, so a shared chat goes without it.
@@ -810,25 +950,50 @@ fn body_hashed(
         };
         system.push_str(&format!(" This computer runs {os}."));
     }
-    // Hashed apart from the model line, so that a switch of model is named
-    // as that rather than as the system prompt.
-    if let Some(prefix) = prefix.as_deref_mut() {
-        use crate::cache_miss::Reason;
-        prefix.set(Reason::System, (&system[..identity], &system[tail..]));
-        prefix.set(Reason::Memory, &memory);
-        prefix.set(Reason::Skills, &skills);
-        prefix.set(Reason::Summary, summary);
-        // Another gateway holds no cache of this one's, whatever the model.
-        let route = (connection.endpoint.trim(), connection.model.trim());
-        prefix.set(Reason::Model, route);
-    }
+    let model = system.len();
     system.push_str(&format!(" The model behind you is {}.", connection.model));
     if let Some(summary) = summary {
         system.push_str(&format!(
             "\n\nEarlier in this conversation, summarized because it no longer fits:\n{summary}"
         ));
     }
-    let mut context = vec![json!({"role": "system", "content": system})];
+    SystemPrompt {
+        text: system,
+        identity,
+        memory,
+        servers,
+        skills,
+        model,
+    }
+}
+
+/// `body_with`, keeping the hashes of its cached prefix in `prefix` when
+/// given one: only a request that is sent needs them.
+fn body_hashed(
+    connection: &Connection,
+    window: &[Message],
+    summary: Option<&str>,
+    plan: Option<&str>,
+    budget: &Budget,
+    extra: &[Value],
+    mut prefix: Option<&mut crate::cache_miss::Prefix>,
+) -> Value {
+    let system = system_prompt(connection, summary);
+    // Hashed apart from the model line, so that a switch of model is named
+    // as that rather than as the system prompt.
+    if let Some(prefix) = prefix.as_deref_mut() {
+        use crate::cache_miss::Reason;
+        let text = system.text.as_str();
+        let rest = &text[system.skills.end..system.model];
+        prefix.set(Reason::System, (&text[..system.identity], rest));
+        prefix.set(Reason::Memory, &text[system.memory.clone()]);
+        prefix.set(Reason::Skills, &text[system.skills.clone()]);
+        prefix.set(Reason::Summary, summary);
+        // Another gateway holds no cache of this one's, whatever the model.
+        let route = (connection.endpoint.trim(), connection.model.trim());
+        prefix.set(Reason::Model, route);
+    }
+    let mut context = vec![json!({"role": "system", "content": system.text})];
     let sees = sees_images(&connection.model) && listed_as_seeing(connection);
     let shown: Vec<(Picture, Value)> = pictures(window)
         .into_iter()
@@ -963,14 +1128,7 @@ fn body_hashed(
         "stream_options": {"include_usage": true}
     });
     if connection.tools {
-        let mut tools = crate::tools::specs_of(&every, connection, on_demand);
-        crate::mcp_find::fit(&mut tools, connection);
-        if connection.search {
-            // The gateway's own search, alongside our functions rather than
-            // instead of them: the model picks whichever it needs, and the
-            // answer comes back with the pages it read attached.
-            tools.push(json!({"type": "web_search"}));
-        }
+        let mut tools = offered(connection, &every, on_demand);
         // Last, so the tools before them go out byte for byte as they would
         // without them, and a provider's cached prefix holds up to here.
         tools.extend_from_slice(extra);
@@ -4083,6 +4241,114 @@ mod tests {
         assert_eq!(fullness(900, 0, 16_385), "5% of 16K");
         assert_eq!(fullness(900, 0, 0), "");
         assert_eq!(fullness(0, 0, 200_000), "");
+    }
+
+    /// An empty scratch folder, so `memory::context` and `skills::context`
+    /// read no file left by another test or the machine's own account.
+    fn empty_data_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("letronna-chat-context-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn context_parts_splits_the_request_by_what_it_is_for() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = empty_data_dir("parts");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let c = Connection {
+            tools: true,
+            ..connection()
+        };
+        let messages = [said("user", "hello"), said("assistant", "hi there")];
+        let parts = context_parts(&c, &messages);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // Nothing written yet: memory still carries the guidance paragraph
+        // that goes out whenever tools do, and no skill is switched on.
+        assert!(parts.memory > 0, "{parts:?}");
+        assert_eq!(parts.skills, 0, "{parts:?}");
+        // No MCP server is set up in the test.
+        assert_eq!(parts.mcp, 0, "{parts:?}");
+        assert!(parts.system > 0, "{parts:?}");
+        assert!(parts.tools > 0, "{parts:?}");
+        assert!(parts.conversation > 0, "{parts:?}");
+    }
+
+    #[test]
+    fn context_parts_prices_the_system_prompt_a_request_sends() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = empty_data_dir("prompt");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let c = Connection {
+            tools: true,
+            ..connection()
+        };
+        let plain = context_parts(&c, &[]);
+        let settings = serde_json::json!({"endpoint": "", "model": "m", "style": "concise"});
+        std::fs::write(dir.join("settings.json"), settings.to_string()).unwrap();
+        let prompt = system_prompt(&c, None);
+        let sent = body(&c, &[], None, None)["messages"][0]["content"].clone();
+        let styled = context_parts(&c, &[]);
+        let memory = crate::memory::context(&c);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(sent.as_str(), Some(prompt.text.as_str()));
+        // The style is part of who Letronna is, cut off before memory.
+        let identity = &prompt.text[..prompt.identity];
+        assert!(
+            identity.contains("Write your replies in this style"),
+            "{identity}"
+        );
+        assert_eq!(&prompt.text[prompt.memory.clone()], memory);
+        assert!(styled.system > plain.system, "{plain:?} {styled:?}");
+        assert_eq!(styled.memory, plain.memory);
+    }
+
+    #[test]
+    fn context_report_prefers_what_the_latest_reply_actually_spent() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = empty_data_dir("recorded");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let messages = [
+            said("user", "question"),
+            Message {
+                prompt_tokens: 76_000,
+                window: 200_000,
+                ..said("assistant", "answer")
+            },
+        ];
+        let report = context_report(&connection(), &messages);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!((report.window, report.used), (200_000, 76_000));
+    }
+
+    #[test]
+    fn context_report_falls_back_to_the_estimate_before_theres_a_reply() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = empty_data_dir("estimate");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let report = context_report(&connection(), &[said("user", "hello")]);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // The test model's window is not known to `models::facts`.
+        assert_eq!(report.window, 0);
+        assert_eq!(report.used, report.parts.total());
+        assert!(report.used > 0);
     }
 
     #[test]
