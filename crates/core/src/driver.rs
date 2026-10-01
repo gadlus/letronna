@@ -1788,7 +1788,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn measured() -> Option<Look> {
         let looking = std::fs::read_link("/proc/thread-self").ok()?;
-        let tasks: Vec<PathBuf> = std::fs::read_dir("/proc/self/task")
+        let tasks: Vec<std::path::PathBuf> = std::fs::read_dir("/proc/self/task")
             .ok()?
             .filter_map(|task| Some(task.ok()?.path()))
             .collect();

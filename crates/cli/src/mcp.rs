@@ -300,6 +300,9 @@ fn serve(words: &[String]) -> Result<(), String> {
         }
     }
     letronna_core::diag::init("cli");
+    // A turn run for the client is a session like the terminal's, so this
+    // start holds the running file as the terminal's does, and prunes as one.
+    letronna_core::store::prune_old(&[]);
     let settings = letronna_core::store::load_listing().settings;
     letronna_core::browser::share_browser(settings.browser_shared);
     std::thread::spawn(letronna_core::browser::close_left_over);

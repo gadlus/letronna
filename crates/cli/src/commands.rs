@@ -338,6 +338,10 @@ pub fn command(
             usage(runner.store.conversations[*session].id);
             Flow::Handled
         }
+        "/retention" => {
+            retention(runner, rest);
+            Flow::Handled
+        }
         "/insights" => {
             insights(rest);
             Flow::Handled
@@ -352,6 +356,44 @@ pub fn command(
             None => Flow::Handled,
         },
         _ => added(runner, whole, workspace),
+    }
+}
+
+/// Show how long sessions are kept, or set it from `rest`.
+fn retention(runner: &mut Runner, rest: &str) {
+    render::blank();
+    let days = match keep_days(rest) {
+        Ok(Some(days)) => {
+            runner.store.settings.keep_days = days;
+            runner.persist();
+            days
+        }
+        Ok(None) => runner.store.settings.keep_days,
+        Err(error) => {
+            render::line(&render::red(&error));
+            return;
+        }
+    };
+    render::line(&render::dim(&match days {
+        0 => "Every session is kept. /retention 30 deletes those untouched for 30 days.".into(),
+        days => format!(
+            "Sessions untouched for {days} day{} are deleted when Letronna starts with no \
+             other copy open, at most once a day; pinned ones are kept. /retention off keeps \
+             them all.",
+            if days == 1 { "" } else { "s" }
+        ),
+    }));
+}
+
+/// The days `/retention` was given: None to only show them, 0 to keep every
+/// session.
+fn keep_days(rest: &str) -> Result<Option<u32>, String> {
+    match rest.trim() {
+        "" => Ok(None),
+        "off" | "never" | "forever" => Ok(Some(0)),
+        days => days.parse().map(Some).map_err(|_| {
+            format!("\"{days}\" is not a number of days. Try /retention 30, or /retention off.")
+        }),
     }
 }
 
@@ -2850,7 +2892,8 @@ pub fn gateways(runner: &mut Runner) {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_rows, choice_label, from_match, last_prompt, name_label, typed_path, with_files,
+        agent_rows, choice_label, from_match, keep_days, last_prompt, name_label, typed_path,
+        with_files,
     };
     use letronna_core::agents::Seen;
     use letronna_core::chat::Message;
@@ -3041,5 +3084,15 @@ mod tests {
         let long = name_label(&"t".repeat(10_000));
         assert_eq!(long.chars().count(), 40);
         assert!(long.ends_with('…'));
+    }
+
+    #[test]
+    fn retention_takes_days_or_off_and_refuses_anything_else() {
+        assert_eq!(keep_days(""), Ok(None));
+        assert_eq!(keep_days(" 30 "), Ok(Some(30)));
+        assert_eq!(keep_days("off"), Ok(Some(0)));
+        assert_eq!(keep_days("0"), Ok(Some(0)));
+        assert!(keep_days("a month").is_err());
+        assert!(keep_days("-3").is_err());
     }
 }
