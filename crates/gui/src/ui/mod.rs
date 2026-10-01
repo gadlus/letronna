@@ -13,6 +13,7 @@ pub(crate) mod files;
 pub(crate) mod grain;
 pub(crate) mod import;
 pub(crate) mod mcp;
+pub(crate) mod memory;
 pub(crate) mod messages;
 pub(crate) mod messaging;
 pub(crate) mod palette;

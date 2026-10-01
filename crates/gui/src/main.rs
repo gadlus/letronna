@@ -64,6 +64,9 @@ fn main() {
             // from dialogs and menus. Inside the chat, theirs go first.
             KeyBinding::new("escape", Dismiss, Some("Chat")),
             KeyBinding::new("secondary-j", ui::panel::TogglePanel, Some("Chat")),
+            // Saves the Memory page's box with focus; nothing else there has
+            // a save key.
+            KeyBinding::new("secondary-s", ui::memory::Save, Some("MemoryPage")),
             KeyBinding::new("secondary-shift-l", ui::panel::BrowserTab, Some("Chat")),
             KeyBinding::new("secondary-shift-e", ui::files::FilesTab, Some("Chat")),
             KeyBinding::new("secondary-shift-u", ui::usage::OpenUsage, Some("Chat")),

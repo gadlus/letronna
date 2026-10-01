@@ -11,6 +11,7 @@ pub(crate) const PAGES: &[(&str, AppIcon)] = &[
     ("Model", AppIcon::Robot),
     ("Appearance", AppIcon::Palette),
     ("Thinking", AppIcon::Sparkles),
+    ("Memory", AppIcon::FileText),
     ("Privacy", AppIcon::Shield),
     ("Shortcuts", AppIcon::Keyboard),
     ("Plugins", AppIcon::Puzzle),
@@ -296,6 +297,14 @@ impl Chat {
         if *self.settings_page.read(cx) == "Usage" {
             self.load_usage(cx);
         }
+        // Memory may have been written since, by the model or by hand.
+        let workspace = self
+            .store
+            .conversations
+            .get(self.store.active)
+            .and_then(|conversation| conversation.workspace.clone());
+        self.memory
+            .update(cx, |page, cx| page.refresh(workspace, window, cx));
         cx.notify();
     }
 
@@ -477,6 +486,7 @@ impl Chat {
             "Thinking" => thinking_page(&chat, &self.store, window, cx).into_any_element(),
             "Shortcuts" => shortcuts_page(&hotkey, &chat, cx).into_any_element(),
             "Plugins" => plugins_page(&chat, cx).into_any_element(),
+            "Memory" => self.memory.clone().into_any_element(),
             "About" => about_page(&chat, self, cx).into_any_element(),
             "Search" => search_page(self.search_rows(), &pick, &endpoint, &key, &chat, cx)
                 .into_any_element(),
