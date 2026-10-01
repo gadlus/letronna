@@ -19,6 +19,15 @@ const MODES: [(Mode, &str); 5] = [
 ];
 
 impl Chat {
+    /// The Scheduled jobs page, its list read again: the model's `schedule`
+    /// tool, or another Letronna, may have changed it since the last read.
+    pub(crate) fn open_jobs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.schedules = self.schedule_runner.list();
+        self.page = Page::Jobs;
+        self.focus_composer(window, cx);
+        cx.notify();
+    }
+
     /// Change the schedules through the runner, which reads them afresh and
     /// saves at once, so a run's `last_run` is never written back over.
     fn change_schedules(&mut self, edit: impl FnOnce(&mut Vec<Schedule>), cx: &mut Context<Self>) {

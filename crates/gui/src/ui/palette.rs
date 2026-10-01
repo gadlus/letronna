@@ -450,6 +450,7 @@ impl Chat {
             Pick::Action(action) => window.dispatch_action(action.boxed_clone(), cx),
             Pick::Page(Page::Activity) => self.open_activity(window, cx),
             Pick::Page(Page::Capabilities) => self.open_capabilities(window, cx),
+            Pick::Page(Page::Jobs) => self.open_jobs(window, cx),
             Pick::Page(page) => {
                 self.page = page;
                 self.focus_composer(window, cx);
