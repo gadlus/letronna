@@ -10,6 +10,16 @@ pub(crate) fn offered() -> impl Iterator<Item = Mode> {
     Mode::OFFERED.into_iter().filter(|mode| *mode != Mode::Auto)
 }
 
+/// How the window shows `mode`: Auto as Accept edits, which is what it does
+/// here until the window has its judge, so the list has it ticked.
+pub(crate) fn shown(mode: Mode) -> Mode {
+    if mode == Mode::Auto {
+        Mode::AcceptEdits
+    } else {
+        mode
+    }
+}
+
 impl Chat {
     /// The (gateway, model) pairs the picker shows for what is typed in its
     /// search box.
@@ -519,7 +529,7 @@ impl Chat {
     /// The session's mode, which opens the list of modes to pick from on a
     /// click, or on Enter or Space while it has the focus.
     fn mode_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (chat, mode) = (cx.entity(), self.active_mode());
+        let (chat, mode) = (cx.entity(), shown(self.active_mode()));
         let icon = if mode == Mode::Plan {
             AppIcon::Checklist
         } else {
@@ -577,7 +587,7 @@ impl Chat {
         if self.mode_menu.is_some() {
             return;
         }
-        let (chat, mode) = (cx.entity(), self.active_mode());
+        let (chat, mode) = (cx.entity(), shown(self.active_mode()));
         // Closed, the menu hands the keys back to the composer, where /mode
         // was typed; otherwise they would go nowhere.
         let back = self.composer.focus_handle(cx);
@@ -796,5 +806,21 @@ impl Chat {
             .children(self.accepted_row(cx))
             .child(frame)
             .children(self.completion_list(cx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
+    // would shadow the built-in attribute.
+    use super::{offered, shown};
+    use letronna_core::gate::Mode;
+
+    #[test]
+    fn every_mode_shows_as_one_the_list_offers() {
+        for mode in Mode::OFFERED {
+            assert!(offered().any(|choice| choice == shown(mode)), "{mode:?}");
+        }
+        assert_eq!(shown(Mode::Auto), Mode::AcceptEdits);
     }
 }
