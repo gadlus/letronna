@@ -657,6 +657,28 @@ impl Store {
         }
     }
 
+    /// Give back the numbers of sessions opened here and never written to,
+    /// removing their reserved files, which are still empty.
+    pub fn release_unused(&self) {
+        for conversation in &self.conversations {
+            let path = session_path(conversation.id);
+            let only_reserved = std::fs::metadata(&path).is_ok_and(|stat| stat.len() == 0);
+            if conversation.written.is_none() && only_reserved {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    /// List the sessions made on disk since this store was read, by a
+    /// scheduled run or another Letronna, without reading them.
+    pub fn pick_up_new(&mut self) {
+        for summary in summaries() {
+            if self.index_of(summary.id).is_none() {
+                self.conversations.push(listed(summary));
+            }
+        }
+    }
+
     /// Give every session an id. Older saves have none.
     pub fn assign_ids(&mut self) {
         let mut next = self.next_id();
@@ -1586,6 +1608,27 @@ impl Transcript {
             return Ok((n, transcript));
         }
         Err("This session has no numbers left for another helper.".into())
+    }
+
+    /// Start a new session for a run nobody is watching, on the next number
+    /// free on disk, reserved as the frontends reserve theirs.
+    pub fn session(title: &str, workspace: Option<PathBuf>) -> Result<Self, String> {
+        let id = Store::default().reserve_id();
+        let conversation = Conversation {
+            id,
+            title: title.into(),
+            updated: backend::now(),
+            workspace,
+            ..Default::default()
+        };
+        let mut transcript = Self {
+            path: session_path(id),
+            conversation,
+        };
+        transcript
+            .save()
+            .map_err(|e| format!("Could not start the session: {e}"))?;
+        Ok(transcript)
     }
 
     /// Read back helper `n` of `session`, if it is there.
@@ -2850,31 +2893,7 @@ pub fn load_listing() -> Store {
     migrate();
     crate::history::sweep(gone);
     sweep_asides();
-    let mut conversations: Vec<Conversation> = summaries()
-        .into_iter()
-        .map(|s| {
-            let mut conversation = Conversation {
-                id: s.id,
-                title: s.title,
-                updated: s.updated,
-                workspace: s.workspace,
-                pinned: s.pinned,
-                todos: s.todos,
-                model: s.model,
-                gateway: s.gateway,
-                effort: s.effort,
-                goal: s.goal,
-                imported_from: s.imported_from,
-                counted: s.messages,
-                ..Default::default()
-            };
-            // Record what the file already says. Left empty, the first save
-            // wrote a fresh meta line into every session -- one saying
-            // unpinned, no todos, whatever the window had set there.
-            conversation.written = Some(conversation.meta());
-            conversation
-        })
-        .collect();
+    let mut conversations: Vec<Conversation> = summaries().into_iter().map(listed).collect();
     conversations.sort_by_key(|c| c.updated);
     let (settings, settings_written) = settings();
     Store {
@@ -2883,6 +2902,30 @@ pub fn load_listing() -> Store {
         settings,
         settings_written,
     }
+}
+
+/// A session as its listing describes it, its messages left on disk.
+fn listed(s: Summary) -> Conversation {
+    let mut conversation = Conversation {
+        id: s.id,
+        title: s.title,
+        updated: s.updated,
+        workspace: s.workspace,
+        pinned: s.pinned,
+        todos: s.todos,
+        model: s.model,
+        gateway: s.gateway,
+        effort: s.effort,
+        goal: s.goal,
+        imported_from: s.imported_from,
+        counted: s.messages,
+        ..Default::default()
+    };
+    // Record what the file already says. Left empty, the first save
+    // wrote a fresh meta line into every session -- one saying
+    // unpinned, no todos, whatever the window had set there.
+    conversation.written = Some(conversation.meta());
+    conversation
 }
 
 /// Session `id` as its file holds it now, if it has one.
@@ -6037,6 +6080,88 @@ pub(crate) mod tests {
             ));
         });
         assert_eq!(held, [(200, "write_file".to_owned(), 0, 0)]);
+    }
+
+    #[test]
+    fn a_session_for_a_scheduled_run_takes_the_next_free_number_and_reads_back() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("transcript-session");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        store.conversations.push(Conversation {
+            id: 4,
+            ..numbered(1)
+        });
+        store.save().unwrap();
+        let mut run = Transcript::session("Morning news", Some("work".into())).unwrap();
+        assert_eq!(run.conversation.id, 5);
+        run.conversation
+            .messages
+            .push(said("user", "what happened"));
+        run.save().unwrap();
+        assert_eq!(
+            Transcript::session("again", None).unwrap().conversation.id,
+            6
+        );
+
+        let back = super::session(5).unwrap();
+        assert_eq!(back.title, "Morning news");
+        assert_eq!(back.workspace, Some("work".into()));
+        assert_eq!(back.messages.len(), 1);
+        // A new session's number counts it as taken.
+        assert_eq!(super::load().next_id(), 7);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_scheduled_run_never_takes_the_number_of_a_session_not_saved_yet() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("claimed-number");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+
+        let mut store = Store::default();
+        for id in 1..=3 {
+            store.conversations.push(Conversation { id, ..numbered(1) });
+        }
+        store.save().unwrap();
+        let mut elsewhere = load_listing();
+        // The terminal opens a fresh session and sends nothing yet.
+        let id = store.reserve_id();
+        assert_eq!(id, 4);
+        store.conversations.push(Conversation {
+            id,
+            title: "terminal".into(),
+            ..Default::default()
+        });
+        assert!(
+            summaries().iter().all(|s| s.id != 4),
+            "an empty reservation was listed"
+        );
+
+        let run = Transcript::session("Morning news", None).unwrap();
+        assert_eq!(run.conversation.id, 5);
+        store.conversations[3]
+            .messages
+            .push(said("user", "my own question"));
+        store.save().unwrap();
+        let mine = super::session(4).unwrap();
+        assert_eq!(mine.title, "terminal");
+        assert_eq!(mine.messages.len(), 1);
+        assert_eq!(super::session(5).unwrap().title, "Morning news");
+        elsewhere.pick_up_new();
+        assert!([4, 5].iter().all(|&id| elsewhere.index_of(id).is_some()));
+
+        // One opened and left unsent gives its number back on the way out.
+        let unsent = store.reserve_id();
+        store.conversations.push(Conversation {
+            id: unsent,
+            ..Default::default()
+        });
+        store.release_unused();
+        assert!(!super::session_path(unsent).exists());
+        assert!(super::session_path(4).exists() && super::session_path(5).exists());
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 
     #[test]

@@ -62,6 +62,9 @@ pub(crate) const DENY: [&str; 5] = [tools::ASK_USER, "memory", "wake_me", "sched
 /// What a helper is told when it asks the user something.
 const NO_QUESTIONS: &str = "Questions are not available to helpers. Decide for yourself, or end with the open question in your report.";
 
+/// What a scheduled run is told when it asks the user something.
+const NOBODY_TO_ASK: &str = "Nobody is there to answer in a scheduled run. Decide for yourself and say in your answer what you assumed.";
+
 /// What a helper is told when a call it needed a yes for did not get one.
 const NOT_APPROVED: &str = "This was not approved, so it did not run. Do not try to get the same result another way: leave it, and say in your report what you could not do.";
 
@@ -432,7 +435,7 @@ fn work_through(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result
             continue;
         }
         let gate = |call: &ToolCall| match decide(call) {
-            Some(outcome) if call_refusal(&spec.allow, call).is_none() => outcome,
+            Some(outcome) if call_refusal(spec, call).is_none() => outcome,
             // A call this agent may not make runs into its refusal in `dispatch`.
             _ => gated(spec, call, &rules),
         };
@@ -494,7 +497,7 @@ fn dispatch(
     {
         return Some(answer(schema, &call.arguments, report));
     }
-    if let Some(refused) = call_refusal(&spec.allow, call) {
+    if let Some(refused) = call_refusal(spec, call) {
         return Some(Err(refused));
     }
     tell(spec, Step::Running(call.id.clone()));
@@ -537,7 +540,7 @@ fn together(spec: &Spec, batch: &[ToolCall]) -> Vec<Option<Result<String, String
             .map(|call| {
                 // Only tools that opt in are batched, and neither `todo` nor a
                 // write is one, so nothing here needs `dispatch`'s special cases.
-                let refused = refusal(&spec.allow, &call.name);
+                let refused = refused(spec, &call.name);
                 let ctx = context(spec);
                 scope.spawn(move || match refused {
                     Some(refused) => Some(Err(refused)),
@@ -572,13 +575,30 @@ pub(crate) fn refusal(allow: &Allow, name: &str) -> Option<String> {
     None
 }
 
+/// Why this agent may not call `name`, when it may not: a scheduled run's
+/// own agent as such, any other as `refusal` says.
+fn refused(spec: &Spec, name: &str) -> Option<String> {
+    if spec.depth > 0 || crate::schedule::running(spec.root).is_none() {
+        return refusal(&spec.allow, name);
+    }
+    // It may remember things as a chat may, but has nobody to ask and no
+    // frontend's loop to come back to it later.
+    match name {
+        tools::ASK_USER => Some(NOBODY_TO_ASK.into()),
+        "wake_me" | "schedule" | "workflow" => {
+            Some(format!("`{name}` is not available in a scheduled run."))
+        }
+        _ => None,
+    }
+}
+
 /// What the gate makes of this agent's `call` under the user's `rules`,
 /// except that a tool needing a yes still goes to `approvals` rather than run.
 fn gated(spec: &Spec, call: &ToolCall, rules: &Result<Vec<Rule>, String>) -> crate::gate::Outcome {
     // A call this agent may not make runs into its refusal in `dispatch`,
     // and its answer is no tool the gate knows.
     let answer = call.name == STRUCTURED_OUTPUT && spec.schema.is_some();
-    if answer || call_refusal(&spec.allow, call).is_some() {
+    if answer || call_refusal(spec, call).is_some() {
         return crate::gate::Outcome::Run;
     }
     let ctx = context(spec);
@@ -602,12 +622,12 @@ fn gated(spec: &Spec, call: &ToolCall, rules: &Result<Vec<Rule>, String>) -> cra
 
 /// Why this agent may not make `call`, when it may not: its tool, or for a
 /// batch of browser steps the tool of any step, which runs as that tool's.
-fn call_refusal(allow: &Allow, call: &ToolCall) -> Option<String> {
+fn call_refusal(spec: &Spec, call: &ToolCall) -> Option<String> {
     let steps = crate::browser::batch_calls(call).and_then(Result::ok);
     let names = steps.iter().flatten().map(|step| step.name.as_str());
     std::iter::once(call.name.as_str())
         .chain(names)
-        .find_map(|name| refusal(allow, name))
+        .find_map(|name| refused(spec, name))
 }
 
 /// What this agent's tool calls can reach, stopping when it stops.
@@ -1484,6 +1504,70 @@ mod tests {
             got.iter()
                 .all(|page| page.starts_with("<untrusted-content-"))
         );
+    }
+
+    #[test]
+    fn a_scheduled_run_decides_in_its_schedules_mode_and_asks_no_questions() {
+        let _serving = crate::approvals::tests::SERVING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (n, mode) in [Mode::Bypass, Mode::Default].into_iter().enumerate() {
+            let dir = scratch(&format!("scheduled-{}", mode.name()));
+            let session = AGENTS + 300 + n as u64;
+            let job = crate::schedule::Schedule {
+                id: 1,
+                name: "Nightly".into(),
+                prompt: "Write it down.".into(),
+                workspace: Some(dir.to_path_buf()),
+                trigger: crate::schedule::Trigger::Every { minutes: 60 },
+                enabled: true,
+                last_run: 0,
+                mode,
+            };
+            let _listed = crate::schedule::Listed::new(session, &job);
+            // A frontend serves the approvals, and turns down what reaches it.
+            let requests = approvals::serve();
+            let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let heard = asked.clone();
+            std::thread::spawn(move || {
+                for request in requests {
+                    heard.lock().unwrap().push(request.root);
+                    request.answer(approvals::Decision::Deny(String::new()));
+                }
+            });
+            let (endpoint, provider) = provider(vec![
+                reply(
+                    "",
+                    &[
+                        ("write_file", json!({"path": "made.txt", "content": "made"})),
+                        ("ask_user", json!({"question": "Which one?"})),
+                        ("wake_me", json!({"in": "1h"})),
+                    ],
+                ),
+                reply("Done.", &[]),
+            ]);
+            let mut spec = spec(endpoint, &dir, session);
+            (spec.root, spec.run, spec.depth) = (session, session, 0);
+            spec.decide = Some(crate::schedule::gate_of(mode));
+            let report = finished(spec);
+            assert_eq!(report.status, Outcome::Done);
+            let sent = provider.sent();
+            let got = results(&sent[1]);
+            assert_eq!(got[1], NOBODY_TO_ASK);
+            assert_eq!(got[2], "`wake_me` is not available in a scheduled run.");
+
+            // Bypass runs the write with nobody asked; Default puts it to the
+            // frontend, whose no stands.
+            let asked = asked.lock().unwrap().clone();
+            if mode == Mode::Bypass {
+                assert!(asked.is_empty(), "a frontend was asked");
+                assert!(dir.join("made.txt").exists(), "{got:?}");
+            } else {
+                assert_eq!(asked, [session]);
+                assert!(!dir.join("made.txt").exists());
+                assert!(got[0].starts_with(NOT_APPROVED), "{got:?}");
+            }
+        }
     }
 
     /// Answers yes to every request of run `run`, as `-p --yes` once did,

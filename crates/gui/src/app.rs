@@ -48,7 +48,7 @@ const OVERDRAW: Pixels = px(800.);
 /// Sessions kept with their messages read in, the one on screen among them.
 /// Switching between a handful is instant; beyond that the least recently
 /// opened is let go and read again from disk, a few milliseconds, when it is
-/// next opened. Running, chat-app and scheduled sessions come on top.
+/// next opened. Running and chat-app sessions come on top.
 const OPEN_SESSIONS: usize = 8;
 /// How long after the system says a session file changed the folder is
 /// looked at: one save is a few writes, and they are taken in together.
@@ -211,8 +211,8 @@ pub(crate) struct Chat {
     /// out once when the card came up rather than on every frame.
     pub(crate) offer: Option<letronna_core::permissions::Rule>,
     /// Tools the user allowed for the rest of this run of the app, by the
-    /// session they were allowed in. Keyed like `unattended`: "stop asking"
-    /// about a tool in one chat is not a yes to it in every other chat.
+    /// session they were allowed in: "stop asking" about a tool in one chat
+    /// is not a yes to it in every other chat.
     pub(crate) session_allow: letronna_core::gate::Grants,
     /// The rules file error last shown, so that one is shown once.
     pub(crate) rules_trouble: Option<String>,
@@ -222,11 +222,6 @@ pub(crate) struct Chat {
     /// was read, so that the queue moving reads them again only once one
     /// changed.
     pub(crate) rules_read: Option<[Option<std::time::SystemTime>; 2]>,
-    /// Sessions running a schedule that decides without the user, in the
-    /// schedule's mode. Keyed by session so the grant cannot reach the
-    /// user's own chats: a job saying "do not ask me at 9am" is not
-    /// permission to stop asking everywhere else.
-    pub(crate) unattended: std::collections::HashMap<u64, letronna_core::gate::Mode>,
     /// Helpers' calls waiting on the user, oldest first, each shown as a card
     /// in its own session. One dropped unanswered is declined.
     pub(crate) agent_asks: std::collections::VecDeque<approvals::Request>,
@@ -241,6 +236,10 @@ pub(crate) struct Chat {
     /// The mode picked on each session's chip; a session not in here is in
     /// the Default mode setting.
     pub(crate) modes: std::collections::HashMap<u64, letronna_core::gate::Mode>,
+    /// Runs the schedules while this Letronna holds their lock, and is where
+    /// every change to them goes.
+    pub(crate) schedule_runner: letronna_core::schedule::Runner,
+    /// The schedules as the runner last read them, for the page to show.
     pub(crate) schedules: Vec<letronna_core::schedule::Schedule>,
     /// Id of the schedule being edited on the Scheduled jobs page.
     pub(crate) editing: Option<u64>,
@@ -257,8 +256,6 @@ pub(crate) struct Chat {
     pub(crate) slack_code: Option<letronna_core::messaging::pairing::Code>,
     /// What the Slack listener last said it was doing; none while it is off.
     pub(crate) slack_state: Option<letronna_core::messaging::SlackState>,
-    /// Sessions a schedule opened, so their result can be reported onward.
-    pub(crate) scheduled: std::collections::HashSet<u64>,
     /// Sessions opened for a remote chat, so the reply goes back to it.
     pub(crate) remote: std::collections::HashMap<u64, letronna_core::messaging::Source>,
     /// The session each remote chat is talking in, so a follow-up keeps its
@@ -767,6 +764,7 @@ impl Chat {
                 this.files_on_front(window, cx)
             }),
         ];
+        let (schedule_runner, schedule_events) = letronna_core::schedule::Runner::start();
         // The message when the old skills.json will not move across, or the
         // skills cannot be read at all; the Skills tab shows it too.
         let workspace = store.conversations[store.active].workspace.as_deref();
@@ -845,14 +843,14 @@ impl Chat {
             rules_trouble: None,
             rules: Ok(Vec::new()),
             rules_read: None,
-            unattended: std::collections::HashMap::new(),
             agent_asks: std::collections::VecDeque::new(),
             answer,
             deny_reason,
             composer_empty: true,
             completer: Default::default(),
             modes: std::collections::HashMap::new(),
-            schedules: letronna_core::schedule::load(),
+            schedules: schedule_runner.list(),
+            schedule_runner,
             editing: None,
             job_name,
             job_prompt,
@@ -862,7 +860,6 @@ impl Chat {
             pairing: None,
             slack_code: None,
             slack_state: None,
-            scheduled: std::collections::HashSet::new(),
             remote: std::collections::HashMap::new(),
             remote_session: std::collections::HashMap::new(),
             generation: 0,
@@ -984,7 +981,7 @@ impl Chat {
         // not exist yet to ask about dialogs, and there can be none.
         this.composer
             .update(cx, |input, cx| input.focus(window, cx));
-        Self::watch_schedules(cx);
+        Self::watch_schedules(schedule_events, cx);
         Self::watch_updates(cx);
         Self::watch_inbox(cx);
         Self::watch_sessions(cx);
@@ -1157,9 +1154,9 @@ impl Chat {
     }
 
     /// Let go of the messages of the sessions opened longest ago, beyond
-    /// `OPEN_SESSIONS`. Never the one on screen, nor one a reply, a chat app
-    /// or a schedule is writing to: added to while let go of, it would hold
-    /// only the new messages, and the next step would be sent those alone.
+    /// `OPEN_SESSIONS`. Never the one on screen, nor one a reply or a chat
+    /// app is writing to: added to while let go of, it would hold only the
+    /// new messages, and the next step would be sent those alone.
     fn let_go(&mut self) {
         let mut at = self.open.len();
         // The front is the session on screen.
@@ -1167,7 +1164,6 @@ impl Chat {
             at -= 1;
             let id = self.open[at];
             let busy = self.streaming_id == Some(id)
-                || self.scheduled.contains(&id)
                 || self.remote.contains_key(&id)
                 || self.remote_session.values().any(|&s| s == id);
             if busy {
@@ -1470,7 +1466,7 @@ impl Chat {
         cx.notify();
     }
 
-    /// Send a prompt in the active session. Split out of `send` so a schedule
+    /// Send a prompt in the active session. Split out of `send` so a chat app
     /// can fire one with no window in hand. `Err` means the gateway is not
     /// usable; the caller decides whether to open Settings about it.
     pub(crate) fn dispatch(
@@ -1497,11 +1493,11 @@ impl Chat {
         self.store.settings.endpoint = connection.endpoint.clone();
         self.store.pin(self.store.active);
         // What is still being said of the last answer is not wanted now, but
-        // only the user asking again says so: a chat's or a schedule's turn
-        // is not read aloud, and would cut off the answer they are hearing.
+        // only the user asking again says so: a chat's turn is not read
+        // aloud, and would cut off the answer they are hearing.
         self.match_voice();
         let session = self.store.conversations[self.store.active].id;
-        let own = !self.remote.contains_key(&session) && !self.scheduled.contains(&session);
+        let own = !self.remote.contains_key(&session);
         if let (Some(voice), true) = (&mut self.voice, own) {
             voice.hush();
         }
@@ -1654,8 +1650,8 @@ impl Chat {
             plan: self.mode(session) == letronna_core::gate::Mode::Plan,
             effort: self.store.effort(ix).to_owned(),
             search: self.store.settings.search,
-            // A schedule's run and a chat app's turn may have nobody watching.
-            unattended: remote.is_some() || self.scheduled.contains(&session),
+            // A chat app's turn may have nobody watching.
+            unattended: remote.is_some(),
             remote,
             conversation: session,
             wrap_up: false,
@@ -1664,16 +1660,24 @@ impl Chat {
         Ok(connection)
     }
 
-    /// Check every half minute for a schedule that is due and run it. Only one
-    /// fires per check, so a backlog drains one at a time instead of opening a
-    /// dozen sessions at once.
-    pub(crate) fn watch_schedules(cx: &mut Context<Self>) {
+    /// Hear what the schedules' runner says: a run that ended is called back
+    /// about as a turn that ended is, and why the schedules are not running
+    /// is shown once, as an error.
+    pub(crate) fn watch_schedules(
+        events: async_channel::Receiver<letronna_core::schedule::Event>,
+        cx: &mut Context<Self>,
+    ) {
+        use letronna_core::schedule::Event as Scheduled;
         cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_secs(30))
-                    .await;
-                if this.update(cx, |this, cx| this.run_due(cx)).is_err() {
+            while let Ok(event) = events.recv().await {
+                let shown = this.update(cx, |this, cx| match event {
+                    Scheduled::Ended(run) => this.scheduled_ended(run, cx),
+                    Scheduled::Trouble(trouble) => {
+                        this.error = Some(trouble);
+                        cx.notify();
+                    }
+                });
+                if shown.is_err() {
                     break;
                 }
             }
@@ -1838,7 +1842,7 @@ impl Chat {
 
     /// Call the user back about a turn in session `id` that ended by itself:
     /// with its answer, or with what went wrong when it has none.
-    fn tell_ended_turn(&mut self, id: u64, scheduled: bool) {
+    fn tell_ended_turn(&mut self, id: u64) {
         let answer = self
             .store
             .index_of(id)
@@ -1847,7 +1851,6 @@ impl Chat {
             .map(|last| last.content.clone());
         let error = self.error.clone();
         let why = match (&answer, &error) {
-            (Some(answer), _) if scheduled => notify::Why::Scheduled(answer),
             (Some(answer), _) => notify::Why::Finished(answer),
             (None, Some(error)) => notify::Why::Failed(error),
             (None, None) => notify::Why::Finished(""),
@@ -1863,6 +1866,11 @@ impl Chat {
         self.agent_asks
             .retain(|queued| queued.run != request.run || queued.call.name != request.call.name);
         cx.notify();
+        // A scheduled run asks from a session the sessions folder's watch
+        // may not have brought in yet.
+        if self.store.index_of(request.root).is_none() {
+            self.follow_sessions(cx);
+        }
         // With its session gone no card could show; dropped, it is declined.
         let Some(ix) = self.store.index_of(request.root) else {
             return;
@@ -1916,7 +1924,7 @@ impl Chat {
             &self.session_allow,
             &self.rules,
             self.mode(root),
-            self.unattended.get(&root).copied(),
+            self.unattended(root),
         );
         match letronna_core::gate::decide(call, &gate) {
             letronna_core::gate::Outcome::Run => Some(approvals::Decision::Once),
@@ -1968,62 +1976,19 @@ impl Chat {
         cx.notify();
     }
 
-    fn run_due(&mut self, cx: &mut Context<Self>) {
-        // A run in progress owns the agent loop; wait rather than interleave.
-        if self.busy {
-            return;
+    /// Call the user back about a scheduled run that ended, in its session,
+    /// which following the sessions folder brought into the sidebar as it
+    /// ran; a run left without one says why as an error. The schedules are
+    /// read again for the time it ran.
+    fn scheduled_ended(&mut self, run: letronna_core::schedule::Ended, cx: &mut Context<Self>) {
+        self.schedules = self.schedule_runner.list();
+        // The folder's watch waits for writes to settle, so this can come first.
+        self.follow_sessions(cx);
+        match run.session.filter(|&id| self.store.index_of(id).is_some()) {
+            Some(id) => self.tell(id, notify::Why::Scheduled(&run.text)),
+            None => self.error = Some(format!("Scheduled job {}: {}", run.name, run.text)),
         }
-        let now = chrono::Local::now();
-        let Some(index) = self
-            .schedules
-            .iter()
-            .position(|s| letronna_core::schedule::is_due(s, now))
-        else {
-            return;
-        };
-        self.schedules[index].last_run = backend::now();
-        letronna_core::schedule::save(&self.schedules);
-        let schedule = self.schedules[index].clone();
-        self.start_scheduled(&schedule, cx);
-    }
-
-    /// Open a fresh session for a schedule and send its prompt.
-    pub(crate) fn start_scheduled(
-        &mut self,
-        schedule: &letronna_core::schedule::Schedule,
-        cx: &mut Context<Self>,
-    ) {
-        self.store.conversations.push(Conversation {
-            id: self.store.reserve_id(),
-            title: schedule.name.clone(),
-            updated: backend::now(),
-            workspace: schedule.workspace.clone(),
-            ..Default::default()
-        });
-        self.store.active = self.store.conversations.len() - 1;
-        self.page = Page::Chat;
-        let session = self.store.conversations[self.store.active].id;
-        self.scheduled.insert(session);
-        // The run is in the schedule's own mode, never the Default mode
-        // setting; a schedule picking any mode, Auto among them, goes here.
-        self.modes.insert(session, schedule.mode);
-        // Nobody is necessarily watching, so a schedule that decides
-        // without the user skips the approval cards that would otherwise
-        // stall it -- but only in the session it just opened.
-        if schedule.mode != letronna_core::gate::Mode::Default {
-            self.unattended.insert(session, schedule.mode);
-        }
-        if self
-            .dispatch(schedule.prompt.clone(), Vec::new(), None, cx)
-            .is_err()
-        {
-            // The gateway is not usable, so the run never started and
-            // `finish` will not come round to report it.
-            self.scheduled.remove(&session);
-            self.unattended.remove(&session);
-            let error = self.error.clone().unwrap_or_default();
-            self.send_report(schedule.name.clone(), format!("Did not start: {error}"), cx);
-        }
+        cx.notify();
     }
 
     /// One model call, streamed. The decisions all live in `core::agent`;
@@ -2069,11 +2034,11 @@ impl Chat {
             return;
         };
         turn.absorb(&event);
-        // Read aloud only for whoever is at the window: a chat's or a
-        // schedule's run is answered where it came from.
+        // Read aloud only for whoever is at the window: a chat's run is
+        // answered where it came from.
         let aloud = self
             .streaming_id
-            .is_some_and(|id| !self.remote.contains_key(&id) && !self.scheduled.contains(&id));
+            .is_some_and(|id| !self.remote.contains_key(&id));
         if let (Some(voice), true) = (&mut self.voice, aloud) {
             match &event {
                 Event::Delta(text) => voice.hear(text),
@@ -2086,8 +2051,8 @@ impl Chat {
                 let kept = self.keep_failure(&error);
                 let on_screen =
                     self.streaming_id == Some(self.store.conversations[self.store.active].id);
-                // `finish` reports it to a schedule or a chat app, and holds
-                // back what was queued, by this.
+                // `finish` reports it to a chat app, and holds back what was
+                // queued, by this.
                 self.error = Some(error.to_string());
                 self.finish(cx);
                 // Said where the turn failed, so not again as a toast; in a
@@ -2345,7 +2310,7 @@ impl Chat {
                     self.refresh_changes(cx);
                     let looped = self.turn.as_ref().and_then(agent::Turn::looping);
                     if let Some(why) = looped.map(str::to_owned) {
-                        // An error, so a schedule's or chat's report says why.
+                        // An error, so a chat's report says why.
                         self.error = Some(why);
                         self.save();
                         self.finish(cx);
@@ -2883,41 +2848,6 @@ impl Chat {
         }
     }
 
-    /// A scheduled run has no one watching, so post how it ended to every
-    /// channel set up to hear it. A failure is reported too: silence would
-    /// read as nothing having run at all.
-    fn report_scheduled(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.streaming_id else { return };
-        if !self.scheduled.remove(&id) {
-            return;
-        }
-        let Some(ix) = self.store.index_of(id) else {
-            return;
-        };
-        let conversation = &self.store.conversations[ix];
-        let body = match &self.error {
-            Some(error) => format!("Did not finish: {error}"),
-            None => conversation
-                .messages
-                .iter()
-                .rev()
-                .find(|m| m.role == "assistant" && !m.content.is_empty())
-                .map(|m| m.content.clone())
-                .unwrap_or_else(|| "That did not produce an answer.".to_owned()),
-        };
-        let title = conversation.title.clone();
-        self.send_report(title, body, cx);
-    }
-
-    fn send_report(&self, title: String, body: String, cx: &mut Context<Self>) {
-        let config = self.messaging.clone();
-        cx.background_executor()
-            .spawn(async move {
-                let _ = letronna_core::messaging::report(&config, &title, &body);
-            })
-            .detach();
-    }
-
     /// Send the finished reply back to the chat that asked for it.
     fn answer_remote(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.streaming_id else { return };
@@ -3034,9 +2964,7 @@ impl Chat {
         call: &backend::ToolCall,
         rules: &Result<Vec<letronna_core::permissions::Rule>, String>,
     ) -> letronna_core::gate::Outcome {
-        let unattended = self
-            .streaming_id
-            .and_then(|id| self.unattended.get(&id).copied());
+        let unattended = self.streaming_id.and_then(|id| self.unattended(id));
         let mode = self
             .streaming_id
             .map_or(self.store.settings.mode, |id| self.mode(id));
@@ -3169,9 +3097,17 @@ impl Chat {
     /// The mode `session` is in: its schedule's while that runs, which the
     /// gate follows, then its chip's, then the Default mode setting.
     pub(crate) fn mode(&self, session: u64) -> letronna_core::gate::Mode {
-        let running = self.unattended.get(&session);
-        let picked = running.or(self.modes.get(&session)).copied();
+        let running = letronna_core::schedule::running(session).map(|run| run.mode);
+        let picked = running.or(self.modes.get(&session).copied());
         picked.unwrap_or(self.store.settings.mode)
+    }
+
+    /// The mode a scheduled run going on here decides `session`'s calls in
+    /// without the user, or None, as for every other session, when they wait
+    /// for the user. Asked of core each time rather than kept here, so the
+    /// grant ends with the run and never reaches the user's own chats.
+    pub(crate) fn unattended(&self, session: u64) -> Option<letronna_core::gate::Mode> {
+        letronna_core::schedule::running(session).and_then(|run| run.unattended())
     }
 
     /// The mode the session on screen is in.
@@ -3558,7 +3494,7 @@ impl Chat {
     }
 
     /// End the turn in flight, from the Stop button or `/stop` in a chat.
-    /// The chat or schedule that started it hears "Stopped." rather than an
+    /// The chat app that started it hears "Stopped." rather than an
     /// error. What the turn got to is kept: the reply so far, or the batch's
     /// results with every call left answered as stopped.
     pub(crate) fn stop_turn(&mut self, cx: &mut Context<Self>) {
@@ -3588,18 +3524,10 @@ impl Chat {
         if let Some(voice) = &mut self.voice {
             voice.hush();
         }
-        if let Some(id) = self.streaming_id {
-            if let Some(source) = self.remote.remove(&id) {
-                self.tell_remote(&source, "Stopped.", cx);
-            }
-            if self.scheduled.remove(&id) {
-                let title = self
-                    .store
-                    .index_of(id)
-                    .map(|ix| self.store.conversations[ix].title.clone())
-                    .unwrap_or_default();
-                self.send_report(title, "Stopped.".into(), cx);
-            }
+        if let Some(id) = self.streaming_id
+            && let Some(source) = self.remote.remove(&id)
+        {
+            self.tell_remote(&source, "Stopped.", cx);
         }
         self.keep_stopped();
         self.stopping = true;
@@ -3678,15 +3606,14 @@ impl Chat {
     fn finish(&mut self, cx: &mut Context<Self>) {
         let stopped = std::mem::take(&mut self.stopping);
         let session = self.streaming_id;
-        // Before the chat app is answered and the schedule reported, which
-        // forget that the session was theirs.
+        // Before the chat app is answered, which forgets that the session
+        // was its.
         if let Some(id) = session.filter(|_| !stopped) {
-            self.tell_ended_turn(id, self.scheduled.contains(&id));
+            self.tell_ended_turn(id);
         }
         self.answer_remote(cx);
         // The reply clears the indicator; nothing may raise it again.
         self.typing = None;
-        self.report_scheduled(cx);
         // The session's loop goes round again from the turn that took its
         // tick, and a stop ends it.
         if let Some(id) = session {
@@ -3699,11 +3626,6 @@ impl Chat {
             if let Some(said) = letronna_core::wake::turn_ended(id, (!stopped).then_some(answer)) {
                 self.loop_note = Some(said);
             }
-        }
-        // The grant is for the run, not the session: a follow-up typed there
-        // has someone watching, and a deleted session's id is handed out again.
-        if let Some(id) = self.streaming_id {
-            self.unattended.remove(&id);
         }
         self.busy = false;
         self.streaming_id = None;
@@ -3845,9 +3767,12 @@ impl Chat {
         }
         let on_screen = self.store.conversations[self.store.active].id;
         // A chat app hears only the answer to what it sent, so a turn started
-        // in its session would answer nobody; its next message takes them.
+        // in its session would answer nobody; its next message takes them. A
+        // scheduled run going on here reads its own as it goes.
         let wakes = |id| {
-            self.store.index_of(id).is_some() && !self.remote_session.values().any(|&s| s == id)
+            self.store.index_of(id).is_some()
+                && !self.remote_session.values().any(|&s| s == id)
+                && letronna_core::schedule::running(id).is_none()
         };
         let Some(id) = woken(on_screen, &inbox::pending(), wakes) else {
             return;
@@ -4030,7 +3955,7 @@ impl Render for Chat {
             letronna_core::browser::show_conversation(on_screen);
         }
         // And the composer holds its draft, however the session was switched
-        // to: a click, a schedule, or a message from a chat app.
+        // to: a click, or a message from a chat app.
         self.swap_draft(window, cx);
         // And the Changes tab and the status bar speak of its folder.
         self.keep_changes_current(cx);

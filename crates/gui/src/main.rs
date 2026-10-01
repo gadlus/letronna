@@ -558,12 +558,14 @@ fn main() {
         })
         .detach();
         // Background jobs are children of this process; do not outlive it.
-        // Nor does a browser with no window, which nobody could close.
+        // Nor does a browser with no window, which nobody could close. The
+        // schedules lock goes too, so a terminal can run them at once.
         cx.on_app_quit(|_| {
             letronna_core::jobs::stop_all();
             letronna_core::mcp::stop_all();
             letronna_core::lsp::stop_all();
             letronna_core::browser::close_hidden();
+            letronna_core::schedule::stop();
             letronna_core::diag::stop();
             async {}
         })

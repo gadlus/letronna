@@ -223,9 +223,15 @@ impl Chat {
             Err(why) => (Vec::new(), Some(why)),
         };
 
+        // The old profile's runner would go on running its jobs, and saving
+        // them into its folder, so the new profile's takes over instead.
+        letronna_core::schedule::stop();
+        let (runner, events) = letronna_core::schedule::Runner::start();
+        self.schedules = runner.list();
+        self.schedule_runner = runner;
+        Self::watch_schedules(events, cx);
         // Whatever is kept here is saved back, so left alone these would put
-        // the old profile's jobs and tokens into the new one.
-        self.schedules = letronna_core::schedule::load();
+        // the old profile's tokens into the new one.
         self.messaging = letronna_core::messaging::load();
         let messaging = &self.messaging;
         for (input, value) in [
@@ -267,15 +273,13 @@ impl Chat {
         self.modes.clear();
         self.session_allow = letronna_core::gate::Grants::new();
         self.agent_asks.clear();
-        self.unattended.clear();
         self.thinking_open.clear();
         self.runs_open.clear();
         self.unseen.clear();
         self.found.clear();
         self.editing_message = None;
-        // Sessions the old profile opened for a schedule or a chat app, by
-        // ids that another profile's sessions may share.
-        self.scheduled.clear();
+        // Sessions the old profile opened for a chat app, by ids that another
+        // profile's sessions may share.
         self.remote.clear();
         self.remote_session.clear();
         self.follow_ups.clear();

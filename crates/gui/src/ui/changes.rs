@@ -769,7 +769,7 @@ impl Chat {
                     &this.session_allow,
                     &this.rules,
                     this.mode(session),
-                    this.unattended.get(&session).copied(),
+                    this.unattended(session),
                 );
                 match plan.decide(&gate) {
                     Outcome::Run => this.run_push(folder, plan, window, cx),
