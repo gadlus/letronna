@@ -135,6 +135,14 @@ pub const COMMANDS: &[Command<'static>] = &[
         blurb: "helpers working for this session; stop one or tell it something",
     },
     Command {
+        name: "/workflows",
+        blurb: "workflow runs: look in on one, stop it or resume it",
+    },
+    Command {
+        name: "/crew",
+        blurb: "let Letronna run workflows of helpers for big tasks",
+    },
+    Command {
         name: "/skills",
         blurb: "skills: use one, switch them on or off, add from GitHub",
     },
