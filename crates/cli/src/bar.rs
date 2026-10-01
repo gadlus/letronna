@@ -136,7 +136,7 @@ pub const COMMANDS: &[Command<'static>] = &[
     },
     Command {
         name: "/workflows",
-        blurb: "workflow runs: look in on one, stop it or resume it",
+        blurb: "workflow runs: look in, pause, stop, resume, skip or retry",
     },
     Command {
         name: "/crew",

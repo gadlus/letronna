@@ -17,9 +17,10 @@
 //! runs it again unchanged, and a run Letronna closed on, known by a lock
 //! nobody holds, can be offered for resuming.
 
+use super::board::{Board, RunState, RunView};
 use super::host::{self, End};
 use super::journal::{self, Line};
-use super::{BUDGET, Run, Tally};
+use super::{BUDGET, Run};
 use crate::agents;
 use crate::budget::{Budget, short};
 use crate::cancel::Cancel;
@@ -31,7 +32,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
@@ -119,7 +119,7 @@ fn opted() -> MutexGuard<'static, BTreeSet<u64>> {
     OPTED_IN.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn runs() -> MutexGuard<'static, Vec<Live>> {
+fn registry() -> MutexGuard<'static, Vec<Live>> {
     RUNS.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -470,15 +470,17 @@ struct Live {
     /// The session it answers to.
     session: u64,
     cancel: Cancel,
-    tally: Arc<Tally>,
+    board: Arc<Board>,
     /// What this launch has spent, beside what `earlier` launches did.
     budget: Arc<Budget>,
     earlier: u64,
+    /// What the run may spend over all its launches.
+    limit: u64,
     started: Instant,
     /// Set when `agents` stopped it, so its end is not told as a failure.
     stopped: bool,
-    /// How it ended, as the list shows it, once it has.
-    ended: Option<String>,
+    /// How it ended, in a word, and the seconds it took, once it has.
+    ended: Option<(&'static str, u64)>,
     /// Set when its script returned, the whole of which is in its folder.
     returned: bool,
 }
@@ -487,9 +489,7 @@ impl Live {
     /// How far it has got, as its notice says: "38 of 40 agents done, 2
     /// failed, 1.9M tokens, 6m12s".
     fn about(&self) -> String {
-        let calls = self.tally.calls.load(Ordering::Relaxed);
-        let answered = self.tally.answered.load(Ordering::Relaxed);
-        let failed = self.tally.failed.load(Ordering::Relaxed);
+        let (calls, answered, failed) = self.board.counts();
         let mut about = format!("{answered} of {calls} agents done");
         if failed > 0 {
             about.push_str(&format!(", {failed} failed"));
@@ -499,6 +499,43 @@ impl Live {
             short(self.earlier + self.budget.spent()),
             agents::took(self.started.elapsed().as_secs())
         )
+    }
+
+    /// How it ended and what that took, as the list shows it: "stopped · 1m".
+    fn ending(&self) -> Option<String> {
+        let (how, seconds) = self.ended?;
+        Some(format!("{how} · {}", agents::took(seconds)))
+    }
+
+    /// Refuses a control once the run has ended.
+    fn going(&self) -> Result<(), String> {
+        match self.ending() {
+            Some(ending) => Err(format!("{} has already ended ({ending}).", self.name)),
+            None => Ok(()),
+        }
+    }
+
+    /// The run as it stands now.
+    fn view(&self) -> RunView {
+        let state = match self.ended {
+            None if self.board.held() => RunState::Paused,
+            None => RunState::Running,
+            Some(("finished", _)) => RunState::Finished,
+            Some((how, _)) => RunState::Ended(how.into()),
+        };
+        let seconds = match self.ended {
+            Some((_, seconds)) => seconds,
+            None => self.started.elapsed().as_secs(),
+        };
+        RunView {
+            name: self.name.clone(),
+            title: self.title.clone(),
+            state,
+            phases: self.board.phases(),
+            spent: self.earlier + self.budget.spent(),
+            budget: self.limit,
+            seconds,
+        }
     }
 }
 
@@ -528,8 +565,12 @@ fn set_off(mut run: Run, launch: &Launch) -> Result<String, String> {
     let (name, id) = (run.name.clone(), run.id);
     let title = text(&launch.meta["name"]);
     let key = Key::Workflow(number(&name));
+    let phases = (launch.meta["phases"].as_array().into_iter().flatten())
+        .map(|phase| text(phase.get("title").unwrap_or(phase)))
+        .filter(|title| !title.is_empty());
+    run.board.declare(phases.collect());
     {
-        let mut runs = runs();
+        let mut runs = registry();
         runs.retain(|live| live.name != name);
         runs.push(Live {
             name: name.clone(),
@@ -538,9 +579,10 @@ fn set_off(mut run: Run, launch: &Launch) -> Result<String, String> {
             title: title.clone(),
             session,
             cancel: run.cancel.clone(),
-            tally: run.tally.clone(),
+            board: run.board.clone(),
             budget: run.budget.clone(),
             earlier: run.earlier,
+            limit: run.limit,
             started: Instant::now(),
             stopped: false,
             ended: None,
@@ -557,7 +599,7 @@ fn set_off(mut run: Run, launch: &Launch) -> Result<String, String> {
     let find = super::saved::finder(run.connection.workspace.clone());
     if let Err(e) = host::start(run, &launch.script, &launch.args, find, then) {
         // It never started, so there is no end to tell.
-        runs().retain(|live| live.id != id);
+        registry().retain(|live| live.id != id);
         tasks::finish(&key, State::Failed(e.clone()), None);
         return Err(e);
     }
@@ -584,7 +626,7 @@ fn number(name: &str) -> u64 {
 /// told.
 fn ended(id: u64, key: Key, end: End) {
     let (name, state, text) = {
-        let mut runs = runs();
+        let mut runs = registry();
         // A resume that took over its name as it let its folder go is the
         // task now, and tells its own end.
         let Some(live) = runs.iter_mut().find(|live| live.id == id) else {
@@ -621,8 +663,7 @@ fn ended(id: u64, key: Key, end: End) {
             }
             End::Paused(reason) => ("paused", State::Failed(format!("paused: {reason}")), None),
         };
-        let took = agents::took(live.started.elapsed().as_secs());
-        live.ended = Some(format!("{how} · {took}"));
+        live.ended = Some((how, live.started.elapsed().as_secs()));
         (name, state, text)
     };
     let notice = text.map(|text| Notice {
@@ -639,17 +680,20 @@ pub(crate) fn rows(caller: &Caller) -> Vec<[String; 5]> {
     if caller.agent.is_some() {
         return Vec::new();
     }
-    let runs = runs();
+    let runs = registry();
     let yours = runs.iter().filter(|live| live.session == caller.root);
     yours
         .map(|live| {
-            let tally = &live.tally;
-            let state = live.ended.clone().unwrap_or_else(|| {
+            let state = live.ending().unwrap_or_else(|| {
+                let (calls, answered, _) = live.board.counts();
+                let going = if live.board.held() {
+                    "paused"
+                } else {
+                    "running"
+                };
                 format!(
-                    "running · {} · {} of {} done",
+                    "{going} · {} · {answered} of {calls} done",
                     agents::took(live.started.elapsed().as_secs()),
-                    tally.answered.load(Ordering::Relaxed),
-                    tally.calls.load(Ordering::Relaxed)
                 )
             });
             let tokens = short(live.earlier + live.budget.spent());
@@ -672,7 +716,7 @@ pub(crate) fn control(args: &Value, caller: &Caller) -> Option<Result<String, St
         return None;
     }
     let to = args["to"].as_str().map(str::trim)?;
-    let mut runs = runs();
+    let mut runs = registry();
     let resume = json!({"resume": to});
     let Some(live) = runs
         .iter_mut()
@@ -697,7 +741,7 @@ pub(crate) fn control(args: &Value, caller: &Caller) -> Option<Result<String, St
                  it stopped, workflow {resume} picks it up."
             ))
         }
-        "report" => match (&live.ended, live.returned) {
+        "report" => match (live.ending(), live.returned) {
             (None, _) => Ok(format!(
                 "{to} is still running; its result comes as a notice when it ends."
             )),
@@ -728,6 +772,82 @@ fn elsewhere(to: &str) -> Option<Result<String, String>> {
         let resume = json!({"resume": to});
         format!("{to} is not running; workflow {resume} picks it up.")
     }))
+}
+
+/// Session `session`'s runs started since Letronna opened, oldest first, as
+/// they stand now; those it closed on while they ran are `left_open`'s.
+pub fn runs(session: u64) -> Vec<RunView> {
+    let runs = registry();
+    let yours = runs.iter().filter(|live| live.session == session);
+    yours.map(Live::view).collect()
+}
+
+/// Session `session`'s run `name` as it stands now.
+pub fn run(session: u64, name: &str) -> Result<RunView, String> {
+    yours(session, name, |live| Ok(live.view()))
+}
+
+/// Holds session `session`'s run `name`: its running agents finish and
+/// answer, and no queued one starts until `resume`.
+pub fn pause(session: u64, name: &str) -> Result<(), String> {
+    yours(session, name, live_board)?.pause(name)
+}
+
+/// Lets the queued agents of session `session`'s paused run `name` start.
+pub fn resume(session: u64, name: &str) -> Result<(), String> {
+    yours(session, name, live_board)?.resume(name)
+}
+
+/// Gives the script of session `session`'s run `name` null for its waiting
+/// or running agent `agent` -- its label, or `#N` for its Nth call --
+/// stopping it if it runs; a resume gives the script null for it again.
+pub fn skip(session: u64, name: &str, agent: &str) -> Result<(), String> {
+    yours(session, name, live_board)?.skip(name, agent)
+}
+
+/// Sets agent `agent` of session `session`'s run `name`, which failed,
+/// stopped or was skipped, to run again at the run's next resume, through
+/// its journal as `Board::retry` says; refused once the run has finished,
+/// as a finished run is not resumed.
+pub fn retry(session: u64, name: &str, agent: &str) -> Result<(), String> {
+    let (board, journal) = yours(session, name, |live| match live.ended {
+        Some(("finished", _)) => Err(format!(
+            "{name} has finished; only a run still going or ended early can retry an agent."
+        )),
+        _ => Ok((live.board.clone(), live.dir.join("journal.jsonl"))),
+    })?;
+    board.retry(name, agent, &journal)
+}
+
+/// The board of a run that has not ended, for a control to act on.
+fn live_board(live: &Live) -> Result<Arc<Board>, String> {
+    live.going()?;
+    Ok(live.board.clone())
+}
+
+/// What `then` makes of session `session`'s run `name`, under the lock;
+/// refused, saying why, when the session has no such run.
+fn yours<T>(
+    session: u64,
+    name: &str,
+    then: impl FnOnce(&Live) -> Result<T, String>,
+) -> Result<T, String> {
+    let runs = registry();
+    let mine = runs
+        .iter()
+        .find(|live| live.name == name && live.session == session);
+    if let Some(live) = mine {
+        return then(live);
+    }
+    let theirs = runs.iter().any(|live| live.name == name);
+    drop(runs);
+    Err(if theirs {
+        format!("{name} is another session's run; only that session can see or change it.")
+    } else if super::existing(&folder(), name).is_ok() {
+        format!("{name} has not run since Letronna opened; only a resume picks it up.")
+    } else {
+        format!("No workflow run called {name}.")
+    })
 }
 
 /// A call on one line, as a tool row and the approval question show it: the
@@ -821,6 +941,7 @@ fn started(lines: &[Line]) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use super::super::AgentState;
     use super::super::tests::{Asked, Data, answering, done, report};
     use super::*;
     use crate::driver::Outcome;
@@ -1201,5 +1322,210 @@ return await agent(args.ask);
         drop(resumed);
         assert!(!lock.exists());
         typed(session, "");
+    }
+
+    /// Waits until the agents of session `session`'s run wf-1 stand as
+    /// `want`, failing rather than hanging.
+    fn standing(session: u64, want: &[AgentState]) -> RunView {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let view = super::run(session, "wf-1").unwrap();
+            let agents = view.phases.iter().flat_map(|phase| &phase.agents);
+            if agents.map(|agent| agent.state).eq(want.iter().copied()) {
+                return view;
+            }
+            assert!(Instant::now() < deadline, "{view:?}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_run_shows_by_phase_and_its_controls_refuse_what_they_cannot_do() {
+        let data = Data::new("tool-view");
+        let connection = data.connection("http://127.0.0.1:9/v1");
+        let session = connection.conversation;
+        let script = r#"export const meta = { name: "view", description: "Finds, then checks.",
+  phases: [{ title: "Find" }, { title: "Check" }, { title: "Report" }] };
+phase("Find");
+const found = await agent("Find it", { label: "finder" });
+phase("Check");
+return await agent(`Check ${found}`, { label: "checker" });
+"#;
+        let mut run = Run::open(
+            None,
+            &connection,
+            script,
+            &json!({}),
+            BUDGET,
+            &Cancel::default(),
+        )
+        .unwrap();
+        run.spawn = answering(&Asked::default(), done);
+        set_off(
+            run,
+            &Launch::read(&json!({"script": script}), None).unwrap(),
+        )
+        .unwrap();
+        notice(session, "wf-1");
+        let view = super::run(session, "wf-1").unwrap();
+        assert_eq!(
+            (view.title.as_str(), &view.state),
+            ("view", &RunState::Finished)
+        );
+        let phases: Vec<(&str, Vec<(&str, AgentState)>)> = (view.phases.iter())
+            .map(|phase| {
+                let agents = phase.agents.iter();
+                let agents = agents.map(|agent| (agent.label.as_str(), agent.state));
+                (phase.title.as_str(), agents.collect())
+            })
+            .collect();
+        let done = AgentState::Done;
+        assert_eq!(
+            phases,
+            [
+                ("Find", vec![("finder", done)]),
+                ("Check", vec![("checker", done)]),
+                ("Report", vec![])
+            ]
+        );
+        let agents = view.phases.iter().flat_map(|phase| &phase.agents);
+        let tokens: u64 = agents.map(|agent| agent.tokens).sum();
+        assert!(tokens > 0);
+        assert_eq!((view.spent, view.budget), (tokens, BUDGET));
+        assert!(runs(session).contains(&view));
+        // Each says why it cannot.
+        let ended = pause(session, "wf-1").unwrap_err();
+        assert!(
+            ended.starts_with("wf-1 has already ended (finished · "),
+            "{ended}"
+        );
+        assert_eq!(skip(session, "wf-1", "finder"), Err(ended));
+        assert_eq!(
+            retry(session, "wf-1", "finder"),
+            Err(
+                "wf-1 has finished; only a run still going or ended early can retry an agent."
+                    .into()
+            )
+        );
+        assert_eq!(
+            super::run(session + 1, "wf-1"),
+            Err("wf-1 is another session's run; only that session can see or change it.".into())
+        );
+        assert!(!runs(session + 1).iter().any(|run| run.name == "wf-1"));
+        assert_eq!(
+            pause(session, "wf-9"),
+            Err("No workflow run called wf-9.".into())
+        );
+    }
+
+    #[test]
+    fn a_paused_run_reads_paused_until_a_resume_lets_it_finish() {
+        use AgentState::{Done, Running, Waiting};
+        let data = Data::new("tool-pause");
+        let connection = data.connection("http://127.0.0.1:9/v1");
+        let session = connection.conversation;
+        let script = r#"export const meta = { name: "two", description: "One, then two." };
+await agent("One");
+return await agent("Two");
+"#;
+        let mut run = Run::open(
+            None,
+            &connection,
+            script,
+            &json!({}),
+            BUDGET,
+            &Cancel::default(),
+        )
+        .unwrap();
+        // The first agent answers only once the test opens its gate.
+        let (open, gate) = mpsc::channel::<()>();
+        let gate = Mutex::new(Some(gate));
+        run.spawn = Box::new(move |spec, then| {
+            let gate = gate.lock().unwrap().take();
+            std::thread::spawn(move || {
+                if let Some(gate) = gate {
+                    let _ = gate.recv();
+                }
+                then(&done(&spec.label));
+            });
+            Ok(())
+        });
+        set_off(
+            run,
+            &Launch::read(&json!({"script": script}), None).unwrap(),
+        )
+        .unwrap();
+        standing(session, &[Running]);
+        pause(session, "wf-1").unwrap();
+        assert_eq!(
+            pause(session, "wf-1"),
+            Err("wf-1 is paused already.".into())
+        );
+        assert_eq!(super::run(session, "wf-1").unwrap().state, RunState::Paused);
+        let caller = Caller {
+            root: session,
+            ..Default::default()
+        };
+        let listed = |caller: &Caller| {
+            let rows = rows(caller);
+            rows.iter().find(|row| row[0] == "wf-1").unwrap()[2].clone()
+        };
+        assert!(
+            listed(&caller).starts_with("paused · "),
+            "{}",
+            listed(&caller)
+        );
+        // The running agent answers; the script's next call waits.
+        open.send(()).unwrap();
+        standing(session, &[Done, Waiting]);
+        std::thread::sleep(Duration::from_millis(100));
+        standing(session, &[Done, Waiting]);
+        resume(session, "wf-1").unwrap();
+        let text = notice(session, "wf-1").text;
+        assert!(
+            text.starts_with("workflow wf-1 \"two\" finished: 2 of 2 agents done"),
+            "{text}"
+        );
+        let ended = resume(session, "wf-1").unwrap_err();
+        assert!(
+            ended.starts_with("wf-1 has already ended (finished · "),
+            "{ended}"
+        );
+    }
+
+    #[test]
+    fn a_run_stopped_while_paused_reads_stopped_and_tells_nobody() {
+        let data = Data::new("tool-pause-stop");
+        let connection = data.connection("http://127.0.0.1:9/v1");
+        let session = connection.conversation;
+        let mut run = Run::open(
+            None,
+            &connection,
+            AUDIT,
+            &json!({}),
+            BUDGET,
+            &Cancel::default(),
+        )
+        .unwrap();
+        run.spawn = answering(&Asked::default(), done);
+        run.board.pause("wf-1").unwrap();
+        set_off(run, &Launch::read(&json!({"script": AUDIT}), None).unwrap()).unwrap();
+        standing(session, &[AgentState::Waiting]);
+        let caller = Caller {
+            root: session,
+            ..Default::default()
+        };
+        let stop = json!({"action": "stop", "to": "wf-1"});
+        control(&stop, &caller).unwrap().unwrap();
+        // Its one call is answered null at once, which the script returns.
+        let deadline = Instant::now() + WAIT;
+        while super::run(session, "wf-1").unwrap().state == RunState::Paused {
+            assert!(Instant::now() < deadline, "the stop never reached it");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let view = super::run(session, "wf-1").unwrap();
+        assert_eq!(view.state, RunState::Ended("stopped".into()));
+        let told = inbox::take(session, true);
+        assert!(told.iter().all(|notice| notice.from != "workflow wf-1"));
     }
 }
