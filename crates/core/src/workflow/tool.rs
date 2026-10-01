@@ -1741,6 +1741,11 @@ return await agent("Three");
         );
         skip(session, "wf-1", "#2").unwrap();
         standing(session, &[Done, Skipped, Waiting]);
+        let skipped = transcript(session, "wf-1", 2).unwrap();
+        assert_eq!(
+            (skipped.state, skipped.messages.len(), skipped.answer),
+            (Skipped, 0, None)
+        );
         let caller = Caller {
             root: session,
             ..Default::default()
