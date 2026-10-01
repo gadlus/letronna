@@ -336,6 +336,10 @@ fn main() {
                     None => format!("{line} is not a command. Type / to see what is."),
                 }));
             }
+            // The footer names the open session's Crew switch, which the
+            // command may have turned, or left behind by opening another.
+            let note = footer(&runner);
+            runner.bar.set_footer(note);
             // Painting is throttled, so the last thing a command printed can
             // still be sitting in the buffer with nothing coming after it to
             // bring it out. Whatever it said, say it now.
