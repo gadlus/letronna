@@ -35,3 +35,8 @@ libc = "0.2"
 # The SHA-256 of an update staged by hand, which the updater checks before it
 # installs one. Already in the build for core.
 ring = "0.17"
+
+# Whether `letronna serve` runs in its terminal's foreground, which only the
+# C library can say. Already in the lock file, for other crates.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

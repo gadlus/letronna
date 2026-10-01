@@ -2838,7 +2838,7 @@ pub fn sessions_dir() -> PathBuf {
     backend::data_dir().join("sessions")
 }
 
-fn session_path(id: u64) -> PathBuf {
+pub(crate) fn session_path(id: u64) -> PathBuf {
     sessions_dir().join(format!("{id}.jsonl"))
 }
 

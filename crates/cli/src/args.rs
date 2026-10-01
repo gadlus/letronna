@@ -11,6 +11,7 @@ Letronna — a small agent in your terminal
   letronna --resume        choose from the recent sessions
   letronna --resume <id>   open that session, by the id /where shows
   letronna gui             open the window instead
+  letronna serve           answer chat apps and run schedules, no window
   letronna setup           name, sign in, provider, model, install
   letronna update          install the newest version
   letronna doctor          check the setup, the disk and the gateway
@@ -95,6 +96,8 @@ pub struct Args {
     pub help: bool,
     pub version: bool,
     pub gui: bool,
+    /// `letronna serve`: the chat apps and the schedules, with no window.
+    pub serve: bool,
     pub install: bool,
     pub uninstall: bool,
     pub update: bool,
@@ -128,6 +131,7 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
         help: false,
         version: false,
         gui: false,
+        serve: false,
         install: false,
         uninstall: false,
         update: false,
@@ -156,6 +160,7 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
     while let Some(arg) = raw.next() {
         match arg.as_str() {
             "gui" => args.gui = true,
+            "serve" => args.serve = true,
             "update" => args.update = true,
             "doctor" => args.doctor = true,
             "--offline" => args.offline = true,
@@ -358,6 +363,7 @@ mod tests {
         let worded = args(&["--resume", "hello"]);
         assert_eq!(worded.start, super::Start::Choose);
         assert!(args(&["gui"]).gui);
+        assert!(args(&["serve"]).serve && args(&["serve"]).prompt.is_none());
         assert!(args(&["update"]).update && args(&["update"]).prompt.is_none());
         assert_eq!(args(&["--yes"]).mode, Ok(Mode::Bypass));
         let edits = args(&["--mode", "accept-edits", "tidy up"]);
