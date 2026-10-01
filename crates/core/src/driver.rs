@@ -320,6 +320,7 @@ fn steps(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result<Outcom
             return Ok(Outcome::OverBudget);
         }
         let Some(reply) = ask_in_line(spec, turn)? else {
+            keep_cut_short(spec, turn);
             return Ok(Outcome::Stopped);
         };
         report.input += reply.input_tokens();
@@ -841,6 +842,14 @@ fn ask(spec: &Spec, turn: &mut Turn, permit: Permit) -> Result<Option<Message>, 
         return Ok(None);
     }
     Err("The model connection closed unexpectedly.".into())
+}
+
+/// Keeps the reply a stop cut short, as far as it streamed and marked
+/// interrupted, so the session shows what the model had said: what
+/// `Turn::stop` keeps of the window's own turn, calls that never ran left out.
+fn keep_cut_short(spec: &mut Spec, turn: &mut Turn) {
+    let kept = turn.stop(&spec.connection.model);
+    spec.transcript.conversation.messages.extend(kept);
 }
 
 /// Keeps the checklist a `todo` call sends on the transcript, as the window
@@ -1396,6 +1405,51 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_chat_apps_call_gets_a_card_but_a_headless_run_still_refuses() {
+        let _serving = crate::approvals::tests::SERVING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let requests = approvals::serve();
+        let dir = scratch("chat-app");
+        let write = || ("write_file", json!({"path": "made.txt", "content": "made"}));
+
+        // A chat app's session has a human too, just reached through a card
+        // sent to the chat, so a call that needs a yes asks rather than
+        // being refused outright.
+        let (endpoint, stub) = provider(vec![reply("", &[write()]), reply("Wrote it.", &[])]);
+        let mut chatting = spec(endpoint, &dir, AGENTS + 300);
+        chatting.connection.remote = Some(chat::Remote {
+            place: "a Telegram chat".into(),
+            ..Default::default()
+        });
+        chatting.connection.human = true;
+        let running = spawn(chatting, |_| ()).unwrap();
+        let request = requests.recv_timeout(WAIT).unwrap();
+        assert_eq!(
+            request.root, 7,
+            "a chat card routes by the session it names"
+        );
+        request.answer(approvals::Decision::Once);
+        assert_eq!(running.join().unwrap().status, Outcome::Done);
+        let _ = stub.sent();
+        assert!(dir.join("made.txt").exists());
+
+        // A headless run -- a schedule, or `-p` with no terminal to answer
+        // in -- has nobody there at all, so it still refuses with no card.
+        let (endpoint, provider) = provider(vec![reply("", &[write()]), reply("Left it.", &[])]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 310);
+        spec.connection.human = false;
+        assert_eq!(finished(spec).status, Outcome::Done);
+        let sent = provider.sent();
+        assert!(
+            results(&sent[1])[0].contains("nobody is here to give it"),
+            "{:?}",
+            results(&sent[1])
+        );
+        assert!(requests.try_recv().is_err(), "a card with nobody there");
+    }
+
+    #[test]
     fn a_message_mid_run_folds_in_after_the_results() {
         let _bell = crate::inbox::tests::DOORBELL
             .lock()
@@ -1491,6 +1545,31 @@ pub(crate) mod tests {
             texts,
             ["helper ended before it read this, from main:\nthen run the tests"]
         );
+    }
+
+    #[test]
+    fn a_reply_a_stop_cut_short_is_kept_as_far_as_it_streamed() {
+        let dir = scratch("cut-short");
+        let mut spec = spec("http://127.0.0.1:9/v1".into(), &dir, AGENTS + 55);
+        let mut turn = Turn::new(spec.connection.clone());
+        // Nothing streamed yet: nothing to keep.
+        keep_cut_short(&mut spec, &mut turn);
+        assert_eq!(spec.transcript.conversation.messages.len(), 1);
+        turn.absorb(&Event::Delta("Reading the no".into()));
+        turn.live.calls.push(ToolCall {
+            id: "call-0".into(),
+            name: "read_file".into(),
+            arguments: "{\"pa".into(),
+        });
+        keep_cut_short(&mut spec, &mut turn);
+        let kept = spec.transcript.conversation.messages.last().unwrap();
+        assert_eq!(
+            (kept.role.as_str(), kept.content.as_str(), kept.interrupted),
+            ("assistant", "Reading the no", true)
+        );
+        assert!(kept.tool_calls.is_empty(), "a call that never ran was kept");
+        let said = last_said(&spec.transcript.conversation.messages);
+        assert_eq!(said, "Reading the no");
     }
 
     #[test]

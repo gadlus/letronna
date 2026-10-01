@@ -18,6 +18,10 @@ impl Chat {
         if self.busy {
             return Some("Stop the reply before switching profiles.");
         }
+        // Each would end into a session of the old profile's by its id.
+        if !self.runs.is_empty() {
+            return Some("Stop the runs beside the chat before switching profiles.");
+        }
         if self.helpers_working() > 0 {
             return Some("Wait for helpers to finish before switching profiles.");
         }
@@ -280,7 +284,6 @@ impl Chat {
         self.editing_message = None;
         // Sessions the old profile opened for a chat app, by ids that another
         // profile's sessions may share.
-        self.remote.clear();
         self.remote_session.clear();
         self.follow_ups.clear();
         self.returned_follow_ups = None;

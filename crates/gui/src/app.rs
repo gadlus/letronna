@@ -287,8 +287,15 @@ pub(crate) struct Chat {
     pub(crate) slack_code: Option<letronna_core::messaging::pairing::Code>,
     /// What the Slack listener last said it was doing; none while it is off.
     pub(crate) slack_state: Option<letronna_core::messaging::SlackState>,
-    /// Sessions opened for a remote chat, so the reply goes back to it.
-    pub(crate) remote: std::collections::HashMap<u64, letronna_core::messaging::Source>,
+    /// Runs beside the chat by session: held ones the window started, and
+    /// scheduled ones its runner started.
+    pub(crate) runs: std::collections::BTreeMap<u64, crate::runs::Run>,
+    /// Where each held run's thread sends its end.
+    pub(crate) run_ends: async_channel::Sender<crate::runs::Finished>,
+    /// The card each chat app was sent for its run's call, which its next
+    /// message or a tap on the card answers.
+    pub(crate) chat_asks:
+        std::collections::HashMap<letronna_core::messaging::Source, approvals::Request>,
     /// The session each remote chat is talking in, so a follow-up keeps its
     /// context. `/new` from the chat starts another.
     pub(crate) remote_session: std::collections::HashMap<letronna_core::messaging::Source, u64>,
@@ -300,17 +307,12 @@ pub(crate) struct Chat {
     /// Stop drops the receiver at once, which is how the worker learns to
     /// give up, even in the middle of a wait to try again.
     pub(crate) reading: Option<Task<()>>,
-    /// What keeps a chat app's typing indicator up while its turn runs.
-    pub(crate) typing: Option<Task<()>>,
+    /// What keeps each chat app's typing indicator up while its run goes,
+    /// by the run's session.
+    pub(crate) typing: std::collections::HashMap<u64, Task<()>>,
     /// Calls the turn in flight started that have not come back. The queue
     /// moves on only once none are, so a batch finishes before the next step.
     pub(crate) outstanding: usize,
-    /// A remote chat that has been sent the card the turn is waiting on, and
-    /// the call it is about. Its next message answers it.
-    pub(crate) remote_waiting: Option<(
-        letronna_core::messaging::Source,
-        letronna_core::chat::ToolCall,
-    )>,
     /// Messages with a voice note, each held while its chat is asked whether
     /// voice notes may be transcribed there. The chat's next words answer.
     pub(crate) voice_waiting: std::collections::HashMap<
@@ -807,6 +809,7 @@ impl Chat {
             Err(why) => (Vec::new(), Some(why)),
         };
         let draft_for = store.conversations[store.active].id;
+        let (run_ends, ended_runs) = async_channel::unbounded();
         let account = letronna_core::auth::account();
         // Nothing reachable yet: no account, and no key or URL saved for a
         // gateway that needs one. Ollama needs neither, so it is not asked.
@@ -903,13 +906,14 @@ impl Chat {
             pairing: None,
             slack_code: None,
             slack_state: None,
-            remote: std::collections::HashMap::new(),
+            runs: Default::default(),
+            run_ends,
+            chat_asks: Default::default(),
             remote_session: std::collections::HashMap::new(),
             generation: 0,
             reading: None,
-            typing: None,
+            typing: Default::default(),
             outstanding: 0,
-            remote_waiting: None,
             messaging_stop: None,
             slack_listener: None,
             voice_waiting: std::collections::HashMap::new(),
@@ -1025,6 +1029,7 @@ impl Chat {
         this.composer
             .update(cx, |input, cx| input.focus(window, cx));
         Self::watch_schedules(schedule_events, cx);
+        Self::watch_runs(ended_runs, cx);
         Self::watch_updates(cx);
         Self::watch_inbox(cx);
         Self::watch_sessions(cx);
@@ -1207,7 +1212,7 @@ impl Chat {
             at -= 1;
             let id = self.open[at];
             let busy = self.streaming_id == Some(id)
-                || self.remote.contains_key(&id)
+                || self.runs.contains_key(&id)
                 || self.remote_session.values().any(|&s| s == id);
             if busy {
                 continue;
@@ -1294,6 +1299,14 @@ impl Chat {
                 .update(cx, |input, cx| input.set_value("", window, cx));
             return self.ask_aside(question, cx);
         }
+        // Beside whatever runs here, so it neither waits for a reply nor
+        // queues behind one.
+        if let Some(task) = crate::runs::background_prompt(&prompt) {
+            self.composer
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            self.run_in_background(task, cx);
+            return;
+        }
         if let Some(args) = goal_command(&prompt) {
             let command = goal::parse(args);
             let ix = self.store.active;
@@ -1349,6 +1362,15 @@ impl Chat {
                 return;
             }
             None => {}
+        }
+        if self.run_holds_open() && (!prompt.is_empty() || !self.attached().is_empty()) {
+            self.error = Some(
+                "This session is running beside the chat. Wait for its answer, or stop it with \
+                 Escape."
+                    .into(),
+            );
+            cx.notify();
+            return;
         }
         if self.busy && !prompt.is_empty() {
             return self.queue_follow_up(prompt, window, cx);
@@ -1585,9 +1607,7 @@ impl Chat {
         // only the user asking again says so: a chat's turn is not read
         // aloud, and would cut off the answer they are hearing.
         self.match_voice();
-        let session = self.store.conversations[self.store.active].id;
-        let own = !self.remote.contains_key(&session);
-        if let (Some(voice), true) = (&mut self.voice, own) {
+        if let (Some(voice), false) = (&mut self.voice, from_chat_app) {
             voice.hush();
         }
         // A new message is the user's next step, whatever a look at the goal
@@ -1755,10 +1775,11 @@ impl Chat {
             conversation: session,
             wrap_up: false,
             mode,
-            // Nobody sees a helper's card in a chat app's session, so its
-            // helpers are refused rather than left asking.
-            human: self.unattended(session).is_none()
-                && !self.remote_session.values().any(|&id| id == session),
+            // A chat app's session has a human too, just reached through a
+            // card sent to the chat by `on_agent_ask` rather than shown in
+            // this window; only a schedule deciding without the user truly
+            // has nobody there.
+            human: self.unattended(session).is_none(),
             // Filled in by `run_turn`, once the prompt is in.
             typed: Default::default(),
             // Its own: the judge runs on `model`.
@@ -1768,8 +1789,9 @@ impl Chat {
         Ok(connection)
     }
 
-    /// Hear what the schedules' runner says: a run that ended is called back
-    /// about as a turn that ended is, and why the schedules are not running
+    /// Hear what the schedules' runner says: a run that starts is listed as
+    /// running, with its stop, until it ends; one that ended is called back
+    /// about as a turn that ended is; and why the schedules are not running
     /// is shown once, as an error.
     pub(crate) fn watch_schedules(
         events: async_channel::Receiver<letronna_core::schedule::Event>,
@@ -1779,6 +1801,7 @@ impl Chat {
         cx.spawn(async move |this, cx| {
             while let Ok(event) = events.recv().await {
                 let shown = this.update(cx, |this, cx| match event {
+                    Scheduled::Started(run) => this.scheduled_started(run, cx),
                     Scheduled::Ended(run) => this.scheduled_ended(run, cx),
                     Scheduled::Trouble(trouble) => {
                         this.error = Some(trouble);
@@ -1943,8 +1966,7 @@ impl Chat {
     /// behind others and they want to be. A chat app's session is answered
     /// in the chat, and a deleted one has nothing to show.
     fn tell(&mut self, id: u64, why: notify::Why) {
-        let remote =
-            self.remote.contains_key(&id) || self.remote_session.values().any(|&s| s == id);
+        let remote = self.remote_session.values().any(|&s| s == id);
         let Some(ix) = self.store.index_of(id).filter(|_| !remote) else {
             return;
         };
@@ -1999,9 +2021,11 @@ impl Chat {
         if self.unattended(request.root).is_some() {
             return;
         }
-        // Nobody in a chat app sees a helper's card, and one waiting here
-        // would hold up the chat's answer until someone came to the window.
+        // A chat app's run puts its card to the chat. Nobody there sees a
+        // helper's, and one waiting here would hold up the chat's answer
+        // until someone came to the window.
         if self.remote_session.values().any(|&id| id == request.root) {
+            self.ask_chat(request, cx);
             return;
         }
         if !(self.page == Page::Chat && self.store.active == ix) {
@@ -2056,6 +2080,10 @@ impl Chat {
     /// read again for the time it ran.
     fn scheduled_ended(&mut self, run: letronna_core::schedule::Ended, cx: &mut Context<Self>) {
         self.schedules = self.schedule_runner.list();
+        // Listed as running no longer: its stop has nothing left to stop.
+        if let Some(session) = run.session {
+            self.runs.remove(&session);
+        }
         // The folder's watch waits for writes to settle, so this can come first.
         self.follow_sessions(cx);
         match run.session.filter(|&id| self.store.index_of(id).is_some()) {
@@ -2115,9 +2143,7 @@ impl Chat {
         turn.absorb(&event);
         // Read aloud only for whoever is at the window: a chat's run is
         // answered where it came from.
-        let aloud = self
-            .streaming_id
-            .is_some_and(|id| !self.remote.contains_key(&id));
+        let aloud = turn.connection.remote.is_none();
         if let (Some(voice), true) = (&mut self.voice, aloud) {
             match &event {
                 Event::Delta(text) => voice.hear(text),
@@ -2370,15 +2396,14 @@ impl Chat {
                 if let Some(id) = self.streaming_id.filter(|_| fresh) {
                     self.tell(id, notify::Why::Waiting(&call, None));
                 }
-                self.ask_remote(call, cx);
                 // The card shows only with its session on screen, and until
                 // it is answered no other session can start, so say which one
-                // is waiting. A chat app's session had it sent to the chat.
+                // is waiting.
                 let on_screen = self.page == Page::Chat
                     && self.streaming_id == Some(self.store.conversations[self.store.active].id);
                 if let Some(ix) = self
                     .streaming_id
-                    .filter(|id| !on_screen && !self.remote.contains_key(id))
+                    .filter(|_| !on_screen)
                     .and_then(|id| self.store.index_of(id))
                 {
                     let title = &self.store.conversations[ix].title;
@@ -2636,7 +2661,7 @@ impl Chat {
         .detach();
     }
 
-    fn tell_remote(
+    pub(crate) fn tell_remote(
         &self,
         source: &letronna_core::messaging::Source,
         text: &str,
@@ -2647,7 +2672,7 @@ impl Chat {
 
     /// Send to a chat, with Allow and Deny under it when `card` is the id of
     /// the call it asks about.
-    fn tell_remote_card(
+    pub(crate) fn tell_remote_card(
         &self,
         source: &letronna_core::messaging::Source,
         text: &str,
@@ -2664,25 +2689,28 @@ impl Chat {
             .detach();
     }
 
-    /// Show `source` that its turn is at work, for as long as it runs and is
-    /// not waiting on the chat. The service drops the indicator after a few
-    /// seconds, so it is sent again on a timer that lives only as long as
-    /// the turn, and a new turn's replaces it.
-    fn keep_typing(&mut self, source: letronna_core::messaging::Source, cx: &mut Context<Self>) {
+    /// Show `source` that its run in session `id` is at work, for as long as
+    /// it goes and is not waiting on the chat. The service drops the
+    /// indicator after a few seconds, so it is sent again on a timer that
+    /// lives only as long as the run, and a new run's there replaces it.
+    pub(crate) fn keep_typing(
+        &mut self,
+        source: letronna_core::messaging::Source,
+        id: u64,
+        cx: &mut Context<Self>,
+    ) {
         let every = source.typing_every();
-        self.typing = Some(cx.spawn(async move |this, cx| {
+        let task = cx.spawn(async move |this, cx| {
             loop {
                 let working = this.update(cx, |this, _| {
-                    let running = this
-                        .streaming_id
-                        .and_then(|id| this.remote.get(&id))
-                        .is_some_and(|turn| *turn == source);
-                    // A card sent is the chat's turn to answer.
-                    let asking = this
-                        .remote_waiting
-                        .as_ref()
-                        .is_some_and(|(waiting, _)| *waiting == source);
-                    running.then(|| (!asking).then(|| this.messaging.clone()))
+                    let run =
+                        (this.runs.get(&id)).filter(|run| run.source.as_ref() == Some(&source));
+                    // Waiting for a place, or on a card sent, which is the
+                    // chat's turn to answer, it is not at work.
+                    let at_work = |run: &crate::runs::Run| {
+                        !run.queued && !this.chat_asks.contains_key(&source)
+                    };
+                    run.map(|run| at_work(run).then(|| this.messaging.clone()))
                 });
                 let Ok(Some(config)) = working else {
                     return;
@@ -2697,7 +2725,8 @@ impl Chat {
                 }
                 cx.background_executor().timer(every).await;
             }
-        }));
+        });
+        self.typing.insert(id, task);
     }
 
     /// A tap on a card's Allow or Deny. It answers the card only while that
@@ -2709,10 +2738,8 @@ impl Chat {
         press: letronna_core::messaging::Press,
         cx: &mut Context<Self>,
     ) {
-        let answers = self
-            .remote_waiting
-            .as_ref()
-            .is_some_and(|(waiting, call)| *waiting == source && press.answers(&call.id));
+        let answers =
+            (self.chat_asks.get(&source)).is_some_and(|request| press.answers(&request.call.id));
         let config = self.messaging.clone();
         let allow = press.allow;
         cx.background_executor()
@@ -2720,14 +2747,11 @@ impl Chat {
                 let _ = letronna_core::messaging::settle(&config, &press, answers);
             })
             .detach();
-        if answers {
-            self.resolve_call(
-                match allow {
-                    true => Verdict::Allow { remember: false },
-                    false => Verdict::Deny(String::new()),
-                },
-                cx,
-            );
+        if answers && let Some(request) = self.chat_asks.remove(&source) {
+            request.answer(match allow {
+                true => approvals::Decision::Once,
+                false => approvals::Decision::Deny(String::new()),
+            });
         }
     }
 
@@ -2808,35 +2832,24 @@ impl Chat {
         if message.needs_session && !self.remote_session.contains_key(&source) {
             return;
         }
+        // The chat's own run, wherever it is; its end says "Stopped.".
+        let running = self
+            .remote_session
+            .get(&source)
+            .copied()
+            .filter(|id| self.runs.contains_key(id));
         if message.said.trim() == "/stop" {
-            if !self.busy {
-                self.tell_remote(&source, "Nothing is running.", cx);
-                return;
-            }
-            // `stop_turn` tells the chat that owns the turn; this one may not be it.
-            let owner = self
-                .streaming_id
-                .and_then(|id| self.remote.get(&id))
-                .cloned();
-            self.stop_turn(cx);
-            if owner.as_ref() != Some(&source) {
-                self.tell_remote(&source, "Stopped.", cx);
+            match running {
+                Some(id) => self.stop_run(id, cx),
+                None => self.tell_remote(&source, "Nothing is running.", cx),
             }
             return;
         }
         // In a group anyone may write, but only the owner's own words answer;
-        // anyone else's go on as any message would while a turn runs.
-        if let Some((waiting, call)) = self.remote_waiting.clone()
-            && waiting == source
-            && pairing::may_answer(&self.messaging, &message)
+        // anyone else's go on as any message would while a run goes.
+        if pairing::may_answer(&self.messaging, &message)
+            && self.answer_chat(&source, &message.said)
         {
-            use letronna_core::messaging::{CardAnswer, card_answer};
-            let verdict = match card_answer(&call.name, &call.arguments, &message.said) {
-                CardAnswer::Answer(text) => Verdict::Answer(text),
-                CardAnswer::Allow => Verdict::Allow { remember: false },
-                CardAnswer::Deny(reason) => Verdict::Deny(reason),
-            };
-            self.resolve_call(verdict, cx);
             return;
         }
         use letronna_core::messaging::files;
@@ -2852,31 +2865,23 @@ impl Chat {
             }
             return self.on_remote(held, cx);
         }
-        if self.busy {
-            // Slack takes a leading / as one of its own commands.
-            let stop = match source {
-                Source::Slack { .. } => "!stop",
-                _ => "/stop",
-            };
-            let text = format!(
-                "Still working on something. Send {stop} to cancel it, or send this again \
-                 once it is done."
-            );
-            self.tell_remote(&source, &text, cx);
-            return;
-        }
         // Telegram sends /start when a chat first opens the bot.
         if matches!(message.said.trim(), "/new" | "/start") {
             self.remote_session.remove(&source);
             self.tell_remote(&source, "Started a new session.", cx);
             return;
         }
+        if let Some(id) = running
+            && self.chat_to_run(&source, id, &message.remote.place, &message.text, cx)
+        {
+            return;
+        }
         let mut message = letronna_core::messaging::Incoming {
             source: source.clone(),
             ..message
         };
-        // Fetched only now, from a chat allowed to talk here and with nothing
-        // running, into the folder of the session they are for.
+        // Fetched only now, from a chat allowed to talk here and with no run
+        // of its own going, into the folder of the session they are for.
         if files::unfetched(&message) {
             let config = self.messaging.clone();
             let into = self.remote_folder(&message);
@@ -2889,47 +2894,56 @@ impl Chat {
                 Some(false) => message = files::hear(message, false),
             }
         }
-        // Carry on in the chat's session unless it has since been deleted.
-        match self
+        // Carry on in the chat's session unless it has since been deleted,
+        // beside whatever the window is doing and without taking its view.
+        let session = self
             .remote_session
             .get(&source)
-            .and_then(|id| self.store.index_of(*id))
-        {
-            Some(ix) => self.store.active = ix,
+            .copied()
+            .filter(|&id| self.store.index_of(id).is_some());
+        // A turn of the window's own there already, which a run would race.
+        if session.is_some() && session == self.streaming_id {
+            self.tell_remote(
+                &source,
+                "Still working on something. Send this again once it is done.",
+                cx,
+            );
+            return;
+        }
+        let id = match session {
+            Some(id) => id,
             None => {
                 let workspace = self.store.conversations[self.store.active]
                     .workspace
                     .clone();
+                let id = self.store.reserve_id();
                 self.store.conversations.push(Conversation {
-                    id: self.store.reserve_id(),
+                    id,
                     title: message.text.chars().take(40).collect(),
                     updated: backend::now(),
                     workspace,
                     ..Default::default()
                 });
-                self.store.active = self.store.conversations.len() - 1;
+                id
             }
-        }
-        let id = self.store.conversations[self.store.active].id;
+        };
         self.remote_session.insert(source.clone(), id);
         let allow_tools = match source {
             Source::Telegram(_) => self.messaging.telegram.allow_tools,
             Source::Discord(_) => self.messaging.discord.allow_tools,
             Source::Slack { .. } => self.messaging.slack.allow_tools,
         };
-        self.remote.insert(id, source.clone());
         // The message itself says it was a voice note: a flag kept per chat
-        // would outlive a message held for its transcript or turned away
-        // while busy, and give a later typed one a paid spoken answer.
+        // would outlive a message held for its transcript or left for a
+        // run, and give a later typed one a paid spoken answer.
         self.speak_back.remove(&id);
         if message.spoken {
             self.speak_back.insert(id);
         }
-        // Nobody on the far end can answer an approval card, so unless the
-        // user has said otherwise a remote message may look but not touch.
-        // With tools it gets the Default mode setting, but never above
-        // Default: whoever writes in the chat drives it, and the chip that
-        // would say what runs unasked is not in front of them.
+        // Unless the user has said otherwise a remote message may look but
+        // not touch. With tools it gets the Default mode setting, but never
+        // above Default: whoever writes in the chat drives it, and the chip
+        // that would say what runs unasked is not in front of them.
         let mode = if allow_tools {
             Mode::narrow(Mode::Default, self.store.settings.mode)
         } else {
@@ -2938,39 +2952,31 @@ impl Chat {
         self.modes.insert(id, mode);
         // Ends what a command typed in this session granted its own turn.
         tell_crew(id, &message.text, crew::Source::ChatApp);
-        let (prompt, pictures) = files::prompt(&message);
-        if self
-            .dispatch(prompt, pictures, Some(message.remote), cx)
-            .is_ok()
-        {
-            self.keep_typing(source, cx);
-        }
+        let (text, images) = files::prompt(&message);
+        // Someone else's words, which must not read the user's files by
+        // naming them.
+        let prompt = Message {
+            role: "user".into(),
+            content: letronna_core::references::inert(&text),
+            images,
+            remote: true,
+            ..Default::default()
+        };
+        self.run_beside(id, prompt, Some(source.clone()), Some(message.remote), cx);
+        self.keep_typing(source, id, cx);
     }
 
-    /// Send the finished reply back to the chat that asked for it.
-    fn answer_remote(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.streaming_id else { return };
-        let Some(source) = self.remote.remove(&id) else {
-            return;
-        };
-        // Only this turn's reply: the session carries on across messages, so
-        // an earlier answer is further up and must not be sent again.
-        let reply = match &self.error {
-            Some(error) => format!("Did not finish: {error}"),
-            None => self
-                .store
-                .index_of(id)
-                .and_then(|ix| {
-                    self.store.conversations[ix]
-                        .messages
-                        .iter()
-                        .rev()
-                        .take_while(|m| m.role != "user" || m.notice)
-                        .find(|m| m.role == "assistant" && !m.content.is_empty())
-                })
-                .map(|m| m.content.clone())
-                .unwrap_or_else(|| "That did not produce an answer.".to_owned()),
-        };
+    /// Send what chat `source`'s run in session `id` came to, `reply`, back
+    /// to the chat, with the pictures and sound it made; read aloud too when
+    /// it `answered` a voice note.
+    pub(crate) fn answer_run(
+        &mut self,
+        source: &letronna_core::messaging::Source,
+        id: u64,
+        reply: &str,
+        answered: bool,
+        cx: &mut Context<Self>,
+    ) {
         let made = self
             .store
             .index_of(id)
@@ -2979,13 +2985,13 @@ impl Chat {
         // Files cannot go to Slack, so a voice note is only for the others.
         let voiced = self.speak_back.remove(&id)
             && self.store.settings.voice
-            && self.error.is_none()
+            && answered
             && !matches!(source, letronna_core::messaging::Source::Slack { .. });
         if made.is_empty() && !voiced {
-            return self.tell_remote(&source, &reply, cx);
+            return self.tell_remote(source, reply, cx);
         }
-        // One task, so the pictures and sound the turn made follow the reply.
-        let config = self.messaging.clone();
+        // One task, so the pictures and sound the run made follow the reply.
+        let (config, source, reply) = (self.messaging.clone(), source.clone(), reply.to_owned());
         cx.background_executor()
             .spawn(async move {
                 let mut made = made;
@@ -3104,40 +3110,8 @@ impl Chat {
         self.record_result(message, cx);
     }
 
-    /// A remote session cannot see the card, so send it to the chat; the
-    /// chat's next message answers it. Without this the turn waits on a card
-    /// nobody is looking at, and every later message is turned away as busy.
-    fn ask_remote(&mut self, call: letronna_core::chat::ToolCall, cx: &mut Context<Self>) {
-        let Some(source) = self
-            .streaming_id
-            .and_then(|id| self.remote.get(&id))
-            .cloned()
-        else {
-            return;
-        };
-        if self
-            .remote_waiting
-            .as_ref()
-            .is_some_and(|(_, waiting)| waiting.id == call.id)
-        {
-            return;
-        }
-        let ctx = self
-            .turn
-            .as_ref()
-            .map(|turn| letronna_core::tools::ToolContext::of(&turn.connection))
-            .unwrap_or_default();
-        let preview = letronna_core::tools::preview(&call.name, &call.arguments, &ctx);
-        let text = letronna_core::messaging::card_text(&call.name, &call.arguments, &preview);
-        // A question is answered in words; a tool is allowed or not.
-        let card = (call.name != letronna_core::tools::ASK_USER).then(|| call.id.clone());
-        self.tell_remote_card(&source, &text, card, cx);
-        self.remote_waiting = Some((source, call));
-    }
-
-    /// The user answered the approval card, here or from a chat.
+    /// The user answered the approval card.
     pub(crate) fn resolve_call(&mut self, verdict: Verdict, cx: &mut Context<Self>) {
-        self.remote_waiting = None;
         let Some((call, true)) = self
             .turn
             .as_ref()
@@ -3288,10 +3262,6 @@ impl Chat {
             return;
         }
         self.advance_tools(cx);
-        // The chat that was sent the card must not answer a call that ran.
-        if self.asking.is_none() {
-            self.remote_waiting = None;
-        }
     }
 
     /// Whether the chat page shows the conversation rather than the empty
@@ -3639,10 +3609,9 @@ impl Chat {
         )
     }
 
-    /// End the turn in flight, from the Stop button or `/stop` in a chat.
-    /// The chat app that started it hears "Stopped." rather than an
-    /// error. What the turn got to is kept: the reply so far, or the batch's
-    /// results with every call left answered as stopped.
+    /// End the turn in flight, from the Stop button. What the turn got to is
+    /// kept: the reply so far, or the batch's results with every call left
+    /// answered as stopped.
     pub(crate) fn stop_turn(&mut self, cx: &mut Context<Self>) {
         // A look at the goal between turns stops as a turn does, but only
         // the look of the session on screen, where the Stop button shows.
@@ -3666,14 +3635,8 @@ impl Chat {
         // than running on unseen. Taken, so the next turn starts unstopped.
         std::mem::take(&mut self.turn_stop).set();
         self.reading = None;
-        self.remote_waiting = None;
         if let Some(voice) = &mut self.voice {
             voice.hush();
-        }
-        if let Some(id) = self.streaming_id
-            && let Some(source) = self.remote.remove(&id)
-        {
-            self.tell_remote(&source, "Stopped.", cx);
         }
         // While the call the judge decides is still in front, before
         // `keep_stopped` answers it as never started.
@@ -3708,7 +3671,8 @@ impl Chat {
     }
 
     /// Escape that nothing nearer took: close what is open over the chat,
-    /// or else stop the reply, which is what escape does in the terminal.
+    /// or else stop the reply, which is what escape does in the terminal, or
+    /// the run beside the chat that holds the open session.
     fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.editing_message.is_some() {
             self.cancel_edit(window, cx);
@@ -3734,6 +3698,10 @@ impl Chat {
         } else if self.page == Page::Activity && self.viewing.is_some() {
             // And out of a helper's transcript, back to the list.
             self.open_activity(window, cx);
+        } else if self.run_holds_open() {
+            // The window's own reply is never in a session a run holds.
+            let id = self.store.conversations[self.store.active].id;
+            self.stop_run(id, cx);
         } else if self.busy && self.busy_elsewhere().is_none() {
             // Not a reply in another session, which nothing here shows. Ahead
             // of the sidebar's filter, which a saved choice would leave
@@ -3761,9 +3729,6 @@ impl Chat {
         if let Some(id) = session.filter(|_| !stopped) {
             self.tell_ended_turn(id);
         }
-        self.answer_remote(cx);
-        // The reply clears the indicator; nothing may raise it again.
-        self.typing = None;
         // The session's loop goes round again from the turn that took its
         // tick, and a stop ends it.
         if let Some(id) = session {
@@ -3966,18 +3931,20 @@ impl Chat {
 
     /// Start a turn for notices that came while nothing ran: in the session
     /// on screen if it has any, otherwise in the one waiting longest.
-    fn wake_idle(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn wake_idle(&mut self, cx: &mut Context<Self>) {
         if self.busy {
             return;
         }
         let on_screen = self.store.conversations[self.store.active].id;
         // A chat app hears only the answer to what it sent, so a turn started
         // in its session would answer nobody; its next message takes them. A
-        // scheduled run going on here reads its own as it goes.
+        // scheduled run going on here reads its own as it goes, and a run
+        // beside the chat reads its session's own before it answers.
         let wakes = |id| {
             self.store.index_of(id).is_some()
                 && !self.remote_session.values().any(|&s| s == id)
                 && letronna_core::schedule::running(id).is_none()
+                && !self.runs.contains_key(&id)
         };
         let Some(id) = woken(on_screen, &inbox::pending(), wakes) else {
             return;

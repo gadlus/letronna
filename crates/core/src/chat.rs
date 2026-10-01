@@ -228,8 +228,8 @@ pub struct Connection {
     /// mode is narrowed from; `plan` is set for Plan too.
     pub mode: Mode,
     /// Someone can answer a card for the session now: false for a scheduled
-    /// run, for `-p` and in a chat app's session, where what would ask is
-    /// refused.
+    /// run and for `-p`, where nobody is watching. True in a chat app's
+    /// session too, whose card goes to the chat as a message.
     pub human: bool,
     /// What the user typed in the session, oldest first, which Auto mode's
     /// judge reads as their wishes when it decides a helper's call.

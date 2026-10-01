@@ -112,7 +112,16 @@ impl Chat {
                     .into_any_element()
             })
             .child(div().flex_1().min_w_0().truncate().child(c.title.clone()))
-            // A notice started a turn there while you were elsewhere.
+            // A run beside the chat holds it.
+            .when(self.runs.contains_key(&c.id), |this| {
+                this.child(
+                    Icon::new(AppIcon::Play)
+                        .size_3()
+                        .text_color(cx.theme().primary),
+                )
+            })
+            // A notice started a turn there, or a run ended, while you were
+            // elsewhere.
             .when(self.unseen.contains(&c.id), |this| {
                 this.child(
                     div()
@@ -483,6 +492,7 @@ impl Chat {
                     .min_h_0()
                     .overflow_y_scroll()
                     .px_2()
+                    .children(self.runs_section(cx))
                     .child(self.section("Sessions", cx))
                     .child(sessions)
                     .children(self.message_hits(cx)),

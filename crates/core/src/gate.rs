@@ -1817,8 +1817,12 @@ mod tests {
                     human,
                 };
                 for args in [&add, &remove] {
-                    let outcome =
-                        decide_with(&call("schedule", args.clone()), &gate, Some(&unasked));
+                    let outcome = decide_with(
+                        &call("schedule", args.clone()),
+                        &gate,
+                        Some(&unasked),
+                        false,
+                    );
                     if human && mode != Mode::DontAsk {
                         assert_eq!(outcome, Outcome::Ask, "{mode:?}");
                     } else {
@@ -1829,7 +1833,10 @@ mod tests {
                     }
                 }
                 let list = call("schedule", serde_json::json!({"action": "list"}));
-                assert_eq!(decide_with(&list, &gate, Some(&unasked)), Outcome::Run);
+                assert_eq!(
+                    decide_with(&list, &gate, Some(&unasked), false),
+                    Outcome::Run
+                );
             }
         }
     }
