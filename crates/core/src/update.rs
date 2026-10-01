@@ -498,6 +498,9 @@ fn destinations() -> Vec<(Part, PathBuf)> {
         if let Some(local) = std::env::var_os("LOCALAPPDATA") {
             let root = PathBuf::from(local).join("Programs").join("Letronna");
             places.push((Part::Window, root.join("Letronna.exe")));
+            places.push((Part::Terminal, root.join("bin").join(TERMINAL_EXE)));
+            // Where installs before the rename put it, until an installer
+            // moves it.
             places.push((Part::Terminal, root.join("bin").join("letronna.exe")));
         }
     } else if let Some(home) = std::env::var_os("HOME") {
@@ -517,6 +520,47 @@ fn destinations() -> Vec<(Part, PathBuf)> {
     }
     places.retain(|(_, path)| path.is_file());
     places
+}
+
+/// What the terminal is called in `bin` on Windows. Not `letronna.exe`, so
+/// Task Manager tells it apart from the window, `Letronna.exe`.
+pub const TERMINAL_EXE: &str = "letronnacli.exe";
+
+/// Put the terminal in `bin` as [`TERMINAL_EXE`], copied from `from` when
+/// given, with `letronna.cmd` for cmd, PowerShell and Run and a `letronna`
+/// script for Git Bash beside it, so the command is still `letronna`.
+#[cfg(windows)]
+pub fn install_terminal(bin: &Path, from: Option<&Path>) -> Result<(), String> {
+    let terminal = bin.join(TERMINAL_EXE);
+    let older = bin.join("letronna.exe");
+    // On PATH an older install's `letronna.exe` would win over the shims.
+    // Renamed into place when it can be: Windows renames a running program,
+    // which this may be, but will not delete one.
+    if older.is_file() {
+        let moved = if terminal.is_file() {
+            std::fs::remove_file(&older)
+        } else {
+            std::fs::rename(&older, &terminal)
+        };
+        moved.map_err(|e| format!("Cannot move {} aside: {e}", older.display()))?;
+    }
+    // Gone when it was that older install, which is now in place.
+    if let Some(from) = from.filter(|from| from.is_file() && *from != terminal) {
+        std::fs::copy(from, &terminal)
+            .map_err(|e| format!("Cannot write {}: {e}", terminal.display()))?;
+    }
+    if !terminal.is_file() {
+        return Ok(());
+    }
+    let write = |name: &str, text: String| {
+        let path = bin.join(name);
+        std::fs::write(&path, text).map_err(|e| format!("Cannot write {}: {e}", path.display()))
+    };
+    write("letronna.cmd", format!("@\"%~dp0{TERMINAL_EXE}\" %*\r\n"))?;
+    write(
+        "letronna",
+        format!("#!/bin/sh\nexec \"$(dirname \"$0\")/{TERMINAL_EXE}\" \"$@\"\n"),
+    )
 }
 
 /// `Letronna.exe` becomes `Letronna.new.exe` and `letronna` becomes
@@ -1189,6 +1233,42 @@ mod tests {
             "window 2"
         );
         assert!(!beside(&window, "old").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_older_terminal_becomes_letronnacli_and_letronna_still_starts_it() {
+        let dir = scratch("terminal-renamed");
+        let older = installed(&dir, "letronna.exe", "terminal 1", None);
+        super::install_terminal(&dir, None).unwrap();
+        assert!(!older.exists());
+        let terminal = dir.join(super::TERMINAL_EXE);
+        assert_eq!(std::fs::read_to_string(&terminal).unwrap(), "terminal 1");
+        for shim in ["letronna.cmd", "letronna"] {
+            let text = std::fs::read_to_string(dir.join(shim)).unwrap();
+            assert!(text.contains(super::TERMINAL_EXE), "{shim}: {text}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_new_terminal_replaces_both_names() {
+        let dir = scratch("terminal-both");
+        let older = installed(&dir, "letronna.exe", "terminal 1", None);
+        installed(&dir, super::TERMINAL_EXE, "terminal 1", None);
+        let from = installed(&dir, "build.exe", "terminal 2", None);
+        super::install_terminal(&dir, Some(&from)).unwrap();
+        assert!(!older.exists());
+        let terminal = dir.join(super::TERMINAL_EXE);
+        assert_eq!(std::fs::read_to_string(&terminal).unwrap(), "terminal 2");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn no_terminal_means_no_shims() {
+        let dir = scratch("terminal-none");
+        super::install_terminal(&dir, None).unwrap();
+        assert!(!dir.join("letronna.cmd").exists() && !dir.join("letronna").exists());
     }
 
     #[test]

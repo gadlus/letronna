@@ -3729,6 +3729,7 @@ version = "0.1.0-alpha.2"
 dependencies = [
  "async-channel 2.5.0",
  "crossterm",
+ "embed-resource",
  "letronna-core",
  "libc",
  "ring",

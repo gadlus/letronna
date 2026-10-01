@@ -48,6 +48,8 @@ const LETRONNA: &[&str] = &[
     "com.gadlus.letronna",
     "letronna",
     "letronna.exe",
+    "letronnacli",
+    "letronnacli.exe",
     "letronna-gui",
     "letronna-gui.exe",
 ];

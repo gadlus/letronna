@@ -82,7 +82,7 @@ fn read_state(dir: &Path) -> Value {
 /// A copy of the terminal where an install would put it.
 fn installed(dir: &Path) -> PathBuf {
     let dest = dir.join("bin").join(if cfg!(windows) {
-        "letronna.exe"
+        "letronnacli.exe"
     } else {
         "letronna"
     });
