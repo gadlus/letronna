@@ -556,6 +556,15 @@ impl Target {
         }
     }
 
+    /// The word `parse` takes for it.
+    fn word(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Memory => "memory",
+            Self::Project => "project",
+        }
+    }
+
     fn file(self) -> &'static str {
         match self {
             Self::User => "USER.md",
@@ -595,6 +604,17 @@ fn project_dir(data: &Path, root: &Path) -> PathBuf {
     let digest = ring::digest::digest(&ring::digest::SHA256, root.as_os_str().as_encoded_bytes());
     let name: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
     data.join("projects").join(name)
+}
+
+/// The folder a store is kept in: the data folder, or the one named for the
+/// project `workspace` is in.
+fn store_dir(data: &Path, workspace: Option<&Path>, target: Target) -> Result<PathBuf, String> {
+    match target {
+        Target::User | Target::Memory => Ok(data.to_path_buf()),
+        Target::Project => workspace
+            .map(|workspace| project_dir(data, &project_root(workspace)))
+            .ok_or_else(|| "No project folder is attached, so there is no project memory.".into()),
+    }
 }
 
 /// The folder a project's notes are kept for: the main checkout of the git
@@ -667,11 +687,12 @@ fn size(entries: &[String]) -> usize {
     entries.join(SEPARATOR).chars().count()
 }
 
-/// Whether a person wrote the store: it does not read back the way Letronna
-/// writes it, or it holds more than the budget Letronna keeps to.
-fn hand_written(text: &str, entries: &[String], limit: usize) -> bool {
+/// Whether a person laid the store out: it does not read back the way
+/// Letronna writes it. Size is no sign, since a store over budget is written
+/// in Letronna's layout each time a change makes it smaller.
+fn hand_written(text: &str, entries: &[String]) -> bool {
     let text = text.replace("\r\n", "\n");
-    size(entries) > limit || text.strip_suffix('\n').unwrap_or(&text) != entries.join(SEPARATOR)
+    text.strip_suffix('\n').unwrap_or(&text) != entries.join(SEPARATOR)
 }
 
 /// What a store holds, as the tool reports it.
@@ -737,6 +758,19 @@ fn find(entries: &[String], old_text: &str) -> Result<usize, String> {
     }
 }
 
+/// Where the entry `op` replaces or removes is: the one a person picked by
+/// its number, while it still holds what they were shown, or else the one
+/// entry that contains `old_text`.
+fn locate(entries: &[String], op: &Op) -> Result<usize, String> {
+    let Some(at) = op.at else {
+        return find(entries, op.old_text);
+    };
+    if entries.get(at).is_none_or(|entry| entry != op.old_text) {
+        return Err("That entry changed since it was shown, so nothing was changed.".into());
+    }
+    Ok(at)
+}
+
 /// One change a memory call asks for.
 #[derive(Debug)]
 struct Op<'a> {
@@ -746,6 +780,9 @@ struct Op<'a> {
     /// Where it is in `operations`, counted from 1; none for the call's own
     /// action, so the numbers match the array the model sent.
     number: Option<usize>,
+    /// The entry a person picked by its number, counted from 0, which must
+    /// still be `old_text` whole; none to find the entry by `old_text`.
+    at: Option<usize>,
 }
 
 impl Op<'_> {
@@ -781,6 +818,7 @@ fn operations(args: &Value) -> Result<Vec<Op<'_>>, String> {
             content: text("content"),
             old_text: text("old_text"),
             number,
+            at: None,
         });
     }
     if ops.is_empty() {
@@ -804,17 +842,20 @@ fn which(op: &Op, ops: &[Op]) -> String {
     }
 }
 
-/// Make every change to one store, or none, and report how full it is now.
-/// Over budget, nothing is written and the model is shown the store so it
-/// can make room. Every write to a store, whichever it is, comes through
-/// here.
-fn change(dir: &Path, target: Target, ops: &[Op]) -> Result<String, String> {
-    // Every later session reads what is kept, so an entry carrying what an
-    // attacker would plant there -- or a key -- is refused whole. The model
-    // is told what kind of thing was found, never the text.
+/// Refuses the changes when an entry they keep carries what an attacker
+/// would plant in memory, or a key, since every later session reads it, or a
+/// line holding only §, where the store would split it in two and move every
+/// later number.
+fn screen(ops: &[Op]) -> Result<(), String> {
+    // The model is told what kind of thing was found, never the text.
     for op in ops {
         if !matches!(op.action, "add" | "replace") {
             continue;
+        }
+        if op.content.lines().any(|line| line.trim_end() == "§") {
+            return Err(
+                "Nothing was changed: a line holding only § splits one entry into two.".into(),
+            );
         }
         let found = crate::scan::scan(op.content);
         if !found.is_empty() {
@@ -825,6 +866,92 @@ fn change(dir: &Path, target: Target, ops: &[Op]) -> Result<String, String> {
             ));
         }
     }
+    Ok(())
+}
+
+/// What a change to a store left.
+struct Saved {
+    /// The entries before the change and after it, oldest first.
+    before: Vec<String>,
+    after: Vec<String>,
+    /// What each replace or remove took out, by where its change is in the
+    /// call.
+    dropped: Vec<(usize, String)>,
+    /// The name the file was copied to first, when it was.
+    backup: Option<String>,
+}
+
+impl Saved {
+    /// A line saying where the store was copied first, or nothing.
+    fn backed_up(&self, target: Target) -> String {
+        self.backup.as_ref().map_or_else(String::new, |backup| {
+            format!(
+                "{} may have held notes written by hand, so that version was copied to {backup} first.\n\n",
+                target.name()
+            )
+        })
+    }
+}
+
+/// Make every change to one store, or none, and report how full it is now,
+/// as the model reads it.
+fn change(dir: &Path, target: Target, ops: &[Op]) -> Result<String, String> {
+    let saved = commit(dir, target, ops)?;
+    if saved.after == saved.before {
+        // Only adds of what is there already, or a replace by the same text,
+        // say it is kept; a remove that undid an earlier add would otherwise
+        // read as that add being kept.
+        let said = if ops.len() == 1 || ops.iter().all(|op| op.action == "add") {
+            "Already kept."
+        } else {
+            "No change: the operations cancel out, so nothing was saved."
+        };
+        return Ok(format!("{said}\n\n{}", listing(target, &saved.before)));
+    }
+    let used = size(&saved.after);
+    // The store is in the next request's prompt, so the listing is left out
+    // and the line says the work is done, which keeps a model from redoing it.
+    let noun = if saved.after.len() == 1 {
+        "entry"
+    } else {
+        "entries"
+    };
+    let mut out = format!(
+        "{}Saved. {} holds {used}/{} characters in {} {noun}. This update is complete; do not repeat it.",
+        saved.backed_up(target),
+        target.name(),
+        target.limit(),
+        saved.after.len()
+    );
+    if used > target.limit() {
+        out.push_str(" It is still over budget, so remove or shorten more before adding.");
+    }
+    for (at, old) in saved.dropped {
+        let op = &ops[at];
+        let verb = if op.action == "replace" {
+            "Replaced"
+        } else {
+            "Removed"
+        };
+        // Echoed, a key the user asked to be rid of would stay in the
+        // session's history and go back to the provider on every request.
+        let held = "an entry that held a key; its text is not repeated.";
+        out.push_str(&match (ops.len(), holds_key(&old)) {
+            (1, true) => format!("\n\n{verb} {held}"),
+            (_, true) => format!("\n\n{verb} by {}: {held}", op.name()),
+            (1, false) => format!("\n\n{verb}:\n{}", shown(&[old])),
+            (_, false) => format!("\n\n{verb} by {}:\n{}", op.name(), shown(&[old])),
+        });
+    }
+    Ok(out)
+}
+
+/// Make every change to one store under its lock, or none, and say what it
+/// left. Over budget, nothing is written and the error shows the store so
+/// room can be made. Every write to a store, whichever it is and whoever
+/// asks, comes through here.
+fn commit(dir: &Path, target: Target, ops: &[Op]) -> Result<Saved, String> {
+    screen(ops)?;
     let path = dir.join(target.file());
     // The lock is kept beside the store, and a project's folder is only made
     // for its first note.
@@ -847,34 +974,29 @@ fn change(dir: &Path, target: Target, ops: &[Op]) -> Result<String, String> {
     })?;
     let before = split(&raw);
     let mut after = before.clone();
-    // What each replace or remove took out, for the model to see it whole.
     let mut dropped = Vec::new();
-    for op in ops {
+    for (at, op) in ops.iter().enumerate() {
         let old = step(&mut after, op).map_err(|e| match ops.len() {
             1 => e,
             _ => format!("Nothing was changed: {} failed. {e}", op.name()),
         })?;
         if let Some(old) = old {
-            dropped.push((op, old));
+            dropped.push((at, old));
         }
     }
     if after == before {
-        // Only adds of what is there already, or a replace by the same text,
-        // say it is kept; a remove that undid an earlier add would otherwise
-        // read as that add being kept.
-        let said = if ops.len() == 1 || ops.iter().all(|op| op.action == "add") {
-            "Already kept."
-        } else {
-            "No change: the operations cancel out, so nothing was saved."
-        };
-        return Ok(format!("{said}\n\n{}", listing(target, &before)));
+        return Ok(Saved {
+            before,
+            after,
+            dropped,
+            backup: None,
+        });
     }
     // Checked on the result, so one call can make room and fill it. A store
     // written over budget by hand takes any change that shrinks it, or no
     // change could ever bring it back.
     let used = size(&after);
-    let over = used > target.limit();
-    if over && used >= size(&before) {
+    if used > target.limit() && used >= size(&before) {
         return Err(format!(
             "That would make {} {used} of {} characters. Replace or remove an entry first; one call can do both.\n\n{}",
             target.name(),
@@ -893,59 +1015,76 @@ fn change(dir: &Path, target: Target, ops: &[Op]) -> Result<String, String> {
     let drops_lines = before
         .iter()
         .any(|entry| entry.contains('\n') && !after.contains(entry));
-    let backed_up = if drops_lines || hand_written(&raw, &before, target.limit()) {
-        let backup = format!("{}.bak.{}", target.file(), crate::chat::now());
-        std::fs::copy(&path, dir.join(&backup)).map_err(|e| {
+    let backup = if drops_lines || hand_written(&raw, &before) {
+        back_up(dir, target.file()).map_err(|e| {
             format!(
                 "Could not back up {}, so nothing was changed: {e}",
                 target.name()
             )
-        })?;
-        format!(
-            "{} may have held notes written by hand, so that version was copied to {backup} first.\n\n",
-            target.name()
-        )
+        })?
     } else {
-        String::new()
+        None
     };
-    // Written beside and moved over, so a crash cannot leave half a file. The
-    // name is per process because a lock that waited too long is taken anyway.
+    write_whole(&path, &text).map_err(|e| format!("Could not save {}: {e}", target.name()))?;
+    Ok(Saved {
+        before,
+        after,
+        dropped,
+        backup,
+    })
+}
+
+/// Copy a file in `dir` beside itself as `<file>.bak.<seconds>`, unless a
+/// backup of it already holds exactly this, and say what it was named.
+fn back_up(dir: &Path, file: &str) -> std::io::Result<Option<String>> {
+    let bytes = std::fs::read(dir.join(file))?;
+    let prefix = format!("{file}.bak.");
+    for entry in std::fs::read_dir(dir)?.flatten() {
+        let kept = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(&prefix));
+        if kept && std::fs::read(entry.path()).is_ok_and(|old| old == bytes) {
+            return Ok(None);
+        }
+    }
+    keep(dir, &prefix, "", &bytes).map(Some)
+}
+
+/// Write `bytes` in `dir` as `<prefix><seconds><suffix>`, counting up past a
+/// name already taken, so no earlier copy is ever written over.
+fn keep(dir: &Path, prefix: &str, suffix: &str, bytes: &[u8]) -> std::io::Result<String> {
+    use std::io::Write;
+    let now = crate::chat::now();
+    let mut n = 1;
+    loop {
+        let name = match n {
+            1 => format!("{prefix}{now}{suffix}"),
+            n => format!("{prefix}{now}-{n}{suffix}"),
+        };
+        let path = dir.join(&name);
+        match std::fs::File::create_new(&path) {
+            Ok(mut file) => {
+                return file.write_all(bytes).map(|()| name).inspect_err(|_| {
+                    let _ = std::fs::remove_file(&path);
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Write `text` beside `path` and move it over, so a crash cannot leave half
+/// a file. The temporary name is per process, so two processes never write
+/// into the same one.
+fn write_whole(path: &Path, text: &str) -> std::io::Result<()> {
     let temp = path.with_extension(format!("{}.tmp", std::process::id()));
     std::fs::write(&temp, text)
-        .and_then(|_| std::fs::rename(&temp, &path))
-        .map_err(|e| {
+        .and_then(|_| std::fs::rename(&temp, path))
+        .inspect_err(|_| {
             let _ = std::fs::remove_file(&temp);
-            format!("Could not save {}: {e}", target.name())
-        })?;
-    // The store is in the next request's prompt, so the listing is left out
-    // and the line says the work is done, which keeps a model from redoing it.
-    let noun = if after.len() == 1 { "entry" } else { "entries" };
-    let mut out = format!(
-        "{backed_up}Saved. {} holds {used}/{} characters in {} {noun}. This update is complete; do not repeat it.",
-        target.name(),
-        target.limit(),
-        after.len()
-    );
-    if over {
-        out.push_str(" It is still over budget, so remove or shorten more before adding.");
-    }
-    for (op, old) in dropped {
-        let verb = if op.action == "replace" {
-            "Replaced"
-        } else {
-            "Removed"
-        };
-        // Echoed, a key the user asked to be rid of would stay in the
-        // session's history and go back to the provider on every request.
-        let held = "an entry that held a key; its text is not repeated.";
-        out.push_str(&match (ops.len(), holds_key(&old)) {
-            (1, true) => format!("\n\n{verb} {held}"),
-            (_, true) => format!("\n\n{verb} by {}: {held}", op.name()),
-            (1, false) => format!("\n\n{verb}:\n{}", shown(&[old])),
-            (_, false) => format!("\n\n{verb} by {}:\n{}", op.name(), shown(&[old])),
-        });
-    }
-    Ok(out)
+        })
 }
 
 /// Whether an entry holds a key, or asks for one to be sent somewhere.
@@ -971,13 +1110,13 @@ fn step(entries: &mut Vec<String>, op: &Op) -> Result<Option<String>, String> {
             Err("Say what the entry becomes in content, or remove it instead.".into())
         }
         "replace" => {
-            let at = find(entries, op.old_text)?;
+            let at = locate(entries, op)?;
             Ok(Some(std::mem::replace(
                 &mut entries[at],
                 content.to_owned(),
             )))
         }
-        "remove" => Ok(Some(entries.remove(find(entries, op.old_text)?))),
+        "remove" => Ok(Some(entries.remove(locate(entries, op)?))),
         other => Err(format!("Unknown action `{other}`: add, replace or remove.")),
     }
 }
@@ -1032,6 +1171,355 @@ impl Tool for Remember {
     }
 }
 
+/// A store as a person sees it: what it holds and how much of its budget
+/// that uses.
+pub struct Store {
+    /// "user", "memory", "project" or "soul", as `file` and `store` take it.
+    pub target: &'static str,
+    /// What it is called: USER.md, MEMORY.md, Project memory or SOUL.md.
+    pub name: &'static str,
+    pub path: PathBuf,
+    /// The entries, oldest first, or why the file could not be read.
+    pub entries: Result<Vec<String>, String>,
+    /// Characters used, separators included.
+    pub used: usize,
+    pub limit: usize,
+}
+
+impl Store {
+    /// Characters used against the budget, as "1,120 / 1,375".
+    pub fn budget(&self) -> String {
+        format!("{} / {}", grouped(self.used), grouped(self.limit))
+    }
+}
+
+/// A count with its thousands set apart, as people read one.
+fn grouped(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (at, digit) in digits.chars().enumerate() {
+        if at > 0 && (digits.len() - at).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+/// What Letronna knows about the user, its own notes and, with a project
+/// folder attached, its notes on that project.
+pub fn stores(workspace: Option<&Path>) -> Vec<Store> {
+    stores_in(&crate::chat::data_dir(), workspace)
+}
+
+fn stores_in(data: &Path, workspace: Option<&Path>) -> Vec<Store> {
+    [Target::User, Target::Memory, Target::Project]
+        .into_iter()
+        .filter_map(|target| {
+            let path = store_dir(data, workspace, target).ok()?.join(target.file());
+            let entries = read_store(&path)
+                .map(|text| split(&text))
+                .map_err(|e| format!("{} could not be read: {e}", target.name()));
+            Some(Store {
+                target: target.word(),
+                name: target.name(),
+                used: entries.as_deref().map_or(0, size),
+                entries,
+                path,
+                limit: target.limit(),
+            })
+        })
+        .collect()
+}
+
+/// One store by its word, SOUL.md included as a store of one entry under the
+/// cap the prompt cuts it at. None for a project's notes with no project.
+pub fn store(workspace: Option<&Path>, target: &str) -> Option<Store> {
+    store_in(&crate::chat::data_dir(), workspace, target)
+}
+
+fn store_in(data: &Path, workspace: Option<&Path>, target: &str) -> Option<Store> {
+    if target != "soul" {
+        return stores_in(data, workspace)
+            .into_iter()
+            .find(|store| store.target == target);
+    }
+    let path = data.join("SOUL.md");
+    let entries = read_store(&path)
+        .map(|text| split_soul(&text))
+        .map_err(|e| format!("SOUL.md could not be read: {e}"));
+    Some(Store {
+        target: "soul",
+        name: "SOUL.md",
+        used: entries.as_deref().map_or(0, size),
+        entries,
+        path,
+        limit: FILE_LIMIT,
+    })
+}
+
+/// SOUL.md as the prompt reads it: the whole file as one entry, or none.
+fn split_soul(text: &str) -> Vec<String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Vec::new();
+    }
+    vec![text.to_owned()]
+}
+
+/// The file behind a store, with its folder made so an editor can save a
+/// new one there.
+pub fn file(workspace: Option<&Path>, target: &str) -> Result<PathBuf, String> {
+    file_in(&crate::chat::data_dir(), workspace, target)
+}
+
+fn file_in(data: &Path, workspace: Option<&Path>, target: &str) -> Result<PathBuf, String> {
+    located(data, workspace, target).map(|(dir, file, _)| dir.join(file))
+}
+
+/// The folder a store's file is in, made if need be, the file's name and
+/// what the store is called.
+fn located(
+    data: &Path,
+    workspace: Option<&Path>,
+    target: &str,
+) -> Result<(PathBuf, &'static str, &'static str), String> {
+    let (dir, file, name) = match target {
+        "soul" => (data.to_path_buf(), "SOUL.md", "SOUL.md"),
+        _ => {
+            let target = Target::parse(target)?;
+            let dir = store_dir(data, workspace, target)?;
+            (dir, target.file(), target.name())
+        }
+    };
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Could not make {}: {e}", dir.display()))?;
+    // Says whose notes the folder holds, as the memory tool does.
+    if let Some(workspace) = workspace.filter(|_| target == "project") {
+        let root = project_root(workspace);
+        let _ = std::fs::write(dir.join("root.txt"), format!("{}\n", root.display()));
+    }
+    Ok((dir, file, name))
+}
+
+/// Change the entry at `at` of a store to `becomes`, or delete it when that
+/// is None, at a person's word, by the memory tool's rules. `was` is the
+/// entry as they were shown it, and if it has changed since, nothing is.
+/// Some line when the file was copied first.
+pub fn edit(
+    workspace: Option<&Path>,
+    target: &str,
+    at: usize,
+    was: &str,
+    becomes: Option<&str>,
+) -> Result<Option<String>, String> {
+    edit_in(
+        &crate::chat::data_dir(),
+        workspace,
+        target,
+        at,
+        was,
+        becomes,
+    )
+}
+
+fn edit_in(
+    data: &Path,
+    workspace: Option<&Path>,
+    target: &str,
+    at: usize,
+    was: &str,
+    becomes: Option<&str>,
+) -> Result<Option<String>, String> {
+    let target = Target::parse(target)?;
+    let dir = store_dir(data, workspace, target)?;
+    let becomes = becomes.map(str::trim);
+    if becomes.is_some_and(str::is_empty) {
+        return Err("An entry cannot be empty; delete it instead.".into());
+    }
+    // The same change a model's call makes, pinned to the entry the person
+    // picked, so it goes through the same checks and the same write.
+    let op = Op {
+        action: if becomes.is_some() {
+            "replace"
+        } else {
+            "remove"
+        },
+        content: becomes.unwrap_or_default(),
+        old_text: was,
+        number: None,
+        at: Some(at),
+    };
+    let saved = commit(&dir, target, &[op])?;
+    Ok(saved
+        .backup
+        .is_some()
+        .then(|| saved.backed_up(target).trim_end().to_owned()))
+}
+
+/// What in an entry memory is not meant to keep, in words that never repeat
+/// it, or None.
+pub fn flagged(entry: &str) -> Option<String> {
+    let found = crate::scan::scan(entry);
+    (!found.is_empty()).then(|| crate::scan::listed(&found))
+}
+
+/// An entry as a screen can show it: without the characters nobody sees,
+/// which hide or reorder text, and without control characters, which a
+/// terminal would act on rather than show.
+pub fn readable(entry: &str) -> String {
+    crate::untrusted::visible(entry)
+        .chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+        .collect()
+}
+
+/// A copy of a store's file for a person to edit in their own editor, so the
+/// file itself is written only once they are done, and only if nothing else
+/// wrote it meanwhile -- as `crontab -e` does. No lock is held while the
+/// editor is open, so the model's writes go on in the meantime.
+pub struct Draft {
+    /// The copy to open.
+    pub path: PathBuf,
+    dir: PathBuf,
+    file: &'static str,
+    name: &'static str,
+    /// What the file held when the copy was made.
+    was: String,
+}
+
+/// Copy a store's file, or SOUL.md, beside it for a person to edit.
+pub fn draft(workspace: Option<&Path>, target: &str) -> Result<Draft, String> {
+    draft_in(&crate::chat::data_dir(), workspace, target)
+}
+
+fn draft_in(data: &Path, workspace: Option<&Path>, target: &str) -> Result<Draft, String> {
+    let (dir, file, name) = located(data, workspace, target)?;
+    let was = read_store(&dir.join(file)).map_err(|e| format!("{name} could not be read: {e}"))?;
+    // Still named .md so the editor shows Markdown, and per process so two
+    // terminals editing one store never share a copy.
+    let path = dir
+        .join(file)
+        .with_extension(format!("edit-{}.md", std::process::id()));
+    std::fs::write(&path, &was)
+        .map_err(|e| format!("Could not make a copy of {name} to edit: {e}"))?;
+    Ok(Draft {
+        path,
+        dir,
+        file,
+        name,
+        was,
+    })
+}
+
+impl Draft {
+    /// Put the edited copy in place of the file if the file still holds what
+    /// it did when the copy was made; otherwise keep the copy beside it. Some
+    /// line to show, such as where the copy was kept.
+    pub fn put_back(self) -> Result<Option<String>, String> {
+        let text = match std::fs::read_to_string(&self.path) {
+            Ok(text) => text,
+            Err(e) => {
+                return Err(format!(
+                    "Your edit could not be read, so {} was left as it is: {e}",
+                    self.name
+                ));
+            }
+        };
+        let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+        if text.trim() == self.was.trim() {
+            self.discard();
+            return Ok(None);
+        }
+        let why = match write_pinned(&self.dir, self.file, self.name, &self.was, text) {
+            Ok(Put::Saved(backup)) => {
+                self.discard();
+                return Ok(backup.map(|backup| copied(self.name, &backup)));
+            }
+            Ok(Put::Changed) => format!("{} changed while it was open", self.name),
+            Err(e) => e,
+        };
+        let stem = self.file.trim_end_matches(".md");
+        match keep(&self.dir, &format!("{stem}.edit."), ".md", text.as_bytes()) {
+            Ok(kept) => {
+                self.discard();
+                Ok(Some(format!(
+                    "{why}, so {} was left as it is; your edit is kept in {}.",
+                    self.name,
+                    self.dir.join(kept).display()
+                )))
+            }
+            Err(e) => Err(format!(
+                "{why}, and your edit could not be set aside ({e}); it is still in {}.",
+                self.path.display()
+            )),
+        }
+    }
+
+    /// Remove the copy.
+    pub fn discard(&self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Save what a person wrote as SOUL.md, unless it changed since they were
+/// shown `was`; empty leaves Letronna's own first line of the prompt. Some
+/// line when what it held was copied first.
+pub fn save_soul(was: &str, text: &str) -> Result<Option<String>, String> {
+    save_soul_in(&crate::chat::data_dir(), was, text)
+}
+
+fn save_soul_in(data: &Path, was: &str, text: &str) -> Result<Option<String>, String> {
+    std::fs::create_dir_all(data).map_err(|e| format!("Could not save SOUL.md: {e}"))?;
+    let text = text.trim();
+    let text = if text.is_empty() {
+        String::new()
+    } else {
+        format!("{text}\n")
+    };
+    match write_pinned(data, "SOUL.md", "SOUL.md", was, &text)? {
+        Put::Saved(backup) => Ok(backup.map(|backup| copied("SOUL.md", &backup))),
+        Put::Changed => Err(
+            "SOUL.md changed since it was shown, so nothing was saved. Reload it to see what it holds now."
+                .into(),
+        ),
+    }
+}
+
+/// A line saying where a file's old text was copied.
+fn copied(name: &str, backup: &str) -> String {
+    format!("What {name} held was copied to {backup} first.")
+}
+
+/// What writing a person's whole file came to.
+enum Put {
+    /// Written, with the name of the copy made when it was emptied.
+    Saved(Option<String>),
+    /// It no longer held the text they started from, so nothing was written.
+    Changed,
+}
+
+/// Write a person's whole file under its lock, but only while it still holds
+/// `was`, the text they started from. Emptying a file copies it first.
+fn write_pinned(dir: &Path, file: &str, name: &str, was: &str, text: &str) -> Result<Put, String> {
+    let path = dir.join(file);
+    let _lock = crate::store::Lock::take(&path).map_err(|e| {
+        format!("{name} is being written by another Letronna, so nothing was saved: {e}")
+    })?;
+    let now = read_store(&path)
+        .map_err(|e| format!("{name} could not be read, so nothing was saved: {e}"))?;
+    if now.trim() != was.trim() {
+        return Ok(Put::Changed);
+    }
+    let backup = if text.trim().is_empty() && !now.trim().is_empty() {
+        back_up(dir, file)
+            .map_err(|e| format!("Could not back up {name}, so nothing was saved: {e}"))?
+    } else {
+        None
+    };
+    write_whole(&path, text).map_err(|e| format!("Could not save {name}: {e}"))?;
+    Ok(Put::Saved(backup))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1055,6 +1543,7 @@ mod tests {
             content,
             old_text,
             number: None,
+            at: None,
         };
         change(dir, target, &[op])
     }
@@ -1067,6 +1556,7 @@ mod tests {
             content,
             old_text,
             number: Some(n),
+            at: None,
         };
         ops.iter().zip(1..).map(op).collect()
     }
@@ -1306,15 +1796,16 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.join(&saved[0])).unwrap(), notes);
         assert_eq!(entries(&dir.join("USER.md")), ["Lives in Singapore."]);
 
-        // Letronna never saves more than the budget, even laid out its way.
+        // Over budget but laid out Letronna's way, it reads back whole, and
+        // Letronna writes that layout itself when it makes such a store smaller.
         let long = format!("{}\n", "x".repeat(MEMORY_LIMIT + 1));
         std::fs::write(dir.join("MEMORY.md"), &long).unwrap();
         apply(&dir, Target::Memory, "remove", "", "x").unwrap();
-        assert_eq!(backups(&dir).len(), 2);
+        assert_eq!(backups(&dir).len(), 1);
 
         // A file Letronna wrote itself is not copied again.
         apply(&dir, Target::User, "add", "Name is Hugo.", "").unwrap();
-        assert_eq!(backups(&dir).len(), 2);
+        assert_eq!(backups(&dir).len(), 1);
 
         // A file laid out some other way is copied even before an add.
         let other = scratch("layout");
@@ -1974,5 +2465,244 @@ mod tests {
         std::fs::write(project.join("AGENTS.md"), &own).unwrap();
         let found = instructions(&project, &dir.join("data"), None);
         assert_eq!(found[1].1, own);
+    }
+
+    #[test]
+    fn a_person_sees_each_store_and_edits_or_deletes_an_entry_by_number() {
+        let dir = scratch("person-edits");
+        for entry in ["Uses zsh.", "Prefers short answers.", "Works late."] {
+            apply(&dir, Target::User, "add", entry, "").unwrap();
+        }
+        let stores = stores_in(&dir, None);
+        let names: Vec<&str> = stores.iter().map(|store| store.target).collect();
+        assert_eq!(names, ["user", "memory"], "no project without a folder");
+        assert_eq!(stores[0].entries.as_ref().unwrap().len(), 3);
+        assert_eq!(stores[0].budget(), "48 / 1,375");
+
+        let out = edit_in(
+            &dir,
+            None,
+            "user",
+            1,
+            "Prefers short answers.",
+            Some(" Terse. "),
+        )
+        .unwrap();
+        assert_eq!(out, None, "nothing was backed up");
+        edit_in(&dir, None, "user", 0, "Uses zsh.", None).unwrap();
+        assert_eq!(entries(&dir.join("USER.md")), ["Terse.", "Works late."]);
+        // What was shown has moved on, so nothing changes.
+        let stale = edit_in(&dir, None, "user", 0, "Uses zsh.", None).unwrap_err();
+        assert!(stale.contains("changed since it was shown"), "{stale}");
+        assert!(edit_in(&dir, None, "user", 5, "Terse.", None).is_err());
+        assert!(edit_in(&dir, None, "user", 0, "Terse.", Some("  ")).is_err());
+        assert!(edit_in(&dir, None, "project", 0, "Terse.", None).is_err());
+        assert_eq!(entries(&dir.join("USER.md")), ["Terse.", "Works late."]);
+    }
+
+    #[test]
+    fn an_edit_is_scanned_and_a_full_store_can_still_be_made_smaller() {
+        let dir = scratch("person-rules");
+        apply(&dir, Target::Memory, "add", "Deploys from main.", "").unwrap();
+        let key = "The deploy key is ghp_0123456789abcdefghij";
+        let err = edit_in(&dir, None, "memory", 0, "Deploys from main.", Some(key)).unwrap_err();
+        assert!(err.contains("holds what looks like a key"), "{err}");
+        assert_eq!(
+            flagged(key).as_deref(),
+            Some("what looks like a key, a token or a private key")
+        );
+        assert_eq!(flagged("Deploys from main."), None);
+
+        // Written by hand past the budget: taking from it is allowed, adding to
+        // it or keeping its size is not, and the hand-written file is copied
+        // first.
+        let long = "y".repeat(MEMORY_LIMIT + 50);
+        let hand = format!("{long}\n\n§\nShort one.\n");
+        std::fs::write(dir.join("MEMORY.md"), &hand).unwrap();
+        let grown = format!("{long}!");
+        let err = edit_in(&dir, None, "memory", 0, &long, Some(&grown)).unwrap_err();
+        assert!(err.contains("Replace or remove"), "{err}");
+        let same = edit_in(&dir, None, "memory", 1, "Short one.", Some("Short two.")).unwrap_err();
+        assert!(same.contains("Replace or remove"), "{same}");
+        let note = edit_in(&dir, None, "memory", 1, "Short one.", None).unwrap();
+        assert!(note.is_some_and(|note| note.contains("MEMORY.md.bak.")));
+        assert_eq!(entries(&dir.join("MEMORY.md")), [long.as_str()]);
+        // The model's remove makes room the same way, within the same second,
+        // and the copy of what the person wrote is left as it was.
+        apply(&dir, Target::Memory, "remove", "", "yyy").unwrap();
+        assert!(entries(&dir.join("MEMORY.md")).is_empty());
+        let saved = backups(&dir);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(std::fs::read_to_string(dir.join(&saved[0])).unwrap(), hand);
+    }
+
+    #[test]
+    fn a_store_file_is_given_its_folder_and_soul_is_one_entry() {
+        let dir = scratch("person-files");
+        let (_, linked) = repository(&dir);
+        let data = dir.join("data");
+        let project = file_in(&data, Some(&linked), "project").unwrap();
+        assert!(project.ends_with("MEMORY.md") && project.parent().unwrap().is_dir());
+        assert!(project.with_file_name("root.txt").is_file());
+        assert!(file_in(&data, None, "project").is_err());
+        assert!(file_in(&data, None, "notes").is_err());
+        assert_eq!(file_in(&data, None, "soul").unwrap(), data.join("SOUL.md"));
+
+        save_soul_in(&data, "", "\n  Be brief.  \n\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(data.join("SOUL.md")).unwrap(),
+            "Be brief.\n"
+        );
+        let soul = store_in(&data, None, "soul").unwrap();
+        assert_eq!(soul.entries.unwrap(), ["Be brief."]);
+        assert_eq!((soul.used, soul.limit), (9, FILE_LIMIT));
+        assert!(store_in(&data, Some(&linked), "project").is_some());
+        assert!(store_in(&data, None, "project").is_none());
+        assert_eq!(grouped(0), "0");
+        assert_eq!(grouped(20_000), "20,000");
+        assert_eq!(grouped(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn a_backup_never_writes_over_another_and_one_text_is_copied_once() {
+        let dir = scratch("backup-names");
+        // Two entries of several lines: each remove drops lines a person wrote.
+        std::fs::write(
+            dir.join("USER.md"),
+            "Uses zsh\nand fish\n§\nWorks late\nmost days\n",
+        )
+        .unwrap();
+        let original = std::fs::read_to_string(dir.join("USER.md")).unwrap();
+        apply(&dir, Target::User, "remove", "", "zsh").unwrap();
+        apply(&dir, Target::User, "remove", "", "late").unwrap();
+        let held: Vec<String> = backups(&dir)
+            .iter()
+            .map(|name| std::fs::read_to_string(dir.join(name)).unwrap())
+            .collect();
+        assert_eq!(held.len(), 2, "{held:?}");
+        assert!(held.contains(&original), "{held:?}");
+        assert!(
+            held.contains(&"Works late\nmost days\n".to_owned()),
+            "{held:?}"
+        );
+
+        // Copies made within one second count up rather than write over.
+        let names: Vec<String> = ["a", "b", "c"]
+            .iter()
+            .map(|text| keep(&dir, "notes.", ".md", text.as_bytes()).unwrap())
+            .collect();
+        assert!(names[0] != names[1] && names[1] != names[2], "{names:?}");
+        assert_eq!(std::fs::read_to_string(dir.join(&names[0])).unwrap(), "a");
+
+        // What a backup already holds is not copied again.
+        std::fs::write(dir.join("USER.md"), &original).unwrap();
+        assert_eq!(back_up(&dir, "USER.md").unwrap(), None);
+        assert_eq!(backups(&dir).len(), 2);
+    }
+
+    #[test]
+    fn a_change_that_changes_nothing_writes_nothing() {
+        let dir = scratch("no-op");
+        let hand = "Likes tea.\r\n\r\n\r\n";
+        std::fs::write(dir.join("USER.md"), hand).unwrap();
+        let out = apply(&dir, Target::User, "add", "Likes tea.", "").unwrap();
+        assert!(out.starts_with("Already kept."), "{out}");
+        let out = apply(&dir, Target::User, "replace", "Likes tea.", "tea").unwrap();
+        assert!(out.starts_with("Already kept."), "{out}");
+        assert_eq!(
+            edit_in(&dir, None, "user", 0, "Likes tea.", Some("Likes tea.")).unwrap(),
+            None
+        );
+        assert_eq!(std::fs::read_to_string(dir.join("USER.md")).unwrap(), hand);
+        assert!(backups(&dir).is_empty());
+    }
+
+    #[test]
+    fn a_line_holding_only_the_separator_is_refused() {
+        let dir = scratch("separator");
+        apply(&dir, Target::User, "add", "Uses zsh.", "").unwrap();
+        let split = "Uses zsh.\n§\nWorks late.";
+        let err = apply(&dir, Target::User, "add", split, "").unwrap_err();
+        assert!(err.contains("splits one entry into two"), "{err}");
+        let err =
+            edit_in(&dir, None, "user", 0, "Uses zsh.", Some("One\r\n§ \r\ntwo")).unwrap_err();
+        assert!(err.contains("splits one entry into two"), "{err}");
+        edit_in(
+            &dir,
+            None,
+            "user",
+            0,
+            "Uses zsh.",
+            Some("Costs 5 §\n§5 of the terms"),
+        )
+        .unwrap();
+        assert_eq!(entries(&dir.join("USER.md")).len(), 1);
+    }
+
+    #[test]
+    fn an_edited_copy_goes_back_only_over_the_file_it_was_made_from() {
+        let data = scratch("drafts");
+        apply(&data, Target::User, "add", "Uses zsh.", "").unwrap();
+        let user = data.join("USER.md");
+
+        // Edited while nothing else wrote the file: it goes back in place.
+        let draft = draft_in(&data, None, "user").unwrap();
+        let copy = draft.path.clone();
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), "Uses zsh.\n");
+        std::fs::write(&copy, "Uses fish.\n\n\n").unwrap();
+        assert_eq!(draft.put_back().unwrap(), None);
+        assert_eq!(std::fs::read_to_string(&user).unwrap(), "Uses fish.\n\n\n");
+        assert!(!copy.exists());
+
+        // The model wrote meanwhile: its entry stays, the edit is set aside.
+        let draft = draft_in(&data, None, "user").unwrap();
+        std::fs::write(&draft.path, "Uses bash.\n").unwrap();
+        apply(&data, Target::User, "add", "Works late.", "").unwrap();
+        let note = draft.put_back().unwrap().unwrap();
+        assert!(note.contains("USER.md changed while it was open"), "{note}");
+        assert_eq!(entries(&user), ["Uses fish.", "Works late."]);
+        let kept = std::fs::read_dir(&data)
+            .unwrap()
+            .filter_map(|entry| entry.unwrap().file_name().into_string().ok())
+            .find(|name| name.starts_with("USER.edit.") && name.ends_with(".md"))
+            .unwrap();
+        assert!(note.contains(&kept), "{note}");
+        assert_eq!(
+            std::fs::read_to_string(data.join(kept)).unwrap(),
+            "Uses bash.\n"
+        );
+
+        // Left as it was, nothing is written; emptied, the old text is copied.
+        let draft = draft_in(&data, None, "user").unwrap();
+        assert_eq!(draft.put_back().unwrap(), None);
+        let draft = draft_in(&data, None, "user").unwrap();
+        std::fs::write(&draft.path, "").unwrap();
+        let note = draft.put_back().unwrap().unwrap();
+        assert!(note.contains("USER.md.bak."), "{note}");
+        assert!(entries(&user).is_empty());
+    }
+
+    #[test]
+    fn soul_is_saved_only_over_the_text_that_was_shown() {
+        let data = scratch("soul-pin");
+        save_soul_in(&data, "", "Be brief.").unwrap();
+        let err = save_soul_in(&data, "", "Be kind.").unwrap_err();
+        assert!(err.contains("SOUL.md changed since it was shown"), "{err}");
+        assert_eq!(
+            save_soul_in(&data, "Be brief.", " Be kind. ").unwrap(),
+            None
+        );
+        let note = save_soul_in(&data, "Be kind.", "  ").unwrap().unwrap();
+        assert!(note.contains("SOUL.md.bak."), "{note}");
+        assert_eq!(std::fs::read_to_string(data.join("SOUL.md")).unwrap(), "");
+    }
+
+    #[test]
+    fn an_entry_is_shown_without_what_would_act_on_a_screen() {
+        let entry = "Red \u{1b}[31mtext\u{1b}]52;c;aGk=\u{7}\u{9b}2J and \u{202e}olleh\nnext\tline";
+        assert_eq!(
+            readable(entry),
+            "Red [31mtext]52;c;aGk=2J and olleh\nnext\tline"
+        );
     }
 }

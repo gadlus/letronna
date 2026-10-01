@@ -139,6 +139,10 @@ pub const COMMANDS: &[Command<'static>] = &[
         blurb: "plugins: add from git, switch on or off, allow servers, update, remove, market",
     },
     Command {
+        name: "/memory",
+        blurb: "what is kept between sessions; /memory edit user|memory|project|soul",
+    },
+    Command {
         name: "/resume",
         blurb: "pick up a session; a word finds it by title or what was said",
     },
@@ -562,6 +566,31 @@ impl Bar {
         let _ = terminal::disable_raw_mode();
         render::set_raw(false);
         self.live = false;
+    }
+
+    /// Hand the window to another program, such as an editor, while `work`
+    /// runs, and take it back after.
+    pub fn lend<T>(&mut self, work: impl FnOnce() -> T) -> T {
+        /// Takes the window back when dropped, so even a panic in `work`
+        /// leaves the terminal as the box needs it.
+        struct Back<'a> {
+            bar: &'a mut Bar,
+            live: bool,
+        }
+        impl Drop for Back<'_> {
+            fn drop(&mut self) {
+                if self.live {
+                    self.bar.install();
+                }
+            }
+        }
+        // A cooked terminal sends Ctrl-C to every process on it, so it is
+        // passed by until the box has the terminal back in raw mode.
+        let _held = letronna_core::interrupt::Held::take();
+        let live = self.live;
+        self.uninstall();
+        let _back = Back { bar: self, live };
+        work()
     }
 
     /// Paint again, for whoever has just changed what is under the box.
