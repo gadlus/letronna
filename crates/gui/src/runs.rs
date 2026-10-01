@@ -19,14 +19,12 @@ use letronna_core::approvals;
 use letronna_core::cancel::Cancel;
 use letronna_core::chat::Remote;
 use letronna_core::driver::{self, Allow, Outcome, Spec};
-use letronna_core::inbox::{self, Notice, When};
-use letronna_core::messaging::Source;
+use letronna_core::gate::Mode;
+use letronna_core::inbox;
+use letronna_core::messaging::pairing::{self, Attempt};
+use letronna_core::messaging::{Config, Incoming, Source};
+use letronna_core::remote::{self, AT_ONCE, Dispatcher, Host};
 use std::collections::BTreeMap;
-
-/// Runs the window starts at once: a few chats and `/bg` tasks side by
-/// side, without crowding the provider's rate limit. The rest wait for a
-/// place rather than being refused, since somebody asked for each.
-pub(crate) const AT_ONCE: usize = 4;
 
 /// A run beside the chat, as the sidebar lists it and a stop reaches it.
 pub(crate) struct Run {
@@ -76,21 +74,6 @@ pub(crate) fn background_prompt(line: &str) -> Option<&str> {
     Some(rest.trim()).filter(|prompt| !prompt.is_empty())
 }
 
-/// Leave chat message `text` from `place` for the run holding session `id`,
-/// as a `Later` notice it reads before it answers; false when none holds it.
-fn leave_for_run(runs: &BTreeMap<u64, Run>, id: u64, place: &str, text: &str) -> bool {
-    if !runs.contains_key(&id) {
-        return false;
-    }
-    let notice = Notice {
-        from: place.into(),
-        when: When::Later,
-        text: text.into(),
-    };
-    inbox::push(id, notice);
-    true
-}
-
 /// Take a finished run into its session, once: only while the run is
 /// listed, which this ends, and only onto the history it started from.
 /// Gives the run back, or `None` for an end already taken.
@@ -114,13 +97,125 @@ fn apply(
     Some(run)
 }
 
-/// What a run came to, as a chat app is told it.
-fn said(report: &driver::Report) -> String {
-    match &report.status {
-        Outcome::Failed(error) => format!("Did not finish: {error}"),
-        Outcome::Stopped => "Stopped.".into(),
-        _ if report.text.trim().is_empty() => "That did not produce an answer.".into(),
-        _ => report.text.clone(),
+/// The window, as a chat app's messages find it.
+struct WindowHost<'a, 'b> {
+    chat: &'a mut Chat,
+    cx: &'a mut Context<'b, Chat>,
+}
+
+impl Host for WindowHost<'_, '_> {
+    fn dispatcher(&mut self) -> &mut Dispatcher {
+        &mut self.chat.remote
+    }
+
+    fn config(&self) -> &Config {
+        &self.chat.messaging
+    }
+
+    fn config_mut(&mut self) -> &mut Config {
+        &mut self.chat.messaging
+    }
+
+    fn default_mode(&self) -> Mode {
+        self.chat.store.settings.mode
+    }
+
+    fn tell_card(&mut self, source: &Source, text: &str, card: Option<String>) {
+        self.chat.tell_remote_card(source, text, card, self.cx);
+    }
+
+    fn answer(&mut self, source: &Source, id: u64, text: &str, spoken: bool) {
+        self.chat.answer_run(source, id, text, spoken, self.cx);
+    }
+
+    /// Tried against the code the Messaging page shows, which shows what
+    /// came of it. A Slack member paired restarts the listener, which hears
+    /// only the member it started with.
+    fn pair(&mut self, message: &Incoming) -> Option<Attempt> {
+        let chat = &mut *self.chat;
+        let now = std::time::Instant::now();
+        let tried = match message.source {
+            Source::Slack { .. } => pairing::pair_slack(
+                &mut chat.slack_code,
+                &mut chat.messaging.slack,
+                message,
+                now,
+            ),
+            _ => pairing::pair(
+                &mut chat.pairing,
+                &mut chat.messaging.telegram,
+                message,
+                now,
+            ),
+        };
+        if tried == Some(Attempt::Paired) && matches!(message.source, Source::Slack { .. }) {
+            chat.restart_messaging(self.cx);
+        }
+        if tried.is_some() {
+            self.cx.notify();
+        }
+        tried
+    }
+
+    fn trouble(&mut self, error: String) {
+        self.chat.error = Some(error);
+        self.cx.notify();
+    }
+
+    fn spawn(&mut self, work: Box<dyn FnOnce() + Send>) {
+        self.cx
+            .background_executor()
+            .spawn(async move { work() })
+            .detach();
+    }
+
+    fn after(&mut self, work: Box<dyn FnOnce() -> Incoming + Send>) {
+        self.chat.on_remote_after(work, self.cx);
+    }
+
+    /// The session's project, or the open session's, which a new one gets.
+    fn folder(&self, id: Option<u64>) -> Option<PathBuf> {
+        let store = &self.chat.store;
+        let ix = id.and_then(|id| store.index_of(id)).unwrap_or(store.active);
+        store.conversations[ix].workspace.clone()
+    }
+
+    fn exists(&self, id: u64) -> bool {
+        self.chat.store.index_of(id).is_some()
+    }
+
+    fn running(&self, id: u64) -> bool {
+        self.chat.runs.contains_key(&id)
+    }
+
+    fn busy(&self, id: u64) -> bool {
+        self.chat.streaming_id == Some(id)
+    }
+
+    /// On the open session's project, without taking the view.
+    fn open(&mut self, title: String) -> Result<u64, String> {
+        let store = &mut self.chat.store;
+        let workspace = store.conversations[store.active].workspace.clone();
+        let id = store.reserve_id();
+        store.conversations.push(Conversation {
+            id,
+            title,
+            updated: backend::now(),
+            workspace,
+            ..Default::default()
+        });
+        Ok(id)
+    }
+
+    fn run(&mut self, id: u64, mode: Mode, prompt: Message, source: Source, remote: Remote) {
+        self.chat.modes.insert(id, mode);
+        self.chat
+            .run_beside(id, prompt, Some(source.clone()), Some(remote), self.cx);
+        self.chat.keep_typing(source, id, self.cx);
+    }
+
+    fn stop(&mut self, id: u64) {
+        self.chat.stop_run(id, self.cx);
     }
 }
 
@@ -290,7 +385,7 @@ impl Chat {
                 from,
                 added,
                 todos,
-                text: said(report),
+                text: remote::said(report),
                 stopped: report.status == Outcome::Stopped,
                 failed: matches!(report.status, Outcome::Failed(_)),
             });
@@ -326,10 +421,14 @@ impl Chat {
     fn ended(&mut self, run: Run, id: u64, text: &str, end: End, cx: &mut Context<Self>) {
         match &run.source {
             Some(source) => {
-                // A card still up in the chat is for a call nothing waits on now.
-                self.chat_asks.remove(source);
                 let answered = !end.stopped && !end.failed;
-                self.answer_run(source, id, text, answered, cx);
+                remote::ended(
+                    &mut WindowHost { chat: self, cx },
+                    source,
+                    id,
+                    text,
+                    answered,
+                );
             }
             None if end.failed => self.error = Some(format!("\"{}\": {text}", run.label)),
             None => {}
@@ -415,23 +514,9 @@ impl Chat {
             .is_some_and(|c| self.runs.contains_key(&c.id))
     }
 
-    /// A chat app's message for session `id`: left for the run holding it,
-    /// if one does, and the chat told so. False when no run holds it.
-    pub(crate) fn chat_to_run(
-        &mut self,
-        source: &Source,
-        id: u64,
-        place: &str,
-        text: &str,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if !leave_for_run(&self.runs, id, place, text) {
-            return false;
-        }
-        let noted =
-            "Still working. This goes to the run in progress, which reads it before it answers.";
-        self.tell_remote(source, noted, cx);
-        true
+    /// A message from a chat app, dealt with as core deals with one.
+    pub(crate) fn on_remote(&mut self, message: Incoming, cx: &mut Context<Self>) {
+        remote::dispatch(&mut WindowHost { chat: self, cx }, message);
     }
 
     /// A call of a chat app's run that needs a yes: its card goes to the
@@ -445,29 +530,7 @@ impl Chat {
         else {
             return;
         };
-        let (call, preview) = (&request.call, &request.preview);
-        let text = letronna_core::messaging::card_text(&call.name, &call.arguments, preview);
-        // A question is answered in words; a tool is allowed or not.
-        let card = (call.name != letronna_core::tools::ASK_USER).then(|| call.id.clone());
-        self.tell_remote_card(&source, &text, card, cx);
-        // A card replaced is dropped, which declines it.
-        self.chat_asks.insert(source, request);
-    }
-
-    /// Answer the card chat `source` was sent with what it said, if one is up.
-    pub(crate) fn answer_chat(&mut self, source: &Source, said: &str) -> bool {
-        use letronna_core::messaging::{CardAnswer, card_answer};
-        let Some(request) = self.chat_asks.remove(source) else {
-            return false;
-        };
-        let decision = match card_answer(&request.call.name, &request.call.arguments, said) {
-            CardAnswer::Allow => approvals::Decision::Once,
-            CardAnswer::Deny(reason) => approvals::Decision::Deny(reason),
-            // A run beside the chat asks no questions, so words are a no.
-            CardAnswer::Answer(_) => approvals::Decision::Deny(String::new()),
-        };
-        request.answer(decision);
-        true
+        remote::ask(&mut WindowHost { chat: self, cx }, source, request);
     }
 
     /// The runs beside the chat, each with its stop. A held run's row opens
@@ -541,10 +604,9 @@ impl Chat {
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute here.
-    use super::{Finished, Run, apply, background_prompt, leave_for_run};
+    use super::{Finished, Run, apply, background_prompt};
     use letronna_core::cancel::Cancel;
     use letronna_core::chat::Message;
-    use letronna_core::inbox::{self, When};
     use letronna_core::store::Conversation;
     use std::collections::BTreeMap;
 
@@ -590,28 +652,6 @@ mod tests {
         assert_eq!(background_prompt("/bg   "), None);
         assert_eq!(background_prompt("/bgx run"), None);
         assert_eq!(background_prompt("run /bg later"), None);
-    }
-
-    #[test]
-    fn a_chat_message_for_a_busy_session_is_left_as_a_later_notice() {
-        // Far above any session the other tests use, since the inbox is shared.
-        let (busy, idle) = (9_000_000_001, 9_000_000_002);
-        let runs = BTreeMap::from([(busy, held())]);
-        assert!(leave_for_run(
-            &runs,
-            busy,
-            "a Telegram chat",
-            "and the docs"
-        ));
-        assert!(!leave_for_run(&runs, idle, "a Telegram chat", "hello"));
-
-        // Not taken in the middle of a turn, only once the run looks before it answers.
-        assert!(inbox::take(busy, false).is_empty());
-        let waiting = inbox::take(busy, true);
-        assert_eq!(waiting.len(), 1);
-        assert_eq!(waiting[0].when, When::Later);
-        assert_eq!(waiting[0].text, "and the docs");
-        assert!(inbox::take(idle, true).is_empty());
     }
 
     #[test]

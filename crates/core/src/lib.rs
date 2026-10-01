@@ -72,6 +72,7 @@ pub mod preview;
 pub mod profiles;
 mod redact;
 pub mod references;
+pub mod remote;
 pub mod retry;
 mod scan;
 pub mod schedule;
