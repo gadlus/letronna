@@ -492,10 +492,17 @@ impl Chat {
                     .min_h_0()
                     .overflow_y_scroll()
                     .px_2()
-                    .children(self.runs_section(cx))
-                    .child(self.section("Sessions", cx))
-                    .child(sessions)
-                    .children(self.message_hits(cx)),
+                    // In one column, so the heading's top margin is inside
+                    // it: gpui measures a scroll's content from its first
+                    // child's edge, and the last row was cut by that margin.
+                    .child(
+                        v_flex()
+                            .flex_shrink_0()
+                            .children(self.runs_section(cx))
+                            .child(self.section("Sessions", cx))
+                            .child(sessions)
+                            .children(self.message_hits(cx)),
+                    ),
             )
             .children(self.grain(&self.grains.sidebar))
             .children(self.ring(crate::ui::keys::Region::Sidebar, cx))
