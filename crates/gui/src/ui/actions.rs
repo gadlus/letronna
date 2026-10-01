@@ -214,6 +214,8 @@ impl Chat {
                 .update(cx, |input, cx| input.set_value(text, window, cx));
             return;
         };
+        let session = self.store.conversations[self.store.active].id;
+        crate::app::tell_crew(session, &text, letronna_core::crew::Source::Composer);
         if self.dispatch(prompt, images, None, cx).is_err() {
             // Not asked, so the text waits in the box rather than being lost.
             self.composer

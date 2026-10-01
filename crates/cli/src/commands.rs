@@ -23,6 +23,9 @@ pub enum Flow {
     Send(String),
     /// Send this prompt to the model, as though it had been typed.
     Ask(&'static str),
+    /// Send this prompt to run a saved workflow, with the `workflow` tool
+    /// granted for its turn.
+    Run(String),
 }
 
 pub fn command(
@@ -383,7 +386,8 @@ fn mcp_prompt(runner: &mut Runner, command: &str, rest: &str) -> Option<Result<S
 }
 
 /// A command the user, the project or a skill added: what it gives goes in
-/// the box, to be read before it is sent. Unknown when none has the name.
+/// the box, to be read before it is sent. A saved workflow's runs instead.
+/// Unknown when none has the name.
 fn added(runner: &mut Runner, line: &str, workspace: Option<&std::path::Path>) -> Flow {
     let Some((name, args)) = slash::split(line) else {
         return Flow::Unknown;
@@ -392,6 +396,12 @@ fn added(runner: &mut Runner, line: &str, workspace: Option<&std::path::Path>) -
     let Some(command) = slash::find(&commands, name) else {
         return Flow::Unknown;
     };
+    if command.origin == Origin::Workflow {
+        // All it sends is a call to the workflow tool, whose card shows the
+        // script and waits before anything runs.
+        let prompt = letronna_core::workflow::saved::prompt(&command.name, args);
+        return Flow::Run(prompt);
+    }
     render::blank();
     render::said(
         &render::blue("●"),
@@ -447,6 +457,7 @@ fn about(command: &slash::Command) -> String {
         Origin::User => "yours",
         Origin::Project => "the project's",
         Origin::Skill => "a skill",
+        Origin::Workflow => "a saved workflow",
     };
     format!("{from} · hidden, {winner} has the name")
 }
@@ -459,6 +470,7 @@ fn from(origin: Origin) -> &'static str {
         Origin::User => "yours",
         Origin::Project => "project",
         Origin::Skill => "skill",
+        Origin::Workflow => "workflow",
     }
 }
 
