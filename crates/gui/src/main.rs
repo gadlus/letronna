@@ -402,6 +402,14 @@ pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Opti
             Some("On the Workflows page: read the runs again"),
         ),
         (
+            KeyBinding::new("alt-u", ToggleCrew, Some("Chat")),
+            Some("Switch Crew on or off for the next message"),
+        ),
+        (
+            KeyBinding::new("alt-w", DismissCrew, Some("Chat")),
+            Some("Send this message without Crew, though it says @crew"),
+        ),
+        (
             KeyBinding::new("enter", ui::actions::ToggleDiff, Some("ChangedFile")),
             Some("On a changed file under a turn: show or hide its diff"),
         ),

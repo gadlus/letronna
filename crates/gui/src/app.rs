@@ -23,7 +23,9 @@ actions!(
         NextRegion,
         PreviousRegion,
         FocusComposer,
-        ShowKeys
+        ShowKeys,
+        ToggleCrew,
+        DismissCrew
     ]
 );
 
@@ -246,6 +248,12 @@ pub(crate) struct Chat {
     /// The mode picked on each session's chip; a session not in here is in
     /// the Default mode setting.
     pub(crate) modes: std::collections::HashMap<u64, letronna_core::gate::Mode>,
+    /// Whether the composer's words ask for Crew with `@crew`, kept as they
+    /// change so the chat redraws only when the chip comes or goes.
+    pub(crate) crew_asked: bool,
+    /// Whether that chip was dismissed, so the message goes without Crew;
+    /// it comes back once the word is gone and typed again.
+    pub(crate) crew_dismissed: bool,
     /// Runs the schedules while this Letronna holds their lock, and is where
     /// every change to them goes.
     pub(crate) schedule_runner: letronna_core::schedule::Runner,
@@ -704,6 +712,7 @@ impl Chat {
                             cx.notify();
                         }
                         this.update_completion(cx);
+                        this.crew_typed(cx);
                     }
                     _ => {}
                 }
@@ -863,6 +872,8 @@ impl Chat {
             composer_empty: true,
             completer: Default::default(),
             modes: std::collections::HashMap::new(),
+            crew_asked: false,
+            crew_dismissed: false,
             schedules: schedule_runner.list(),
             schedule_runner,
             editing: None,
@@ -1340,12 +1351,15 @@ impl Chat {
             return;
         }
         let session = self.store.conversations[self.store.active].id;
-        tell_crew(session, &prompt, crew::Source::Composer);
+        let words = crate::ui::composer::crew_words(&prompt, self.crew_dismissed);
+        tell_crew(session, &words, crew::Source::Composer);
         let Some(prompt) = self.prompt_for(prompt, cx) else {
             return;
         };
         self.composer
             .update(cx, |input, cx| input.set_value("", window, cx));
+        // Setting the box raises no change, so the chip is put right here.
+        self.crew_reset(cx);
         if self.dispatch(prompt, images, None, cx).is_err() {
             self.open_settings(window, cx);
         } else {
@@ -4275,6 +4289,7 @@ impl Render for Chat {
                         .children(self.busy_note(cx))
                         .children(self.todo_panel(cx))
                         .children(self.goal_line(cx))
+                        .children(self.crew_chip(cx))
                         .child(self.composer(pane < px(600.), cx)),
                 )
             })
@@ -4296,6 +4311,10 @@ impl Render for Chat {
             .key_context("Chat")
             .on_action(cx.listener(|this, _: &NewSession, window, cx| this.new_chat(window, cx)))
             .on_action(cx.listener(|this, _: &Dismiss, window, cx| this.dismiss(window, cx)))
+            .on_action(cx.listener(|this, _: &ToggleCrew, _, cx| this.toggle_crew(cx)))
+            .on_action(
+                cx.listener(|this, _: &DismissCrew, window, cx| this.dismiss_crew(window, cx)),
+            )
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 this.sidebar_open = !this.sidebar_open;
                 cx.notify();

@@ -1,6 +1,6 @@
 use crate::prelude::*;
 use gpui_component::{Selectable, menu::PopupMenu, popover::Popover};
-use letronna_core::gate::Mode;
+use letronna_core::{crew, gate::Mode};
 
 actions!(composer, [LeaveComposer, KeysOrType]);
 
@@ -396,6 +396,7 @@ impl Chat {
             input.set_value("", window, cx);
             input.insert(draft, window, cx);
         });
+        self.crew_reset(cx);
     }
 
     pub(crate) fn insert(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -632,6 +633,7 @@ impl Chat {
     /// the controls under the text, for a narrow pane.
     pub(crate) fn composer(&self, compact: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let chat = cx.entity();
+        let crew_on = crew::on(self.store.conversations[self.store.active].id);
         let attach = Button::new("attach")
             .plain(cx)
             .xsmall()
@@ -722,6 +724,35 @@ impl Chat {
             // The session's mode sits where the message is written, since it
             // decides what the reply may do without asking.
             .child(self.mode_chip(cx))
+            .child(
+                Button::new("crew-mode")
+                    .plain(cx)
+                    .xsmall()
+                    .tooltip_with_action(
+                        if crew_on {
+                            "Crew on in this session: Letronna may run a workflow of \
+                             helpers for a big task, each run asking first. Click to stop."
+                        } else {
+                            "Crew off. Click to let Letronna run workflows of helpers for \
+                             big tasks in this session."
+                        },
+                        &ToggleCrew,
+                        None,
+                    )
+                    .text_color(if crew_on {
+                        cx.theme().primary
+                    } else {
+                        cx.theme().muted_foreground
+                    })
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(Icon::new(AppIcon::Crew).size_3())
+                            .child("Crew"),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_crew(cx))),
+            )
             // Searching is a setting, but it changes what an answer is made
             // of, so it belongs where the answer is asked for rather than
             // three clicks away in a dialog.
@@ -833,6 +864,182 @@ impl Chat {
             .child(frame)
             .children(self.completion_list(cx))
     }
+
+    /// Whether the Crew chip shows: only where sending would opt the message
+    /// in, since one sent while a reply runs joins it as a follow-up, which
+    /// never opts in, and with the switch on it says nothing new.
+    fn crew_chip_shown(&self) -> bool {
+        let id = self.store.conversations[self.store.active].id;
+        self.crew_asked && !self.crew_dismissed && !self.busy && !crew::on(id)
+    }
+
+    /// The chip over the composer saying `@crew` opts this message into
+    /// Crew, with a way to send it without.
+    pub(crate) fn crew_chip(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.crew_chip_shown() {
+            return None;
+        }
+        let chip = h_flex()
+            .gap_1p5()
+            .items_center()
+            .pl_2()
+            .rounded(cx.theme().radius)
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().secondary.opacity(0.3))
+            .text_xs()
+            .child(
+                Icon::new(AppIcon::Crew)
+                    .size_3()
+                    .text_color(cx.theme().primary),
+            )
+            .child("Crew: this message")
+            .child(
+                Button::new("crew-chip-close")
+                    .plain(cx)
+                    .xsmall()
+                    .icon(Icon::new(IconName::Close))
+                    .tooltip_with_action("Send it without Crew", &DismissCrew, None)
+                    .on_click(cx.listener(|this, _, window, cx| this.dismiss_crew(window, cx))),
+            );
+        Some(h_flex().w_full().mb_2().child(chip))
+    }
+
+    /// Turns the Crew switch of the open session over.
+    pub(crate) fn toggle_crew(&mut self, cx: &mut Context<Self>) {
+        turn_crew(self.store.conversations[self.store.active].id);
+        cx.notify();
+    }
+
+    /// Dismisses the Crew chip, so the message goes without Crew.
+    pub(crate) fn dismiss_crew(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.crew_chip_shown() {
+            // With no chip the key types what it would, such as "∑" on a Mac.
+            cx.propagate();
+            return;
+        }
+        self.crew_dismissed = true;
+        self.focus_composer(window, cx);
+        cx.notify();
+    }
+
+    /// Notes whether the composer's words ask for Crew, redrawing only when
+    /// that changes; a chip dismissed for words that no longer ask comes back
+    /// when they ask again.
+    pub(crate) fn crew_typed(&mut self, cx: &mut Context<Self>) {
+        let asked = crew_asked(&self.composer.read(cx).value());
+        if asked == self.crew_asked {
+            return;
+        }
+        self.crew_asked = asked;
+        self.crew_dismissed = false;
+        cx.notify();
+    }
+
+    /// Notes afresh whether the composer's words ask for Crew once they were
+    /// put there rather than typed, as when a session's draft comes back or
+    /// a message leaves, so a chip dismissed for other words stays with them.
+    pub(crate) fn crew_reset(&mut self, cx: &mut Context<Self>) {
+        self.crew_asked = crew_asked(&self.composer.read(cx).value());
+        self.crew_dismissed = false;
+        cx.notify();
+    }
+}
+
+/// Turns the Crew switch of `session` over.
+fn turn_crew(session: u64) {
+    crew::set(session, !crew::on(session));
+}
+
+/// Whether the composer's `text` asks for Crew, by core's rules for words
+/// typed into the composer.
+fn crew_asked(text: &str) -> bool {
+    crew::requested(text, crew::Source::Composer)
+}
+
+/// The words `crew::prompt` hears for `prompt`: as typed, or with each
+/// `@crew` made a plain "crew" once its chip was `dismissed`, so the message
+/// goes without Crew while the model still reads it as typed.
+pub(crate) fn crew_words(prompt: &str, dismissed: bool) -> Cow<'_, str> {
+    if !dismissed {
+        return Cow::Borrowed(prompt);
+    }
+    // Lowering only ASCII leaves every byte where it was, so a place found
+    // in the copy is the same place in `prompt`.
+    let lower = prompt.to_ascii_lowercase();
+    let mut words = String::with_capacity(prompt.len());
+    let mut from = 0;
+    for (at, _) in lower.match_indices("@crew") {
+        words.push_str(&prompt[from..at]);
+        // Past the one-byte "@".
+        from = at + 1;
+    }
+    words.push_str(&prompt[from..]);
+    Cow::Owned(words)
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
+    // would shadow the built-in attribute.
+    use super::{crew_asked, crew_words, turn_crew};
+    use letronna_core::crew;
+
+    #[test]
+    fn the_crew_switch_turns_over_in_its_own_session_only() {
+        // Far from the ids of real sessions, since the switches belong to
+        // the process.
+        let (here, there) = (u64::MAX - 46, u64::MAX - 47);
+        turn_crew(here);
+        assert!(crew::on(here));
+        assert!(!crew::on(there));
+        turn_crew(there);
+        turn_crew(here);
+        assert!(!crew::on(here));
+        assert!(crew::on(there));
+        turn_crew(there);
+        assert!(!crew::on(there));
+    }
+
+    #[test]
+    fn the_chip_shows_for_at_crew_typed_as_a_word() {
+        let meant = [
+            "@crew",
+            "@CREW find every bug",
+            "audit this (@crew)",
+            "`code` then @crew",
+        ];
+        for text in meant {
+            assert!(crew_asked(text), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn the_chip_stays_away_for_code_quotes_paths_urls_and_commands() {
+        let quoted = [
+            "what does `@crew` do?",
+            "```\n@crew\n```",
+            "the word '@crew' is special",
+            "the word \"@crew\" is special",
+            "open src/@crew/mod.rs",
+            "see https://example.com/@crew",
+            "mail team@crew.io",
+            "/review @crew",
+            "/crew on",
+        ];
+        for text in quoted {
+            assert!(!crew_asked(text), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_dismissed_chip_sends_the_message_without_crew() {
+        let typed = "über @Crew, then @crew's plan";
+        assert!(crew_asked(&crew_words(typed, false)));
+        let sent = crew_words(typed, true);
+        assert_eq!(sent, "über Crew, then crew's plan");
+        assert!(!crew_asked(&sent));
+    }
 }
 
 /// What a key adds to a message when typed outside any text box: its
@@ -850,7 +1057,7 @@ fn typed(keystroke: &Keystroke) -> Option<&str> {
 }
 
 #[cfg(test)]
-mod tests {
+mod typed_tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
     use super::typed;
