@@ -219,10 +219,24 @@ const FOCUSED: &str = "(() => {
   for (let hops = 0; at && at.contentDocument && hops < 16; hops++) at = at.contentDocument.activeElement;
   return at;
 })()";
+/// The document an element is in, to look through for the options a
+/// dropdown of the site's own shows once opened.
+const DOCUMENT_OF: &str = "function() { return this.ownerDocument; }";
+/// Accessibility roles of what a site's own dropdown or menu offers to pick.
+const OPTION_ROLES: &[&str] = &["option", "menuitem", "menuitemradio", "treeitem"];
+/// How often a dropdown just opened is looked in for its options, which a
+/// page drawn by script shows within a frame or two of the click.
+const OPTIONS_LOOK: Duration = Duration::from_millis(100);
 /// Picks a dropdown's option by its text or value, as choosing it by hand
-/// would, and says what went wrong otherwise.
+/// would, and says what went wrong otherwise; `false` for a dropdown the
+/// site drew itself -- a combobox, or an element whose popup is a list,
+/// not a dialog -- whose option is picked as a person would, by clicking.
 const CHOOSE: &str = "function(choice) {
-  if (!(this instanceof HTMLSelectElement)) return 'That is not a dropdown; click it, then click the option.';
+  if (!(this instanceof HTMLSelectElement)) {
+    const popup = this.getAttribute?.('aria-haspopup');
+    const drawn = this.getAttribute?.('role') === 'combobox' || ['true', 'listbox', 'menu', 'tree', 'grid'].includes(popup);
+    return drawn ? false : 'That is not a dropdown; click it, then click the option.';
+  }
   const option = [...this.options].find(o => o.label.trim() === choice || o.value === choice);
   if (!option) return 'It has no option \"' + choice + '\". It has:\\n' + [...this.options].map(o => o.label.trim()).join(', ');
   this.value = option.value;
@@ -410,7 +424,7 @@ impl Tool for UsePage {
         "use_page"
     }
     fn description(&self) -> &'static str {
-        "Act on the page open in browse, the way a person would: `click` an element, `type` into a field (it replaces what is there; `submit` presses Enter after), `press` a key such as Enter, Tab, Escape or ArrowDown, `select` a dropdown's option by its text, `upload` files from the project into a file field, `drag` an element onto another (`to`) or to a point, or `eval` a JavaScript expression and get its value back. Elements are named by the refs browse lists, such as e12; one listed under a frame's header marked cross-origin or opaque origin also needs `frame`, the origin that header names after \"frame\", and each such action is asked about on its own. `click` also takes a point instead of a ref, and names what was there: `x` and `y` in CSS pixels from the top left of the view, which is as big as the latest screenshot's result says -- not the picture's own pixels, which may have been shrunk on the way to you, and read off a screenshot of the view, not of the whole page. It is refused once the page has changed or scrolled since it was last seen, and inside a frame from another origin than the page's. `batch` runs `steps`, a list of these actions and browse's hover, wait and scroll, each written as its own call would be, in order in one call, stopping at the first that fails (a wait whose text does not come counts), and gives each step's short result; each step is asked about as it would be alone. Returns what changed on the page afterwards: the lines that are new (`>`) or gone (`<`), with the lines around them and where they are, measured against the page as you last saw it listed in this tab; the whole page instead after it loaded another page, when there is no earlier listing to measure against, or with `listing` set to `full`. It names any file an action downloaded, saved in the project's media/downloads folder (one the page starts a little later is named in the next result). A question the page asks, such as \"Are you sure?\", is answered Cancel unless `confirm` is true."
+        "Act on the page open in browse, the way a person would: `click` an element, `type` into a field (it replaces what is there; `submit` presses Enter after), `press` a key such as Enter, Tab, Escape or ArrowDown, `select` a dropdown's option by its text (a site's own dropdown too: it is opened and the option clicked), `upload` files from the project into a file field, `drag` an element onto another (`to`) or to a point, or `eval` a JavaScript expression and get its value back. Elements are named by the refs browse lists, such as e12; one listed under a frame's header marked cross-origin or opaque origin also needs `frame`, the origin that header names after \"frame\", and each such action is asked about on its own. `click` also takes a point instead of a ref, and names what was there: `x` and `y` in CSS pixels from the top left of the view, which is as big as the latest screenshot's result says -- not the picture's own pixels, which may have been shrunk on the way to you, and read off a screenshot of the view, not of the whole page. It is refused once the page has changed or scrolled since it was last seen, and inside a frame from another origin than the page's. `batch` runs `steps`, a list of these actions and browse's hover, wait and scroll, each written as its own call would be, in order in one call, stopping at the first that fails (a wait whose text does not come counts), and gives each step's short result; each step is asked about as it would be alone. Returns what changed on the page afterwards: the lines that are new (`>`) or gone (`<`), with the lines around them and where they are, measured against the page as you last saw it listed in this tab; the whole page instead after it loaded another page, when there is no earlier listing to measure against, or with `listing` set to `full`. It names any file an action downloaded, saved in the project's media/downloads folder (one the page starts a little later is named in the next result). A question the page asks, such as \"Are you sure?\", is answered Cancel unless `confirm` is true."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -420,7 +434,7 @@ impl Tool for UsePage {
             "y": {"type": "number", "description": "With x: the point's CSS pixels from the top of the view."},
             "to": {"type": "string", "description": "For drag: the element to drop onto, by its ref."},
             "frame": {"type": "string", "description": "For an element in a frame from another origin than the page's, or keys typed or pressed while focus is in one: that origin, as the frame's header in the listing names it, such as https://pay.example, or opaque:https://pay.example for one whose origin is opaque, as a sandboxed frame's is. Left out otherwise."},
-            "text": {"type": "string", "description": "For type: what to type. For select: the option."},
+            "text": {"type": "string", "description": "For type: what to type. For select: the option's text, in a <select> or a site's own dropdown."},
             "submit": {"type": "boolean", "description": "For type: press Enter afterwards."},
             "key": {"type": "string", "description": "For press: Enter, Tab, Escape, Backspace, Delete, an arrow such as ArrowDown, Home, End, PageUp, PageDown, Space, or one character. With a ref, the element is focused first."},
             "files": {"type": "array", "items": {"type": "string"}, "description": "For upload: the files to put in the field, by their paths in the project."},
@@ -554,7 +568,7 @@ impl UsePage {
                 with_downloads(&saving, |session| {
                     let node = target(session)?;
                     session.act(agree, Some(&saving), after, |session| {
-                        session.choose(node, choice)
+                        session.choose(node, choice, frame)
                     })
                 })
             }
@@ -4751,7 +4765,7 @@ impl Session {
         Ok(())
     }
 
-    fn choose(&mut self, node: i64, choice: &str) -> Result<(), String> {
+    fn choose(&mut self, node: i64, choice: &str, frame: Option<&str>) -> Result<(), String> {
         self.point(node, format!("Choosing \"{}\" in", cut(choice, 40)), None);
         let object = self.object(node)?;
         let answer: Value = self.on_node(
@@ -4759,6 +4773,9 @@ impl Session {
             json!({"objectId": object, "functionDeclaration": CHOOSE,
                    "arguments": [{"value": choice}], "returnByValue": true}),
         )?;
+        if answer["result"]["value"] == false {
+            return self.pick_drawn(node, &object, choice, frame);
+        }
         match answer["result"]["value"].as_str() {
             Some("") => Ok(()),
             // The options are the page's words.
@@ -4770,6 +4787,152 @@ impl Session {
             }),
             None => Err("The dropdown did not answer.".into()),
         }
+    }
+
+    /// Pick `choice` in `node`, a dropdown the site drew itself, whose
+    /// handle is `object`, as a person would: open it with a click unless it
+    /// says it is open, then click the one option of that name it shows.
+    /// Otherwise it is closed with Escape, sent only where `frame` says, and
+    /// the options it showed are named; with several of that name it is
+    /// left open to click one.
+    fn pick_drawn(
+        &mut self,
+        node: i64,
+        object: &str,
+        choice: &str,
+        frame: Option<&str>,
+    ) -> Result<(), String> {
+        let found: Value = self.on_node(
+            "Runtime.callFunctionOn",
+            json!({"objectId": object, "functionDeclaration": DOCUMENT_OF}),
+        )?;
+        let document = found["result"]["objectId"]
+            .as_str()
+            .ok_or("The dropdown is no longer on the page.")?
+            .to_owned();
+        let open = self.ax_said(node, "expanded")?["value"] == true;
+        // What the page offered before it opened is not what it shows.
+        let before: Vec<i64> = (self.options_in(json!({"objectId": document}))?.into_iter())
+            .map(|(option, _)| option)
+            .collect();
+        // Open already, only a list it names tells its options from the
+        // rest of the page's.
+        if open && self.options_shown(node, &document, &before)?.is_empty() {
+            return Err(
+                "It is open already and does not say which options are its own, so nothing \
+                 was picked. Look at what it shows, then click the option meant."
+                    .into(),
+            );
+        }
+        if !open {
+            self.click(node)?;
+        }
+        let started = Instant::now();
+        let shown = loop {
+            let shown = self.options_shown(node, &document, &before)?;
+            if shown.iter().any(|(_, name)| name == choice) || started.elapsed() >= SETTLE {
+                break shown;
+            }
+            if self.stop.is_set() {
+                return Err(cdp::STOPPED.into());
+            }
+            std::thread::sleep(OPTIONS_LOOK);
+        };
+        let named: Vec<i64> = (shown.iter())
+            .filter(|(_, name)| name == choice)
+            .map(|(option, _)| *option)
+            .collect();
+        match named[..] {
+            [option] => return self.click(option),
+            [] => {}
+            _ => {
+                return Err(format!(
+                    "{} of its options are named \"{choice}\", so none was picked. They are \
+                     showing now: look, then click the one meant.",
+                    named.len()
+                ));
+            }
+        }
+        self.keys_go_to(frame)?;
+        self.press(&key("Escape").ok_or("There is no Escape key.")?)?;
+        if shown.is_empty() {
+            return Err(
+                "It showed no options to pick from, so nothing was picked. Type into it \
+                 if it searches as you type, or click it and look at what it shows."
+                    .into(),
+            );
+        }
+        let names: Vec<&str> = shown.iter().map(|(_, name)| name.as_str()).collect();
+        // The options are the page's words.
+        Err(crate::untrusted::quoted(
+            &format!("It has no option \"{choice}\". It has:"),
+            &names.join(", "),
+        ))
+    }
+
+    /// The options dropdown `node` shows now, by node and name: those in
+    /// the list it says it controls, or else those in the page's handle on
+    /// its `document` that were not there `before` it opened.
+    fn options_shown(
+        &mut self,
+        node: i64,
+        document: &str,
+        before: &[i64],
+    ) -> Result<Vec<(i64, String)>, String> {
+        let controls = self.ax_said(node, "controls")?;
+        let lists: Vec<i64> = (controls["relatedNodes"].as_array().into_iter().flatten())
+            .filter_map(|list| list["backendDOMNodeId"].as_i64())
+            .collect();
+        let mut shown = Vec::new();
+        for list in lists {
+            shown.extend(self.options_in(json!({"backendNodeId": list}))?);
+        }
+        if !shown.is_empty() {
+            return Ok(shown);
+        }
+        let mut shown = self.options_in(json!({"objectId": document}))?;
+        shown.retain(|(option, _)| !before.contains(option));
+        Ok(shown)
+    }
+
+    /// What there is to pick under `root`, a node as
+    /// `Accessibility.queryAXTree` takes one, by node and name.
+    fn options_in(&mut self, root: Value) -> Result<Vec<(i64, String)>, String> {
+        let mut found = Vec::new();
+        for role in OPTION_ROLES {
+            let mut asked = root.clone();
+            asked["role"] = json!(role);
+            let answer: Value = self.on_node("Accessibility.queryAXTree", asked)?;
+            let nodes = answer["nodes"].as_array().map(Vec::as_slice);
+            let shown = nodes.unwrap_or_default().iter();
+            found.extend(
+                shown
+                    .filter(|option| option["ignored"] != true)
+                    .filter_map(|option| {
+                        let name = option["name"]["value"].as_str().unwrap_or_default();
+                        Some((option["backendDOMNodeId"].as_i64()?, name.to_owned()))
+                    }),
+            );
+        }
+        Ok(found)
+    }
+
+    /// What the accessibility tree says of `node`'s `property`, such as
+    /// whether it is expanded; null when it says nothing of it.
+    fn ax_said(&mut self, node: i64, property: &str) -> Result<Value, String> {
+        let asked = json!({"backendNodeId": node, "fetchRelatives": false});
+        let tree: Value = self.on_node("Accessibility.getPartialAXTree", asked)?;
+        let nodes = tree["nodes"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let found = nodes.iter().find(|ax| ax["backendDOMNodeId"] == node);
+        let properties = found.and_then(|ax| ax["properties"].as_array());
+        let said = properties
+            .into_iter()
+            .flatten()
+            .find(|said| said["name"] == property);
+        Ok(said.map(|said| said["value"].clone()).unwrap_or_default())
     }
 }
 
@@ -6448,6 +6611,219 @@ mod tests {
         );
     }
 
+    /// A page with a dropdown of its own, node 5, `open` or not, that shows
+    /// `options` once pressed -- in list 20 when it `controls` one -- on a
+    /// page that already has a "Canada", node 3, and a hidden one, node 4.
+    /// Node n is drawn n tens of pixels down, and focus stays on the page;
+    /// what the mouse and keys did is kept in `seen`.
+    fn drawn_dropdown(
+        options: &'static [(i64, &'static str)],
+        controls: bool,
+        open: bool,
+        seen: Arc<Mutex<Vec<String>>>,
+    ) -> impl Fn(&str, &Value) -> (Vec<Value>, Value) + Send + 'static {
+        let open = AtomicBool::new(open);
+        move |method, params| {
+            let item = |node: i64, name: &str, ignored: bool| {
+                json!({"ignored": ignored, "role": {"value": "option"},
+                       "name": {"value": name}, "backendDOMNodeId": node})
+            };
+            let shown = open.load(Ordering::Relaxed);
+            let function = &params["functionDeclaration"];
+            let answer = match method {
+                "DOM.resolveNode" => {
+                    json!({"object": {"objectId": format!("o{}", params["backendNodeId"])}})
+                }
+                "Runtime.callFunctionOn" if function == CHOOSE => {
+                    json!({"result": {"value": false}})
+                }
+                "Runtime.callFunctionOn" if function == DOCUMENT_OF => {
+                    json!({"result": {"type": "object", "objectId": "D"}})
+                }
+                "Runtime.callFunctionOn" => json!({"result": {"value": ""}}),
+                "DOM.getContentQuads" => {
+                    let y = params["backendNodeId"].as_f64().unwrap() * 10.;
+                    json!({"quads": [[10., y, 110., y, 110., y + 10., 10., y + 10.]]})
+                }
+                "Accessibility.getPartialAXTree" => {
+                    let mut said = vec![json!({"name": "expanded", "value": {"value": shown}})];
+                    if controls && shown {
+                        let list = json!({"relatedNodes": [{"backendDOMNodeId": 20}]});
+                        said.push(json!({"name": "controls", "value": list}));
+                    }
+                    json!({"nodes": [{"backendDOMNodeId": params["backendNodeId"],
+                                      "role": {"value": "combobox"}, "properties": said}]})
+                }
+                "Accessibility.queryAXTree" if params["role"] != "option" => json!({"nodes": []}),
+                "Accessibility.queryAXTree" => {
+                    let in_list = params["backendNodeId"] == 20;
+                    let mut nodes = match in_list {
+                        true => Vec::new(),
+                        false => vec![item(3, "Canada", false), item(4, "Canada", true)],
+                    };
+                    if shown {
+                        nodes.extend(options.iter().map(|(node, name)| item(*node, name, false)));
+                    }
+                    json!({"nodes": nodes})
+                }
+                "Input.dispatchMouseEvent" => {
+                    if params["type"] == "mousePressed" && params["y"] == 55. {
+                        open.store(true, Ordering::Relaxed);
+                    }
+                    let kind = params["type"].as_str().unwrap_or_default();
+                    let pressed = format!("{kind} {},{}", params["x"], params["y"]);
+                    seen.lock().unwrap().push(pressed);
+                    json!({})
+                }
+                "Page.createIsolatedWorld" => json!({"executionContextId": 1}),
+                "Runtime.evaluate" => json!({"result": {"type": "object", "subtype": "null"}}),
+                "Input.dispatchKeyEvent" => {
+                    if params["key"] == "Escape" {
+                        open.store(false, Ordering::Relaxed);
+                    }
+                    let kind = params["type"].as_str().unwrap_or_default();
+                    let key = params["key"].as_str().unwrap_or_default();
+                    seen.lock().unwrap().push(format!("{kind} {key}"));
+                    json!({})
+                }
+                _ => json!({}),
+            };
+            (Vec::new(), answer)
+        }
+    }
+
+    #[test]
+    fn a_sites_own_dropdown_is_opened_and_the_option_clicked_by_its_name() {
+        const OPTIONS: &[(i64, &str)] = &[(7, "Canada"), (8, "Chile")];
+        let pressed = |y: &str| {
+            ["mouseMoved", "mousePressed", "mouseReleased"].map(|kind| format!("{kind} 60.0,{y}"))
+        };
+        // Shut, it is opened, and the "Canada" it shows is told from the one
+        // already on the page by not having been there before.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let page = drawn_dropdown(OPTIONS, false, false, seen.clone());
+        let (mut session, server) = fake_session(page);
+        assert_eq!(session.choose(5, "Canada", None), Ok(()));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [pressed("55.0"), pressed("75.0")].concat()
+        );
+        drop(session);
+        let heard = server.join().unwrap();
+        assert!(
+            !heard.iter().any(|m| m == "Input.dispatchKeyEvent"),
+            "{heard:?}"
+        );
+        // Open already, it is not clicked shut, and its own list is used.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let page = drawn_dropdown(OPTIONS, true, true, seen.clone());
+        let (mut session, _server) = fake_session(page);
+        assert_eq!(session.choose(5, "Canada", None), Ok(()));
+        assert_eq!(*seen.lock().unwrap(), pressed("75.0"));
+    }
+
+    #[test]
+    fn an_option_a_dropdown_lacks_closes_it_and_lists_the_ones_it_has_fenced() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let page = drawn_dropdown(&[(7, "Canada"), (8, "Chile")], true, false, seen.clone());
+        let (mut session, _server) = fake_session(page);
+        let started = Instant::now();
+        let missing = session.choose(5, "Peru", None).unwrap_err();
+        // Its options were waited for before it was given up on.
+        assert!(started.elapsed() >= SETTLE);
+        assert!(
+            missing.starts_with("It has no option \"Peru\". It has:\n<untrusted-content-"),
+            "{missing}"
+        );
+        assert!(missing.contains("\nCanada, Chile\n"), "{missing}");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 5, "{seen:?}");
+        assert_eq!(seen[3..], ["rawKeyDown Escape", "keyUp Escape"]);
+        // One that shows nothing at all says so.
+        let (mut session, _server) =
+            fake_session(drawn_dropdown(&[], false, false, Arc::default()));
+        let empty = session.choose(5, "Peru", None).unwrap_err();
+        assert!(
+            empty.starts_with("It showed no options to pick from"),
+            "{empty}"
+        );
+    }
+
+    #[test]
+    fn an_open_dropdown_naming_no_list_is_not_picked_from_the_whole_page() {
+        // Open already with no list of its own named, so the page's other
+        // "Canada" cannot be told from one it shows.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let page = drawn_dropdown(&[(8, "Chile")], false, true, seen.clone());
+        let (mut session, _server) = fake_session(page);
+        let refused = session.choose(5, "Canada", None).unwrap_err();
+        assert!(
+            refused.starts_with("It is open already and does not say which options"),
+            "{refused}"
+        );
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_dropdown_left_open_sends_no_escape_into_a_frame_not_listed() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let page = drawn_dropdown(&[(7, "Canada")], true, false, seen.clone());
+        // Opening it put focus in a frame the page's tree does not have.
+        let (mut session, _server) = fake_session(move |method, params| {
+            let answer = match method {
+                "Page.getFrameTree" => json!({"frameTree": {"frame": {"id": "TOP"}}}),
+                "Runtime.evaluate" => json!({"result": {"type": "object", "objectId": "A"}}),
+                "DOM.describeNode" => json!({"node": {"nodeName": "IFRAME", "frameId": "F9"}}),
+                _ => return page(method, params),
+            };
+            (Vec::new(), answer)
+        });
+        let refused = session.choose(5, "Peru", None).unwrap_err();
+        assert!(refused.contains("not listed"), "{refused}");
+        let seen = seen.lock().unwrap();
+        assert!(
+            !seen.iter().any(|done| done.ends_with("Escape")),
+            "{seen:?}"
+        );
+    }
+
+    #[test]
+    fn two_options_of_one_name_are_not_guessed_between() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let page = drawn_dropdown(&[(7, "Canada"), (9, "Canada")], false, false, seen.clone());
+        let (mut session, _server) = fake_session(page);
+        let refused = session.choose(5, "Canada", None).unwrap_err();
+        assert!(
+            refused.starts_with("2 of its options are named \"Canada\", so none was picked."),
+            "{refused}"
+        );
+        // Opened, and left open for the one meant to be clicked.
+        let opened =
+            ["mouseMoved", "mousePressed", "mouseReleased"].map(|k| format!("{k} 60.0,55.0"));
+        assert_eq!(*seen.lock().unwrap(), opened);
+    }
+
+    #[test]
+    fn a_native_dropdown_is_still_set_by_the_page_alone() {
+        let (mut session, server) = fake_session(|method, _| {
+            let answer = match method {
+                "DOM.resolveNode" => json!({"object": {"objectId": "O"}}),
+                "Runtime.callFunctionOn" => json!({"result": {"value": ""}}),
+                _ => json!({}),
+            };
+            (Vec::new(), answer)
+        });
+        assert_eq!(session.choose(5, "Green", None), Ok(()));
+        drop(session);
+        let heard = server.join().unwrap();
+        assert!(
+            !heard
+                .iter()
+                .any(|m| m.starts_with("Input.") || m.starts_with("Accessibility.")),
+            "{heard:?}"
+        );
+    }
+
     /// A page at a.test scrolled `scrolled` down in document `loader`, with
     /// the button "Send" under every point: `swapped` once it is pressed,
     /// and `frame` the node when it is a frame.
@@ -7151,8 +7527,8 @@ mod tests {
 <button onclick="setTimeout(() => location.href = '/report.txt', 1500)">Later</button>"#;
 
         /// A menu shown on hover, a card dropped by HTML5 drag and drop, a
-        /// knob dragged by the mouse, a canvas with no refs in it, and a
-        /// save whose words come a moment later.
+        /// knob dragged by the mouse, a dropdown of the page's own, a canvas
+        /// with no refs in it, and a save whose words come a moment later.
         const INPUT: &str = r#"<!doctype html><title>Input</title>
 <style>#menu{display:none} #hot:hover + #menu{display:block}</style>
 <button id=hot>Products</button><div id=menu><a href="/two">Hover link</a></div>
@@ -7160,6 +7536,9 @@ mod tests {
 <div role=button ondragover="event.preventDefault()" ondrop="event.preventDefault(); out.textContent = 'Dropped ' + event.dataTransfer.getData('text')" style="width:200px;height:80px;margin-top:40px">Bin</div>
 <div role=button onmousedown="held = true" style="position:absolute;left:300px;top:20px;width:30px;height:30px">Knob</div>
 <p role=status id=out>Nothing yet</p>
+<button role=combobox aria-label=Shade aria-haspopup=listbox aria-expanded=false aria-controls=colours id=colour onclick="show(colours.hidden)">Colour</button>
+<ul role=listbox id=colours hidden style="position:absolute;margin:0;background:#fff"><li role=option onclick="pick(this)">Red</li><li role=option onclick="pick(this)">Green</li></ul>
+<script>function show(open) { colours.hidden = !open; colour.setAttribute('aria-expanded', open) } function pick(o) { out.textContent = 'Colour ' + o.textContent; show(false) } addEventListener('keydown', e => { if (e.key == 'Escape') show(false) })</script>
 <canvas id=pad width=200 height=100 onclick="out.textContent = 'Pad ' + event.offsetX"></canvas>
 <label>Secret <input id=secret type=password value=hunter2></label>
 <button onclick="setTimeout(() => { out.textContent = 'Saved at last'; spin.remove() }, 1200)">Save</button><span id=spin>Saving now</span>
@@ -7533,6 +7912,21 @@ mod tests {
                     json!({"action": "drag", "ref": ref_of(&page, "Knob"), "x": 400, "y": 200});
                 let knob = timed("mouse drag", || act(drag)).unwrap();
                 assert!(knob.contains("Knob to 400,200"), "{knob}");
+                // A dropdown of the page's own is opened and its option
+                // clicked, in a batch too; one it lacks closes it again.
+                let shade = ref_of(&page, "combobox \"Shade\"");
+                let chosen =
+                    act(json!({"action": "select", "ref": shade, "text": "Green"})).unwrap();
+                assert!(chosen.contains("\"Colour Green\""), "{chosen}");
+                let missing =
+                    act(json!({"action": "select", "ref": shade, "text": "Blue"})).unwrap_err();
+                assert!(missing.contains("Red, Green"), "{missing}");
+                let shut = act(json!({"action": "eval", "script": "colours.hidden"})).unwrap();
+                assert_eq!(shut, "true");
+                let steps = json!([{"action": "select", "ref": shade, "text": "Red"},
+                                   {"action": "wait", "text": "Colour Red"}]);
+                let ran = act(json!({"action": "batch", "steps": steps})).unwrap();
+                assert!(ran.starts_with("All 2 steps ran:"), "{ran}");
                 let script = "JSON.stringify((r => [r.x + 50, r.y + 20])\
                               (document.querySelector('#pad').getBoundingClientRect()))";
                 let pad = act(json!({"action": "eval", "script": script})).unwrap();
