@@ -422,7 +422,8 @@ impl QuickEntry {
             glance.lines.clone()
         };
         // From the bottom up, so a line wrapping past three rows loses its
-        // start rather than its end.
+        // start rather than its end -- clipped by whole rows inside the
+        // padding, so no half a row shows over the session's name.
         let text = v_flex()
             .flex_none()
             .h(TEXT)
@@ -431,12 +432,16 @@ impl QuickEntry {
             // gap and the input's own 12px.
             .pl_12()
             .pr_3()
-            .justify_end()
-            .overflow_hidden()
-            .text_sm()
-            .line_height(LINE)
-            .text_color(color)
-            .children(lines.into_iter().map(|line| div().child(line)));
+            .child(
+                v_flex()
+                    .h(LINE * LINES as f32)
+                    .justify_end()
+                    .overflow_hidden()
+                    .text_sm()
+                    .line_height(LINE)
+                    .text_color(color)
+                    .children(lines.into_iter().map(|line| div().flex_none().child(line))),
+            );
         let (place, place_color) = match glance.stage {
             Stage::Waiting => (
                 format!("\u{201c}{}\u{201d} is waiting on you", glance.title).into(),
