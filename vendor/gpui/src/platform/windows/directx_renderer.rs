@@ -1,6 +1,7 @@
 use std::{
     mem::ManuallyDrop,
     sync::{Arc, OnceLock},
+    time::{Duration, Instant},
 };
 
 use ::util::ResultExt;
@@ -30,6 +31,12 @@ pub(crate) const DISABLE_DIRECT_COMPOSITION: &str = "GPUI_DISABLE_DIRECT_COMPOSI
 const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
 // This configuration is used for MSAA rendering on paths only, and it's guaranteed to be supported by DirectX 11.
 const PATH_MULTISAMPLE_COUNT: u32 = 4;
+// How long the path textures are kept after the last frame that drew a path.
+// At 20 bytes a pixel they are the biggest thing a window holds, and many
+// windows draw no path for minutes or ever, so they are made for the first
+// path drawn and let go of once paths stop. The wait keeps a selection made,
+// cleared and made again from making them over and over.
+const PATH_TEXTURES_KEPT: Duration = Duration::from_secs(5);
 
 pub(crate) struct FontInfo {
     pub gamma_ratios: [f32; 4],
@@ -45,6 +52,8 @@ pub(crate) struct DirectXRenderer {
     pipelines: DirectXRenderPipelines,
     direct_composition: Option<DirectComposition>,
     font_info: &'static FontInfo,
+    // When a frame last drew a path.
+    paths_drawn_at: Option<Instant>,
 }
 
 /// Direct3D objects
@@ -63,16 +72,22 @@ struct DirectXResources {
     render_target: ManuallyDrop<ID3D11Texture2D>,
     render_target_view: [Option<ID3D11RenderTargetView>; 1],
 
-    // Path intermediate textures (with MSAA)
-    path_intermediate_texture: ID3D11Texture2D,
-    path_intermediate_srv: [Option<ID3D11ShaderResourceView>; 1],
-    path_intermediate_msaa_texture: ID3D11Texture2D,
-    path_intermediate_msaa_view: [Option<ID3D11RenderTargetView>; 1],
+    // Path intermediate textures (with MSAA), while paths are being drawn.
+    path_textures: Option<PathTextures>,
 
     // Cached window size and viewport
     width: u32,
     height: u32,
     viewport: [D3D11_VIEWPORT; 1],
+}
+
+// What paths are drawn into before they are copied to the window, at the
+// window's size.
+struct PathTextures {
+    texture: ID3D11Texture2D,
+    srv: [Option<ID3D11ShaderResourceView>; 1],
+    msaa_texture: ID3D11Texture2D,
+    msaa_view: [Option<ID3D11RenderTargetView>; 1],
 }
 
 struct DirectXRenderPipelines {
@@ -164,6 +179,7 @@ impl DirectXRenderer {
             pipelines,
             direct_composition,
             font_info: Self::get_font_info(),
+            paths_drawn_at: None,
         })
     }
 
@@ -289,10 +305,7 @@ impl DirectXRenderer {
             match batch {
                 PrimitiveBatch::Shadows(shadows) => self.draw_shadows(shadows),
                 PrimitiveBatch::Quads(quads) => self.draw_quads(quads),
-                PrimitiveBatch::Paths(paths) => {
-                    self.draw_paths_to_intermediate(paths)?;
-                    self.draw_paths_from_intermediate(paths)
-                }
+                PrimitiveBatch::Paths(paths) => self.draw_paths(paths),
                 PrimitiveBatch::Underlines(underlines) => self.draw_underlines(underlines),
                 PrimitiveBatch::MonochromeSprites {
                     texture_id,
@@ -312,7 +325,67 @@ impl DirectXRenderer {
                     scene.polychrome_sprites.len(),
                     scene.surfaces.len(),))?;
         }
-        self.present()
+        let presented = self.present();
+        if scene.paths.is_empty() && self.path_textures_unused() {
+            self.trim();
+        }
+        presented
+    }
+
+    fn draw_paths(&mut self, paths: &[Path<ScaledPixels>]) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        if self.resources.path_textures.is_none() {
+            let made = PathTextures::new(
+                &self.devices.device,
+                self.resources.width,
+                self.resources.height,
+            );
+            match made {
+                Ok(textures) => self.resources.path_textures = Some(textures),
+                // The rest of the frame is still worth drawing.
+                Err(error) => {
+                    log::error!("Failed to create the path textures: {error:#}");
+                    return Ok(());
+                }
+            }
+        }
+        self.paths_drawn_at = Some(Instant::now());
+        self.draw_paths_to_intermediate(paths)?;
+        self.draw_paths_from_intermediate(paths)
+    }
+
+    /// Lets go of the path textures now, if there are any.
+    pub(crate) fn drop_path_textures(&mut self) {
+        if self.resources.path_textures.is_some() {
+            self.trim();
+        }
+    }
+
+    fn path_textures_unused(&self) -> bool {
+        self.resources.path_textures.is_some()
+            && self
+                .paths_drawn_at
+                .is_none_or(|at| at.elapsed() >= PATH_TEXTURES_KEPT)
+    }
+
+    /// Lets go of the path textures, and has Direct3D and the driver give
+    /// back what they keep between frames -- dropping a texture alone leaves
+    /// its memory with them. Whatever is needed again is made again.
+    fn trim(&mut self) {
+        self.resources.path_textures = None;
+        // Nothing left bound keeps what goes alive, which Trim asks for.
+        unsafe { self.devices.device_context.ClearState() };
+        // ClearState also reset what every window's draws count on being set
+        // once: no culling, and multisampling for the paths.
+        set_rasterizer_state(&self.devices.device, &self.devices.device_context).log_err();
+        if let Ok(device) = self.devices.device.cast::<IDXGIDevice3>() {
+            unsafe { device.Trim() };
+        }
+        // Without a frame after it -- a window left inactive draws none --
+        // the driver only gives the memory back at its next call.
+        unsafe { self.devices.device_context.Flush() };
     }
 
     pub(crate) fn resize(&mut self, new_size: Size<DevicePixels>) -> Result<()> {
@@ -399,19 +472,19 @@ impl DirectXRenderer {
         if paths.is_empty() {
             return Ok(());
         }
+        let Some(textures) = &self.resources.path_textures else {
+            return Ok(());
+        };
 
         // Clear intermediate MSAA texture
         unsafe {
-            self.devices.device_context.ClearRenderTargetView(
-                self.resources.path_intermediate_msaa_view[0]
-                    .as_ref()
-                    .unwrap(),
-                &[0.0; 4],
-            );
+            self.devices
+                .device_context
+                .ClearRenderTargetView(textures.msaa_view[0].as_ref().unwrap(), &[0.0; 4]);
             // Set intermediate MSAA texture as render target
             self.devices
                 .device_context
-                .OMSetRenderTargets(Some(&self.resources.path_intermediate_msaa_view), None);
+                .OMSetRenderTargets(Some(&textures.msaa_view), None);
         }
 
         // Collect all vertices and sprites for a single draw call
@@ -443,9 +516,9 @@ impl DirectXRenderer {
         // Resolve MSAA to non-MSAA intermediate texture
         unsafe {
             self.devices.device_context.ResolveSubresource(
-                &self.resources.path_intermediate_texture,
+                &textures.texture,
                 0,
-                &self.resources.path_intermediate_msaa_texture,
+                &textures.msaa_texture,
                 0,
                 RENDER_TARGET_FORMAT,
             );
@@ -459,6 +532,9 @@ impl DirectXRenderer {
     }
 
     fn draw_paths_from_intermediate(&mut self, paths: &[Path<ScaledPixels>]) -> Result<()> {
+        let Some(textures) = &self.resources.path_textures else {
+            return Ok(());
+        };
         let Some(first_path) = paths.first() else {
             return Ok(());
         };
@@ -494,7 +570,7 @@ impl DirectXRenderer {
         // Draw the sprites with the path texture
         self.pipelines.path_sprite_pipeline.draw_with_texture(
             &self.devices.device_context,
-            &self.resources.path_intermediate_srv,
+            &textures.srv,
             &self.resources.viewport,
             &self.globals.global_params_buffer,
             &self.globals.sampler,
@@ -671,25 +747,15 @@ impl DirectXResources {
             )?
         };
 
-        let (
-            render_target,
-            render_target_view,
-            path_intermediate_texture,
-            path_intermediate_srv,
-            path_intermediate_msaa_texture,
-            path_intermediate_msaa_view,
-            viewport,
-        ) = create_resources(devices, &swap_chain, width, height)?;
+        let (render_target, render_target_view, viewport) =
+            create_resources(devices, &swap_chain, width, height)?;
         set_rasterizer_state(&devices.device, &devices.device_context)?;
 
         Ok(ManuallyDrop::new(Self {
             swap_chain,
             render_target,
             render_target_view,
-            path_intermediate_texture,
-            path_intermediate_msaa_texture,
-            path_intermediate_msaa_view,
-            path_intermediate_srv,
+            path_textures: None,
             viewport,
             width,
             height,
@@ -703,23 +769,29 @@ impl DirectXResources {
         width: u32,
         height: u32,
     ) -> Result<()> {
-        let (
-            render_target,
-            render_target_view,
-            path_intermediate_texture,
-            path_intermediate_srv,
-            path_intermediate_msaa_texture,
-            path_intermediate_msaa_view,
-            viewport,
-        ) = create_resources(devices, &self.swap_chain, width, height)?;
+        // The old size's path textures go first; the next path drawn makes
+        // them again at this size.
+        self.path_textures = None;
+        let (render_target, render_target_view, viewport) =
+            create_resources(devices, &self.swap_chain, width, height)?;
         self.render_target = render_target;
         self.render_target_view = render_target_view;
-        self.path_intermediate_texture = path_intermediate_texture;
-        self.path_intermediate_msaa_texture = path_intermediate_msaa_texture;
-        self.path_intermediate_msaa_view = path_intermediate_msaa_view;
-        self.path_intermediate_srv = path_intermediate_srv;
         self.viewport = viewport;
         Ok(())
+    }
+}
+
+impl PathTextures {
+    fn new(device: &ID3D11Device, width: u32, height: u32) -> Result<Self> {
+        let (texture, srv) = create_path_intermediate_texture(device, width, height)?;
+        let (msaa_texture, msaa_view) =
+            create_path_intermediate_msaa_texture_and_view(device, width, height)?;
+        Ok(Self {
+            texture,
+            srv,
+            msaa_texture,
+            msaa_view,
+        })
     }
 }
 
@@ -1084,28 +1156,12 @@ fn create_resources(
 ) -> Result<(
     ManuallyDrop<ID3D11Texture2D>,
     [Option<ID3D11RenderTargetView>; 1],
-    ID3D11Texture2D,
-    [Option<ID3D11ShaderResourceView>; 1],
-    ID3D11Texture2D,
-    [Option<ID3D11RenderTargetView>; 1],
     [D3D11_VIEWPORT; 1],
 )> {
     let (render_target, render_target_view) =
         create_render_target_and_its_view(swap_chain, &devices.device)?;
-    let (path_intermediate_texture, path_intermediate_srv) =
-        create_path_intermediate_texture(&devices.device, width, height)?;
-    let (path_intermediate_msaa_texture, path_intermediate_msaa_view) =
-        create_path_intermediate_msaa_texture_and_view(&devices.device, width, height)?;
     let viewport = set_viewport(&devices.device_context, width as f32, height as f32);
-    Ok((
-        render_target,
-        render_target_view,
-        path_intermediate_texture,
-        path_intermediate_srv,
-        path_intermediate_msaa_texture,
-        path_intermediate_msaa_view,
-        viewport,
-    ))
+    Ok((render_target, render_target_view, viewport))
 }
 
 #[inline]

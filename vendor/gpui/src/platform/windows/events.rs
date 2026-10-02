@@ -751,6 +751,12 @@ impl WindowsWindowInner {
         let this = self.clone();
         self.executor
             .spawn(async move {
+                // A window not in front draws no text selection, which is all
+                // Letronna draws paths for, so their textures can go until it
+                // is: drawing nothing, it would not let go of them otherwise.
+                if !activated {
+                    this.state.borrow_mut().renderer.drop_path_textures();
+                }
                 let mut lock = this.state.borrow_mut();
                 if let Some(mut func) = lock.callbacks.active_status_change.take() {
                     drop(lock);
