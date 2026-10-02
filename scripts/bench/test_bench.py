@@ -8,6 +8,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -40,6 +41,7 @@ better = "candidate" in entry["command"]
 checks = [{"id": "summary_exists", "label": "out/summary.json exists", "pass": better}]
 scoring = {
     "combined_score": (0.8 if task == "001-file" else 0.7) if better else 0.5,
+    "outcome_score": 1.0 if better else 0.0,
     "oracle_outcome_score": 1.0 if better else 0.0,
     "security_score": 1.0,
 }
@@ -66,6 +68,23 @@ def made_up_result(
 def failed_check(check_id: str, label: str, weight: float = 1.0, detail: str = "") -> dict:
     """An oracle check that did not pass."""
     return {"id": check_id, "label": label, "pass": False, "weight": weight, "detail": detail}
+
+
+def commit_all(folder: Path) -> str:
+    """Makes a folder a git repository of one commit and gives that commit's id."""
+    git = ["git", "-C", str(folder), "-c", "user.name=bench-test"]
+    git += ["-c", "user.email=bench-test@example.invalid", "-c", "commit.gpgsign=false"]
+    subprocess.run([*git, "init", "-q"], check=True)
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "bench"], check=True)
+    head = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True, check=True)
+    return head.stdout.strip()
+
+
+def write_ledger(path: Path, commit: str, tasks: dict | None = None) -> Path:
+    """Writes a known-issues ledger pinned to a commit."""
+    path.write_text(json.dumps({"commit": commit, "tasks": tasks or {}}), encoding="utf-8")
+    return path
 
 
 def write_result(folder: Path, result: dict) -> None:
@@ -98,7 +117,7 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("spoiled: no proxy trace: empty responses/", printed.getvalue())
         result = run.newest_result(self.tmp, "001-file")
         self.assertEqual(report.score(result), 0.0)
-        self.assertEqual(buckets.run_bucket(result, set()), buckets.INFRA)
+        self.assertEqual(buckets.run_bucket(result, set(), {}), buckets.INFRA)
         run.run_until_clean("001-file", self.tmp, spoiled_run)
         self.assertEqual(len(runs), 1 + run.MAX_RERUNS, "carrying on gives it no more reruns")
 
@@ -114,7 +133,7 @@ class RunnerTests(unittest.TestCase):
             "003-browser": None,
             "004-meeting-summary": made_up_result("004-meeting-summary", error="judge crashed"),
         }
-        summary = report.arm_summary(tasks, [one_run])
+        summary = report.arm_summary(tasks, [one_run], {})
         self.assertAlmostEqual(summary["mean"], 1.6 / 4)
         self.assertAlmostEqual(summary["pass_at_1"], 1 / 4)
         self.assertEqual(summary["infra"], 2)
@@ -150,7 +169,30 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(on_the_list, buckets.ORACLE_DEFECT)
         self.assertEqual(off_the_list, buckets.ARTIFACT)
         only_defects = made_up_result("012-doc-synthesis", checks=[check])
-        self.assertEqual(buckets.run_bucket(only_defects, defects), buckets.ORACLE_DEFECT)
+        self.assertEqual(buckets.run_bucket(only_defects, defects, {}), buckets.ORACLE_DEFECT)
+
+    def test_a_check_on_the_ledger_is_bucketed_as_oracle_defect(self) -> None:
+        known = buckets.load_known_issues(buckets.KNOWN_ISSUES)
+        self.assertEqual(known.commit, "1025086a446653702b80cfb48babbeec35db6b2c")
+        self.assertEqual(known.not_for_tuning, set(known.ceilings))
+        task_id = "025-meeting-action-tracker"
+        never = failed_check("rationale_covers_merge_decisions", "rationale covers merge decisions")
+        self.assertEqual(buckets.check_bucket(task_id, never, known.checks), buckets.ORACLE_DEFECT)
+        self.assertEqual(buckets.check_bucket(task_id, never, set()), buckets.UNLABELLED)
+        at_most = made_up_result(task_id, checks=[never], outcome_score=0.9444)
+        self.assertEqual(
+            buckets.run_bucket(at_most, known.checks, known.ceilings), buckets.ORACLE_DEFECT
+        )
+        task_id = "064-service-dependency-triage"
+        at_ceiling = made_up_result(task_id, outcome_score=0.8372)
+        short = made_up_result(task_id, outcome_score=0.8)
+        gated = made_up_result(task_id, outcome_score=0.8372, security_score=0.0)
+        for result, bucket in [
+            (at_ceiling, buckets.ORACLE_DEFECT),
+            (short, buckets.UNLABELLED),
+            (gated, buckets.UNLABELLED),
+        ]:
+            self.assertEqual(buckets.run_bucket(result, known.checks, known.ceilings), bucket)
 
     def test_a_failed_run_takes_the_bucket_that_lost_the_most_weight(self) -> None:
         checks = [
@@ -158,7 +200,7 @@ class RunnerTests(unittest.TestCase):
             failed_check("ledger_events", "ledger records 429, 503, and cursor recovery", 3.0),
             {"id": "datasets", "label": "datasets exact", "pass": True, "weight": 3.0},
         ]
-        self.assertEqual(buckets.run_bucket(made_up_result(checks=checks), set()), buckets.TOOL)
+        self.assertEqual(buckets.run_bucket(made_up_result(checks=checks), set(), {}), buckets.TOOL)
 
     def test_a_run_whose_last_model_call_got_a_5xx_is_infra(self) -> None:
         proxy_log = self.tmp / "usage-proxy" / "requests.jsonl"
@@ -184,7 +226,47 @@ class RunnerTests(unittest.TestCase):
             {task: made_up_result(task, outcome=float(i < n)) for task, n in passes.items()}
             for i in range(3)
         ]
-        self.assertEqual(report.in_band(list(passes), runs), ["002-exec"])
+        self.assertEqual(report.in_band(list(passes), runs, set()), ["002-exec"])
+        self.assertEqual(report.in_band(list(passes), runs, {"002-exec"}), [])
+
+    def test_ceiling_normalised_completion_divides_by_the_ledger_ceiling(self) -> None:
+        tasks = ["012-doc-synthesis", "001-file", "002-exec"]
+        one_run = {
+            "012-doc-synthesis": made_up_result("012-doc-synthesis", outcome_score=0.75),
+            "001-file": made_up_result("001-file", outcome_score=0.5),
+            "002-exec": None,
+        }
+        summary = report.arm_summary(tasks, [one_run], {"012-doc-synthesis": 0.75})
+        self.assertAlmostEqual(summary["completion"], 1.25 / 3)
+        self.assertAlmostEqual(summary["completion_of_ceiling"], 1.5 / 3)
+
+    def test_the_runner_refuses_a_fork_on_a_different_commit(self) -> None:
+        bench = self.tmp / "bench"
+        (bench / "src" / "harnessbench").mkdir(parents=True)
+        (bench / "src" / "harnessbench" / "cli.py").write_text("", encoding="utf-8")
+        (bench / "tasks" / "001-file").mkdir(parents=True)
+        binary = self.tmp / "letronna"
+        binary.write_text("#!/bin/sh\n", encoding="utf-8")
+        binary.chmod(0o755)
+        (self.tmp / "entry.json").write_text("{}", encoding="utf-8")
+        (self.tmp / "tasks.txt").write_text("001-file\n", encoding="utf-8")
+        argv = [
+            "--bench", str(bench),
+            "--entry", str(self.tmp / "entry.json"),
+            "--baseline", str(binary),
+            "--candidate", str(binary),
+            "--tasks", str(self.tmp / "tasks.txt"),
+            "--models", "some/model",
+            "--out", str(self.tmp / "out"),
+            "--known-issues", str(write_ledger(self.tmp / "ledger.json", "1" * 40)),
+        ]  # fmt: skip
+        with mock.patch.dict(os.environ, {"RUBRIC_API_KEY": "made-up"}):
+            with self.assertRaisesRegex(SystemExit, "is at no git commit, but"):
+                run.main(argv)
+            moved = commit_all(bench)
+            with self.assertRaisesRegex(SystemExit, f"is at {moved}, but .* Harness-Bench 1111"):
+                run.main(argv)
+        self.assertFalse((self.tmp / "out").exists(), "nothing was started")
 
     def test_a_paired_run_goes_through_run_task_for_every_arm_repeat_and_task(self) -> None:
         bench = self.tmp / "bench"
@@ -201,6 +283,9 @@ class RunnerTests(unittest.TestCase):
             binaries[arm].chmod(0o755)
         (self.tmp / "entry.json").write_text('{"adapter": "letronna"}', encoding="utf-8")
         (self.tmp / "tasks.txt").write_text("# two\n001-file\n002-exec\n", encoding="utf-8")
+        issue = {"checks": ["summary_exists"]}
+        listed = {"ceiling": 1.0, "exclude_from_tuning": True, "issues": [issue]}
+        ledger = write_ledger(self.tmp / "ledger.json", commit_all(bench), {"002-exec": listed})
         out, calls = self.tmp / "out", self.tmp / "calls.txt"
         env = {"FAKE_BENCH_CALLS": str(calls), "RUBRIC_API_KEY": "made-up"}
         argv = [
@@ -212,6 +297,7 @@ class RunnerTests(unittest.TestCase):
             "--models", "some/model",
             "--k", "2",
             "--out", str(out),
+            "--known-issues", str(ledger),
         ]  # fmt: skip
         no_judge = {
             "RUBRIC_API_KEY": "",
@@ -248,16 +334,18 @@ class RunnerTests(unittest.TestCase):
 
         printed = io.StringIO()
         with redirect_stdout(printed):
-            report.main([str(out)])
+            report.main([str(out), "--known-issues", str(ledger)])
         text = printed.getvalue()
         self.assertIn("| score, mean of 2 runs | 0.500 | 0.750 |", text)
+        self.assertIn("| completion over each task's ceiling | 0.000 | 1.000 |", text)
         self.assertIn("| pass^2 | 0.000 | 1.000 |", text)
         self.assertIn("**win**", text)
-        self.assertIn("| artifact commitment | 4 | 0 |", text)
+        self.assertIn("| artifact commitment | 2 | 0 |", text)
+        self.assertIn("| oracle defect | 2 | 0 |", text)
         self.assertIn("| 001-file | summary_exists | artifact commitment | 0 | 2 |", text)
-        (self.tmp / "defects.txt").write_text("001-file\n", encoding="utf-8")
-        with redirect_stdout(io.StringIO()), self.assertRaisesRegex(SystemExit, "a check id"):
-            report.main([str(out), "--oracle-defects", str(self.tmp / "defects.txt")])
+        self.assertIn("| 002-exec | summary_exists | oracle defect | 0 | 2 |", text)
+        with redirect_stdout(io.StringIO()), self.assertRaisesRegex(SystemExit, "is pinned to"):
+            report.main([str(out)])
 
         entry = self.tmp / "entry.json"
         with mock.patch.dict(os.environ, env), redirect_stdout(io.StringIO()):

@@ -7,12 +7,17 @@ defect for checks known to be wrong. A check is labelled by the words in its
 id and label, and by a detail saying a file is missing, not by a judge, so the
 same result always lands in the same bucket and two arms can be compared; a
 check no rule recognises stays unlabelled rather than being guessed at.
+
+The checks known to be wrong come from bench/harness-bench/known_issues.json,
+checked by hand against one Harness-Bench commit. It is JSON, though YAML
+would read better, so the report runs on a Python without PyYAML.
 """
 
 from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 CONTRACT = "contract/format"
@@ -50,6 +55,45 @@ RULES = [
 # purpose; any other skipped judge means the judge could not run.
 SKIP_REASON = "HARNESSBENCH_SKIP_PROCESS_GRADE"
 
+KNOWN_ISSUES = Path(__file__).resolve().parents[2] / "bench" / "harness-bench" / "known_issues.json"
+
+
+@dataclass
+class KnownIssues:
+    """The oracle defects checked by hand against one Harness-Bench commit."""
+
+    commit: str
+    checks: set[tuple[str, str]]
+    ceilings: dict[str, float]
+    not_for_tuning: set[str]
+
+
+def load_known_issues(path: Path) -> KnownIssues:
+    """Reads the known-issues ledger, or stops saying what is wrong with it."""
+    try:
+        ledger = json.loads(path.read_text(encoding="utf-8"))
+        tasks = ledger["tasks"]
+        known = KnownIssues(
+            commit=str(ledger["commit"]),
+            checks={
+                (task_id, check)
+                for task_id, entry in tasks.items()
+                for issue in entry["issues"]
+                for check in issue["checks"]
+            },
+            ceilings={task_id: float(entry["ceiling"]) for task_id, entry in tasks.items()},
+            not_for_tuning={
+                task_id for task_id, entry in tasks.items() if entry["exclude_from_tuning"]
+            },
+        )
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as err:
+        raise SystemExit(f"{path} cannot be read as a known-issues ledger: {err!r}") from err
+    # A ceiling divides the outcome, and no oracle scores above 1.
+    wrong = sorted(task_id for task_id, ceiling in known.ceilings.items() if not 0 < ceiling <= 1)
+    if wrong:
+        raise SystemExit(f"{path} gives a ceiling outside 0-1 to: {', '.join(wrong)}")
+    return known
+
 
 def check_id(check: dict) -> str:
     """The name an oracle check goes by."""
@@ -79,7 +123,9 @@ def check_bucket(task_id: str, check: dict, oracle_defects: set[tuple[str, str]]
     return UNLABELLED
 
 
-def run_bucket(result: dict | None, oracle_defects: set[tuple[str, str]]) -> str:
+def run_bucket(
+    result: dict | None, oracle_defects: set[tuple[str, str]], ceilings: dict[str, float]
+) -> str:
     """Names a failed run's bucket: infra, a missing output, or the bucket that lost most weight."""
     if result is None or infra_reason(result) is not None:
         return INFRA
@@ -96,8 +142,22 @@ def run_bucket(result: dict | None, oracle_defects: set[tuple[str, str]]) -> str
         return ARTIFACT
     fair = {bucket: weight for bucket, weight in lost.items() if bucket != ORACLE_DEFECT}
     if not fair:
-        return ORACLE_DEFECT if lost else UNLABELLED
+        return ORACLE_DEFECT if lost or reached_ceiling(result, ceilings) else UNLABELLED
     return max(fair, key=lambda bucket: (fair[bucket], -BUCKETS.index(bucket)))
+
+
+def reached_ceiling(result: dict, ceilings: dict[str, float]) -> bool:
+    """Whether a run held the security gate and scored all the ledger says its task allows."""
+    # The ceiling can sit inside a check that passes, as in 042 and 064, so
+    # such a run lost only to the oracle with no failed check to say so.
+    task_id = str(result.get("task_id") or "")
+    scoring = result.get("scoring") or {}
+    outcome = float(scoring.get("outcome_score") or 0.0)
+    return (
+        task_id in ceilings
+        and outcome >= ceilings[task_id]
+        and scoring.get("security_score") != 0.0
+    )
 
 
 def infra_reason(result: dict) -> str | None:
