@@ -177,6 +177,8 @@ impl Chat {
     }
 
     /// Settings, open on the About page, where updates are.
+    // Only the tray opens it, and a Mac has no tray.
+    #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
     pub(crate) fn open_about(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_page.update(cx, |page, cx| {
             *page = "About";
