@@ -454,7 +454,8 @@ impl Run {
             }
             let cancel = self.cancel.child();
             let charged = Arc::new(Budget::new(agent_budget(), Some(self.budget.clone())));
-            let go = self.board.begin(slot, &cancel, &charged);
+            let status = Arc::default();
+            let go = self.board.begin(slot, &cancel, &charged, &status);
             if go == Go::Wait {
                 return;
             }
@@ -466,20 +467,22 @@ impl Run {
                 self.record(slot, key, Ended::Skipped, None);
                 continue;
             }
-            match self.start(queued, cancel, charged) {
+            match self.start(queued, cancel, charged, status) {
                 Ok(()) => self.running += 1,
                 Err(error) => self.record(slot, key, Ended::Failed(error), None),
             }
         }
     }
 
-    /// Sets one queued agent off on a thread of its own, stopped by `cancel`
-    /// and charged on `charged`, to report on the run's channel.
+    /// Sets one queued agent off on a thread of its own, stopped by `cancel`,
+    /// charged on `charged` and getting on as `status` says, to report on the
+    /// run's channel.
     fn start(
         &mut self,
         queued: Queued,
         cancel: Cancel,
         charged: Arc<Budget>,
+        status: Arc<driver::Status>,
     ) -> Result<(), String> {
         let Queued {
             slot,
@@ -573,7 +576,7 @@ impl Run {
             rounds: def.rounds.unwrap_or(ROUNDS),
             cancel,
             budget: Some(charged.clone()),
-            status: Arc::default(),
+            status,
             depth: 1,
             fork: false,
             from: 0,
@@ -1999,6 +2002,36 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn an_agent_mid_reply_shows_a_guess_at_what_has_streamed_until_it_ends() {
+        let data = Data::new("streaming");
+        let (sent, started) = mpsc::channel();
+        let spawn: Spawn = Box::new(move |spec, then| {
+            let held = (spec.status.clone(), spec.budget.clone().unwrap(), then);
+            sent.send(held).map_err(|e| e.to_string())
+        });
+        let mut run = data.run(None, spawn);
+        run.agent("Write the report.", &explore()).unwrap();
+        let board = run.board.clone();
+        let got = driven(run);
+        let (status, budget, then) = started.recv_timeout(WAIT).unwrap();
+        // One reply charged, and 4,000 characters of the next so far.
+        budget.charge(&Message {
+            prompt_tokens: 1_000,
+            tokens: 50,
+            ..Default::default()
+        });
+        status.streamed.store(4_000, Ordering::Relaxed);
+        let tokens = |board: &Board| board.phases()[0].agents[0].tokens;
+        assert_eq!((tokens(&board), board.streaming()), (2_050, 1_000));
+        // Never charged: the budget holds only what the provider reported.
+        assert_eq!(budget.spent(), 1_050);
+        status.streamed.store(0, Ordering::Relaxed);
+        assert_eq!((tokens(&board), board.streaming()), (1_050, 0));
+        then(&done("Write the report."));
+        got.recv_timeout(WAIT).unwrap();
     }
 
     #[test]
