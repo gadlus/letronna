@@ -170,7 +170,13 @@ impl Chat {
     /// The chat app listeners are restarted on the new profile's settings, so
     /// the old profile's bots stop feeding messages into this one.
     fn reload_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mut store = letronna_core::store::load();
+        // Only listed, as at start: each is read in when it is opened.
+        let mut store = letronna_core::store::load_listing();
+        store.active = store
+            .conversations
+            .iter()
+            .position(|c| c.id == store.settings.active_id)
+            .unwrap_or(store.conversations.len().saturating_sub(1));
         if store.conversations.is_empty() {
             store.conversations.push(Conversation {
                 id: store.reserve_id(),
@@ -272,6 +278,7 @@ impl Chat {
         self.editing_skill = None;
 
         // Keyed by the old profile's session ids, which mean nothing here.
+        self.open.clear();
         self.drafts.clear();
         self.attachments.clear();
         self.modes.clear();
@@ -292,8 +299,7 @@ impl Chat {
         self.reveal = None;
         self.revealed = None;
         self.aside = None;
-        self.video = None;
-        self.video_frame = None;
+        self.stop_video(window);
         self.viewing = None;
         self.steering = None;
 

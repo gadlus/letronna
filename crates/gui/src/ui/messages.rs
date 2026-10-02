@@ -1240,7 +1240,7 @@ impl Chat {
     }
 
     /// Stop the video playing, and give its last frame back to the GPU.
-    fn stop_video(&mut self, window: &mut Window) {
+    pub(crate) fn stop_video(&mut self, window: &mut Window) {
         self.video = None;
         if let Some(frame) = self.video_frame.take() {
             let _ = window.drop_image(frame);
