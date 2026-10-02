@@ -16,9 +16,11 @@ use super::runlog::{Event, Log};
 use crate::budget::Budget;
 use crate::cancel::Cancel;
 use crate::chat::Message;
+use crate::driver::Status;
 use async_channel::Sender;
 use serde_json::Value;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 /// A run as its session sees it at one moment.
@@ -32,7 +34,9 @@ pub struct RunView {
     /// The phases its meta names, in order, then any others as its agents
     /// name them, each with its agents in the order they were called.
     pub phases: Vec<PhaseView>,
-    /// Tokens it has spent over all its launches.
+    /// Tokens it has spent over all its launches, and a guess at what its
+    /// agents' replies still streaming come to, which the provider reports
+    /// only once each ends.
     pub spent: u64,
     /// Tokens it may spend.
     pub budget: u64,
@@ -58,7 +62,8 @@ pub struct AgentView {
     pub label: String,
     pub phase: String,
     pub state: AgentState,
-    /// Tokens it has spent in this launch; none when replayed.
+    /// Tokens it has spent in this launch, and a guess at what its reply
+    /// still streaming comes to; none when replayed.
     pub tokens: u64,
 }
 
@@ -189,6 +194,8 @@ struct Call {
     state: AgentState,
     /// What it is charged on, once it starts.
     charged: Option<Arc<Budget>>,
+    /// How its reply now streaming has got on, once it starts.
+    status: Option<Arc<Status>>,
     /// Stops it, once it starts.
     cancel: Option<Cancel>,
     /// Set by a skip, until the run acts on it.
@@ -239,16 +246,23 @@ impl Board {
             key,
             state,
             charged: None,
+            status: None,
             cancel: None,
             skip: false,
         });
     }
 
     /// Whether the queued call in `slot` may start, marking it running,
-    /// stopped by `cancel` and charged on `charged`, when it may: asked under
-    /// the lock a pause and a skip take, so neither can land between the
-    /// asking and the start.
-    pub(super) fn begin(&self, slot: usize, cancel: &Cancel, charged: &Arc<Budget>) -> Go {
+    /// stopped by `cancel`, charged on `charged` and streaming as `status`
+    /// says, when it may: asked under the lock a pause and a skip take, so
+    /// neither can land between the asking and the start.
+    pub(super) fn begin(
+        &self,
+        slot: usize,
+        cancel: &Cancel,
+        charged: &Arc<Budget>,
+        status: &Arc<Status>,
+    ) -> Go {
         let mut shared = self.shared();
         let held = shared.held;
         let Some(call) = shared.calls.get_mut(slot) else {
@@ -263,6 +277,7 @@ impl Board {
         call.state = AgentState::Running;
         call.cancel = Some(cancel.clone());
         call.charged = Some(charged.clone());
+        call.status = Some(status.clone());
         self.write(&shared, Event::Started, Some(slot), "");
         Go::Start
     }
@@ -337,7 +352,8 @@ impl Board {
                 label: call.label.clone(),
                 phase: call.phase.clone(),
                 state: call.state,
-                tokens: call.charged.as_ref().map_or(0, |charged| charged.spent()),
+                tokens: call.charged.as_ref().map_or(0, |charged| charged.spent())
+                    + streaming(call),
             })
             .collect();
         let phases = shared.phases.iter().map(|title| PhaseView {
@@ -348,6 +364,11 @@ impl Board {
                 .collect(),
         });
         phases.collect()
+    }
+
+    /// What the replies still streaming come to, as `streaming` guesses it.
+    pub(super) fn streaming(&self) -> u64 {
+        self.shared().calls.iter().map(streaming).sum()
     }
 
     /// Holds the queued agents of run `name` back; refused when a pause
@@ -457,6 +478,14 @@ impl Board {
     fn poke(&self) {
         let _ = self.wake.try_send(Arrival::Wake);
     }
+}
+
+/// Tokens `call`'s reply still streaming has come to so far, at four
+/// characters a token: the provider says only once the reply ends, which for
+/// a long answer can be minutes. Shown, never charged.
+fn streaming(call: &Call) -> u64 {
+    let status = call.status.as_ref();
+    status.map_or(0, |status| status.streamed.load(Ordering::Relaxed)) / 4
 }
 
 /// The slot of the call `agent` names among run `name`'s `calls`: its label,

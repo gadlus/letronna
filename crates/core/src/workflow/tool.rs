@@ -541,7 +541,7 @@ impl Live {
             title: self.title.clone(),
             state,
             phases: self.board.phases(),
-            spent: self.earlier + self.budget.spent(),
+            spent: self.earlier + self.budget.spent() + self.board.streaming(),
             budget: self.limit,
             seconds,
         }

@@ -183,6 +183,9 @@ pub struct Status {
     pub cached: AtomicU64,
     /// Tokens the model has written so far.
     pub output: AtomicU64,
+    /// Characters of the reply still streaming, its words and its thinking,
+    /// which no count above holds until the provider reports it at the end.
+    pub streamed: AtomicU64,
 }
 
 /// How a run ended and what it came to.
@@ -780,7 +783,10 @@ fn ask_in_line(spec: &Spec, turn: &mut Turn) -> Result<Option<Message>, String> 
             return Ok(None);
         };
         let throttled = gate.throttled();
-        let error = match ask(spec, turn, permit) {
+        let asked = ask(spec, turn, permit);
+        // What streamed is in the reply's own count now, or went with it.
+        spec.status.streamed.store(0, Ordering::Relaxed);
+        let error = match asked {
             Ok(Some(reply)) => {
                 gate.answered();
                 return Ok(Some(reply));
@@ -822,6 +828,11 @@ fn ask(spec: &Spec, turn: &mut Turn, permit: Permit) -> Result<Option<Message>, 
         closer.close();
     });
     while let Ok(event) = events.recv_blocking() {
+        // Counted before it is told, so a watcher reads the count with it.
+        if let Event::Delta(text) | Event::Reasoning(text) = &event {
+            let streamed = &spec.status.streamed;
+            streamed.fetch_add(text.len() as u64, Ordering::Relaxed);
+        }
         // Told as it streams, so the words of a try a 429 cuts short stay
         // with the watcher though the reply drops them, as on a screen.
         match &event {
@@ -1249,6 +1260,36 @@ pub(crate) mod tests {
             when,
             text: text.into(),
         }
+    }
+
+    #[test]
+    fn a_reply_counts_what_it_has_streamed_until_it_ends() {
+        let dir = scratch("streamed");
+        let event = |event: Value| format!("data: {event}\n\n");
+        let mut stream: String = (["Reading ", "the notes."].iter())
+            .map(|text| event(json!({"choices": [{"delta": {"content": text}}]})))
+            .collect();
+        stream.push_str(&event(json!({"choices": [],
+            "usage": {"prompt_tokens": 1_000, "completion_tokens": 50}})));
+        stream.push_str("data: [DONE]\n\n");
+        let (endpoint, provider) = provider(vec![stream]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 480);
+        let status = spec.status.clone();
+        let counts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (seen, counted) = (counts.clone(), status.clone());
+        spec.watch = Some(Arc::new(move |step| {
+            if let Step::Said(_) = step {
+                let streamed = counted.streamed.load(Ordering::Relaxed);
+                seen.lock().unwrap().push(streamed);
+            }
+        }));
+        let report = finished(spec);
+        provider.sent();
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(*counts.lock().unwrap(), [8, 18]);
+        // The provider's count holds it from here.
+        assert_eq!(status.streamed.load(Ordering::Relaxed), 0);
+        assert_eq!(status.output.load(Ordering::Relaxed), 50);
     }
 
     #[test]
