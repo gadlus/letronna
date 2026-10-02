@@ -7,6 +7,38 @@ use crate::ui::actions::{NextTurn, PreviousTurn, Stop};
 use letronna_core::approvals::Decision;
 use letronna_core::{gate, tools};
 
+/// What the card for a call waiting on the user shows, worked out once when
+/// it comes up: the preview reads the user's keys from disk to hide them,
+/// and the card is drawn many times a second while it waits.
+pub(crate) struct CardFor {
+    call: backend::ToolCall,
+    args: serde_json::Value,
+    preview: String,
+    /// Whether "Allow for this session" is offered.
+    for_session: bool,
+}
+
+impl CardFor {
+    pub(crate) fn of(call: &backend::ToolCall, ctx: &tools::ToolContext) -> Self {
+        let args = tools::parse_args_for(&call.name, &call.arguments).unwrap_or_default();
+        Self {
+            call: call.clone(),
+            preview: tools::preview(&call.name, &call.arguments, ctx),
+            for_session: gate::grants_for_session(&call.name, &args)
+                && !tools::asked_each_time(&call.name),
+            args,
+        }
+    }
+
+    /// Whether this was worked out for `call`, arguments and all: some
+    /// gateways number their calls the same in every reply.
+    fn is_for(&self, call: &backend::ToolCall) -> bool {
+        self.call.id == call.id
+            && self.call.name == call.name
+            && self.call.arguments == call.arguments
+    }
+}
+
 /// Picks a question card's answer by its place, for the letter keys.
 #[derive(Clone, PartialEq, Action)]
 #[action(namespace = question, no_json)]
@@ -102,7 +134,16 @@ impl Chat {
             return Some(v_flex().gap_1().children(lines).into_any_element());
         }
 
-        let args = tools::parse_args_for(&call.name, &call.arguments).unwrap_or_default();
+        // Worked out when the card came up; here only if it somehow was not.
+        let made;
+        let shown = match self.card_for.as_ref().filter(|shown| shown.is_for(&call)) {
+            Some(shown) => shown,
+            None => {
+                made = CardFor::of(&call, &ctx);
+                &made
+            }
+        };
+        let args = &shown.args;
         let card = v_flex()
             .w_full()
             .gap_3()
@@ -131,7 +172,7 @@ impl Chat {
                 }))
                 .flex_wrap()
                 .gap_2();
-            for (i, option) in options_in(&args).into_iter().enumerate() {
+            for (i, option) in options_in(args).into_iter().enumerate() {
                 let pick = option.clone();
                 let mut chip = Button::new(("option", i)).framed(cx).small();
                 // Its letter, while the keys are on the answers to press it.
@@ -177,7 +218,7 @@ impl Chat {
         }
 
         if call.name == tools::EXIT_PLAN {
-            let plan = tools::preview(&call.name, &call.arguments, &ctx);
+            let plan = shown.preview.clone();
             return Some(
                 card.child(
                     div()
@@ -230,7 +271,6 @@ impl Chat {
             "search_web" => "Letronna wants to search the web".to_owned(),
             other => format!("Letronna wants to use {other}"),
         };
-        let preview = tools::preview(&call.name, &call.arguments, &ctx);
         // These work in the project folder. Without one, Allow could only
         // fail, so the card asks for the folder first.
         let folder = self
@@ -288,20 +328,16 @@ impl Chat {
                 )
                 // An upload, or a sign-in, is asked about each time, so there
                 // is no allowing it for the session.
-                .children(
-                    (gate::grants_for_session(&call.name, &args)
-                        && !tools::asked_each_time(&call.name))
-                    .then(|| {
-                        Button::new("allow-session")
-                            .framed(cx)
-                            .small()
-                            .label("Allow for this session")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.take_reason(window, cx);
-                                this.resolve_call(Verdict::Allow { remember: true }, cx)
-                            }))
-                    }),
-                )
+                .children(shown.for_session.then(|| {
+                    Button::new("allow-session")
+                        .framed(cx)
+                        .small()
+                        .label("Allow for this session")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.take_reason(window, cx);
+                            this.resolve_call(Verdict::Allow { remember: true }, cx)
+                        }))
+                }))
                 .children(self.offer.as_ref().map(|rule| {
                     Button::new("allow-here")
                         .framed(cx)
@@ -371,7 +407,7 @@ impl Chat {
                     .bg(cx.theme().background)
                     .child(crate::ui::code_block(
                         "preview",
-                        tools::clamp_lines(&preview, 400),
+                        tools::clamp_lines(&shown.preview, 400),
                         px(240.),
                         window,
                         cx,
