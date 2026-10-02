@@ -68,6 +68,15 @@ pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Opti
             Some("Open activity"),
         ),
         (
+            KeyBinding::new("secondary-shift-i", ui::activity::ShowRunning, Some("Chat")),
+            Some("Show what is running"),
+        ),
+        // Nearer than the chat's own escape, which would stop the reply.
+        (
+            KeyBinding::new("escape", ui::activity::LeaveStrip, Some("LiveStrip")),
+            Some("In the strip over the composer: close its list"),
+        ),
+        (
             KeyBinding::new("secondary-k", ui::palette::OpenPalette, Some("Chat")),
             Some("Open the command palette"),
         ),

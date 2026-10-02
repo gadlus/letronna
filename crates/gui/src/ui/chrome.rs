@@ -287,35 +287,34 @@ impl Chat {
             .on_click(cx.listener(|this, _, window, cx| this.show_changes(window, cx)))
     }
 
-    /// One chip per running background job, which shows its output in the
-    /// Jobs tab. A finished one is history, and is kept there.
-    fn job_chips(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let jobs = letronna_core::jobs::list();
-        h_flex().gap_1().children(
-            jobs.into_iter()
-                .filter(|job| job.running)
-                .map(|job| {
-                    let label = letronna_core::tools::one_line(&job.command);
-                    Button::new(("job", job.id as usize))
-                        .plain(cx)
-                        .xsmall()
-                        .text_color(cx.theme().muted_foreground)
-                        .tooltip(format!("Job #{}: {label} — see its output", job.id))
-                        .child(
-                            h_flex()
-                                .gap_1()
-                                .items_center()
-                                .max_w(px(180.))
-                                .child(div().size(px(6.)).rounded_full().bg(cx.theme().green))
-                                .child(div().truncate().child(label)),
-                        )
-                        .on_click(
-                            cx.listener(move |this, _, window, cx| {
-                                this.show_job(job.id, window, cx)
-                            }),
-                        )
-                })
-                .collect::<Vec<_>>(),
+    /// How many things are working, away from the chat, whose strip over the
+    /// composer lists them; click to see them there.
+    fn running_pill(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if self.page == Page::Chat {
+            return None;
+        }
+        let running = self.running_count();
+        if running == 0 {
+            return None;
+        }
+        Some(
+            Button::new("running")
+                .plain(cx)
+                .xsmall()
+                .text_color(cx.theme().muted_foreground)
+                .tooltip_with_action(
+                    "See what is running",
+                    &crate::ui::activity::ShowRunning,
+                    Some("Chat"),
+                )
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(div().size(px(6.)).rounded_full().bg(cx.theme().green))
+                        .child(format!("{running} running")),
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.show_running(window, cx))),
         )
     }
 
@@ -325,7 +324,7 @@ impl Chat {
         let about = letronna_core::wake::looping(session)?;
         Some(
             Button::new("loop")
-                .ghost()
+                .plain(cx)
                 .xsmall()
                 .text_color(cx.theme().muted_foreground)
                 .tooltip(format!("{about} — click to stop"))
@@ -344,31 +343,6 @@ impl Chat {
         )
     }
 
-    /// How many helpers are working, while any are; click to see them. Away
-    /// from the chat only, whose strip over the composer says it there.
-    fn helper_pill(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let working = self.helpers_working();
-        if working == 0 || self.page == Page::Chat {
-            return None;
-        }
-        let s = if working == 1 { "" } else { "s" };
-        Some(
-            Button::new("helpers")
-                .ghost()
-                .xsmall()
-                .text_color(cx.theme().muted_foreground)
-                .tooltip("See, steer or stop them")
-                .child(
-                    h_flex()
-                        .gap_1()
-                        .items_center()
-                        .child(div().size(px(6.)).rounded_full().bg(cx.theme().green))
-                        .child(format!("{working} helper{s} working")),
-                )
-                .on_click(cx.listener(|this, _, window, cx| this.open_activity(window, cx))),
-        )
-    }
-
     pub(crate) fn status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .h(px(20.))
@@ -379,14 +353,13 @@ impl Chat {
             .text_color(cx.theme().muted_foreground)
             .child(self.gateway_chip(cx))
             .child(self.workspace_chip(cx))
-            .child(self.job_chips(cx))
+            .children(self.running_pill(cx))
             .children(self.loop_chip(cx))
             .children(
                 self.heard_elsewhere
                     .as_ref()
                     .map(|holder| div().min_w_0().truncate().child(holder.line())),
             )
-            .children(self.helper_pill(cx))
             .children(self.context_chip(cx))
             .child(div().flex_1())
             .children(self.update_chip(cx))

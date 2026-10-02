@@ -570,7 +570,7 @@ impl Chat {
                 )
                 .child(
                     Button::new(("stop-run", id as usize))
-                        .ghost()
+                        .plain(cx)
                         .xsmall()
                         .icon(Icon::new(AppIcon::Stop))
                         .tooltip("Stop")

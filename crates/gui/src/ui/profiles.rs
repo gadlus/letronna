@@ -291,6 +291,7 @@ impl Chat {
         self.thought_for.clear();
         self.thinking_since = None;
         self.edited.clear();
+        self.plan_folded.clear();
         self.unseen.clear();
         self.panel.forget_previews();
         self.found.clear();
