@@ -320,29 +320,30 @@ impl BrowserView {
             window.focus(&self.focus);
         }
         if !letronna_core::browser::has_page() {
-            self.resume(cx);
+            self.resume(HOME.to_owned(), cx);
         }
     }
 
     /// Open the browser the user asked to see as the preview: as `ask` does,
-    /// but leaving the keys where they are.
-    pub(crate) fn reopen(&mut self, cx: &mut Context<Self>) {
+    /// but leaving the keys where they are, and on `home` if the session's
+    /// page is gone.
+    pub(crate) fn reopen(&mut self, home: Option<String>, cx: &mut Context<Self>) {
         self.dismissed = false;
         self.open(cx);
         if !letronna_core::browser::has_page() {
-            self.resume(cx);
+            self.resume(home.unwrap_or(HOME.to_owned()), cx);
         }
     }
 
     /// Open the session's page again, closed with its browser while nothing
-    /// used it, or Google if it has none, showing it load meanwhile.
-    fn resume(&mut self, cx: &mut Context<Self>) {
+    /// used it, or `home` if it has none, showing it load meanwhile.
+    fn resume(&mut self, home: String, cx: &mut Context<Self>) {
         self.note = None;
         self.start_loading(cx);
         cx.spawn(async move |view, cx| {
             let resumed = cx
                 .background_executor()
-                .spawn(async { letronna_core::browser::resume(HOME) })
+                .spawn(async move { letronna_core::browser::resume(&home) })
                 .await;
             let _ = view.update(cx, |view, cx| {
                 match resumed {
@@ -403,7 +404,7 @@ impl BrowserView {
         } else if std::mem::take(&mut self.unseen) {
             self.open(cx);
             if !self.url.is_empty() && !letronna_core::browser::has_page() {
-                self.resume(cx);
+                self.resume(HOME.to_owned(), cx);
             }
         }
         cx.notify();

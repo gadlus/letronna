@@ -976,6 +976,13 @@ impl Chat {
             .read(cx)
             .clone();
         let summary = letronna_core::tools::summary(&message.name, &message.args);
+        // A call that used the browser can bring its page back up, at the
+        // address it opened if the browser has since let it go.
+        let page = matches!(message.name.as_str(), "browse" | "use_page");
+        let address = page
+            .then(|| serde_json::from_str::<serde_json::Value>(&message.args).ok())
+            .flatten()
+            .and_then(|args| args["url"].as_str().map(str::to_owned));
         // The fences' tags are for the model; here a few words say where the
         // text came from.
         let (content, from) = letronna_core::untrusted::shown(&message.name, &message.content);
@@ -1095,11 +1102,12 @@ impl Chat {
                                 .child(from),
                         )
                     })
+                    .when(open || page, |row| row.child(div().flex_1()))
                     // All of it, however little the preview shows; read when
                     // copied, not copied out at every frame.
                     .when(open, |row| {
                         let chat = cx.weak_entity();
-                        row.child(div().flex_1()).child(
+                        row.child(
                             gpui_component::clipboard::Clipboard::new(("copy-tool", index))
                                 .value_fn(move |_, cx| {
                                     if let Some(text) = &copied {
@@ -1122,6 +1130,21 @@ impl Chat {
                                         .unwrap_or_default()
                                         .into()
                                 }),
+                        )
+                    })
+                    // A call that used the browser: the page it left, small,
+                    // in the corner, as the agent's browsing shows it.
+                    .when(page, |row| {
+                        row.child(
+                            Button::new(("tool-page", index))
+                                .plain(cx)
+                                .xsmall()
+                                .icon(Icon::new(IconName::Globe).size_3())
+                                .tooltip("Show the page")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.open_browser_preview_at(address.clone(), window, cx);
+                                })),
                         )
                     })
                     // As on a folded run: a press leaves the keys in the

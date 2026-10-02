@@ -448,13 +448,24 @@ impl Chat {
     /// Show the browser of the session on screen as the preview at the
     /// chat's corner, unless it is beside the chat already.
     pub(crate) fn open_browser_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_browser_preview_at(None, window, cx);
+    }
+
+    /// As `open_browser_preview`, opening `home` if the session's page is
+    /// gone with its browser: the address a browse row was on.
+    pub(crate) fn open_browser_preview_at(
+        &mut self,
+        home: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.tab_on_screen(window, cx) == Some(PanelTab::Browser) {
             return;
         }
         self.page = Page::Chat;
         self.panel.previews.insert(self.session_on_screen());
         if !self.browser.read(cx).is_open() {
-            self.browser.update(cx, |view, cx| view.reopen(cx));
+            self.browser.update(cx, |view, cx| view.reopen(home, cx));
         }
         cx.notify();
     }
