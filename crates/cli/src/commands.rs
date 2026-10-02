@@ -1964,6 +1964,9 @@ fn mcp_servers(runner: &mut Runner, rest: &str) {
     let (verb, name) = rest.split_once(' ').unwrap_or((rest, ""));
     let name = name.trim();
     render::blank();
+    if matches!(verb, "enable" | "disable") && name.is_empty() && switch_servers(runner) {
+        return;
+    }
     if !verb.is_empty() && verb != "reload" && name.is_empty() {
         let which = format!("Which server? /mcp {verb} <name>");
         render::said(&render::blue("●"), &render::bold(&which));
@@ -2028,8 +2031,32 @@ fn mcp_servers(runner: &mut Runner, rest: &str) {
         render::line(&render::dim("/mcp <prompt> to send one"));
     }
     render::line(&render::dim(
-        "/mcp reconnect|enable|disable|login|logout|log <name>, or /mcp reload after editing mcp.json",
+        "/mcp enable or /mcp disable to switch servers · /mcp reconnect|login|logout|log <name> · /mcp reload after editing mcp.json",
     ));
+}
+
+/// The MCP servers as a list to switch on and off with the arrows. False off
+/// a keyboard, or with no servers to switch.
+fn switch_servers(runner: &mut Runner) -> bool {
+    use letronna_core::mcp::{self, State};
+    let rows: Vec<_> = mcp::status()
+        .iter()
+        .map(|server| crate::bar::Switch {
+            name: server.name.clone(),
+            about: format!(
+                "{} · {}",
+                server.transport,
+                render::plain(&crate::mcp::health(server))
+            ),
+            on: server.state != State::Disabled,
+        })
+        .collect();
+    if rows.is_empty() {
+        return false;
+    }
+    switch_list(runner, "MCP servers", rows, &mut |name, on| {
+        mcp::set_enabled(name, on)
+    })
 }
 
 /// The newest of what one server printed on stderr.
@@ -2083,6 +2110,12 @@ fn skills(runner: &mut Runner, rest: &str, workspace: Option<&std::path::Path>) 
             return;
         }
     };
+    // Switching with no name, or the bare command, opens them as a list to
+    // switch with the arrows; `/skills list` lists them as lines.
+    let switching = rest.is_empty() || (matches!(verb, "on" | "off") && target.is_empty());
+    if switching && !saved.is_empty() && switch_skills(runner, &saved) {
+        return;
+    }
     if matches!(verb, "on" | "off") {
         switch_skill(&saved, target, verb == "on");
         return;
@@ -2096,7 +2129,7 @@ fn skills(runner: &mut Runner, rest: &str, workspace: Option<&std::path::Path>) 
     }
 
     // Named, it goes to the model as the next thing said.
-    if !rest.is_empty() {
+    if !rest.is_empty() && rest != "list" {
         match pick_skill(&saved, rest) {
             Ok(skill) => {
                 render::said(&render::blue("●"), &render::bold(&skill.name));
@@ -2114,14 +2147,8 @@ fn skills(runner: &mut Runner, rest: &str, workspace: Option<&std::path::Path>) 
         } else {
             render::dim("off")
         };
-        let source = match skill.source {
-            Source::User if skill.learned => "learned",
-            Source::User => "yours",
-            Source::Project => "project",
-            Source::Plugin => "plugin",
-        };
         // A line each: descriptions are written for the model, and run long.
-        let about = format!("{source} · {}", skill.description);
+        let about = skill_about(skill);
         let room = render::width().saturating_sub(skill.name.chars().count() + 12);
         let about = if about.chars().count() > room {
             let cut: String = about.chars().take(room.saturating_sub(1)).collect();
@@ -2136,8 +2163,76 @@ fn skills(runner: &mut Runner, rest: &str, workspace: Option<&std::path::Path>) 
         ));
     }
     render::line(&render::dim(
-        "/skills <name> to use one · /skills on|off <name> · /skills add <owner/repo, link or path>",
+        "/skills <name> to use one · /skills to switch them · /skills add <owner/repo, link or path>",
     ));
+}
+
+/// What a skill is listed with: where it came from, then its description.
+fn skill_about(skill: &Skill) -> String {
+    let source = match skill.source {
+        Source::User if skill.learned => "learned",
+        Source::User => "yours",
+        Source::Project => "project",
+        Source::Plugin => "plugin",
+    };
+    format!("{source} · {}", skill.description)
+}
+
+/// The skills as a list to switch on and off with the arrows. False off a
+/// keyboard, where they are listed as lines instead.
+fn switch_skills(runner: &mut Runner, saved: &[Skill]) -> bool {
+    let rows = saved
+        .iter()
+        .map(|skill| crate::bar::Switch {
+            name: skill.name.clone(),
+            about: skill_about(skill),
+            on: skill.enabled,
+        })
+        .collect();
+    let switched = switch_list(runner, "Skills", rows, &mut |name, on| {
+        letronna_core::skills::set_enabled(name, on)
+    });
+    if switched {
+        render::line(&render::dim(
+            "Only the ones on are offered to the model · /skills <name> to use one",
+        ));
+    }
+    switched
+}
+
+/// Switch things on and off from a list in the box, and leave a line in the
+/// conversation saying what changed. False off a keyboard, with nothing done.
+fn switch_list(
+    runner: &mut Runner,
+    what: &str,
+    rows: Vec<crate::bar::Switch>,
+    flip: &mut dyn FnMut(&str, bool) -> Result<(), String>,
+) -> bool {
+    if !runner.bar.steered() {
+        return false;
+    }
+    let before: Vec<bool> = rows.iter().map(|row| row.on).collect();
+    let after = runner.bar.switches(what, rows, flip);
+    let on = after.iter().filter(|row| row.on).count();
+    render::said(
+        &render::blue("●"),
+        &render::bold(&format!("{what}: {on} of {} on", after.len())),
+    );
+    for (state, label) in [(true, "Switched on"), (false, "Switched off")] {
+        let names: Vec<&str> = after
+            .iter()
+            .zip(&before)
+            .filter(|(row, was)| row.on == state && row.on != **was)
+            .map(|(row, _)| row.name.as_str())
+            .collect();
+        if !names.is_empty() {
+            render::line(&render::dim(&format!("{label}: {}", names.join(", "))));
+        }
+    }
+    if after.iter().zip(&before).all(|(row, was)| row.on == *was) {
+        render::line(&render::dim("Nothing was switched."));
+    }
+    true
 }
 
 /// The skill called `wanted`, or else the one whose name contains it. When
@@ -2248,6 +2343,35 @@ fn add_skills(runner: &mut Runner, source: &str) {
 
 /// The plugins: list them and what each brings, or add, switch, allow,
 /// update or remove one, or look through the marketplaces.
+/// The plugins as a list to switch on and off with the arrows. False off a
+/// keyboard, or with no plugins to switch.
+fn switch_plugins(runner: &mut Runner) -> bool {
+    use letronna_core::plugins;
+    let rows: Vec<_> = match plugins::list() {
+        Ok(found) => found
+            .into_iter()
+            .map(|plugin| crate::bar::Switch {
+                about: match &plugin.broken {
+                    Some(why) => format!("will not load · {why}"),
+                    None => plugin.description.clone(),
+                },
+                name: plugin.name,
+                on: plugin.enabled,
+            })
+            .collect(),
+        Err(why) => {
+            render::line(&render::red(&why));
+            return true;
+        }
+    };
+    if rows.is_empty() {
+        return false;
+    }
+    switch_list(runner, "Plugins", rows, &mut |name, on| {
+        plugins::set_enabled(name, on)
+    })
+}
+
 fn plugins(runner: &mut Runner, rest: &str) {
     use letronna_core::plugins;
     render::blank();
@@ -2255,6 +2379,9 @@ fn plugins(runner: &mut Runner, rest: &str) {
         .split_once(' ')
         .map_or((rest, ""), |(verb, target)| (verb, target.trim()));
     let needs_name = matches!(verb, "on" | "off" | "allow" | "remove" | "add");
+    if matches!(verb, "on" | "off") && target.is_empty() && switch_plugins(runner) {
+        return;
+    }
     if needs_name && target.is_empty() {
         let what = if verb == "add" {
             "<git url or owner/repo>"
