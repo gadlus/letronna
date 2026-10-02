@@ -5,54 +5,214 @@ use crate::prelude::*;
 /// sized from.
 pub(crate) const SIDEBAR_WIDTH: Pixels = px(250.);
 
+/// The pages folded under the sidebar's More row, in the order it lists
+/// them; Workflows only while there is a run to show.
+const MORE: [Page; 5] = [
+    Page::Plugins,
+    Page::Messaging,
+    Page::Artifacts,
+    Page::Jobs,
+    Page::Workflows,
+];
+
+/// A row of the sidebar's page list.
+#[derive(Clone, Copy, PartialEq)]
+enum Nav {
+    New,
+    Page(Page),
+    More,
+}
+
+impl Nav {
+    /// A number of its own, for the row's id and its focus.
+    fn slot(self) -> usize {
+        match self {
+            Nav::New => 0,
+            Nav::More => 1,
+            Nav::Page(page) => 2 + page as usize,
+        }
+    }
+}
+
+/// The icon a page's row in the sidebar shows.
+fn page_icon(page: Page) -> AppIcon {
+    match page {
+        Page::Chat => AppIcon::MessageSquare,
+        Page::Capabilities => AppIcon::Sparkles,
+        Page::Plugins => AppIcon::Puzzle,
+        Page::Messaging => AppIcon::MessageSquare,
+        Page::Artifacts => AppIcon::File,
+        Page::Jobs => AppIcon::Clock,
+        Page::Activity => AppIcon::Robot,
+        Page::Workflows => AppIcon::Workflow,
+    }
+}
+
+/// The sidebar's page rows, top to bottom: New session, the two pages used
+/// most, then More, with the rest under it once it is `open`. Folded, the
+/// page on screen still shows, above More, so the row marking it is there.
+fn nav_rows(open: bool, on_screen: Page, workflows: bool) -> Vec<Nav> {
+    let under: Vec<Page> = MORE
+        .into_iter()
+        .filter(|&page| page != Page::Workflows || workflows)
+        .collect();
+    let mut rows = vec![
+        Nav::New,
+        Nav::Page(Page::Capabilities),
+        Nav::Page(Page::Activity),
+    ];
+    if !open && under.contains(&on_screen) {
+        rows.push(Nav::Page(on_screen));
+    }
+    rows.push(Nav::More);
+    if open {
+        rows.extend(under.into_iter().map(Nav::Page));
+    }
+    rows
+}
+
 impl Chat {
-    pub(crate) fn nav_item(
+    /// A row of the sidebar's page list, the `at`th of `handles`: Tab
+    /// reaches it and Enter opens it as a click does, and Up and Down go on
+    /// to the row above or below, from the last into the sessions.
+    fn nav_item(
         &self,
-        id: &'static str,
-        icon: AppIcon,
-        label: &'static str,
-        page: Option<Page>,
+        nav: Nav,
+        at: usize,
+        handles: &std::rc::Rc<[FocusHandle]>,
+        folded: &[Page],
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
-        let active = page.is_some_and(|p| p == self.page);
+        let active = matches!(nav, Nav::Page(page) if page == self.page);
+        let theme = cx.theme();
+        let (muted, ring, accent) = (theme.muted_foreground, theme.ring, theme.sidebar_accent);
+        let (icon, label) = match nav {
+            Nav::New => (Icon::new(AppIcon::SquarePen), "New session"),
+            Nav::Page(page) => (Icon::new(page_icon(page)), page.title()),
+            Nav::More => (Icon::new(IconName::Ellipsis), "More"),
+        };
+        let up = at.checked_sub(1).and_then(|up| handles.get(up)).cloned();
+        let down = handles.get(at + 1).cloned();
+        // Folded, More says what is under it.
+        let under = (nav == Nav::More && !folded.is_empty()).then(|| {
+            folded
+                .iter()
+                .map(|page| page.title())
+                .collect::<Vec<_>>()
+                .join(", ")
+        });
         h_flex()
-            .id(id)
-            .h(px(28.))
+            .id(("nav", nav.slot()))
+            .track_focus(&handles[at])
+            .h(px(26.))
             .px_2()
             .gap_2()
             .items_center()
-            .rounded(cx.theme().radius)
+            .rounded(theme.radius)
+            // Always there, so the ring the keys bring moves nothing.
+            .border_1()
+            .border_color(theme.transparent)
             .cursor_pointer()
             .font_family(HEADING_FONT)
             .font_weight(FontWeight::MEDIUM)
-            .text_color(cx.theme().sidebar_foreground)
-            .when(active, |this| this.bg(cx.theme().sidebar_accent))
-            .active(|s| s.bg(cx.theme().sidebar_accent.opacity(0.6)))
+            .text_color(theme.sidebar_foreground)
+            .when(active, |this| this.bg(accent))
+            .focus(|s| s.border_color(ring))
+            .active(|s| s.bg(accent.opacity(0.6)))
+            .child(icon.size_4().text_color(muted))
             .child(
-                Icon::new(icon)
-                    .size_4()
-                    .text_color(cx.theme().muted_foreground),
+                div()
+                    .when(nav != Nav::More, |this| this.flex_1())
+                    .min_w_0()
+                    .truncate()
+                    .child(label),
             )
-            .child(div().flex_1().child(label))
-            .when_some(page, |this, page| {
-                this.on_click(cx.listener(move |this, _, window, cx| {
-                    if page == Page::Capabilities {
-                        return this.open_capabilities(window, cx);
-                    }
-                    if page == Page::Jobs {
-                        return this.open_jobs(window, cx);
-                    }
-                    this.page = page;
-                    if page == Page::Artifacts {
-                        this.read_artifacts(cx);
-                    }
-                    if page == Page::Plugins {
-                        this.reload_plugins();
-                    }
-                    this.focus_composer(window, cx);
-                    cx.notify();
-                }))
+            .when(nav == Nav::New, |this| {
+                this.children(
+                    crate::ui::keys::bound_key(&NewSession, cx).map(|key| Kbd::new(key).text_xs()),
+                )
             })
+            .when(nav == Nav::More, |this| {
+                this.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .font_weight(FontWeight::NORMAL)
+                        .text_color(muted)
+                        .children(under),
+                )
+                .child(
+                    Icon::new(if self.nav_more {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .size_3()
+                    .text_color(muted),
+                )
+            })
+            // As on a session row, a press leaves the keys where they were;
+            // Tab or Up and Down are what put them here.
+            .on_any_mouse_down(|_, window, _| window.prevent_default())
+            .on_click(cx.listener(move |this, _, window, cx| match nav {
+                Nav::New => this.new_chat(window, cx),
+                Nav::Page(page) => this.open_page(page, window, cx),
+                Nav::More => {
+                    this.nav_more ^= true;
+                    cx.notify();
+                }
+            }))
+            .on_action(
+                cx.listener(move |_, _: &sessions::PreviousSession, window, _| {
+                    if let Some(up) = &up {
+                        window.focus(up);
+                    }
+                }),
+            )
+            .on_action(cx.listener(
+                move |this, _: &sessions::NextSession, window, cx| match &down {
+                    Some(down) => window.focus(down),
+                    None => this.down_to_sessions(window, cx),
+                },
+            ))
+    }
+
+    /// Go to `page` as its sidebar row does, reading afresh what it lists.
+    pub(crate) fn open_page(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
+        match page {
+            Page::Capabilities => return self.open_capabilities(window, cx),
+            Page::Jobs => return self.open_jobs(window, cx),
+            // To the list, as the pill goes, even from a transcript.
+            Page::Activity => return self.open_activity(window, cx),
+            Page::Workflows => return self.open_workflows(window, cx),
+            Page::Artifacts => self.read_artifacts(cx),
+            Page::Plugins => self.reload_plugins(),
+            Page::Chat | Page::Messaging => {}
+        }
+        self.page = page;
+        self.focus_composer(window, cx);
+        cx.notify();
+    }
+
+    /// Down from the last page row: the keys go on to the sessions, at the
+    /// first one listed.
+    fn down_to_sessions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(&first) = self.listed_sessions(cx).first() else {
+            return;
+        };
+        self.picked = Some(self.store.conversations[first].id);
+        window.focus(&self.sidebar_focus);
+        cx.notify();
+    }
+
+    /// Whether the sidebar's keys are on its first session, or it lists
+    /// none, so that Up goes on to the page rows above.
+    fn at_first_session(&self, cx: &App) -> bool {
+        let listed = self.listed_sessions(cx);
+        let at = self.picked.and_then(|id| self.store.index_of(id));
+        listed.is_empty() || at.is_some_and(|at| listed.first() == Some(&at))
     }
 
     pub(crate) fn section(&self, label: &'static str, cx: &Context<Self>) -> Div {
@@ -90,11 +250,13 @@ impl Chat {
             .text_sm()
             .when(active, |this| this.bg(cx.theme().sidebar_accent))
             .active(|s| s.bg(cx.theme().sidebar_accent.opacity(0.6)))
+            // Its marks are in the blue read as text: the fill blue sinks
+            // under 3:1 on the midnight frame.
             .child(if c.pinned {
                 Icon::new(AppIcon::Pin)
                     .size_3()
                     .text_color(if active {
-                        cx.theme().primary
+                        cx.theme().link
                     } else {
                         cx.theme().muted_foreground
                     })
@@ -105,7 +267,7 @@ impl Chat {
                     .rounded_full()
                     .flex_shrink_0()
                     .bg(if active {
-                        cx.theme().primary
+                        cx.theme().link
                     } else {
                         cx.theme().muted_foreground.opacity(0.5)
                     })
@@ -117,7 +279,7 @@ impl Chat {
                 this.child(
                     Icon::new(AppIcon::Play)
                         .size_3()
-                        .text_color(cx.theme().primary),
+                        .text_color(cx.theme().link),
                 )
             })
             // A notice started a turn there, or a run ended, while you were
@@ -128,7 +290,7 @@ impl Chat {
                         .size(px(6.))
                         .rounded_full()
                         .flex_shrink_0()
-                        .bg(cx.theme().primary),
+                        .bg(cx.theme().link),
                 )
             })
             // Green, as a running job's chip is: a helper works for it.
@@ -273,12 +435,33 @@ impl Chat {
         })
     }
 
-    pub(crate) fn sidebar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn sidebar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let now = backend::now();
         // Kept while the page is open, so the entry it was opened from stays.
         let session = self.store.conversations[self.store.active].id;
         let workflows =
             self.page == Page::Workflows || !letronna_core::workflow::runs(session).is_empty();
+        let rows = nav_rows(self.nav_more, self.page, workflows);
+        let handles: std::rc::Rc<[FocusHandle]> = rows
+            .iter()
+            .map(|nav| {
+                window
+                    .use_keyed_state(("nav-focus", nav.slot()), cx, |_, cx| {
+                        cx.focus_handle().tab_stop(true)
+                    })
+                    .read(cx)
+                    .clone()
+            })
+            .collect();
+        let folded: Vec<Page> = MORE
+            .into_iter()
+            .filter(|&page| page != Page::Workflows || workflows)
+            .filter(|page| !rows.contains(&Nav::Page(*page)))
+            .collect();
+        let mut nav = v_flex().px_2().pt_2().gap_0p5();
+        for (at, &row) in rows.iter().enumerate() {
+            nav = nav.child(self.nav_item(row, at, &handles, &folded, cx));
+        }
         let visible = self.visible_sessions(cx);
         let keyed = self
             .picked
@@ -352,10 +535,22 @@ impl Chat {
             // Only F6 gives the sidebar itself the keys; a click leaves
             // them where they were, or with what was clicked.
             .on_any_mouse_down(|_, window, _| window.prevent_default())
-            .on_action(Self::session_move::<sessions::PreviousSession>(
-                |this, cx| this.pick_session(false, cx),
-                cx,
-            ))
+            // From the first session, Up goes on to the page rows above.
+            .on_action({
+                let last = handles.last().cloned();
+                cx.listener(move |this, _: &sessions::PreviousSession, window, cx| {
+                    if !this.sidebar_focus.is_focused(window) {
+                        return cx.propagate();
+                    }
+                    if this.at_first_session(cx)
+                        && let Some(last) = &last
+                    {
+                        window.focus(last);
+                        return cx.notify();
+                    }
+                    this.pick_session(false, cx)
+                })
+            })
             .on_action(Self::session_move::<sessions::NextSession>(
                 |this, cx| this.pick_session(true, cx),
                 cx,
@@ -399,80 +594,7 @@ impl Chat {
             .text_color(cx.theme().sidebar_foreground)
             .border_r(px(3.))
             .border_color(cx.theme().sidebar_border)
-            .child(
-                v_flex()
-                    .px_2()
-                    .pt_2()
-                    .gap_0p5()
-                    .child(
-                        self.nav_item("new", AppIcon::SquarePen, "New session", None, cx)
-                            .child(Kbd::new(Keystroke::parse("secondary-n").unwrap()).text_xs())
-                            .on_click(cx.listener(|this, _, window, cx| this.new_chat(window, cx))),
-                    )
-                    .child(self.nav_item(
-                        "capabilities",
-                        AppIcon::Sparkles,
-                        "Capabilities",
-                        Some(Page::Capabilities),
-                        cx,
-                    ))
-                    .child(self.nav_item(
-                        "plugins",
-                        AppIcon::Puzzle,
-                        "Plugins",
-                        Some(Page::Plugins),
-                        cx,
-                    ))
-                    .child(self.nav_item(
-                        "messaging",
-                        AppIcon::MessageSquare,
-                        "Messaging",
-                        Some(Page::Messaging),
-                        cx,
-                    ))
-                    .child(self.nav_item(
-                        "artifacts",
-                        AppIcon::File,
-                        "Artifacts",
-                        Some(Page::Artifacts),
-                        cx,
-                    ))
-                    .child(
-                        self.nav_item(
-                            "activity",
-                            AppIcon::Robot,
-                            "Activity",
-                            Some(Page::Activity),
-                            cx,
-                        )
-                        // To the list, as the pill goes, even from a transcript.
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.open_activity(window, cx)),
-                        ),
-                    )
-                    .child(self.nav_item(
-                        "jobs",
-                        AppIcon::Clock,
-                        "Scheduled jobs",
-                        Some(Page::Jobs),
-                        cx,
-                    ))
-                    // Only once the session on screen has a run to show.
-                    .when(workflows, |this| {
-                        this.child(
-                            self.nav_item(
-                                "workflows",
-                                AppIcon::Workflow,
-                                "Workflows",
-                                Some(Page::Workflows),
-                                cx,
-                            )
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.open_workflows(window, cx)),
-                            ),
-                        )
-                    }),
-            )
+            .child(nav)
             .child(
                 div().px_2().pt_3().child(
                     Input::new(&self.search)
@@ -547,9 +669,71 @@ fn move_in(listed: &[usize], picked: Option<usize>, down: bool) -> Option<usize>
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
-    use super::{drawn_order, move_in};
+    use super::{Nav, drawn_order, move_in, nav_rows};
+    use crate::app::Page;
     use letronna_core::store::Conversation;
     use std::path::PathBuf;
+
+    /// The rows by the names they show.
+    fn names(rows: &[Nav]) -> Vec<&'static str> {
+        rows.iter()
+            .map(|row| match row {
+                Nav::New => "New session",
+                Nav::More => "More",
+                Nav::Page(page) => page.title(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn folded_only_the_pages_used_most_show_above_more() {
+        assert_eq!(
+            names(&nav_rows(false, Page::Chat, true)),
+            ["New session", "Capabilities", "Activity", "More"]
+        );
+    }
+
+    #[test]
+    fn a_folded_page_on_screen_still_shows_above_more() {
+        assert_eq!(
+            names(&nav_rows(false, Page::Artifacts, false)),
+            [
+                "New session",
+                "Capabilities",
+                "Activity",
+                "Artifacts",
+                "More"
+            ]
+        );
+        // One of the two kept out of More is not shown twice.
+        assert_eq!(nav_rows(false, Page::Activity, false).len(), 4);
+    }
+
+    #[test]
+    fn open_more_lists_the_rest_with_workflows_only_while_runs_show() {
+        let mut open = vec![
+            "New session",
+            "Capabilities",
+            "Activity",
+            "More",
+            "Plugins",
+            "Messaging",
+            "Artifacts",
+            "Scheduled jobs",
+        ];
+        assert_eq!(names(&nav_rows(true, Page::Chat, false)), open);
+        open.push("Workflows");
+        assert_eq!(names(&nav_rows(true, Page::Workflows, true)), open);
+    }
+
+    #[test]
+    fn every_page_row_has_a_focus_of_its_own() {
+        let rows = nav_rows(true, Page::Chat, true);
+        let mut slots: Vec<usize> = rows.iter().map(|row| row.slot()).collect();
+        slots.sort_unstable();
+        slots.dedup();
+        assert_eq!(slots.len(), rows.len());
+    }
 
     #[test]
     fn the_sidebar_keys_move_in_its_order_and_stop_at_the_ends() {

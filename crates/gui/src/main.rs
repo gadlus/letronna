@@ -206,11 +206,11 @@ pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Opti
         // they act only while the sidebar itself has the focus.
         (
             KeyBinding::new("up", sessions::PreviousSession, Some("Sessions")),
-            Some("In the sidebar: the session above"),
+            Some("In the sidebar: the row above"),
         ),
         (
             KeyBinding::new("down", sessions::NextSession, Some("Sessions")),
-            Some("In the sidebar: the session below"),
+            Some("In the sidebar: the row below"),
         ),
         (
             KeyBinding::new("enter", sessions::OpenSession, Some("Sessions")),
@@ -389,6 +389,19 @@ pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Opti
         (
             KeyBinding::new("enter", ui::jobs::AddLines, Some("JobLog")),
             Some("In a job's output: add the picked lines to the message"),
+        ),
+        // Settings' list of pages, once Tab has put the keys on it.
+        (
+            KeyBinding::new(
+                "up",
+                ui::settings::PreviousSettingsPage,
+                Some("SettingsNav"),
+            ),
+            Some("In settings: the page above"),
+        ),
+        (
+            KeyBinding::new("down", ui::settings::NextSettingsPage, Some("SettingsNav")),
+            Some("In settings: the page below"),
         ),
         // Saves the Memory page's box with focus; nothing else there has a
         // save key.

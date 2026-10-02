@@ -1132,9 +1132,28 @@ impl Chat {
         let no_project = self.store.conversations[self.store.active]
             .workspace
             .is_none();
-        v_flex()
-            .relative()
-            .flex_1()
+        // The window's two ways to find the rest, with their keys as this
+        // computer writes them.
+        let hints = [
+            (&crate::ui::palette::OpenPalette as &dyn Action, "commands"),
+            (&ShowKeys, "keys"),
+        ]
+        .map(|(action, what)| {
+            crate::ui::keys::bound_key(action, cx)
+                .map(|key| SharedString::from(format!("{} {what}", Kbd::format(&key))))
+        });
+        let hint = |hints: Vec<SharedString>| {
+            h_flex()
+                .gap_x_4()
+                .children(hints.into_iter().map(|hint| div().child(hint)))
+        };
+        let page = v_flex()
+            .w_full()
+            // At least the pane's height, so it is centred there, and taller
+            // when it must be, so a short window scrolls it rather than cut
+            // the wordmark off at the top.
+            .min_h_full()
+            .py_6()
             .items_center()
             .justify_center()
             .gap_2()
@@ -1165,19 +1184,203 @@ impl Chat {
                         ),
                 )
             })
+            .children(self.recent_places(window, cx))
             .child(
-                div()
-                    .mt_4()
+                // In two groups, so a narrow pane breaks between them.
+                h_flex()
+                    .mt_6()
+                    .max_w_full()
+                    .px_6()
+                    .flex_wrap()
+                    .justify_center()
+                    .gap_x_4()
+                    .gap_y_1()
                     .text_xs()
-                    .text_color(cx.theme().muted_foreground.opacity(0.7))
-                    .child("Enter to send  ·  Shift+Enter for a new line  ·  Esc to stop"),
+                    // Plain muted, not faded: faded it read under 4.5:1.
+                    .text_color(cx.theme().muted_foreground)
+                    .child(hint(
+                        ["Enter to send", "Shift+Enter for a new line", "Esc to stop"]
+                            .map(SharedString::from)
+                            .to_vec(),
+                    ))
+                    .child(hint(hints.into_iter().flatten().collect())),
             )
-            .children(self.grain(&self.grains.empty_chat))
             // A side question asked before anything else still needs somewhere to show.
             .children(
                 self.aside_row(self.store.conversations[self.store.active].id, window, cx)
                     .map(|row| div().w_full().max_w(COLUMN).px_6().mt_6().child(row)),
+            );
+        v_flex()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .child(
+                div()
+                    .id("empty-chat")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .child(page),
             )
+            .children(self.grain(&self.grains.empty_chat))
+    }
+
+    /// Sessions to go back to and folders worked in lately, side by side
+    /// under a new session's greeting, or nothing when there are none. Each
+    /// row is a tab stop that Enter opens, as a click does.
+    fn recent_places(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<Div> {
+        // Rows in each list: enough to go back to what was open this week,
+        // few enough that the greeting stays the middle of the page.
+        const RECENT: usize = 4;
+        let here = &self.store.conversations[self.store.active];
+        let now = backend::now();
+        let mut by_age: Vec<&Conversation> = (self.store.conversations.iter())
+            .filter(|c| c.id != here.id && c.length() > 0)
+            .collect();
+        by_age.sort_by_key(|c| std::cmp::Reverse(c.updated));
+        let sessions: Vec<Stateful<Div>> = by_age
+            .into_iter()
+            .take(RECENT)
+            .map(|c| {
+                let id = c.id;
+                self.recent_row(
+                    ("recent-session", id as usize),
+                    AppIcon::MessageSquare,
+                    (c.title.clone().into(), age_label(c.updated, now).into()),
+                    false,
+                    window,
+                    cx,
+                    move |this, window, cx| this.go_to_session(id, window, cx),
+                )
+            })
+            .collect();
+        let folders: Vec<Stateful<Div>> =
+            letronna_core::palette::recent_folders(&self.store.conversations)
+                .into_iter()
+                .filter(|folder| here.workspace.as_ref() != Some(folder))
+                .take(RECENT)
+                .enumerate()
+                .map(|(n, folder)| {
+                    let name = folder
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| folder.display().to_string());
+                    // Where it is, its name being the label already.
+                    let path = (folder.parent())
+                        .map(|parent| parent.display().to_string())
+                        .unwrap_or_default();
+                    self.recent_row(
+                        ("recent-folder", n),
+                        AppIcon::Folder,
+                        (name.into(), path.into()),
+                        true,
+                        window,
+                        cx,
+                        move |this, window, cx| {
+                            this.open_folder(folder.clone(), window, cx);
+                            cx.notify();
+                        },
+                    )
+                })
+                .collect();
+        if sessions.is_empty() && folders.is_empty() {
+            return None;
+        }
+        let column = |title: &'static str, rows: Vec<Stateful<Div>>| {
+            v_flex()
+                .w(px(300.))
+                .gap_0p5()
+                .child(
+                    div()
+                        .px_2()
+                        .pb_1()
+                        .text_xs()
+                        .font_family(HEADING_FONT)
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(cx.theme().muted_foreground)
+                        .child(title),
+                )
+                .children(rows)
+        };
+        Some(
+            h_flex()
+                .mt_6()
+                .max_w_full()
+                .px_6()
+                .flex_wrap()
+                .justify_center()
+                .items_start()
+                .gap_x_8()
+                .gap_y_4()
+                .when(!sessions.is_empty(), |this| {
+                    this.child(column("Recent sessions", sessions))
+                })
+                .when(!folders.is_empty(), |this| {
+                    this.child(column("Recent folders", folders))
+                }),
+        )
+    }
+
+    /// One of the empty state's rows: `text` is its label and a muted
+    /// detail, which with `wide_detail` takes the room left, as a folder's
+    /// path does, and otherwise sits at the end, as a session's age does.
+    #[allow(clippy::too_many_arguments)]
+    fn recent_row(
+        &self,
+        id: (&'static str, usize),
+        icon: AppIcon,
+        text: (SharedString, SharedString),
+        wide_detail: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        open: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> Stateful<Div> {
+        let focus = window
+            .use_keyed_state(
+                (SharedString::from(format!("{}-focus", id.0)), id.1),
+                cx,
+                |_, cx| cx.focus_handle().tab_stop(true),
+            )
+            .read(cx)
+            .clone();
+        let theme = cx.theme();
+        let (label, detail) = text;
+        h_flex()
+            .id(id)
+            .track_focus(&focus)
+            .h(px(28.))
+            .px_2()
+            .gap_2()
+            .items_center()
+            .rounded(theme.radius)
+            // Always there, so the ring the keys bring moves nothing.
+            .border_1()
+            .border_color(theme.transparent)
+            .cursor_pointer()
+            .text_sm()
+            .focus(|s| s.border_color(theme.ring))
+            .active(|s| s.bg(theme.secondary.opacity(0.5)))
+            .child(
+                Icon::new(icon)
+                    .size_4()
+                    .flex_shrink_0()
+                    .text_color(theme.muted_foreground),
+            )
+            .child(
+                div()
+                    .when(!wide_detail, |this| this.flex_1())
+                    .min_w_0()
+                    .truncate()
+                    .child(label),
+            )
+            .child(
+                div()
+                    .when(wide_detail, |this| this.flex_1().min_w_0().truncate())
+                    .flex_shrink_0()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(detail),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| open(this, window, cx)))
     }
 
     pub(crate) fn page_view(&self, page: Page, cx: &mut Context<Self>) -> impl IntoElement {

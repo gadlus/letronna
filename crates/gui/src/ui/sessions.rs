@@ -424,7 +424,7 @@ impl Chat {
             .xsmall()
             .selected(on)
             .icon(Icon::new(filter.icon()).size_3().text_color(if on {
-                cx.theme().primary
+                cx.theme().link
             } else {
                 cx.theme().muted_foreground
             }))
@@ -439,7 +439,7 @@ impl Chat {
             .xsmall()
             .selected(on)
             .icon(Icon::new(AppIcon::Folder).size_3().text_color(if on {
-                cx.theme().primary
+                cx.theme().link
             } else {
                 cx.theme().muted_foreground
             }))

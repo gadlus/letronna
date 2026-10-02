@@ -164,6 +164,18 @@ impl Chat {
     }
 }
 
+/// The key `action` is bound to, as the window takes it: the binding made
+/// last, which wins when the key is pressed.
+pub(crate) fn bound_key(action: &dyn Action, cx: &App) -> Option<Keystroke> {
+    let keymap = cx.key_bindings();
+    let keymap = keymap.borrow();
+    keymap
+        .bindings_for_action(action)
+        .next_back()
+        .and_then(|binding| binding.keystrokes().first())
+        .map(|key| key.as_keystroke().clone())
+}
+
 /// The part after `now` in `shown`, or before it with `back`, wrapping
 /// round; from outside them all, the first or the last.
 fn step_region(shown: &[Region], now: Option<Region>, back: bool) -> Option<Region> {

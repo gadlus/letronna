@@ -512,6 +512,9 @@ pub(crate) struct Chat {
     /// to be transcribed. `None` the rest of the time; nothing runs then.
     pub(crate) mic: Option<crate::ui::voice::Voice>,
     pub(crate) _subscriptions: Vec<Subscription>,
+    /// Whether the sidebar's More row is open on the pages under it, kept
+    /// for the window's life.
+    pub(crate) nav_more: bool,
 }
 
 impl Chat {
@@ -1004,6 +1007,7 @@ impl Chat {
             drawn: false,
             mic: None,
             _subscriptions: subscriptions,
+            nav_more: false,
         };
         let resized = this.follow_window_width(window, cx);
         this._subscriptions.push(resized);

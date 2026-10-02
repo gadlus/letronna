@@ -480,7 +480,7 @@ impl Chat {
                         let label = format!("Allow `{pattern}` for this run");
                         row.child(
                             Button::new("helper-allow-run")
-                                .outline()
+                                .framed(cx)
                                 .small()
                                 .label(label)
                                 .on_click(for_run),
@@ -488,7 +488,7 @@ impl Chat {
                     })
                     .child(
                         Button::new("helper-deny")
-                            .ghost()
+                            .plain(cx)
                             .small()
                             .label("Deny")
                             .on_click(deny),
