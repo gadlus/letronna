@@ -107,6 +107,13 @@ impl Chat {
         };
         // A reply that only asked for tools: its tool rows say what happened.
         let tool_only = !is_user && message.content.is_empty() && !message.tool_calls.is_empty();
+        // The call the model is writing now, while this reply streams.
+        let writing = self
+            .turn
+            .as_ref()
+            .filter(|_| streaming && !is_user)
+            .and_then(|turn| turn.live.drafts.last())
+            .map(letronna_core::chat::Draft::label);
         let label: String = if message.model.is_empty() {
             self.store.model(self.store.active).1.to_owned()
         } else {
@@ -239,7 +246,8 @@ impl Chat {
                     ) {
                         (Some(retry), _) => retry.to_string(),
                         (None, true) => "Compacting…".to_owned(),
-                        (None, false) => "Thinking…".to_owned(),
+                        // A long write streams for a while; say so, not Thinking.
+                        (None, false) => writing.clone().unwrap_or("Thinking…".to_owned()),
                     }
                 })
                 .into_any_element()
@@ -372,6 +380,25 @@ impl Chat {
             .when(!tool_only, |this| {
                 this.child(div().w_full().overflow_hidden().pb_1().child(body))
             })
+            // A reply that said a few words and goes on to write a call: the
+            // call is named under them while it streams.
+            .when_some(
+                writing.filter(|_| !message.content.is_empty()),
+                |this, label| {
+                    this.child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(
+                                crate::ui::busy::Spinner::new()
+                                    .xsmall()
+                                    .color(cx.theme().primary),
+                            )
+                            .child(label),
+                    )
+                },
+            )
             // Outside the clip above, which would cut the left of its fill.
             .children(prompt_more)
             .when(is_user && !message.images.is_empty(), |this| {
