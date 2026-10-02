@@ -352,6 +352,11 @@ pub struct Settings {
     /// when it uses the browser, though it can still be opened to look.
     #[serde(default)]
     pub browse_unseen: bool,
+    /// A page or drawing the agent writes opens beside the chat by itself
+    /// and follows every change to it; off, it waits in the window's
+    /// Preview tab to be looked at.
+    #[serde(default = "yes")]
+    pub preview_opens_by_itself: bool,
     /// The window's colours: empty for Night, "paper", or "system" to follow
     /// the computer's light or dark mode.
     #[serde(default)]
@@ -443,8 +448,9 @@ pub struct Settings {
     pub memory_review: bool,
 }
 
-// Written out rather than derived so the film grain and notifications start
-// on for a first run too, as they do for a settings file from before them.
+// Written out rather than derived so the film grain, notifications and
+// previews opening by themselves start on for a first run too, as they do
+// for a settings file from before them.
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -473,6 +479,7 @@ impl Default for Settings {
             manual_updates: false,
             browser_shared: false,
             browse_unseen: false,
+            preview_opens_by_itself: true,
             appearance: String::new(),
             grain: true,
             notifications: true,
@@ -5253,6 +5260,30 @@ pub(crate) mod tests {
         std::fs::remove_file(&file).unwrap();
         let first = load().settings;
         assert_eq!((first.appearance.as_str(), first.grain), ("", true));
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn previews_open_by_themselves_unless_turned_off() {
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("preview-opens");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        let file = dir.join("settings.json");
+        // As a build from before previews wrote it.
+        std::fs::write(
+            &file,
+            r#"{"endpoint":"https://api.letronna.ai/v1","model":"a/model"}"#,
+        )
+        .unwrap();
+        let mut store = load();
+        assert!(store.settings.preview_opens_by_itself);
+        // Turned off, it stays off once saved and read again.
+        store.settings.preview_opens_by_itself = false;
+        store.save().unwrap();
+        assert!(!load().settings.preview_opens_by_itself);
+        // A first run, with no settings file at all, opens them.
+        std::fs::remove_file(&file).unwrap();
+        assert!(load().settings.preview_opens_by_itself);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 
