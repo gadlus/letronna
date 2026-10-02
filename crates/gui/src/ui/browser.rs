@@ -317,7 +317,9 @@ impl BrowserView {
     /// page that moves would fill the atlas with them.
     fn show(&mut self, frame: Option<Arc<RenderImage>>, cx: &mut Context<Self>) {
         if let Some(old) = std::mem::replace(&mut self.frame, frame) {
-            cx.drop_image(old, None);
+            // Once the window is free: while it is being updated -- a click
+            // closing the panel -- gpui leaves it out, and the picture stays.
+            cx.defer(move |cx| cx.drop_image(old, None));
         }
     }
 
