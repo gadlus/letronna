@@ -156,6 +156,10 @@ const CHECKS: &[&str] = &[
     "access denied",
     "checking your browser",
 ];
+/// The titles in `CHECKS` of a check that stands in front of the page only
+/// until it is passed, which a call waits on. The rest may name a page that
+/// stays -- a block no one gets past, or an article about captchas.
+const PASSING_CHECKS: &[&str] = &["just a moment", "checking your browser"];
 /// How long a call waits for the user to get past a site's check before it
 /// gives up and has the model ask them: a picture puzzle takes a person a
 /// minute or two, and three is as long as a turn should stand still.
@@ -169,9 +173,9 @@ const CHECK_LOOK: Duration = Duration::from_millis(100);
 /// away is hidden, moved off the view, or squeezed to nothing.
 const CHALLENGE_SIZE: u32 = 100;
 /// The frames that may hold a check's challenge, picked out by address
-/// before `challenge_frame` reads it: reCAPTCHA's, hCaptcha's and Arkose's.
-const CHALLENGE_FRAMES: &str = "iframe[src*='/recaptcha/'], iframe[src*='hcaptcha.com'], \
-     iframe[src*='arkoselabs.com'], iframe[src*='funcaptcha.com']";
+/// before `challenge_frame` reads it: reCAPTCHA's and hCaptcha's. Arkose's
+/// is left out, as its frame reads the same with its puzzle up or passed.
+const CHALLENGE_FRAMES: &str = "iframe[src*='/recaptcha/'], iframe[src*='hcaptcha.com']";
 /// The page's title, whether it is still being read in, and the addresses
 /// of the frames `frames` picks out that show at least `least` CSS pixels
 /// each way within the view, neither hidden nor see-through. Run in a
@@ -1819,6 +1823,12 @@ fn bot_check(title: &str) -> bool {
     CHECKS.iter().any(|check| title.contains(check))
 }
 
+/// Whether a page's title says it is a site's check that goes once passed.
+fn passing_check(title: &str) -> bool {
+    let title = title.to_lowercase();
+    PASSING_CHECKS.iter().any(|check| title.contains(check))
+}
+
 /// Whether a frame loaded from `url` holds a check's challenge -- the part a
 /// person must do, such as a picture puzzle -- rather than the box or badge
 /// a check keeps on the page all along, and after it is passed.
@@ -1836,18 +1846,15 @@ fn challenge_frame(url: &str) -> bool {
         return path.starts_with("/recaptcha/") && path.ends_with("/bframe");
     }
     // Its box and its puzzle come from one address, told apart after the #.
-    if under("hcaptcha.com") {
-        let fragment = url.fragment().unwrap_or_default();
-        return fragment.split('&').any(|part| part == "frame=challenge");
-    }
-    under("arkoselabs.com") || under("funcaptcha.com")
+    let fragment = url.fragment().unwrap_or_default();
+    under("hcaptcha.com") && fragment.split('&').any(|part| part == "frame=challenge")
 }
 
-/// Whether what `CHECK_SIGNS` read says the page is a site's check: by its
-/// title, or by a challenge shown in one of its frames.
+/// Whether what `CHECK_SIGNS` read says the page is a site's check that goes
+/// once passed: by its title, or by a challenge shown in one of its frames.
 fn challenged(signs: &Value) -> bool {
     let frames = signs["frames"].as_array().map(Vec::as_slice);
-    bot_check(signs["title"].as_str().unwrap_or_default())
+    passing_check(signs["title"].as_str().unwrap_or_default())
         || (frames.unwrap_or_default().iter())
             .filter_map(Value::as_str)
             .any(challenge_frame)
@@ -1868,13 +1875,6 @@ fn check_signs(tab: &mut Tab, stop: &Cancel) -> Option<Value> {
                        "returnByValue": true});
     let said: Value = (tab.call_in(None, "Runtime.evaluate", asked, LOOK_TIME, Some(stop))).ok()?;
     Some(said["result"]["value"].clone()).filter(Value::is_object)
-}
-
-/// Whether someone can get past a site's check while the agent waits: the
-/// browser has a window of its own, or Letronna's window shows its page.
-fn passable(reach: &cdp::Reach) -> bool {
-    // Only a window says its screen's scale.
-    !reach.headless || watch::scale().is_some()
 }
 
 /// What the model is told of a site's check the call did not wait on: to
@@ -3746,15 +3746,22 @@ impl Session {
 
     /// `notes` on the page with what else there is to say of it: the
     /// questions it asked, and whether it is a site's bot check -- which the
-    /// call waits on when someone can get past it, and has the model ask the
-    /// user about otherwise.
+    /// call waits on when it goes once passed and someone can get past it,
+    /// and has the model ask the user about otherwise.
     fn noted(&mut self, page: &Page, notes: &mut Vec<String>) {
         notes.append(&mut self.tab.dialogs);
-        let check = bot_check(&page.title) || self.challenge_shown();
-        self.check_seen = check && passable(&self.reach);
-        if check && !self.check_seen {
+        let passing = passing_check(&page.title) || self.challenge_shown();
+        self.check_seen = passing && self.passable();
+        if (passing || bot_check(&page.title)) && !self.check_seen {
             notes.push(ask_past_check(self.reach.headless));
         }
+    }
+
+    /// Whether someone can get past a site's check while the agent waits:
+    /// the browser has a window of its own, or Letronna's window watches
+    /// this session's page now.
+    fn passable(&self) -> bool {
+        !self.reach.headless || (watch::watched() && self.on_screen())
     }
 
     /// Whether the page shows a check's challenge in a frame, as far as can
@@ -5079,7 +5086,6 @@ mod tests {
             "https://www.google.com/recaptcha/api2/bframe?hl=en&v=v1&k=key",
             "https://www.recaptcha.net/recaptcha/enterprise/bframe?k=key",
             "https://newassets.hcaptcha.com/captcha/v1/abc/static/hcaptcha.html#frame=challenge&id=0x1",
-            "https://client-api.arkoselabs.com/v2/KEY/enforcement.abc.html",
         ];
         for puzzle in puzzles {
             assert!(challenge_frame(puzzle), "{puzzle}");
@@ -5091,12 +5097,14 @@ mod tests {
     #[test]
     fn an_invisible_badge_does_not_stall_the_agent() {
         // The badge, the box to tick, Turnstile's box -- each stays on the
-        // page once passed -- and addresses only made to look like them.
+        // page once passed -- Arkose's frame, which reads the same with its
+        // puzzle up or passed, and addresses only made to look like them.
         let kept = [
             "https://www.google.com/recaptcha/api2/anchor?ar=1&k=key&size=invisible",
             "https://www.google.com/recaptcha/api2/anchor?ar=1&k=key&size=normal",
             "https://newassets.hcaptcha.com/captcha/v1/abc/static/hcaptcha.html#frame=checkbox&id=0x1",
             "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/b/turnstile/if/ov2/av0/rcv/a/0x4AAA/auto/normal/auto/",
+            "https://client-api.arkoselabs.com/v2/KEY/enforcement.abc.html",
             "https://www.google.com.shop.test/recaptcha/api2/bframe",
             "https://shop.test/recaptcha/api2/bframe",
             "https://notarkoselabs.com/fc/gc/",
@@ -5167,6 +5175,51 @@ mod tests {
         }
         drop(session);
         server.join().unwrap();
+    }
+
+    /// What a session lists of a page titled `title`, with no frame from
+    /// another site, and whether the call would wait on a site's check there,
+    /// in a browser with no window of its own when `headless`.
+    fn check_listed(title: &'static str, headless: bool) -> (String, bool) {
+        let (mut session, server) = fake_session(move |method, _| {
+            let answer = match method {
+                "Accessibility.getFullAXTree" => json!({"nodes": [{"nodeId": "1",
+                    "role": {"value": "RootWebArea"}, "name": {"value": title},
+                    "backendDOMNodeId": 1, "childIds": []}]}),
+                _ => json!({}),
+            };
+            (Vec::new(), answer)
+        });
+        session.reach = cdp::Reach::on_port(1, headless);
+        let page = session.read(false).unwrap();
+        let shown = session.show(&page, &View::default(), Vec::new()).unwrap();
+        let waits = session.check_seen;
+        drop(session);
+        server.join().unwrap();
+        (shown, waits)
+    }
+
+    #[test]
+    fn a_page_only_titled_like_a_check_is_not_waited_on() {
+        // An article about captchas, or a block no one gets past, stays as
+        // it is: the model asks the user at once, as before.
+        for title in ["CAPTCHA - Wikipedia", "Access Denied"] {
+            let (shown, waits) = check_listed(title, false);
+            assert!(!waits, "{title}");
+            let asked = "Ask the user to get past it in the browser window";
+            assert!(shown.contains(asked), "{shown}");
+        }
+    }
+
+    #[test]
+    fn a_check_in_a_session_the_window_does_not_show_is_not_waited_on() {
+        // The window has said its screen's scale, as it does when it starts,
+        // but watches another conversation's page or none: no one is there
+        // to get past it, so the model asks at once.
+        crate::watch::screen(1.5);
+        let (shown, waits) = check_listed("Just a moment...", true);
+        assert!(!waits);
+        assert!(shown.contains("browser panel beside the chat"), "{shown}");
     }
 
     /// A stand-in tab whose page is a site's check while `title` says so, as
@@ -5265,7 +5318,7 @@ mod tests {
 
     #[test]
     fn a_check_still_there_when_the_wait_is_up_is_said_to_be() {
-        let title = Arc::new(Mutex::new("Attention Required! | Cloudflare"));
+        let title = Arc::new(Mutex::new("Checking your browser..."));
         let (reach, _say, looks) = checked_tab(title);
         let started = Instant::now();
         let limit = Duration::from_millis(500);
@@ -7388,7 +7441,7 @@ mod tests {
                      <script>setTimeout(() => location.href = '/two', 2500)</script>"
                 }
                 "/puzzle" => {
-                    "<!doctype html><title>Captcha</title><p>Pick the boats\
+                    "<!doctype html><title>Checking your browser</title><p>Pick the boats\
                      <script>setTimeout(() => document.title = 'Shop', 2500)</script>"
                 }
                 // A sign-in window, which closes itself when done.
