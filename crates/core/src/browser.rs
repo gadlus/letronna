@@ -215,6 +215,32 @@ const CHOOSE: &str = "function(choice) {
   this.dispatchEvent(new Event('change', {bubbles: true}));
   return '';
 }";
+/// Sets a date, time, month, week, colour or range field -- or the one a
+/// part such as its day is in -- to `text` through the setter React and
+/// Vue watch, since its parts take no typed text; says how a value it will
+/// not take is written, and false for any other element, typed into.
+const SET_VALUE: &str = "function(text) {
+  const shapes = {date: 'A date field takes its date as 2026-10-02.', time: 'A time field takes its time as 14:30.',
+    'datetime-local': 'A date and time field takes them as 2026-10-02T14:30.', month: 'A month field takes its month as 2026-10.',
+    week: 'A week field takes its week as 2026-W40.', color: 'A colour field takes its colour as #rrggbb, such as #3366ff.',
+    range: ''};
+  const field = this instanceof HTMLInputElement ? this : this.getRootNode().host;
+  if (!(field instanceof HTMLInputElement) || !Object.hasOwn(shapes, field.type)) return false;
+  if (field.disabled || field.readOnly) return 'That field is turned off.';
+  const old = field.value;
+  const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+  set.call(field, text);
+  const took = field.type === 'range' ? text.trim() !== '' && Number(field.value) === Number(text)
+    : field.type === 'color' ? field.value === text.toLowerCase() : field.value !== '' || text === '';
+  if (!took) {
+    set.call(field, old);
+    return shapes[field.type] || 'This slider takes a number from ' + (field.min || 0) + ' to ' + (field.max || 100)
+      + (field.step && field.step !== 'any' ? ', in steps of ' + field.step : '') + '.';
+  }
+  field.dispatchEvent(new Event('input', {bubbles: true}));
+  field.dispatchEvent(new Event('change', {bubbles: true}));
+  return '';
+}";
 /// The file field an upload fills: the element named, the one its label is
 /// for, the only one inside it, or the only one on the page -- sites hide
 /// the field behind a button of their own. Says what went wrong otherwise.
@@ -4356,6 +4382,23 @@ impl Session {
             .ok_or_else(|| "That element is no longer on the page.".to_owned())
     }
 
+    /// Sets a date, time, colour or range field `node` to `text`, saying
+    /// false for any other element, which is typed into instead.
+    fn set_value(&mut self, node: i64, text: &str) -> Result<bool, String> {
+        let object = self.object(node)?;
+        let answer: Value = self.on_node(
+            "Runtime.callFunctionOn",
+            json!({"objectId": object, "functionDeclaration": SET_VALUE,
+                   "arguments": [{"value": text}], "returnByValue": true}),
+        )?;
+        match answer["result"]["value"].as_str() {
+            Some("") => Ok(true),
+            Some(why) => Err(why.to_owned()),
+            // Any other element, or a page that broke the function.
+            None => Ok(false),
+        }
+    }
+
     /// Replace what the field `node` holds with `text`, each round of keys
     /// going only where `frame` says, as `keys_go_to` makes sure first: the
     /// page may move focus as the field is focused, or at any key.
@@ -4369,6 +4412,14 @@ impl Session {
         // Not what is typed: it may be a password.
         self.point(node, "Typing into".into(), None);
         self.focus(node)?;
+        // A date's or a slider's parts take no typed text, so it is set.
+        if self.set_value(node, text)? {
+            if submit {
+                self.keys_go_to(frame)?;
+                self.press(&key("Enter").ok_or("There is no Enter key.")?)?;
+            }
+            return Ok(());
+        }
         self.keys_go_to(frame)?;
         for kind in ["keyDown", "keyUp"] {
             let mut event = json!({"type": kind, "key": "a", "code": "KeyA",
@@ -6119,6 +6170,99 @@ mod tests {
         server.join().unwrap();
     }
 
+    /// A page whose field answers the function that sets it with `set`;
+    /// what that function was given, each key and each text typed are kept
+    /// in `seen`.
+    fn field_page(
+        set: Value,
+        seen: Arc<Mutex<Vec<String>>>,
+    ) -> impl Fn(&str, &Value) -> (Vec<Value>, Value) + Send + 'static {
+        move |method, params| {
+            let said = |at: &Value| at.as_str().unwrap_or_default().to_owned();
+            let heard = match method {
+                "Runtime.callFunctionOn" => {
+                    Some(format!("set {}", said(&params["arguments"][0]["value"])))
+                }
+                "Input.dispatchKeyEvent" => {
+                    let (kind, key) = (said(&params["type"]), said(&params["key"]));
+                    Some(format!("{kind} {key}"))
+                }
+                "Input.insertText" => Some(format!("insert {}", said(&params["text"]))),
+                _ => None,
+            };
+            seen.lock().unwrap().extend(heard);
+            let answer = match method {
+                "Page.getFrameTree" => json!({"frameTree": {"frame": {"id": "TOP"}}}),
+                "Page.createIsolatedWorld" => json!({"executionContextId": 1}),
+                "DOM.resolveNode" => json!({"object": {"objectId": "O"}}),
+                "Runtime.callFunctionOn" => {
+                    assert_eq!(params["functionDeclaration"], SET_VALUE);
+                    set.clone()
+                }
+                _ => json!({}),
+            };
+            (Vec::new(), answer)
+        }
+    }
+
+    #[test]
+    fn a_date_field_is_set_to_what_is_typed_not_typed_into() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let set = json!({"result": {"type": "string", "value": ""}});
+        let (mut session, server) = fake_session(field_page(set, seen.clone()));
+        session.type_into(3, "2026-10-02", false, None).unwrap();
+        assert_eq!(*seen.lock().unwrap(), ["set 2026-10-02"]);
+        seen.lock().unwrap().clear();
+        // Asked to, it still presses Enter once the field is set.
+        session.type_into(3, "2026-10-02", true, None).unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["set 2026-10-02", "keyDown Enter", "keyUp Enter"]
+        );
+        drop(session);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_date_in_the_wrong_shape_is_refused_with_the_shape_it_takes() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let shape = "A date field takes its date as 2026-10-02.";
+        assert!(SET_VALUE.contains(shape));
+        let refused = json!({"result": {"type": "string", "value": shape}});
+        let (mut session, server) = fake_session(field_page(refused, seen.clone()));
+        let typed = session.type_into(3, "02/10/2026", true, None);
+        assert_eq!(typed, Err(shape.to_owned()));
+        // Nothing is typed, and Enter does not send the form.
+        assert_eq!(*seen.lock().unwrap(), ["set 02/10/2026"]);
+        drop(session);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn any_other_field_is_still_typed_into_as_before() {
+        let broken = json!({"result": {"type": "object", "subtype": "error"},
+                            "exceptionDetails": {"text": "Uncaught"}});
+        let other = json!({"result": {"type": "boolean", "value": false}});
+        for set in [other, broken] {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let (mut session, server) = fake_session(field_page(set, seen.clone()));
+            session.type_into(3, "Ada", true, None).unwrap();
+            assert_eq!(
+                *seen.lock().unwrap(),
+                [
+                    "set Ada",
+                    "keyDown a",
+                    "keyUp a",
+                    "insert Ada",
+                    "keyDown Enter",
+                    "keyUp Enter"
+                ]
+            );
+            drop(session);
+            server.join().unwrap();
+        }
+    }
+
     #[test]
     fn a_frame_drawn_scaled_or_still_moving_is_not_clicked_at_a_point() {
         let cases = [
@@ -6775,8 +6919,8 @@ mod tests {
 <button onclick="setTimeout(() => location.href = '/report.txt', 1500)">Later</button>"#;
 
         /// A menu shown on hover, a card dropped by HTML5 drag and drop, a
-        /// knob dragged by the mouse, a canvas with no refs in it, and a
-        /// save whose words come a moment later.
+        /// knob dragged by the mouse, a canvas with no refs in it, a date
+        /// and a slider, and a save whose words come a moment later.
         const INPUT: &str = r#"<!doctype html><title>Input</title>
 <style>#menu{display:none} #hot:hover + #menu{display:block}</style>
 <button id=hot>Products</button><div id=menu><a href="/two">Hover link</a></div>
@@ -6786,6 +6930,8 @@ mod tests {
 <p role=status id=out>Nothing yet</p>
 <canvas id=pad width=200 height=100 onclick="out.textContent = 'Pad ' + event.offsetX"></canvas>
 <label>Secret <input id=secret type=password value=hunter2></label>
+<label>Due <input type=date onchange="out.textContent = 'Due ' + this.value"></label>
+<label>Volume <input type=range min=0 max=10 onchange="out.textContent = 'Volume ' + this.value"></label>
 <button onclick="setTimeout(() => { out.textContent = 'Saved at last'; spin.remove() }, 1200)">Save</button><span id=spin>Saving now</span>
 <div style="height:900px"></div><button id=low onclick="out.textContent = 'Low pressed'">Low</button>
 <script>let held = false; addEventListener('mouseup', e => { if (held) out.textContent = 'Knob to ' + e.clientX + ',' + e.clientY; held = false })</script>"#;
@@ -7210,6 +7356,29 @@ mod tests {
                     missed.contains("did not show on the page within 1 second."),
                     "{missed}"
                 );
+
+                // A date and a slider are set, not typed into, a date by one
+                // of its parts too, and a value written another way is
+                // refused with the way to write it.
+                let page = look(json!({"action": "look"})).unwrap();
+                // The page's only spinbuttons are the date's parts.
+                let part = ref_of(&page, "spinbutton");
+                let set =
+                    act(json!({"action": "type", "ref": part, "text": "2026-10-02"})).unwrap();
+                assert!(set.contains("Due 2026-10-02"), "{set}");
+                let due = ref_of(&page, "Date \"Due\"");
+                let typed = json!({"action": "type", "ref": due, "text": "02/10/2026"});
+                let refused = act(typed).unwrap_err();
+                assert!(
+                    refused.contains("takes its date as 2026-10-02."),
+                    "{refused}"
+                );
+                let volume = ref_of(&page, "\"Volume\"");
+                let set = act(json!({"action": "type", "ref": volume, "text": "7"})).unwrap();
+                assert!(set.contains("Volume 7"), "{set}");
+                let refused = act(json!({"action": "type", "ref": volume, "text": "70"}));
+                let refused = refused.unwrap_err();
+                assert!(refused.contains("a number from 0 to 10."), "{refused}");
 
                 // A page gone elsewhere since it was seen is not clicked at a
                 // point, nor is a frame from another origin.
