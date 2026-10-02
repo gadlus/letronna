@@ -769,7 +769,7 @@ impl Chat {
                 if crate::theme::follows_system(&this.store.settings.appearance) {
                     // As when the theme is picked: the blurred snapshot behind
                     // settings wears the old colours.
-                    this.settings_backdrop = None;
+                    this.drop_backdrop(cx);
                     crate::theme::apply(&this.store.settings.appearance, window, cx);
                 }
             }),

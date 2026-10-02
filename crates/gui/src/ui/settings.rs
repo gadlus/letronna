@@ -307,6 +307,7 @@ impl Chat {
     pub(crate) fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Snapshot the window before the overlay covers it. Platforms that
         // cannot sample it return None, which falls back to the plain scrim.
+        self.drop_backdrop(cx);
         self.settings_backdrop = crate::platform::backdrop::capture(window);
         self.settings_open = true;
         self.gateway_pick.update(cx, |g, _| g.clear());
@@ -348,11 +349,21 @@ impl Chat {
             let _ = this.update(cx, |this, cx| {
                 this.settings_open = false;
                 this.settings_closing = false;
-                this.settings_backdrop = None;
+                this.drop_backdrop(cx);
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// Let go of the blurred snapshot behind settings, and of its place on
+    /// the GPU, where gpui keeps every picture it has drawn until told.
+    pub(crate) fn drop_backdrop(&mut self, cx: &mut Context<Self>) {
+        if let Some(backdrop) = self.settings_backdrop.take() {
+            // Once the window is free: gpui leaves out the window being
+            // updated, which is where this is called from.
+            cx.defer(move |cx| cx.drop_image(backdrop, None));
+        }
     }
 
     /// The settings overlay, mounted while open so both open and close animate.
@@ -1251,7 +1262,7 @@ fn appearance_page(
                         this.save();
                         // The blurred snapshot behind settings still wears
                         // the old colours; the live window shows through.
-                        this.settings_backdrop = None;
+                        this.drop_backdrop(cx);
                         crate::theme::apply(value, window, cx);
                         cx.notify();
                     })
