@@ -136,7 +136,7 @@ impl Model {
 
 /// How a run stands and for how long, with how far it has got while it
 /// goes: "running · 1m02s · 3 of 9 done", "stopped · 9s".
-fn standing(view: &RunView) -> String {
+pub(crate) fn standing(view: &RunView) -> String {
     let agents = view.phases.iter().flat_map(|phase| &phase.agents);
     let (calls, done) = agents.fold((0, 0), |(calls, done), agent| {
         (calls + 1, done + usize::from(agent.state.answered()))
@@ -187,7 +187,7 @@ fn resume_run(session: u64, name: &str) -> Result<(), String> {
 
 /// What a button asks of a run, or of its agent by number.
 #[derive(Clone, Copy)]
-enum Ask {
+pub(crate) enum Ask {
     Pause,
     Resume,
     Stop,
@@ -206,7 +206,12 @@ impl Chat {
     /// Opens run `name`, or the list for none, with no error or result left
     /// from the one before, and the page's keys working: the button pressed
     /// to get here, which had focus, is gone.
-    fn show_run(&mut self, name: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn show_run(
+        &mut self,
+        name: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.workflows.open = name;
         self.workflows.error = None;
         self.workflows.result = None;
@@ -247,7 +252,7 @@ impl Chat {
 
 /// What core makes of `ask` on session `session`'s run `name`: the run's
 /// result when that is what was asked, or why it refused.
-fn asked(session: u64, name: &str, ask: Ask) -> Result<Option<String>, String> {
+pub(crate) fn asked(session: u64, name: &str, ask: Ask) -> Result<Option<String>, String> {
     let agent = |number: usize| format!("#{number}");
     match ask {
         Ask::Pause => workflow::pause(session, name).map(|()| None),

@@ -1445,7 +1445,7 @@ fn agents_call(id: u64, args: Value) -> Result<String, String> {
 
 /// How a run stands and for how long, with how far it has got while it
 /// goes: "running · 1m02s · 3 of 9 done", "stopped · 9s".
-fn standing(view: &RunView) -> String {
+pub(crate) fn standing(view: &RunView) -> String {
     let agents = view.phases.iter().flat_map(|phase| &phase.agents);
     let (calls, done) = agents.fold((0, 0), |(calls, done), agent| {
         (calls + 1, done + usize::from(agent.state.answered()))

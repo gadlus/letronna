@@ -257,9 +257,8 @@ const QUEUED_LIMIT: usize = 4;
 /// the eye, and what their lines say changes by the second at most.
 const LOOK: Duration = Duration::from_millis(250);
 
-/// Helpers given a line of their own while a turn runs. The rest share one
-/// line, so a fan-out of helpers cannot squeeze the conversation out of a
-/// short window.
+/// Helpers given a line of their own. The rest share one line, so a fan-out
+/// of helpers cannot squeeze the conversation out of a short window.
 const RELAY_LIMIT: usize = 4;
 
 /// How long a pump waits for a keystroke before handing the loop back. Short
@@ -491,6 +490,8 @@ pub struct Bar {
     helpers_of: u64,
     /// A line for each of its helpers at work, as last looked at.
     relay: Vec<String>,
+    /// A line for each of its workflow runs going, as last looked at.
+    runs: Vec<String>,
     /// When the helpers were last looked at.
     looked: std::time::Instant,
     /// The doorbell for notices, once the conversation listens for them.
@@ -545,6 +546,7 @@ impl Bar {
             goal: None,
             helpers_of: 0,
             relay: Vec::new(),
+            runs: Vec::new(),
             looked: std::time::Instant::now(),
             bell: None,
             schedules: None,
@@ -1007,7 +1009,7 @@ impl Bar {
     }
 
     /// Follow the helpers of `session`, the one now open: a line for each at
-    /// work while a turn runs, and how many there are in the footer.
+    /// work, and for each workflow run going, and how many in the footer.
     pub fn show_helpers_of(&mut self, session: u64) {
         if self.helpers_of == session {
             return;
@@ -1018,17 +1020,22 @@ impl Bar {
         self.settle();
     }
 
-    /// Read how the open session's helpers are getting on, and say whether
-    /// that changes the screen: their lines show while a turn runs, and
-    /// their count always.
+    /// Read how the open session's helpers and workflow runs are getting on,
+    /// and say whether that changes the screen. Their lines stay once the
+    /// turn is done, since that is when work out of sight is easiest to miss.
     fn look_at_helpers(&mut self) -> bool {
         let now = std::time::Instant::now();
         let relay: Vec<String> = (letronna_core::agents::seen().iter())
             .filter(|helper| helper.session == self.helpers_of && helper.ended.is_none())
             .map(|helper| relay_line(helper, now))
             .collect();
-        let changed = relay.len() != self.relay.len() || (self.working && relay != self.relay);
+        let runs: Vec<String> = (letronna_core::workflow::runs(self.helpers_of).iter())
+            .filter(|run| run.state == letronna_core::workflow::RunState::Running)
+            .map(run_line)
+            .collect();
+        let changed = relay != self.relay || runs != self.runs;
         self.relay = relay;
+        self.runs = runs;
         changed
     }
 
@@ -1537,9 +1544,7 @@ impl Bar {
         let edge = "─".repeat(room + 2);
         let mut lines = Vec::new();
         // Above the waiting line, which stays next to the box it waits to fill.
-        if self.working {
-            self.relay_lines(&mut lines);
-        }
+        self.relay_lines(&mut lines);
         // The waiting line sits above the box, where the answer it is waiting
         // for will appear.
         if let Some(waiting) = &self.waiting {
@@ -1653,7 +1658,8 @@ impl Bar {
             // a reply going the wrong way is worth stopping early.
             fitted(&self.footer, &format!("{helpers}  ·  esc to stop"), width)
         } else {
-            fitted(&self.footer, &helpers, width)
+            let reach = reach(self.relay.len(), self.runs.len());
+            fitted(&self.footer, &format!("{helpers}{reach}"), width)
         };
         lines.push(format!("{}{}", render::PAD, render::dim(&note)));
 
@@ -1671,11 +1677,13 @@ impl Bar {
         lines
     }
 
-    /// The helpers' lines, each cut to the window, and no more of them than
-    /// `RELAY_LIMIT` before the rest are counted instead.
+    /// The helpers' lines, then the workflow runs', each cut to the window,
+    /// and no more of them than `RELAY_LIMIT` before the rest are counted
+    /// instead.
     fn relay_lines(&self, lines: &mut Vec<String>) {
         let room = render::width().saturating_sub(render::INSIDE.len() + 3);
-        for text in self.relay.iter().take(RELAY_LIMIT) {
+        let all: Vec<&String> = self.relay.iter().chain(&self.runs).collect();
+        for text in all.iter().take(RELAY_LIMIT) {
             lines.push(format!(
                 "{}{} {}",
                 render::INSIDE,
@@ -1683,8 +1691,8 @@ impl Bar {
                 render::dim(&render::clip(text, room))
             ));
         }
-        if self.relay.len() > RELAY_LIMIT {
-            let more = format!("… {} more", self.relay.len() - RELAY_LIMIT);
+        if all.len() > RELAY_LIMIT {
+            let more = format!("… {} more", all.len() - RELAY_LIMIT);
             lines.push(format!("{}  {}", render::INSIDE, render::dim(&more)));
         }
     }
@@ -1853,6 +1861,27 @@ fn relay_line(helper: &letronna_core::agents::Seen, now: std::time::Instant) -> 
     parts.join(" · ")
 }
 
+/// A workflow run's line over the box: "Review changes · wf-3 · running ·
+/// 1m02s · 3 of 9 done".
+fn run_line(run: &letronna_core::workflow::RunView) -> String {
+    format!(
+        "{} · {} · {}",
+        run.title,
+        run.name,
+        crate::commands::standing(run)
+    )
+}
+
+/// The command that reaches the work listed over the box, said in the
+/// footer at the prompt, where it can be typed.
+fn reach(helpers: usize, runs: usize) -> &'static str {
+    match (helpers, runs) {
+        (0, 0) => "",
+        (0, _) => "  ·  /workflows to look in or stop",
+        _ => "  ·  /agents to steer or stop",
+    }
+}
+
 /// The footer's note of how many helpers are at work, if any are.
 fn at_work(helpers: usize) -> String {
     match helpers {
@@ -1925,7 +1954,7 @@ mod tests {
     use super::{
         Bar, Choice, MENU_LIMIT, NAME_WIDTH, PLAN_ROWS, QUEUED_LIMIT, RELAY_LIMIT, STILL, Slider,
         Waited, at_work, checklist, closest, fitted, is_command, matches, menu_top, name_width,
-        offered, one_row, relay_line, stops_at, track, unescaped,
+        offered, one_row, reach, relay_line, stops_at, track, unescaped,
     };
     use crate::render::{MARGIN, plain, visible};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -2370,21 +2399,24 @@ mod tests {
     }
 
     #[test]
-    fn helpers_at_work_are_counted_always_and_drawn_while_a_turn_runs() {
+    fn helpers_at_work_are_drawn_at_the_prompt_as_well_as_during_a_turn() {
         let mut bar = Bar::new("model".into());
-        bar.relay = (1..=6)
+        bar.relay = (1..=5)
             .map(|n| format!("helper-{n} · 1k tokens · 5s"))
             .collect();
+        bar.runs = vec!["Review changes · wf-1 · running · 9s · 0 of 3 done".into()];
         // Only what is not cut to the window is looked at, so the test
         // passes in a terminal of any width.
-        let idle = bar.lines(40);
-        assert!(!idle.iter().any(|line| line.contains('◆')));
-
-        bar.working = true;
-        let busy = bar.lines(40);
-        let drawn = busy.iter().filter(|line| line.contains('◆')).count();
-        assert_eq!(drawn, RELAY_LIMIT);
-        assert!(busy.iter().any(|line| line.ends_with("… 2 more")));
+        for working in [false, true] {
+            bar.working = working;
+            let lines = bar.lines(40);
+            let drawn = lines.iter().filter(|line| line.contains('◆')).count();
+            assert_eq!(drawn, RELAY_LIMIT);
+            assert!(lines.iter().any(|line| line.ends_with("… 2 more")));
+        }
+        assert_eq!(reach(0, 0), "");
+        assert_eq!(reach(2, 1), "  ·  /agents to steer or stop");
+        assert_eq!(reach(0, 1), "  ·  /workflows to look in or stop");
         assert_eq!(at_work(0), "");
         assert_eq!(at_work(1), "  ·  1 helper working");
         assert_eq!(at_work(6), "  ·  6 helpers working");
