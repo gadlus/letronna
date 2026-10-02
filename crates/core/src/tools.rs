@@ -192,6 +192,10 @@ pub const PLAN_APPROVED: &str = "The user approved this plan. Plan mode is off; 
 pub const KEEP_PLANNING: &str =
     "Keep planning: the user wants changes. Ask what to change, or refine the plan.";
 const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// The most seconds a call can give a command to finish: half an hour fits
+/// a slow build or a full test suite, and what runs longer belongs in the
+/// background, where it does not hold the turn up.
+const MAX_COMMAND_SECS: u64 = 1800;
 /// How much of a file one read shows, in bytes, which is never more
 /// characters: under the chat's cap on a tool result with room for the
 /// footer, so a page reaches the model whole instead of losing its middle.
@@ -1189,10 +1193,11 @@ fn run_sandboxed(
     cwd: &Path,
     cancel: &Cancel,
     save: Option<SaveTo>,
+    limit: Duration,
 ) -> Result<String, String> {
     let (policy, _scratch) = crate::sandbox::Policy::for_project(cwd)?;
     let wrapped = crate::sandbox::here().wrap(&shell(command, Some(cwd)), &policy)?;
-    match run_shell_saving(wrapped, command, cancel, save, COMMAND_TIMEOUT, None) {
+    match run_shell_saving(wrapped, command, cancel, save, limit, None) {
         Ok(text) => Ok(crate::sandbox::noted(&text)),
         Err(e) => Err(crate::sandbox::noted(&e)),
     }
@@ -1277,9 +1282,10 @@ fn run_shell_into(
             }
             let _ = child.kill();
             break Err(format!(
-                "Timed out after {}s and was stopped. If this command is meant to \
-                 keep running, such as a dev server, call it again with \
-                 background: true.",
+                "Timed out after {}s and was stopped. If it only needs longer, call \
+                 it again with a longer timeout, up to {MAX_COMMAND_SECS} seconds. If \
+                 this command is meant to keep running, such as a dev server, call \
+                 it again with background: true.",
                 limit.as_secs()
             ));
         }
@@ -1954,9 +1960,9 @@ impl Tool for RunCommand {
     }
     fn description(&self) -> &'static str {
         if cfg!(windows) {
-            "Run a Windows PowerShell 5.1 command in the project folder. `&&` and `||` are syntax errors in 5.1: separate commands with `;`, or write `first; if ($?) { second }` to run the second only when the first succeeded. Waits for it to finish and returns its output, with a 2 minute limit. For anything meant to keep running, such as a dev server or a watcher, pass background: true instead."
+            "Run a Windows PowerShell 5.1 command in the project folder. `&&` and `||` are syntax errors in 5.1: separate commands with `;`, or write `first; if ($?) { second }` to run the second only when the first succeeded. Waits for it to finish and returns its output, for up to 2 minutes or the `timeout` given. For anything meant to keep running, such as a dev server or a watcher, pass background: true instead."
         } else {
-            "Run a shell (sh) command in the project folder. Waits for it to finish and returns its output, with a 2 minute limit. For anything meant to keep running, such as a dev server or a watcher, pass background: true instead."
+            "Run a shell (sh) command in the project folder. Waits for it to finish and returns its output, for up to 2 minutes or the `timeout` given. For anything meant to keep running, such as a dev server or a watcher, pass background: true instead."
         }
     }
     fn parameters(&self) -> Value {
@@ -1964,7 +1970,8 @@ impl Tool for RunCommand {
             "command": {"type": "string"},
             "background": {"type": "boolean", "description": "Leave the command running and return a job number straight away. A notice comes when it exits; read its output meanwhile with read_job, and end it with stop_job."},
             "notify_on": {"type": "array", "items": {"type": "string"}, "description": "With background: a notice when an output line contains one of these, such as \"ready\" or \"error\". At most one notice every 15 s; exiting always sends one."},
-            "unsandboxed": {"type": "boolean", "description": "Run it outside the sandbox. Only after a sandboxed run of it failed for want of the network or of writing outside the project; it needs the user's approval."}
+            "unsandboxed": {"type": "boolean", "description": "Run it outside the sandbox. Only after a sandboxed run of it failed for want of the network or of writing outside the project; it needs the user's approval."},
+            "timeout": {"type": "number", "description": format!("Seconds to wait for it to finish, 1 to {MAX_COMMAND_SECS}; {} if left out. Give a slow build, install or test suite longer.", COMMAND_TIMEOUT.as_secs())}
         }, "required": ["command"]})
     }
     fn needs_approval(&self) -> bool {
@@ -2018,13 +2025,14 @@ impl Tool for RunCommand {
                         .into(),
                 );
             }
+            let limit = command_timeout(args)?;
             let before = crate::filestate::before(ctx.conversation);
             let save = spill_path(ctx).map(|path| SaveTo {
                 path,
                 cap: PIPE_SPILL_BYTES,
             });
             let out = if ctx.sandboxed {
-                run_sandboxed(command, cwd, &ctx.cancel, save)
+                run_sandboxed(command, cwd, &ctx.cancel, save, limit)
             } else {
                 // A helper's command is stopped at the limit instead, since its
                 // report would come back before the command had finished, as is
@@ -2032,7 +2040,7 @@ impl Tool for RunCommand {
                 let own = ctx.caller.agent.is_none() && ctx.conversation != 0;
                 let owner = own.then_some(ctx.conversation);
                 let cmd = shell(command, Some(cwd));
-                run_shell_saving(cmd, command, &ctx.cancel, save, COMMAND_TIMEOUT, owner)
+                run_shell_saving(cmd, command, &ctx.cancel, save, limit, owner)
             };
             let note = crate::filestate::note(ctx.conversation, before, cwd);
             // The note goes first, so cutting long output short cannot drop it.
@@ -2554,6 +2562,21 @@ fn job_state(running: bool, exit_code: Option<i32>) -> String {
         (false, Some(code)) => format!("exited with code {code}"),
         (false, None) => "stopped".to_owned(),
     }
+}
+
+/// How long a foreground command may run: the call's `timeout` in whole
+/// seconds, kept between one and `MAX_COMMAND_SECS`, or two minutes.
+fn command_timeout(args: &Value) -> Result<Duration, String> {
+    if args["timeout"].is_null() {
+        return Ok(COMMAND_TIMEOUT);
+    }
+    let Some(seconds) = args["timeout"].as_f64() else {
+        return Err(format!(
+            "`timeout` must be a number of seconds, 1 to {MAX_COMMAND_SECS}, such as 600."
+        ));
+    };
+    let seconds = seconds.round().clamp(1., MAX_COMMAND_SECS as f64);
+    Ok(Duration::from_secs(seconds as u64))
 }
 
 /// The text a background command's output is watched for, from `notify_on`.
@@ -4424,6 +4447,76 @@ mod tests {
             jobs.iter().all(|job| job.command != command),
             "it became a job"
         );
+    }
+
+    #[test]
+    fn a_command_is_stopped_at_the_timeout_it_was_given() {
+        // No conversation to tell of a job, so it is stopped rather than moved.
+        let ctx = ToolContext {
+            workspace: Some(std::env::temp_dir()),
+            ..Default::default()
+        };
+        let command = if cfg!(windows) {
+            "Start-Sleep 30; Write-Output given"
+        } else {
+            "sleep 30; echo given"
+        };
+        let args = json!({"command": command, "timeout": 1}).to_string();
+        let started = Instant::now();
+        let out = run("run_command", &args, &ctx).unwrap_err();
+        assert!(
+            out.starts_with("Timed out after 1s and was stopped."),
+            "{out}"
+        );
+        assert!(
+            out.contains("a longer timeout, up to 1800 seconds"),
+            "{out}"
+        );
+        // A cold PowerShell start comes on top of the second.
+        assert!(started.elapsed() < Duration::from_secs(20));
+    }
+
+    #[test]
+    fn a_command_given_a_longer_timeout_is_not_stopped_at_two_minutes() {
+        let given = |args: Value| command_timeout(&args).unwrap();
+        assert_eq!(given(json!({"command": "make"})), COMMAND_TIMEOUT);
+        assert_eq!(given(json!({"timeout": null})), COMMAND_TIMEOUT);
+        assert_eq!(given(json!({"timeout": 600})), Duration::from_secs(600));
+        assert_eq!(given(json!({"timeout": 299.6})), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn a_timeout_over_the_limit_is_clamped() {
+        let given = |args: Value| command_timeout(&args).unwrap();
+        assert_eq!(
+            given(json!({"timeout": 86_400})),
+            Duration::from_secs(MAX_COMMAND_SECS)
+        );
+        // Nothing would run at all with no time to.
+        assert_eq!(given(json!({"timeout": 0})), Duration::from_secs(1));
+        assert_eq!(given(json!({"timeout": -5})), Duration::from_secs(1));
+        assert_eq!(given(json!({"timeout": 0.2})), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_timeout_that_is_not_a_number_is_refused_before_anything_runs() {
+        let dir = std::env::temp_dir().join(format!("letronna-timeout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let command = if cfg!(windows) {
+            "Set-Content ran x"
+        } else {
+            "echo x > ran"
+        };
+        let args = json!({"command": command, "timeout": "ten minutes"}).to_string();
+        let refused = run("run_command", &args, &ctx).unwrap_err();
+        assert!(refused.contains("`timeout` must be a number"), "{refused}");
+        assert!(!dir.join("ran").exists(), "it ran anyway");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(unix)]
