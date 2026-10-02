@@ -42,7 +42,7 @@ use letronna_core::cancel::Cancel;
 use letronna_core::chat::{self, Message};
 use letronna_core::driver::{self, Allow, Outcome, Report, Spec, Status};
 use letronna_core::store::Transcript;
-use letronna_core::{agent, crew, hooks, inbox, store, tools, update};
+use letronna_core::{crew, hooks, inbox, store, tools, update};
 use serde_json::{Value, json};
 use session::Runner;
 use std::io::IsTerminal;
@@ -65,6 +65,10 @@ const PREVIEW_LINES: usize = 12;
 /// How long a new version runs before it counts as working and is kept, as
 /// in the window.
 const SETTLED: std::time::Duration = std::time::Duration::from_secs(10);
+/// Four times a conversation's 25 tool rounds, since nobody is there to say
+/// "continue" and a task left to run on its own, such as a fix across a
+/// repository, often reads and runs more than 25 times.
+const PRINT_ROUNDS: usize = 100;
 
 fn main() {
     // The first mark, from which the others are timed.
@@ -551,12 +555,17 @@ fn begin(
         watch: None,
         decide: None,
         allow: args.tools.clone().map_or(Allow::All, Allow::Only),
-        rounds: args.max_rounds.unwrap_or(agent::MAX_ROUNDS),
+        rounds: rounds(args),
         cancel: Cancel::default(),
         budget,
         status: Arc::default(),
     };
     Ok((spec, context, before))
+}
+
+/// The tool rounds a `-p` run gets: what --max-rounds says, else `PRINT_ROUNDS`.
+fn rounds(args: &Args) -> usize {
+    args.max_rounds.unwrap_or(PRINT_ROUNDS)
 }
 
 /// Runs `spec` to its end on this thread, with progress lines while it runs
@@ -1114,6 +1123,13 @@ mod tests {
         ];
         assert_eq!(said_last(&session[2..]), "");
         assert_eq!(said_last(&session), "The notes say hello.");
+    }
+
+    #[test]
+    fn a_print_run_gets_a_hundred_rounds_unless_told_otherwise() {
+        let asked = |words: &[&str]| parse(words.iter().map(|w| w.to_string())).unwrap();
+        assert_eq!(rounds(&asked(&["-p", "fix it"])), 100);
+        assert_eq!(rounds(&asked(&["-p", "fix it", "--max-rounds", "40"])), 40);
     }
 
     fn call(name: &str, args: Value) -> ToolCall {

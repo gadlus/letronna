@@ -37,7 +37,7 @@ Options
 
 With -p
       --output <form>      text (the answer), json, or stream-json
-      --max-rounds <n>     tool rounds a message gets before it stops (25)
+      --max-rounds <n>     tool rounds a message gets before it stops (100)
       --model <name>       use this model instead of the one set up
       --tools <a,b>        only these tools, by name
       --budget <tokens>    stop once this many tokens are spent, over every
