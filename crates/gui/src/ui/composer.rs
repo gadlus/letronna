@@ -63,14 +63,17 @@ impl Chat {
             .overflow_y_scroll()
             .p_1()
             .gap_0p5();
-        // The chat models, unless a media tab is showing instead.
+        // The chat models, unless a media tab is showing instead. Only
+        // while the list is open: it is a button for every model of every
+        // gateway, and the window is drawn many times a second while a reply
+        // comes in.
         let chat = self.model_kind == "chat";
-        let matches = if chat {
+        let matches = if chat && self.model_open {
             self.model_matches(cx)
         } else {
             Vec::new()
         };
-        if chat && matches.is_empty() {
+        if self.model_open && chat && matches.is_empty() {
             list = list.child(
                 div()
                     .px_2()
@@ -118,7 +121,7 @@ impl Chat {
                     })),
             );
         }
-        if !chat {
+        if self.model_open && !chat {
             let query = self.model_search.read(cx).value().to_lowercase();
             list = self.media_list(list, &query, cx);
         }
