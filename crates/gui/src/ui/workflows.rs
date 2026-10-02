@@ -12,6 +12,7 @@
 //! of a run, where the window can read them, so Open shows the run's result
 //! and the page has no log.
 
+use super::PageColumn;
 use crate::prelude::*;
 use letronna_core::agents::took;
 use letronna_core::budget::short;
@@ -296,7 +297,7 @@ impl Chat {
             }))
             .flex_1()
             .min_h_0()
-            .px_8()
+            .page_column()
             .py_6()
             .gap_4()
             .child(body)
@@ -311,7 +312,7 @@ impl Chat {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let refresh = Button::new("workflows-refresh")
-            .ghost()
+            .plain(cx)
             .small()
             .icon(Icon::new(AppIcon::Reload))
             .tooltip("Refresh")
@@ -397,7 +398,7 @@ impl Chat {
                     )
                     .child(
                         Button::new(("open-run", index))
-                            .ghost()
+                            .plain(cx)
                             .xsmall()
                             .label("Open")
                             .on_click(cx.listener(move |this, _, window, cx| {
@@ -434,7 +435,7 @@ impl Chat {
     ) -> AnyElement {
         let name = name.to_owned();
         Button::new(ElementId::Name(format!("run-{label}").into()))
-            .ghost()
+            .plain(cx)
             .small()
             .icon(Icon::new(icon))
             .label(label)
@@ -453,7 +454,7 @@ impl Chat {
     ) -> impl IntoElement {
         let name = model.name.as_str();
         let back = Button::new("workflow-back")
-            .ghost()
+            .plain(cx)
             .small()
             .icon(Icon::new(IconName::ArrowLeft))
             .tooltip("All runs")
@@ -590,7 +591,7 @@ impl Chat {
             )
             .child(
                 Button::new(("skip-agent", number))
-                    .ghost()
+                    .plain(cx)
                     .xsmall()
                     .icon(Icon::new(AppIcon::Skip))
                     .label("Skip")
@@ -601,7 +602,7 @@ impl Chat {
             )
             .child(
                 Button::new(("retry-agent", number))
-                    .ghost()
+                    .plain(cx)
                     .xsmall()
                     .icon(Icon::new(AppIcon::Reload))
                     .label("Retry")

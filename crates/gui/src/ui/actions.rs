@@ -9,10 +9,12 @@
 //! sees the shorter session too. It can also put back the files the agent's
 //! tools wrote since, from the copies `history` kept of them.
 //!
-//! The newest finished turn ends with the files it changed: each with the
-//! lines it added and removed, its diff a key away, and a button that puts
-//! them all back without leaving the conversation. What the card lists is
-//! read off the UI thread once per session and length, never on a timer.
+//! The newest finished turn ends with one line of the files it changed and
+//! the lines it added and removed, the Changes tab a key away, and a button
+//! that puts them all back without leaving the conversation. A turn that
+//! changed only a few files lists them under the line, each diff a key
+//! away. What the card lists is read off the UI thread once per session and
+//! length, never on a timer.
 
 use crate::app::Given;
 use crate::prelude::*;
@@ -21,9 +23,9 @@ use gpui_component::menu::PopupMenu;
 use gpui_component::notification::Notification;
 use gpui_component::{button::ButtonVariant, dialog::DialogButtonProps};
 use letronna_core::history;
-use std::{cell::Cell, collections::HashSet, rc::Rc};
+use std::{cell::Cell, collections::HashMap, rc::Rc};
 
-actions!(turn_files, [ToggleDiff]);
+actions!(turn_files, [ToggleDiff, ReviewFiles]);
 
 /// Diff lines drawn under a file at most; a file rewritten whole says how
 /// many more rather than laying out thousands of rows.
@@ -33,9 +35,14 @@ const DIFF_ROWS: usize = 300;
 /// of megabytes, copied again on every frame were it drawn whole.
 const DIFF_LINE: usize = 500;
 
-/// Files the card lists at most; a turn that rewrote a tree says how many
-/// more rather than drawing a row and a tab stop for each.
-const CARD_FILES: usize = 50;
+/// Files the card lists under its line at most. A turn that changed more
+/// rests as the line alone, and Review shows them all in the Changes tab.
+const CARD_FILES: usize = 3;
+
+/// Diff lines an open diff shows before it scrolls, and half of one more
+/// under them, cut, to say there is more: a file rewritten whole would
+/// otherwise push the conversation thousands of pixels down.
+const DIFF_SHOWN: f32 = 12.5;
 
 actions!(
     turn,
@@ -97,8 +104,11 @@ pub(crate) struct TurnFiles {
     ran_commands: bool,
     /// Makes each file a tab stop, so Enter can open its diff.
     focus: Vec<FocusHandle>,
-    /// The files whose diffs are open, by place in `files`.
-    open: HashSet<usize>,
+    /// The files whose diffs are open, by place in `files`, each with where
+    /// its diff is scrolled to.
+    open: HashMap<usize, ScrollHandle>,
+    /// Makes the card's line a tab stop, so Enter can open the review.
+    line: FocusHandle,
 }
 
 /// An action on a turn, as the menu and the buttons both call it.
@@ -109,7 +119,7 @@ type Act = fn(&mut Chat, Span, &mut Window, &mut Context<Chat>);
 pub(crate) enum Stop {
     /// A turn with a menu, by its first message.
     Turn(usize),
-    /// The question waiting on its card, at the end.
+    /// The question or the permission card waiting on the user, at the end.
     Question,
 }
 
@@ -169,6 +179,12 @@ impl Chat {
             .retain(|&(session, at)| session != id || at < keep);
         self.runs_open
             .retain(|&(session, at)| session != id || at < keep);
+        self.previews_open
+            .retain(|&(session, at)| session != id || at < keep);
+        self.thought_for
+            .retain(|&(session, at), _| session != id || at < keep);
+        self.edited
+            .retain(|&(session, at), _| session != id || at < keep);
         self.save();
     }
 
@@ -646,7 +662,7 @@ impl Chat {
     pub(crate) fn stops(&self) -> Vec<Stop> {
         let conversation = &self.store.conversations[self.store.active];
         let streaming_here = self.busy && self.streaming_id == Some(conversation.id);
-        let asking = streaming_here && self.question_options().is_some();
+        let asking = streaming_here && self.card_takes_keys();
         stops(&self.turns, &conversation.messages, streaming_here, asking)
     }
 
@@ -1023,7 +1039,8 @@ impl Chat {
                     files,
                     labels,
                     ran_commands,
-                    open: HashSet::new(),
+                    open: HashMap::new(),
+                    line: cx.focus_handle().tab_stop(true),
                 });
                 this.show_turn_files(card);
                 cx.notify();
@@ -1053,7 +1070,9 @@ impl Chat {
     }
 
     /// The card that ends the turn at `span` when it is the newest finished
-    /// one and changed files: each file, its diff when open, and Undo.
+    /// one and changed files: one line of how many and how much, whose
+    /// Review opens the Changes tab, and Undo; under it each file and its
+    /// diff when open, when there are few enough to list.
     pub(crate) fn files_card(&self, span: Span, cx: &mut Context<Self>) -> Option<AnyElement> {
         let open = &self.store.conversations[self.store.active];
         let card = self
@@ -1062,96 +1081,158 @@ impl Chat {
             .filter(|card| card.key == (open.id, open.messages.len()))
             .filter(|card| !span.yours && card.first == span.first)?;
         let undoable = card.files.iter().any(|file| file.restore.fate.touches());
-        let muted = cx.theme().muted_foreground;
         let heading = match card.files.len() {
             1 => "1 file changed".to_owned(),
             n => format!("{n} files changed"),
         };
+        let totals = line_totals(card.files.iter().map(|file| file.lines.as_ref()));
+        // Without a project folder the Changes tab has none of them to show.
+        let listed = card.files.len() <= CARD_FILES || open.workspace.is_none();
         let rows: Vec<_> = card
             .files
             .iter()
             .enumerate()
-            .take(CARD_FILES)
+            .filter(|_| listed)
             .map(|(n, file)| {
-                let shown = card.open.contains(&n);
+                let scroll = card.open.get(&n);
                 let path = &card.labels[n];
                 v_flex()
                     .w_full()
                     .border_t_1()
                     .border_color(cx.theme().border)
-                    .child(self.changed_file_row(n, file, path, shown, &card.focus[n], cx))
-                    .when_some(file.lines.as_ref().filter(|_| shown), |row, lines| {
-                        row.child(diff_rows(lines, cx))
+                    .child(self.changed_file_row(
+                        n,
+                        file,
+                        path,
+                        scroll.is_some(),
+                        &card.focus[n],
+                        cx,
+                    ))
+                    .when_some(file.lines.as_ref().zip(scroll), |row, (lines, scroll)| {
+                        row.child(diff_rows(self.row_id("file-diff", n), lines, scroll, cx))
                     })
             })
             .collect();
         let session = open.id;
         let files: Vec<history::Restore> =
             card.files.iter().map(|file| file.restore.clone()).collect();
+        let theme = cx.theme();
+        // What Undo leaves alone is said where Undo is: the card rests as
+        // one line.
+        let undo_tip = if card.ran_commands {
+            format!(
+                "Put these files back as they were before this turn. {}",
+                history::COMMANDS_NOTE
+            )
+        } else {
+            "Put these files back as they were before this turn".to_owned()
+        };
+        // The line's own part, apart from Undo: a press on Undo would
+        // otherwise open the review as well.
+        let summary = h_flex()
+            .id(self.row_id("review-files", span.first))
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .pl_2()
+            .gap_2()
+            .items_center()
+            .rounded(theme.radius_lg)
+            .cursor_pointer()
+            .active(|s| s.bg(theme.secondary.opacity(0.5)))
+            .text_xs()
+            .child(
+                div()
+                    .flex_none()
+                    .font_family(HEADING_FONT)
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(heading),
+            )
+            .when_some(totals, |line, (added, removed)| {
+                line.child(
+                    h_flex()
+                        .flex_none()
+                        .gap_1()
+                        .child(div().text_color(theme.green).child(format!("+{added}")))
+                        .child(div().text_color(theme.danger).child(format!("−{removed}"))),
+                )
+            })
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(theme.muted_foreground)
+                    .child("·"),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(theme.link)
+                    .child("Review"),
+            )
+            // Enter is ReviewFiles', on the line that has the focus.
+            .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
+                if !event.is_keyboard() {
+                    this.review_files(window, cx);
+                }
+            }));
+        let line = h_flex()
+            .id(self.row_id("files-line", span.first))
+            .track_focus(&card.line)
+            .key_context("TurnFiles")
+            .h(px(30.))
+            .w_full()
+            .min_w_0()
+            .pr_2()
+            .gap_2()
+            .items_center()
+            .rounded(theme.radius_lg)
+            .focus(|s| s.bg(theme.secondary))
+            // As on a tool row, a press leaves the keys in the composer;
+            // Tab is what picks the line out.
+            .on_any_mouse_down(|_, window, _| window.prevent_default())
+            // Only the line's own: Enter on Undo presses Undo.
+            .on_action({
+                let line = card.line.clone();
+                cx.listener(move |this, _: &ReviewFiles, window, cx| {
+                    if !line.is_focused(window) {
+                        return cx.propagate();
+                    }
+                    this.review_files(window, cx)
+                })
+            })
+            .child(summary)
+            .child(
+                Button::new(self.row_id("undo-files", span.first))
+                    .plain(cx)
+                    .xsmall()
+                    .icon(Icon::new(IconName::Undo))
+                    .label("Undo these")
+                    .tooltip(undo_tip)
+                    .disabled(self.busy || !undoable)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if !this.busy && this.store.conversations[this.store.active].id == session {
+                            this.put_files_back(session, files.clone(), window, cx);
+                        }
+                    })),
+            );
         Some(
             v_flex()
                 .w_full()
-                .rounded(cx.theme().radius_lg)
+                .rounded(theme.radius_lg)
                 .border_1()
-                .border_color(cx.theme().border)
-                .child(
-                    h_flex()
-                        .h(px(30.))
-                        .px_2()
-                        .gap_2()
-                        .items_center()
-                        .justify_between()
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_family(HEADING_FONT)
-                                .font_weight(FontWeight::MEDIUM)
-                                .child(heading),
-                        )
-                        .child(
-                            Button::new(self.row_id("undo-files", span.first))
-                                .plain(cx)
-                                .xsmall()
-                                .icon(Icon::new(IconName::Undo))
-                                .label("Undo these")
-                                .tooltip("Put these files back as they were before this turn")
-                                .disabled(self.busy || !undoable)
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    if !this.busy
-                                        && this.store.conversations[this.store.active].id == session
-                                    {
-                                        this.put_files_back(session, files.clone(), window, cx);
-                                    }
-                                })),
-                        ),
-                )
+                .border_color(theme.border)
+                .child(line)
                 .children(rows)
-                .when(card.files.len() > CARD_FILES, |this| {
-                    this.child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .border_t_1()
-                            .border_color(cx.theme().border)
-                            .text_xs()
-                            .text_color(muted)
-                            .child(format!("and {} more", card.files.len() - CARD_FILES)),
-                    )
-                })
-                .when(card.ran_commands, |this| {
-                    this.child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .border_t_1()
-                            .border_color(cx.theme().border)
-                            .text_xs()
-                            .text_color(muted)
-                            .child(history::COMMANDS_NOTE),
-                    )
-                })
                 .into_any_element(),
         )
+    }
+
+    /// Show the Changes tab on this session's files, which the card is
+    /// about, whichever list it was last switched to.
+    fn review_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.switch_scope(crate::ui::changes::Scope::Session, cx);
+        self.show_changes(window, cx);
     }
 
     /// One file of the card: its path and the lines the turn added and
@@ -1235,16 +1316,21 @@ impl Chat {
         if card.files.get(n).is_none_or(|file| file.lines.is_none()) {
             return;
         }
-        if !card.open.remove(&n) {
-            card.open.insert(n);
+        if card.open.remove(&n).is_none() {
+            card.open.insert(n, ScrollHandle::new());
         }
         cx.notify();
     }
 }
 
 /// A file's diff under its row: additions and removals in their colours,
-/// long unchanged stretches as a count.
-fn diff_rows(lines: &history::Lines, cx: &Context<Chat>) -> impl IntoElement {
+/// long unchanged stretches as a count, scrolling past `DIFF_SHOWN` lines.
+fn diff_rows(
+    id: ElementId,
+    lines: &history::Lines,
+    scroll: &ScrollHandle,
+    cx: &Context<Chat>,
+) -> impl IntoElement {
     let theme = cx.theme();
     let row = |mark: &str, text: &str, color: Hsla| {
         let text: String = text.chars().take(DIFF_LINE).collect();
@@ -1257,13 +1343,8 @@ fn diff_rows(lines: &history::Lines, cx: &Context<Chat>) -> impl IntoElement {
             .child(format!("{mark} {}", text.replace('\t', "    ")))
     };
     let hidden = lines.rows.len().saturating_sub(DIFF_ROWS);
-    v_flex()
-        .ml_4()
-        .mb_2()
-        .pl_3()
+    let body = v_flex()
         .min_w_0()
-        .border_l_2()
-        .border_color(theme.border)
         .text_xs()
         .font_family(MONO_FONT)
         .line_height(crate::ui::CODE_LINE)
@@ -1283,7 +1364,54 @@ fn diff_rows(lines: &history::Lines, cx: &Context<Chat>) -> impl IntoElement {
                 &format!("⋯ {hidden} more"),
                 theme.muted_foreground,
             ))
-        })
+        });
+    let frame = div()
+        .ml_4()
+        .mb_2()
+        .pl_3()
+        .min_w_0()
+        .border_l_2()
+        .border_color(theme.border);
+    // Each row is one line high, clipped rather than wrapped, so the count
+    // is the height.
+    let drawn = lines.rows.len().min(DIFF_ROWS) + usize::from(hidden > 0);
+    if !scrolls(drawn) {
+        return frame.child(body);
+    }
+    frame.child(
+        div()
+            .id(id)
+            .relative()
+            // A definite height, so the scroll area inside has something to
+            // resolve `size_full` against.
+            .h(crate::ui::CODE_LINE * DIFF_SHOWN)
+            .child(
+                div()
+                    .id("diff-scroll")
+                    .occlude()
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(scroll)
+                    .child(body),
+            )
+            .vertical_scrollbar(scroll),
+    )
+}
+
+/// Whether a diff of `drawn` lines is taller than an open diff is let be.
+fn scrolls(drawn: usize) -> bool {
+    drawn as f32 > DIFF_SHOWN
+}
+
+/// What a turn added and removed in all, from its files' counts; `None`
+/// when no file's lines can be told.
+fn line_totals<'a>(
+    lines: impl IntoIterator<Item = Option<&'a history::Lines>>,
+) -> Option<(usize, usize)> {
+    lines.into_iter().flatten().fold(None, |sum, lines| {
+        let (added, removed) = sum.unwrap_or((0, 0));
+        Some((added + lines.added, removed + lines.removed))
+    })
 }
 
 /// Whether a turn shows its buttons: the newest one once nothing is coming
@@ -1364,8 +1492,11 @@ fn message_count(n: usize) -> String {
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
-    use super::{Span, Stop, message_count, shows_bar, step_stop, stops, turns};
+    use super::{
+        Span, Stop, line_totals, message_count, scrolls, shows_bar, step_stop, stops, turns,
+    };
     use letronna_core::chat::Message;
+    use letronna_core::history::Lines;
 
     #[test]
     fn a_turn_keeps_what_comes_before_your_message_or_up_to_its_reply() {
@@ -1450,6 +1581,33 @@ mod tests {
             ]
         );
         assert!(stops(&[], &[], false, false).is_empty());
+    }
+
+    #[test]
+    fn the_line_adds_up_every_file_it_can_count() {
+        let lines = |added, removed| Lines {
+            added,
+            removed,
+            ..Default::default()
+        };
+        let (small, large) = (lines(3, 1), lines(37, 11));
+        // A file whose lines cannot be told adds nothing, and no other.
+        assert_eq!(
+            line_totals([Some(&small), None, Some(&large)]),
+            Some((40, 12))
+        );
+        assert_eq!(line_totals([None, None]), None);
+        assert_eq!(line_totals([]), None);
+        // Counted as nothing is still counted: the line says +0 −0.
+        assert_eq!(line_totals([Some(&lines(0, 0))]), Some((0, 0)));
+    }
+
+    #[test]
+    fn a_diff_scrolls_only_past_twelve_lines() {
+        assert!(!scrolls(1));
+        assert!(!scrolls(12));
+        assert!(scrolls(13));
+        assert!(scrolls(301));
     }
 
     #[test]

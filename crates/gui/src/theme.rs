@@ -430,6 +430,25 @@ mod tests {
     }
 
     #[test]
+    fn every_sidebar_mark_stands_out_from_the_frame() {
+        // The sidebar's dots, pins and picked filters are drawn in `link`;
+        // marks that are not text ask 3:1 of what is behind them.
+        let p = &PAPER_PALETTE;
+        let pairs = [
+            ("signal on midnight", SIGNAL, MIDNIGHT),
+            ("signal on the selected sidebar row", SIGNAL, SIDEBAR_ON),
+            ("signal on a picked filter", SIGNAL, SELECTED),
+            ("blue on the paper frame", p.link, p.frame),
+            ("blue on the paper frame's selected row", p.link, p.frame_on),
+            ("blue on a picked paper filter", p.link, p.selected),
+        ];
+        for (what, mark, surface) in pairs {
+            let ratio = contrast(mark, surface);
+            assert!(ratio >= 3.0, "{what} reads at {ratio:.2}:1, under 3:1");
+        }
+    }
+
+    #[test]
     fn every_paper_syntax_colour_passes_aa_on_a_code_block() {
         let paper = paper_highlight(&HighlightTheme::default_light());
         let syntax = &paper.style.syntax;

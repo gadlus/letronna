@@ -3,6 +3,9 @@ use gpui_component::popover::Popover;
 
 /// The user guide on the website, opened from the account menu.
 const GUIDE: &str = "https://letronna.ai/docs";
+/// The window width from which the palette's button says what it does:
+/// below it, its words would take the session name's room.
+const COMMAND_WORDS: Pixels = px(960.);
 
 impl Chat {
     pub(crate) fn title_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -24,27 +27,31 @@ impl Chat {
                     .gap_2()
                     // Nothing follows the chip on macOS, so keep it off the edge.
                     .when(cfg!(target_os = "macos"), |bar| bar.pr_3())
+                    // Both sides grow alike from nothing, so the name sits
+                    // in the middle of the bar, not of what the buttons
+                    // leave; a side wider than its half only pushes it over.
                     .child(
-                        Button::new("toggle-sidebar")
-                            .plain(cx)
-                            .small()
-                            .icon(
-                                Icon::new(if self.sidebar_open {
-                                    IconName::PanelLeftClose
-                                } else {
-                                    IconName::PanelLeftOpen
-                                })
-                                .size_4(),
-                            )
-                            .tooltip_with_action("Toggle sidebar", &ToggleSidebar, None)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.sidebar_open = !this.sidebar_open;
-                                cx.notify();
-                            })),
+                        h_flex().flex_1().items_center().child(
+                            Button::new("toggle-sidebar")
+                                .plain(cx)
+                                .small()
+                                .icon(
+                                    Icon::new(if self.sidebar_open {
+                                        IconName::PanelLeftClose
+                                    } else {
+                                        IconName::PanelLeftOpen
+                                    })
+                                    .size_4(),
+                                )
+                                .tooltip_with_action("Toggle sidebar", &ToggleSidebar, None)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.sidebar_open = !this.sidebar_open;
+                                    cx.notify();
+                                })),
+                        ),
                     )
                     .child(
                         h_flex()
-                            .flex_1()
                             .min_w_0()
                             .justify_center()
                             .when(self.page == Page::Chat, |this| {
@@ -52,27 +59,61 @@ impl Chat {
                             }),
                     )
                     .child(
-                        Button::new("toggle-panel")
-                            .plain(cx)
-                            .small()
-                            .icon(Icon::new(IconName::PanelRight).size_4())
-                            .tooltip_with_action(
-                                "Toggle right panel",
-                                &crate::ui::panel::TogglePanel,
-                                Some("Chat"),
+                        h_flex()
+                            .flex_1()
+                            .items_center()
+                            .justify_end()
+                            .gap_2()
+                            .child(self.command_button(window, cx))
+                            .child(
+                                Button::new("toggle-panel")
+                                    .plain(cx)
+                                    .small()
+                                    .icon(Icon::new(IconName::PanelRight).size_4())
+                                    .tooltip_with_action(
+                                        "Toggle right panel",
+                                        &crate::ui::panel::TogglePanel,
+                                        Some("Chat"),
+                                    )
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.toggle_panel(window, cx)
+                                    })),
                             )
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.toggle_panel(window, cx)),
-                            ),
-                    )
-                    .children(self.profile_label.clone().map(|name| {
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(name)
-                    }))
-                    .child(self.account_chip(cx)),
+                            .children(self.profile_label.clone().map(|name| {
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(name)
+                            }))
+                            .child(self.account_chip(cx)),
+                    ),
             )
+    }
+
+    /// A quiet field that opens the palette, so the palette, and the key
+    /// for it, can be found without knowing it is there.
+    fn command_button(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
+        let key = crate::ui::keys::bound_key(&crate::ui::palette::OpenPalette, cx);
+        // In a narrow window the words go first, so the session's name
+        // keeps its room; the glass and the key say enough.
+        let words = window.viewport_size().width >= COMMAND_WORDS;
+        Button::new("command")
+            .framed(cx)
+            .xsmall()
+            .px_2()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(Icon::new(AppIcon::Search).size_3())
+                    .when(words, |this| this.child("Search or run a command"))
+                    .children(key.map(|key| Kbd::format(&key))),
+            )
+            .when(!words, |this| this.tooltip("Search or run a command"))
+            .on_click(cx.listener(|this, _, window, cx| this.open_palette(window, cx)))
     }
 
     /// The open session's name, so it is clear which one this is; click
@@ -287,35 +328,34 @@ impl Chat {
             .on_click(cx.listener(|this, _, window, cx| this.show_changes(window, cx)))
     }
 
-    /// One chip per running background job, which shows its output in the
-    /// Jobs tab. A finished one is history, and is kept there.
-    fn job_chips(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let jobs = letronna_core::jobs::list();
-        h_flex().gap_1().children(
-            jobs.into_iter()
-                .filter(|job| job.running)
-                .map(|job| {
-                    let label = letronna_core::tools::one_line(&job.command);
-                    Button::new(("job", job.id as usize))
-                        .plain(cx)
-                        .xsmall()
-                        .text_color(cx.theme().muted_foreground)
-                        .tooltip(format!("Job #{}: {label} — see its output", job.id))
-                        .child(
-                            h_flex()
-                                .gap_1()
-                                .items_center()
-                                .max_w(px(180.))
-                                .child(div().size(px(6.)).rounded_full().bg(cx.theme().green))
-                                .child(div().truncate().child(label)),
-                        )
-                        .on_click(
-                            cx.listener(move |this, _, window, cx| {
-                                this.show_job(job.id, window, cx)
-                            }),
-                        )
-                })
-                .collect::<Vec<_>>(),
+    /// How many things are working, away from the chat, whose strip over the
+    /// composer lists them; click to see them there.
+    fn running_pill(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if self.page == Page::Chat {
+            return None;
+        }
+        let running = self.running_count();
+        if running == 0 {
+            return None;
+        }
+        Some(
+            Button::new("running")
+                .plain(cx)
+                .xsmall()
+                .text_color(cx.theme().muted_foreground)
+                .tooltip_with_action(
+                    "See what is running",
+                    &crate::ui::activity::ShowRunning,
+                    Some("Chat"),
+                )
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(div().size(px(6.)).rounded_full().bg(cx.theme().green))
+                        .child(format!("{running} running")),
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.show_running(window, cx))),
         )
     }
 
@@ -325,7 +365,7 @@ impl Chat {
         let about = letronna_core::wake::looping(session)?;
         Some(
             Button::new("loop")
-                .ghost()
+                .plain(cx)
                 .xsmall()
                 .text_color(cx.theme().muted_foreground)
                 .tooltip(format!("{about} — click to stop"))
@@ -344,31 +384,6 @@ impl Chat {
         )
     }
 
-    /// How many helpers are working, while any are; click to see them. Away
-    /// from the chat only, whose strip over the composer says it there.
-    fn helper_pill(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let working = self.helpers_working();
-        if working == 0 || self.page == Page::Chat {
-            return None;
-        }
-        let s = if working == 1 { "" } else { "s" };
-        Some(
-            Button::new("helpers")
-                .ghost()
-                .xsmall()
-                .text_color(cx.theme().muted_foreground)
-                .tooltip("See, steer or stop them")
-                .child(
-                    h_flex()
-                        .gap_1()
-                        .items_center()
-                        .child(div().size(px(6.)).rounded_full().bg(cx.theme().green))
-                        .child(format!("{working} helper{s} working")),
-                )
-                .on_click(cx.listener(|this, _, window, cx| this.open_activity(window, cx))),
-        )
-    }
-
     pub(crate) fn status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .h(px(20.))
@@ -379,14 +394,13 @@ impl Chat {
             .text_color(cx.theme().muted_foreground)
             .child(self.gateway_chip(cx))
             .child(self.workspace_chip(cx))
-            .child(self.job_chips(cx))
+            .children(self.running_pill(cx))
             .children(self.loop_chip(cx))
             .children(
                 self.heard_elsewhere
                     .as_ref()
                     .map(|holder| div().min_w_0().truncate().child(holder.line())),
             )
-            .children(self.helper_pill(cx))
             .children(self.context_chip(cx))
             .child(div().flex_1())
             .children(self.update_chip(cx))

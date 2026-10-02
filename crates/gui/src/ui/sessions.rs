@@ -260,6 +260,7 @@ impl Chat {
                     letronna_core::browser::forget(id);
                     this.drafts.remove(&id);
                     this.open.retain(|&open| open != id);
+                    this.recent.retain(|&recent| recent != id);
                     this.panel.forget(id);
                     // The next new session can be given this id again, and
                     // must not start out with what was allowed here, nor in
@@ -270,6 +271,14 @@ impl Chat {
                     // Nor with this one's loop, whose ticks would go there.
                     letronna_core::wake::stop(this.store.conversations[index].id);
                     this.modes.remove(&this.store.conversations[index].id);
+                    // Nor with this one's rows as they were: what was open,
+                    // how long a reply thought, what an edit changed.
+                    this.thinking_open.retain(|&(session, _)| session != id);
+                    this.runs_open.retain(|&(session, _)| session != id);
+                    this.previews_open.retain(|&(session, _)| session != id);
+                    this.thought_for.retain(|&(session, _), _| session != id);
+                    this.edited.retain(|&(session, _), _| session != id);
+                    this.plan_folded.remove(&id);
                     // Nor show its helpers' cards; dropped, they are declined.
                     let id = this.store.conversations[index].id;
                     this.agent_asks.retain(|request| request.root != id);
@@ -432,7 +441,7 @@ impl Chat {
             .xsmall()
             .selected(on)
             .icon(Icon::new(filter.icon()).size_3().text_color(if on {
-                cx.theme().primary
+                cx.theme().link
             } else {
                 cx.theme().muted_foreground
             }))
@@ -447,7 +456,7 @@ impl Chat {
             .xsmall()
             .selected(on)
             .icon(Icon::new(AppIcon::Folder).size_3().text_color(if on {
-                cx.theme().primary
+                cx.theme().link
             } else {
                 cx.theme().muted_foreground
             }))

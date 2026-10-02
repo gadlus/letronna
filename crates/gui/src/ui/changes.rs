@@ -388,7 +388,7 @@ impl Chat {
         window.focus(&self.changes.focus);
     }
 
-    fn switch_scope(&mut self, scope: Scope, cx: &mut Context<Self>) {
+    pub(crate) fn switch_scope(&mut self, scope: Scope, cx: &mut Context<Self>) {
         if self.changes.scope == scope {
             return;
         }

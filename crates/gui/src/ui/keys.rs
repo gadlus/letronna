@@ -10,7 +10,11 @@ pub(crate) enum Region {
     Sidebar,
     /// The conversation, or the page shown in its place.
     Transcript,
+    /// The strip over the composer, while it shows.
+    Strip,
     Composer,
+    /// The browser's preview, at the conversation's corner.
+    Preview,
     Panel,
 }
 
@@ -25,8 +29,14 @@ impl Chat {
         if self.page != Page::Chat || (self.transcript_shown() && !self.panel_covers(window, cx)) {
             shown.push(Region::Transcript);
         }
+        if self.strip_shown() {
+            shown.push(Region::Strip);
+        }
         if self.page == Page::Chat {
             shown.push(Region::Composer);
+        }
+        if self.browser_preview_shown(window, cx) {
+            shown.push(Region::Preview);
         }
         if self.tab_on_screen(window, cx).is_some() {
             shown.push(Region::Panel);
@@ -39,13 +49,17 @@ impl Chat {
         match region {
             Region::Sidebar => self.sidebar_focus.contains_focused(window, cx),
             // The question card is drawn in the transcript, but maybe not
-            // yet, when F6 or Alt+Down has only just scrolled to it.
+            // yet, when F6 or Alt+Down has only just scrolled to it. The
+            // browser's preview is drawn in it too, but is a part of its own.
             Region::Transcript if self.page == Page::Chat => {
-                self.transcript_focus.contains_focused(window, cx)
+                (self.transcript_focus.contains_focused(window, cx)
+                    && !self.browser.read(cx).preview_focus.is_focused(window))
                     || self.question_focus.is_focused(window)
             }
             Region::Transcript => self.page_focus.contains_focused(window, cx),
+            Region::Strip => self.strip_area.contains_focused(window, cx),
             Region::Composer => self.composer.focus_handle(cx).contains_focused(window, cx),
+            Region::Preview => self.browser.read(cx).preview_focus.is_focused(window),
             Region::Panel => self.panel_focus.contains_focused(window, cx),
         }
     }
@@ -78,7 +92,12 @@ impl Chat {
                 Some(&stop) => self.go_to_stop(stop, false, window),
                 None => window.focus(&self.transcript_focus),
             },
+            Region::Strip => window.focus(&self.strip_focus),
             Region::Composer => self.focus_composer(window, cx),
+            Region::Preview => {
+                let focus = self.browser.read(cx).preview_focus.clone();
+                window.focus(&focus);
+            }
             Region::Panel => window.focus(&self.panel_focus),
         }
         self.region = Some(region);
@@ -86,8 +105,20 @@ impl Chat {
     }
 
     /// Let the ring go once the focus has left the part it marks, by a
-    /// click, Tab or anything else.
-    pub(crate) fn keep_region(&mut self, window: &Window, cx: &App) {
+    /// click, Tab or anything else. And give the composer the keys the
+    /// preview, the strip or the panel had when it is not drawn this time:
+    /// left on something not drawn, they would reach none of the window's.
+    pub(crate) fn keep_region(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The strip and the panel are looked up in the frame drawn last,
+        // which still had them.
+        let going = (self.browser.read(cx).preview_focus.is_focused(window)
+            && !self.browser_preview_shown(window, cx))
+            || (self.strip_area.contains_focused(window, cx) && !self.strip_shown())
+            || (self.panel_focus.contains_focused(window, cx)
+                && self.tab_on_screen(window, cx).is_none());
+        if going && !self.settings_open {
+            self.focus_composer(window, cx);
+        }
         if let Some(region) = self.region
             && !self.holds_focus(region, window, cx)
         {
@@ -162,6 +193,18 @@ impl Chat {
                 )
         });
     }
+}
+
+/// The key `action` is bound to, as the window takes it: the binding made
+/// last, which wins when the key is pressed.
+pub(crate) fn bound_key(action: &dyn Action, cx: &App) -> Option<Keystroke> {
+    let keymap = cx.key_bindings();
+    let keymap = keymap.borrow();
+    keymap
+        .bindings_for_action(action)
+        .next_back()
+        .and_then(|binding| binding.keystrokes().first())
+        .map(|key| key.as_keystroke().clone())
 }
 
 /// The part after `now` in `shown`, or before it with `back`, wrapping

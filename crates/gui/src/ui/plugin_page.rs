@@ -1,6 +1,7 @@
 //! The Plugins page: plugins added from git, what each brings, the one
 //! consent a plugin's MCP servers wait for, and the marketplaces' lists.
 
+use super::PageColumn;
 use crate::prelude::*;
 use letronna_core::plugins::{self as extensions, Market, Plugin};
 
@@ -339,7 +340,7 @@ impl Chat {
                             .when(!plugin.source.is_empty(), |this| {
                                 this.child(
                                     Button::new(("update-plugin", index))
-                                        .ghost()
+                                        .plain(cx)
                                         .xsmall()
                                         .icon(Icon::new(AppIcon::Reload))
                                         .tooltip("Update")
@@ -351,7 +352,7 @@ impl Chat {
                             })
                             .child(
                                 Button::new(("remove-plugin", index))
-                                    .ghost()
+                                    .plain(cx)
                                     .xsmall()
                                     .icon(Icon::new(AppIcon::Trash))
                                     .tooltip("Remove")
@@ -506,7 +507,7 @@ impl Chat {
                     )
                     .child(
                         Button::new(("remove-market", index))
-                            .ghost()
+                            .plain(cx)
                             .xsmall()
                             .icon(Icon::new(AppIcon::Trash))
                             .tooltip("Stop listing this marketplace")
@@ -546,35 +547,18 @@ impl Chat {
                 .text_color(cx.theme().muted_foreground)
                 .child("No plugins yet. Add one from git, or from a marketplace below.")
         });
-        v_flex()
-            .id("plugins-page")
-            .flex_1()
-            .min_h_0()
-            .px_8()
+        let page = v_flex()
+            .page_column()
             .py_6()
             .gap_4()
-            .overflow_y_scroll()
-            .child(
-                v_flex()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_xl()
-                            .font_family(HEADING_FONT)
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Plugins"),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(
-                                "A plugin brings skills, commands, styles and MCP servers in one \
-                                 git repository. It is checked before it is installed, and its \
-                                 servers start only once you allow them.",
-                            ),
-                    ),
-            )
+            .child(super::page_header(
+                "Plugins",
+                "A plugin brings skills, commands, styles and MCP servers in one git \
+                 repository. It is checked before it is installed, and its servers start only \
+                 once you allow them.",
+                [],
+                cx,
+            ))
             .child(
                 h_flex()
                     .gap_2()
@@ -629,7 +613,7 @@ impl Chat {
                     )
                     .child(
                         Button::new("read-markets")
-                            .ghost()
+                            .plain(cx)
                             .small()
                             .icon(Icon::new(AppIcon::Reload))
                             .label("Read lists")
@@ -639,7 +623,14 @@ impl Chat {
                             ),
                     ),
             )
-            .children(markets)
+            .children(markets);
+        // The whole width scrolls, margins too, with the page in the column.
+        div()
+            .id("plugins-page")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .child(page)
     }
 }
 

@@ -557,12 +557,13 @@ impl Runner {
                 }
             };
             // The waiting line says why while a failed try waits to be made
-            // again or earlier turns are summarized, and goes back to
-            // waiting once the reply answers, which may be with thinking
-            // that is not shown.
+            // again, earlier turns are summarized or a call is being written,
+            // and goes back to waiting once the reply answers, which may be
+            // with thinking that is not shown.
             let why = match &event {
                 Event::Retrying(retry) => Some(retry.to_string()),
                 Event::Compacting => Some("Compacting…".to_owned()),
+                Event::Drafting(drafts) => drafts.last().map(letronna_core::chat::Draft::label),
                 _ => None,
             };
             if let Some(why) = why {

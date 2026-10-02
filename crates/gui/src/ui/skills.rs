@@ -2,6 +2,7 @@
 //! and switched on and off. The agent loads one that is on when a task calls
 //! for it, and Use puts its instructions in the composer.
 
+use super::PageColumn;
 use crate::prelude::*;
 use letronna_core::skills::{self, Installed, Source};
 
@@ -333,7 +334,7 @@ impl Chat {
                     .when(yours, |this| {
                         this.child(
                             Button::new(("edit-skill", index))
-                                .ghost()
+                                .plain(cx)
                                 .xsmall()
                                 .icon(Icon::new(AppIcon::Pencil))
                                 .tooltip("Edit")
@@ -343,7 +344,7 @@ impl Chat {
                         )
                         .child(
                             Button::new(("delete-skill", index))
-                                .ghost()
+                                .plain(cx)
                                 .xsmall()
                                 .icon(Icon::new(AppIcon::Trash))
                                 .tooltip("Delete")
@@ -386,7 +387,7 @@ impl Chat {
             )
             .child(
                 Button::new("choose-skills")
-                    .ghost()
+                    .plain(cx)
                     .small()
                     .icon(Icon::new(AppIcon::Folder))
                     .label("Choose folder…")
@@ -465,7 +466,7 @@ impl Chat {
         v_flex()
             .flex_1()
             .min_h_0()
-            .px_8()
+            .page_column()
             .py_6()
             .gap_4()
             .child(

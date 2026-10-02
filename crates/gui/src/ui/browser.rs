@@ -9,10 +9,12 @@
 //! browser with no window of its own lays the page out in the panel, at the
 //! screen's sharpness, as a desktop's or a phone's. It is a tab of the right
 //! panel (panel.rs), beside the chat, or over it in a window too narrow for
-//! both.
+//! both -- or, while the agent browses, a small preview at the chat's
+//! corner: the latest picture only, five a second at most, which a click
+//! shows beside the chat.
 
 use crate::prelude::*;
-use crate::ui::panel::WideBrowser;
+use crate::ui::panel::{PreviewBrowser, WideBrowser};
 use gpui_component::Selectable;
 use letronna_core::browser::PointedElement;
 use letronna_core::watch::{self, Control, Held, Layout, Room, Sight, Watching};
@@ -39,6 +41,13 @@ const LOADING_SWEEP: Duration = Duration::from_millis(1100);
 /// still loading after this is more likely stuck than slow, and the sweep
 /// draws the whole window at every refresh of the display.
 const LOADING_SWEPT: Duration = Duration::from_secs(15);
+/// The least time between the pictures the preview puts up: five a second
+/// follows what the agent does, at a sixth of the browser's thirty.
+const PREVIEW_GAP: Duration = Duration::from_millis(200);
+/// The preview's picture is never shorter or taller than this, whatever the
+/// page's shape: a strip says too little, and more covers the conversation.
+const PREVIEW_SHORTEST: f64 = 140.;
+const PREVIEW_TALLEST: f64 = 220.;
 /// The zooms a browser steps through, smallest first.
 const ZOOMS: &[f64] = &[0.5, 0.67, 0.75, 0.8, 0.9, 1., 1.1, 1.25, 1.5, 1.75, 2.];
 /// How the keyboard's shortcuts are written here.
@@ -76,6 +85,8 @@ pub(crate) struct BrowserView {
     /// The page's size in CSS pixels, which pointers are given in.
     size: (f64, f64),
     url: String,
+    /// The page's title, which the preview is headed with.
+    title: String,
     pointer: Option<Pointer>,
     /// Pointers so far, so each gets an animation of its own.
     pointers: usize,
@@ -83,6 +94,8 @@ pub(crate) struct BrowserView {
     address: Entity<InputState>,
     /// Keys go to the page while it has this focus.
     focus: FocusHandle,
+    /// And to the preview while it has this one.
+    pub(crate) preview_focus: FocusHandle,
     /// Where the page is drawn, as laid out last.
     area: Option<Bounds<Pixels>>,
     /// The mouse button held down on the page, while it is.
@@ -100,6 +113,9 @@ pub(crate) struct BrowserView {
     switching: bool,
     /// The page's question, until it is answered.
     dialog: Option<String>,
+    /// Since when the agent has waited on a site's check, which the user
+    /// gets past on the page; it carries on by itself once it is gone.
+    check: Option<Instant>,
     /// Why the address typed did not open.
     note: Option<String>,
     layout: Layout,
@@ -139,6 +155,8 @@ pub(crate) enum Drawn {
     Beside,
     /// In place of the conversation, in a room too narrow for both.
     Over,
+    /// As the small preview at the chat's corner: a picture only.
+    Preview,
 }
 
 /// A reference to something pointed at on the page, with the user's comment
@@ -146,6 +164,17 @@ pub(crate) enum Drawn {
 pub(crate) struct PointComment(pub(crate) String);
 
 impl EventEmitter<PointComment> for BrowserView {}
+
+/// Asked from the browser's bar: show it as the small preview instead.
+pub(crate) struct ToPreview;
+
+impl EventEmitter<ToPreview> for BrowserView {}
+
+/// The agent has come to a site's check that only the user can get past:
+/// the page wants showing where it can be clicked.
+pub(crate) struct CheckUp;
+
+impl EventEmitter<CheckUp> for BrowserView {}
 
 impl BrowserView {
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -168,10 +197,12 @@ impl BrowserView {
             waiting: None,
             size: (0., 0.),
             url: String::new(),
+            title: String::new(),
             pointer: None,
             pointers: 0,
             address,
             focus: cx.focus_handle(),
+            preview_focus: cx.focus_handle().tab_stop(true),
             area: None,
             pressed: None,
             loading: None,
@@ -180,6 +211,7 @@ impl BrowserView {
             own_window: letronna_core::browser::has_window(),
             switching: false,
             dialog: None,
+            check: None,
             note: None,
             layout: Layout::Landscape,
             zoom: 1.,
@@ -195,9 +227,35 @@ impl BrowserView {
         if self.watching.is_some() || self.dismissed || self.unseen {
             return;
         }
+        // A wait on a site's check that ended while nothing watched was
+        // never told; one still going is told again as watching starts.
+        self.check = None;
         let Watching { frames, sights } = watch::watch();
         let pictures = cx.spawn(async move |this, cx| {
-            while let Ok(frame) = frames.recv().await {
+            // When the last picture went up, which the preview's next waits on.
+            let mut shown_at: Option<Instant> = None;
+            while let Ok(mut frame) = frames.recv().await {
+                // One that comes too soon for the preview waits its turn, and
+                // gives way to any newer meanwhile: the browser drops what
+                // the window is not ready for, so a picture held back unread
+                // could leave the page's last look unseen.
+                let gap = this
+                    .read_with(cx, |view, _| view.picture_gap())
+                    .unwrap_or_default();
+                while let Some(left) = shown_at
+                    .map(|at| gap.saturating_sub(at.elapsed()))
+                    .filter(|left| !left.is_zero())
+                {
+                    match frames
+                        .recv()
+                        .with_timeout(left, cx.background_executor())
+                        .await
+                    {
+                        Ok(Ok(newer)) => frame = newer,
+                        Ok(Err(_)) => return,
+                        Err(_) => break,
+                    }
+                }
                 let frame = match this.update(cx, |view, _| view.decode_now(frame)) {
                     Ok(Some(frame)) => frame,
                     Ok(None) => continue,
@@ -206,6 +264,7 @@ impl BrowserView {
                 if decode(this.clone(), frame, cx).await.is_err() {
                     break;
                 }
+                shown_at = Some(Instant::now());
             }
         });
         let rest = cx.spawn(async move |this, cx| {
@@ -226,7 +285,7 @@ impl BrowserView {
     fn see(&mut self, sight: Sight, cx: &mut Context<Self>) {
         match sight {
             Sight::Pointer { x, y, area, doing } => self.point((x, y), area, doing),
-            Sight::Page { url, .. } => {
+            Sight::Page { title, url } => {
                 // The box drawn, why an address did not open, and what was
                 // pointed at were about the page before.
                 if self.url != url {
@@ -237,6 +296,7 @@ impl BrowserView {
                     self.pointing = None;
                 }
                 self.url = url;
+                self.title = title;
             }
             Sight::Loading(loading) => {
                 self.loads += 1;
@@ -255,18 +315,25 @@ impl BrowserView {
                 self.pointer = None;
                 self.pointing = None;
                 self.url.clear();
+                self.title.clear();
                 self.loading = None;
                 self.history = (false, false);
                 self.dialog = None;
+                self.check = None;
             }
-            // The panel has no card for it yet.
-            Sight::Check(_) => {}
+            Sight::Check(since) => {
+                let began = since.is_some() && self.check.is_none();
+                self.check = since;
+                if began {
+                    cx.emit(CheckUp);
+                }
+            }
         }
     }
 
     /// How many of the page's questions wait on the user.
     pub(crate) fn waiting(&self) -> usize {
-        usize::from(self.dialog.is_some())
+        usize::from(self.dialog.is_some()) + usize::from(self.check.is_some())
     }
 
     /// Show the browser as the user asks for it: at once, even with no page
@@ -278,19 +345,30 @@ impl BrowserView {
             window.focus(&self.focus);
         }
         if !letronna_core::browser::has_page() {
-            self.resume(cx);
+            self.resume(HOME.to_owned(), cx);
+        }
+    }
+
+    /// Open the browser the user asked to see as the preview: as `ask` does,
+    /// but leaving the keys where they are, and on `home` if the session's
+    /// page is gone.
+    pub(crate) fn reopen(&mut self, home: Option<String>, cx: &mut Context<Self>) {
+        self.dismissed = false;
+        self.open(cx);
+        if !letronna_core::browser::has_page() {
+            self.resume(home.unwrap_or(HOME.to_owned()), cx);
         }
     }
 
     /// Open the session's page again, closed with its browser while nothing
-    /// used it, or Google if it has none, showing it load meanwhile.
-    fn resume(&mut self, cx: &mut Context<Self>) {
+    /// used it, or `home` if it has none, showing it load meanwhile.
+    fn resume(&mut self, home: String, cx: &mut Context<Self>) {
         self.note = None;
         self.start_loading(cx);
         cx.spawn(async move |view, cx| {
             let resumed = cx
                 .background_executor()
-                .spawn(async { letronna_core::browser::resume(HOME) })
+                .spawn(async move { letronna_core::browser::resume(&home) })
                 .await;
             let _ = view.update(cx, |view, cx| {
                 match resumed {
@@ -349,6 +427,11 @@ impl BrowserView {
     /// idle, which an unwatched one is after a while.
     pub(crate) fn set_drawn(&mut self, drawn: Option<Drawn>, cx: &mut Context<Self>) {
         self.drawn = drawn;
+        // The preview is a picture: nothing on it is held or pointed at.
+        if drawn == Some(Drawn::Preview) {
+            self.pressed = None;
+            self.pointing = None;
+        }
         if drawn.is_none() {
             if self.watching.take().is_some() {
                 self.unseen = true;
@@ -360,10 +443,98 @@ impl BrowserView {
         } else if std::mem::take(&mut self.unseen) {
             self.open(cx);
             if !self.url.is_empty() && !letronna_core::browser::has_page() {
-                self.resume(cx);
+                self.resume(HOME.to_owned(), cx);
             }
         }
         cx.notify();
+    }
+
+    /// How long a picture waits after the one before: the preview needs no
+    /// more than a few a second to show what the agent does.
+    fn picture_gap(&self) -> Duration {
+        match self.drawn {
+            Some(Drawn::Preview) => PREVIEW_GAP,
+            _ => Duration::ZERO,
+        }
+    }
+
+    /// What the preview is headed with: the page's title, else its site;
+    /// None with no page open.
+    pub(crate) fn page_name(&self) -> Option<String> {
+        let title = self.title.trim();
+        match self.url.as_str() {
+            "" | "about:blank" => None,
+            _ if !title.is_empty() => Some(title.to_owned()),
+            // A file has no site: its whole address, then.
+            url => Some(match site(url) {
+                "" => url.to_owned(),
+                site => site.to_owned(),
+            }),
+        }
+    }
+
+    /// What the agent is doing on the page, as its pointer last said.
+    pub(crate) fn doing(&self) -> Option<String> {
+        self.pointer
+            .as_ref()
+            .map(|pointer| pointer.doing.clone())
+            .filter(|doing| !doing.is_empty())
+    }
+
+    /// How tall `thumbnail` draws the page `width` wide.
+    pub(crate) fn thumbnail_height(&self, width: Pixels) -> Pixels {
+        let page = match self.frame {
+            Some(_) => self.size,
+            None => (0., 0.),
+        };
+        px(preview_fit(f64::from(width), page).0 as f32)
+    }
+
+    /// The page as the preview shows it, `width` wide: the latest picture,
+    /// filling the width and as tall as the page's shape gives within the
+    /// preview's bounds, with the pointer over it.
+    pub(crate) fn thumbnail(&self, width: Pixels, cx: &mut Context<Self>) -> AnyElement {
+        let (page_width, page_height) = self.size;
+        let picture = self
+            .frame
+            .clone()
+            .filter(|_| page_width >= 1. && page_height >= 1.);
+        let Some(frame) = picture else {
+            return div()
+                .w(width)
+                .h(px(PREVIEW_SHORTEST as f32))
+                .flex()
+                .items_center()
+                .justify_center()
+                .px_4()
+                .text_xs()
+                .text_center()
+                .text_color(cx.theme().muted_foreground)
+                .child("The page shows here as the agent browses.")
+                .into_any_element();
+        };
+        let (height, left, scale) = preview_fit(f64::from(width), self.size);
+        div()
+            .relative()
+            .flex_shrink_0()
+            .w(width)
+            .h(px(height as f32))
+            .overflow_hidden()
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left(px(left as f32))
+                    .w(px((page_width * scale) as f32))
+                    .h(px((page_height * scale) as f32))
+                    .child(img(frame).size_full())
+                    .children(
+                        self.pointer
+                            .as_ref()
+                            .map(|pointer| self.pointer_over(pointer, cx)),
+                    ),
+            )
+            .into_any_element()
     }
 
     /// Put up a new picture, and give the one before back to the GPU: gpui
@@ -849,6 +1020,12 @@ impl BrowserView {
             })
             .disabled(self.switching)
             .on_click(cx.listener(|view, _, _, cx| view.switch_window(cx)));
+        let shrink = Button::new("page-preview")
+            .plain(cx)
+            .xsmall()
+            .icon(Icon::new(AppIcon::Preview))
+            .tooltip_with_action("Shrink to a preview", &PreviewBrowser, Some("Chat"))
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(ToPreview)));
         // Beside the chat only: over it, the page has all the room there is.
         let wide = (self.drawn == Some(Drawn::Beside)).then(|| {
             Button::new("page-wide")
@@ -908,6 +1085,7 @@ impl BrowserView {
             .children(zoomed)
             .child(point_button)
             .child(view_menu)
+            .child(shrink)
             .children(wide)
             .child(own_window)
     }
@@ -1149,6 +1327,14 @@ impl BrowserView {
                 .text_color(cx.theme().danger)
                 .child(div().flex_1().min_w_0().child(note.clone()))
         });
+        let check = self.check.map(|_| {
+            card().child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child("Get past the site's check on the page; Letronna carries on by itself."),
+            )
+        });
         let doing = self.pointer.as_ref().map(|pointer| {
             div()
                 .px_3()
@@ -1208,6 +1394,7 @@ impl BrowserView {
             _ => None,
         };
         if asked.is_none()
+            && check.is_none()
             && note.is_none()
             && doing.is_none()
             && hint.is_none()
@@ -1235,6 +1422,7 @@ impl BrowserView {
                         .p_2()
                         .gap_2()
                         .children(asked)
+                        .children(check)
                         .children(note)
                         .children(above),
                 )
@@ -1440,6 +1628,25 @@ fn fitted(area: (f64, f64), page: (f64, f64)) -> Option<(f64, f64, f64)> {
     Some(((area.0 - page.0 * scale) / 2., 0., scale))
 }
 
+/// How tall the preview's picture is `width` wide, and where a page `page`
+/// big sits in it: filling it, cut at the bottom when the page is taller
+/// than the preview goes, and at the sides when wider. Its height, the
+/// page's left, and how many of the preview's pixels are one of the page's.
+fn preview_fit(width: f64, page: (f64, f64)) -> (f64, f64, f64) {
+    if page.0 < 1. || page.1 < 1. || width < 1. {
+        return (PREVIEW_SHORTEST, 0., 0.);
+    }
+    let height = (width * page.1 / page.0).clamp(PREVIEW_SHORTEST, PREVIEW_TALLEST);
+    let scale = (width / page.0).max(height / page.1);
+    (height, (width - page.0 * scale) / 2., scale)
+}
+
+/// The site an address is on: `example.com` of `https://example.com/a?b`.
+fn site(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    rest.split(['/', '?', '#']).next().unwrap_or(rest)
+}
+
 fn animation() -> Animation {
     Animation::new(POINTER_ANIMATION)
 }
@@ -1485,7 +1692,7 @@ fn picture(bytes: &[u8]) -> Option<RenderImage> {
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
-    use super::{arrival, fitted, picture, spread, travelled, zoom_step};
+    use super::{arrival, fitted, picture, preview_fit, site, spread, travelled, zoom_step};
 
     #[test]
     fn zoom_steps_as_a_browser_does_and_stops_at_the_ends() {
@@ -1517,6 +1724,29 @@ mod tests {
         // A page taller than the panel is centred across it.
         assert_eq!(fitted((500., 400.), (400., 800.)), Some((150., 0., 0.5)));
         assert_eq!(fitted((500., 400.), (0., 0.)), None);
+    }
+
+    #[test]
+    fn the_preview_keeps_the_page_shape_within_its_bounds() {
+        // A desktop page, wider than tall, fills the preview's width whole.
+        assert_eq!(preview_fit(300., (1200., 750.)), (187.5, 0., 0.25));
+        // A tall page is cut at the bottom, at the preview's tallest.
+        assert_eq!(preview_fit(300., (600., 1200.)), (220., 0., 0.5));
+        // A very wide one keeps the shortest height, cut at both sides.
+        let (height, left, scale) = preview_fit(300., (1400., 280.));
+        assert_eq!(height, 140.);
+        assert_eq!(scale, 0.5);
+        assert_eq!(left, -200.);
+        // No picture yet: the shortest, with nothing to place.
+        assert_eq!(preview_fit(300., (0., 0.)), (140., 0., 0.));
+    }
+
+    #[test]
+    fn a_page_is_named_by_its_site() {
+        assert_eq!(site("https://example.com/docs?page=2"), "example.com");
+        assert_eq!(site("http://127.0.0.1:18090/index.html"), "127.0.0.1:18090");
+        assert_eq!(site("example.org#top"), "example.org");
+        assert_eq!(site("file:///tmp/a.html"), "");
     }
 
     #[test]

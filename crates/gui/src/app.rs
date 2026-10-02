@@ -416,7 +416,8 @@ pub(crate) struct Chat {
     pub(crate) sidebar_focus: FocusHandle,
     pub(crate) transcript_focus: FocusHandle,
     pub(crate) panel_focus: FocusHandle,
-    /// The question card's answers, which take letter keys.
+    /// The question card's answers, which take letter keys, or the
+    /// permission card, which takes Enter and Escape.
     pub(crate) question_focus: FocusHandle,
     /// The part of the window F6 last moved to, ringed while it keeps the
     /// focus; a click anywhere takes the ring away.
@@ -517,7 +518,42 @@ pub(crate) struct Chat {
     /// The mic button's own state: recording, or sending what it heard off
     /// to be transcribed. `None` the rest of the time; nothing runs then.
     pub(crate) mic: Option<crate::ui::voice::Voice>,
+    /// The key that answers a permission card while it is held down, and
+    /// whether its press answered one: its repeats never do.
+    pub(crate) card_key: Option<(crate::ui::approval::CardKey, bool)>,
     pub(crate) _subscriptions: Vec<Subscription>,
+    /// The sessions shown in this window, by id, the one shown last first,
+    /// for the recent-session switcher; kept in memory only.
+    pub(crate) recent: Vec<u64>,
+    /// The recent-session switcher, while it shows.
+    pub(crate) switcher: Option<crate::ui::switcher::Switcher>,
+    /// Previews shown whole -- a tool's output, a long prompt, a reply's
+    /// fences -- by session id and place.
+    pub(crate) previews_open: std::collections::HashSet<(u64, usize)>,
+    /// How long each reply thought, by session id and place, timed as it
+    /// came in; a reply from before has none.
+    pub(crate) thought_for: std::collections::HashMap<(u64, usize), std::time::Duration>,
+    /// The reply thinking now, by session id and place, and since when.
+    pub(crate) thinking_since: Option<((u64, usize), std::time::Instant)>,
+    /// What each edit call changed, by session id and place, worked out
+    /// once from its arguments rather than at every frame.
+    pub(crate) edited: std::collections::HashMap<(u64, usize), crate::ui::messages::Edited>,
+    /// How wide the chat's column was last drawn, its padding included,
+    /// to tell how many rows a long line of a preview wraps to.
+    pub(crate) column: Pixels,
+    /// The line of the strip over the composer, which F6 and Tab stop at.
+    pub(crate) strip_focus: FocusHandle,
+    /// The whole strip, which holds the keys while its line or a row has them.
+    pub(crate) strip_area: FocusHandle,
+    /// Set by the key that shows what is running, for the strip's first row
+    /// to take the keys as it is drawn, since it has no focus before then.
+    pub(crate) strip_focus_first: bool,
+    /// Sessions whose plan's list was closed by hand, which then rests as the
+    /// strip's one line rather than opening by itself.
+    pub(crate) plan_folded: std::collections::HashSet<u64>,
+    /// Whether the sidebar's More row is open on the pages under it, kept
+    /// for the window's life.
+    pub(crate) nav_more: bool,
 }
 
 impl Chat {
@@ -1011,10 +1047,25 @@ impl Chat {
             mode_menu: None,
             drawn: false,
             mic: None,
+            card_key: None,
             _subscriptions: subscriptions,
+            recent: Vec::new(),
+            switcher: None,
+            previews_open: std::collections::HashSet::new(),
+            thought_for: std::collections::HashMap::new(),
+            thinking_since: None,
+            edited: std::collections::HashMap::new(),
+            column: COLUMN,
+            strip_focus: cx.focus_handle().tab_stop(true),
+            strip_area: cx.focus_handle(),
+            strip_focus_first: false,
+            plan_folded: std::collections::HashSet::new(),
+            nav_more: false,
         };
-        let resized = this.follow_window_width(window, cx);
-        this._subscriptions.push(resized);
+        let shrink = this.follow_browser_shrink(window, cx);
+        this._subscriptions.push(shrink);
+        let checks = this.follow_browser_checks(window, cx);
+        this._subscriptions.push(checks);
         let front = cx.observe_window_activation(window, |this, window, _| {
             this.in_front = window.is_window_active();
         });
@@ -1247,6 +1298,9 @@ impl Chat {
                 .is_none_or(|ix| self.store.conversations[ix].unload());
             if gone {
                 self.open.remove(at);
+                // What its edits changed goes with its messages, and is
+                // worked out again if it is opened.
+                self.edited.retain(|&(session, _), _| session != id);
             }
         }
     }
@@ -2247,6 +2301,7 @@ impl Chat {
     }
 
     fn on_event(&mut self, event: Event, cx: &mut Context<Self>) {
+        self.time_thinking(&event);
         let Some(turn) = self.turn.as_mut() else {
             return;
         };
@@ -2481,10 +2536,15 @@ impl Chat {
                 }
                 _ => None,
             };
+            // Numbered after the card before it, before that one goes.
+            let place = match &next {
+                agent::Next::AskUser(call) => self.card_place(call),
+                _ => None,
+            };
             self.card_for = match &next {
                 agent::Next::AskUser(call) => self.turn.as_ref().map(|turn| {
                     let ctx = letronna_core::tools::ToolContext::of(&turn.connection);
-                    crate::ui::approval::CardFor::of(call, &ctx)
+                    crate::ui::approval::CardFor::of(call, &ctx).at(place)
                 }),
                 _ => None,
             };
@@ -3244,6 +3304,9 @@ impl Chat {
             self.focusing = None;
             window.focus(&focus);
         }
+        // What a preview's long lines wrap to depends on it.
+        self.column = column;
+        self.note_edits(span.first, span.last);
         let conversation = &self.store.conversations[self.store.active];
         let messages = &conversation.messages;
         let mut rows = Vec::new();
@@ -3300,9 +3363,17 @@ impl Chat {
                 } else {
                     line
                 });
+                // What its calls made stays in sight, small, while folded.
+                if folded.is_some() {
+                    rows.extend(self.run_media(run, window, cx));
+                }
             }
-            // A failure is never folded away: it is what needs reading.
-            if folded.is_some() && !letronna_core::tool_runs::failed(m) {
+            // A failure is never folded away: it is what needs reading. A
+            // command that exited badly is one too.
+            if folded.is_some()
+                && !letronna_core::tool_runs::failed(m)
+                && !crate::ui::messages::exited_badly(m)
+            {
                 // A run that ends a stopped turn still carries its buttons.
                 rows.extend(bar);
                 continue;
@@ -3429,7 +3500,13 @@ impl Chat {
                         }
                     })
                     .pb_6()
-                    .children(rows),
+                    .children(rows)
+                    // Clear of the browser's preview over the pane's corner.
+                    .children(
+                        Some(self.browser_preview_room(column, window, cx))
+                            .filter(|room| *room > px(0.))
+                            .map(|room| div().flex_shrink_0().h(room)),
+                    ),
             )
             .into_any_element()
     }
@@ -3632,6 +3709,14 @@ impl Chat {
         self.turn = None;
         self.media_turn = false;
         self.judging = None;
+        // A retried or rewound reply can come back at the same place, and
+        // must not number its cards on from this turn's.
+        self.card_for = None;
+        // Nor be timed from this turn's thinking; thinking closed while it
+        // came in rests shut.
+        if let Some((at, _)) = self.thinking_since.take() {
+            self.thinking_open.remove(&at);
+        }
         // Calls a stop left running come back to a generation that is gone,
         // so the next turn must not wait for them.
         self.outstanding = 0;
@@ -4023,6 +4108,8 @@ impl Render for Chat {
         self.swap_draft(window, cx);
         // And the Changes tab and the status bar speak of its folder.
         self.keep_changes_current(cx);
+        // And the switcher counts it as the one used last.
+        self.note_recent(on_screen);
         if self.page == Page::Chat {
             self.unseen.remove(&on_screen);
         }
@@ -4185,6 +4272,9 @@ impl Render for Chat {
                 .min_h_0()
                 .min_w_0()
                 .w_full()
+                // The browser's preview at its corner is cut short in a
+                // short window, rather than drawn over the title bar.
+                .overflow_hidden()
                 .track_focus(&self.transcript_focus)
                 // As on the sidebar: a click leaves the keys where they
                 // were, in the composer most often.
@@ -4192,10 +4282,15 @@ impl Render for Chat {
                 .child(list(self.list.clone(), row).size_full())
                 .vertical_scrollbar(&self.list)
                 .children(self.jump_to_latest(cx))
+                .children(self.browser_preview(pane, window, cx))
                 .children(self.ring(crate::ui::keys::Region::Transcript, cx))
                 .into_any_element()
         };
 
+        // Built only where it shows: another page pays nothing for it.
+        let strip = (self.page == Page::Chat)
+            .then(|| self.running_strip(window, cx))
+            .flatten();
         let main = v_flex()
             .relative()
             .flex_1()
@@ -4221,9 +4316,8 @@ impl Render for Chat {
                         .px_6()
                         .pb_2()
                         .children(self.busy_note(cx))
-                        .children(self.todo_panel(cx))
                         .children(self.goal_line(cx))
-                        .children(self.running_strip(cx))
+                        .children(strip)
                         .children(self.crew_chip(cx))
                         .child(self.composer(pane < px(600.), cx)),
                 )
@@ -4286,6 +4380,13 @@ impl Render for Chat {
                 }),
             )
             .on_action(
+                cx.listener(|this, _: &crate::ui::panel::PreviewBrowser, window, cx| {
+                    if !window.has_active_dialog(cx) && !this.settings_open {
+                        this.toggle_browser_preview(window, cx)
+                    }
+                }),
+            )
+            .on_action(
                 cx.listener(|this, _: &crate::ui::files::FilesTab, window, cx| {
                     if !window.has_active_dialog(cx) && !this.settings_open {
                         this.open_files_tab(window, cx)
@@ -4310,6 +4411,11 @@ impl Render for Chat {
                 cx.listener(|this, _: &OpenActivity, window, cx| this.open_activity(window, cx)),
             )
             .on_action(
+                cx.listener(|this, _: &crate::ui::activity::ShowRunning, window, cx| {
+                    this.show_running(window, cx)
+                }),
+            )
+            .on_action(
                 cx.listener(|this, _: &crate::ui::palette::OpenPalette, window, cx| {
                     this.open_palette(window, cx)
                 }),
@@ -4327,6 +4433,16 @@ impl Render for Chat {
             .on_action(cx.listener(
                 |this, _: &crate::ui::capabilities::PrevCapabilityTab, window, cx| {
                     this.step_capability(-1, window, cx)
+                },
+            ))
+            .on_action(
+                cx.listener(|this, _: &crate::ui::switcher::SwitchSession, window, cx| {
+                    this.switch_session(false, window, cx)
+                }),
+            )
+            .on_action(cx.listener(
+                |this, _: &crate::ui::switcher::SwitchSessionBack, window, cx| {
+                    this.switch_session(true, window, cx)
                 },
             ))
             .on_action(
@@ -4353,6 +4469,19 @@ impl Render for Chat {
                     this.step_turn(None, true, window, cx)
                 }),
             )
+            // Enter and Escape on a permission card, or in an empty composer
+            // while one waits; a held key answers again only once it is up.
+            .on_action(
+                cx.listener(|this, _: &crate::ui::approval::AllowCall, window, cx| {
+                    this.allow_by_key(window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::ui::approval::DenyCall, window, cx| {
+                    this.deny_by_key(window, cx)
+                }),
+            )
+            .capture_key_up(cx.listener(|this, event: &KeyUpEvent, _, _| this.card_key_up(event)))
             // Last, after every binding had its chance: a key that typed
             // nothing where the focus is goes to the composer.
             .on_key_down(cx.listener(Self::type_into_composer))
@@ -4380,6 +4509,7 @@ impl Render for Chat {
                     .children(self.right_panel(window, cx)),
             )
             .children(self.settings_overlay(window, cx))
+            .children(self.switcher(cx))
             .children(Root::render_dialog_layer(window, cx))
     }
 }

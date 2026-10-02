@@ -52,6 +52,10 @@ pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Opti
             Some("Give the browser the most room, or put it back"),
         ),
         (
+            KeyBinding::new("secondary-shift-b", ui::panel::PreviewBrowser, Some("Chat")),
+            Some("Shrink the browser to a preview, or show it beside the chat"),
+        ),
+        (
             KeyBinding::new("secondary-shift-e", files::FilesTab, Some("Chat")),
             Some("Open the files"),
         ),
@@ -62,6 +66,17 @@ pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Opti
         (
             KeyBinding::new("secondary-shift-a", OpenActivity, Some("Chat")),
             Some("Open activity"),
+        ),
+        // Not Shift+I: off macOS that is gpui-component's inspector in a
+        // debug build, bound window-wide and so tried before this.
+        (
+            KeyBinding::new("secondary-shift-t", ui::activity::ShowRunning, Some("Chat")),
+            Some("Show what is running"),
+        ),
+        // Nearer than the chat's own escape, which would stop the reply.
+        (
+            KeyBinding::new("escape", ui::activity::LeaveStrip, Some("LiveStrip")),
+            Some("In the strip over the composer: close its list"),
         ),
         (
             KeyBinding::new("secondary-k", ui::palette::OpenPalette, Some("Chat")),
@@ -90,6 +105,44 @@ pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Opti
                 Some("Capabilities"),
             ),
             Some("In capabilities: the tab before"),
+        ),
+        // Everywhere else in the chat, Ctrl+Tab lists the sessions used
+        // last; the capabilities page's own, nearer, still goes first there.
+        (
+            KeyBinding::new("ctrl-tab", ui::switcher::SwitchSession, Some("Chat")),
+            Some("Switch to a recent session (hold Ctrl, let go to open)"),
+        ),
+        (
+            KeyBinding::new(
+                "ctrl-shift-tab",
+                ui::switcher::SwitchSessionBack,
+                Some("Chat"),
+            ),
+            None,
+        ),
+        (
+            KeyBinding::new("tab", ui::switcher::NextRecent, Some("Switcher")),
+            None,
+        ),
+        (
+            KeyBinding::new("down", ui::switcher::NextRecent, Some("Switcher")),
+            None,
+        ),
+        (
+            KeyBinding::new("shift-tab", ui::switcher::PreviousRecent, Some("Switcher")),
+            None,
+        ),
+        (
+            KeyBinding::new("up", ui::switcher::PreviousRecent, Some("Switcher")),
+            None,
+        ),
+        (
+            KeyBinding::new("enter", ui::switcher::OpenRecent, Some("Switcher")),
+            None,
+        ),
+        (
+            KeyBinding::new("escape", ui::switcher::CloseRecent, Some("Switcher")),
+            None,
         ),
         (
             KeyBinding::new("secondary-shift-d", changes::ChangesTab, Some("Chat")),
@@ -160,6 +213,24 @@ pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Opti
             KeyBinding::new("escape", ui::browser::CancelPoint, Some("Browser")),
             None,
         ),
+        // On the browser's preview, as on a folded run; its Escape is nearer
+        // than Chat's too.
+        (
+            KeyBinding::new(
+                "enter",
+                ui::panel::ExpandBrowserPreview,
+                Some("BrowserPreview"),
+            ),
+            Some("On the browser's preview: show the page beside the chat"),
+        ),
+        (
+            KeyBinding::new(
+                "escape",
+                ui::panel::CloseBrowserPreview,
+                Some("BrowserPreview"),
+            ),
+            Some("On the browser's preview: close it"),
+        ),
         (
             KeyBinding::new("tab", composer::LeaveComposer, Some("Composer > Input")),
             None,
@@ -206,11 +277,11 @@ pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Opti
         // they act only while the sidebar itself has the focus.
         (
             KeyBinding::new("up", sessions::PreviousSession, Some("Sessions")),
-            Some("In the sidebar: the session above"),
+            Some("In the sidebar: the row above"),
         ),
         (
             KeyBinding::new("down", sessions::NextSession, Some("Sessions")),
-            Some("In the sidebar: the session below"),
+            Some("In the sidebar: the row below"),
         ),
         (
             KeyBinding::new("enter", sessions::OpenSession, Some("Sessions")),
@@ -390,6 +461,19 @@ pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Opti
             KeyBinding::new("enter", ui::jobs::AddLines, Some("JobLog")),
             Some("In a job's output: add the picked lines to the message"),
         ),
+        // Settings' list of pages, once Tab has put the keys on it.
+        (
+            KeyBinding::new(
+                "up",
+                ui::settings::PreviousSettingsPage,
+                Some("SettingsNav"),
+            ),
+            Some("In settings: the page above"),
+        ),
+        (
+            KeyBinding::new("down", ui::settings::NextSettingsPage, Some("SettingsNav")),
+            Some("In settings: the page below"),
+        ),
         // Saves the Memory page's box with focus; nothing else there has a
         // save key.
         (
@@ -406,6 +490,53 @@ pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Opti
             KeyBinding::new("secondary-r", ui::workflows::Refresh, Some("Workflows")),
             Some("On the Workflows page: read the runs again"),
         ),
+        // A picture in the chat opens over the window, and its own keys
+        // act there, nearer than the dialog's and the chat's.
+        (
+            KeyBinding::new("enter", ui::viewer::OpenPicture, Some("Picture")),
+            Some("On a picture: open it in the window"),
+        ),
+        (
+            KeyBinding::new("+", ui::viewer::ZoomIn, Some("PictureViewer")),
+            Some("In a picture: zoom in"),
+        ),
+        // Windows hands the plus over with the Shift that typed it.
+        (
+            KeyBinding::new("shift-+", ui::viewer::ZoomIn, Some("PictureViewer")),
+            None,
+        ),
+        (
+            KeyBinding::new("=", ui::viewer::ZoomIn, Some("PictureViewer")),
+            None,
+        ),
+        (
+            KeyBinding::new("-", ui::viewer::ZoomOut, Some("PictureViewer")),
+            Some("In a picture: zoom out"),
+        ),
+        (
+            KeyBinding::new("0", ui::viewer::ZoomFit, Some("PictureViewer")),
+            Some("In a picture: fit it to the window"),
+        ),
+        (
+            KeyBinding::new("left", ui::viewer::PanLeft, Some("PictureViewer")),
+            Some("In a zoomed picture: move about it with the arrows"),
+        ),
+        (
+            KeyBinding::new("right", ui::viewer::PanRight, Some("PictureViewer")),
+            None,
+        ),
+        (
+            KeyBinding::new("up", ui::viewer::PanUp, Some("PictureViewer")),
+            None,
+        ),
+        (
+            KeyBinding::new("down", ui::viewer::PanDown, Some("PictureViewer")),
+            None,
+        ),
+        (
+            KeyBinding::new("o", ui::viewer::OpenOutside, Some("PictureViewer")),
+            Some("In a picture: open it with the system's viewer"),
+        ),
         (
             KeyBinding::new("alt-u", ToggleCrew, Some("Chat")),
             Some("Switch Crew on or off for the next message"),
@@ -419,8 +550,16 @@ pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Opti
             Some("On a changed file under a turn: show or hide its diff"),
         ),
         (
+            KeyBinding::new("enter", ui::actions::ReviewFiles, Some("TurnFiles")),
+            Some("On the files a turn changed: review them in the Changes tab"),
+        ),
+        (
             KeyBinding::new("enter", ui::messages::ToggleRun, Some("ToolRun")),
-            Some("On a folded run of tool calls: open or close it"),
+            Some("On a tool call, a thought, a folded run or a preview: open or close it"),
+        ),
+        (
+            KeyBinding::new("space", ui::messages::ToggleRun, Some("ToolRun")),
+            None,
         ),
         (
             KeyBinding::new("escape", changes::LeaveChanges, Some("Changes")),
@@ -515,6 +654,27 @@ pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Opti
         .into_iter()
         .flatten(),
     );
+    // Enter and Escape answer a permission card from the card itself or
+    // from an empty composer. Bound after the input's own keys, so they are
+    // tried first and hand the key back when there is no card to answer.
+    keys.extend([
+        (
+            KeyBinding::new("enter", approval::AllowCall, Some("Permission")),
+            Some("On a call waiting for a yes, or in an empty composer: allow it once"),
+        ),
+        (
+            KeyBinding::new("escape", approval::DenyCall, Some("Permission")),
+            Some("On a call waiting for a yes, or in an empty composer: deny it"),
+        ),
+        (
+            KeyBinding::new("enter", approval::AllowCall, Some("Composer > Input")),
+            None,
+        ),
+        (
+            KeyBinding::new("escape", approval::DenyCall, Some("Composer > Input")),
+            None,
+        ),
+    ]);
     // One binding per letter, so the list says it once.
     keys.extend(('a'..='z').enumerate().map(|(n, letter)| {
         (
@@ -666,5 +826,17 @@ mod tests {
             .map(|(binding, _)| binding.keystrokes()[0].unparse())
             .collect();
         assert_eq!(window_wide.len(), 3, "{window_wide:?}");
+    }
+
+    #[test]
+    fn no_key_is_the_one_the_inspector_takes_in_a_debug_build() {
+        // gpui-component binds Ctrl+Shift+I with no context in a debug
+        // build, which outranks any of ours; Cmd is Ctrl off macOS.
+        let taken: Vec<String> = keys(&gpui::DummyKeyboardMapper)
+            .iter()
+            .map(|(binding, _)| binding.keystrokes()[0].unparse())
+            .filter(|key| matches!(key.as_str(), "ctrl-shift-i" | "cmd-shift-i"))
+            .collect();
+        assert!(taken.is_empty(), "{taken:?}");
     }
 }

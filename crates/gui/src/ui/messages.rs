@@ -5,6 +5,36 @@ use letronna_core::tool_runs::Run;
 
 actions!(messages, [ToggleRun]);
 
+/// How far a tool's output is drawn in from the row above it: its 8px
+/// margin, 12px padding and 2px rule.
+const INSET: Pixels = px(22.);
+
+/// A prompt of more lines than this rests folded: a pasted log, not a
+/// question.
+const PROMPT_LINES: usize = 8;
+
+/// A prompt of more characters than this rests folded too: about ten lines
+/// of the column, run together.
+const PROMPT_CHARS: usize = 800;
+
+/// Rows a folded prompt shows.
+const PROMPT_ROWS: usize = 6;
+
+/// About how wide a character of a prompt is: half its 15px size, as a
+/// proportional face averages, to tell how many rows a long line takes.
+const PROMPT_CHAR: Pixels = px(7.5);
+
+/// Rows of a fenced block a reply shows until its fences are opened.
+const FENCE_ROWS: usize = 16;
+
+/// What an edit call changed, as its row tells it: lines added and taken
+/// away, and those lines with `+` and `-` in front.
+pub(crate) struct Edited {
+    pub(crate) added: usize,
+    pub(crate) removed: usize,
+    pub(crate) text: SharedString,
+}
+
 /// A failed turn set to be asked again when its provider's wait is over.
 pub(crate) struct WaitingRetry {
     pub(crate) session: u64,
@@ -77,6 +107,13 @@ impl Chat {
         };
         // A reply that only asked for tools: its tool rows say what happened.
         let tool_only = !is_user && message.content.is_empty() && !message.tool_calls.is_empty();
+        // The call the model is writing now, while this reply streams.
+        let writing = self
+            .turn
+            .as_ref()
+            .filter(|_| streaming && !is_user)
+            .and_then(|turn| turn.live.drafts.last())
+            .map(letronna_core::chat::Draft::label);
         let label: String = if message.model.is_empty() {
             self.store.model(self.store.active).1.to_owned()
         } else {
@@ -89,6 +126,7 @@ impl Chat {
         // press inside it, even one on a dialog drawn over it, and that press
         // never ends -- confirming a rewind left the reply half selected.
         let selectable = !window.has_active_dialog(cx);
+        let mut prompt_more = None;
         let body: AnyElement = if editing {
             // Sending takes back what followed, unless more was asked: that
             // stays, and the edit goes to a fork, which Send says first.
@@ -141,12 +179,49 @@ impl Chat {
                 Some(typed) => typed,
                 None => letronna_core::untrusted::shown("", content).0,
             };
-            TextView::markdown(md, said, window, cx)
-                .selectable(selectable)
-                .text_size(px(15.))
-                .font_weight(FontWeight::MEDIUM)
-                .line_height(leading)
-                .into_any_element()
+            // A long paste rests as its first rows, the rest a key away.
+            let per_row = (self.text_width(px(0.)) / PROMPT_CHAR) as usize;
+            let rest = prompt_rest(&said, per_row);
+            let long = rest.is_some();
+            let cut = rest.filter(|_| !self.previews_open.contains(&self.open_key(index)));
+            if long {
+                let label = match &cut {
+                    Some(cut) => crate::ui::more_lines(cut.hidden),
+                    None => "Show less".to_owned(),
+                };
+                prompt_more = Some(
+                    crate::ui::more_row(
+                        self.row_id("prompt-more", index),
+                        label,
+                        cut.is_none(),
+                        self.toggler(self.open_key(index), cx),
+                        window,
+                        cx,
+                    )
+                    .into_any_element(),
+                );
+            }
+            match cut {
+                // Its own view, so opening it does not wait on the whole
+                // prompt being parsed again in the background.
+                Some(cut) => div()
+                    .max_h(leading * PROMPT_ROWS as f32)
+                    .overflow_hidden()
+                    .child(
+                        TextView::markdown(self.text_id("md-cut", index), cut.shown, window, cx)
+                            .selectable(selectable)
+                            .text_size(px(15.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .line_height(leading),
+                    )
+                    .into_any_element(),
+                None => TextView::markdown(md, said, window, cx)
+                    .selectable(selectable)
+                    .text_size(px(15.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .line_height(leading)
+                    .into_any_element(),
+            }
         } else if message.content.is_empty() && !streaming {
             // Stored with nothing said, by a run elsewhere -- the window keeps
             // no such reply of its own -- and long done thinking.
@@ -169,24 +244,69 @@ impl Chat {
                     ) {
                         (Some(retry), _) => retry.to_string(),
                         (None, true) => "Compacting…".to_owned(),
-                        (None, false) => "Thinking…".to_owned(),
+                        // A long write streams for a while; say so, not Thinking.
+                        (None, false) => writing.clone().unwrap_or("Thinking…".to_owned()),
                     }
                 })
                 .into_any_element()
         } else {
+            // Each fence rests at its first rows; one button beside any long
+            // one shows them all, and the reply is drawn again in a view of
+            // its own, as the view keeps the buttons it was first given.
+            let key = self.open_key(index);
+            let fences_open = self.previews_open.contains(&key);
+            let md = if fences_open {
+                self.text_id("md-all", index)
+            } else {
+                md
+            };
+            let style = gpui_component::text::TextViewStyle::default().heading_gap(gpui::rems(1.));
+            let style = if fences_open {
+                style
+            } else {
+                // The block's 12px padding above the rows, and a sliver of
+                // the next row's leading below them to say it goes on.
+                let cap = px(12.) + leading * FENCE_ROWS as f32 + px(4.);
+                style.code_block(StyleRefinement::default().max_h(cap).overflow_hidden())
+            };
+            // At the size the block draws its code, less a little, as a row
+            // breaks before a word that does not fit: an estimate short of
+            // the real rows would cut a fence with no way to open it.
+            let size = cx.theme().mono_font_size;
+            let per_row = crate::ui::per_row(self.text_width(px(24.)), size, window);
+            let per_row = per_row - per_row / 8;
+            let chat = cx.weak_entity();
             TextView::markdown(md, message.content.clone(), window, cx)
                 .selectable(selectable)
                 .line_height(leading)
-                .style(gpui_component::text::TextViewStyle::default().heading_gap(gpui::rems(1.)))
-                .code_block_actions(move |block, _, _| {
+                .style(style)
+                .code_block_actions(move |block, _, cx| {
                     let code = block.code();
                     let mut hasher = std::hash::DefaultHasher::new();
                     std::hash::Hash::hash(&code, &mut hasher);
                     let id = std::hash::Hasher::finish(&hasher);
                     let lang = block.lang().unwrap_or_default();
+                    let long = crate::ui::rows(&code, per_row) > FENCE_ROWS;
+                    let chat = chat.clone();
                     h_flex()
                         .gap_2()
                         .items_center()
+                        .when(long, |this| {
+                            this.child(
+                                Button::new(SharedString::from(format!("fences-{index}-{id}")))
+                                    .plain(cx)
+                                    .xsmall()
+                                    .label(if fences_open { "Show less" } else { "Show all" })
+                                    .on_click(move |_, _, cx| {
+                                        let _ = chat.update(cx, |this, cx| {
+                                            if !this.previews_open.remove(&key) {
+                                                this.previews_open.insert(key);
+                                            }
+                                            cx.notify();
+                                        });
+                                    }),
+                            )
+                        })
                         .when(!lang.is_empty(), |this| {
                             this.child(div().text_xs().text_color(cx_muted).child(lang.to_string()))
                         })
@@ -263,8 +383,34 @@ impl Chat {
             .when(!tool_only, |this| {
                 this.child(div().w_full().overflow_hidden().pb_1().child(body))
             })
+            // A reply that said a few words and goes on to write a call: the
+            // call is named under them while it streams.
+            .when_some(
+                writing.filter(|_| !message.content.is_empty()),
+                |this, label| {
+                    this.child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(
+                                crate::ui::busy::Spinner::new()
+                                    .xsmall()
+                                    .color(cx.theme().primary),
+                            )
+                            .child(label),
+                    )
+                },
+            )
+            // Outside the clip above, which would cut the left of its fill.
+            .children(prompt_more)
             .when(is_user && !message.images.is_empty(), |this| {
-                this.child(crate::ui::pictures::sent_row(&message.images, cx))
+                this.child(crate::ui::pictures::sent_row(
+                    index,
+                    &message.images,
+                    window,
+                    cx,
+                ))
             })
             // A reply is often wanted whole, and selecting it across
             // paragraphs and code blocks is fiddly.
@@ -339,7 +485,7 @@ impl Chat {
                             .gap_0p5()
                             .child(
                                 Button::new(("queued-now", n))
-                                    .ghost()
+                                    .plain(cx)
                                     .xsmall()
                                     .icon(Icon::new(IconName::ArrowUp))
                                     .tooltip(now)
@@ -347,7 +493,7 @@ impl Chat {
                             )
                             .child(
                                 Button::new(("queued-back", n))
-                                    .ghost()
+                                    .plain(cx)
                                     .xsmall()
                                     .icon(Icon::new(AppIcon::Pencil))
                                     .tooltip("Back to the box")
@@ -357,7 +503,7 @@ impl Chat {
                             )
                             .child(
                                 Button::new(("queued-drop", n))
-                                    .ghost()
+                                    .plain(cx)
                                     .xsmall()
                                     .icon(Icon::new(IconName::Close))
                                     .tooltip("Don't send")
@@ -428,7 +574,7 @@ impl Chat {
                     .child("Aside · not kept in the session")
                     .child(
                         Button::new("aside-close")
-                            .ghost()
+                            .plain(cx)
                             .xsmall()
                             .icon(Icon::new(IconName::Close))
                             .tooltip_with_action("Close", &Dismiss, None)
@@ -735,12 +881,26 @@ impl Chat {
             .to_owned();
         let first = body.lines().next().unwrap_or_default();
         let headline = letronna_core::tools::one_line(first.strip_prefix("- ").unwrap_or(first));
+        let focus = window
+            .use_keyed_state(self.row_id("notice-focus", index), cx, |_, cx| {
+                cx.focus_handle().tab_stop(true)
+            })
+            .read(cx)
+            .clone();
+        let toggle = move |this: &mut Self, cx: &mut Context<Self>| {
+            if !this.thinking_open.remove(&key) {
+                this.thinking_open.insert(key);
+            }
+            cx.notify();
+        };
         v_flex()
             .w_full()
             .gap_1()
             .child(
                 h_flex()
                     .id(("notice", index))
+                    .track_focus(&focus)
+                    .key_context("ToolRun")
                     .h(px(26.))
                     .min_w_0()
                     .w_full()
@@ -752,7 +912,8 @@ impl Chat {
                     .text_xs()
                     .font_family(HEADING_FONT)
                     .text_color(cx.theme().muted_foreground)
-                    .hover(|s| s.bg(cx.theme().secondary.opacity(0.5)))
+                    .focus(|s| s.bg(cx.theme().secondary))
+                    .active(|s| s.bg(cx.theme().secondary.opacity(0.5)))
                     .child(
                         Icon::new(if open {
                             IconName::ChevronDown
@@ -763,12 +924,13 @@ impl Chat {
                     )
                     .child("Notice")
                     .child(div().min_w_0().truncate().child(headline))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if !this.thinking_open.remove(&key) {
-                            this.thinking_open.insert(key);
+                    .on_any_mouse_down(|_, window, _| window.prevent_default())
+                    .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                        if !event.is_keyboard() {
+                            toggle(this, cx);
                         }
-                        cx.notify();
-                    })),
+                    }))
+                    .on_action(cx.listener(move |this, _: &ToggleRun, _, cx| toggle(this, cx))),
             )
             .when(open, |this| {
                 this.child(
@@ -791,7 +953,8 @@ impl Chat {
             .into_any_element()
     }
 
-    /// A tool result: one quiet line, click to see the output.
+    /// A tool result: one quiet line, which Enter or a click opens into a
+    /// preview of the output, and the preview into all of it.
     fn tool_row(
         &self,
         index: usize,
@@ -800,11 +963,29 @@ impl Chat {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let key = self.open_key(index);
-        // A failure is the output you need to read, so it starts open, in
-        // full. One you declined yourself is no news, so it stays shut.
-        let failed = message.is_error && !letronna_core::tools::is_declined(&message.content);
+        // A command that exited badly came back as output, not as an error,
+        // but it failed all the same.
+        let exit = (!message.is_error)
+            .then(|| exit_code(&message.name, &message.content))
+            .flatten();
+        // A failure is the output you need to read, so it starts open. One
+        // you declined yourself is no news, so it stays shut.
+        let failed = letronna_core::tool_runs::failed(message) || exit.is_some();
         let open = self.thinking_open.contains(&key) != failed;
+        let focus = window
+            .use_keyed_state(self.row_id("tool-focus", index), cx, |_, cx| {
+                cx.focus_handle().tab_stop(true)
+            })
+            .read(cx)
+            .clone();
         let summary = letronna_core::tools::summary(&message.name, &message.args);
+        // A call that used the browser can bring its page back up, at the
+        // address it opened if the browser has since let it go.
+        let page = matches!(message.name.as_str(), "browse" | "use_page");
+        let address = page
+            .then(|| serde_json::from_str::<serde_json::Value>(&message.args).ok())
+            .flatten()
+            .and_then(|args| args["url"].as_str().map(str::to_owned));
         // The fences' tags are for the model; here a few words say where the
         // text came from.
         let (content, from) = letronna_core::untrusted::shown(&message.name, &message.content);
@@ -815,7 +996,11 @@ impl Chat {
             .then(|| letronna_core::media::saved_by(&message.name, &message.content))
             .flatten()
             .filter(|path| path.exists());
-        let (status, color) = if failed {
+        // What an edit changed, read from its call once and kept.
+        let edited = (!message.is_error).then(|| self.edited.get(&key)).flatten();
+        let (status, color) = if let Some(code) = exit {
+            (format!("exit {code}"), cx.theme().danger)
+        } else if failed {
             ("failed".to_owned(), cx.theme().danger)
         } else if message.is_error {
             ("declined".to_owned(), cx.theme().muted_foreground)
@@ -829,6 +1014,8 @@ impl Chat {
                 name.to_string_lossy().into_owned(),
                 cx.theme().muted_foreground,
             )
+        } else if edited.is_some() {
+            (String::new(), cx.theme().muted_foreground)
         } else {
             let count = if lines == 1 {
                 "1 line".to_owned()
@@ -837,12 +1024,22 @@ impl Chat {
             };
             (count, cx.theme().muted_foreground)
         };
+        let toggle = move |this: &mut Self, cx: &mut Context<Self>| {
+            if !this.thinking_open.remove(&key) {
+                this.thinking_open.insert(key);
+            }
+            cx.notify();
+        };
+        let session = key.0;
+        let copied = edited.map(|edit| edit.text.clone());
         v_flex()
             .w_full()
             .gap_1()
             .child(
                 h_flex()
                     .id(("tool", index))
+                    .track_focus(&focus)
+                    .key_context("ToolRun")
                     .h(px(26.))
                     // Without this the row's nowrap text sets a min width that
                     // widens the whole column past the composer. It belongs
@@ -858,6 +1055,7 @@ impl Chat {
                     .text_xs()
                     .font_family(HEADING_FONT)
                     .text_color(cx.theme().muted_foreground)
+                    .focus(|s| s.bg(cx.theme().secondary))
                     .active(|s| s.bg(cx.theme().secondary.opacity(0.5)))
                     .child(
                         Icon::new(if open {
@@ -880,7 +1078,25 @@ impl Chat {
                             .truncate()
                             .child(summary),
                     )
-                    .child(div().min_w_0().text_color(color).truncate().child(status))
+                    .when(!status.is_empty(), |row| {
+                        row.child(div().min_w_0().text_color(color).truncate().child(status))
+                    })
+                    .when_some(edited, |row, edit| {
+                        row.child(
+                            div()
+                                .flex_none()
+                                .text_color(cx.theme().green)
+                                .child(format!("+{}", edit.added)),
+                        )
+                        .when(edit.removed > 0, |row| {
+                            row.child(
+                                div()
+                                    .flex_none()
+                                    .text_color(cx.theme().danger)
+                                    .child(format!("−{}", edit.removed)),
+                            )
+                        })
+                    })
                     .when_some(from, |row, from| {
                         row.child(
                             div()
@@ -889,11 +1105,66 @@ impl Chat {
                                 .child(from),
                         )
                     })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if !this.thinking_open.remove(&key) {
-                            this.thinking_open.insert(key);
+                    .when(open || page, |row| row.child(div().flex_1()))
+                    // All of it, however little the preview shows; read when
+                    // copied, not copied out at every frame.
+                    .when(open, |row| {
+                        let chat = cx.weak_entity();
+                        row.child(crate::ui::copy_button(
+                            ("copy-tool", index),
+                            move |cx| {
+                                if let Some(text) = &copied {
+                                    return text.to_string();
+                                }
+                                chat.upgrade()
+                                    .and_then(|chat| {
+                                        let store = &chat.read(cx).store;
+                                        let ix = store.index_of(session)?;
+                                        let said = store.conversations[ix].messages.get(index)?;
+                                        Some(
+                                            letronna_core::untrusted::shown(
+                                                &said.name,
+                                                &said.content,
+                                            )
+                                            .0,
+                                        )
+                                    })
+                                    .unwrap_or_default()
+                            },
+                            cx,
+                        ))
+                    })
+                    // A call that used the browser: the page it left, small,
+                    // in the corner, as the agent's browsing shows it.
+                    .when(page, |row| {
+                        row.child(
+                            Button::new(("tool-page", index))
+                                .plain(cx)
+                                .xsmall()
+                                .icon(Icon::new(IconName::Globe).size_3())
+                                .tooltip("Show the page")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.open_browser_preview_at(address.clone(), window, cx);
+                                })),
+                        )
+                    })
+                    // As on a folded run: a press leaves the keys in the
+                    // composer, and Enter is ToggleRun's, not the keyboard's
+                    // own click as it comes back up.
+                    .on_any_mouse_down(|_, window, _| window.prevent_default())
+                    .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                        if !event.is_keyboard() {
+                            toggle(this, cx);
                         }
-                        cx.notify();
+                    }))
+                    // Only the row's own: Enter on its Copy or page button
+                    // presses that button.
+                    .on_action(cx.listener(move |this, _: &ToggleRun, window, cx| {
+                        if !focus.is_focused(window) {
+                            return cx.propagate();
+                        }
+                        toggle(this, cx)
                     })),
             )
             // What let the call run in Auto mode, lined up with its name.
@@ -909,9 +1180,30 @@ impl Chat {
             .when_some(made, |this, path| {
                 let playing = self.video.as_ref().is_some_and(|v| v.path == path);
                 let frame = self.video_frame.clone().filter(|_| playing);
-                this.child(made_file(index, path, playing, frame, cx))
+                this.child(made_file(index, path, playing, frame, window, cx))
             })
             .when(open, |this| {
+                // A command's errors and summary are at its end; a file or a
+                // page starts at the top.
+                let cut = if matches!(message.name.as_str(), "run_command" | "read_job") {
+                    crate::ui::Cut::Tail
+                } else {
+                    crate::ui::Cut::Head
+                };
+                let (text, ink) = match edited {
+                    Some(edit) => (edit.text.to_string(), crate::ui::Ink::Diff),
+                    None if failed => (without_exit(&content).to_owned(), crate::ui::Ink::Failed),
+                    None => (content, crate::ui::Ink::Plain),
+                };
+                let preview = self.preview(
+                    self.row_id("tool-out", index),
+                    &text,
+                    cut,
+                    ink,
+                    index,
+                    window,
+                    cx,
+                );
                 this.child(
                     div()
                         .ml_2()
@@ -919,20 +1211,216 @@ impl Chat {
                         .min_w_0()
                         .border_l_2()
                         .border_color(cx.theme().border)
-                        .text_color(if failed {
-                            cx.theme().danger
-                        } else {
-                            cx.theme().muted_foreground
-                        })
-                        .child(crate::ui::code_block(
-                            ("tool-out", index),
-                            letronna_core::tools::clamp_lines(&content, 400),
-                            px(220.),
-                            window,
-                            cx,
-                        )),
+                        .text_color(cx.theme().muted_foreground)
+                        .child(preview),
                 )
             })
+    }
+
+    /// `text` as a preview, open as far as the user took it, under message
+    /// `index`: drawn inset under a row, as a tool's output is.
+    #[allow(clippy::too_many_arguments)]
+    fn preview(
+        &self,
+        id: ElementId,
+        text: &str,
+        cut: crate::ui::Cut,
+        ink: crate::ui::Ink,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let key = self.open_key(index);
+        let open = self.previews_open.contains(&key);
+        crate::ui::preview_block(
+            id,
+            text,
+            cut,
+            ink,
+            self.text_width(INSET),
+            open,
+            self.toggler(key, cx),
+            window,
+            cx,
+        )
+    }
+
+    /// What opens or closes the preview at `key`, for a preview's own row.
+    fn toggler(&self, key: (u64, usize), cx: &mut Context<Self>) -> crate::ui::Toggle {
+        let chat = cx.weak_entity();
+        std::rc::Rc::new(move |_, cx| {
+            let _ = chat.update(cx, |this, cx| {
+                if !this.previews_open.remove(&key) {
+                    this.previews_open.insert(key);
+                }
+                cx.notify();
+            });
+        })
+    }
+
+    /// How wide text is drawn in the chat's column, `inset` in from its
+    /// edges.
+    fn text_width(&self, inset: Pixels) -> Pixels {
+        // The column's own padding, either side.
+        (self.column - px(48.) - inset).max(px(120.))
+    }
+
+    /// Work out once what each edit call among messages `first..=last` of
+    /// the session on screen changed, for its row to say.
+    pub(crate) fn note_edits(&mut self, first: usize, last: usize) {
+        let conversation = &self.store.conversations[self.store.active];
+        let id = conversation.id;
+        let said = conversation.messages.iter().enumerate();
+        let mut found = Vec::new();
+        for (i, m) in said.skip(first).take(last + 1 - first) {
+            if m.role == "tool" && !m.is_error && !self.edited.contains_key(&(id, i)) {
+                found.extend(edited_by(&m.name, &m.args).map(|edit| ((id, i), edit)));
+            }
+        }
+        self.edited.extend(found);
+    }
+
+    /// What the calls of a folded run made -- pictures, videos, sounds --
+    /// as small tiles under its line, each opening its file on Enter or a
+    /// click, so folding the run does not hide them.
+    pub(crate) fn run_media(
+        &self,
+        run: Run,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let messages = &self.store.conversations[self.store.active].messages;
+        let made: Vec<(usize, PathBuf)> = (run.first..=run.last)
+            .filter_map(|i| {
+                let m = messages
+                    .get(i)
+                    .filter(|m| m.role == "tool" && !m.is_error)?;
+                let path = letronna_core::media::saved_by(&m.name, &m.content)?;
+                path.exists().then_some((i, path))
+            })
+            .collect();
+        if made.is_empty() {
+            return None;
+        }
+        let tiles: Vec<AnyElement> = made
+            .into_iter()
+            .map(|(i, path)| self.made_tile(i, path, window, cx))
+            .collect();
+        // Lined up with the run line's words, past its chevron.
+        Some(
+            h_flex()
+                .flex_wrap()
+                .gap_2()
+                .pl(px(26.))
+                .children(tiles)
+                .into_any_element(),
+        )
+    }
+
+    /// One file a call in a folded run made, small: a picture or a video's
+    /// still at the height of a sent picture, a sound as its name.
+    fn made_tile(
+        &self,
+        index: usize,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let kind = |known: &[&str]| {
+            path.extension()
+                .is_some_and(|extension| known.iter().any(|k| extension.eq_ignore_ascii_case(k)))
+        };
+        let video = kind(&["mp4", "webm", "mov"]);
+        let still = kind(&["png", "jpg", "jpeg", "webp"]);
+        let picture = video || still;
+        let focus = window
+            .use_keyed_state(self.row_id("made-tile", index), cx, |_, cx| {
+                cx.focus_handle().tab_stop(true)
+            })
+            .read(cx)
+            .clone();
+        let theme = cx.theme();
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let (open, on_key) = (path.clone(), path.clone());
+        let body = if picture {
+            // Read through the picture cache, held only while shown.
+            let blank = {
+                let tile = theme.secondary;
+                move || div().size(px(MADE_TILE)).bg(tile).into_any_element()
+            };
+            crate::ui::pictures::held_while_shown(&path, (MADE_TILE * 4.) as u32)
+                .child(
+                    img(path.clone())
+                        .h(px(MADE_TILE))
+                        .max_w(px(MADE_TILE * 2.))
+                        .object_fit(ObjectFit::Contain)
+                        .with_loading(blank)
+                        .with_fallback(blank),
+                )
+                .into_any_element()
+        } else {
+            h_flex()
+                .h(px(MADE_TILE))
+                .max_w(px(MADE_TILE * 3.))
+                .px_3()
+                .gap_1p5()
+                .items_center()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(Icon::new(AppIcon::Play).size_3p5())
+                .child(div().min_w_0().truncate().child(name.clone()))
+                .into_any_element()
+        };
+        div()
+            .id(self.row_id("made-tile", index))
+            .track_focus(&focus)
+            .key_context("ToolRun")
+            .relative()
+            .flex_none()
+            .overflow_hidden()
+            .rounded(theme.radius)
+            .border_1()
+            .border_color(theme.border)
+            .cursor_pointer()
+            .focus(|s| s.border_color(theme.ring))
+            .active(|s| s.opacity(0.8))
+            .child(body)
+            // A video says so in the corner of its still.
+            .when(video, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .left_1()
+                        .bottom_1()
+                        .size(px(18.))
+                        .rounded_full()
+                        .bg(theme.background.opacity(0.75))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            Icon::new(AppIcon::Play)
+                                .size_2p5()
+                                .text_color(theme.foreground),
+                        ),
+                )
+            })
+            .tooltip(move |window, cx| {
+                gpui_component::tooltip::Tooltip::new(name.clone()).build(window, cx)
+            })
+            .on_any_mouse_down(|_, window, _| window.prevent_default())
+            .on_click(move |event: &ClickEvent, window, cx| {
+                if !event.is_keyboard() {
+                    open_made(open.clone(), still, window, cx);
+                }
+            })
+            .on_action(move |_: &ToggleRun, window, cx| {
+                open_made(on_key.clone(), still, window, cx)
+            })
+            .into_any_element()
     }
 
     /// A run of tool calls as one line, which Enter or a click opens into
@@ -1053,6 +1541,9 @@ impl Chat {
             .into_any_element()
     }
 
+    /// The model's thinking for message `index`: its newest rows in a small
+    /// window while it comes in, then one line saying how long it took,
+    /// which Enter or a click opens into the whole of it.
     fn thinking_block(
         &self,
         index: usize,
@@ -1062,23 +1553,55 @@ impl Chat {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let key = self.open_key(index);
-        let open = streaming || self.thinking_open.contains(&key);
+        // Thinking is live until the reply says anything or starts writing
+        // a call; the window stays open then unless closed, and shut
+        // afterwards unless opened.
+        let drafting = self
+            .turn
+            .as_ref()
+            .is_some_and(|turn| !turn.live.drafts.is_empty());
+        let live = streaming && message.content.is_empty() && !drafting;
+        let open = live != self.thinking_open.contains(&key);
+        let focus = window
+            .use_keyed_state(self.row_id("think-focus", index), cx, |_, cx| {
+                cx.focus_handle().tab_stop(true)
+            })
+            .read(cx)
+            .clone();
+        let toggle = move |this: &mut Self, cx: &mut Context<Self>| {
+            if !this.thinking_open.remove(&key) {
+                this.thinking_open.insert(key);
+            }
+            cx.notify();
+        };
+        let label = if live {
+            "Thinking…".to_owned()
+        } else {
+            match self.thought_for.get(&key) {
+                Some(took) => format!("Thought for {}", took_for(*took)),
+                None => "Thought".to_owned(),
+            }
+        };
+        let theme = cx.theme();
         v_flex()
             .w_full()
             .gap_1()
             .child(
                 h_flex()
                     .id(("think", index))
+                    .track_focus(&focus)
+                    .key_context("ToolRun")
                     .h(px(26.))
                     .px_2()
                     .gap_1p5()
                     .items_center()
-                    .rounded(cx.theme().radius)
+                    .rounded(theme.radius)
                     .cursor_pointer()
                     .text_xs()
                     .font_family(HEADING_FONT)
-                    .text_color(cx.theme().muted_foreground)
-                    .active(|s| s.bg(cx.theme().secondary.opacity(0.5)))
+                    .text_color(theme.muted_foreground)
+                    .focus(|s| s.bg(theme.secondary))
+                    .active(|s| s.bg(theme.secondary.opacity(0.5)))
                     .child(
                         Icon::new(if open {
                             IconName::ChevronDown
@@ -1087,19 +1610,43 @@ impl Chat {
                         })
                         .size_3(),
                     )
-                    .child(if streaming {
-                        "Thinking…"
-                    } else {
-                        "Thought process"
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if !this.thinking_open.remove(&key) {
-                            this.thinking_open.insert(key);
+                    .child(label)
+                    .on_any_mouse_down(|_, window, _| window.prevent_default())
+                    .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                        if !event.is_keyboard() {
+                            toggle(this, cx);
                         }
-                        cx.notify();
-                    })),
+                    }))
+                    .on_action(cx.listener(move |this, _: &ToggleRun, _, cx| toggle(this, cx))),
             )
-            .when(open, |this| {
+            .when(open && live, |this| {
+                // Plain text, not markdown parsed again at every token: the
+                // newest rows, held to the bottom of a box that grows to
+                // eight rows and then stays.
+                let rows = crate::ui::PREVIEW_ROWS;
+                let tail = crate::ui::rest(&message.reasoning, crate::ui::Cut::Tail, 200, rows)
+                    .map_or_else(
+                        || message.reasoning.trim_end().to_owned(),
+                        |rest| rest.shown,
+                    );
+                this.child(
+                    div()
+                        .ml_2()
+                        .pl_3()
+                        .border_l_2()
+                        .border_color(theme.border)
+                        .flex()
+                        .flex_col()
+                        .justify_end()
+                        .max_h(crate::ui::CODE_LINE * rows as f32)
+                        .overflow_hidden()
+                        .text_xs()
+                        .line_height(crate::ui::CODE_LINE)
+                        .text_color(theme.muted_foreground)
+                        .child(tail),
+                )
+            })
+            .when(open && !live, |this| {
                 this.child(
                     div()
                         .ml_2()
@@ -1122,6 +1669,32 @@ impl Chat {
             })
     }
 
+    /// Time the thinking of the reply coming in, from its first reasoning
+    /// to its first words or its end, by its session and coming place.
+    pub(crate) fn time_thinking(&mut self, event: &Event) {
+        let Some(id) = self.streaming_id else {
+            return;
+        };
+        let Some(ix) = self.store.index_of(id) else {
+            return;
+        };
+        let key = (id, self.store.conversations[ix].messages.len());
+        let thinking = matches!(self.thinking_since, Some((at, _)) if at == key);
+        match event {
+            Event::Reasoning(_) if !thinking && !self.thought_for.contains_key(&key) => {
+                self.thinking_since = Some((key, std::time::Instant::now()));
+            }
+            event if thinking && ends_thinking(event) => {
+                if let Some((at, since)) = self.thinking_since.take() {
+                    self.thought_for.insert(at, since.elapsed());
+                    // Closed while it came in is not opened once it is done.
+                    self.thinking_open.remove(&at);
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub(crate) fn empty_state(
         &self,
         window: &mut Window,
@@ -1132,9 +1705,28 @@ impl Chat {
         let no_project = self.store.conversations[self.store.active]
             .workspace
             .is_none();
-        v_flex()
-            .relative()
-            .flex_1()
+        // The window's two ways to find the rest, with their keys as this
+        // computer writes them.
+        let hints = [
+            (&crate::ui::palette::OpenPalette as &dyn Action, "commands"),
+            (&ShowKeys, "keys"),
+        ]
+        .map(|(action, what)| {
+            crate::ui::keys::bound_key(action, cx)
+                .map(|key| SharedString::from(format!("{} {what}", Kbd::format(&key))))
+        });
+        let hint = |hints: Vec<SharedString>| {
+            h_flex()
+                .gap_x_4()
+                .children(hints.into_iter().map(|hint| div().child(hint)))
+        };
+        let page = v_flex()
+            .w_full()
+            // At least the pane's height, so it is centred there, and taller
+            // when it must be, so a short window scrolls it rather than cut
+            // the wordmark off at the top.
+            .min_h_full()
+            .py_6()
             .items_center()
             .justify_center()
             .gap_2()
@@ -1165,19 +1757,203 @@ impl Chat {
                         ),
                 )
             })
+            .children(self.recent_places(window, cx))
             .child(
-                div()
-                    .mt_4()
+                // In two groups, so a narrow pane breaks between them.
+                h_flex()
+                    .mt_6()
+                    .max_w_full()
+                    .px_6()
+                    .flex_wrap()
+                    .justify_center()
+                    .gap_x_4()
+                    .gap_y_1()
                     .text_xs()
-                    .text_color(cx.theme().muted_foreground.opacity(0.7))
-                    .child("Enter to send  ·  Shift+Enter for a new line  ·  Esc to stop"),
+                    // Plain muted, not faded: faded it read under 4.5:1.
+                    .text_color(cx.theme().muted_foreground)
+                    .child(hint(
+                        ["Enter to send", "Shift+Enter for a new line", "Esc to stop"]
+                            .map(SharedString::from)
+                            .to_vec(),
+                    ))
+                    .child(hint(hints.into_iter().flatten().collect())),
             )
-            .children(self.grain(&self.grains.empty_chat))
             // A side question asked before anything else still needs somewhere to show.
             .children(
                 self.aside_row(self.store.conversations[self.store.active].id, window, cx)
                     .map(|row| div().w_full().max_w(COLUMN).px_6().mt_6().child(row)),
+            );
+        v_flex()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .child(
+                div()
+                    .id("empty-chat")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .child(page),
             )
+            .children(self.grain(&self.grains.empty_chat))
+    }
+
+    /// Sessions to go back to and folders worked in lately, side by side
+    /// under a new session's greeting, or nothing when there are none. Each
+    /// row is a tab stop that Enter opens, as a click does.
+    fn recent_places(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<Div> {
+        // Rows in each list: enough to go back to what was open this week,
+        // few enough that the greeting stays the middle of the page.
+        const RECENT: usize = 4;
+        let here = &self.store.conversations[self.store.active];
+        let now = backend::now();
+        let mut by_age: Vec<&Conversation> = (self.store.conversations.iter())
+            .filter(|c| c.id != here.id && c.length() > 0)
+            .collect();
+        by_age.sort_by_key(|c| std::cmp::Reverse(c.updated));
+        let sessions: Vec<Stateful<Div>> = by_age
+            .into_iter()
+            .take(RECENT)
+            .map(|c| {
+                let id = c.id;
+                self.recent_row(
+                    ("recent-session", id as usize),
+                    AppIcon::MessageSquare,
+                    (c.title.clone().into(), age_label(c.updated, now).into()),
+                    false,
+                    window,
+                    cx,
+                    move |this, window, cx| this.go_to_session(id, window, cx),
+                )
+            })
+            .collect();
+        let folders: Vec<Stateful<Div>> =
+            letronna_core::palette::recent_folders(&self.store.conversations)
+                .into_iter()
+                .filter(|folder| here.workspace.as_ref() != Some(folder))
+                .take(RECENT)
+                .enumerate()
+                .map(|(n, folder)| {
+                    let name = folder
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| folder.display().to_string());
+                    // Where it is, its name being the label already.
+                    let path = (folder.parent())
+                        .map(|parent| parent.display().to_string())
+                        .unwrap_or_default();
+                    self.recent_row(
+                        ("recent-folder", n),
+                        AppIcon::Folder,
+                        (name.into(), path.into()),
+                        true,
+                        window,
+                        cx,
+                        move |this, window, cx| {
+                            this.open_folder(folder.clone(), window, cx);
+                            cx.notify();
+                        },
+                    )
+                })
+                .collect();
+        if sessions.is_empty() && folders.is_empty() {
+            return None;
+        }
+        let column = |title: &'static str, rows: Vec<Stateful<Div>>| {
+            v_flex()
+                .w(px(300.))
+                .gap_0p5()
+                .child(
+                    div()
+                        .px_2()
+                        .pb_1()
+                        .text_xs()
+                        .font_family(HEADING_FONT)
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(cx.theme().muted_foreground)
+                        .child(title),
+                )
+                .children(rows)
+        };
+        Some(
+            h_flex()
+                .mt_6()
+                .max_w_full()
+                .px_6()
+                .flex_wrap()
+                .justify_center()
+                .items_start()
+                .gap_x_8()
+                .gap_y_4()
+                .when(!sessions.is_empty(), |this| {
+                    this.child(column("Recent sessions", sessions))
+                })
+                .when(!folders.is_empty(), |this| {
+                    this.child(column("Recent folders", folders))
+                }),
+        )
+    }
+
+    /// One of the empty state's rows: `text` is its label and a muted
+    /// detail, which with `wide_detail` takes the room left, as a folder's
+    /// path does, and otherwise sits at the end, as a session's age does.
+    #[allow(clippy::too_many_arguments)]
+    fn recent_row(
+        &self,
+        id: (&'static str, usize),
+        icon: AppIcon,
+        text: (SharedString, SharedString),
+        wide_detail: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        open: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> Stateful<Div> {
+        let focus = window
+            .use_keyed_state(
+                (SharedString::from(format!("{}-focus", id.0)), id.1),
+                cx,
+                |_, cx| cx.focus_handle().tab_stop(true),
+            )
+            .read(cx)
+            .clone();
+        let theme = cx.theme();
+        let (label, detail) = text;
+        h_flex()
+            .id(id)
+            .track_focus(&focus)
+            .h(px(28.))
+            .px_2()
+            .gap_2()
+            .items_center()
+            .rounded(theme.radius)
+            // Always there, so the ring the keys bring moves nothing.
+            .border_1()
+            .border_color(theme.transparent)
+            .cursor_pointer()
+            .text_sm()
+            .focus(|s| s.border_color(theme.ring))
+            .active(|s| s.bg(theme.secondary.opacity(0.5)))
+            .child(
+                Icon::new(icon)
+                    .size_4()
+                    .flex_shrink_0()
+                    .text_color(theme.muted_foreground),
+            )
+            .child(
+                div()
+                    .when(!wide_detail, |this| this.flex_1())
+                    .min_w_0()
+                    .truncate()
+                    .child(label),
+            )
+            .child(
+                div()
+                    .when(wide_detail, |this| this.flex_1().min_w_0().truncate())
+                    .flex_shrink_0()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(detail),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| open(this, window, cx)))
     }
 
     pub(crate) fn page_view(&self, page: Page, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1290,19 +2066,150 @@ fn usage_line(message: &Message) -> String {
     parts.join(" · ")
 }
 
+/// The exit code a command's output ends with, when it is not 0: the
+/// command ran, but failed.
+fn exit_code(tool: &str, output: &str) -> Option<i64> {
+    if tool != "run_command" {
+        return None;
+    }
+    let last = output.trim_end().lines().next_back()?;
+    let code: i64 = last
+        .strip_prefix("[exit code ")?
+        .strip_suffix(']')?
+        .parse()
+        .ok()?;
+    (code != 0).then_some(code)
+}
+
+/// Whether `message` is a command's output that ends in a failing exit
+/// code: a failure, though the call itself went through.
+pub(crate) fn exited_badly(message: &Message) -> bool {
+    message.role == "tool"
+        && !message.is_error
+        && exit_code(&message.name, &message.content).is_some()
+}
+
+/// A command's output without the exit code at its end, which its row
+/// already says.
+fn without_exit(output: &str) -> &str {
+    let output = output.trim_end();
+    match output.rsplit_once('\n') {
+        Some((rest, last)) if last.starts_with("[exit code ") => rest.trim_end(),
+        None if output.starts_with("[exit code ") => "",
+        _ => output,
+    }
+}
+
+/// How long thinking took, as its line says it: "12s", "1m 5s".
+fn took_for(time: std::time::Duration) -> String {
+    match time.as_secs() {
+        0 => "a moment".to_owned(),
+        seconds @ 1..60 => format!("{seconds}s"),
+        seconds => format!("{}m {}s", seconds / 60, seconds % 60),
+    }
+}
+
+/// What your prompt `said` shows at rest when it is long enough to fold
+/// and does not fit `PROMPT_ROWS` rows of `per_row` characters anyway.
+fn prompt_rest(said: &str, per_row: usize) -> Option<crate::ui::Rest> {
+    let long = said.lines().count() > PROMPT_LINES || said.chars().count() > PROMPT_CHARS;
+    long.then(|| crate::ui::rest(said, crate::ui::Cut::Head, per_row, PROMPT_ROWS))
+        .flatten()
+}
+
+/// Whether `event` ends a reply's thinking: its first words, a call it
+/// starts writing, which is the reply under way, its calls or its end.
+fn ends_thinking(event: &Event) -> bool {
+    match event {
+        Event::Delta(text) => !text.is_empty(),
+        Event::Drafting(drafts) => !drafts.is_empty(),
+        Event::ToolCalls(_) | Event::Finished(_) => true,
+        _ => false,
+    }
+}
+
+/// What a call to `tool` with `args` changes, when it is an edit: an
+/// edit_file's replacements compared line by line as the files card does,
+/// a written file's lines all added, a patch's own `+` and `-` lines.
+fn edited_by(tool: &str, args: &str) -> Option<Edited> {
+    // Asked again at every frame of a call that is no edit, which is then
+    // not worth parsing.
+    if !matches!(tool, "edit_file" | "write_file" | "apply_patch") {
+        return None;
+    }
+    let args: serde_json::Value = serde_json::from_str(args).ok()?;
+    let mut lines: Vec<String> = Vec::new();
+    let (mut added, mut removed) = (0, 0);
+    match tool {
+        "edit_file" => {
+            let own = std::iter::once(&args).filter(|a| !a["old"].is_null());
+            let listed = args["edits"].as_array().into_iter().flatten();
+            for edit in own.chain(listed) {
+                let (Some(old), Some(new)) = (edit["old"].as_str(), edit["new"].as_str()) else {
+                    continue;
+                };
+                let diff = letronna_core::history::diff(old, new);
+                added += diff.added;
+                removed += diff.removed;
+                lines.extend(diff.rows.iter().map(|row| match row {
+                    letronna_core::history::Row::Same(text) => format!("  {text}"),
+                    letronna_core::history::Row::Added(text) => format!("+ {text}"),
+                    letronna_core::history::Row::Removed(text) => format!("- {text}"),
+                    letronna_core::history::Row::Folded(n) => format!("  ⋯ {n} unchanged"),
+                }));
+            }
+        }
+        "write_file" => {
+            let content = args["content"].as_str()?;
+            lines.extend(content.lines().map(|line| format!("+ {line}")));
+            added = lines.len();
+        }
+        "apply_patch" => {
+            let patch = args["patch"].as_str().or(args["input"].as_str())?;
+            for line in patch.lines() {
+                if line.starts_with("*** Begin Patch") || line.starts_with("*** End Patch") {
+                    continue;
+                }
+                if let Some(text) = line.strip_prefix("*** ") {
+                    lines.push(text.to_owned());
+                } else if let Some(text) = line.strip_prefix('+') {
+                    added += 1;
+                    lines.push(format!("+ {text}"));
+                } else if let Some(text) = line.strip_prefix('-') {
+                    removed += 1;
+                    lines.push(format!("- {text}"));
+                } else {
+                    lines.push(format!("  {}", line.strip_prefix(' ').unwrap_or(line)));
+                }
+            }
+        }
+        _ => return None,
+    }
+    Some(Edited {
+        added,
+        removed,
+        text: lines.join("\n").into(),
+    })
+}
+
+/// The height of a file a folded run made, shown small under its line: as
+/// tall as a picture sent with a prompt.
+const MADE_TILE: f32 = 56.;
+
 /// The longest side a picture a tool made is decoded at: twice as wide as
 /// it is shown, for a screen up to twice as sharp.
 const MADE_SIDE: u32 = 720;
 
-/// What a media tool made, shown as itself: a picture, a video by its first
-/// frame until it plays here, a sound with a button to play it. Each gets
-/// buttons to open the file or find it. `frame` is the video's newest frame
-/// while `playing`.
+/// What a media tool made, shown as itself: a picture, which Enter or a
+/// click opens in the window, a video by its first frame until it plays
+/// here, a sound with a button to play it. Each gets buttons to open the
+/// file or find it. `frame` is the video's newest frame while `playing`.
 fn made_file(
     index: usize,
     path: PathBuf,
     playing: bool,
     frame: Option<std::sync::Arc<RenderImage>>,
+    window: &mut Window,
     cx: &mut Context<Chat>,
 ) -> impl IntoElement {
     let kind = |known: &[&str]| {
@@ -1401,7 +2308,8 @@ fn made_file(
                     })
                     .map(|this| {
                         if !video {
-                            return this.on_click(move |_, _, cx| cx.open_with_system(&open));
+                            let focus = ("made-picture-focus", index);
+                            return crate::ui::viewer::opens(this, focus, open, window, cx);
                         }
                         this.on_click(cx.listener(move |chat, _, window, cx| {
                             if playing {
@@ -1476,12 +2384,80 @@ fn sound_button(index: usize, path: PathBuf, cx: &mut Context<Chat>) -> Button {
         }))
 }
 
+/// Open a file a call made: a picture in the window's own viewer, anything
+/// else with the system.
+fn open_made(path: PathBuf, picture: bool, window: &mut Window, cx: &mut App) {
+    if picture {
+        crate::ui::viewer::open(path, window, cx);
+    } else {
+        cx.open_with_system(&path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // Deliberately not `use super::*`: the prelude re-exports gpui, whose own
     // `test` macro would shadow the built-in attribute here.
-    use super::{countdown, retry_due, usage_line};
-    use letronna_core::chat::Message;
+    use super::{
+        countdown, edited_by, ends_thinking, exit_code, prompt_rest, retry_due, took_for,
+        usage_line, without_exit,
+    };
+    use letronna_core::chat::{Draft, Event, Message};
+
+    #[test]
+    fn a_command_that_exits_badly_says_its_code() {
+        let output = "running 3 tests\ntest result: FAILED\n\n[exit code 101]\n";
+        assert_eq!(exit_code("run_command", output), Some(101));
+        assert_eq!(exit_code("run_command", "ok\n[exit code 0]"), None);
+        assert_eq!(exit_code("run_command", "all fine"), None);
+        // Only a command's output is read for one.
+        assert_eq!(exit_code("read_file", output), None);
+        assert_eq!(without_exit(output), "running 3 tests\ntest result: FAILED");
+        assert_eq!(without_exit("[exit code 2]"), "");
+        assert_eq!(without_exit("no code here\n"), "no code here");
+    }
+
+    #[test]
+    fn thinking_time_reads_as_seconds_then_minutes() {
+        let secs = std::time::Duration::from_secs;
+        assert_eq!(took_for(std::time::Duration::from_millis(400)), "a moment");
+        assert_eq!(took_for(secs(12)), "12s");
+        assert_eq!(took_for(secs(65)), "1m 5s");
+    }
+
+    #[test]
+    fn an_edit_counts_only_the_lines_it_changed() {
+        let args = serde_json::json!({
+            "path": "a.rs",
+            "old": "fn a() {\n    1\n}\n",
+            "new": "fn a() {\n    2\n}\n",
+        });
+        let Some(edit) = edited_by("edit_file", &args.to_string()) else {
+            panic!("an edit_file call is an edit");
+        };
+        assert_eq!((edit.added, edit.removed), (1, 1));
+        assert_eq!(edit.text.as_ref(), "  fn a() {\n-     1\n+     2\n  }");
+    }
+
+    #[test]
+    fn a_written_file_and_a_patch_tell_their_lines() {
+        let write = serde_json::json!({"path": "n.md", "content": "one\ntwo\n"});
+        let Some(written) = edited_by("write_file", &write.to_string()) else {
+            panic!("a write_file call is an edit");
+        };
+        assert_eq!((written.added, written.removed), (2, 0));
+        let patch = "*** Begin Patch\n*** Update File: a.rs\n@@\n-old\n+new\n same\n*** End Patch";
+        let call = serde_json::json!({ "patch": patch });
+        let Some(patched) = edited_by("apply_patch", &call.to_string()) else {
+            panic!("an apply_patch call is an edit");
+        };
+        assert_eq!((patched.added, patched.removed), (1, 1));
+        assert_eq!(
+            patched.text.as_ref(),
+            "Update File: a.rs\n  @@\n- old\n+ new\n  same"
+        );
+        assert!(edited_by("read_file", &write.to_string()).is_none());
+    }
 
     #[test]
     fn a_retry_that_falls_due_while_busy_waits_rather_than_going() {
@@ -1533,5 +2509,33 @@ mod tests {
             usage_line(&message),
             "16 out · 76000 in · 38% of 200K · 95% cached"
         );
+    }
+
+    #[test]
+    fn a_call_being_written_ends_the_thinking() {
+        let draft = Draft {
+            name: "write_file".into(),
+            subject: "notes.md".into(),
+        };
+        assert!(ends_thinking(&Event::Drafting(vec![draft])));
+        assert!(ends_thinking(&Event::Delta("Here".into())));
+        assert!(!ends_thinking(&Event::Drafting(Vec::new())));
+        assert!(!ends_thinking(&Event::Delta(String::new())));
+        assert!(!ends_thinking(&Event::Reasoning("hmm".into())));
+    }
+
+    #[test]
+    fn a_prompt_folds_only_when_it_does_not_fit_its_rows() {
+        // Over 800 bytes, but 450 characters: five rows of a wide column.
+        let cyrillic = "я".repeat(450);
+        assert_eq!(prompt_rest(&cyrillic, 102), None);
+        let pasted: Vec<String> = (1..=20).map(|n| format!("line {n}")).collect();
+        let Some(rest) = prompt_rest(&pasted.join("\n"), 102) else {
+            panic!("twenty lines do not fit in six rows");
+        };
+        assert_eq!(rest.hidden, 14);
+        assert!(prompt_rest(&"x".repeat(900), 102).is_some());
+        // Short, however narrow: a question, not a paste.
+        assert_eq!(prompt_rest("why does this fail?", 10), None);
     }
 }

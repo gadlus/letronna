@@ -279,6 +279,7 @@ impl Chat {
 
         // Keyed by the old profile's session ids, which mean nothing here.
         self.open.clear();
+        self.recent.clear();
         self.drafts.clear();
         self.attachments.clear();
         self.modes.clear();
@@ -286,9 +287,15 @@ impl Chat {
         self.agent_asks.clear();
         self.thinking_open.clear();
         self.runs_open.clear();
+        self.previews_open.clear();
+        self.thought_for.clear();
+        self.thinking_since = None;
+        self.edited.clear();
+        self.plan_folded.clear();
         self.unseen.clear();
         self.tags.clear();
         self.kept_own.clear();
+        self.panel.forget_previews();
         self.found.clear();
         self.editing_message = None;
         // Sessions the old profile opened for a chat app, by ids that another

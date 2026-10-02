@@ -486,58 +486,6 @@ impl Chat {
         )
     }
 
-    /// The model's checklist, above the composer while work is outstanding.
-    /// It disappears on its own once everything is done.
-    pub(crate) fn todo_panel(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let todos = &self.store.conversations[self.store.active].todos;
-        if todos.is_empty() || todos.iter().all(|t| t.status == "done") {
-            return None;
-        }
-        let done = todos.iter().filter(|t| t.status == "done").count();
-        let rows = todos.iter().enumerate().map(|(i, todo)| {
-            // The three states use icons from different sets, so build the
-            // element in each arm rather than passing a name around.
-            let (icon, color) = match todo.status.as_str() {
-                "done" => (Icon::new(IconName::CircleCheck), cx.theme().green),
-                "doing" => (Icon::new(IconName::LoaderCircle), cx.theme().primary),
-                _ => (Icon::new(AppIcon::Circle), cx.theme().muted_foreground),
-            };
-            h_flex()
-                .gap_2()
-                .items_center()
-                .text_xs()
-                .child(icon.size_3().text_color(color))
-                .child(
-                    div()
-                        .when(todo.status == "done", |d| {
-                            d.line_through().text_color(cx.theme().muted_foreground)
-                        })
-                        .child(todo.text.clone()),
-                )
-                .id(("todo", i))
-        });
-        Some(
-            v_flex()
-                .w_full()
-                .gap_1p5()
-                .mb_2()
-                .px_3()
-                .py_2p5()
-                .rounded(cx.theme().radius)
-                .border_1()
-                .border_color(cx.theme().border)
-                .bg(cx.theme().secondary.opacity(0.3))
-                .child(
-                    div()
-                        .text_xs()
-                        .font_family(HEADING_FONT)
-                        .text_color(cx.theme().muted_foreground)
-                        .child(format!("Plan · {done} of {} done", todos.len())),
-                )
-                .children(rows),
-        )
-    }
-
     /// The session's standing goal, above the composer while it has one:
     /// what it is, how many turns it has carried on for, and whether it is
     /// being looked at now.
@@ -579,7 +527,7 @@ impl Chat {
             AppIcon::Shield
         };
         let chip = Button::new("mode")
-            .ghost()
+            .plain(cx)
             .xsmall()
             .tooltip(format!(
                 "{} mode: {}. Click to change.",
@@ -834,7 +782,7 @@ impl Chat {
                     // this is the way out that does not need a restart.
                     row.child(
                         Button::new("stop")
-                            .ghost()
+                            .plain(cx)
                             .xsmall()
                             .rounded_full()
                             .icon(Icon::new(IconName::CircleX))
