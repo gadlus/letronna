@@ -4188,7 +4188,10 @@ impl Render for Chat {
                 .into_any_element()
         };
 
-        let strip = self.running_strip(window, cx);
+        // Built only where it shows: another page pays nothing for it.
+        let strip = (self.page == Page::Chat)
+            .then(|| self.running_strip(window, cx))
+            .flatten();
         let main = v_flex()
             .relative()
             .flex_1()
