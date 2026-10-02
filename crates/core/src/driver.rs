@@ -32,6 +32,15 @@
 //! prose is reminded once. Past either, the run fails with no answer and says
 //! why.
 //!
+//! A session's own run that would end with items open on the checklist it set
+//! is sent back once, to finish them or say why not, and to end with its whole
+//! answer again, since only its last message is printed or sent. A list an
+//! earlier turn left is not counted, since the new prompt may be about
+//! something else, nor is a `todo` call the run was refused, which set
+//! nothing. A run someone watches live, as an editor's turn over ACP is, and
+//! a chat app's are not sent back at all: a person answers what they end
+//! with, as in the window.
+//!
 //! Nothing here polls. Each wait -- for the model, for a tool, for an
 //! approval -- is a blocking receive that a stop closes, so a stop is heard at
 //! once, and the stop and the budget are checked again before every model
@@ -89,6 +98,10 @@ const CORRECTIONS: usize = 2;
 
 /// What an agent with a schema is told when it ends without giving its answer.
 const REMINDER: &str = "You ended without calling structured_output, so your answer has not been given. Call structured_output now, once, with your final answer.";
+
+/// What a session's own run is told, followed by the items, when it would
+/// end with items on its checklist not done.
+const OPEN_ITEMS: &str = "Your checklist still has open items. Finish them, or say why each is not needed. If the task told you to stop at this point, say which items wait and end. Only your last message is passed on as your answer, so end with your whole answer again, not only what changed.";
 
 /// What an answer cut off at the reply's token cap gets back, in place of the
 /// usual advice to send a file in parts, which would leave an answer short.
@@ -311,6 +324,10 @@ fn steps(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result<Outcom
         ));
     }
     let mut reminded = false;
+    // A session's transcript holds its earlier turns too, and a checklist
+    // one of them left is not this run's to finish.
+    let begun = spec.transcript.conversation.messages.len();
+    let mut nudged = false;
     loop {
         if spec.cancel.is_set() {
             return Ok(Outcome::Stopped);
@@ -357,6 +374,32 @@ fn steps(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result<Outcom
                     from: "Letronna".into(),
                     when: When::Next,
                     text: REMINDER.into(),
+                }]);
+            }
+            // Ending with its own plan unfinished is how part of a task gets
+            // dropped, so a session's own run goes on once more for it; a
+            // helper's answer is its parent's to judge, and a turn someone
+            // watches live, as an editor's over ACP, or a chat app's is a
+            // person's to answer, as the window's is. Past once, what is
+            // still open was left on purpose. With no round or budget left,
+            // going on could only end an answered run at its limit.
+            if mail.is_none()
+                && spec.depth == 0
+                && spec.connection.remote.is_none()
+                && spec.watch.is_none()
+                && !nudged
+                && report.rounds < spec.rounds
+                && (spec.budget.as_ref()).is_none_or(|budget| budget.check().is_ok())
+                && let Some(open) = open_checklist(
+                    (spec.transcript.conversation.messages.get(begun..)).unwrap_or_default(),
+                    &spec.transcript.conversation.todos,
+                )
+            {
+                nudged = true;
+                mail = inbox::fold(&[Notice {
+                    from: "Letronna".into(),
+                    when: When::Next,
+                    text: open,
                 }]);
             }
             let answered = mail.is_none();
@@ -881,6 +924,29 @@ fn checklist(transcript: &mut Transcript, arguments: &str) -> Result<String, Str
     // Written with the batch's results, like everything else the batch changed.
     transcript.conversation.todos = todos;
     Ok(format!("Checklist updated: {done} of {total} done."))
+}
+
+/// What a run is sent back with when a `todo` call among its own `messages`
+/// kept `todos` with items not done, or None otherwise.
+fn open_checklist(messages: &[Message], todos: &[Todo]) -> Option<String> {
+    // Only a call that ran keeps a list: one it was refused, or one that
+    // could not be read, left `todos` as an earlier turn had it.
+    let kept = messages
+        .iter()
+        .any(|message| message.role == "tool" && message.name == tools::TODO && !message.is_error);
+    if !kept {
+        return None;
+    }
+    let open: Vec<String> = todos
+        .iter()
+        .filter(|todo| todo.status != "done")
+        .map(|todo| format!("- {} ({})", todo.text, todo.status))
+        .collect();
+    if open.is_empty() {
+        return None;
+    }
+    // The items go last: a fold cuts a long notice off at its end.
+    Some(format!("{OPEN_ITEMS}\n{}", open.join("\n")))
 }
 
 /// Keeps the answer a `structured_output` call gives on the report when it
@@ -1654,6 +1720,251 @@ pub(crate) mod tests {
             .rfind(|record| record["type"] == "meta")
             .unwrap();
         assert_eq!(meta["todos"], items);
+    }
+
+    /// A `todo` call that sets the checklist to `items`, each a text and its status.
+    fn checklist_of(items: &[(&str, &str)]) -> (&'static str, Value) {
+        let items: Vec<Value> = items
+            .iter()
+            .map(|(text, status)| json!({"text": text, "status": status}))
+            .collect();
+        ("todo", json!({ "items": items }))
+    }
+
+    /// A session's own run of the helper task, as `-p` starts one.
+    fn own_run(endpoint: String, dir: &Path, id: AgentId) -> Spec {
+        Spec {
+            depth: 0,
+            ..spec(endpoint, dir, id)
+        }
+    }
+
+    /// The checklist notices among the messages a request sent.
+    fn checklist_notices(body: &Value) -> Vec<&str> {
+        messages(body)
+            .iter()
+            .filter_map(|message| message["content"].as_str())
+            .filter(|content| content.contains(OPEN_ITEMS))
+            .collect()
+    }
+
+    #[test]
+    fn open_checklist_items_send_the_run_back_once() {
+        let dir = scratch("open-items");
+        let half = [("read the notes", "done"), ("write the summary", "doing")];
+        let (endpoint, provider) = provider(vec![
+            reply("", &[checklist_of(&half)]),
+            reply("Planned.", &[]),
+            reply(
+                "",
+                &[checklist_of(&[
+                    ("read the notes", "done"),
+                    ("write the summary", "done"),
+                ])],
+            ),
+            reply("The summary is written.", &[]),
+        ]);
+        let report = finished(own_run(endpoint, &dir, AGENTS + 490));
+        let sent = provider.sent();
+
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(report.text, "The summary is written.");
+        assert!(checklist_notices(&sent[1]).is_empty());
+        let sent_back = messages(&sent[2]).last().unwrap();
+        assert_eq!(sent_back["role"], "user");
+        let notice = sent_back["content"].as_str().unwrap();
+        assert!(notice.starts_with("[Letronna notice"), "{notice}");
+        assert!(notice.contains("- write the summary (doing)"), "{notice}");
+        assert!(!notice.contains("read the notes (done)"), "{notice}");
+        assert!(notice.contains("your whole answer again"), "{notice}");
+        assert_eq!(checklist_notices(&sent[3]).len(), 1);
+    }
+
+    #[test]
+    fn a_finished_checklist_lets_the_run_end() {
+        let dir = scratch("finished-items");
+        let (endpoint, provider) = provider(vec![
+            reply("", &[checklist_of(&[("read the notes", "done")])]),
+            reply("The notes say hello.", &[]),
+        ]);
+        let report = finished(own_run(endpoint, &dir, AGENTS + 500));
+        let sent = provider.sent();
+
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(report.text, "The notes say hello.");
+        assert_eq!(sent.len(), 2);
+    }
+
+    #[test]
+    fn a_run_sent_back_once_for_its_checklist_may_then_end_with_items_open() {
+        let dir = scratch("waiting-items");
+        let (endpoint, provider) = provider(vec![
+            reply(
+                "",
+                &[checklist_of(&[
+                    ("item one", "done"),
+                    ("item two", "pending"),
+                ])],
+            ),
+            reply("Item one is done.", &[]),
+            reply(
+                "Item one is done. The task said to stop there, so item two waits.",
+                &[],
+            ),
+        ]);
+        let report = finished(own_run(endpoint, &dir, AGENTS + 510));
+        let sent = provider.sent();
+
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(
+            report.text,
+            "Item one is done. The task said to stop there, so item two waits."
+        );
+        assert_eq!(sent.len(), 3);
+        assert_eq!(checklist_notices(&sent[2]).len(), 1);
+    }
+
+    #[test]
+    fn a_checklist_an_earlier_turn_left_open_does_not_send_the_run_back() {
+        let dir = scratch("earlier-items");
+        let (endpoint, provider) = provider(vec![reply("The notes say hello.", &[])]);
+        let mut spec = own_run(endpoint, &dir, AGENTS + 520);
+        let (name, args) = checklist_of(&[("tidy the folder", "doing")]);
+        let earlier = vec![
+            Message {
+                role: "user".into(),
+                content: "Tidy the folder.".into(),
+                ..Default::default()
+            },
+            Message {
+                role: "assistant".into(),
+                tool_calls: vec![ToolCall {
+                    id: "call-0".into(),
+                    name: name.into(),
+                    arguments: args.to_string(),
+                }],
+                ..Default::default()
+            },
+            Message {
+                role: "tool".into(),
+                content: "Checklist updated: 0 of 1 done.".into(),
+                tool_call_id: "call-0".into(),
+                name: name.into(),
+                ..Default::default()
+            },
+            Message {
+                role: "assistant".into(),
+                content: "Started tidying.".into(),
+                ..Default::default()
+            },
+        ];
+        spec.transcript.conversation.messages.splice(0..0, earlier);
+        spec.transcript.conversation.todos = vec![Todo {
+            text: "tidy the folder".into(),
+            status: "doing".into(),
+        }];
+        let report = finished(spec);
+        let sent = provider.sent();
+
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(report.text, "The notes say hello.");
+        assert_eq!(sent.len(), 1);
+    }
+
+    #[test]
+    fn a_helper_ends_with_its_checklist_open() {
+        let dir = scratch("helper-items");
+        let (endpoint, provider) = provider(vec![
+            reply("", &[checklist_of(&[("write the summary", "doing")])]),
+            reply("Planned.", &[]),
+        ]);
+        let report = finished(spec(endpoint, &dir, AGENTS + 530));
+        let sent = provider.sent();
+
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(sent.len(), 2);
+    }
+
+    #[test]
+    fn a_chat_apps_run_ends_with_its_checklist_open() {
+        let dir = scratch("chat-app-items");
+        let (endpoint, provider) = provider(vec![
+            reply("", &[checklist_of(&[("write the summary", "pending")])]),
+            reply("Shall I write the summary?", &[]),
+        ]);
+        let mut spec = own_run(endpoint, &dir, AGENTS + 540);
+        spec.connection.remote = Some(chat::Remote {
+            place: "a Telegram chat".into(),
+            ..Default::default()
+        });
+        let report = finished(spec);
+        let sent = provider.sent();
+
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(report.text, "Shall I write the summary?");
+        assert_eq!(sent.len(), 2);
+    }
+
+    #[test]
+    fn a_run_someone_watches_live_ends_with_its_checklist_open() {
+        let dir = scratch("watched-items");
+        let (endpoint, provider) = provider(vec![
+            reply("", &[checklist_of(&[("write the summary", "pending")])]),
+            reply("Shall I write the summary?", &[]),
+        ]);
+        let mut spec = own_run(endpoint, &dir, AGENTS + 570);
+        spec.watch = Some(Arc::new(|_| ()));
+        let report = finished(spec);
+        let sent = provider.sent();
+
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(report.text, "Shall I write the summary?");
+        assert_eq!(sent.len(), 2);
+    }
+
+    #[test]
+    fn a_checklist_the_run_was_refused_does_not_send_it_back() {
+        let dir = scratch("refused-items");
+        let (endpoint, provider) = provider(vec![
+            reply("", &[checklist_of(&[("write the summary", "doing")])]),
+            reply("The notes say hello.", &[]),
+        ]);
+        let mut spec = own_run(endpoint, &dir, AGENTS + 580);
+        spec.allow = Allow::Only(vec!["read_file".into()]);
+        let report = finished(spec);
+        let sent = provider.sent();
+
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(report.text, "The notes say hello.");
+        assert_eq!(sent.len(), 2);
+        let refused = results(&sent[1])[0];
+        assert!(refused.starts_with("`todo` is not available"), "{refused}");
+    }
+
+    #[test]
+    fn a_run_with_no_round_or_budget_left_ends_with_its_checklist_open() {
+        let open = [("write the summary", "doing")];
+        // Its one round went on the checklist.
+        let dir = scratch("last-round-items");
+        let (endpoint, last_round) = provider(vec![
+            reply("", &[checklist_of(&open)]),
+            reply("The notes say hello.", &[]),
+        ]);
+        let mut spec = own_run(endpoint, &dir, AGENTS + 550);
+        spec.rounds = 1;
+        assert_eq!(finished(spec).status, Outcome::Done);
+        assert_eq!(last_round.sent().len(), 2);
+
+        // Each reply costs 1,050 tokens, so the answer spends the last of it.
+        let dir = scratch("spent-items");
+        let (endpoint, spent) = provider(vec![
+            reply("", &[checklist_of(&open)]),
+            reply("The notes say hello.", &[]),
+        ]);
+        let mut spec = own_run(endpoint, &dir, AGENTS + 560);
+        spec.budget = Some(Arc::new(Budget::new(2_000, None)));
+        assert_eq!(finished(spec).status, Outcome::Done);
+        assert_eq!(spent.sent().len(), 2);
     }
 
     #[test]
