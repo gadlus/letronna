@@ -3,18 +3,19 @@
 //! one's output as it comes.
 //!
 //! There is no terminal emulator here. The output is the job's log as core
-//! keeps it, a line each in the code font; lines are picked with the arrows
-//! or the pointer to go into the message, and interactive work goes to the
-//! user's own terminal, opened in the job's folder. Core rings a doorbell as
-//! a job starts, prints or ends, so nothing here reads the list on a timer,
-//! and the chosen job's log is read again only while the tab is on screen.
+//! keeps it, a line each in the code font, and only the lines in sight are
+//! laid out; lines are picked with the arrows or the pointer to go into the
+//! message, and interactive work goes to the user's own terminal, opened in
+//! the job's folder. Core rings a doorbell as a job starts, prints or ends,
+//! so nothing here reads the list on a timer, and the chosen job's log is
+//! read again only while the tab is on screen.
 
 use crate::prelude::*;
 use crate::ui::panel::PanelTab;
 use gpui_component::dialog::DialogButtonProps;
 use letronna_core::approvals::Decision;
 use letronna_core::jobs::{self, JobInfo};
-use std::ops::RangeInclusive;
+use std::ops::{Range, RangeInclusive};
 use std::path::Path;
 use std::time::Duration;
 
@@ -39,13 +40,17 @@ actions!(
 const LIST_MAX: Pixels = px(168.);
 /// How tall the tab is in the floating panel, at most, as the Files tab is.
 const FLOAT_HEIGHT: Pixels = px(440.);
-/// Lines of output drawn, the newest: a log of 64 KB can hold tens of
-/// thousands of empty lines, and drawing them all ten times a second would
-/// stall the window.
+/// Lines of output kept, the newest: a log of 64 KB can hold tens of
+/// thousands of empty lines, each copied again at every read while it
+/// prints.
 const MAX_LINES: usize = 2_000;
-/// How long a burst of output gathers before the next redraw: a chatty job
+/// Characters drawn of one line: a minified file or a progress bar can be
+/// one line of the whole log, shaped again at every frame it is in sight.
+const LINE_CHARS: usize = 1_000;
+/// How long a burst of output gathers before the next redraw, so the tab
+/// redraws the whole window at most four times a second: a chatty job
 /// rings on every read, and a redraw per read would keep the window busy.
-const SETTLE: Duration = Duration::from_millis(100);
+const SETTLE: Duration = Duration::from_millis(250);
 
 /// Lines picked in a job's output, from `anchor` to `cursor` either way round.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,6 +107,27 @@ fn tail_lines(log: &str) -> Vec<SharedString> {
         .collect()
 }
 
+/// A line as drawn: a space for an empty one, which would draw no height,
+/// and a long one cut at `LINE_CHARS`; a pick still takes the whole line.
+fn drawn(line: &SharedString) -> SharedString {
+    if line.is_empty() {
+        return " ".into();
+    }
+    match line.char_indices().nth(LINE_CHARS) {
+        Some((at, _)) => format!("{}…", &line[..at]).into(),
+        None => line.clone(),
+    }
+}
+
+/// Which line draws widest, which sets how far the output scrolls sideways.
+fn widest(lines: &[SharedString]) -> usize {
+    lines
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, line)| line.chars().take(LINE_CHARS + 1).count())
+        .map_or(0, |(n, _)| n)
+}
+
 /// `text` as a code block, fenced by more backticks than any run in it so
 /// that output holding a fence of its own cannot end the block early.
 fn fenced(text: &str) -> String {
@@ -121,6 +147,8 @@ pub(crate) struct Jobs {
     selected: Option<u64>,
     /// Its output as last read, a line each.
     lines: Vec<SharedString>,
+    /// Which of them draws widest.
+    widest: usize,
     /// Lines picked in it. While any are, the output holds still, so what
     /// was picked is what goes into the message.
     picked: Option<Picked>,
@@ -134,7 +162,7 @@ pub(crate) struct Jobs {
     /// The list's, which the Jobs tab's key and a job chip hand the keys to.
     list_focus: FocusHandle,
     log_focus: FocusHandle,
-    scroll: ScrollHandle,
+    scroll: UniformListScrollHandle,
 }
 
 impl Jobs {
@@ -142,6 +170,7 @@ impl Jobs {
         Self {
             selected: None,
             lines: Vec::new(),
+            widest: 0,
             picked: None,
             stale: true,
             listed: Vec::new(),
@@ -150,8 +179,13 @@ impl Jobs {
             }),
             list_focus: cx.focus_handle().tab_stop(true),
             log_focus: cx.focus_handle().tab_stop(true),
-            scroll: ScrollHandle::new(),
+            scroll: UniformListScrollHandle::new(),
         }
+    }
+
+    /// Show the newest line at the next draw, however many have come by then.
+    fn follow(&self) {
+        self.scroll.0.borrow().base_handle.scroll_to_bottom();
     }
 }
 
@@ -208,7 +242,7 @@ impl Chat {
         self.jobs.selected = Some(id);
         self.jobs.picked = None;
         self.jobs.stale = true;
-        self.jobs.scroll.scroll_to_bottom();
+        self.jobs.follow();
         cx.notify();
     }
 
@@ -246,15 +280,19 @@ impl Chat {
         }
         let Some(id) = self.jobs.selected else {
             self.jobs.lines.clear();
+            self.jobs.widest = 0;
             return;
         };
-        let scroll = &self.jobs.scroll;
         // Kept at the end while it is there, and left where it was scrolled
         // back to.
-        let at_end = scroll.offset().y <= -scroll.max_offset().height + px(4.);
+        let at_end = {
+            let scroll = &self.jobs.scroll.0.borrow().base_handle;
+            scroll.offset().y <= -scroll.max_offset().height + px(4.)
+        };
         self.jobs.lines = tail_lines(&jobs::log(id).unwrap_or_default());
+        self.jobs.widest = widest(&self.jobs.lines);
         if at_end || gone {
-            scroll.scroll_to_bottom();
+            self.jobs.follow();
         }
     }
 
@@ -294,7 +332,13 @@ impl Chat {
             None => Picked::one(len - 1),
         };
         self.jobs.picked = Some(picked);
-        self.jobs.scroll.scroll_to_item(picked.cursor);
+        // Scrolled no further than brings the line into sight.
+        let edge = if by > 0 {
+            ScrollStrategy::Bottom
+        } else {
+            ScrollStrategy::Top
+        };
+        self.jobs.scroll.scroll_to_item(picked.cursor, edge);
         cx.notify();
     }
 
@@ -321,7 +365,7 @@ impl Chat {
     fn unpick(&mut self, cx: &mut Context<Self>) {
         self.jobs.picked = None;
         self.jobs.stale = true;
-        self.jobs.scroll.scroll_to_bottom();
+        self.jobs.follow();
         cx.notify();
     }
 
@@ -635,26 +679,41 @@ impl Chat {
                     .on_click(cx.listener(|this, _, window, cx| this.add_lines(window, cx))),
             )
             .children(terminal);
-        let lines = self.jobs.lines.iter().enumerate().map(|(n, line)| {
-            let chosen = picked.is_some_and(|picked| picked.range().contains(&n));
-            div()
-                .id(("job-line", n))
-                .px_3()
-                .whitespace_normal()
-                .when(chosen, |row| row.bg(cx.theme().selection))
-                // A line with no text would draw no height.
-                .child(if line.is_empty() {
-                    SharedString::from(" ")
-                } else {
-                    line.clone()
-                })
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                        this.pick_line(n, event.modifiers.shift, window, cx)
-                    }),
-                )
-        });
+        // Every line is one row of the code font, so only those in sight
+        // are built, and a long one scrolls sideways rather than wrapping.
+        let lines = uniform_list(
+            "job-lines",
+            self.jobs.lines.len(),
+            cx.processor(|this, range: Range<usize>, _, cx| {
+                let picked = this.jobs.picked;
+                range
+                    .filter_map(|n| {
+                        let line = this.jobs.lines.get(n)?;
+                        let chosen = picked.is_some_and(|picked| picked.range().contains(&n));
+                        Some(
+                            div()
+                                .px_3()
+                                .whitespace_nowrap()
+                                .when(chosen, |row| row.bg(cx.theme().selection))
+                                .child(drawn(line))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                        this.pick_line(n, event.modifiers.shift, window, cx)
+                                    }),
+                                ),
+                        )
+                    })
+                    .collect()
+            }),
+        )
+        .track_scroll(self.jobs.scroll.clone())
+        .flex_1()
+        .min_h_0()
+        .font_family(MONO_FONT)
+        .text_xs()
+        .with_width_from_item(Some(self.jobs.widest))
+        .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained);
         let note = if picked.is_some() {
             Some("Held while lines are picked. Esc lets go and follows it again.")
         } else if self.jobs.lines.is_empty() {
@@ -667,18 +726,16 @@ impl Chat {
             .min_h_0()
             .child(actions)
             .child(
-                div()
+                // The padding is out here: gpui counts a uniform list's own
+                // padding twice, and the end would scroll past the last line.
+                v_flex()
                     .id("job-log")
                     .track_focus(&self.jobs.log_focus)
                     .key_context("JobLog")
                     .flex_1()
                     .min_h_0()
                     .py_1()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.jobs.scroll)
-                    .font_family(MONO_FONT)
-                    .text_xs()
-                    .children(lines)
+                    .child(lines)
                     .on_action(
                         cx.listener(|this, _: &LineDown, _, cx| this.pick_step(1, false, cx)),
                     )
@@ -724,7 +781,7 @@ impl Chat {
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
-    use super::{MAX_LINES, Picked, fenced, picked_text, tail_lines};
+    use super::{LINE_CHARS, MAX_LINES, Picked, drawn, fenced, picked_text, tail_lines, widest};
     use gpui::SharedString;
 
     #[test]
@@ -761,6 +818,35 @@ mod tests {
         assert_eq!(lines.len(), MAX_LINES);
         assert_eq!(lines.last().map(|line| line.as_ref()), Some("last"));
         assert!(tail_lines("").is_empty());
+    }
+
+    #[test]
+    fn a_long_line_is_cut_where_it_is_drawn_but_picked_whole() {
+        let long = SharedString::from("é".repeat(LINE_CHARS + 50));
+        let shown = drawn(&long);
+        assert_eq!(shown.chars().count(), LINE_CHARS + 1);
+        assert!(shown.ends_with('…'));
+        assert_eq!(
+            picked_text(std::slice::from_ref(&long), Some(Picked::one(0))).as_deref(),
+            Some(long.as_ref())
+        );
+        // An empty line still draws a row, and a short one is left alone.
+        assert_eq!(drawn(&SharedString::from("")).as_ref(), " ");
+        assert_eq!(drawn(&SharedString::from("ok")).as_ref(), "ok");
+    }
+
+    #[test]
+    fn the_widest_line_sets_how_far_the_output_scrolls() {
+        let long = "x".repeat(LINE_CHARS * 3);
+        let lines: Vec<SharedString> = ["short".to_owned(), long.clone(), "medium line".to_owned()]
+            .map(SharedString::from)
+            .to_vec();
+        assert_eq!(widest(&lines), 1);
+        assert_eq!(widest(&[]), 0);
+        // Past the cut every line draws as wide, so the later of two is
+        // taken without counting the rest of the longer one.
+        let cut = SharedString::from("y".repeat(LINE_CHARS + 1));
+        assert_eq!(widest(&[SharedString::from(long), cut]), 1);
     }
 
     #[test]
