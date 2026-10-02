@@ -1005,8 +1005,8 @@ impl Chat {
             mic: None,
             _subscriptions: subscriptions,
         };
-        let resized = this.follow_window_width(window, cx);
-        this._subscriptions.push(resized);
+        let shrink = this.follow_browser_shrink(window, cx);
+        this._subscriptions.push(shrink);
         let front = cx.observe_window_activation(window, |this, window, _| {
             this.in_front = window.is_window_active();
         });
@@ -3336,7 +3336,13 @@ impl Chat {
                         }
                     })
                     .pb_6()
-                    .children(rows),
+                    .children(rows)
+                    // Clear of the browser's preview over the pane's corner.
+                    .children(
+                        Some(self.browser_preview_room(column, window, cx))
+                            .filter(|room| *room > px(0.))
+                            .map(|room| div().flex_shrink_0().h(room)),
+                    ),
             )
             .into_any_element()
     }
@@ -4096,6 +4102,7 @@ impl Render for Chat {
                 .child(list(self.list.clone(), row).size_full())
                 .vertical_scrollbar(&self.list)
                 .children(self.jump_to_latest(cx))
+                .children(self.browser_preview(pane, window, cx))
                 .children(self.ring(crate::ui::keys::Region::Transcript, cx))
                 .into_any_element()
         };
@@ -4186,6 +4193,13 @@ impl Render for Chat {
                 cx.listener(|this, _: &crate::ui::panel::WideBrowser, window, cx| {
                     if !window.has_active_dialog(cx) && !this.settings_open {
                         this.toggle_wide(window, cx)
+                    }
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::ui::panel::PreviewBrowser, window, cx| {
+                    if !window.has_active_dialog(cx) && !this.settings_open {
+                        this.toggle_browser_preview(window, cx)
                     }
                 }),
             )

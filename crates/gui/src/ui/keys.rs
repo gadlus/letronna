@@ -11,6 +11,8 @@ pub(crate) enum Region {
     /// The conversation, or the page shown in its place.
     Transcript,
     Composer,
+    /// The browser's preview, at the conversation's corner.
+    Preview,
     Panel,
 }
 
@@ -27,6 +29,9 @@ impl Chat {
         }
         if self.page == Page::Chat {
             shown.push(Region::Composer);
+        }
+        if self.browser_preview_shown(cx) {
+            shown.push(Region::Preview);
         }
         if self.tab_on_screen(window, cx).is_some() {
             shown.push(Region::Panel);
@@ -46,6 +51,7 @@ impl Chat {
             }
             Region::Transcript => self.page_focus.contains_focused(window, cx),
             Region::Composer => self.composer.focus_handle(cx).contains_focused(window, cx),
+            Region::Preview => self.browser.read(cx).preview_focus.is_focused(window),
             Region::Panel => self.panel_focus.contains_focused(window, cx),
         }
     }
@@ -79,6 +85,10 @@ impl Chat {
                 None => window.focus(&self.transcript_focus),
             },
             Region::Composer => self.focus_composer(window, cx),
+            Region::Preview => {
+                let focus = self.browser.read(cx).preview_focus.clone();
+                window.focus(&focus);
+            }
             Region::Panel => window.focus(&self.panel_focus),
         }
         self.region = Some(region);

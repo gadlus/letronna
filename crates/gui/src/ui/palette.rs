@@ -90,6 +90,10 @@ fn commands() -> Vec<(&'static str, Rc<dyn Action>)> {
             "Give the browser the most room, or put it back",
             Rc::new(super::panel::WideBrowser),
         ),
+        (
+            "Browser: shrink to preview / show beside the chat",
+            Rc::new(super::panel::PreviewBrowser),
+        ),
         ("Open settings", Rc::new(OpenSettings)),
         ("Open usage", Rc::new(super::usage::OpenUsage)),
         ("Open activity", Rc::new(OpenActivity)),

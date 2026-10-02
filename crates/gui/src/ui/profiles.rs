@@ -287,6 +287,7 @@ impl Chat {
         self.thinking_open.clear();
         self.runs_open.clear();
         self.unseen.clear();
+        self.panel.forget_previews();
         self.found.clear();
         self.editing_message = None;
         // Sessions the old profile opened for a chat app, by ids that another

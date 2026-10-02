@@ -52,6 +52,10 @@ pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Opti
             Some("Give the browser the most room, or put it back"),
         ),
         (
+            KeyBinding::new("secondary-shift-b", ui::panel::PreviewBrowser, Some("Chat")),
+            Some("Shrink the browser to a preview, or show it beside the chat"),
+        ),
+        (
             KeyBinding::new("secondary-shift-e", files::FilesTab, Some("Chat")),
             Some("Open the files"),
         ),
@@ -159,6 +163,24 @@ pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Opti
         (
             KeyBinding::new("escape", ui::browser::CancelPoint, Some("Browser")),
             None,
+        ),
+        // On the browser's preview, as on a folded run; its Escape is nearer
+        // than Chat's too.
+        (
+            KeyBinding::new(
+                "enter",
+                ui::panel::ExpandBrowserPreview,
+                Some("BrowserPreview"),
+            ),
+            Some("On the browser's preview: show the page beside the chat"),
+        ),
+        (
+            KeyBinding::new(
+                "escape",
+                ui::panel::CloseBrowserPreview,
+                Some("BrowserPreview"),
+            ),
+            Some("On the browser's preview: close it"),
         ),
         (
             KeyBinding::new("tab", composer::LeaveComposer, Some("Composer > Input")),
