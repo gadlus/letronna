@@ -263,10 +263,19 @@ impl ImageCache for Shrunk {
         let svg = matches!(resource, Resource::Path(path)
             if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("svg")));
         let longest = if svg { u32::MAX } else { self.longest };
-        let read = ImageAssetLoader::load(resource.clone(), cx);
-        let picture = cx
-            .background_executor()
-            .spawn(async move { read.await.map(|picture| shrunk(picture, longest)) });
+        let picture = match resource {
+            // A video's still, from the system's thumbnailer.
+            Resource::Path(path) if crate::platform::poster::is_video(path) => {
+                let read = crate::platform::poster::still(path.to_path_buf());
+                cx.background_executor()
+                    .spawn(async move { read.await.map(|picture| shrunk(picture, longest)) })
+            }
+            _ => {
+                let read = ImageAssetLoader::load(resource.clone(), cx);
+                cx.background_executor()
+                    .spawn(async move { read.await.map(|picture| shrunk(picture, longest)) })
+            }
+        };
         let (this, view) = (self.this.clone(), window.current_view());
         window
             .spawn(cx, async move |cx| {
