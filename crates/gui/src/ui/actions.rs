@@ -661,6 +661,7 @@ impl Chat {
     ) {
         if self.page != Page::Chat
             || !self.transcript_shown()
+            || self.panel_covers(window, cx)
             || self.settings_open
             || window.has_active_dialog(cx)
         {

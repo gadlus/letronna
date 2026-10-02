@@ -48,6 +48,10 @@ pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Opti
             Some("Open the browser"),
         ),
         (
+            KeyBinding::new("secondary-shift-m", ui::panel::WideBrowser, Some("Chat")),
+            Some("Give the browser the most room, or put it back"),
+        ),
+        (
             KeyBinding::new("secondary-shift-e", files::FilesTab, Some("Chat")),
             Some("Open the files"),
         ),

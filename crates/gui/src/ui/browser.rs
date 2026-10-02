@@ -4,14 +4,15 @@
 //! keys and scrolling on the page go to it.
 //!
 //! Letronna has no web view of its own. These are the browser's pictures of
-//! the page, which it sends only when the page changes -- at most twelve a
-//! second, and none once the panel is closed -- drawn as images. A browser
-//! with no window of its own lays the page out in the panel, at the
-//! screen's sharpness. It is a tab of the right panel (panel.rs), which
-//! docks it beside the chat or, in a narrow window, floats it in the corner,
-//! where the page shows smaller.
+//! the page, which it sends only when the page changes -- at most thirty a
+//! second, and none while the panel does not draw it -- drawn as images. A
+//! browser with no window of its own lays the page out in the panel, at the
+//! screen's sharpness, as a desktop's or a phone's. It is a tab of the right
+//! panel (panel.rs), beside the chat, or over it in a window too narrow for
+//! both.
 
 use crate::prelude::*;
+use crate::ui::panel::WideBrowser;
 use gpui_component::Selectable;
 use letronna_core::browser::PointedElement;
 use letronna_core::watch::{self, Control, Held, Layout, Room, Sight, Watching};
@@ -50,13 +51,18 @@ const RING: f32 = 46.;
 
 pub(crate) struct BrowserView {
     /// Read the browser's pictures, and everything else it shows, while
-    /// the panel is open. Dropping them stops the watching.
+    /// the panel draws it. Dropping them stops the watching.
     watching: Option<[Task<()>; 2]>,
+    /// Open, but watching nothing until the panel draws it again.
+    unseen: bool,
+    /// How the panel draws it, as it said last; None while it does not.
+    drawn: Option<Drawn>,
     /// Closed by the user during this turn, so it stays closed until the
     /// next one.
     pub(crate) dismissed: bool,
-    /// Asked for by the user, so it shows even before there is a page.
-    asked: bool,
+    /// Given all the room beside the sidebar but the chat's, rather than
+    /// the share of it the panel's edge was dragged to.
+    pub(crate) wide: bool,
     frame: Option<Arc<RenderImage>>,
     /// The page's size in CSS pixels, which pointers are given in.
     size: (f64, f64),
@@ -68,9 +74,8 @@ pub(crate) struct BrowserView {
     address: Entity<InputState>,
     /// Keys go to the page while it has this focus.
     focus: FocusHandle,
-    /// Where the page is drawn, as laid out last, and whether the page is
-    /// laid out to fit it.
-    area: Option<(Bounds<Pixels>, bool)>,
+    /// Where the page is drawn, as laid out last.
+    area: Option<Bounds<Pixels>>,
     /// The mouse button held down on the page, while it is.
     pressed: Option<watch::Button>,
     /// Since when the page is loading, while it is.
@@ -118,11 +123,14 @@ enum Pointing {
     },
 }
 
-/// Asks the panel to widen for a page laid out as a desktop's, or to go
-/// back to its width before.
-pub(crate) struct Widen(pub(crate) bool);
-
-impl EventEmitter<Widen> for BrowserView {}
+/// How the panel draws the browser.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Drawn {
+    /// Beside the chat.
+    Beside,
+    /// In place of the conversation, in a room too narrow for both.
+    Over,
+}
 
 /// A reference to something pointed at on the page, with the user's comment
 /// on it, ready to go in the composer.
@@ -142,8 +150,10 @@ impl BrowserView {
         watch::screen(f64::from(window.scale_factor()));
         Self {
             watching: None,
+            unseen: false,
+            drawn: None,
             dismissed: false,
-            asked: false,
+            wide: false,
             frame: None,
             size: (0., 0.),
             url: String::new(),
@@ -160,7 +170,7 @@ impl BrowserView {
             switching: false,
             dialog: None,
             note: None,
-            layout: Layout::Portrait,
+            layout: Layout::Landscape,
             zoom: 1.,
             zoom_wheel: 0.,
             pointing: None,
@@ -168,9 +178,10 @@ impl BrowserView {
         }
     }
 
-    /// Start watching the browser, unless the panel was hidden this turn.
+    /// Start watching the browser, unless the panel was hidden this turn,
+    /// or does not draw it now and will start it once it does.
     pub(crate) fn open(&mut self, cx: &mut Context<Self>) {
-        if self.watching.is_some() || self.dismissed {
+        if self.watching.is_some() || self.dismissed || self.unseen {
             return;
         }
         let Watching { frames, sights } = watch::watch();
@@ -247,13 +258,6 @@ impl BrowserView {
         }
     }
 
-    /// Whether the browser has something for its tab: while it is open,
-    /// docked at once, but floating over the chat only once there is a page
-    /// or the user asked for it.
-    pub(crate) fn has_content(&self, docked: bool) -> bool {
-        self.watching.is_some() && (docked || self.frame.is_some() || self.asked)
-    }
-
     /// How many of the page's questions wait on the user.
     pub(crate) fn waiting(&self) -> usize {
         usize::from(self.dialog.is_some())
@@ -263,7 +267,6 @@ impl BrowserView {
     /// yet, and then ready for an address.
     pub(crate) fn ask(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.dismissed = false;
-        self.asked = true;
         self.open(cx);
         if self.url.is_empty() {
             window.focus(&self.focus);
@@ -297,18 +300,49 @@ impl BrowserView {
         .detach();
     }
 
+    /// Open: watching, or to watch again once the panel draws it.
     pub(crate) fn is_open(&self) -> bool {
-        self.watching.is_some()
+        self.watching.is_some() || self.unseen
     }
 
     pub(crate) fn close(&mut self, cx: &mut Context<Self>) {
         self.watching = None;
+        self.unseen = false;
         self.dismissed = true;
-        self.asked = false;
         self.area = None;
         self.pressed = None;
         self.pointing = None;
         self.show(None, cx);
+        cx.notify();
+    }
+
+    /// Whether it stands as the panel drawing it so needs: told how, and
+    /// watching only while drawn.
+    pub(crate) fn is_drawn_as(&self, drawn: Option<Drawn>) -> bool {
+        self.drawn == drawn && (drawn.is_some() || self.watching.is_none())
+    }
+
+    /// How the panel draws it now. Pictures nobody sees cost what seen ones
+    /// do, so it stops watching while it is not drawn, and keeps its last
+    /// picture and address for when it is again. Then it watches again,
+    /// opening its page anew if the browser was closed meanwhile for being
+    /// idle, which an unwatched one is after a while.
+    pub(crate) fn set_drawn(&mut self, drawn: Option<Drawn>, cx: &mut Context<Self>) {
+        self.drawn = drawn;
+        if drawn.is_none() {
+            if self.watching.take().is_some() {
+                self.unseen = true;
+                self.pressed = None;
+                self.pointing = None;
+                // Unwatched, nothing says when the page has loaded.
+                self.loading = None;
+            }
+        } else if std::mem::take(&mut self.unseen) {
+            self.open(cx);
+            if !self.url.is_empty() && !letronna_core::browser::has_page() {
+                self.resume(cx);
+            }
+        }
         cx.notify();
     }
 
@@ -483,11 +517,11 @@ impl BrowserView {
 
     /// Where the page was drawn this time, which the browser lays it out
     /// in, and clicks are placed by.
-    fn placed(&mut self, bounds: Bounds<Pixels>, fit: bool, window: &mut Window) {
-        if self.area == Some((bounds, fit)) {
+    fn placed(&mut self, bounds: Bounds<Pixels>, window: &mut Window) {
+        if self.area == Some(bounds) {
             return;
         }
-        self.area = Some((bounds, fit));
+        self.area = Some(bounds);
         self.fit_page(window);
         // The picture is placed by the area, so once more with it.
         window.request_animation_frame();
@@ -496,27 +530,24 @@ impl BrowserView {
     /// Tell the browser the room the page has, and how it is laid out and
     /// zoomed there.
     fn fit_page(&self, window: &Window) {
-        let Some((bounds, fit)) = self.area else {
+        let Some(bounds) = self.area else {
             return;
         };
         watch::fit(Room {
             width: f64::from(bounds.size.width),
             height: f64::from(bounds.size.height),
             scale: f64::from(window.scale_factor()),
-            fit,
+            fit: true,
             layout: self.layout,
             zoom: self.zoom,
         });
     }
 
-    /// Lay the page out as a phone does, or as a desktop browser does,
-    /// widening the panel for it as far as the chat allows -- and back to
-    /// its width before, as a phone again.
+    /// Lay the page out as a desktop browser does, or as a phone does.
     fn set_layout(&mut self, layout: Layout, window: &mut Window, cx: &mut Context<Self>) {
         if layout == self.layout {
             return;
         }
-        cx.emit(Widen(layout == Layout::Landscape));
         self.layout = layout;
         self.fit_page(window);
         cx.notify();
@@ -530,7 +561,7 @@ impl BrowserView {
 
     /// A point in the window as the point on the page under it.
     fn on_page(&self, at: Point<Pixels>) -> Option<(f64, f64)> {
-        let (area, _) = self.area?;
+        let area = self.area?;
         let (left, top, scale) = fitted(size_of(area), self.size)?;
         let x = (f64::from(at.x - area.origin.x) - left) / scale;
         let y = (f64::from(at.y - area.origin.y) - top) / scale;
@@ -734,17 +765,17 @@ impl BrowserView {
                 };
                 menu.min_w(px(230.))
                     .item(
-                        PopupMenuItem::new("Portrait: laid out as a phone")
-                            .checked(layout == Layout::Portrait)
-                            .on_click(act(|view, window, cx| {
-                                view.set_layout(Layout::Portrait, window, cx)
-                            })),
-                    )
-                    .item(
-                        PopupMenuItem::new("Landscape: as a desktop, wider")
+                        PopupMenuItem::new("Desktop layout")
                             .checked(layout == Layout::Landscape)
                             .on_click(act(|view, window, cx| {
                                 view.set_layout(Layout::Landscape, window, cx)
+                            })),
+                    )
+                    .item(
+                        PopupMenuItem::new("Phone layout")
+                            .checked(layout == Layout::Portrait)
+                            .on_click(act(|view, window, cx| {
+                                view.set_layout(Layout::Portrait, window, cx)
                             })),
                     )
                     .separator()
@@ -798,6 +829,28 @@ impl BrowserView {
             })
             .disabled(self.switching)
             .on_click(cx.listener(|view, _, _, cx| view.switch_window(cx)));
+        // Beside the chat only: over it, the page has all the room there is.
+        let wide = (self.drawn == Some(Drawn::Beside)).then(|| {
+            Button::new("page-wide")
+                .plain(cx)
+                .xsmall()
+                .map(|button| match self.wide {
+                    true => button.icon(Icon::new(AppIcon::Narrow)).tooltip_with_action(
+                        "Back beside the chat",
+                        &WideBrowser,
+                        Some("Chat"),
+                    ),
+                    false => button.icon(Icon::new(AppIcon::Widen)).tooltip_with_action(
+                        "Give the page the most room",
+                        &WideBrowser,
+                        Some("Chat"),
+                    ),
+                })
+                .on_click(cx.listener(|view, _, _, cx| {
+                    view.wide = !view.wide;
+                    cx.notify();
+                }))
+        });
         let typing = self.address.read(cx).focus_handle(cx).is_focused(window);
         h_flex()
             .h(px(38.))
@@ -835,17 +888,18 @@ impl BrowserView {
             .children(zoomed)
             .child(point_button)
             .child(view_menu)
+            .children(wide)
             .child(own_window)
     }
 
     /// The page, with the pointer over it, which takes the user's clicks,
-    /// keys and scrolling. Docked, it fills the panel and the page is laid
-    /// out to fit; floating, it takes the page's own shape.
-    fn screen(&self, docked: bool, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    /// keys and scrolling. It fills the panel, and the page is laid out to
+    /// fit.
+    fn screen(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let view = cx.entity();
         let measure = canvas(
             move |bounds, window, cx| {
-                view.update(cx, |view, _| view.placed(bounds, docked, window));
+                view.update(cx, |view, _| view.placed(bounds, window));
             },
             |_, _, _, _| {},
         )
@@ -856,6 +910,8 @@ impl BrowserView {
             .id("page")
             .relative()
             .w_full()
+            .flex_1()
+            .min_h_0()
             .overflow_hidden()
             .track_focus(&self.focus)
             .key_context("Browser")
@@ -964,17 +1020,7 @@ impl BrowserView {
         }
         let (width, height) = self.size;
         let picture = self.frame.clone().filter(|_| width >= 1. && height >= 1.);
-        if docked {
-            screen = screen.flex_1().min_h_0();
-        } else if picture.is_some() {
-            // The page's own shape, so the picture fills it exactly.
-            screen.style().aspect_ratio = Some((width / height) as f32);
-        } else {
-            screen = screen.h(px(160.));
-        }
-        let placed = self
-            .area
-            .and_then(|(area, _)| fitted(size_of(area), self.size));
+        let placed = self.area.and_then(|area| fitted(size_of(area), self.size));
         let screen = match (picture, placed) {
             (Some(frame), Some((left, top, scale))) => screen.child(
                 div()
@@ -1267,12 +1313,12 @@ impl BrowserView {
 
 impl Render for BrowserView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let docked = crate::ui::panel::docks(window.viewport_size().width);
         v_flex()
-            // Docked, the page fills what the panel has left under the bar.
-            .when(docked, |view| view.flex_1().min_h_0())
+            // The page fills what the panel has left under the bar.
+            .flex_1()
+            .min_h_0()
             .child(self.header(window, cx))
-            .child(self.screen(docked, window, cx))
+            .child(self.screen(window, cx))
     }
 }
 
