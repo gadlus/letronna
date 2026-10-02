@@ -104,6 +104,9 @@ pub(crate) struct BrowserView {
     switching: bool,
     /// The page's question, until it is answered.
     dialog: Option<String>,
+    /// Since when the agent has waited on a site's check, which the user
+    /// gets past on the page; it carries on by itself once it is gone.
+    check: Option<Instant>,
     /// Why the address typed did not open.
     note: Option<String>,
     layout: Layout,
@@ -158,6 +161,12 @@ pub(crate) struct ToPreview;
 
 impl EventEmitter<ToPreview> for BrowserView {}
 
+/// The agent has come to a site's check that only the user can get past:
+/// the page wants showing where it can be clicked.
+pub(crate) struct CheckUp;
+
+impl EventEmitter<CheckUp> for BrowserView {}
+
 impl BrowserView {
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let address = cx.new(|cx| InputState::new(window, cx).placeholder("Type an address"));
@@ -191,6 +200,7 @@ impl BrowserView {
             own_window: letronna_core::browser::has_window(),
             switching: false,
             dialog: None,
+            check: None,
             note: None,
             layout: Layout::Landscape,
             zoom: 1.,
@@ -302,15 +312,21 @@ impl BrowserView {
                 self.loading = None;
                 self.history = (false, false);
                 self.dialog = None;
+                self.check = None;
             }
-            // The panel has no card for it yet.
-            Sight::Check(_) => {}
+            Sight::Check(since) => {
+                let began = since.is_some() && self.check.is_none();
+                self.check = since;
+                if began {
+                    cx.emit(CheckUp);
+                }
+            }
         }
     }
 
     /// How many of the page's questions wait on the user.
     pub(crate) fn waiting(&self) -> usize {
-        usize::from(self.dialog.is_some())
+        usize::from(self.dialog.is_some()) + usize::from(self.check.is_some())
     }
 
     /// Show the browser as the user asks for it: at once, even with no page
@@ -1286,6 +1302,14 @@ impl BrowserView {
                 .text_color(cx.theme().danger)
                 .child(div().flex_1().min_w_0().child(note.clone()))
         });
+        let check = self.check.map(|_| {
+            card().child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child("Get past the site's check on the page; Letronna carries on by itself."),
+            )
+        });
         let doing = self.pointer.as_ref().map(|pointer| {
             div()
                 .px_3()
@@ -1345,6 +1369,7 @@ impl BrowserView {
             _ => None,
         };
         if asked.is_none()
+            && check.is_none()
             && note.is_none()
             && doing.is_none()
             && hint.is_none()
@@ -1372,6 +1397,7 @@ impl BrowserView {
                         .p_2()
                         .gap_2()
                         .children(asked)
+                        .children(check)
                         .children(note)
                         .children(above),
                 )

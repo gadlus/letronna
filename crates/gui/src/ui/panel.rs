@@ -20,7 +20,7 @@
 //! the chat, and the bar there shrinks it back.
 
 use crate::prelude::*;
-use crate::ui::browser::{Drawn, PointComment, ToPreview};
+use crate::ui::browser::{CheckUp, Drawn, PointComment, ToPreview};
 use gpui_component::tab::{Tab, TabBar};
 use std::collections::{HashMap, HashSet};
 
@@ -797,6 +797,20 @@ impl Chat {
             window,
             |this, _, _: &ToPreview, window, cx| this.toggle_browser_preview(window, cx),
         )
+    }
+
+    /// Show the browser beside the chat when the agent waits on a site's
+    /// check: the preview is a picture, and the check wants clicking.
+    pub(crate) fn follow_browser_checks(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        cx.subscribe_in(&self.browser, window, |this, _, _: &CheckUp, window, cx| {
+            if this.tab_on_screen(window, cx) != Some(PanelTab::Browser) {
+                this.show_tab(PanelTab::Browser, window, cx);
+            }
+        })
     }
 
     /// Put what Point mode found, with its comment, in the composer.

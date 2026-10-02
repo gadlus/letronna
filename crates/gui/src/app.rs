@@ -1056,6 +1056,8 @@ impl Chat {
         };
         let shrink = this.follow_browser_shrink(window, cx);
         this._subscriptions.push(shrink);
+        let checks = this.follow_browser_checks(window, cx);
+        this._subscriptions.push(checks);
         let front = cx.observe_window_activation(window, |this, window, _| {
             this.in_front = window.is_window_active();
         });
