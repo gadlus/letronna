@@ -219,6 +219,8 @@ pub(crate) struct Chat {
     /// The id of the queued call the approval card is up for, decided once
     /// when the queue stopped on it.
     pub(crate) asking: Option<String>,
+    /// What the card for the call in `asking` shows.
+    pub(crate) card_for: Option<crate::ui::approval::CardFor>,
     /// The rule "Always allow" keeps for the call the card is up for, worked
     /// out once when the card came up rather than on every frame.
     pub(crate) offer: Option<letronna_core::permissions::Rule>,
@@ -870,6 +872,7 @@ impl Chat {
             call_running: false,
             streaming_id: None,
             asking: None,
+            card_for: None,
             offer: None,
             why: None,
             judging: None,
@@ -2384,6 +2387,13 @@ impl Chat {
                     letronna_core::permissions::suggest(call, &self.call_context())
                         .filter(|_| !letronna_core::tools::asked_each_time(&call.name))
                 }
+                _ => None,
+            };
+            self.card_for = match &next {
+                agent::Next::AskUser(call) => self.turn.as_ref().map(|turn| {
+                    let ctx = letronna_core::tools::ToolContext::of(&turn.connection);
+                    crate::ui::approval::CardFor::of(call, &ctx)
+                }),
                 _ => None,
             };
             if let agent::Next::AskUser(call) = &next {
