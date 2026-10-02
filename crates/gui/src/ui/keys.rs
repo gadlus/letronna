@@ -105,8 +105,20 @@ impl Chat {
     }
 
     /// Let the ring go once the focus has left the part it marks, by a
-    /// click, Tab or anything else.
-    pub(crate) fn keep_region(&mut self, window: &Window, cx: &App) {
+    /// click, Tab or anything else. And give the composer the keys the
+    /// preview, the strip or the panel had when it is not drawn this time:
+    /// left on something not drawn, they would reach none of the window's.
+    pub(crate) fn keep_region(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The strip and the panel are looked up in the frame drawn last,
+        // which still had them.
+        let going = (self.browser.read(cx).preview_focus.is_focused(window)
+            && !self.browser_preview_shown(window, cx))
+            || (self.strip_area.contains_focused(window, cx) && !self.strip_shown())
+            || (self.panel_focus.contains_focused(window, cx)
+                && self.tab_on_screen(window, cx).is_none());
+        if going && !self.settings_open {
+            self.focus_composer(window, cx);
+        }
         if let Some(region) = self.region
             && !self.holds_focus(region, window, cx)
         {
