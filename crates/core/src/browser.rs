@@ -31,7 +31,8 @@ use crate::tools::{Tool, ToolContext};
 use crate::watch::{self, Sight};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -41,8 +42,22 @@ use std::time::{Duration, Instant};
 /// its screenshots.
 pub const BROWSE: &str = "browse";
 /// How long after an action to watch for a page starting to load or a tab
-/// opening, before taking the page as it is.
+/// opening; past it, the page itself is watched until it is `QUIET`.
 const SETTLE: Duration = Duration::from_millis(500);
+/// How long a page must have done nothing -- no request an action started
+/// still out, no change to its content -- to be taken as done with what the
+/// action set off: a page shows what a request brought within a few frames
+/// of it coming. An action that set nothing off has been quiet this long by
+/// the end of `SETTLE`, so it costs no more than it did.
+const QUIET: Duration = Duration::from_millis(300);
+/// The longest a page is watched past `SETTLE` for that: a search's results
+/// come within a second or two. A page still changing then is read as it
+/// is, with a note to look again, and a request still out, such as a long
+/// poll, is waited for no longer.
+const SETTLE_MOST: Duration = Duration::from_secs(3);
+/// How often a page being watched is asked whether its content changed: a
+/// sixth of `QUIET`, so the watch ends soon after the page is quiet.
+const QUIET_LOOK: Duration = Duration::from_millis(50);
 /// How long a page gets to load.
 const LOAD_TIME: Duration = Duration::from_secs(20);
 /// After loading, how long to wait for the page's own requests to quieten,
@@ -240,6 +255,21 @@ const SHOWS: &str = "(text) => {
   const flat = s => s.replace(/\\s+/g, ' ').trim().toLowerCase();
   return flat(document.body.innerText).includes(flat(text));
 }";
+/// Watches the page's content, from a script context of our own the page
+/// can neither see nor break, keeping when it last changed; run again, it
+/// starts afresh. Not attributes: a page animated by script changes those
+/// every frame, and would hold every action to `SETTLE_MOST`.
+const WATCH_CHANGES: &str = "(() => {
+  if (globalThis.changes) changes.watcher.disconnect();
+  const watching = {at: performance.now()};
+  watching.watcher = new MutationObserver(() => watching.at = performance.now());
+  watching.watcher.observe(document, {childList: true, characterData: true, subtree: true});
+  globalThis.changes = watching;
+})()";
+/// How many milliseconds ago what `WATCH_CHANGES` watches last changed.
+const CHANGED_AGO: &str = "performance.now() - changes.at";
+/// Stops what `WATCH_CHANGES` started.
+const UNWATCH_CHANGES: &str = "globalThis.changes?.watcher.disconnect()";
 /// Accessibility roles a person would call something to click, by which a
 /// point inside one is named: a click on a button's icon is on the button.
 /// A text box among them is named by its label, never by what it holds.
@@ -2850,6 +2880,61 @@ pub fn close_hidden() {
     }
 }
 
+/// The requests an action set off that a page waits on before it shows what
+/// came of them: XHR and fetch from its main frame. Not what it loads to draw
+/// itself, nor a stream it keeps open, such as an EventSource or a
+/// WebSocket. Each is known by its id, so an event heard twice -- a wait
+/// reads again what was kept -- changes nothing.
+#[derive(Default)]
+struct Requests {
+    started: HashSet<String>,
+    ended: HashSet<String>,
+    /// When one last started or ended.
+    last: Option<Instant>,
+}
+
+impl Requests {
+    /// Note `event`, heard at `now`, when it starts a request of frame
+    /// `main`'s that is counted, or ends one that was.
+    fn hear(&mut self, event: &Event, main: &str, now: Instant) {
+        let params = &event.params;
+        let Some(id) = params["requestId"].as_str() else {
+            return;
+        };
+        let news = match event.method.as_str() {
+            "Network.requestWillBeSent" => {
+                params["frameId"] == main
+                    && matches!(params["type"].as_str(), Some("XHR" | "Fetch"))
+                    && self.started.insert(id.to_owned())
+            }
+            "Network.loadingFinished" | "Network.loadingFailed" => {
+                self.started.contains(id) && self.ended.insert(id.to_owned())
+            }
+            _ => false,
+        };
+        if news {
+            self.last = Some(now);
+        }
+    }
+
+    /// Whether none is out, and none started or ended in the `QUIET` before
+    /// `now`.
+    fn quiet(&self, now: Instant) -> bool {
+        self.started.len() == self.ended.len()
+            && (self.last).is_none_or(|last| now.saturating_duration_since(last) >= QUIET)
+    }
+}
+
+/// What came of watching a page an action started no load on.
+enum Settled {
+    /// It did nothing for `QUIET`, or the watch was stopped.
+    Quiet,
+    /// It was still changing when `SETTLE_MOST` was up.
+    Changing,
+    /// It started loading a page, or opened a tab, after all.
+    Loading,
+}
+
 impl Session {
     /// A conversation's session: in a private context of its own, unless it
     /// is the shared one.
@@ -3065,10 +3150,16 @@ impl Session {
         self.tab.dialogs.clear();
         self.tab.agree = agree;
         let step = |session: &mut Session| {
+            // Watched from before the action, so what it changes at once
+            // counts too.
+            let watching = session.watch_changes();
             let done = action(session);
             session.let_go_of_handles();
+            if done.is_err() {
+                session.unwatch(watching);
+            }
             done?;
-            session.settle()
+            session.settle(watching)
         };
         let settled = match saving {
             Some(saving) => self.downloading(saving, step),
@@ -3140,8 +3231,10 @@ impl Session {
     }
 
     /// After an action: follow the page it started loading, or the tab it
-    /// opened. Notes on what happened.
-    fn settle(&mut self) -> Result<Vec<String>, String> {
+    /// opened, or when it did neither, wait as `quieten` does for what it set
+    /// off to show, its content watched through `watching`. Notes on what
+    /// happened.
+    fn settle(&mut self, watching: Option<i64>) -> Result<Vec<String>, String> {
         let main = self.tab.id.clone();
         let started = |e: &Event| {
             let here = e.params["frameId"] == main.as_str();
@@ -3155,8 +3248,28 @@ impl Session {
                 _ => false,
             }
         };
-        if !self.tab.wait(SETTLE, started)? {
-            return Ok(Vec::new());
+        let requests = RefCell::new(Requests::default());
+        // Each event is counted as it comes, before a busy page's many can
+        // push it out of those kept.
+        let loading = |e: &Event| {
+            requests.borrow_mut().hear(e, &main, Instant::now());
+            started(e)
+        };
+        let settled = match self.tab.wait(SETTLE, loading)? {
+            true => Settled::Loading,
+            false => self.quieten(watching, &requests, &loading)?,
+        };
+        // Before a load, which would flood the tab with requests nobody counts.
+        self.unwatch(watching);
+        match settled {
+            Settled::Quiet => return Ok(Vec::new()),
+            Settled::Changing => {
+                return Ok(vec![
+                    "The page was still changing when this was read; look again for the rest."
+                        .into(),
+                ]);
+            }
+            Settled::Loading => {}
         }
         if self
             .tab
@@ -3175,6 +3288,85 @@ impl Session {
             self.refs.forget();
         }
         Ok(notes)
+    }
+
+    /// Watch a page an action started no load on within `SETTLE` until it
+    /// has done nothing for `QUIET` -- no request the action started out, as
+    /// `requests` keeps them, and no change to its content, asked about
+    /// through `watching` -- or `SETTLE_MOST` has passed, or it starts a load
+    /// after all, as `loading` tells. Without `watching`, or once the page
+    /// cannot say, its requests alone are waited for. A stop ends the watch.
+    fn quieten(
+        &mut self,
+        mut watching: Option<i64>,
+        requests: &RefCell<Requests>,
+        loading: &impl Fn(&Event) -> bool,
+    ) -> Result<Settled, String> {
+        let deadline = Instant::now() + SETTLE_MOST;
+        loop {
+            let changed = watching.and_then(|context| self.changed_ago(context));
+            if changed.is_none() {
+                watching = None;
+            }
+            // What the page said while it was asked counts before it is
+            // called quiet.
+            if self.tab.events.iter().any(loading) {
+                return Ok(Settled::Loading);
+            }
+            let now = Instant::now();
+            let quiet = requests.borrow().quiet(now) && changed.is_none_or(|ago| ago >= QUIET);
+            if quiet || self.stop.is_set() {
+                return Ok(Settled::Quiet);
+            }
+            if now >= deadline {
+                return Ok(Settled::Changing);
+            }
+            if self.tab.wait(QUIET_LOOK, loading)? {
+                return Ok(Settled::Loading);
+            }
+            // Counted already: kept, they would only push out what else the
+            // page said.
+            (self.tab.events).retain(|e| !e.method.starts_with("Network."));
+        }
+    }
+
+    /// Start watching what an action is about to set off: the page's
+    /// requests, which the tab is told of only meanwhile -- left on, a busy
+    /// page's would fill the connection between actions -- and its content,
+    /// from a script context of our own. That context, or `None` when the
+    /// page has none to give.
+    fn watch_changes(&mut self) -> Option<i64> {
+        let _ = self.tab.tell("Network.enable", json!({}));
+        let main = self.tab.id.clone();
+        let context = self.world(None, &main).ok()?;
+        let asked = json!({"expression": WATCH_CHANGES, "contextId": context});
+        self.tab.tell("Runtime.evaluate", asked).ok()?;
+        Some(context)
+    }
+
+    /// Stop watching the page's requests, and its content through
+    /// `watching`, and let go of what was heard of the requests.
+    fn unwatch(&mut self, watching: Option<i64>) {
+        // Waited for, so no word of a request comes after it.
+        let _ = self.tab.call::<Ignored>("Network.disable", json!({}));
+        if let Some(context) = watching {
+            let asked = json!({"expression": UNWATCH_CHANGES, "contextId": context});
+            let _ = self.tab.tell("Runtime.evaluate", asked);
+        }
+        (self.tab.events).retain(|e| !e.method.starts_with("Network."));
+    }
+
+    /// How long ago the content watched from script context `context` last
+    /// changed; `None` when the page does not say within `QUIET`.
+    fn changed_ago(&mut self, context: i64) -> Option<Duration> {
+        let asked = json!({"expression": CHANGED_AGO, "contextId": context,
+                           "returnByValue": true});
+        let stop = self.stop.clone();
+        let said: Value = (self.tab)
+            .call_in(None, "Runtime.evaluate", asked, QUIET, Some(&stop))
+            .ok()?;
+        let ago = said["result"]["value"].as_f64()?;
+        Duration::try_from_secs_f64(ago / 1000.).ok()
     }
 
     /// Carry on in the tab an action opened.
@@ -6504,6 +6696,119 @@ mod tests {
     }
 
     #[test]
+    fn the_requests_an_action_waits_for_are_its_pages_own_xhr_and_fetch() {
+        let event = |method: &str, params: Value| Event {
+            method: method.into(),
+            params,
+        };
+        let sent = |id: &str, frame: &str, kind: &str| {
+            let params = json!({"requestId": id, "frameId": frame, "type": kind});
+            event("Network.requestWillBeSent", params)
+        };
+        let ended = |method: &str, id: &str| event(method, json!({"requestId": id}));
+        let start = Instant::now();
+        let mut requests = Requests::default();
+        assert!(requests.quiet(start));
+        // What the page loads to draw itself, a stream it keeps open, a
+        // frame's own fetch, and the end of a request never seen to start.
+        for other in [
+            sent("1", "T1", "Image"),
+            sent("2", "T1", "EventSource"),
+            sent("3", "T1", "WebSocket"),
+            sent("4", "F2", "Fetch"),
+            ended("Network.loadingFinished", "9"),
+        ] {
+            requests.hear(&other, "T1", start);
+        }
+        assert!(requests.quiet(start));
+        requests.hear(&sent("5", "T1", "XHR"), "T1", start);
+        requests.hear(&sent("6", "T1", "Fetch"), "T1", start);
+        // Out, they keep the page from being quiet however long they take.
+        assert!(!requests.quiet(start + Duration::from_secs(60)));
+        let later = start + Duration::from_millis(100);
+        requests.hear(&ended("Network.loadingFinished", "5"), "T1", later);
+        assert!(!requests.quiet(later + QUIET));
+        requests.hear(&ended("Network.loadingFailed", "6"), "T1", later);
+        // All ended, the page is quiet once `QUIET` has passed since.
+        assert!(!requests.quiet(later + QUIET / 2));
+        assert!(requests.quiet(later + QUIET));
+        // Heard again, as a wait reads again what was kept, nothing changes.
+        requests.hear(&sent("5", "T1", "XHR"), "T1", later + QUIET);
+        requests.hear(&ended("Network.loadingFinished", "5"), "T1", later + QUIET);
+        assert!(requests.quiet(later + QUIET));
+    }
+
+    #[test]
+    fn an_action_waits_for_the_request_it_started_and_notes_a_page_still_busy_at_the_cap() {
+        let names: Vec<String> = (1..=30).map(|n| format!("Item {n}")).collect();
+        let state = Arc::new(Mutex::new(("L1", names)));
+        let listed = listed_page(state.clone());
+        let (clicks, looks) = (AtomicU64::new(0), AtomicU64::new(0));
+        // Each click starts a fetch. The first ends at the page's fourth look
+        // after `SETTLE`, and what it brought shows; the second never ends.
+        // Nothing else on the page changes.
+        let (mut session, server) = fake_session(move |method, params| match method {
+            "Page.createIsolatedWorld" => (Vec::new(), json!({"executionContextId": 7})),
+            "Input.dispatchMouseEvent" => {
+                let click = clicks.fetch_add(1, Ordering::Relaxed) + 1;
+                let sent = json!({"method": "Network.requestWillBeSent", "params":
+                    {"requestId": format!("R{click}"), "frameId": "T1", "type": "Fetch"}});
+                (vec![sent], json!({}))
+            }
+            "Runtime.evaluate" if params["expression"] == CHANGED_AGO => {
+                let mut events = Vec::new();
+                if looks.fetch_add(1, Ordering::Relaxed) + 1 == 4 {
+                    events.push(json!({"method": "Network.loadingFinished",
+                                       "params": {"requestId": "R1"}}));
+                    state.lock().unwrap().1[0] = "Results".into();
+                }
+                (events, json!({"result": {"value": 10_000.}}))
+            }
+            _ => listed(method, params),
+        });
+        let page = session.read(false).unwrap();
+        session.show(&page, &View::default(), Vec::new()).unwrap();
+        let click = |session: &mut Session| {
+            let started = Instant::now();
+            let after = session.act(false, None, After::Changes, |session| {
+                (session.tab)
+                    .call::<Ignored>("Input.dispatchMouseEvent", json!({}))
+                    .map(drop)
+            });
+            (after.unwrap(), started.elapsed())
+        };
+        let (found, took) = click(&mut session);
+        assert!(
+            found.contains("> - button \"Results\"") && !found.contains("still changing"),
+            "{found}"
+        );
+        assert!(took >= SETTLE + QUIET, "{took:?}");
+        let (busy, took) = click(&mut session);
+        assert_eq!(
+            busy,
+            "The page was still changing when this was read; look again for the rest.\n\
+             Nothing on the page changed."
+        );
+        assert!(took >= SETTLE + SETTLE_MOST, "{took:?}");
+        drop(session);
+        let heard = server.join().unwrap();
+        let network: Vec<&str> = (heard.iter())
+            .map(String::as_str)
+            .filter(|method| method.starts_with("Network."))
+            .collect();
+        // Told of requests only while each action was watched.
+        assert_eq!(
+            network,
+            [
+                "Network.enable",
+                "Network.disable",
+                "Network.enable",
+                "Network.disable"
+            ]
+        );
+    }
+
+    #[test]
     fn changes_are_counted_placed_under_their_frame_and_left_to_the_listing_when_longer() {
         let mut before: Vec<String> = (1..=30)
             .map(|n| format!("- button \"Item {n}\" [e{n}]"))
@@ -6790,6 +7095,17 @@ mod tests {
 <div style="height:900px"></div><button id=low onclick="out.textContent = 'Low pressed'">Low</button>
 <script>let held = false; addEventListener('mouseup', e => { if (held) out.textContent = 'Knob to ' + e.clientX + ',' + e.clientY; held = false })</script>"#;
 
+        /// Words a request brings a little over a second after a click, a
+        /// count that goes on changing the page for ten seconds, a button
+        /// that does nothing, and one that loads another page once a
+        /// request is in.
+        const SETTLES: &str = r#"<!doctype html><title>Settles</title>
+<button onclick="setTimeout(() => fetch('/late').then(r => r.text()).then(t => out.textContent = t), 200)">Search</button>
+<button onclick="let n = 0; const t = setInterval(() => { out.textContent = 'Tick ' + ++n; if (n == 100) clearInterval(t) }, 100)">Count</button>
+<button>Idle</button>
+<button onclick="fetch('/late').then(() => location.href = '/two')">Go</button>
+<p role=status id=out>Nothing yet</p>"#;
+
         /// Serves the test page and two more, until the test ends.
         fn serve() -> String {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -6846,6 +7162,12 @@ mod tests {
                 }
                 "/files" => FILES,
                 "/input" => INPUT,
+                "/settle" => SETTLES,
+                // Answered a second late, as a search is.
+                "/late" => {
+                    std::thread::sleep(Duration::from_secs(1));
+                    "Results are in"
+                }
                 "/two" => "<!doctype html><title>Two</title><h1>Page two</h1>",
                 "/boxed" => "<!doctype html><title>Boxed</title><label>Note <input></label>",
                 "/pay" => {
@@ -7318,6 +7640,47 @@ mod tests {
                 assert_eq!(stopped, Err(cdp::STOPPED.to_owned()));
                 assert!(started.elapsed() < Duration::from_secs(2));
                 forget(4);
+            }
+
+            // What a click sets off is waited for: words a request brings a
+            // second later come with it, a page still changing at the cap
+            // comes with a note, one that does nothing answers as soon as it
+            // did, and a load the page starts once a request is in is
+            // followed.
+            {
+                let ctx = ToolContext {
+                    conversation: 5,
+                    ..ToolContext::default()
+                };
+                let open = json!({"action": "open", "url": format!("{site}/settle")});
+                let page = Browse.run(&open, &ctx).unwrap();
+                let click = |name: &str| {
+                    let button = ref_of(&page, &format!("button \"{name}\""));
+                    let started = Instant::now();
+                    let clicked = UsePage.run(&json!({"action": "click", "ref": button}), &ctx);
+                    let took = started.elapsed();
+                    println!("{name}: {took:?}\n{clicked:?}\n");
+                    (clicked.unwrap(), took)
+                };
+                let (idle, took) = click("Idle");
+                assert_eq!(idle, "Nothing on the page changed.");
+                assert!(took < Duration::from_millis(1300), "{took:?}");
+                let (found, _) = click("Search");
+                assert!(
+                    found.contains("\"Results are in\"") && !found.contains("still changing"),
+                    "{found}"
+                );
+                let (counting, took) = click("Count");
+                assert!(
+                    counting.contains(
+                        "The page was still changing when this was read; look again for the rest."
+                    ),
+                    "{counting}"
+                );
+                assert!(took < Duration::from_secs(4), "{took:?}");
+                let (went, _) = click("Go");
+                assert!(went.contains("Page two"), "{went}");
+                forget(5);
             }
 
             // Watched, an action shows where it acts, and pictures come.
