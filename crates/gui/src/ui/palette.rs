@@ -86,6 +86,10 @@ fn commands() -> Vec<(&'static str, Rc<dyn Action>)> {
         ("Show or hide the sidebar", Rc::new(ToggleSidebar)),
         ("Show or hide the panel", Rc::new(super::panel::TogglePanel)),
         ("Show the browser", Rc::new(super::panel::BrowserTab)),
+        (
+            "Give the browser the most room, or put it back",
+            Rc::new(super::panel::WideBrowser),
+        ),
         ("Open settings", Rc::new(OpenSettings)),
         ("Open usage", Rc::new(super::usage::OpenUsage)),
         ("Open activity", Rc::new(OpenActivity)),
