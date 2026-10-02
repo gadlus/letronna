@@ -516,6 +516,11 @@ pub(crate) struct Chat {
     /// whether its press answered one: its repeats never do.
     pub(crate) card_key: Option<(crate::ui::approval::CardKey, bool)>,
     pub(crate) _subscriptions: Vec<Subscription>,
+    /// The sessions shown in this window, by id, the one shown last first,
+    /// for the recent-session switcher; kept in memory only.
+    pub(crate) recent: Vec<u64>,
+    /// The recent-session switcher, while it shows.
+    pub(crate) switcher: Option<crate::ui::switcher::Switcher>,
 }
 
 impl Chat {
@@ -1009,6 +1014,8 @@ impl Chat {
             mic: None,
             card_key: None,
             _subscriptions: subscriptions,
+            recent: Vec::new(),
+            switcher: None,
         };
         let resized = this.follow_window_width(window, cx);
         this._subscriptions.push(resized);
@@ -3937,6 +3944,8 @@ impl Render for Chat {
         self.swap_draft(window, cx);
         // And the Changes tab and the status bar speak of its folder.
         self.keep_changes_current(cx);
+        // And the switcher counts it as the one used last.
+        self.note_recent(on_screen);
         if self.page == Page::Chat {
             self.unseen.remove(&on_screen);
         }
@@ -4244,6 +4253,16 @@ impl Render for Chat {
                 },
             ))
             .on_action(
+                cx.listener(|this, _: &crate::ui::switcher::SwitchSession, window, cx| {
+                    this.switch_session(false, window, cx)
+                }),
+            )
+            .on_action(cx.listener(
+                |this, _: &crate::ui::switcher::SwitchSessionBack, window, cx| {
+                    this.switch_session(true, window, cx)
+                },
+            ))
+            .on_action(
                 cx.listener(|this, _: &NextRegion, window, cx| {
                     this.cycle_region(false, window, cx)
                 }),
@@ -4307,6 +4326,7 @@ impl Render for Chat {
                     .children(self.right_panel(window, cx)),
             )
             .children(self.settings_overlay(window, cx))
+            .children(self.switcher(cx))
             .children(Root::render_dialog_layer(window, cx))
     }
 }

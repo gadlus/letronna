@@ -260,6 +260,7 @@ impl Chat {
                     letronna_core::browser::forget(id);
                     this.drafts.remove(&id);
                     this.open.retain(|&open| open != id);
+                    this.recent.retain(|&recent| recent != id);
                     this.panel.forget(id);
                     // The next new session can be given this id again, and
                     // must not start out with what was allowed here, nor in

@@ -279,6 +279,7 @@ impl Chat {
 
         // Keyed by the old profile's session ids, which mean nothing here.
         self.open.clear();
+        self.recent.clear();
         self.drafts.clear();
         self.attachments.clear();
         self.modes.clear();
