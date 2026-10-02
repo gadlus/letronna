@@ -1224,15 +1224,28 @@ impl Chat {
         let workspace = self.store.conversations[self.store.active]
             .workspace
             .clone();
-        self.leave_for(self.store.conversations.len());
-        self.store.conversations.push(Conversation {
-            id: self.store.reserve_id(),
-            title: "New session".into(),
-            updated: backend::now(),
-            workspace,
-            ..Default::default()
-        });
-        self.store.active = self.store.conversations.len() - 1;
+        // One nothing was written in yet is opened again rather than another
+        // piled up beside it: the one on screen, otherwise the newest.
+        let conversations = &self.store.conversations;
+        let index = std::iter::once(self.store.active)
+            .chain((0..conversations.len()).rev())
+            .find(|&ix| untouched(&conversations[ix]))
+            .unwrap_or(conversations.len());
+        self.leave_for(index);
+        if index == self.store.conversations.len() {
+            self.store.conversations.push(Conversation {
+                id: self.store.reserve_id(),
+                title: "New session".into(),
+                updated: backend::now(),
+                workspace,
+                ..Default::default()
+            });
+        } else {
+            let conversation = &mut self.store.conversations[index];
+            conversation.updated = backend::now();
+            conversation.workspace = workspace;
+        }
+        self.store.active = index;
         self.error = None;
         self.page = Page::Chat;
         self.swap_draft(window, cx);
@@ -4323,6 +4336,13 @@ fn escape_closes_aside(asked: u64, here: u64, replying: Option<u64>) -> bool {
     asked == here && replying != Some(here)
 }
 
+/// Whether a session is a new one nothing was said in yet.
+fn untouched(conversation: &Conversation) -> bool {
+    conversation.messages.is_empty()
+        && !conversation.unfilled()
+        && conversation.title == "New session"
+}
+
 /// What follows `/goal` in `prompt`, when that is what it is.
 fn goal_command(prompt: &str) -> Option<&str> {
     let rest = prompt.strip_prefix("/goal")?;
@@ -4362,7 +4382,7 @@ mod tests {
     // would shadow the built-in attribute.
     use super::{
         card_is_up, cuts_in, escape_closes_aside, front_call, run_ended, running_calls,
-        side_question, until_repeated_id,
+        side_question, until_repeated_id, untouched,
     };
     use letronna_core::agent::{MAX_BATCH, Next, Turn};
     use letronna_core::chat::{Connection, ToolCall};
@@ -4587,5 +4607,33 @@ mod tests {
         assert_eq!(side_question("/btw"), Some(""));
         assert_eq!(side_question("/btwx"), None);
         assert_eq!(side_question("tell me /btw"), None);
+    }
+
+    #[test]
+    fn only_a_new_session_nothing_was_said_in_is_opened_again() {
+        use letronna_core::chat::Message;
+        use letronna_core::store::Conversation;
+        let blank = || Conversation {
+            title: "New session".into(),
+            ..Default::default()
+        };
+        assert!(untouched(&blank()));
+        let said = Conversation {
+            messages: vec![Message::default()],
+            ..blank()
+        };
+        assert!(!untouched(&said));
+        // Its messages let go of, it still has them on disk.
+        let let_go = Conversation {
+            counted: 2,
+            ..blank()
+        };
+        assert!(!untouched(&let_go));
+        // A name given on purpose, as a scheduled job's.
+        let named = Conversation {
+            title: "Morning digest".into(),
+            ..Default::default()
+        };
+        assert!(!untouched(&named));
     }
 }
