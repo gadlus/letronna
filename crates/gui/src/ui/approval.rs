@@ -87,7 +87,7 @@ impl Chat {
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
                         .child(
-                            gpui_component::spinner::Spinner::new()
+                            crate::ui::busy::Spinner::new()
                                 .xsmall()
                                 .color(cx.theme().primary),
                         )
