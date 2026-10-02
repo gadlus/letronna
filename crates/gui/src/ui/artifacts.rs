@@ -7,6 +7,7 @@
 //! is read from disk, by `store::artifacts`, as most sessions are not in
 //! memory: once each time the page opens, off the UI thread.
 
+use super::PageColumn;
 use crate::prelude::*;
 use gpui_component::notification::Notification;
 use letronna_core::preview;
@@ -145,44 +146,32 @@ impl Chat {
             })
             .collect();
 
+        // Not "nothing" while the sessions are still being read.
+        let blurb = if self.artifacts.as_ref().is_some_and(Vec::is_empty) {
+            "Files Letronna writes will be listed here, newest first. Nothing yet."
+        } else {
+            "Files Letronna has written, newest first. The list comes from the sessions \
+             themselves, so removing a session removes its files from here too."
+        };
         v_flex()
             .flex_1()
             .min_h_0()
-            .px_8()
-            .py_6()
-            .gap_4()
             .child(
                 v_flex()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_xl()
-                            .font_family(HEADING_FONT)
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Artifacts"),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            // Not "nothing" while the sessions are still being read.
-                            .child(if self.artifacts.as_ref().is_some_and(Vec::is_empty) {
-                                "Files Letronna writes will be listed here, newest first. \
-                                 Nothing yet."
-                            } else {
-                                "Files Letronna has written, newest first. The list comes \
-                                 from the sessions themselves, so removing a session removes \
-                                 its files from here too."
-                            }),
-                    ),
+                    .page_column()
+                    .pt_6()
+                    .pb_4()
+                    .child(super::page_header("Artifacts", blurb, [], cx)),
             )
             .child(
+                // The whole width scrolls, margins too, with the rows in
+                // the column.
                 div()
                     .id("artifact-list")
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .child(v_flex().children(rows)),
+                    .child(v_flex().page_column().pb_6().children(rows)),
             )
     }
 }
