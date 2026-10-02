@@ -34,6 +34,10 @@ const LOAD_WAIT: Duration = Duration::from_secs(5);
 const LEAST_LOADING: Duration = Duration::from_millis(350);
 /// One sweep of the bar that shows a page loading.
 const LOADING_SWEEP: Duration = Duration::from_millis(1100);
+/// How long the bar sweeps for a page that has not said it finished: one
+/// still loading after this is more likely stuck than slow, and the sweep
+/// draws the whole window at every refresh of the display.
+const LOADING_SWEPT: Duration = Duration::from_secs(15);
 /// The zooms a browser steps through, smallest first.
 const ZOOMS: &[f64] = &[0.5, 0.67, 0.75, 0.8, 0.9, 1., 1.1, 1.25, 1.5, 1.75, 2.];
 /// How the keyboard's shortcuts are written here.
@@ -58,6 +62,11 @@ pub(crate) struct BrowserView {
     /// Asked for by the user, so it shows even before there is a page.
     asked: bool,
     frame: Option<Arc<RenderImage>>,
+    /// Whether `frame` has been drawn. Until it is, the browser's tab or the
+    /// window is out of sight, and newer pictures wait undecoded.
+    drawn: bool,
+    /// The newest picture that came while `frame` was not drawn yet.
+    waiting: Option<watch::Frame>,
     /// The page's size in CSS pixels, which pointers are given in.
     size: (f64, f64),
     url: String,
@@ -145,6 +154,8 @@ impl BrowserView {
             dismissed: false,
             asked: false,
             frame: None,
+            drawn: true,
+            waiting: None,
             size: (0., 0.),
             url: String::new(),
             pointer: None,
@@ -176,19 +187,12 @@ impl BrowserView {
         let Watching { frames, sights } = watch::watch();
         let pictures = cx.spawn(async move |this, cx| {
             while let Ok(frame) = frames.recv().await {
-                let (width, height) = (frame.width, frame.height);
-                let decode = cx
-                    .background_executor()
-                    .spawn(async move { picture(&frame.image) });
-                let Some(image) = decode.await else {
-                    continue;
+                let frame = match this.update(cx, |view, _| view.decode_now(frame)) {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => continue,
+                    Err(_) => break,
                 };
-                let shown = this.update(cx, |view, cx| {
-                    view.show(Some(Arc::new(image)), cx);
-                    view.size = (width, height);
-                    cx.notify();
-                });
-                if shown.is_err() {
+                if decode(this.clone(), frame, cx).await.is_err() {
                     break;
                 }
             }
@@ -301,8 +305,22 @@ impl BrowserView {
         self.watching.is_some()
     }
 
+    /// `frame`, to decode and put up now, unless the picture up already is
+    /// not drawn yet: then it waits, the newest only, until it is.
+    fn decode_now(&mut self, frame: watch::Frame) -> Option<watch::Frame> {
+        if self.drawn {
+            self.waiting = None;
+            Some(frame)
+        } else {
+            self.waiting = Some(frame);
+            None
+        }
+    }
+
     pub(crate) fn close(&mut self, cx: &mut Context<Self>) {
         self.watching = None;
+        self.waiting = None;
+        self.drawn = true;
         self.dismissed = true;
         self.asked = false;
         self.area = None;
@@ -1012,7 +1030,11 @@ impl BrowserView {
             ),
         };
         screen
-            .children(self.loading.map(|_| loading_bar(cx)))
+            .children(
+                (self.loading)
+                    .filter(|since| since.elapsed() < LOADING_SWEPT)
+                    .map(|_| loading_bar(cx)),
+            )
             .children(self.overlay(cx))
             // Lit while keys go to the page; drawn over it, so the page
             // does not move.
@@ -1267,6 +1289,16 @@ impl BrowserView {
 
 impl Render for BrowserView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.drawn = true;
+        // Back in sight: the newest picture that came meanwhile goes up, and
+        // newer ones wait for it to be drawn, so they go up in order.
+        if let Some(frame) = self.waiting.take() {
+            self.drawn = false;
+            cx.spawn(async move |this, cx| {
+                let _ = decode(this, frame, cx).await;
+            })
+            .detach();
+        }
         let docked = crate::ui::panel::docks(window.viewport_size().width);
         v_flex()
             // Docked, the page fills what the panel has left under the bar.
@@ -1274,6 +1306,31 @@ impl Render for BrowserView {
             .child(self.header(window, cx))
             .child(self.screen(docked, window, cx))
     }
+}
+
+/// Decode `frame` off the UI thread and put it up in the view; an error
+/// once the view is gone.
+async fn decode(
+    view: WeakEntity<BrowserView>,
+    frame: watch::Frame,
+    cx: &mut AsyncApp,
+) -> Result<(), ()> {
+    let (width, height) = (frame.width, frame.height);
+    let decode = cx
+        .background_executor()
+        .spawn(async move { picture(&frame.image) });
+    let image = decode.await;
+    view.update(cx, |view, cx| match image {
+        Some(image) => {
+            view.show(Some(Arc::new(image)), cx);
+            view.size = (width, height);
+            view.drawn = false;
+            cx.notify();
+        }
+        // Nothing went up, so the next picture need not wait for it.
+        None => view.drawn = true,
+    })
+    .map_err(|_| ())
 }
 
 /// A bar sweeping across the top of the page while it loads.
