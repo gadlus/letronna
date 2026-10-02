@@ -1172,7 +1172,7 @@ impl Chat {
             // Enter is ReviewFiles', on the line that has the focus.
             .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
                 if !event.is_keyboard() {
-                    this.show_changes(window, cx);
+                    this.review_files(window, cx);
                 }
             }));
         let line = h_flex()
@@ -1190,9 +1190,16 @@ impl Chat {
             // As on a tool row, a press leaves the keys in the composer;
             // Tab is what picks the line out.
             .on_any_mouse_down(|_, window, _| window.prevent_default())
-            .on_action(
-                cx.listener(|this, _: &ReviewFiles, window, cx| this.show_changes(window, cx)),
-            )
+            // Only the line's own: Enter on Undo presses Undo.
+            .on_action({
+                let line = card.line.clone();
+                cx.listener(move |this, _: &ReviewFiles, window, cx| {
+                    if !line.is_focused(window) {
+                        return cx.propagate();
+                    }
+                    this.review_files(window, cx)
+                })
+            })
             .child(summary)
             .child(
                 Button::new(self.row_id("undo-files", span.first))
@@ -1218,6 +1225,13 @@ impl Chat {
                 .children(rows)
                 .into_any_element(),
         )
+    }
+
+    /// Show the Changes tab on this session's files, which the card is
+    /// about, whichever list it was last switched to.
+    fn review_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.switch_scope(crate::ui::changes::Scope::Session, cx);
+        self.show_changes(window, cx);
     }
 
     /// One file of the card: its path and the lines the turn added and
