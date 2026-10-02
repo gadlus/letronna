@@ -170,7 +170,9 @@ pub struct Draft {
 }
 
 impl Draft {
-    /// What a frontend says while the call is written, as in "Writing app.rs…".
+    /// What a frontend says while the call is written, as in "Writing
+    /// app.rs…": what is being written, never that it runs, since it has not
+    /// been allowed yet.
     pub fn label(&self) -> String {
         let file = || {
             std::path::Path::new(&self.subject)
@@ -183,13 +185,13 @@ impl Draft {
         match self.name.as_str() {
             "write_file" if known => format!("Writing {}…", file()),
             "write_file" => "Writing a file…".to_owned(),
-            "edit_file" if known => format!("Editing {}…", file()),
-            "edit_file" | "apply_patch" => "Editing files…".to_owned(),
-            "run_command" if known => format!("Running {}…", self.subject),
+            "edit_file" if known => format!("Writing an edit to {}…", file()),
+            "edit_file" => "Writing an edit…".to_owned(),
+            "apply_patch" => "Writing a patch…".to_owned(),
+            "run_command" if known => format!("Writing a command: {}…", self.subject),
             "run_command" => "Writing a command…".to_owned(),
-            "web_fetch" if known => format!("Fetching {}…", self.subject),
-            "web_fetch" => "Fetching a page…".to_owned(),
-            name => format!("Calling {name}…"),
+            name if known => format!("Writing a {name} call: {}…", self.subject),
+            name => format!("Writing a {name} call…"),
         }
     }
 }
@@ -2910,8 +2912,10 @@ struct Reply {
     finish: Option<FinishReason>,
     think: crate::think::Scrubber,
     /// Each call begun as last told, by its place in `assembler.calls`,
-    /// with the name it streamed under.
-    drafts: Vec<(String, Draft)>,
+    /// with the name it streamed under and how much of its arguments was
+    /// looked through for a subject, so a call that has stopped growing is
+    /// not read again as the others stream.
+    drafts: Vec<(String, usize, Draft)>,
 }
 
 impl Reply {
@@ -2996,9 +3000,10 @@ impl Reply {
             if at == self.drafts.len() {
                 self.drafts.push(Default::default());
             }
-            let (streamed, draft) = &mut self.drafts[at];
+            let (streamed, looked, draft) = &mut self.drafts[at];
             if *streamed != call.name {
                 streamed.clone_from(&call.name);
+                *looked = 0;
                 let mut named = [ToolCall {
                     name: call.name.clone(),
                     ..Default::default()
@@ -3011,7 +3016,9 @@ impl Reply {
             if draft.subject.is_empty()
                 && !draft.name.is_empty()
                 && call.arguments.len() <= DRAFT_LOOK
+                && call.arguments.len() > *looked
             {
+                *looked = call.arguments.len();
                 draft.subject = subject(&draft.name, &call.arguments);
                 changed |= !draft.subject.is_empty();
             }
@@ -3022,7 +3029,7 @@ impl Reply {
         let drafts = self
             .drafts
             .iter()
-            .map(|(_, draft)| draft)
+            .map(|(_, _, draft)| draft)
             .filter(|draft| !draft.name.is_empty())
             .cloned()
             .collect();
@@ -7745,14 +7752,19 @@ mod tests {
         assert_eq!(draft("write_file", "").label(), "Writing a file…");
         assert_eq!(
             draft("edit_file", "crates/gui/src/ui/mod.rs").label(),
-            "Editing mod.rs…"
+            "Writing an edit to mod.rs…"
         );
-        assert_eq!(draft("apply_patch", "").label(), "Editing files…");
+        assert_eq!(draft("apply_patch", "").label(), "Writing a patch…");
+        // Not "Running": it has not been allowed, let alone run.
         assert_eq!(
             draft("run_command", "cargo test").label(),
-            "Running cargo test…"
+            "Writing a command: cargo test…"
         );
-        assert_eq!(draft("browse", "").label(), "Calling browse…");
+        assert_eq!(
+            draft("browse", "https://example.com").label(),
+            "Writing a browse call: https://example.com…"
+        );
+        assert_eq!(draft("todo", "").label(), "Writing a todo call…");
     }
 
     #[test]
