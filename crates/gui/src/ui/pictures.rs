@@ -7,6 +7,7 @@
 //! it as it was sent. They wait per session, as drafts do.
 
 use crate::prelude::*;
+use crate::ui::viewer;
 use gpui_component::input::Paste;
 use image::{DynamicImage, ImageFormat};
 use letronna_core::media;
@@ -138,7 +139,12 @@ impl Chat {
             h_flex()
                 .gap_0p5()
                 .items_start()
-                .child(thumbnail(path, cx))
+                .child({
+                    let view = path.clone();
+                    thumbnail(("attached-picture", i), path, cx)
+                        .cursor_pointer()
+                        .on_click(move |_, window, cx| viewer::open(view.clone(), window, cx))
+                })
                 .child(
                     Button::new(("unattach", i))
                         .plain(cx)
@@ -159,26 +165,41 @@ impl Chat {
     }
 }
 
-/// The pictures sent with a prompt, small, under its words; one since
-/// deleted is left out.
-pub(crate) fn sent_row(paths: &[PathBuf], cx: &App) -> impl IntoElement {
+/// The pictures sent with the prompt at `message`, small, under its words;
+/// one since deleted is left out. Tab reaches each, and Enter or a click
+/// opens it in the window.
+pub(crate) fn sent_row(
+    message: usize,
+    paths: &[PathBuf],
+    window: &mut Window,
+    cx: &mut App,
+) -> impl IntoElement {
     let kept = paths.iter().filter(|path| path.exists());
-    h_flex()
-        .flex_wrap()
-        .gap_2()
-        .children(kept.map(|path| thumbnail(path, cx)))
+    let pictures: Vec<_> = kept
+        .enumerate()
+        .map(|(i, path)| {
+            let i = i as u64;
+            let id = ElementId::NamedInteger(format!("sent-picture-{message}").into(), i);
+            let focus = ElementId::NamedInteger(format!("sent-focus-{message}").into(), i);
+            let thumbnail = thumbnail(id, path, cx);
+            viewer::opens(thumbnail, focus, path.to_path_buf(), window, cx)
+        })
+        .collect();
+    h_flex().flex_wrap().gap_2().children(pictures)
 }
 
-fn thumbnail(path: &std::path::Path, cx: &App) -> impl IntoElement {
-    // At most twice as wide as tall, on a screen up to twice as sharp.
-    held_while_shown(path, (THUMB * 4.) as u32).child(
-        img(path.to_path_buf())
-            .h(px(THUMB))
-            .max_w(px(THUMB * 2.))
-            .object_fit(ObjectFit::Contain)
-            .rounded(cx.theme().radius)
-            .border_1()
-            .border_color(cx.theme().border),
+fn thumbnail(id: impl Into<ElementId>, path: &std::path::Path, cx: &App) -> Stateful<Div> {
+    div().id(id).relative().child(
+        // At most twice as wide as tall, on a screen up to twice as sharp.
+        held_while_shown(path, (THUMB * 4.) as u32).child(
+            img(path.to_path_buf())
+                .h(px(THUMB))
+                .max_w(px(THUMB * 2.))
+                .object_fit(ObjectFit::Contain)
+                .rounded(cx.theme().radius)
+                .border_1()
+                .border_color(cx.theme().border),
+        ),
     )
 }
 
@@ -215,14 +236,16 @@ impl ImageCacheProvider for Held {
 }
 
 /// Pictures by the hash of where they were read from: `None` while read.
-struct Shrunk {
+pub(crate) struct Shrunk {
     this: WeakEntity<Shrunk>,
     longest: u32,
     pictures: HashMap<u64, Option<Result<Arc<RenderImage>, ImageCacheError>>>,
 }
 
 impl Shrunk {
-    fn new(longest: u32, cx: &mut App) -> Entity<Self> {
+    /// A cache that decodes pictures no larger than `longest` a side, and
+    /// gives them back, to memory and the GPU, once nothing holds it.
+    pub(crate) fn new(longest: u32, cx: &mut App) -> Entity<Self> {
         let cache = cx.new(|cx| Self {
             this: cx.weak_entity(),
             longest,
@@ -238,6 +261,13 @@ impl Shrunk {
         })
         .detach();
         cache
+    }
+
+    /// Whether a picture has been decoded here and can be drawn at once.
+    pub(crate) fn ready(&self) -> bool {
+        self.pictures
+            .values()
+            .any(|picture| matches!(picture, Some(Ok(_))))
     }
 }
 

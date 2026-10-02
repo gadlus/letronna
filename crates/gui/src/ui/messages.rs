@@ -264,7 +264,12 @@ impl Chat {
                 this.child(div().w_full().overflow_hidden().pb_1().child(body))
             })
             .when(is_user && !message.images.is_empty(), |this| {
-                this.child(crate::ui::pictures::sent_row(&message.images, cx))
+                this.child(crate::ui::pictures::sent_row(
+                    index,
+                    &message.images,
+                    window,
+                    cx,
+                ))
             })
             // A reply is often wanted whole, and selecting it across
             // paragraphs and code blocks is fiddly.
@@ -909,7 +914,7 @@ impl Chat {
             .when_some(made, |this, path| {
                 let playing = self.video.as_ref().is_some_and(|v| v.path == path);
                 let frame = self.video_frame.clone().filter(|_| playing);
-                this.child(made_file(index, path, playing, frame, cx))
+                this.child(made_file(index, path, playing, frame, window, cx))
             })
             .when(open, |this| {
                 this.child(
@@ -1294,15 +1299,16 @@ fn usage_line(message: &Message) -> String {
 /// it is shown, for a screen up to twice as sharp.
 const MADE_SIDE: u32 = 720;
 
-/// What a media tool made, shown as itself: a picture, a video by its first
-/// frame until it plays here, a sound with a button to play it. Each gets
-/// buttons to open the file or find it. `frame` is the video's newest frame
-/// while `playing`.
+/// What a media tool made, shown as itself: a picture, which Enter or a
+/// click opens in the window, a video by its first frame until it plays
+/// here, a sound with a button to play it. Each gets buttons to open the
+/// file or find it. `frame` is the video's newest frame while `playing`.
 fn made_file(
     index: usize,
     path: PathBuf,
     playing: bool,
     frame: Option<std::sync::Arc<RenderImage>>,
+    window: &mut Window,
     cx: &mut Context<Chat>,
 ) -> impl IntoElement {
     let kind = |known: &[&str]| {
@@ -1401,7 +1407,8 @@ fn made_file(
                     })
                     .map(|this| {
                         if !video {
-                            return this.on_click(move |_, _, cx| cx.open_with_system(&open));
+                            let focus = ("made-picture-focus", index);
+                            return crate::ui::viewer::opens(this, focus, open, window, cx);
                         }
                         this.on_click(cx.listener(move |chat, _, window, cx| {
                             if playing {

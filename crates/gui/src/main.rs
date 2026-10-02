@@ -406,6 +406,53 @@ pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Opti
             KeyBinding::new("secondary-r", ui::workflows::Refresh, Some("Workflows")),
             Some("On the Workflows page: read the runs again"),
         ),
+        // A picture in the chat opens over the window, and its own keys
+        // act there, nearer than the dialog's and the chat's.
+        (
+            KeyBinding::new("enter", ui::viewer::OpenPicture, Some("Picture")),
+            Some("On a picture: open it in the window"),
+        ),
+        (
+            KeyBinding::new("+", ui::viewer::ZoomIn, Some("PictureViewer")),
+            Some("In a picture: zoom in"),
+        ),
+        // Windows hands the plus over with the Shift that typed it.
+        (
+            KeyBinding::new("shift-+", ui::viewer::ZoomIn, Some("PictureViewer")),
+            None,
+        ),
+        (
+            KeyBinding::new("=", ui::viewer::ZoomIn, Some("PictureViewer")),
+            None,
+        ),
+        (
+            KeyBinding::new("-", ui::viewer::ZoomOut, Some("PictureViewer")),
+            Some("In a picture: zoom out"),
+        ),
+        (
+            KeyBinding::new("0", ui::viewer::ZoomFit, Some("PictureViewer")),
+            Some("In a picture: fit it to the window"),
+        ),
+        (
+            KeyBinding::new("left", ui::viewer::PanLeft, Some("PictureViewer")),
+            Some("In a zoomed picture: move about it with the arrows"),
+        ),
+        (
+            KeyBinding::new("right", ui::viewer::PanRight, Some("PictureViewer")),
+            None,
+        ),
+        (
+            KeyBinding::new("up", ui::viewer::PanUp, Some("PictureViewer")),
+            None,
+        ),
+        (
+            KeyBinding::new("down", ui::viewer::PanDown, Some("PictureViewer")),
+            None,
+        ),
+        (
+            KeyBinding::new("o", ui::viewer::OpenOutside, Some("PictureViewer")),
+            Some("In a picture: open it with the system's viewer"),
+        ),
         (
             KeyBinding::new("alt-u", ToggleCrew, Some("Chat")),
             Some("Switch Crew on or off for the next message"),
