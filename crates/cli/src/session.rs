@@ -1049,10 +1049,14 @@ impl Runner {
                 self.bar.reply().ok_or("No answer given.")?
             } else {
                 let choices: Vec<&str> = options.iter().map(String::as_str).collect();
-                let picked = self
-                    .bar
-                    .choose(&question, Vec::new(), &choices)
-                    .ok_or("No answer given.")?;
+                // Escape turns the question down, which ends the turn as it
+                // does when a call is asked about.
+                let Some(picked) = self.bar.choose(&question, Vec::new(), &choices) else {
+                    render::blank();
+                    render::said(&render::blue("●"), &bold_question(&question));
+                    render::line(&render::dim("Left unanswered; the turn stopped."));
+                    return Ok(false);
+                };
                 render::blank();
                 render::said(&render::blue("●"), &bold_question(&question));
                 render::said(&render::blue("›"), &render::bold(&options[picked]));

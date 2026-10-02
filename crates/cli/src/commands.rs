@@ -2602,6 +2602,10 @@ fn plugin_market(runner: &mut Runner, rest: &str) {
 /// the window; this is the shortlist you would actually pick from.
 const SESSION_CHOICES: usize = 9;
 
+/// Sessions offered in the box, where typing narrows them by title, so the
+/// list reaches further back than the shortlist.
+const SESSION_LIST: usize = 50;
+
 /// How a session reads in the `/resume` list: its title, project folder and
 /// length.
 fn choice_label(conversation: &store::Conversation) -> String {
@@ -2646,7 +2650,11 @@ pub fn resume(
         })
         .collect();
     recent.sort_by_key(|i| std::cmp::Reverse(runner.store.conversations[*i].updated));
-    recent.truncate(SESSION_CHOICES);
+    recent.truncate(if runner.bar.steered() {
+        SESSION_LIST
+    } else {
+        SESSION_CHOICES
+    });
 
     if recent.is_empty() && !term.is_empty() {
         resume_said(runner, session, workspace, term);
@@ -2667,7 +2675,8 @@ pub fn resume(
     render::said(&render::blue("●"), &render::bold("Earlier sessions"));
     let mut options: Vec<&str> = labels.iter().map(String::as_str).collect();
     options.push("Stay where I am");
-    let Some(picked) = runner.bar.choose("Which one?", Vec::new(), &options) else {
+    let Some(picked) = runner.bar.pick_from("Which one?", Vec::new(), &options) else {
+        render::line(&render::dim("Stayed put."));
         return;
     };
     let Some(index) = recent.get(picked).copied() else {
@@ -3332,8 +3341,9 @@ fn branch(runner: &mut Runner, session: &mut usize, name: &str) {
     )));
 }
 
-/// Models offered at once. Some gateways carry hundreds; a list longer than
-/// this is narrowed with a word rather than scrolled.
+/// Models listed at once where they cannot be steered through. Some gateways
+/// carry hundreds; there, a list longer than this is narrowed with a word. In
+/// the box they are all offered, and narrowed by typing.
 const MODEL_CHOICES: usize = 10;
 
 /// The media kind a `/model` word names, if it names one: `image` or `images`.
@@ -3370,13 +3380,18 @@ fn switch_media(runner: &mut Runner, kind: &'static str, label: &str) {
         return;
     }
     let chosen = letronna_core::media::choices().remove(kind);
-    let shown = &offers[..offers.len().min(MODEL_CHOICES)];
+    let room = if runner.bar.steered() {
+        offers.len()
+    } else {
+        MODEL_CHOICES
+    };
+    let shown = &offers[..offers.len().min(room)];
     let mut labels = vec!["Auto · the cheapest working".to_owned()];
     labels.extend(shown.iter().map(|o| format!("{} · {}", o.id, o.price())));
     let mut options: Vec<&str> = labels.iter().map(String::as_str).collect();
     options.push("Keep the one I have");
     let question = format!("In use: {}", chosen.as_deref().unwrap_or("Auto"));
-    let Some(picked) = runner.bar.choose(&question, Vec::new(), &options) else {
+    let Some(picked) = runner.bar.pick_from(&question, Vec::new(), &options) else {
         return;
     };
     let model = match picked {
@@ -3457,7 +3472,12 @@ pub fn switch_model(runner: &mut Runner, session: Option<usize>, filter: &str) {
         return;
     }
 
-    let shown: Vec<(String, String)> = matching.iter().take(MODEL_CHOICES).cloned().collect();
+    let room = if runner.bar.steered() {
+        matching.len()
+    } else {
+        MODEL_CHOICES
+    };
+    let shown: Vec<(String, String)> = matching.iter().take(room).cloned().collect();
     if matching.len() > shown.len() {
         render::line(&render::dim(&format!(
             "{} of {} shown — type /model <word> to narrow it.",
@@ -3470,7 +3490,8 @@ pub fn switch_model(runner: &mut Runner, session: Option<usize>, filter: &str) {
     options.push("Keep the one I have");
 
     let question = format!("In use: {current}");
-    let Some(picked) = runner.bar.choose(&question, Vec::new(), &options) else {
+    let Some(picked) = runner.bar.pick_from(&question, Vec::new(), &options) else {
+        render::line(&render::dim("Left as it was."));
         return;
     };
     match shown.get(picked) {

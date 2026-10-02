@@ -323,6 +323,10 @@ const MENU_LIMIT: usize = 8;
 /// push the box off a short window.
 const SWITCH_ROWS: usize = 10;
 
+/// Answers a question shows at once; a longer list, such as every model a
+/// gateway has, scrolls.
+const CHOICE_ROWS: usize = 10;
+
 /// The most columns a name takes in the menu and `/help`: over twice the
 /// longest of Letronna's own, and an added name longer than that is cut
 /// rather than pushing every description off the row.
@@ -583,7 +587,24 @@ struct Choice {
     question: String,
     detail: Vec<String>,
     options: Vec<String>,
+    /// The highlighted answer, among those the filter leaves.
     picked: usize,
+    /// The first of those on show, when more are left than fit.
+    top: usize,
+    /// Letters typed to narrow a list the user opened. `None` where letters
+    /// must not answer anything, as in an approval that comes up under
+    /// someone typing.
+    filter: Option<String>,
+}
+
+impl Choice {
+    /// The places in `options` of the ones the filter leaves, in order.
+    fn shown(&self) -> Vec<usize> {
+        let filter = self.filter.as_deref().unwrap_or_default().to_lowercase();
+        (0..self.options.len())
+            .filter(|&i| self.options[i].to_lowercase().contains(&filter))
+            .collect()
+    }
 }
 
 /// What ended a wait at the prompt.
@@ -666,6 +687,8 @@ pub struct Bar {
     /// What the slider settled on: a stop, or nothing when it was left.
     slid: Option<Option<usize>>,
     answer: Option<usize>,
+    /// Set when escape turned a question down without an answer.
+    declined: bool,
     /// True while a turn is in flight, which is what makes escape mean stop.
     working: bool,
     interrupt: bool,
@@ -741,6 +764,7 @@ impl Bar {
             asking: None,
             slid: None,
             answer: None,
+            declined: false,
             working: false,
             interrupt: false,
             hurry: false,
@@ -987,13 +1011,37 @@ impl Bar {
     }
 
     /// Ask a question with a fixed set of answers. Returns the one picked, or
-    /// `None` if the user left instead.
+    /// `None` if the user turned it down with escape or left instead.
     pub fn choose(
         &mut self,
         question: &str,
         detail: Vec<String>,
         options: &[&str],
     ) -> Option<usize> {
+        self.question(question, detail, options, false)
+    }
+
+    /// `choose`, for a list the user opened: letters typed narrow it to the
+    /// answers holding them, so a long one need not be scrolled through.
+    pub fn pick_from(
+        &mut self,
+        question: &str,
+        detail: Vec<String>,
+        options: &[&str],
+    ) -> Option<usize> {
+        self.question(question, detail, options, true)
+    }
+
+    fn question(
+        &mut self,
+        question: &str,
+        detail: Vec<String>,
+        options: &[&str],
+        narrowed: bool,
+    ) -> Option<usize> {
+        if options.is_empty() {
+            return None;
+        }
         if !self.live {
             render::line(&render::bold(question));
             for line in &detail {
@@ -1007,11 +1055,14 @@ impl Bar {
             detail,
             options: options.iter().map(|o| (*o).to_owned()).collect(),
             picked: 0,
+            top: 0,
+            filter: narrowed.then(String::new),
         });
         self.answer = None;
+        self.declined = false;
         self.settle();
         loop {
-            if self.done {
+            if self.done || std::mem::take(&mut self.declined) {
                 self.choice = None;
                 self.settle();
                 return None;
@@ -1750,8 +1801,9 @@ impl Bar {
     }
 
     /// Steer a question. Enter takes what is highlighted, a digit takes that
-    /// one outright, and escape is the same as picking the last answer, which
-    /// is always the one that does nothing.
+    /// one outright, and escape turns the question down -- what the footer
+    /// says it does. In a list the user opened, letters and digits narrow it
+    /// instead, and escape takes the narrowing off first.
     fn pick(&mut self, key: KeyEvent) {
         // Letters are typing, not answering, and each one puts an answer off
         // again; an answer that comes too soon is dropped rather than put off,
@@ -1766,12 +1818,37 @@ impl Bar {
         let Some(choice) = self.choice.as_mut() else {
             return;
         };
-        let last = choice.options.len().saturating_sub(1);
+        let shown = choice.shown();
+        let last = shown.len().saturating_sub(1);
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         match key.code {
             KeyCode::Up => choice.picked = choice.picked.checked_sub(1).unwrap_or(last),
-            KeyCode::Down => choice.picked = (choice.picked + 1) % choice.options.len(),
-            KeyCode::Enter => self.answer = Some(choice.picked),
-            KeyCode::Esc => self.answer = Some(last),
+            KeyCode::Down if choice.picked >= last => choice.picked = 0,
+            KeyCode::Down => choice.picked += 1,
+            KeyCode::PageUp => choice.picked = choice.picked.saturating_sub(CHOICE_ROWS),
+            KeyCode::PageDown => choice.picked = (choice.picked + CHOICE_ROWS).min(last),
+            KeyCode::Home => choice.picked = 0,
+            KeyCode::End => choice.picked = last,
+            KeyCode::Enter => self.answer = shown.get(choice.picked).copied(),
+            KeyCode::Esc if choice.filter.as_ref().is_some_and(|f| !f.is_empty()) => {
+                choice.filter = Some(String::new());
+                choice.picked = 0;
+            }
+            KeyCode::Esc => self.declined = true,
+            KeyCode::Backspace if choice.filter.is_some() => {
+                if let Some(filter) = choice.filter.as_mut() {
+                    filter.pop();
+                }
+                choice.picked = 0;
+            }
+            KeyCode::Char(letter) if plain && choice.filter.is_some() => {
+                if let Some(filter) = choice.filter.as_mut() {
+                    filter.push(letter);
+                }
+                choice.picked = 0;
+            }
             KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
                 // A helper's question can come up while a call runs, and
                 // leaving there stops the turn, as Ctrl-C does anywhere else
@@ -1787,6 +1864,10 @@ impl Bar {
                 }
             }
             _ => {}
+        }
+        if let Some(choice) = self.choice.as_mut() {
+            let count = choice.shown().len();
+            choice.top = menu_top(choice.top, choice.picked, count, CHOICE_ROWS);
         }
     }
 
@@ -1970,8 +2051,13 @@ impl Bar {
             said.clone()
         } else if self.slider.is_some() {
             "← → to slide  ·  enter to keep it  ·  esc to leave it as it was".to_owned()
-        } else if self.choice.is_some() {
-            "↑↓ to choose  ·  enter to take it  ·  esc to decline".to_owned()
+        } else if let Some(choice) = &self.choice {
+            match choice.filter.as_deref() {
+                Some("") => "↑↓ to choose  ·  enter to take it  ·  type to find  ·  esc to decline",
+                Some(_) => "↑↓ to choose  ·  enter to take it  ·  esc to show them all",
+                None => "↑↓ to choose  ·  enter to take it  ·  esc to decline",
+            }
+            .to_owned()
         } else if let Some(list) = &self.switches {
             if list.filter.is_empty() {
                 "↑↓ to move  ·  space to switch  ·  type to find  ·  esc when done".to_owned()
@@ -2174,10 +2260,41 @@ impl Bar {
                 lines.push(self.boxed(&render::dim(&part), width, room));
             }
         }
+        let shown = choice.shown();
+        if let Some(filter) = choice.filter.as_deref().filter(|f| !f.is_empty()) {
+            let count = format!("{} with \"{filter}\"", shown.len());
+            lines.push(self.boxed(&render::dim(&count), count.chars().count(), room));
+        }
         lines.push(self.boxed("", 0, room));
-        for (i, option) in choice.options.iter().enumerate() {
-            let chosen = i == choice.picked;
-            let text = format!("{} {} {option}", if chosen { "›" } else { " " }, i + 1);
+        // A list the user narrows keeps its height as it is narrowed, so the
+        // box does not jump under the letters being typed.
+        let rows = match choice.options.len() {
+            all if all > CHOICE_ROWS => CHOICE_ROWS + 2,
+            all => all,
+        };
+        let start = lines.len();
+        if shown.is_empty() {
+            let none = "Nothing matches.";
+            lines.push(self.boxed(&render::dim(none), none.len(), room));
+        }
+        let more = |count: usize, arrow: &str| {
+            let text = format!("    {arrow} {count} more");
+            self.boxed(&render::dim(&text), text.chars().count(), room)
+        };
+        let end = (choice.top + CHOICE_ROWS).min(shown.len());
+        if choice.top > 0 {
+            lines.push(more(choice.top, "↑"));
+        }
+        for (at, &index) in shown.iter().enumerate().take(end).skip(choice.top) {
+            let chosen = at == choice.picked;
+            let mark = if chosen { "›" } else { " " };
+            // Digits take an answer outright only where letters are not
+            // being typed, and only the first nine.
+            let text = match (&choice.filter, index) {
+                (None, 0..=8) => format!("{mark} {} {}", index + 1, choice.options[index]),
+                _ => format!("{mark}   {}", choice.options[index]),
+            };
+            let text = render::clip(&text, room);
             let width = render::visible(&text);
             lines.push(self.boxed(
                 &if chosen {
@@ -2188,6 +2305,14 @@ impl Bar {
                 width,
                 room,
             ));
+        }
+        if end < shown.len() {
+            lines.push(more(shown.len() - end, "↓"));
+        }
+        if choice.filter.is_some() {
+            while lines.len() - start < rows {
+                lines.push(self.boxed("", 0, room));
+            }
         }
     }
 }
@@ -2352,10 +2477,10 @@ fn track(stops: &[String], at: usize, room: usize) -> (String, String, usize) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Added, Bar, Choice, MENU_LIMIT, NAME_WIDTH, PLAN_ROWS, QUEUED_LIMIT, RELAY_LIMIT, Row,
-        STILL, SWITCH_ROWS, Slider, Switch, Switches, Waited, at_work, checklist, closest, fitted,
-        is_command, matches, menu_top, name_width, offered, one_row, reach, relay_line, stops_at,
-        track, unescaped,
+        Added, Bar, CHOICE_ROWS, Choice, MENU_LIMIT, NAME_WIDTH, PLAN_ROWS, QUEUED_LIMIT,
+        RELAY_LIMIT, Row, STILL, SWITCH_ROWS, Slider, Switch, Switches, Waited, at_work, checklist,
+        closest, fitted, is_command, matches, menu_top, name_width, offered, one_row, reach,
+        relay_line, stops_at, track, unescaped,
     };
     use crate::render::{MARGIN, plain, visible};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -2840,6 +2965,8 @@ mod tests {
                 .map(String::from)
                 .into(),
             picked: 0,
+            top: 0,
+            filter: None,
         });
         let asking = rows(&bar, 24);
         assert!(asking.len() <= 24, "{asking:#?}");
@@ -3119,6 +3246,8 @@ mod tests {
             detail: Vec::new(),
             options: vec!["Yes".into(), "No".into()],
             picked: 0,
+            top: 0,
+            filter: None,
         });
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         // Just after the question came up, neither answers.
@@ -3135,6 +3264,83 @@ mod tests {
         bar.guard = Instant::now().checked_sub(STILL);
         bar.pick(key(KeyCode::Enter));
         assert_eq!(bar.answer, Some(0));
+    }
+
+    /// A question with `options`, narrowed by typing when `narrowed`.
+    fn question(options: &[&str], narrowed: bool) -> Choice {
+        Choice {
+            question: "Which one?".into(),
+            detail: Vec::new(),
+            options: options.iter().map(|o| (*o).to_owned()).collect(),
+            picked: 0,
+            top: 0,
+            filter: narrowed.then(String::new),
+        }
+    }
+
+    #[test]
+    fn escape_turns_a_question_down_rather_than_taking_its_last_answer() {
+        let mut bar = Bar::new(String::new());
+        bar.choice = Some(question(&["Personal", "Team one", "Team two"], false));
+        hit(&mut bar, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(bar.answer, None);
+        assert!(bar.declined);
+    }
+
+    #[test]
+    fn letters_answer_nothing_in_a_question_nobody_opened() {
+        let mut bar = Bar::new(String::new());
+        bar.choice = Some(question(&["Yes", "No"], false));
+        hit(&mut bar, KeyCode::Char('n'), KeyModifiers::NONE);
+        assert_eq!(bar.choice.as_ref().unwrap().shown(), vec![0, 1]);
+        hit(&mut bar, KeyCode::Char('2'), KeyModifiers::NONE);
+        assert_eq!(bar.answer, Some(1));
+    }
+
+    #[test]
+    fn a_list_opened_by_hand_narrows_as_its_names_are_typed() {
+        let mut bar = Bar::new(String::new());
+        let models = [
+            "gpt-5.5 · OpenAI",
+            "claude-x · Letronna",
+            "deepseek-v4 · Letronna",
+        ];
+        bar.choice = Some(question(&models, true));
+        // Digits are part of names here, not answers.
+        for letter in "v4".chars() {
+            hit(&mut bar, KeyCode::Char(letter), KeyModifiers::NONE);
+        }
+        assert_eq!(bar.answer, None);
+        assert_eq!(bar.choice.as_ref().unwrap().shown(), vec![2]);
+        hit(&mut bar, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(bar.answer, Some(2));
+        // Escape takes the narrowing off before it turns the list down.
+        bar.answer = None;
+        hit(&mut bar, KeyCode::Char('x'), KeyModifiers::NONE);
+        hit(&mut bar, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(bar.choice.as_ref().unwrap().shown(), vec![0, 1, 2]);
+        assert!(!bar.declined);
+        hit(&mut bar, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(bar.declined);
+    }
+
+    #[test]
+    fn a_long_list_of_answers_scrolls_to_the_one_highlighted() {
+        let names: Vec<String> = (0..30).map(|i| format!("model-{i:02}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut bar = Bar::new(String::new());
+        bar.choice = Some(question(&names, true));
+        hit(&mut bar, KeyCode::End, KeyModifiers::NONE);
+        assert_eq!(bar.choice.as_ref().unwrap().top, 30 - CHOICE_ROWS);
+        let drawn: Vec<String> = bar.lines(60).iter().map(|line| plain(line)).collect();
+        assert!(
+            drawn
+                .iter()
+                .any(|line| line.contains("› model-29") || line.contains("›   model-29"))
+        );
+        assert!(drawn.iter().any(|line| line.contains("↑ 20 more")));
+        hit(&mut bar, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(bar.answer, Some(29));
     }
 
     /// A list of switches named `names`, the first of each pair on.
