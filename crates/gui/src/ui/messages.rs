@@ -1156,7 +1156,14 @@ impl Chat {
                             toggle(this, cx);
                         }
                     }))
-                    .on_action(cx.listener(move |this, _: &ToggleRun, _, cx| toggle(this, cx))),
+                    // Only the row's own: Enter on its Copy or page button
+                    // presses that button.
+                    .on_action(cx.listener(move |this, _: &ToggleRun, window, cx| {
+                        if !focus.is_focused(window) {
+                            return cx.propagate();
+                        }
+                        toggle(this, cx)
+                    })),
             )
             // What let the call run in Auto mode, lined up with its name.
             .when_some(self.row_tag(index), |this, tag| {
