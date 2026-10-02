@@ -1550,9 +1550,14 @@ impl Chat {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let key = self.open_key(index);
-        // Thinking is live until the reply says anything; the window stays
-        // open then unless closed, and shut afterwards unless opened.
-        let live = streaming && message.content.is_empty();
+        // Thinking is live until the reply says anything or starts writing
+        // a call; the window stays open then unless closed, and shut
+        // afterwards unless opened.
+        let drafting = self
+            .turn
+            .as_ref()
+            .is_some_and(|turn| !turn.live.drafts.is_empty());
+        let live = streaming && message.content.is_empty() && !drafting;
         let open = live != self.thinking_open.contains(&key);
         let focus = window
             .use_keyed_state(self.row_id("think-focus", index), cx, |_, cx| {
@@ -1676,8 +1681,7 @@ impl Chat {
             Event::Reasoning(_) if !thinking && !self.thought_for.contains_key(&key) => {
                 self.thinking_since = Some((key, std::time::Instant::now()));
             }
-            Event::Delta(text) if text.is_empty() => {}
-            Event::Delta(_) | Event::ToolCalls(_) | Event::Finished(_) if thinking => {
+            event if thinking && ends_thinking(event) => {
                 if let Some((at, since)) = self.thinking_since.take() {
                     self.thought_for.insert(at, since.elapsed());
                     // Closed while it came in is not opened once it is done.
@@ -2102,6 +2106,17 @@ fn took_for(time: std::time::Duration) -> String {
     }
 }
 
+/// Whether `event` ends a reply's thinking: its first words, a call it
+/// starts writing, which is the reply under way, its calls or its end.
+fn ends_thinking(event: &Event) -> bool {
+    match event {
+        Event::Delta(text) => !text.is_empty(),
+        Event::Drafting(drafts) => !drafts.is_empty(),
+        Event::ToolCalls(_) | Event::Finished(_) => true,
+        _ => false,
+    }
+}
+
 /// What a call to `tool` with `args` changes, when it is an edit: an
 /// edit_file's replacements compared line by line as the files card does,
 /// a written file's lines all added, a patch's own `+` and `-` lines.
@@ -2367,8 +2382,11 @@ fn open_made(path: PathBuf, picture: bool, window: &mut Window, cx: &mut App) {
 mod tests {
     // Deliberately not `use super::*`: the prelude re-exports gpui, whose own
     // `test` macro would shadow the built-in attribute here.
-    use super::{countdown, edited_by, exit_code, retry_due, took_for, usage_line, without_exit};
-    use letronna_core::chat::Message;
+    use super::{
+        countdown, edited_by, ends_thinking, exit_code, retry_due, took_for, usage_line,
+        without_exit,
+    };
+    use letronna_core::chat::{Draft, Event, Message};
 
     #[test]
     fn a_command_that_exits_badly_says_its_code() {
@@ -2475,5 +2493,18 @@ mod tests {
             usage_line(&message),
             "16 out · 76000 in · 38% of 200K · 95% cached"
         );
+    }
+
+    #[test]
+    fn a_call_being_written_ends_the_thinking() {
+        let draft = Draft {
+            name: "write_file".into(),
+            subject: "notes.md".into(),
+        };
+        assert!(ends_thinking(&Event::Drafting(vec![draft])));
+        assert!(ends_thinking(&Event::Delta("Here".into())));
+        assert!(!ends_thinking(&Event::Drafting(Vec::new())));
+        assert!(!ends_thinking(&Event::Delta(String::new())));
+        assert!(!ends_thinking(&Event::Reasoning("hmm".into())));
     }
 }

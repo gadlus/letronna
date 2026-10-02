@@ -3618,6 +3618,11 @@ impl Chat {
         // A retried or rewound reply can come back at the same place, and
         // must not number its cards on from this turn's.
         self.card_for = None;
+        // Nor be timed from this turn's thinking; thinking closed while it
+        // came in rests shut.
+        if let Some((at, _)) = self.thinking_since.take() {
+            self.thinking_open.remove(&at);
+        }
         // Calls a stop left running come back to a generation that is gone,
         // so the next turn must not wait for them.
         self.outstanding = 0;
