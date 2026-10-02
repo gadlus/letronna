@@ -1272,7 +1272,8 @@ impl Chat {
                 .is_some_and(|extension| known.iter().any(|k| extension.eq_ignore_ascii_case(k)))
         };
         let video = kind(&["mp4", "webm", "mov"]);
-        let picture = video || kind(&["png", "jpg", "jpeg", "webp"]);
+        let still = kind(&["png", "jpg", "jpeg", "webp"]);
+        let picture = video || still;
         let focus = window
             .use_keyed_state(self.row_id("made-tile", index), cx, |_, cx| {
                 cx.focus_handle().tab_stop(true)
@@ -1352,12 +1353,14 @@ impl Chat {
                 gpui_component::tooltip::Tooltip::new(name.clone()).build(window, cx)
             })
             .on_any_mouse_down(|_, window, _| window.prevent_default())
-            .on_click(move |event: &ClickEvent, _, cx| {
+            .on_click(move |event: &ClickEvent, window, cx| {
                 if !event.is_keyboard() {
-                    cx.open_with_system(&open);
+                    open_made(open.clone(), still, window, cx);
                 }
             })
-            .on_action(move |_: &ToggleRun, _, cx| cx.open_with_system(&on_key))
+            .on_action(move |_: &ToggleRun, window, cx| {
+                open_made(on_key.clone(), still, window, cx)
+            })
             .into_any_element()
     }
 
@@ -2292,6 +2295,16 @@ fn sound_button(index: usize, path: PathBuf, cx: &mut Context<Chat>) -> Button {
             }
             cx.notify();
         }))
+}
+
+/// Open a file a call made: a picture in the window's own viewer, anything
+/// else with the system.
+fn open_made(path: PathBuf, picture: bool, window: &mut Window, cx: &mut App) {
+    if picture {
+        crate::ui::viewer::open(path, window, cx);
+    } else {
+        cx.open_with_system(&path);
+    }
 }
 
 #[cfg(test)]
