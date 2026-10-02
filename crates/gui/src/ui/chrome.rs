@@ -344,10 +344,11 @@ impl Chat {
         )
     }
 
-    /// How many helpers are working, while any are; click to see them.
+    /// How many helpers are working, while any are; click to see them. Away
+    /// from the chat only, whose strip over the composer says it there.
     fn helper_pill(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let working = self.helpers_working();
-        if working == 0 {
+        if working == 0 || self.page == Page::Chat {
             return None;
         }
         let s = if working == 1 { "" } else { "s" };
