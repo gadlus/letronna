@@ -410,7 +410,8 @@ pub(crate) struct Chat {
     pub(crate) sidebar_focus: FocusHandle,
     pub(crate) transcript_focus: FocusHandle,
     pub(crate) panel_focus: FocusHandle,
-    /// The question card's answers, which take letter keys.
+    /// The question card's answers, which take letter keys, or the
+    /// permission card, which takes Enter and Escape.
     pub(crate) question_focus: FocusHandle,
     /// The part of the window F6 last moved to, ringed while it keeps the
     /// focus; a click anywhere takes the ring away.
@@ -511,6 +512,9 @@ pub(crate) struct Chat {
     /// The mic button's own state: recording, or sending what it heard off
     /// to be transcribed. `None` the rest of the time; nothing runs then.
     pub(crate) mic: Option<crate::ui::voice::Voice>,
+    /// The key that answers a permission card while it is held down, and
+    /// whether its press answered one: its repeats never do.
+    pub(crate) card_key: Option<(crate::ui::approval::CardKey, bool)>,
     pub(crate) _subscriptions: Vec<Subscription>,
 }
 
@@ -1003,6 +1007,7 @@ impl Chat {
             mode_menu: None,
             drawn: false,
             mic: None,
+            card_key: None,
             _subscriptions: subscriptions,
         };
         let resized = this.follow_window_width(window, cx);
@@ -2389,10 +2394,15 @@ impl Chat {
                 }
                 _ => None,
             };
+            // Numbered after the card before it, before that one goes.
+            let place = match &next {
+                agent::Next::AskUser(call) => self.card_place(call),
+                _ => None,
+            };
             self.card_for = match &next {
                 agent::Next::AskUser(call) => self.turn.as_ref().map(|turn| {
                     let ctx = letronna_core::tools::ToolContext::of(&turn.connection);
-                    crate::ui::approval::CardFor::of(call, &ctx)
+                    crate::ui::approval::CardFor::of(call, &ctx).at(place)
                 }),
                 _ => None,
             };
@@ -4257,6 +4267,19 @@ impl Render for Chat {
                     this.step_turn(None, true, window, cx)
                 }),
             )
+            // Enter and Escape on a permission card, or in an empty composer
+            // while one waits; a held key answers again only once it is up.
+            .on_action(
+                cx.listener(|this, _: &crate::ui::approval::AllowCall, window, cx| {
+                    this.allow_by_key(window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::ui::approval::DenyCall, window, cx| {
+                    this.deny_by_key(window, cx)
+                }),
+            )
+            .capture_key_up(cx.listener(|this, event: &KeyUpEvent, _, _| this.card_key_up(event)))
             // Last, after every binding had its chance: a key that typed
             // nothing where the focus is goes to the composer.
             .on_key_down(cx.listener(Self::type_into_composer))

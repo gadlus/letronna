@@ -7,6 +7,16 @@ use crate::ui::actions::{NextTurn, PreviousTurn, Stop};
 use letronna_core::approvals::Decision;
 use letronna_core::{gate, tools};
 
+/// Eight of a code block's 18px lines: a longer preview scrolls, so the
+/// answers under it stay in sight.
+const PREVIEW_MAX: Pixels = px(8. * 18.);
+/// The most room a plan takes on its card before it scrolls, so its
+/// buttons stay in sight.
+const PLAN_MAX: Pixels = px(320.);
+/// The share of the window's height a plan takes at most, for a short
+/// window where `PLAN_MAX` would still push the buttons out of sight.
+const PLAN_SHARE: f32 = 0.4;
+
 /// What the card for a call waiting on the user shows, worked out once when
 /// it comes up: the preview reads the user's keys from disk to hide them,
 /// and the card is drawn many times a second while it waits.
@@ -16,6 +26,9 @@ pub(crate) struct CardFor {
     preview: String,
     /// Whether "Allow for this session" is offered.
     for_session: bool,
+    /// Where the card stands among its reply's calls that wait on the
+    /// user, when that is known.
+    place: Option<Place>,
 }
 
 impl CardFor {
@@ -27,7 +40,14 @@ impl CardFor {
             for_session: gate::grants_for_session(&call.name, &args)
                 && !tools::asked_each_time(&call.name),
             args,
+            place: None,
         }
+    }
+
+    /// The card, numbered at `place` among its reply's.
+    pub(crate) fn at(mut self, place: Option<Place>) -> Self {
+        self.place = place;
+        self
     }
 
     /// Whether this was worked out for `call`, arguments and all: some
@@ -39,10 +59,53 @@ impl CardFor {
     }
 }
 
+/// Where a card stands among the calls of one reply that wait on the user,
+/// for its `2 of 3`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Place {
+    /// The reply, by its session and its place among the session's messages.
+    reply: (u64, usize),
+    /// This card's number, from 1.
+    n: usize,
+    /// How many of the reply's calls wait on the user: those answered, this
+    /// one, and those still to come.
+    of: usize,
+}
+
 /// Picks a question card's answer by its place, for the letter keys.
 #[derive(Clone, PartialEq, Action)]
 #[action(namespace = question, no_json)]
 pub(crate) struct PickOption(pub(crate) usize);
+
+actions!(approval, [AllowCall, DenyCall]);
+
+/// A key that answers a permission card.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum CardKey {
+    Enter,
+    Escape,
+}
+
+impl CardKey {
+    /// The key's name as a key-up event gives it.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Enter => "enter",
+            Self::Escape => "escape",
+        }
+    }
+}
+
+/// What a press of a card key comes to.
+#[derive(Debug, PartialEq)]
+enum Press {
+    /// Answer the card.
+    Answer,
+    /// Do nothing, and keep the key from anything else.
+    Swallow,
+    /// Leave the key to whatever else it does.
+    PassOn,
+}
 
 impl Chat {
     /// The answers offered by the question waiting on its card, if one is.
@@ -54,6 +117,16 @@ impl Chat {
         }
         let args = tools::parse_args_for(&call.name, &call.arguments).unwrap_or_default();
         Some(options_in(&args))
+    }
+
+    /// Whether the card waiting on the user takes the keys, as a question's
+    /// answers and a permission card do; a plan's card has only buttons.
+    pub(crate) fn card_takes_keys(&self) -> bool {
+        let Some(turn) = self.turn.as_ref() else {
+            return false;
+        };
+        front_call(turn, self.asking.as_deref())
+            .is_some_and(|(call, waiting)| waiting && call.name != tools::EXIT_PLAN)
     }
 
     /// Answer the question waiting with its answer at `n`, if it has one.
@@ -76,13 +149,155 @@ impl Chat {
         }
         self.answer
             .update(cx, |input, cx| input.set_value("", window, cx));
+        self.keys_back(false, window, cx);
         self.resolve_call(Verdict::Answer(text), cx);
     }
 
     /// Denies the call on the card, with what was typed in its reason field.
     pub(crate) fn deny_call(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let reason = self.take_reason(window, cx);
+        self.keys_back(false, window, cx);
         self.resolve_call(Verdict::Deny(reason), cx);
+    }
+
+    /// Allows the call on the card this once.
+    fn allow_call(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.take_reason(window, cx);
+        self.keys_back(false, window, cx);
+        self.resolve_call(Verdict::Allow { remember: false }, cx);
+    }
+
+    /// Gives the keys back to the composer when they are on the card about
+    /// to go with its answer, put there by Tab, F6 or a click in one of its
+    /// boxes, or when `keyboard` says a key pressed one of its buttons.
+    fn keys_back(&self, keyboard: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let on_card = self.question_focus.contains_focused(window, cx)
+            || self.answer.focus_handle(cx).is_focused(window);
+        if keyboard || on_card {
+            self.focus_composer(window, cx);
+        }
+    }
+
+    /// Enter: allows the call on a permission card this once, from the card
+    /// or from an empty composer; anything else Enter does otherwise.
+    pub(crate) fn allow_by_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let takes = self.keys_answer(true, window, cx);
+        match self.press(CardKey::Enter, takes) {
+            Press::Answer => self.allow_call(window, cx),
+            Press::Swallow => {}
+            Press::PassOn => cx.propagate(),
+        }
+    }
+
+    /// Escape: denies the call on a permission card, from the card or from
+    /// an empty composer; anything else Escape does otherwise.
+    pub(crate) fn deny_by_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let takes = self.keys_answer(false, window, cx);
+        match self.press(CardKey::Escape, takes) {
+            Press::Answer => self.deny_call(window, cx),
+            Press::Swallow => {}
+            Press::PassOn => cx.propagate(),
+        }
+    }
+
+    /// Notes `key` pressed, and what the press comes to when a card would
+    /// `take` it now.
+    fn press(&mut self, key: CardKey, takes: bool) -> Press {
+        let (press, held) = pressed(self.card_key, key, takes);
+        self.card_key = held;
+        press
+    }
+
+    /// A key coming back up ends its being held.
+    pub(crate) fn card_key_up(&mut self, event: &KeyUpEvent) {
+        if self
+            .card_key
+            .is_some_and(|(key, _)| key.name() == event.keystroke.key)
+        {
+            self.card_key = None;
+        }
+    }
+
+    /// Whether Enter, with `enter`, or Escape answers the call waiting now:
+    /// a permission card in sight for the session on screen, with the keys
+    /// on the card or in an empty composer, and nothing open that Escape
+    /// closes first. Enter does not answer a card asking for a project
+    /// folder, which has no Allow.
+    fn keys_answer(&self, enter: bool, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let here = self.store.conversations[self.store.active].id;
+        let open = self.settings_open
+            || self.model_open
+            || self.context_report.is_some()
+            || self.editing_message.is_some()
+            || window.has_active_dialog(cx);
+        if open
+            || self.page != Page::Chat
+            || self.streaming_id != Some(here)
+            || !self.transcript_shown()
+            || self.panel_covers(window, cx)
+        {
+            return false;
+        }
+        let Some((call, true)) = self
+            .turn
+            .as_ref()
+            .and_then(|turn| front_call(turn, self.asking.as_deref()))
+        else {
+            return false;
+        };
+        if call.name == tools::ASK_USER || call.name == tools::EXIT_PLAN {
+            return false;
+        }
+        if enter && asks_for_folder(&call.name, self.card_folder().is_some()) {
+            return false;
+        }
+        // Enter on a button of the card presses that button instead.
+        let on_card = if enter {
+            self.question_focus.is_focused(window)
+        } else {
+            self.question_focus.contains_focused(window, cx)
+        };
+        on_card || self.composer_idle(window, cx)
+    }
+
+    /// Whether the keys are in the composer with nothing in it to send.
+    fn composer_idle(&self, window: &Window, cx: &App) -> bool {
+        self.composer_empty
+            && self.attached().is_empty()
+            && self.composer.focus_handle(cx).is_focused(window)
+    }
+
+    /// The project folder of the session the card waits in.
+    fn card_folder(&self) -> Option<PathBuf> {
+        self.streaming_id
+            .and_then(|id| self.store.index_of(id))
+            .and_then(|ix| self.store.conversations[ix].workspace.clone())
+    }
+
+    /// Where the card coming up for `call` stands among the calls of its
+    /// reply that wait on the user; None where that cannot be told, as in
+    /// Auto mode, whose judge decides such calls off this thread.
+    pub(crate) fn card_place(&self, call: &backend::ToolCall) -> Option<Place> {
+        if self.turn_mode() == gate::Mode::Auto {
+            return None;
+        }
+        let session = self.streaming_id?;
+        let messages = &self.store.conversations[self.store.index_of(session)?].messages;
+        let at = messages
+            .iter()
+            .rposition(|message| message.role == "assistant")?;
+        let calls = &messages[at].tool_calls;
+        // The queue is what is left of the reply's calls, in their order, so
+        // the calls after this one are those still to come.
+        let front = calls.iter().position(|queued| {
+            queued.id == call.id && queued.name == call.name && queued.arguments == call.arguments
+        })?;
+        let behind = calls[front + 1..]
+            .iter()
+            .filter(|queued| self.decide(queued, &self.rules) == gate::Outcome::Ask)
+            .count();
+        let before = self.card_for.as_ref().and_then(|shown| shown.place);
+        Some(place((session, at), before, behind))
     }
 
     /// Empties the card's reason field and hands back what was in it, so a
@@ -188,11 +403,19 @@ impl Chat {
                     );
                 }
                 chips = chips.child(chip.label(option).on_click(cx.listener(
-                    move |this, _, _, cx| this.resolve_call(Verdict::Answer(pick.clone()), cx),
+                    move |this, event: &ClickEvent, window, cx| {
+                        this.keys_back(event.is_keyboard(), window, cx);
+                        this.resolve_call(Verdict::Answer(pick.clone()), cx)
+                    },
                 )));
             }
+            let question = h_flex()
+                .gap_2()
+                .items_start()
+                .child(div().flex_1().min_w_0().text_sm().child(question))
+                .children(place_note(shown.place, cx));
             return Some(
-                card.child(div().text_sm().child(question))
+                card.child(question)
                     .child(chips)
                     .child(
                         h_flex()
@@ -208,9 +431,12 @@ impl Chat {
                                     .primary()
                                     .small()
                                     .label("Reply")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.submit_answer(window, cx)
-                                    })),
+                                    .on_click(cx.listener(
+                                        |this, event: &ClickEvent, window, cx| {
+                                            this.keys_back(event.is_keyboard(), window, cx);
+                                            this.submit_answer(window, cx)
+                                        },
+                                    )),
                             ),
                     )
                     .into_any_element(),
@@ -219,23 +445,55 @@ impl Chat {
 
         if call.name == tools::EXIT_PLAN {
             let plan = shown.preview.clone();
+            // Its own scroll state, by call, as every scroll box needs.
+            let scroll = window
+                .use_keyed_state(
+                    SharedString::from(format!("plan-scroll-{}", call.id)),
+                    cx,
+                    |_, _| ScrollHandle::default(),
+                )
+                .read(cx)
+                .clone();
+            let most = PLAN_MAX.min(window.viewport_size().height * PLAN_SHARE);
             return Some(
                 card.child(
-                    div()
-                        .text_sm()
-                        .font_family(BODY_FONT)
-                        .font_weight(FontWeight::MEDIUM)
-                        .child("Letronna has a plan"),
+                    h_flex()
+                        .gap_2()
+                        .items_start()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_sm()
+                                .font_family(BODY_FONT)
+                                .font_weight(FontWeight::MEDIUM)
+                                .child("Letronna has a plan"),
+                        )
+                        .children(place_note(shown.place, cx)),
                 )
                 .child(
-                    // Clipped as a reply is: the markdown renderer can report
-                    // a width wider than the card.
-                    div().w_full().overflow_hidden().child(TextView::markdown(
-                        SharedString::from(format!("plan-{}", call.id)),
-                        plan,
-                        window,
-                        cx,
-                    )),
+                    // A long plan scrolls rather than pushing the buttons out
+                    // of sight; a short one takes only the room it needs.
+                    div()
+                        .relative()
+                        .w_full()
+                        .child(
+                            div()
+                                .id("plan")
+                                .w_full()
+                                .max_h(most)
+                                .overflow_y_scroll()
+                                .track_scroll(&scroll)
+                                // Clipped as a reply is: the markdown renderer
+                                // can report a width wider than the card.
+                                .child(div().w_full().overflow_hidden().child(TextView::markdown(
+                                    SharedString::from(format!("plan-{}", call.id)),
+                                    plan,
+                                    window,
+                                    cx,
+                                ))),
+                        )
+                        .vertical_scrollbar(&scroll),
                 )
                 .child(
                     h_flex()
@@ -245,16 +503,18 @@ impl Chat {
                                 .primary()
                                 .small()
                                 .label("Approve and carry on")
-                                .on_click(cx.listener(|this, _, _, cx| {
+                                .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
+                                    this.keys_back(event.is_keyboard(), window, cx);
                                     this.resolve_call(Verdict::Allow { remember: false }, cx)
                                 })),
                         )
                         .child(
                             Button::new("keep-planning")
-                                .outline()
+                                .framed(cx)
                                 .small()
                                 .label("Keep planning")
-                                .on_click(cx.listener(|this, _, _, cx| {
+                                .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
+                                    this.keys_back(event.is_keyboard(), window, cx);
                                     this.resolve_call(Verdict::Deny(String::new()), cx)
                                 })),
                         ),
@@ -271,17 +531,20 @@ impl Chat {
             "search_web" => "Letronna wants to search the web".to_owned(),
             other => format!("Letronna wants to use {other}"),
         };
-        // These work in the project folder. Without one, Allow could only
-        // fail, so the card asks for the folder first.
-        let folder = self
-            .streaming_id
-            .and_then(|id| self.store.index_of(id))
-            .and_then(|ix| self.store.conversations[ix].workspace.clone());
-        let in_folder = matches!(
-            call.name.as_str(),
-            "run_command" | "write_file" | "edit_file"
-        );
-        let answers = if in_folder && folder.is_none() {
+        let folder = self.card_folder();
+        // Enter and Escape answer while the keys are on the card or in an
+        // empty composer, and say so on the buttons they press.
+        let keyed = self.question_focus.is_focused(window) || self.composer_idle(window, cx);
+        let hint = |key: &str| {
+            keyed.then(|| {
+                Kbd::new(Keystroke {
+                    key: key.to_owned(),
+                    ..Default::default()
+                })
+                .text_xs()
+            })
+        };
+        let answers = if asks_for_folder(&call.name, folder.is_some()) {
             h_flex()
                 .gap_2()
                 .items_center()
@@ -300,9 +563,8 @@ impl Chat {
                         .plain(cx)
                         .small()
                         .label("Deny")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.resolve_call(Verdict::Deny(String::new()), cx)
-                        })),
+                        .children(hint("escape"))
+                        .on_click(cx.listener(|this, _, window, cx| this.deny_call(window, cx))),
                 )
                 .child(
                     div()
@@ -321,10 +583,8 @@ impl Chat {
                         .primary()
                         .small()
                         .label("Allow")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.take_reason(window, cx);
-                            this.resolve_call(Verdict::Allow { remember: false }, cx)
-                        })),
+                        .children(hint("enter"))
+                        .on_click(cx.listener(|this, _, window, cx| this.allow_call(window, cx))),
                 )
                 // An upload, or a sign-in, is asked about each time, so there
                 // is no allowing it for the session.
@@ -335,6 +595,7 @@ impl Chat {
                         .label("Allow for this session")
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.take_reason(window, cx);
+                            this.keys_back(false, window, cx);
                             this.resolve_call(Verdict::Allow { remember: true }, cx)
                         }))
                 }))
@@ -343,9 +604,10 @@ impl Chat {
                         .framed(cx)
                         .small()
                         .label(format!("Always allow `{}` here", rule.pattern))
-                        .on_click(
-                            cx.listener(|this, _, _, cx| this.resolve_call(Verdict::AllowHere, cx)),
-                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.keys_back(false, window, cx);
+                            this.resolve_call(Verdict::AllowHere, cx)
+                        }))
                 }))
                 // Beside Deny, which sends what is typed here; enter in the
                 // field denies too.
@@ -360,19 +622,43 @@ impl Chat {
                         .plain(cx)
                         .small()
                         .label("Deny")
+                        .children(hint("escape"))
                         .on_click(cx.listener(|this, _, window, cx| this.deny_call(window, cx))),
                 )
         };
+        // A stop for Tab, F6 and Alt+Up, where Enter and Escape answer it.
+        let card = card
+            .id("permission")
+            .track_focus(&self.question_focus.clone().tab_stop(true))
+            .key_context("Permission")
+            .focus(|style| style.border_color(cx.theme().ring))
+            // A press leaves the keys where they were, as on a turn; a box
+            // or a button in it still takes them.
+            .on_any_mouse_down(|_, window, _| window.prevent_default())
+            .on_action(cx.listener(|this, _: &PreviousTurn, window, cx| {
+                this.step_turn(Some(Stop::Question), false, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &NextTurn, window, cx| {
+                this.step_turn(Some(Stop::Question), true, window, cx)
+            }));
         Some(
             card.child(
                 v_flex()
                     .gap_0p5()
                     .child(
-                        div()
-                            .text_sm()
-                            .font_family(HEADING_FONT)
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(title),
+                        h_flex()
+                            .gap_2()
+                            .items_start()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_sm()
+                                    .font_family(HEADING_FONT)
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(title),
+                            )
+                            .children(place_note(shown.place, cx)),
                     )
                     // Where a command runs, which its text does not say.
                     .when_some(
@@ -408,7 +694,7 @@ impl Chat {
                     .child(crate::ui::code_block(
                         "preview",
                         tools::clamp_lines(&shown.preview, 400),
-                        px(240.),
+                        PREVIEW_MAX,
                         window,
                         cx,
                     )),
@@ -520,6 +806,62 @@ fn option_letter(n: usize) -> Option<char> {
         .map(|n| char::from(b'a' + n))
 }
 
+/// Whether a call of `name` waits for a project folder before it can be
+/// allowed: these work in the folder, so without one Allow could only fail.
+fn asks_for_folder(name: &str, has_folder: bool) -> bool {
+    !has_folder && matches!(name, "run_command" | "write_file" | "edit_file")
+}
+
+/// The place of the card coming up in `reply` after the card `before`, with
+/// `behind` of the reply's calls still to come that will wait on the user.
+fn place(reply: (u64, usize), before: Option<Place>, behind: usize) -> Place {
+    let n = before
+        .filter(|before| before.reply == reply)
+        .map_or(1, |before| before.n + 1);
+    Place {
+        reply,
+        n,
+        of: n + behind,
+    }
+}
+
+/// A card's `2 of 3`, when more than one of its reply's calls wait.
+fn place_note(place: Option<Place>, cx: &App) -> Option<Div> {
+    let place = place.filter(|place| place.of > 1)?;
+    Some(
+        div()
+            .flex_none()
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .child(format!("{} of {}", place.n, place.of)),
+    )
+}
+
+/// What a press of `key` comes to, and the key held after it. `held` is
+/// the card key down since it was last seen pressed, with whether that
+/// press answered a card; `takes` is whether a card would take the key
+/// now. A key's repeats while it is held never answer: a held Enter must
+/// not allow the card after the one it allowed, nor one that came up while
+/// it sent a message, and what a press answered keeps its repeats.
+fn pressed(
+    held: Option<(CardKey, bool)>,
+    key: CardKey,
+    takes: bool,
+) -> (Press, Option<(CardKey, bool)>) {
+    match held {
+        Some((down, answered)) if down == key => {
+            let press = if answered || takes {
+                Press::Swallow
+            } else {
+                Press::PassOn
+            };
+            (press, held)
+        }
+        _ if takes => (Press::Answer, Some((key, true))),
+        _ => (Press::PassOn, Some((key, false))),
+    }
+}
+
 /// The box an approval card sits in.
 fn frame(cx: &App) -> Div {
     v_flex()
@@ -583,7 +925,7 @@ fn permission(
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
-    use super::{option_letter, options_in};
+    use super::{CardKey, Press, asks_for_folder, option_letter, options_in, place, pressed};
 
     #[test]
     fn a_question_offers_its_answers_in_order_each_under_a_letter() {
@@ -593,5 +935,47 @@ mod tests {
         assert_eq!(option_letter(0), Some('a'));
         assert_eq!(option_letter(25), Some('z'));
         assert_eq!(option_letter(26), None);
+    }
+
+    #[test]
+    fn the_cards_of_one_reply_are_counted_in_order() {
+        let first = place((7, 4), None, 2);
+        assert_eq!((first.n, first.of), (1, 3));
+        let second = place((7, 4), Some(first), 1);
+        assert_eq!((second.n, second.of), (2, 3));
+        // Allowed for the session, the last one asked no more.
+        let last = place((7, 4), Some(second), 0);
+        assert_eq!((last.n, last.of), (3, 3));
+        // A later reply, or another session, counts from one again.
+        let next = place((7, 9), Some(last), 0);
+        assert_eq!((next.n, next.of), (1, 1));
+        assert_eq!(place((8, 4), Some(last), 1).n, 1);
+    }
+
+    #[test]
+    fn a_held_key_never_answers_the_next_card() {
+        use CardKey::{Enter, Escape};
+        // A fresh press answers the card, and its repeats answer nothing,
+        // whether a card takes them or not.
+        let (press, held) = pressed(None, Enter, true);
+        assert_eq!((press, held), (Press::Answer, Some((Enter, true))));
+        assert_eq!(pressed(held, Enter, true).0, Press::Swallow);
+        assert_eq!(pressed(held, Enter, false).0, Press::Swallow);
+        // Held down to send a message, Enter still sends, but its repeats
+        // never answer a card that comes up meanwhile.
+        let (press, held) = pressed(None, Enter, false);
+        assert_eq!((press, held), (Press::PassOn, Some((Enter, false))));
+        assert_eq!(pressed(held, Enter, true).0, Press::Swallow);
+        assert_eq!(pressed(held, Enter, false).0, Press::PassOn);
+        // Another key is a press of its own.
+        assert_eq!(pressed(held, Escape, true).0, Press::Answer);
+    }
+
+    #[test]
+    fn a_command_or_a_write_waits_for_a_project_folder() {
+        assert!(asks_for_folder("run_command", false));
+        assert!(asks_for_folder("edit_file", false));
+        assert!(!asks_for_folder("run_command", true));
+        assert!(!asks_for_folder("search_web", false));
     }
 }
