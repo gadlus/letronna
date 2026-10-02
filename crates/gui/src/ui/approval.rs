@@ -257,7 +257,9 @@ impl Chat {
         } else {
             self.question_focus.contains_focused(window, cx)
         };
-        on_card || self.composer_idle(window, cx)
+        // From the composer, Enter allows only a card the chat is kept at:
+        // scrolled up to read, the card can be below the fold, unseen.
+        on_card || ((!enter || self.following) && self.composer_idle(window, cx))
     }
 
     /// Whether the keys are in the composer with nothing in it to send.
