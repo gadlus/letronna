@@ -351,8 +351,9 @@ pub fn parse_args(args: &str) -> Result<Value, String> {
     serde_json::from_str(args).map_err(|e| {
         if e.is_eof() {
             "The arguments were cut off before the call was complete. Send less \
-             content in one call: write the file in smaller pieces, or write a \
-             short version first and append to it."
+             content in one call. To write a file in parts, write_file the first \
+             part, then add the rest with edit_file anchored on its last lines, or \
+             with run_command."
                 .to_owned()
         } else {
             format!("Invalid arguments: {e}")
@@ -4803,6 +4804,19 @@ mod tests {
         for empty in ["{}", "", r#"{"plan":"  \n"}"#, r#"{"plan":3}"#] {
             let missing = plan_of(empty).unwrap_err();
             assert!(missing.contains("No plan came"), "{empty}: {missing}");
+        }
+    }
+
+    #[test]
+    fn cut_off_arguments_point_to_a_way_to_write_in_parts() {
+        let cut = parse_args(r#"{"path":"report.md","content":"The first fin"#).unwrap_err();
+        assert!(cut.contains("cut off"), "{cut}");
+        // write_file only ever writes the whole file, so there is nothing to
+        // append with; every tool the hint sends the model to must exist.
+        assert!(!cut.contains("append"), "{cut}");
+        for tool in ["write_file", "edit_file", "run_command"] {
+            assert!(cut.contains(tool), "{tool}: {cut}");
+            assert!(find(tool).is_some(), "{tool}");
         }
     }
 
