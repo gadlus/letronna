@@ -4468,8 +4468,8 @@ mod tests {
             }
         });
         let out = run_shell_saving(
+            shell(command, Some(&dir)),
             command,
-            Some(&dir),
             &cancel,
             None,
             COMMAND_TIMEOUT,
