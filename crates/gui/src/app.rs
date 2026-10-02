@@ -512,6 +512,20 @@ pub(crate) struct Chat {
     /// to be transcribed. `None` the rest of the time; nothing runs then.
     pub(crate) mic: Option<crate::ui::voice::Voice>,
     pub(crate) _subscriptions: Vec<Subscription>,
+    /// Previews shown whole -- a tool's output, a long prompt, a reply's
+    /// fences -- by session id and place.
+    pub(crate) previews_open: std::collections::HashSet<(u64, usize)>,
+    /// How long each reply thought, by session id and place, timed as it
+    /// came in; a reply from before has none.
+    pub(crate) thought_for: std::collections::HashMap<(u64, usize), std::time::Duration>,
+    /// The reply thinking now, by session id and place, and since when.
+    pub(crate) thinking_since: Option<((u64, usize), std::time::Instant)>,
+    /// What each edit call changed, by session id and place, worked out
+    /// once from its arguments rather than at every frame.
+    pub(crate) edited: std::collections::HashMap<(u64, usize), crate::ui::messages::Edited>,
+    /// How wide the chat's column was last drawn, its padding included,
+    /// to tell how many rows a long line of a preview wraps to.
+    pub(crate) column: Pixels,
 }
 
 impl Chat {
@@ -1004,6 +1018,11 @@ impl Chat {
             drawn: false,
             mic: None,
             _subscriptions: subscriptions,
+            previews_open: std::collections::HashSet::new(),
+            thought_for: std::collections::HashMap::new(),
+            thinking_since: None,
+            edited: std::collections::HashMap::new(),
+            column: COLUMN,
         };
         let resized = this.follow_window_width(window, cx);
         this._subscriptions.push(resized);
@@ -2155,6 +2174,7 @@ impl Chat {
     }
 
     fn on_event(&mut self, event: Event, cx: &mut Context<Self>) {
+        self.time_thinking(&event);
         let Some(turn) = self.turn.as_mut() else {
             return;
         };
@@ -3151,6 +3171,9 @@ impl Chat {
             self.focusing = None;
             window.focus(&focus);
         }
+        // What a preview's long lines wrap to depends on it.
+        self.column = column;
+        self.note_edits(span.first, span.last);
         let conversation = &self.store.conversations[self.store.active];
         let messages = &conversation.messages;
         let mut rows = Vec::new();
@@ -3207,9 +3230,17 @@ impl Chat {
                 } else {
                     line
                 });
+                // What its calls made stays in sight, small, while folded.
+                if folded.is_some() {
+                    rows.extend(self.run_media(run, window, cx));
+                }
             }
-            // A failure is never folded away: it is what needs reading.
-            if folded.is_some() && !letronna_core::tool_runs::failed(m) {
+            // A failure is never folded away: it is what needs reading. A
+            // command that exited badly is one too.
+            if folded.is_some()
+                && !letronna_core::tool_runs::failed(m)
+                && !crate::ui::messages::exited_badly(m)
+            {
                 // A run that ends a stopped turn still carries its buttons.
                 rows.extend(bar);
                 continue;

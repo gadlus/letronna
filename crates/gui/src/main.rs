@@ -420,7 +420,11 @@ pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Opti
         ),
         (
             KeyBinding::new("enter", ui::messages::ToggleRun, Some("ToolRun")),
-            Some("On a folded run of tool calls: open or close it"),
+            Some("On a tool call, a thought, a folded run or a preview: open or close it"),
+        ),
+        (
+            KeyBinding::new("space", ui::messages::ToggleRun, Some("ToolRun")),
+            None,
         ),
         (
             KeyBinding::new("escape", changes::LeaveChanges, Some("Changes")),
