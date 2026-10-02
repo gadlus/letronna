@@ -1205,7 +1205,7 @@ fn appearance_page(
     cx: &mut App,
 ) -> Div {
     const LOOKS: [(&str, &str, &str); 3] = [
-        ("", "night", "Night — deep blue around a near-black page"),
+        ("", "night", "Night — midnight blue around a dark ink page"),
         (
             "paper",
             "paper",
