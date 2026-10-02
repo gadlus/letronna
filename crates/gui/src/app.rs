@@ -151,6 +151,12 @@ pub(crate) struct Chat {
     pub(crate) media_models: Vec<letronna_core::media::Offer>,
     /// The model picked for each media kind, as `media.json` keeps it.
     pub(crate) media_choices: std::collections::BTreeMap<String, String>,
+    /// The media kind each session's messages are made into, from a model
+    /// picked on that kind's tab; a session not in here chats.
+    pub(crate) media_kinds: std::collections::HashMap<u64, &'static str>,
+    /// The turn running makes what a media model was asked for, and ends
+    /// with it rather than asking the chat model about it.
+    pub(crate) media_turn: bool,
     pub(crate) model_open: bool,
     pub(crate) model_search: Entity<InputState>,
     pub(crate) keys: std::collections::HashMap<String, String>,
@@ -843,6 +849,8 @@ impl Chat {
             model_kind: "chat",
             media_models: Vec::new(),
             media_choices: letronna_core::media::choices(),
+            media_kinds: std::collections::HashMap::new(),
+            media_turn: false,
             model_open: false,
             model_search,
             keys,
@@ -1088,13 +1096,17 @@ impl Chat {
         self.model
             .update(cx, |input, cx| input.set_value(id.clone(), window, cx));
         self.store.choose_model(self.store.active, &gateway, &id);
+        // A text model means chatting again.
+        let here = self.store.conversations[self.store.active].id;
+        self.media_kinds.remove(&here);
         self.model_open = false;
         self.focus_composer(window, cx);
         self.save();
         cx.notify();
     }
 
-    /// The model a media kind's tool uses, or `None` for the cheapest working.
+    /// The model a media kind's tool uses, or `None` for the cheapest
+    /// working, and what the session on screen makes its messages into.
     pub(crate) fn choose_media(
         &mut self,
         kind: &'static str,
@@ -1102,7 +1114,11 @@ impl Chat {
         cx: &mut Context<Self>,
     ) {
         match letronna_core::media::choose(kind, model.as_deref()) {
-            Ok(()) => self.media_choices = letronna_core::media::choices(),
+            Ok(()) => {
+                self.media_choices = letronna_core::media::choices();
+                let here = self.store.conversations[self.store.active].id;
+                self.media_kinds.insert(here, kind);
+            }
             Err(why) => self.error = Some(why),
         }
         self.model_open = false;
@@ -1407,6 +1423,20 @@ impl Chat {
         let Some(prompt) = self.prompt_for(prompt, cx) else {
             return;
         };
+        // What a media model makes is paid from the Letronna account, so
+        // signed out it is not sent, and the box keeps it as typed, without
+        // the line Enter added.
+        if self.making(&prompt, false).is_some() && !letronna_core::auth::signed_in() {
+            self.composer
+                .update(cx, |input, cx| input.set_value(prompt, window, cx));
+            self.error = Some(
+                "Images, speech and video are made on Letronna's hosted models, which need a \
+                 Letronna account. Sign in first, or pick a text model."
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
         self.composer
             .update(cx, |input, cx| input.set_value("", window, cx));
         // Setting the box raises no change, so the chip is put right here.
@@ -1603,6 +1633,7 @@ impl Chat {
         // sent all of it.
         self.fill_now(self.store.active);
         let from_chat_app = remote.is_some();
+        let making = self.making(&prompt, from_chat_app);
         // Asking anything at all means the setup page has done its job.
         self.show_setup = None;
         let connection = match self.connection_for(self.store.active, remote) {
@@ -1697,8 +1728,66 @@ impl Chat {
         self.error = None;
         self.save();
         self.follow();
-        self.run_turn(cx);
+        match making {
+            Some(kind) => self.make(kind, &prompt, cx),
+            None => self.run_turn(cx),
+        }
         Ok(())
+    }
+
+    /// The media kind the active session's messages are made into, or
+    /// `None` for the chat model, which a chat app's message, `/init` and a
+    /// saved workflow always go to: they are written for it.
+    pub(crate) fn making(&self, prompt: &str, from_chat_app: bool) -> Option<&'static str> {
+        let here = self.store.conversations[self.store.active].id;
+        let for_chat = from_chat_app
+            || letronna_core::init::typed(prompt).is_some()
+            || letronna_core::workflow::saved::typed(prompt).is_some();
+        self.media_kinds.get(&here).copied().filter(|_| !for_chat)
+    }
+
+    /// Make what `prompt` describes on the model picked for `kind`, as a
+    /// reply that calls that kind's tool: its card asks first, since it is
+    /// paid, and what it makes shows as any call's result does.
+    fn make(&mut self, kind: &str, prompt: &str, cx: &mut Context<Self>) {
+        let Some(ix) = self.streaming_id.and_then(|id| self.store.index_of(id)) else {
+            return self.finish(cx);
+        };
+        let (tool, field) = match kind {
+            "speech" => ("speak", "text"),
+            "video" => ("make_video", "prompt"),
+            _ => ("make_image", "prompt"),
+        };
+        let mut args = serde_json::json!({});
+        args[field] = prompt.into();
+        let picked = self.media_choices.get(kind).cloned();
+        if let Some(model) = &picked {
+            args["model"] = model.as_str().into();
+        }
+        let conversation = &mut self.store.conversations[ix];
+        // Its place in the session, so no two calls there share an id.
+        let call = backend::ToolCall {
+            id: format!("call_{tool}_{}", conversation.messages.len()),
+            name: tool.into(),
+            arguments: args.to_string(),
+        };
+        let label = crate::ui::composer::kind_label(kind);
+        conversation.messages.push(Message {
+            role: "assistant".into(),
+            model: picked.unwrap_or_else(|| format!("{label} · Auto")),
+            tool_calls: vec![call.clone()],
+            at: backend::now(),
+            ..Default::default()
+        });
+        let workspace = conversation.workspace.clone();
+        self.media_turn = true;
+        if let Some(turn) = self.turn.as_mut() {
+            // Where it is saved, as `run_turn` sets it for a model's calls.
+            turn.connection.workspace = workspace;
+            turn.begin(vec![call]);
+        }
+        self.save();
+        self.advance_tools(cx);
     }
 
     /// The quick entry bar's send: like [`Self::dispatch`], but window-free,
@@ -2448,8 +2537,9 @@ impl Chat {
                         self.error = Some(why);
                         self.save();
                         self.finish(cx);
-                    // A hook's `continue: false`, shown with the results.
-                    } else if letronna_core::hooks::halted(session) {
+                    // A hook's `continue: false`, shown with the results;
+                    // or what a media model made, which is the answer.
+                    } else if letronna_core::hooks::halted(session) || self.media_turn {
                         self.save();
                         self.finish(cx);
                     } else {
@@ -3524,6 +3614,7 @@ impl Chat {
         self.busy = false;
         self.streaming_id = None;
         self.turn = None;
+        self.media_turn = false;
         self.judging = None;
         // Calls a stop left running come back to a generation that is gone,
         // so the next turn must not wait for them.
