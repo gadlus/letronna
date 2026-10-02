@@ -2174,6 +2174,23 @@ pub fn set_profile_dir(dir: Option<std::path::PathBuf>) {
 /// before it says anything.
 const IDLE: Duration = Duration::from_secs(300);
 
+/// The fewest and most seconds `LETRONNA_READ_TIMEOUT` may set: under half a
+/// minute cuts off a model still reading a long prompt, and an hour is well
+/// past how long a proxy that holds each reply back until it is whole, such
+/// as a benchmark's usage meter, waits on one; any longer and a call that
+/// never answers only keeps the run waiting.
+const IDLE_SECONDS: std::ops::RangeInclusive<u64> = 30..=3600;
+
+/// How long a reply may go quiet: the seconds `LETRONNA_READ_TIMEOUT` names,
+/// kept within `IDLE_SECONDS`, or `IDLE` when it names none.
+fn idle(env: &dyn Fn(&str) -> Option<String>) -> Duration {
+    let Some(seconds) = env("LETRONNA_READ_TIMEOUT").and_then(|s| s.trim().parse::<u64>().ok())
+    else {
+        return IDLE;
+    };
+    Duration::from_secs(seconds.clamp(*IDLE_SECONDS.start(), *IDLE_SECONDS.end()))
+}
+
 /// The one HTTP client every model call goes through.
 ///
 /// A client per call meant a new runtime thread and a fresh TCP and TLS
@@ -2190,7 +2207,7 @@ pub(crate) fn client() -> Result<&'static reqwest::blocking::Client, String> {
                 // In the blocking client this bounds the wait for the headers
                 // and each read after them, not the whole body. A timeout on
                 // the request instead is a deadline for the entire reply.
-                .timeout(IDLE)
+                .timeout(idle(&|name| std::env::var(name).ok()))
                 // reqwest's own keepalive probes every 15 s and takes a minute
                 // to find a peer that vanished mid-reply (165 s on Windows;
                 // Linux already stops at 30 s). Probing every 5 s finds it in
@@ -7823,5 +7840,36 @@ mod tests {
         assert_eq!(whole_fields(""), Value::Null);
         assert_eq!(subject("write_file", r#"{"file_path": "b.rs", "#), "b.rs");
         assert_eq!(subject("todo", r#"{"items": [], "#), "");
+    }
+
+    /// An environment holding only `LETRONNA_READ_TIMEOUT`, set to `value`.
+    fn read_timeout(value: &str) -> impl Fn(&str) -> Option<String> {
+        move |name| (name == "LETRONNA_READ_TIMEOUT").then(|| value.to_owned())
+    }
+
+    #[test]
+    fn the_read_timeout_follows_the_environment() {
+        assert_eq!(idle(&read_timeout("1200")), Duration::from_secs(1200));
+        assert_eq!(idle(&read_timeout(" 45\n")), Duration::from_secs(45));
+    }
+
+    #[test]
+    fn a_read_timeout_outside_the_range_is_clamped() {
+        assert_eq!(idle(&read_timeout("0")), Duration::from_secs(30));
+        assert_eq!(idle(&read_timeout("5")), Duration::from_secs(30));
+        assert_eq!(idle(&read_timeout("86400")), Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn no_setting_keeps_three_hundred_seconds() {
+        assert_eq!(idle(&|_| None), Duration::from_secs(300));
+        // A value that is no whole number of seconds is no setting either.
+        for value in ["", "ten", "-60", "1.5", "300s"] {
+            assert_eq!(
+                idle(&read_timeout(value)),
+                Duration::from_secs(300),
+                "{value:?}"
+            );
+        }
     }
 }
