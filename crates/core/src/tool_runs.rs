@@ -42,9 +42,24 @@ pub struct Told {
     pub took: String,
 }
 
-/// Whether a tool result failed, as opposed to being turned down by the user.
+/// Whether a tool result failed, a command that exited non-zero included, as
+/// opposed to being turned down by the user.
 pub fn failed(message: &Message) -> bool {
-    message.is_error && !tools::is_declined(&message.content)
+    (message.is_error && !tools::is_declined(&message.content)) || exit_code(message).is_some()
+}
+
+/// The code a command's result says it exited with, when that was not 0.
+// `run_command` then ends its output with an `[exit code N]` line, which only
+// Letronna's own bracketed notes, from a hook or about a repeated call, follow.
+pub fn exit_code(message: &Message) -> Option<i32> {
+    const LINE: &str = "\n[exit code ";
+    if message.name != "run_command" {
+        return None;
+    }
+    let at = message.content.rfind(LINE)?;
+    let (code, after) = message.content[at + LINE.len()..].split_once(']')?;
+    let code: i32 = code.parse().ok()?;
+    (code != 0 && (after.is_empty() || after.starts_with("\n\n["))).then_some(code)
 }
 
 /// Whether a reply shows nothing between tool rows: it only asked for tools,
@@ -358,6 +373,36 @@ mod tests {
             (all_failed.did.as_str(), all_failed.failed.as_str()),
             ("", "2 steps failed")
         );
+    }
+
+    #[test]
+    fn a_command_that_exits_non_zero_counts_as_failed() {
+        let ran = |content: &str| Message {
+            content: content.into(),
+            ..call("run_command", serde_json::json!({"command": "cargo test"}))
+        };
+        let run = [
+            ran("test result: ok. 3 passed"),
+            ran("error[E0425]: cannot find value `x`\n[exit code 101]"),
+            ran("\n[exit code -1]"),
+            ran(
+                "boom\n[exit code 2]\n\n[You have made this exact call 3 times this turn \
+                 and got the same result each time. Change your approach instead of \
+                 repeating it.]",
+            ),
+        ];
+        let told = tell_with(&run, flags);
+        assert_eq!(told.did, "Ran 1 command");
+        assert_eq!(told.failed, "3 steps failed");
+        let codes: Vec<Option<i32>> = run.iter().map(exit_code).collect();
+        assert_eq!(codes, [None, Some(101), Some(-1), Some(2)]);
+        // Only the line that ends a command's output says how it exited.
+        let said_earlier = ran("$ cat log\n[exit code 1]\nretried: ok");
+        let read = Message {
+            content: "last run:\n[exit code 1]".into(),
+            ..call("read_file", serde_json::json!({"path": "log"}))
+        };
+        assert!(!failed(&said_earlier) && !failed(&read));
     }
 
     #[test]
