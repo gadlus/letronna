@@ -852,13 +852,15 @@ pub fn summary(name: &str, args: &str) -> String {
                 v["around"].as_u64().unwrap_or(0)
             )
         }
-        "search" | "search_sessions" | crate::mcp_find::FIND_TOOLS => v["pattern"]
+        "search" | "search_sessions" | "search_web" | crate::mcp_find::FIND_TOOLS => v["pattern"]
             .as_str()
             .or(v["query"].as_str())
             .map(|q| format!("\"{q}\""))
             .or(v["glob"].as_str().map(str::to_owned))
             .unwrap_or_default(),
         "run_command" => v["command"].as_str().unwrap_or_default().to_owned(),
+        // Left out, the path is the workspace root, which "." names.
+        "list_dir" => path_arg(&v).to_owned(),
         "web_fetch" => v["url"].as_str().unwrap_or_default().to_owned(),
         crate::patch::APPLY_PATCH => crate::patch::paths(&v).unwrap_or_default().join(", "),
         "read_job" | "stop_job" => format!("#{}", v["id"].as_u64().unwrap_or(0)),
@@ -929,7 +931,9 @@ pub fn summary(name: &str, args: &str) -> String {
         },
         #[cfg(feature = "workflows")]
         "workflow" => crate::workflow::tool::summary(&v),
-        _ => v["path"].as_str().unwrap_or(".").to_owned(),
+        // A tool with no path, such as list_jobs or most MCP tools, shows
+        // nothing rather than a "." that reads as the folder.
+        _ => v["path"].as_str().unwrap_or_default().to_owned(),
     };
     one_line(&text)
 }
@@ -5240,6 +5244,20 @@ mod tests {
             r#"[{"action": "remove", "old_text": "tea"}, {"action": "add", "content": "d"}]"#})
         .to_string();
         assert_eq!(summary("memory", &stringed), "remove, add user");
+    }
+
+    #[test]
+    fn a_web_search_shows_its_query_in_quotes() {
+        let args = r#"{"query":"gpui text wrap","count":5}"#;
+        assert_eq!(summary("search_web", args), "\"gpui text wrap\"");
+    }
+
+    #[test]
+    fn a_tool_without_a_path_shows_nothing_beside_its_name() {
+        assert_eq!(summary("list_jobs", "{}"), "");
+        assert_eq!(summary("mcp__notes__recent", r#"{"limit":3}"#), "");
+        assert_eq!(summary("read_file", r#"{"path":"src/a.txt"}"#), "src/a.txt");
+        assert_eq!(summary("list_dir", "{}"), ".");
     }
 
     #[test]

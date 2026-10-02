@@ -143,7 +143,8 @@ fn said(what: &str, text: &str) -> String {
 fn waiting(call: &ToolCall, helper: Option<&str>) -> String {
     let summary = tools::summary(&call.name, &call.arguments);
     let who = helper.map(|name| format!("Helper {name}"));
-    // A tool with nothing to show beside its name is summed up as ".".
+    // A tool with nothing to show beside its name, or only the workspace
+    // root as list_dir's ".", is named alone.
     let what = match summary.as_str() {
         "" | "." => call.name.clone(),
         _ => format!("{} {summary}", call.name),
