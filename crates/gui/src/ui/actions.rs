@@ -1086,7 +1086,8 @@ impl Chat {
             n => format!("{n} files changed"),
         };
         let totals = line_totals(card.files.iter().map(|file| file.lines.as_ref()));
-        let listed = card.files.len() <= CARD_FILES;
+        // Without a project folder the Changes tab has none of them to show.
+        let listed = card.files.len() <= CARD_FILES || open.workspace.is_none();
         let rows: Vec<_> = card
             .files
             .iter()
