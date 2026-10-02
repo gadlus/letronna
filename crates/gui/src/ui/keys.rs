@@ -49,9 +49,11 @@ impl Chat {
         match region {
             Region::Sidebar => self.sidebar_focus.contains_focused(window, cx),
             // The question card is drawn in the transcript, but maybe not
-            // yet, when F6 or Alt+Down has only just scrolled to it.
+            // yet, when F6 or Alt+Down has only just scrolled to it. The
+            // browser's preview is drawn in it too, but is a part of its own.
             Region::Transcript if self.page == Page::Chat => {
-                self.transcript_focus.contains_focused(window, cx)
+                (self.transcript_focus.contains_focused(window, cx)
+                    && !self.browser.read(cx).preview_focus.is_focused(window))
                     || self.question_focus.is_focused(window)
             }
             Region::Transcript => self.page_focus.contains_focused(window, cx),
