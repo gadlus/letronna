@@ -455,7 +455,7 @@ impl UsePage {
             "click" => match (point_arg(args)?, args["ref"].is_null()) {
                 (None, _) => with_downloads(&saving, |session| {
                     let node = target(session)?;
-                    session.act(agree, Some(&saving), after, |session| session.click(node))
+                    session.click_named(node, agree, &saving, after)
                 }),
                 (Some(_), false) => Err("Give `ref` or `x` and `y` for a click, not both.".into()),
                 // One go only: on a tab opened again the point would land on
@@ -4117,6 +4117,29 @@ impl Session {
         Ok((size("clientWidth"), size("clientHeight")))
     }
 
+    /// Click the element `node`, first saying what it is as the listing
+    /// named it, as a click at a point does, then show the page as `after`
+    /// says: the call itself names only a ref, as in "click e12".
+    fn click_named(
+        &mut self,
+        node: i64,
+        agree: bool,
+        saving: &Saving,
+        after: After,
+    ) -> Result<String, String> {
+        let frame = self
+            .inside
+            .as_ref()
+            .and_then(|inside| inside.frame.as_deref());
+        // Taken before the click, which may load a page and forget its refs.
+        let named = self.refs.name_for(frame, node).map(str::to_owned);
+        let page = self.act(agree, Some(saving), after, |session| session.click(node))?;
+        Ok(match named {
+            Some(named) => format!("Clicked {named}.\n{page}"),
+            None => page,
+        })
+    }
+
     /// Click at a point in the view, as the model saw it: refused when the
     /// page is new to this session or has changed or scrolled since it was
     /// last listed or pictured, or when the point is off the view. Says
@@ -6336,6 +6359,54 @@ mod tests {
     }
 
     #[test]
+    fn a_click_on_a_ref_says_what_it_clicked_before_the_page_after() {
+        let names = vec!["Basket".to_owned(), "Sign in".to_owned()];
+        let listed = listed_page(Arc::new(Mutex::new(("L1", names))));
+        let (mut session, server) = fake_session(move |method, params| {
+            let answer = match method {
+                "DOM.getContentQuads" => json!({"quads": [[10, 10, 90, 10, 90, 30, 10, 30]]}),
+                "DOM.resolveNode" => json!({"object": {"objectId": "O"}}),
+                "Runtime.callFunctionOn" => json!({"result": {"value": ""}}),
+                _ => return listed(method, params),
+            };
+            (Vec::new(), answer)
+        });
+        let page = session.read(false).unwrap();
+        session.show(&page, &View::default(), Vec::new()).unwrap();
+        let node = session.reach("e2", None).unwrap();
+        let ctx = ToolContext::default();
+        let clicked = session
+            .click_named(node, false, &Saving::of(&ctx), After::Changes)
+            .unwrap();
+        assert_eq!(
+            clicked,
+            "Clicked button \"Sign in\".\nNothing on the page changed."
+        );
+        drop(session);
+        let heard = server.join().unwrap();
+        let pressed = heard
+            .iter()
+            .filter(|m| *m == "Input.dispatchMouseEvent")
+            .count();
+        assert_eq!(pressed, 3, "{heard:?}");
+    }
+
+    #[test]
+    fn a_click_in_another_sites_frame_says_what_it_clicked_there() {
+        let loader = Arc::new(Mutex::new("L1"));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let page = framed_page(loader, seen, [300, 100], u64::MAX);
+        let (mut session, _server) = fake_frames_session(page);
+        session.read(false).unwrap();
+        let node = session.reach("e1", Some("https://pay.test")).unwrap();
+        let ctx = ToolContext::default();
+        let clicked = session
+            .click_named(node, false, &Saving::of(&ctx), After::Nothing)
+            .unwrap();
+        assert_eq!(clicked.trim(), "Clicked textbox \"Card number\".");
+    }
+
+    #[test]
     fn a_point_on_a_frame_from_another_site_is_refused_before_anything_is_pressed() {
         let state = Arc::new(Mutex::new(("L1", 0.)));
         let frame =
@@ -7551,7 +7622,10 @@ mod tests {
             );
             let idle = ref_of(&page, "Does nothing");
             let nothing = use_page(json!({"action": "click", "ref": idle})).unwrap();
-            assert_eq!(nothing, "Nothing on the page changed.");
+            assert_eq!(
+                nothing,
+                "Clicked button \"Does nothing\".\nNothing on the page changed."
+            );
 
             // A batch runs its steps in order and lists what they changed
             // once, at the end; the first that fails ends it.
