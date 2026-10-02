@@ -152,7 +152,7 @@ pub const COMMANDS: &[Command<'static>] = &[
     },
     Command {
         name: "/mcp",
-        blurb: "MCP servers: how each is doing; reconnect, enable, disable, login, logout, log, reload",
+        blurb: "MCP servers and their prompts; reconnect, enable, disable, login, logout, log, reload",
     },
     Command {
         name: "/plugins",
@@ -232,6 +232,86 @@ pub const COMMANDS: &[Command<'static>] = &[
     },
 ];
 
+/// What `/skills` does besides using one, offered under it after the skills.
+const SKILL_VERBS: &[Command<'static>] = &[
+    Command {
+        name: "add",
+        blurb: "add some from GitHub, a link or a path",
+    },
+    Command {
+        name: "on",
+        blurb: "switch one on, for the model to use",
+    },
+    Command {
+        name: "off",
+        blurb: "switch one off, out of the model's sight",
+    },
+];
+
+/// What `/mcp` does to a server, offered under it after the prompts.
+const MCP_VERBS: &[Command<'static>] = &[
+    Command {
+        name: "reconnect",
+        blurb: "start a server again",
+    },
+    Command {
+        name: "enable",
+        blurb: "switch a server on",
+    },
+    Command {
+        name: "disable",
+        blurb: "switch a server off",
+    },
+    Command {
+        name: "login",
+        blurb: "sign in to a server",
+    },
+    Command {
+        name: "logout",
+        blurb: "sign out of a server",
+    },
+    Command {
+        name: "log",
+        blurb: "what a server printed",
+    },
+    Command {
+        name: "reload",
+        blurb: "read mcp.json again",
+    },
+];
+
+/// What the user, the project and skills add to the `/` menu.
+#[derive(Default)]
+pub struct Added {
+    /// Command files and saved workflows, listed with Letronna's own as
+    /// (`/name`, blurb).
+    pub commands: Vec<(String, String)>,
+    /// Skills that run as a command by their name, as (`/name`,
+    /// description): offered once a letter of one is typed, as there can be
+    /// dozens, which listed unasked would bury Letronna's own.
+    pub skills: Vec<(String, String)>,
+    /// Every skill, on or off, offered under `/skills ` as (name, blurb).
+    pub shelf: Vec<(String, String)>,
+}
+
+/// A row of the menu. Picking it puts `under` and `name` in the box, and the
+/// row shows `name` alone: under `/skills ` the rest is typed already.
+#[derive(Clone, Copy)]
+struct Row<'a> {
+    under: &'static str,
+    name: &'a str,
+    /// Said before the blurb: what a skill or a prompt is among commands.
+    kind: &'static str,
+    blurb: &'a str,
+}
+
+impl Row<'_> {
+    /// What picking it puts in the box.
+    fn line(&self) -> String {
+        format!("{}{}", self.under, self.name)
+    }
+}
+
 /// Rows a turn of the wheel moves, and rows a page key moves.
 const WHEEL: isize = 3;
 const PAGE: isize = 10;
@@ -281,27 +361,114 @@ const PLAN_LEAVES: usize = 12;
 /// question takes.
 const STILL: Duration = Duration::from_millis(500);
 
-/// The menu's lines for what is typed: the command named exactly so first,
-/// then Letronna's own, then the `added` ones, as (name, blurb).
-fn matches<'a>(text: &str, added: &'a [(String, String)]) -> Vec<Command<'a>> {
+/// The menu's rows for what is typed: the command named exactly so first,
+/// then Letronna's own, then the `added` ones. Skills and MCP servers'
+/// prompts join them once a letter is typed after the slash, and are
+/// listed in full under `/skills ` and `/mcp `.
+fn matches<'a>(text: &str, added: &'a Added) -> Vec<Row<'a>> {
+    if let Some(rows) = under(text, added) {
+        return rows;
+    }
     if !text.starts_with('/') || text.contains(char::is_whitespace) {
         return Vec::new();
     }
-    let added = added.iter().map(|(name, blurb)| Command { name, blurb });
-    // MCP servers' prompts come after the built-in commands.
-    let prompts = letronna_core::mcp::prompts()
-        .into_iter()
-        .map(|(name, blurb)| Command { name, blurb });
-    let mut found: Vec<Command> = COMMANDS
-        .iter()
-        .copied()
+    let row = |kind| {
+        move |(name, blurb): &'a (String, String)| Row {
+            under: "",
+            name,
+            kind,
+            blurb,
+        }
+    };
+    let own = COMMANDS.iter().map(|c| Row {
+        under: "",
+        name: c.name,
+        kind: "",
+        blurb: c.blurb,
+    });
+    let typed = text.len() > 1;
+    let skills = added.skills.iter().filter(|_| typed).map(row("skill · "));
+    let prompts = if typed {
+        letronna_core::mcp::prompts()
+    } else {
+        Vec::new()
+    };
+    let prompts = prompts.into_iter().map(|(name, blurb)| Row {
+        under: "",
+        name,
+        kind: "MCP · ",
+        blurb,
+    });
+    let mut found: Vec<Row> = own
+        .chain(added.commands.iter().map(row("")))
+        .chain(skills)
         .chain(prompts)
-        .chain(added)
-        .filter(|c| c.name.starts_with(text))
+        .filter(|r| r.name.starts_with(text))
         .collect();
     // Enter takes the first, so an added `/u` is not lost to `/undo`.
-    found.sort_by_key(|c| c.name != text);
+    found.sort_by_key(|r| r.name != text);
     found
+}
+
+/// The rows under `/skills ` or `/mcp ` while the one word after it is
+/// typed: every skill, or each MCP prompt, then what else the command does,
+/// those with the word in their name, the ones starting with it first.
+/// Before a letter, the first row is the command alone, so enter still
+/// lists them as it did. None for any other text.
+fn under<'a>(text: &str, added: &'a Added) -> Option<Vec<Row<'a>>> {
+    let (command, word) = text.split_once(' ')?;
+    if word.contains(char::is_whitespace) {
+        return None;
+    }
+    let (under, about, items, verbs): (_, _, Vec<(&'a str, &'a str)>, _) = match command {
+        "/skills" => (
+            "/skills ",
+            "list every skill; or add, on, off",
+            added
+                .shelf
+                .iter()
+                .map(|(name, blurb)| (name.as_str(), blurb.as_str()))
+                .collect(),
+            SKILL_VERBS,
+        ),
+        "/mcp" => (
+            "/mcp ",
+            "the servers and how each is doing",
+            letronna_core::mcp::prompts()
+                .into_iter()
+                .filter_map(|(name, blurb)| Some((name.strip_prefix("/mcp__")?, blurb)))
+                .collect(),
+            MCP_VERBS,
+        ),
+        _ => return None,
+    };
+    let word = word.to_lowercase();
+    let verbs = verbs.iter().map(|v| (v.name, v.blurb));
+    let mut rows: Vec<Row> = items
+        .into_iter()
+        .chain(verbs)
+        .filter(|(name, _)| name.to_lowercase().contains(&word))
+        .map(|(name, blurb)| Row {
+            under,
+            name,
+            kind: "",
+            blurb,
+        })
+        .collect();
+    rows.sort_by_key(|r| {
+        let name = r.name.to_lowercase();
+        (name != word, !name.starts_with(&word))
+    });
+    if word.is_empty() {
+        let alone = Row {
+            under: "",
+            name: under.trim_end(),
+            kind: "",
+            blurb: about,
+        };
+        rows.insert(0, alone);
+    }
+    Some(rows)
 }
 
 /// The names an `@` path could go on as, as many as fit in `width` columns
@@ -509,9 +676,8 @@ pub struct Bar {
     guard: Option<std::time::Instant>,
     /// Whether anyone is looking, for notifications.
     focus: crate::notify::Focus,
-    /// The commands the user, the project and skills added, as the menu
-    /// offers them: (`/name`, blurb).
-    added: Vec<(String, String)>,
+    /// What the user, the project and skills added, as the menu offers it.
+    added: Added,
     /// The open session's project folder, where an `@` path is completed.
     folder: Option<std::path::PathBuf>,
 }
@@ -553,21 +719,20 @@ impl Bar {
             held: None,
             guard: None,
             focus: crate::notify::Focus::new(std::time::Instant::now()),
-            added: Vec::new(),
+            added: Added::default(),
             folder: None,
         }
     }
 
-    /// Offer `added` in the `/` menu beside Letronna's own commands, as
-    /// (`/name`, blurb).
-    pub fn offer(&mut self, added: Vec<(String, String)>) {
+    /// Offer `added` in the `/` menu beside Letronna's own commands.
+    pub fn offer(&mut self, added: Added) {
         self.added = added;
     }
 
-    /// The command, Letronna's own or an added one, that the mistyped
-    /// `typed` was most likely meant to be.
+    /// The command, Letronna's own, an added one or a skill, that the
+    /// mistyped `typed` was most likely meant to be.
     pub fn meant(&self, typed: &str) -> Option<&str> {
-        closest(typed, &self.added)
+        closest(typed, &self.added.commands).or_else(|| closest(typed, &self.added.skills))
     }
 
     /// What is in the box, typed and not yet sent.
@@ -1268,7 +1433,7 @@ impl Bar {
             KeyCode::Char('s') if control => self.send_now(),
             KeyCode::Tab => {
                 if let Some(choice) = options.get(self.picked) {
-                    self.line.set(choice.name);
+                    self.line.set(&choice.line());
                     self.picked = 0;
                 } else if let Some(partial) = self.line.reference_before() {
                     let (completed, choices) =
@@ -1343,7 +1508,7 @@ impl Bar {
         let text = self.line.text().trim_end_matches('\n').to_owned();
         self.line.set(&text);
         if let Some(choice) = matches(self.line.text(), &self.added).get(self.picked) {
-            self.line.set(choice.name);
+            self.line.set(&choice.line());
         }
         self.picked = 0;
         let line = self.line.take().trim().to_owned();
@@ -1599,7 +1764,15 @@ impl Bar {
             let options = matches(self.line.text(), &self.added);
             let top = menu_top(self.menu_top, self.picked, options.len(), MENU_LIMIT);
             let end = (top + MENU_LIMIT).min(options.len());
-            let width = name_width(&self.added);
+            // The longest name in this list rather than of all there are:
+            // dozens of skills are no reason to push Letronna's own blurbs
+            // along.
+            let width = options
+                .iter()
+                .map(|o| o.name.chars().count())
+                .max()
+                .unwrap_or(0)
+                .min(NAME_WIDTH);
             let more = |count: usize, arrow: &str| {
                 format!(
                     "{}  {}",
@@ -1621,10 +1794,11 @@ impl Bar {
                 // An added command's description is its writer's and can
                 // run long; a row that wrapped would push the box up.
                 let blurb_room = render::width().saturating_sub(render::GUTTER.len() + width + 4);
+                let blurb = format!("{}{}", option.kind, option.blurb);
                 lines.push(format!(
                     "{}{marker} {name}  {}",
                     render::GUTTER,
-                    render::dim(&render::fit(option.blurb, blurb_room))
+                    render::dim(&render::fit(&blurb, blurb_room))
                 ));
             }
             if end < options.len() {
@@ -1923,9 +2097,9 @@ fn track(stops: &[String], at: usize, room: usize) -> (String, String, usize) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Bar, Choice, MENU_LIMIT, NAME_WIDTH, PLAN_ROWS, QUEUED_LIMIT, RELAY_LIMIT, STILL, Slider,
-        Waited, at_work, checklist, closest, fitted, is_command, matches, menu_top, name_width,
-        offered, one_row, relay_line, stops_at, track, unescaped,
+        Added, Bar, Choice, MENU_LIMIT, NAME_WIDTH, PLAN_ROWS, QUEUED_LIMIT, RELAY_LIMIT, Row,
+        STILL, Slider, Waited, at_work, checklist, closest, fitted, is_command, matches, menu_top,
+        name_width, offered, one_row, relay_line, stops_at, track, unescaped,
     };
     use crate::render::{MARGIN, plain, visible};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -2065,9 +2239,10 @@ mod tests {
 
     #[test]
     fn the_menu_only_opens_for_a_slash() {
-        assert!(matches("what is this", &[]).is_empty());
-        assert!(matches("", &[]).is_empty());
-        assert!(!matches("/", &[]).is_empty());
+        let none = Added::default();
+        assert!(matches("what is this", &none).is_empty());
+        assert!(matches("", &none).is_empty());
+        assert!(!matches("/", &none).is_empty());
     }
 
     #[test]
@@ -2102,20 +2277,24 @@ mod tests {
 
     #[test]
     fn typing_narrows_the_list() {
-        let all = matches("/", &[]).len();
-        let e = matches("/e", &[]);
+        let none = Added::default();
+        let all = matches("/", &none).len();
+        let e = matches("/e", &none);
         assert!(e.len() < all && !e.is_empty());
         assert!(e.iter().all(|c| c.name.starts_with("/e")));
-        assert_eq!(matches("/exit", &[]).len(), 1);
+        assert_eq!(matches("/exit", &none).len(), 1);
         // A command that does not exist offers nothing rather than guessing.
-        assert!(matches("/nonsense", &[]).is_empty());
+        assert!(matches("/nonsense", &none).is_empty());
         // Once it carries an argument it is no longer a name being typed.
-        assert!(matches("/model gpt", &[]).is_empty());
+        assert!(matches("/model gpt", &none).is_empty());
     }
 
     #[test]
     fn added_commands_follow_letronna_s_own_in_the_menu() {
-        let added = [("/review".to_owned(), "look over a change".to_owned())];
+        let added = Added {
+            commands: vec![("/review".to_owned(), "look over a change".to_owned())],
+            ..Added::default()
+        };
         let names: Vec<&str> = matches("/re", &added).iter().map(|c| c.name).collect();
         assert_eq!(names, ["/retention", "/resume", "/retry", "/review"]);
         let long = [("/a-long-command-name".to_owned(), String::new())];
@@ -2128,7 +2307,10 @@ mod tests {
     #[test]
     fn enter_on_an_added_name_that_starts_one_of_letronna_s_takes_the_added_one() {
         let mut bar = Bar::new(String::new());
-        bar.offer(vec![("/u".to_owned(), "a kept prompt".to_owned())]);
+        bar.offer(Added {
+            commands: vec![("/u".to_owned(), "a kept prompt".to_owned())],
+            ..Added::default()
+        });
         bar.line.set("/u");
         bar.send();
         assert_eq!(bar.queued.pop_front().as_deref(), Some("/u"));
@@ -2139,6 +2321,121 @@ mod tests {
         bar.line.set("/us");
         bar.send();
         assert_eq!(bar.queued.pop_front().as_deref(), Some("/usage"));
+    }
+
+    /// Two skills switched on and one off, as `offer_added` hands them over.
+    fn skills() -> Added {
+        let pair = |a: &str, b: &str| (a.to_owned(), b.to_owned());
+        Added {
+            commands: Vec::new(),
+            skills: vec![
+                pair("/firecrawl-agent", "pages into JSON"),
+                pair("/motion", "short animations"),
+            ],
+            shelf: vec![
+                pair("firecrawl", "off · scrape the web"),
+                pair("firecrawl-agent", "pages into JSON"),
+                pair("motion", "short animations"),
+            ],
+        }
+    }
+
+    fn lines(text: &str, added: &Added) -> Vec<String> {
+        matches(text, added).iter().map(Row::line).collect()
+    }
+
+    #[test]
+    fn skills_wait_for_a_letter_before_the_menu_offers_them() {
+        let added = skills();
+        let bare = matches("/", &added);
+        assert_eq!(bare.len(), matches("/", &Added::default()).len());
+        assert!(bare.iter().all(|r| r.kind.is_empty()));
+        // Typed, they come after the commands with the same start, marked.
+        let typed = matches("/m", &added);
+        let names: Vec<&str> = typed.iter().map(|r| r.name).collect();
+        assert_eq!(
+            names,
+            [
+                "/mode",
+                "/model",
+                "/memory-review",
+                "/mcp",
+                "/memory",
+                "/motion"
+            ]
+        );
+        assert_eq!(typed[5].kind, "skill · ");
+        assert_eq!(lines("/fire", &added), ["/firecrawl-agent"]);
+    }
+
+    #[test]
+    fn every_skill_is_listed_under_skills() {
+        let added = skills();
+        assert_eq!(
+            lines("/skills ", &added),
+            [
+                "/skills",
+                "/skills firecrawl",
+                "/skills firecrawl-agent",
+                "/skills motion",
+                "/skills add",
+                "/skills on",
+                "/skills off",
+            ]
+        );
+        // A word finds them by any part of their name, a start first.
+        assert_eq!(lines("/skills agent", &added), ["/skills firecrawl-agent"]);
+        assert_eq!(
+            lines("/skills O", &added),
+            ["/skills on", "/skills off", "/skills motion"]
+        );
+        // Past the word it is an argument, as with `/model gpt`.
+        assert!(lines("/skills on fire", &added).is_empty());
+        // The row shows the name alone: `/skills ` is typed already.
+        assert_eq!(matches("/skills fire", &added)[0].name, "firecrawl");
+    }
+
+    #[test]
+    fn enter_under_skills_keeps_the_whole_name_typed() {
+        let mut bar = Bar::new(String::new());
+        bar.offer(skills());
+        // Off, it is still the one meant, not the longer one that is on.
+        bar.line.set("/skills firecrawl");
+        bar.send();
+        assert_eq!(bar.queued.pop_front().as_deref(), Some("/skills firecrawl"));
+        bar.line.set("/skills agent");
+        bar.send();
+        assert_eq!(
+            bar.queued.pop_front().as_deref(),
+            Some("/skills firecrawl-agent")
+        );
+        // A verb typed whole is the verb, though a skill has it in its name.
+        bar.line.set("/skills on");
+        bar.send();
+        assert_eq!(bar.queued.pop_front().as_deref(), Some("/skills on"));
+        // Nothing after it lists them, as it always did.
+        bar.line.set("/skills ");
+        bar.send();
+        assert_eq!(bar.queued.pop_front().as_deref(), Some("/skills"));
+    }
+
+    #[test]
+    fn what_mcp_does_to_a_server_is_offered_under_it() {
+        let none = Added::default();
+        let all = lines("/mcp ", &none);
+        assert_eq!(all[0], "/mcp");
+        assert!(all.contains(&"/mcp reconnect".to_owned()));
+        assert_eq!(lines("/mcp re", &none), ["/mcp reconnect", "/mcp reload"]);
+        // Other commands keep their arguments to themselves.
+        assert!(lines("/model ", &none).is_empty());
+    }
+
+    #[test]
+    fn a_mistyped_skill_points_at_it() {
+        let mut bar = Bar::new(String::new());
+        bar.offer(skills());
+        assert_eq!(bar.meant("/motoin"), Some("/motion"));
+        assert_eq!(bar.meant("/mdoel"), Some("/model"));
     }
 
     #[test]
