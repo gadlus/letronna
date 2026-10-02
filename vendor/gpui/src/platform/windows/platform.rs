@@ -248,7 +248,16 @@ impl WindowsPlatform {
             .spawn(move || {
                 let vsync_provider = VSyncProvider::new();
                 loop {
-                    vsync_provider.wait_for_vsync();
+                    // With no window on screen there is nothing to ask for
+                    // frames, so the wait is long and not tied to the display.
+                    let none_shown = all_windows.upgrade().is_some_and(|windows| {
+                        !windows.read().iter().any(|hwnd| is_on_screen(hwnd.as_raw()))
+                    });
+                    if none_shown {
+                        std::thread::sleep(NONE_SHOWN_WAIT);
+                    } else {
+                        vsync_provider.wait_for_vsync();
+                    }
                     if check_device_lost(&directx_device.device) {
                         handle_gpu_device_lost(
                             &mut directx_device,
@@ -261,7 +270,14 @@ impl WindowsPlatform {
                     let Some(all_windows) = all_windows.upgrade() else {
                         break;
                     };
+                    // A minimized window draws nothing until it is restored and
+                    // a hidden one gets no WM_PAINT, yet asking woke this
+                    // thread and the main one every refresh of the display.
+                    // Restoring or showing a window draws it on its own.
                     for hwnd in all_windows.read().iter() {
+                        if !is_on_screen(hwnd.as_raw()) {
+                            continue;
+                        }
                         unsafe {
                             let _ = RedrawWindow(Some(hwnd.as_raw()), None, None, RDW_INVALIDATE);
                         }
@@ -270,6 +286,14 @@ impl WindowsPlatform {
             })
             .unwrap();
     }
+}
+
+// How long the vsync thread waits while no window is on screen: often enough
+// to notice one coming back and keep the device-lost check going.
+const NONE_SHOWN_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+
+fn is_on_screen(hwnd: HWND) -> bool {
+    unsafe { IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool() }
 }
 
 impl Platform for WindowsPlatform {
