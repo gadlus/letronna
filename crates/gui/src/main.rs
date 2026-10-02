@@ -91,6 +91,44 @@ pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Opti
             ),
             Some("In capabilities: the tab before"),
         ),
+        // Everywhere else in the chat, Ctrl+Tab lists the sessions used
+        // last; the capabilities page's own, nearer, still goes first there.
+        (
+            KeyBinding::new("ctrl-tab", ui::switcher::SwitchSession, Some("Chat")),
+            Some("Switch to a recent session (hold Ctrl, let go to open)"),
+        ),
+        (
+            KeyBinding::new(
+                "ctrl-shift-tab",
+                ui::switcher::SwitchSessionBack,
+                Some("Chat"),
+            ),
+            None,
+        ),
+        (
+            KeyBinding::new("tab", ui::switcher::NextRecent, Some("Switcher")),
+            None,
+        ),
+        (
+            KeyBinding::new("down", ui::switcher::NextRecent, Some("Switcher")),
+            None,
+        ),
+        (
+            KeyBinding::new("shift-tab", ui::switcher::PreviousRecent, Some("Switcher")),
+            None,
+        ),
+        (
+            KeyBinding::new("up", ui::switcher::PreviousRecent, Some("Switcher")),
+            None,
+        ),
+        (
+            KeyBinding::new("enter", ui::switcher::OpenRecent, Some("Switcher")),
+            None,
+        ),
+        (
+            KeyBinding::new("escape", ui::switcher::CloseRecent, Some("Switcher")),
+            None,
+        ),
         (
             KeyBinding::new("secondary-shift-d", changes::ChangesTab, Some("Chat")),
             Some("Open the changes"),

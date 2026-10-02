@@ -97,6 +97,10 @@ fn commands() -> Vec<(&'static str, Rc<dyn Action>)> {
         // Escape's action: it stops the reply only once nothing else is
         // open to back out of, such as Settings or an edit.
         ("Back out, or stop the reply", Rc::new(Dismiss)),
+        (
+            "Switch to a recent session",
+            Rc::new(super::switcher::SwitchSession),
+        ),
     ]
 }
 

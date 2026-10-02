@@ -33,6 +33,7 @@ pub(crate) mod settings;
 pub(crate) mod setup;
 pub(crate) mod sidebar;
 pub(crate) mod skills;
+pub(crate) mod switcher;
 pub(crate) mod update;
 pub(crate) mod usage;
 pub(crate) mod voice;
