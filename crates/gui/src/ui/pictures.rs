@@ -139,11 +139,9 @@ impl Chat {
             h_flex()
                 .gap_0p5()
                 .items_start()
-                .child({
-                    let view = path.clone();
-                    thumbnail(("attached-picture", i), path, cx)
-                        .cursor_pointer()
-                        .on_click(move |_, window, cx| viewer::open(view.clone(), window, cx))
+                .child(Waiting {
+                    index: i,
+                    path: path.clone(),
                 })
                 .child(
                     Button::new(("unattach", i))
@@ -162,6 +160,28 @@ impl Chat {
                 )
         });
         Some(h_flex().flex_wrap().gap_2().pb_1().children(pictures))
+    }
+}
+
+/// A picture waiting in the composer, as a tab stop that Enter or a click
+/// opens in the window. Its own element, as its focus is kept by the
+/// window, which the composer is built without.
+#[derive(IntoElement)]
+struct Waiting {
+    index: usize,
+    path: PathBuf,
+}
+
+impl RenderOnce for Waiting {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let thumbnail = thumbnail(("attached-picture", self.index), &self.path, cx);
+        viewer::opens(
+            thumbnail,
+            ("attached-focus", self.index),
+            self.path,
+            window,
+            cx,
+        )
     }
 }
 
