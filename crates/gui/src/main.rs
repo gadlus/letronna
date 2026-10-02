@@ -466,6 +466,10 @@ pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Opti
             Some("On a changed file under a turn: show or hide its diff"),
         ),
         (
+            KeyBinding::new("enter", ui::actions::ReviewFiles, Some("TurnFiles")),
+            Some("On the files a turn changed: review them in the Changes tab"),
+        ),
+        (
             KeyBinding::new("enter", ui::messages::ToggleRun, Some("ToolRun")),
             Some("On a folded run of tool calls: open or close it"),
         ),
