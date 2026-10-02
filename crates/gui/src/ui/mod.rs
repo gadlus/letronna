@@ -4,8 +4,8 @@ pub(crate) mod activity;
 pub(crate) mod approval;
 pub(crate) mod artifacts;
 pub(crate) mod auto;
-pub(crate) mod busy;
 pub(crate) mod browser;
+pub(crate) mod busy;
 pub(crate) mod capabilities;
 pub(crate) mod changes;
 pub(crate) mod chrome;
@@ -78,6 +78,61 @@ fn pressed_only(ground: Hsla, edge: Hsla, cx: &App) -> ButtonCustomVariant {
         .border(edge)
         .foreground(cx.theme().secondary_foreground)
         .active(cx.theme().secondary_active)
+}
+
+/// A page laid out in the chat's column.
+pub(crate) trait PageColumn: Styled + Sized {
+    /// Centred in the pane, as wide as the chat's column at most and inside
+    /// its gutters, so switching between the chat and a page keeps the left
+    /// edge still and a wide window widens the margins, not the lines.
+    fn page_column(self) -> Self {
+        // A width given outright and capped by the pane, as the chat's is,
+        // which nothing inside can push wider.
+        self.w(COLUMN).max_w_full().mx_auto().px_6()
+    }
+}
+
+impl<T: Styled> PageColumn for T {}
+
+/// A page's title with its actions at the right, and the line under it
+/// saying what the page is for: one heading for every page.
+pub(crate) fn page_header(
+    title: impl Into<SharedString>,
+    blurb: impl Into<SharedString>,
+    actions: impl IntoIterator<Item = AnyElement>,
+    cx: &App,
+) -> Div {
+    v_flex()
+        .gap_1()
+        .child(
+            h_flex()
+                .items_center()
+                .justify_between()
+                .gap_4()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_xl()
+                        .font_family(HEADING_FONT)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(title.into()),
+                )
+                .child(
+                    h_flex()
+                        .flex_shrink_0()
+                        .gap_1()
+                        .items_center()
+                        .children(actions),
+                ),
+        )
+        .child(
+            div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(blurb.into()),
+        )
 }
 
 /// Ask before something is removed for good. The button says what it does

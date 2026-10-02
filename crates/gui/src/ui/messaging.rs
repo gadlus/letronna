@@ -1,5 +1,6 @@
 //! The Messaging page: a channel list beside the setup for the selected one.
 
+use super::PageColumn;
 use crate::prelude::*;
 use letronna_core::messaging::{self, pairing};
 
@@ -486,24 +487,9 @@ impl Chat {
         v_flex()
             .flex_1()
             .min_h_0()
+            .page_column()
             .child(
-                v_flex()
-                    .px_8()
-                    .py_6()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_xl()
-                            .font_family(HEADING_FONT)
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(Page::Messaging.title()),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(Page::Messaging.blurb()),
-                    ),
+                super::page_header(Page::Messaging.title(), Page::Messaging.blurb(), [], cx).py_6(),
             )
             .child(
                 h_flex()

@@ -8,6 +8,7 @@
 //! change, not on every redraw, and counting the calls runs off the UI
 //! thread; nothing ticks while the page is open.
 
+use super::PageColumn;
 use crate::prelude::*;
 use gpui_component::switch::Switch;
 use gpui_component::tab::{Tab, TabBar};
@@ -307,16 +308,15 @@ impl Chat {
             .min_h_0()
             .child(
                 v_flex()
-                    .px_8()
+                    .page_column()
                     .pt_6()
                     .gap_3()
-                    .child(
-                        div()
-                            .text_xl()
-                            .font_family(HEADING_FONT)
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(Page::Capabilities.title()),
-                    )
+                    .child(super::page_header(
+                        Page::Capabilities.title(),
+                        Page::Capabilities.blurb(),
+                        [],
+                        cx,
+                    ))
                     .child(bar),
             )
             .child(body)
@@ -571,15 +571,14 @@ pub(crate) fn switch(
         .on_click(flip)
 }
 
-/// `content` under the tabs, scrolling on its own.
+/// `content` under the tabs, scrolling on its own across the whole width,
+/// margins too, with the content in the column.
 fn scrolled(id: &'static str, content: Div) -> AnyElement {
     div()
         .id(id)
         .flex_1()
         .min_h_0()
         .overflow_y_scroll()
-        .px_8()
-        .py_6()
-        .child(content)
+        .child(v_flex().page_column().py_6().child(content))
         .into_any_element()
 }

@@ -2,6 +2,7 @@
 //! and switched on and off. The agent loads one that is on when a task calls
 //! for it, and Use puts its instructions in the composer.
 
+use super::PageColumn;
 use crate::prelude::*;
 use letronna_core::skills::{self, Installed, Source};
 
@@ -465,7 +466,7 @@ impl Chat {
         v_flex()
             .flex_1()
             .min_h_0()
-            .px_8()
+            .page_column()
             .py_6()
             .gap_4()
             .child(

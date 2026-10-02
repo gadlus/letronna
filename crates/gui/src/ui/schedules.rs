@@ -1,5 +1,6 @@
 //! The Scheduled jobs page: prompts that run on a timer.
 
+use super::PageColumn;
 use crate::prelude::*;
 use chrono::{Local, TimeZone};
 use letronna_core::gate::Mode;
@@ -428,59 +429,42 @@ impl Chat {
                 }
             })
             .collect();
+        let blurb = if self.schedules.is_empty() {
+            "A prompt that runs on a timer. Each run opens its own session, and works while \
+             the window is hidden in the tray."
+        } else {
+            "Each run opens its own session, and works while the window is hidden in the tray."
+        };
+        let add = Button::new("add-job")
+            .primary()
+            .small()
+            .icon(Icon::new(IconName::Plus))
+            .label("New job")
+            .on_click(cx.listener(|this, _, _, cx| this.new_schedule(cx)));
         v_flex()
             .flex_1()
             .min_h_0()
-            .px_8()
-            .py_6()
-            .gap_4()
             .child(
-                h_flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_4()
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_xl()
-                                    .font_family(HEADING_FONT)
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child("Scheduled jobs"),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(if self.schedules.is_empty() {
-                                        "A prompt that runs on a timer. Each run opens its own \
-                                         session, and works while the window is hidden in the tray."
-                                    } else {
-                                        "Each run opens its own session, and works while the \
-                                         window is hidden in the tray."
-                                    }),
-                            ),
-                    )
-                    .child(
-                        Button::new("add-job")
-                            .primary()
-                            .small()
-                            .flex_shrink_0()
-                            .icon(Icon::new(IconName::Plus))
-                            .label("New job")
-                            .on_click(cx.listener(|this, _, _, cx| this.new_schedule(cx))),
-                    ),
+                v_flex()
+                    .page_column()
+                    .pt_6()
+                    .pb_4()
+                    .child(super::page_header(
+                        "Scheduled jobs",
+                        blurb,
+                        [add.into_any_element()],
+                        cx,
+                    )),
             )
             .child(
+                // The whole width scrolls, margins too, with the rows in
+                // the column.
                 div()
                     .id("schedule-list")
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .child(v_flex().children(rows)),
+                    .child(v_flex().page_column().pb_6().children(rows)),
             )
     }
 }
