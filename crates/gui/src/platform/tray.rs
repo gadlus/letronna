@@ -167,26 +167,30 @@ mod windows_impl {
         };
         cx.set_global(Tray(tray));
 
+        // Handed over as they happen, rather than looked for ten times a
+        // second for as long as the app runs.
+        let (tx, rx) = async_channel::unbounded();
+        TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
+            let _ = tx.send_blocking(event);
+        }));
         cx.spawn(async move |cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(100))
-                    .await;
-                while let Ok(event) = TrayIconEvent::receiver().try_recv() {
-                    let TrayIconEvent::Click {
-                        button,
-                        button_state: MouseButtonState::Up,
-                        position,
-                        ..
-                    } = event
-                    else {
-                        continue;
-                    };
-                    let _ = cx.update(|cx| match button {
-                        MouseButton::Left => show_main_window(cx),
-                        MouseButton::Right => open_menu(position.x as f32, position.y as f32, cx),
-                        MouseButton::Middle => {}
-                    });
+            while let Ok(event) = rx.recv().await {
+                let TrayIconEvent::Click {
+                    button,
+                    button_state: MouseButtonState::Up,
+                    position,
+                    ..
+                } = event
+                else {
+                    continue;
+                };
+                let shown = cx.update(|cx| match button {
+                    MouseButton::Left => show_main_window(cx),
+                    MouseButton::Right => open_menu(position.x as f32, position.y as f32, cx),
+                    MouseButton::Middle => {}
+                });
+                if shown.is_err() {
+                    break;
                 }
             }
         })
