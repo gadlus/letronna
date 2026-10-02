@@ -153,7 +153,7 @@ impl Chat {
                 .items_center()
                 .text_color(cx.theme().muted_foreground)
                 .child(
-                    gpui_component::spinner::Spinner::new()
+                    crate::ui::busy::Spinner::new()
                         .xsmall()
                         .color(cx.theme().primary),
                 )
@@ -240,16 +240,7 @@ impl Chat {
                                     .size(px(6.))
                                     .rounded_full()
                                     .bg(cx.theme().primary)
-                                    .with_animation(
-                                        "pulse",
-                                        Animation::new(std::time::Duration::from_millis(1000))
-                                            .repeat()
-                                            .with_easing(ease_in_out),
-                                        |dot, delta| {
-                                            let wave = 1.0 - (delta * 2.0 - 1.0).abs();
-                                            dot.opacity(0.25 + 0.75 * wave)
-                                        },
-                                    ),
+                                    .opacity(crate::ui::busy::breathing(window, cx)),
                             )
                         }),
                 )
@@ -959,7 +950,7 @@ impl Chat {
         let (muted, plain, danger) = (theme.muted_foreground, theme.foreground, theme.danger);
         let line: Vec<AnyElement> = match running {
             Some(call) => vec![
-                gpui_component::spinner::Spinner::new()
+                crate::ui::busy::Spinner::new()
                     .xsmall()
                     .color(theme.primary)
                     .into_any_element(),

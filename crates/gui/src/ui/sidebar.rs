@@ -144,7 +144,7 @@ impl Chat {
             // The session a reply is running in says so, on screen or not.
             .child(if self.busy && self.streaming_id == Some(c.id) {
                 // In the age's colour: the primary is lost on the sidebar.
-                gpui_component::spinner::Spinner::new()
+                crate::ui::busy::Spinner::new()
                     .xsmall()
                     .color(cx.theme().muted_foreground)
                     .into_any_element()

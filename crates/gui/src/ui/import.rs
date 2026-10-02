@@ -253,7 +253,7 @@ impl Render for ImportPicker {
                         .gap_2()
                         .text_sm()
                         .text_color(cx.theme().muted_foreground)
-                        .child(gpui_component::spinner::Spinner::new().xsmall())
+                        .child(crate::ui::busy::Spinner::new().xsmall())
                         .child("Importing…"),
                 )
             })

@@ -313,7 +313,7 @@ pub(crate) fn waiting_card(chat: &Entity<Chat>, url: String, cx: &App) -> Div {
                 .gap_2()
                 .items_center()
                 .child(
-                    gpui_component::spinner::Spinner::new()
+                    crate::ui::busy::Spinner::new()
                         .small()
                         .color(cx.theme().primary),
                 )
