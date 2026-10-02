@@ -35,7 +35,7 @@ impl Chat {
         if self.page == Page::Chat {
             shown.push(Region::Composer);
         }
-        if self.browser_preview_shown(cx) {
+        if self.browser_preview_shown(window, cx) {
             shown.push(Region::Preview);
         }
         if self.tab_on_screen(window, cx).is_some() {
