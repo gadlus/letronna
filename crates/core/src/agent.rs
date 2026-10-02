@@ -44,13 +44,18 @@ const SPEAK_UP: &str = "Your previous response had no visible output. Please con
 /// The notice after a short answer that stops at what it is about to do.
 const CONTINUE_NOW: &str = "Continue now.";
 
-/// The notice when a turn that changed files is about to end without
-/// running anything since.
-const VERIFY: &str = "You changed files and have not run anything since. Before saying the \
-    work is done, check it: run the project's build or tests, or say why that cannot be done here.";
+/// The notice when a turn that changed files is about to end with no
+/// command since that ran clean and did more than read.
+const VERIFY: &str = "You changed files and no build or test has passed since. Before saying \
+    the work is done, check it: run the project's build or tests, or say why that cannot be \
+    done here.";
 
 /// Tools whose successful calls change files in the project.
-const EDITS: [&str; 2] = ["write_file", "edit_file"];
+const EDITS: [&str; 3] = ["write_file", "edit_file", crate::patch::APPLY_PATCH];
+
+/// Extensions of files written to be read, such as a report or notes, which
+/// no build or test checks.
+const NOTES: [&str; 2] = ["md", "txt"];
 
 /// The longest answer read as only announcing its next step: room for a
 /// sentence or two before "Now let me...", too little for a finished answer
@@ -169,7 +174,7 @@ pub struct Turn {
     pushed_on: bool,
     /// Whether an answer after unchecked edits is sent back to check them.
     verify: bool,
-    /// A file was changed since the last command ran.
+    /// A file was changed since the last command that checked it.
     edited: bool,
     /// Unchecked edits were sent back this turn.
     asked_to_verify: bool,
@@ -226,7 +231,7 @@ impl Turn {
     }
 
     /// This turn, sending back once an answer that follows file edits with
-    /// no command run since, when `on`.
+    /// no command since that checked them, when `on`.
     pub fn verifying(self, on: bool) -> Self {
         Self { verify: on, ..self }
     }
@@ -393,7 +398,7 @@ impl Turn {
             self.asked_to_verify = true;
             return Ok(Some(nudge(
                 VERIFY,
-                "Files changed with nothing run since; asking it to check them.",
+                "Files changed with no passing check since; asking it to check them.",
             )));
         }
         Ok(None)
@@ -499,13 +504,6 @@ impl Turn {
             Ok(out) => (out, false),
             Err(error) => (error, true),
         };
-        // Any command tried, even one that failed or was declined, leaves
-        // the check to the model; a failed edit changed nothing.
-        if call.name == "run_command" {
-            self.edited = false;
-        } else if !is_error && EDITS.contains(&call.name.as_str()) {
-            self.edited = true;
-        }
         let times = self.repeated(&call, &content, is_error);
         if times >= REPEATS_NOTED {
             content.push_str(&format!(
@@ -520,7 +518,7 @@ impl Turn {
                 call.name
             ));
         }
-        self.results.push(Message {
+        let result = Message {
             role: "tool".into(),
             content,
             tool_call_id: call.id,
@@ -529,7 +527,25 @@ impl Turn {
             is_error,
             files: self.files.take(),
             ..Default::default()
-        });
+        };
+        self.track_edits(&result);
+        self.results.push(result);
+    }
+
+    /// Note what a finished call did to the edits waiting to be checked: an
+    /// edit that changed more than notes adds to them, and a command that ran
+    /// clean and did more than read, or that the user turned down, settles them.
+    fn track_edits(&mut self, result: &Message) {
+        if result.name == "run_command" {
+            // A decline tells the model to ask before trying another way,
+            // which a nudge to go and run something would cut across.
+            let declined = result.is_error && tools::is_declined(&result.content);
+            if declined || checks(result, self.connection.workspace.as_deref()) {
+                self.edited = false;
+            }
+        } else if !result.is_error && EDITS.contains(&result.name.as_str()) && !only_notes(result) {
+            self.edited = true;
+        }
     }
 
     /// How many times this turn the call has now come back with this result;
@@ -663,6 +679,42 @@ fn nudge(notice: &str, why: &'static str) -> Nudge {
         },
         why,
     }
+}
+
+/// Whether a command's result checks the edits before it: it ran to the end
+/// without failing, and did more than read, as `ls` or `git diff` only do.
+// A failing command is still an `Ok` result, told apart only by the
+// `[exit code N]` line it ends with.
+fn checks(result: &Message, workspace: Option<&std::path::Path>) -> bool {
+    if result.is_error || crate::tool_runs::exit_code(result).is_some() {
+        return false;
+    }
+    let args = tools::parse_args_for(&result.name, &result.args).unwrap_or_default();
+    let line = args["command"].as_str().unwrap_or_default();
+    let dialect = crate::command::Dialect::here();
+    crate::command::assess(line, dialect, workspace).risk != crate::command::Risk::ReadOnly
+}
+
+/// Whether every file an edit names is a note, such as a report, rather
+/// than anything a build or test would run.
+fn only_notes(result: &Message) -> bool {
+    let args = tools::parse_args_for(&result.name, &result.args).unwrap_or_default();
+    let paths = match result.name.as_str() {
+        crate::patch::APPLY_PATCH => crate::patch::paths(&args).unwrap_or_default(),
+        _ => args["path"]
+            .as_str()
+            .map(str::to_owned)
+            .into_iter()
+            .collect(),
+    };
+    let note = |path: &String| {
+        let extension = std::path::Path::new(path).extension();
+        let extension = extension.and_then(|e| e.to_str()).unwrap_or_default();
+        NOTES
+            .iter()
+            .any(|note| extension.eq_ignore_ascii_case(note))
+    };
+    !paths.is_empty() && paths.iter().all(note)
 }
 
 /// Whether `answer` is short and ends by announcing a step it did not take,
@@ -1427,6 +1479,122 @@ mod tests {
         let mut turn = verifying_after(&["edit_file"]).verifying(false);
         let mut done = answer(&mut turn, "Done.");
         assert!(matches!(turn.continuation(&mut done), Ok(None)));
+    }
+
+    /// Makes a call to `name` with `arguments` in a round of its own, coming
+    /// back `outcome`.
+    fn made(
+        turn: &mut Turn,
+        name: &str,
+        arguments: serde_json::Value,
+        outcome: Result<&str, &str>,
+    ) {
+        let mut call = call(name);
+        call.arguments = arguments.to_string();
+        turn.begin(vec![call]);
+        turn.finish_call(outcome.map(str::to_owned).map_err(str::to_owned));
+        turn.take_results();
+    }
+
+    /// Whether an answer now is sent back to check the turn's edits.
+    fn sent_back_to_verify(turn: &mut Turn) -> bool {
+        let mut done = answer(turn, "Done.");
+        let nudge = turn.continuation(&mut done).unwrap();
+        nudge.is_some_and(|nudge| nudge.notice.content == VERIFY)
+    }
+
+    #[test]
+    fn a_patch_counts_as_an_edit_to_verify() {
+        let mut turn = verifying_after(&[]);
+        let patch = "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-a\n+b\n*** End Patch";
+        made(
+            &mut turn,
+            "apply_patch",
+            serde_json::json!({ "patch": patch }),
+            Ok("Done"),
+        );
+        assert!(sent_back_to_verify(&mut turn));
+        // One that did not apply changed nothing.
+        let mut turn = verifying_after(&[]);
+        let failed = Err("A hunk did not apply; no file was changed.");
+        made(
+            &mut turn,
+            "apply_patch",
+            serde_json::json!({ "patch": patch }),
+            failed,
+        );
+        assert!(!sent_back_to_verify(&mut turn));
+    }
+
+    #[test]
+    fn listing_files_does_not_count_as_checking_edits() {
+        // A command counts as only reading inside a project with a real place.
+        let in_project = |mut turn: Turn| {
+            turn.connection.workspace = Some(std::env::temp_dir());
+            turn
+        };
+        let mut turn = in_project(verifying_after(&["edit_file"]));
+        made(
+            &mut turn,
+            "run_command",
+            serde_json::json!({ "command": "ls" }),
+            Ok("src"),
+        );
+        assert!(sent_back_to_verify(&mut turn));
+        let mut turn = in_project(verifying_after(&["edit_file"]));
+        let test = serde_json::json!({ "command": "cargo test" });
+        made(&mut turn, "run_command", test, Ok("test result: ok"));
+        assert!(!sent_back_to_verify(&mut turn));
+        // Under another agent's name for the parameter, too.
+        let mut turn = in_project(verifying_after(&["edit_file"]));
+        made(
+            &mut turn,
+            "run_command",
+            serde_json::json!({ "cmd": "ls" }),
+            Ok("src"),
+        );
+        assert!(sent_back_to_verify(&mut turn));
+    }
+
+    #[test]
+    fn a_failed_test_run_does_not_count_as_checking_edits() {
+        let test = serde_json::json!({ "command": "cargo test" });
+        let mut turn = verifying_after(&["edit_file"]);
+        let failed = Ok("test result: FAILED\n[exit code 101]");
+        made(&mut turn, "run_command", test.clone(), failed);
+        assert!(sent_back_to_verify(&mut turn));
+        let mut turn = verifying_after(&["edit_file"]);
+        made(&mut turn, "run_command", test, Err("Timed out after 120s."));
+        assert!(sent_back_to_verify(&mut turn));
+    }
+
+    #[test]
+    fn a_declined_command_leaves_the_check_to_the_user() {
+        let mut turn = verifying_after(&["edit_file"]);
+        let test = serde_json::json!({ "command": "cargo test" });
+        made(&mut turn, "run_command", test, Err(tools::DECLINED));
+        assert!(!sent_back_to_verify(&mut turn));
+    }
+
+    #[test]
+    fn writing_a_report_alone_is_not_sent_back_to_verify() {
+        let mut turn = verifying_after(&[]);
+        let report = serde_json::json!({ "path": "out/REPORT.md", "content": "# Done" });
+        made(&mut turn, "write_file", report, Ok("Wrote out/REPORT.md"));
+        let notes = serde_json::json!({ "file_path": "notes.txt", "old": "a", "new": "b" });
+        made(&mut turn, "edit_file", notes, Ok("Edited notes.txt"));
+        let patch = "*** Begin Patch\n*** Add File: docs/plan.md\n+plan\n*** End Patch";
+        made(
+            &mut turn,
+            "apply_patch",
+            serde_json::json!({ "patch": patch }),
+            Ok("Done"),
+        );
+        assert!(!sent_back_to_verify(&mut turn));
+        // Code changed alongside a report still is.
+        let code = serde_json::json!({ "path": "src/main.rs", "content": "fn main() {}" });
+        made(&mut turn, "write_file", code, Ok("Wrote src/main.rs"));
+        assert!(sent_back_to_verify(&mut turn));
     }
 
     #[test]
