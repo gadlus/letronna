@@ -159,6 +159,43 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
+/// A tool call the model is still writing, as far as it has streamed.
+#[derive(Clone, Default, Debug, PartialEq)]
+pub struct Draft {
+    /// The tool, named as it was offered.
+    pub name: String,
+    /// The `path`, `command` or `url` the arguments give, on one line, once
+    /// that value is whole; empty until then and for a tool that takes none.
+    pub subject: String,
+}
+
+impl Draft {
+    /// What a frontend says while the call is written, as in "Writing
+    /// app.rs…": what is being written, never that it runs, since it has not
+    /// been allowed yet.
+    pub fn label(&self) -> String {
+        let file = || {
+            std::path::Path::new(&self.subject)
+                .file_name()
+                .map_or(self.subject.clone(), |name| {
+                    name.to_string_lossy().into_owned()
+                })
+        };
+        let known = !self.subject.is_empty();
+        match self.name.as_str() {
+            "write_file" if known => format!("Writing {}…", file()),
+            "write_file" => "Writing a file…".to_owned(),
+            "edit_file" if known => format!("Writing an edit to {}…", file()),
+            "edit_file" => "Writing an edit…".to_owned(),
+            "apply_patch" => "Writing a patch…".to_owned(),
+            "run_command" if known => format!("Writing a command: {}…", self.subject),
+            "run_command" => "Writing a command…".to_owned(),
+            name if known => format!("Writing a {name} call: {}…", self.subject),
+            name => format!("Writing a {name} call…"),
+        }
+    }
+}
+
 /// What a provider wants sent back unchanged with a reply on later requests:
 /// the thinking behind it, which it may have signed or encrypted and
 /// otherwise has to work out again or refuses the tool calls that followed.
@@ -306,6 +343,11 @@ pub enum Event {
     CacheMiss(crate::cache_miss::Reason),
     /// Sent once, before `Finished`, when the model asked for tools.
     ToolCalls(Vec<ToolCall>),
+    /// Every call a streamed reply has begun so far, the newest last, sent
+    /// when a call's name or subject first shows -- not as its arguments
+    /// only grow -- so a long write is not taken for thinking. `ToolCalls`
+    /// still hands the calls over whole at the end.
+    Drafting(Vec<Draft>),
     /// Sent once, before `Finished`, when a finished reply came with
     /// something the provider wants back.
     Replay(Replay),
@@ -2776,6 +2818,7 @@ fn read(
             break;
         }
         reply.absorb(parse_event(data)?, stands, sender)?;
+        reply.draft(&extra.tools, sender)?;
     }
     reply.end(done, began, connection, &extra.tools, ticket, sender)
 }
@@ -2807,6 +2850,53 @@ fn join_details(details: &mut Vec<Value>, pieces: Vec<Value>) {
     }
 }
 
+/// How many bytes of a streaming call's arguments are searched for its
+/// subject: room for any path and most commands, while a long file written
+/// ahead of its path is not parsed again at every piece.
+const DRAFT_LOOK: usize = 4_096;
+
+/// What a call being written is about so far: the whole `path`, `command`
+/// or `url` in its arguments, under any name the tools take for them.
+fn subject(name: &str, arguments: &str) -> String {
+    let mut fields = whole_fields(arguments);
+    crate::tools::rename_aliases(name, &mut fields);
+    ["path", "command", "url"]
+        .iter()
+        .find_map(|key| fields[*key].as_str())
+        .map(crate::tools::one_line)
+        .unwrap_or_default()
+}
+
+/// The fields of arguments cut off anywhere that are whole: all of them
+/// once the arguments parse, else those before the last top-level comma.
+fn whole_fields(arguments: &str) -> Value {
+    let (mut depth, mut quoted, mut escaped, mut cut) = (0usize, false, false, None);
+    for (at, byte) in arguments.bytes().enumerate() {
+        if quoted {
+            match byte {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => quoted = false,
+                _ => {}
+            }
+            continue;
+        }
+        match byte {
+            b'"' => quoted = true,
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            b',' if depth == 1 => cut = Some(at),
+            _ => {}
+        }
+    }
+    let parsed = match cut {
+        _ if depth == 0 => serde_json::from_str(arguments),
+        Some(cut) => serde_json::from_str(&format!("{}}}", &arguments[..cut])),
+        None => return Value::Null,
+    };
+    parsed.unwrap_or(Value::Null)
+}
+
 /// A streamed reply as it arrives.
 #[derive(Default)]
 struct Reply {
@@ -2821,6 +2911,11 @@ struct Reply {
     reasoning_details: Vec<Value>,
     finish: Option<FinishReason>,
     think: crate::think::Scrubber,
+    /// Each call begun as last told, by its place in `assembler.calls`,
+    /// with the name it streamed under and how much of its arguments was
+    /// looked through for a subject, so a call that has stopped growing is
+    /// not read again as the others stream.
+    drafts: Vec<(String, usize, Draft)>,
 }
 
 impl Reply {
@@ -2852,9 +2947,9 @@ impl Reply {
         if chunk.finish.is_some() {
             self.finish = chunk.finish;
         }
-        // A tool call is not shown until the stream ends, but one begun is an
-        // answer under way like any text: another go is billed again, and a
-        // server that never sends [DONE] would cut it off again.
+        // A tool call is handed over only once the stream ends, but one begun
+        // is an answer under way like any text: another go is billed again,
+        // and a server that never sends [DONE] would cut it off again.
         *stands |= !chunk.tool_calls.is_empty();
         self.assembler.add(&chunk);
         join_details(&mut self.reasoning_details, chunk.reasoning_details);
@@ -2891,6 +2986,56 @@ impl Reply {
                 .map_err(|_| Failure::new(FailureKind::Stopped, "Chat closed."))?;
         }
         Ok(())
+    }
+
+    /// Send the calls begun so far when one has come by a name or a subject
+    /// since the last chunk, naming them as `offered` beside the tools does.
+    fn draft(
+        &mut self,
+        offered: &[Value],
+        sender: &async_channel::Sender<Event>,
+    ) -> Result<(), Failure> {
+        let mut changed = false;
+        for (at, call) in self.assembler.calls.iter().enumerate() {
+            if at == self.drafts.len() {
+                self.drafts.push(Default::default());
+            }
+            let (streamed, looked, draft) = &mut self.drafts[at];
+            if *streamed != call.name {
+                streamed.clone_from(&call.name);
+                *looked = 0;
+                let mut named = [ToolCall {
+                    name: call.name.clone(),
+                    ..Default::default()
+                }];
+                name_as_offered(&mut named, offered);
+                draft.name = std::mem::take(&mut named[0].name);
+                draft.subject.clear();
+                changed = true;
+            }
+            if draft.subject.is_empty()
+                && !draft.name.is_empty()
+                && call.arguments.len() <= DRAFT_LOOK
+                && call.arguments.len() > *looked
+            {
+                *looked = call.arguments.len();
+                draft.subject = subject(&draft.name, &call.arguments);
+                changed |= !draft.subject.is_empty();
+            }
+        }
+        if !changed {
+            return Ok(());
+        }
+        let drafts = self
+            .drafts
+            .iter()
+            .map(|(_, _, draft)| draft)
+            .filter(|draft| !draft.name.is_empty())
+            .cloned()
+            .collect();
+        sender
+            .send_blocking(Event::Drafting(drafts))
+            .map_err(|_| Failure::new(FailureKind::Stopped, "Chat closed."))
     }
 
     /// Hand over the usage and the calls once the provider stops sending.
@@ -5974,6 +6119,8 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"\"}}]}}]}\n\n",
         )]);
         let rx = ask(endpoint);
+        // Shown as being written, which a second try could not take back.
+        assert!(matches!(rx.recv_blocking().unwrap(), Event::Drafting(_)));
         let Event::Finished(Err(failure)) = rx.recv_blocking().unwrap() else {
             panic!("a tool call already begun was tried again");
         };
@@ -6125,9 +6272,14 @@ mod tests {
              data: [DONE]\n\n",
         );
         assert!(!events.iter().any(|e| matches!(e, Event::ToolCalls(_))));
-        assert!(matches!(events[0], Event::CutOff { in_call: true }));
+        // It was shown being written all the same.
+        let Event::Drafting(drafts) = &events[0] else {
+            panic!("no draft");
+        };
+        assert_eq!(drafts[0].subject, "a.rs");
+        assert!(matches!(events[1], Event::CutOff { in_call: true }));
         // Not an error: the turn goes on and asks for the call again.
-        assert!(matches!(events[1], Event::Finished(Ok(()))));
+        assert!(matches!(events[2], Event::Finished(Ok(()))));
     }
 
     #[test]
@@ -7552,5 +7704,124 @@ mod tests {
         }
         assert_eq!(answer, "It is 4.");
         assert_eq!(thought, "Two and two.");
+    }
+
+    /// Feed `pieces` of calls to a reply as a stream does, one chunk each as
+    /// (index, name, arguments), and collect what it told.
+    fn drafted(pieces: &[(usize, &str, &str)]) -> Vec<Vec<Draft>> {
+        let (sender, events) = async_channel::unbounded();
+        let mut reply = Reply::default();
+        let mut stands = false;
+        for (index, name, arguments) in pieces {
+            let chunk = Chunk {
+                tool_calls: vec![(
+                    Some(*index),
+                    String::new(),
+                    (*name).to_owned(),
+                    (*arguments).to_owned(),
+                    Value::Null,
+                )],
+                ..Default::default()
+            };
+            reply.absorb(chunk, &mut stands, &sender).unwrap();
+            reply.draft(&[], &sender).unwrap();
+        }
+        let mut told = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let Event::Drafting(drafts) = event {
+                told.push(drafts);
+            }
+        }
+        told
+    }
+
+    fn draft(name: &str, subject: &str) -> Draft {
+        Draft {
+            name: name.into(),
+            subject: subject.into(),
+        }
+    }
+
+    #[test]
+    fn a_call_being_written_is_named_by_what_it_does_and_its_file() {
+        let draft = |name: &str, subject: &str| Draft {
+            name: name.into(),
+            subject: subject.into(),
+        };
+        assert_eq!(draft("write_file", "src/app.rs").label(), "Writing app.rs…");
+        assert_eq!(draft("write_file", "").label(), "Writing a file…");
+        assert_eq!(
+            draft("edit_file", "crates/gui/src/ui/mod.rs").label(),
+            "Writing an edit to mod.rs…"
+        );
+        assert_eq!(draft("apply_patch", "").label(), "Writing a patch…");
+        // Not "Running": it has not been allowed, let alone run.
+        assert_eq!(
+            draft("run_command", "cargo test").label(),
+            "Writing a command: cargo test…"
+        );
+        assert_eq!(
+            draft("browse", "https://example.com").label(),
+            "Writing a browse call: https://example.com…"
+        );
+        assert_eq!(draft("todo", "").label(), "Writing a todo call…");
+    }
+
+    #[test]
+    fn a_streaming_call_is_told_by_its_name_then_its_path_and_not_per_piece() {
+        let told = drafted(&[
+            (0, "write_file", ""),
+            (0, "", r#"{"path": "src/app.rs""#),
+            (0, "", r#", "content": "fn main() {"#),
+            (0, "", r#"}\n"}"#),
+            // A gateway's own case for the name, and another agent's name
+            // for the command, as the tool would take them.
+            (1, "RunCommand", r#"{"cmd": "cargo test\n  --quiet", "#),
+            (1, "", r#""background": false}"#),
+        ]);
+        assert_eq!(
+            told,
+            [
+                vec![draft("write_file", "")],
+                vec![draft("write_file", "src/app.rs")],
+                vec![
+                    draft("write_file", "src/app.rs"),
+                    draft("run_command", "cargo test --quiet")
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn a_long_write_is_not_searched_again_for_a_path_that_comes_after_it() {
+        let content = format!(r#"{{"content": "{}"#, "x".repeat(DRAFT_LOOK));
+        let told = drafted(&[
+            (0, "write_file", &content),
+            (0, "", r#"", "path": "a.rs"}"#),
+        ]);
+        assert_eq!(told, [vec![draft("write_file", "")]]);
+    }
+
+    #[test]
+    fn arguments_cut_off_anywhere_give_only_their_whole_fields() {
+        // A comma and a quote inside a string do not end the field.
+        assert_eq!(
+            whole_fields(r#"{"path": "a\",b.rs", "content": "x, y"#),
+            json!({"path": "a\",b.rs"})
+        );
+        // A field is whole once a comma at the top follows it.
+        assert_eq!(whole_fields(r#"{"path": "a.rs""#), Value::Null);
+        assert_eq!(
+            whole_fields(r#"{"edits": [{"old": "a", "new": "b"}], "path": "x.rs", "mo"#),
+            json!({"edits": [{"old": "a", "new": "b"}], "path": "x.rs"})
+        );
+        // Or once the arguments end.
+        assert_eq!(
+            whole_fields(r#"{"url": "https://a.dev"}"#),
+            json!({"url": "https://a.dev"})
+        );
+        assert_eq!(whole_fields(""), Value::Null);
+        assert_eq!(subject("write_file", r#"{"file_path": "b.rs", "#), "b.rs");
+        assert_eq!(subject("todo", r#"{"items": [], "#), "");
     }
 }
