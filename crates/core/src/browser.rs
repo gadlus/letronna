@@ -171,6 +171,41 @@ const CHECKS: &[&str] = &[
     "access denied",
     "checking your browser",
 ];
+/// The titles in `CHECKS` of a check that stands in front of the page only
+/// until it is passed, which a call waits on. The rest may name a page that
+/// stays -- a block no one gets past, or an article about captchas.
+const PASSING_CHECKS: &[&str] = &["just a moment", "checking your browser"];
+/// How long a call waits for the user to get past a site's check before it
+/// gives up and has the model ask them: a picture puzzle takes a person a
+/// minute or two, and three is as long as a turn should stand still.
+const CHECK_WAIT: Duration = Duration::from_secs(180);
+/// How often a wait for a site's check looks for a stop, and how long it
+/// gathers the page's events before looking at the check again: as often
+/// as a call that may be stopped looks.
+const CHECK_LOOK: Duration = Duration::from_millis(100);
+/// The least a check's challenge shows of itself in the view to count, in
+/// CSS pixels each way: a picture puzzle is some 300 across, and one put
+/// away is hidden, moved off the view, or squeezed to nothing.
+const CHALLENGE_SIZE: u32 = 100;
+/// The frames that may hold a check's challenge, picked out by address
+/// before `challenge_frame` reads it: reCAPTCHA's and hCaptcha's. Arkose's
+/// is left out, as its frame reads the same with its puzzle up or passed.
+const CHALLENGE_FRAMES: &str = "iframe[src*='/recaptcha/'], iframe[src*='hcaptcha.com']";
+/// The page's title, whether it is still being read in, and the addresses
+/// of the frames `frames` picks out that show at least `least` CSS pixels
+/// each way within the view, neither hidden nor see-through. Run in a
+/// script context of our own, which a page's anti-bot script cannot watch.
+const CHECK_SIGNS: &str = "(frames, least) => {
+  const shown = frame => {
+    const box = frame.getBoundingClientRect();
+    const wide = Math.min(box.right, innerWidth) - Math.max(box.left, 0);
+    const tall = Math.min(box.bottom, innerHeight) - Math.max(box.top, 0);
+    return wide >= least && tall >= least && typeof frame.checkVisibility === 'function'
+      && frame.checkVisibility({opacityProperty: true, visibilityProperty: true, checkOpacity: true, checkVisibilityCSS: true});
+  };
+  return {title: document.title, loading: document.readyState === 'loading',
+          frames: [...document.querySelectorAll(frames)].filter(shown).map(frame => frame.src)};
+}";
 
 /// Keys by the names a model uses: the key, its code, its Windows key code,
 /// and what it types.
@@ -451,7 +486,7 @@ impl Tool for Browse {
                  screenshot, pdf, hover or wait."
             )),
         };
-        told_downloads(ctx.conversation, done)
+        told_downloads(ctx.conversation, past_check(ctx, done))
     }
 }
 
@@ -519,7 +554,7 @@ impl Tool for UsePage {
             Some("batch") => batch(args, ctx),
             _ => Self::on_page(args, ctx, after(args)),
         };
-        told_downloads(ctx.conversation, done)
+        told_downloads(ctx.conversation, past_check(ctx, done))
     }
 }
 
@@ -1892,6 +1927,247 @@ fn bot_check(title: &str) -> bool {
     CHECKS.iter().any(|check| title.contains(check))
 }
 
+/// Whether a page's title says it is a site's check that goes once passed.
+fn passing_check(title: &str) -> bool {
+    let title = title.to_lowercase();
+    PASSING_CHECKS.iter().any(|check| title.contains(check))
+}
+
+/// Whether a frame loaded from `url` holds a check's challenge -- the part a
+/// person must do, such as a picture puzzle -- rather than the box or badge
+/// a check keeps on the page all along, and after it is passed.
+fn challenge_frame(url: &str) -> bool {
+    let Some(url) = reqwest::Url::parse(url)
+        .ok()
+        .filter(|url| url.scheme() == "https")
+    else {
+        return false;
+    };
+    let host = url.host_str().unwrap_or_default();
+    let under = |site: &str| host == site || host.ends_with(&format!(".{site}"));
+    let path = url.path();
+    if under("google.com") || under("recaptcha.net") {
+        return path.starts_with("/recaptcha/") && path.ends_with("/bframe");
+    }
+    // Its box and its puzzle come from one address, told apart after the #.
+    let fragment = url.fragment().unwrap_or_default();
+    under("hcaptcha.com") && fragment.split('&').any(|part| part == "frame=challenge")
+}
+
+/// Whether what `CHECK_SIGNS` read says the page is a site's check that goes
+/// once passed: by its title, or by a challenge shown in one of its frames.
+fn challenged(signs: &Value) -> bool {
+    let frames = signs["frames"].as_array().map(Vec::as_slice);
+    passing_check(signs["title"].as_str().unwrap_or_default())
+        || (frames.unwrap_or_default().iter())
+            .filter_map(Value::as_str)
+            .any(challenge_frame)
+}
+
+/// What tells whether the page in `tab` is a site's check, as `CHECK_SIGNS`
+/// reads it from a script context of our own; `None` when it cannot say
+/// within `LOOK_TIME`, as a page between two documents cannot.
+fn check_signs(tab: &mut Tab, stop: &Cancel) -> Option<Value> {
+    let asked = json!({"frameId": tab.id, "worldName": WORLD});
+    let world = "Page.createIsolatedWorld";
+    let made: Value = (tab.call_in(None, world, asked, LOOK_TIME, Some(stop))).ok()?;
+    let expression = format!(
+        "({CHECK_SIGNS})({}, {CHALLENGE_SIZE})",
+        Value::from(CHALLENGE_FRAMES)
+    );
+    let asked = json!({"expression": expression, "contextId": made["executionContextId"],
+                       "returnByValue": true});
+    let said: Value = (tab.call_in(None, "Runtime.evaluate", asked, LOOK_TIME, Some(stop))).ok()?;
+    Some(said["result"]["value"].clone()).filter(Value::is_object)
+}
+
+/// What the model is told of a site's check the call did not wait on: to
+/// ask the user to get past it, and where.
+fn ask_past_check(headless: bool) -> String {
+    match headless {
+        true => "This looks like the site's bot check. Ask the user to get past it in the \
+                 browser panel beside the chat in Letronna's window, then look again. In the \
+                 terminal, where there is no panel, LETRONNA_BROWSER_HEADLESS=0 gives the \
+                 browser a window of its own for them to do it in."
+            .into(),
+        false => "This looks like the site's bot check. Ask the user to get past it in the \
+                  browser window, then look again."
+            .into(),
+    }
+}
+
+/// What the model is told when a site's check outlasted `CHECK_WAIT`: to
+/// ask the user to get past it, and where.
+fn check_stayed(headless: bool) -> String {
+    let place = match headless {
+        true => "the browser panel beside the chat in Letronna's window",
+        false => "the browser window",
+    };
+    format!(
+        "The site's check was still there after {} minutes; ask the user to get past it in \
+         {place}, then look again.",
+        CHECK_WAIT.as_secs() / 60
+    )
+}
+
+/// What the model is told when a site's check went while the call waited:
+/// how long that took, and the page it is on now, if that could be read.
+fn check_went(waited: Duration, page: Option<&Page>) -> String {
+    let took = format!(
+        "Waited {:.0} s for the site's check, which is gone",
+        waited.as_secs_f64()
+    );
+    match page {
+        Some(page) if page.title.is_empty() => format!("{took}; the page is now {}.", page.url),
+        Some(page) => format!("{took}; the page is now {} at {}.", page.title, page.url),
+        None => format!("{took}."),
+    }
+}
+
+/// The browser and tab of a conversation's page, when it was last listed
+/// showing a site's check someone can get past; forgotten as it is told.
+fn check_seen(conversation: u64) -> Option<(cdp::Reach, String)> {
+    let owner = owner_of(conversation);
+    let mut all = lock().ok()?;
+    let session = (all.sessions.iter_mut()).find(|session| session.owner == owner)?;
+    let seen = std::mem::take(&mut session.check_seen);
+    seen.then(|| (session.reach.clone(), session.tab.id.clone()))
+}
+
+/// A browser tool's result, `done`, and when the page it ended on is a
+/// site's check someone can get past, what came of waiting for them to: a
+/// line saying how long it took, or to ask them once it outlasted the wait,
+/// then what changed since the check's page. The browser is free meanwhile,
+/// for the window and other conversations.
+fn past_check(ctx: &ToolContext, done: Result<String, String>) -> Result<String, String> {
+    let seen = check_seen(ctx.conversation);
+    let listed = done?;
+    let Some((reach, tab)) = seen else {
+        return Ok(listed);
+    };
+    let waited = wait_past_check(&reach, &tab, CHECK_WAIT, &ctx.cancel);
+    if let Err(stopped) = &waited
+        && stopped == cdp::STOPPED
+    {
+        return Err(stopped.clone());
+    }
+    let said = |page: Option<&Page>| match &waited {
+        Ok(Some(took)) => check_went(*took, page),
+        Ok(None) => check_stayed(reach.headless),
+        // The page could not be watched, so nothing was waited for.
+        Err(_) => ask_past_check(reach.headless),
+    };
+    let after = with_session(ctx, |session| {
+        let page = session.read(false)?;
+        let shown = session.changes(&page, Vec::new());
+        // Waited for already, and said so here.
+        session.check_seen = false;
+        Ok(format!("{}\n{}", said(Some(&page)), shown?))
+    });
+    let after = after
+        .unwrap_or_else(|why| format!("{}\nThe page could not be listed after: {why}", said(None)));
+    Ok(format!("{listed}\n\n{after}"))
+}
+
+/// Wait, on a connection of its own to tab `id`, until the site's check on
+/// its page has gone, `limit` has passed or the user stops, the window told
+/// meanwhile that the agent waits, and since when. How long the check took
+/// to go, or `None` when it was still there.
+fn wait_past_check(
+    reach: &cdp::Reach,
+    id: &str,
+    limit: Duration,
+    stop: &Cancel,
+) -> Result<Option<Duration>, String> {
+    let since = Instant::now();
+    let mut tab = reach.open(id)?;
+    // What the page asks meanwhile is the user's to answer, in the window.
+    tab.leaves_dialogs = true;
+    tab.call::<Ignored>("Page.enable", json!({}))?;
+    watch::waiting_on_check(id, Some(since));
+    let gone = check_gone(&mut tab, since, limit, stop);
+    watch::waiting_on_check(id, None);
+    Ok(gone?.then(|| since.elapsed()))
+}
+
+/// Whether the site's check on `tab`'s page goes before `limit` has passed
+/// since `since`: looked at now, again only once the page has said something
+/// that may have taken it away, and a last time at the end. A stop ends the
+/// wait at once.
+fn check_gone(
+    tab: &mut Tab,
+    since: Instant,
+    limit: Duration,
+    stop: &Cancel,
+) -> Result<bool, String> {
+    let passed = |signs: &Value| signs["loading"] == false && !challenged(signs);
+    let mut look = true;
+    loop {
+        let over = since.elapsed() >= limit;
+        if (look || over) && !stop.is_set() {
+            if check_signs(tab, stop).is_some_and(|signs| passed(&signs)) {
+                return Ok(true);
+            }
+            if !over {
+                watch_check(tab, stop);
+            }
+        }
+        if stop.is_set() {
+            return Err(cdp::STOPPED.into());
+        }
+        if over {
+            return Ok(false);
+        }
+        // A long wait keeps its browser from being closed as idle.
+        mark_agent_use();
+        let heard = std::cell::Cell::new(false);
+        let left = limit.saturating_sub(since.elapsed());
+        // Read for the whole look, so a busy page's events come to one look.
+        tab.wait(CHECK_LOOK.min(left), |event| {
+            heard.set(heard.get() || may_end_check(event));
+            false
+        })?;
+        // Counted: kept, they would be counted again.
+        tab.events.clear();
+        look = heard.get();
+    }
+}
+
+/// Have the browser tell `tab` of changes to what a site's check on its
+/// page hangs on: its title, and the frames that may hold a challenge with
+/// every element around them, as one is put away by hiding what holds it.
+fn watch_check(tab: &mut Tab, stop: &Cancel) {
+    // Asked each time: a new document's elements are new ones.
+    let asked = json!({"depth": 0});
+    let Ok(document) = tab.call_in::<Value>(None, "DOM.getDocument", asked, LOOK_TIME, Some(stop))
+    else {
+        return;
+    };
+    let asked = json!({"nodeId": document["root"]["nodeId"],
+                       "selector": format!("title, {CHALLENGE_FRAMES}")});
+    let _ = tab.call_in::<Ignored>(None, "DOM.querySelectorAll", asked, LOOK_TIME, Some(stop));
+}
+
+/// Whether `event` may have taken a site's check away: the page loaded or
+/// moved within itself, lost a frame, or changed around what `watch_check`
+/// asked about -- not the browser handing over the elements it asked for.
+fn may_end_check(event: &Event) -> bool {
+    matches!(
+        event.method.as_str(),
+        "Page.loadEventFired"
+            | "Page.frameStoppedLoading"
+            | "Page.navigatedWithinDocument"
+            | "Page.frameDetached"
+            | "DOM.documentUpdated"
+            | "DOM.attributeModified"
+            | "DOM.attributeRemoved"
+            | "DOM.inlineStyleInvalidated"
+            | "DOM.childNodeInserted"
+            | "DOM.childNodeRemoved"
+            | "DOM.characterDataModified"
+    )
+}
+
 /// The address to open, or why not. A bare `example.com` gets https.
 pub(crate) fn address(raw: &str, secrets: &[String]) -> Result<String, String> {
     let raw = raw.trim();
@@ -2077,6 +2353,9 @@ struct Session {
     inside: Option<Inside>,
     /// The stop of the tool call using the session now.
     stop: Cancel,
+    /// Whether the page last listed showed a site's check someone can get
+    /// past, for the call to wait on before it ends.
+    check_seen: bool,
 }
 
 /// The listing the model last saw of each tab, so that an action shows only
@@ -3073,6 +3352,7 @@ impl Session {
             seen: None,
             inside: None,
             stop: Cancel::default(),
+            check_seen: false,
         };
         if session.downloads_off.is_some() {
             session.refuse_downloads();
@@ -3751,22 +4031,34 @@ impl Session {
     }
 
     /// `notes` on the page with what else there is to say of it: the
-    /// questions it asked, and whether it is a site's bot check.
+    /// questions it asked, and whether it is a site's bot check -- which the
+    /// call waits on when it goes once passed and someone can get past it,
+    /// and has the model ask the user about otherwise.
     fn noted(&mut self, page: &Page, notes: &mut Vec<String>) {
         notes.append(&mut self.tab.dialogs);
-        if bot_check(&page.title) {
-            notes.push(if self.reach.headless {
-                "This looks like the site's bot check. Ask the user to get past it in the \
-                 browser panel beside the chat in Letronna's window, then look again. In the \
-                 terminal, where there is no panel, LETRONNA_BROWSER_HEADLESS=0 gives the \
-                 browser a window of its own for them to do it in."
-                    .into()
-            } else {
-                "This looks like the site's bot check. Ask the user to get past it in the \
-                 browser window, then look again."
-                    .into()
-            });
+        let passing = passing_check(&page.title) || self.challenge_shown();
+        self.check_seen = passing && self.passable();
+        if (passing || bot_check(&page.title)) && !self.check_seen {
+            notes.push(ask_past_check(self.reach.headless));
         }
+    }
+
+    /// Whether someone can get past a site's check while the agent waits:
+    /// the browser has a window of its own, or Letronna's window watches
+    /// this session's page now.
+    fn passable(&self) -> bool {
+        !self.reach.headless || (watch::watched() && self.on_screen())
+    }
+
+    /// Whether the page shows a check's challenge in a frame, as far as can
+    /// be told. Only a frame from another site can be one, which the browser
+    /// runs apart and tells of; a page with none, as most are, is not asked.
+    fn challenge_shown(&mut self) -> bool {
+        if self.tab.frames.is_empty() {
+            return false;
+        }
+        let stop = self.stop.clone();
+        check_signs(&mut self.tab, &stop).is_some_and(|signs| challenged(&signs))
     }
 
     /// Where a page too long to show whole is read from. Scrolled, that is
@@ -5298,6 +5590,279 @@ mod tests {
     }
 
     #[test]
+    fn a_challenge_frame_counts_as_a_check() {
+        let puzzles = [
+            "https://www.google.com/recaptcha/api2/bframe?hl=en&v=v1&k=key",
+            "https://www.recaptcha.net/recaptcha/enterprise/bframe?k=key",
+            "https://newassets.hcaptcha.com/captcha/v1/abc/static/hcaptcha.html#frame=challenge&id=0x1",
+        ];
+        for puzzle in puzzles {
+            assert!(challenge_frame(puzzle), "{puzzle}");
+        }
+        let shown = json!({"title": "Sign in", "loading": false, "frames": [puzzles[0]]});
+        assert!(challenged(&shown));
+    }
+
+    #[test]
+    fn an_invisible_badge_does_not_stall_the_agent() {
+        // The badge, the box to tick, Turnstile's box -- each stays on the
+        // page once passed -- Arkose's frame, which reads the same with its
+        // puzzle up or passed, and addresses only made to look like them.
+        let kept = [
+            "https://www.google.com/recaptcha/api2/anchor?ar=1&k=key&size=invisible",
+            "https://www.google.com/recaptcha/api2/anchor?ar=1&k=key&size=normal",
+            "https://newassets.hcaptcha.com/captcha/v1/abc/static/hcaptcha.html#frame=checkbox&id=0x1",
+            "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/b/turnstile/if/ov2/av0/rcv/a/0x4AAA/auto/normal/auto/",
+            "https://client-api.arkoselabs.com/v2/KEY/enforcement.abc.html",
+            "https://www.google.com.shop.test/recaptcha/api2/bframe",
+            "https://shop.test/recaptcha/api2/bframe",
+            "https://notarkoselabs.com/fc/gc/",
+            "http://www.google.com/recaptcha/api2/bframe",
+        ];
+        for frame in kept {
+            assert!(!challenge_frame(frame), "{frame}");
+        }
+        let page = json!({"title": "Shop", "loading": false, "frames": kept});
+        assert!(!challenged(&page));
+    }
+
+    #[test]
+    fn a_check_is_told_by_its_title_or_by_a_puzzle_shown_in_another_sites_frame() {
+        let listed = |session: &mut Session| {
+            // A browser with a window of its own, where the user can get
+            // past it: the call waits, rather than have the model ask.
+            session.reach = cdp::Reach::on_port(1, false);
+            let page = session.read(false).unwrap();
+            let shown = session.show(&page, &View::default(), Vec::new()).unwrap();
+            assert!(!shown.contains("bot check"), "{shown}");
+            session.check_seen
+        };
+        // By its title alone. A page with no frame from another site, as
+        // most are, is asked nothing more.
+        for (title, check) in [("Just a moment...", true), ("Shop", false)] {
+            let (mut session, server) = fake_session(move |method, _| {
+                let answer = match method {
+                    "Accessibility.getFullAXTree" => json!({"nodes": [{"nodeId": "1",
+                        "role": {"value": "RootWebArea"}, "name": {"value": title},
+                        "backendDOMNodeId": 1, "childIds": []}]}),
+                    _ => json!({}),
+                };
+                (Vec::new(), answer)
+            });
+            assert_eq!(listed(&mut session), check, "{title}");
+            drop(session);
+            let heard = server.join().unwrap();
+            assert!(!heard.iter().any(|m| m == "Runtime.evaluate"), "{heard:?}");
+        }
+        // By a puzzle shown in another site's frame; not by one put away,
+        // nor by a badge.
+        let shown = Arc::new(Mutex::new(Vec::<&str>::new()));
+        let framed = framed_page(Arc::new(Mutex::new("L1")), Arc::default(), [300, 100], 99);
+        let signs = shown.clone();
+        let (mut session, server) = fake_frames_session(move |session, method, params| {
+            let expression = params["expression"].as_str().unwrap_or_default();
+            if session.is_none() && method == "Runtime.evaluate" && expression.contains("least") {
+                let frames = signs.lock().unwrap().clone();
+                let said = json!({"title": "Shop", "loading": false, "frames": frames});
+                return (Vec::new(), json!({"result": {"value": said}}));
+            }
+            framed(session, method, params)
+        });
+        for (frames, check) in [
+            (
+                vec!["https://www.google.com/recaptcha/api2/bframe?k=key"],
+                true,
+            ),
+            (vec![], false),
+            (
+                vec!["https://www.google.com/recaptcha/api2/anchor?k=key"],
+                false,
+            ),
+        ] {
+            *shown.lock().unwrap() = frames.clone();
+            assert_eq!(listed(&mut session), check, "{frames:?}");
+        }
+        drop(session);
+        server.join().unwrap();
+    }
+
+    /// What a session lists of a page titled `title`, with no frame from
+    /// another site, and whether the call would wait on a site's check there,
+    /// in a browser with no window of its own when `headless`.
+    fn check_listed(title: &'static str, headless: bool) -> (String, bool) {
+        let (mut session, server) = fake_session(move |method, _| {
+            let answer = match method {
+                "Accessibility.getFullAXTree" => json!({"nodes": [{"nodeId": "1",
+                    "role": {"value": "RootWebArea"}, "name": {"value": title},
+                    "backendDOMNodeId": 1, "childIds": []}]}),
+                _ => json!({}),
+            };
+            (Vec::new(), answer)
+        });
+        session.reach = cdp::Reach::on_port(1, headless);
+        let page = session.read(false).unwrap();
+        let shown = session.show(&page, &View::default(), Vec::new()).unwrap();
+        let waits = session.check_seen;
+        drop(session);
+        server.join().unwrap();
+        (shown, waits)
+    }
+
+    #[test]
+    fn a_page_only_titled_like_a_check_is_not_waited_on() {
+        // An article about captchas, or a block no one gets past, stays as
+        // it is: the model asks the user at once, as before.
+        for title in ["CAPTCHA - Wikipedia", "Access Denied"] {
+            let (shown, waits) = check_listed(title, false);
+            assert!(!waits, "{title}");
+            let asked = "Ask the user to get past it in the browser window";
+            assert!(shown.contains(asked), "{shown}");
+        }
+    }
+
+    #[test]
+    fn a_check_in_a_session_the_window_does_not_show_is_not_waited_on() {
+        // The window has said its screen's scale, as it does when it starts,
+        // but watches another conversation's page or none: no one is there
+        // to get past it, so the model asks at once.
+        crate::watch::screen(1.5);
+        let (shown, waits) = check_listed("Just a moment...", true);
+        assert!(!waits);
+        assert!(shown.contains("browser panel beside the chat"), "{shown}");
+    }
+
+    /// A stand-in tab whose page is a site's check while `title` says so, as
+    /// each look at it reads, and which says what the test sends it the
+    /// moment it is sent, as a page does. Its browser, and how many looks
+    /// there were.
+    fn checked_tab(
+        title: Arc<Mutex<&'static str>>,
+    ) -> (cdp::Reach, std::sync::mpsc::Sender<Value>, Arc<AtomicU64>) {
+        use tungstenite::Message;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let reach = cdp::Reach::on_port(listener.local_addr().unwrap().port(), true);
+        let (say, said) = std::sync::mpsc::channel::<Value>();
+        let looks = Arc::new(AtomicU64::new(0));
+        let counted = looks.clone();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            let _ = (socket.get_ref()).set_read_timeout(Some(Duration::from_millis(5)));
+            loop {
+                for event in said.try_iter() {
+                    if socket.send(Message::text(event.to_string())).is_err() {
+                        return;
+                    }
+                }
+                let text = match socket.read() {
+                    Ok(Message::Text(text)) => text,
+                    Ok(_) => continue,
+                    Err(tungstenite::Error::Io(e))
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Err(_) => return,
+                };
+                let request: Value = serde_json::from_str(text.as_str()).unwrap();
+                let result = match request["method"].as_str().unwrap_or_default() {
+                    "Page.createIsolatedWorld" => json!({"executionContextId": 7}),
+                    "Runtime.evaluate" => {
+                        counted.fetch_add(1, Ordering::Relaxed);
+                        let title = *title.lock().unwrap();
+                        let signs = json!({"title": title, "loading": false, "frames": []});
+                        json!({"result": {"value": signs}})
+                    }
+                    "DOM.getDocument" => json!({"root": {"nodeId": 1}}),
+                    // The elements asked for are handed over, which is no
+                    // change to the page.
+                    "DOM.querySelectorAll" => {
+                        let handed = json!({"method": "DOM.setChildNodes",
+                                            "params": {"parentId": 1, "nodes": []}});
+                        let _ = socket.send(Message::text(handed.to_string()));
+                        json!({"nodeIds": [2, 3]})
+                    }
+                    _ => json!({}),
+                };
+                let answer = json!({"id": request["id"], "result": result});
+                if socket.send(Message::text(answer.to_string())).is_err() {
+                    return;
+                }
+            }
+        });
+        (reach, say, looks)
+    }
+
+    #[test]
+    fn the_wait_ends_when_the_check_is_gone() {
+        let title = Arc::new(Mutex::new("Just a moment..."));
+        let (reach, say, looks) = checked_tab(title.clone());
+        let waiting = std::thread::spawn(move || {
+            wait_past_check(&reach, "T1", Duration::from_secs(10), &Cancel::default())
+        });
+        // Looked at once, then only when the page says something that may
+        // have taken the check away: time passing, the elements handed
+        // over, or a page saying something else, are no reason to look.
+        std::thread::sleep(Duration::from_millis(400));
+        let idle = json!({"method": "Page.lifecycleEvent", "params": {"name": "networkIdle"}});
+        say.send(idle).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(looks.load(Ordering::Relaxed), 1);
+        // Got past, the page loads what the check stood in front of.
+        *title.lock().unwrap() = "Shop";
+        say.send(json!({"method": "Page.loadEventFired", "params": {}}))
+            .unwrap();
+        let took = waiting.join().unwrap().unwrap().expect("the check went");
+        assert!(
+            took >= Duration::from_millis(700) && took < Duration::from_secs(5),
+            "{took:?}"
+        );
+        assert_eq!(looks.load(Ordering::Relaxed), 2);
+        let went = check_went(Duration::from_millis(23_200), None);
+        assert_eq!(went, "Waited 23 s for the site's check, which is gone.");
+    }
+
+    #[test]
+    fn a_check_still_there_when_the_wait_is_up_is_said_to_be() {
+        let title = Arc::new(Mutex::new("Checking your browser..."));
+        let (reach, _say, looks) = checked_tab(title);
+        let started = Instant::now();
+        let limit = Duration::from_millis(500);
+        let waited = wait_past_check(&reach, "T1", limit, &Cancel::default());
+        assert_eq!(waited, Ok(None));
+        assert!(started.elapsed() >= limit);
+        // Once at the start and once at the end, and not in between.
+        assert_eq!(looks.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            check_stayed(true),
+            "The site's check was still there after 3 minutes; ask the user to get past it in \
+             the browser panel beside the chat in Letronna's window, then look again."
+        );
+    }
+
+    #[test]
+    fn a_stop_ends_the_wait_for_a_check_at_once() {
+        let (reach, _say, _) = checked_tab(Arc::new(Mutex::new("Just a moment...")));
+        let stop = Cancel::default();
+        let stopper = stop.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            stopper.set();
+        });
+        let started = Instant::now();
+        let waited = wait_past_check(&reach, "T1", CHECK_WAIT, &stop);
+        assert_eq!(waited, Err(cdp::STOPPED.to_owned()));
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_millis(300) + CHECK_LOOK * 3,
+            "{took:?}"
+        );
+    }
+
+    #[test]
     fn a_click_lands_in_the_middle_of_what_can_be_clicked() {
         let quads = json!([[0, 0, 0, 0, 0, 0, 0, 0], [8, 184, 46, 184, 46, 206, 8, 206]]);
         assert_eq!(centre(&quads), Some((27., 195.)));
@@ -6514,6 +7079,7 @@ mod tests {
             seen: None,
             inside: None,
             stop: Cancel::default(),
+            check_seen: false,
         };
         (session, server)
     }
@@ -8021,6 +8587,26 @@ mod tests {
                      <h1 style=\"height:3000px\">Top</h1><p>Bottom</p>"
                 }
                 "/three" => "<!doctype html><title>Three</title><h1>Page three</h1>",
+                // Puzzles from this site, as a check's would be shown: in
+                // view, hidden, off the view, a small box, and see-through.
+                "/challenges" => {
+                    "<!doctype html><title>Puzzles</title>\
+                     <iframe src=\"/recaptcha/api2/bframe?k=1\" style=\"width:400px;height:500px\"></iframe>\
+                     <div style=\"visibility:hidden\"><iframe src=\"/recaptcha/api2/bframe?k=2\" style=\"width:400px;height:500px\"></iframe></div>\
+                     <div style=\"position:absolute;top:-10000px\"><iframe src=\"/recaptcha/api2/bframe?k=3\" style=\"width:400px;height:500px\"></iframe></div>\
+                     <iframe src=\"/recaptcha/api2/anchor?k=4\" style=\"width:304px;height:78px\"></iframe>\
+                     <div style=\"opacity:0\"><iframe src=\"/recaptcha/api2/bframe?k=5\" style=\"width:400px;height:500px\"></iframe></div>"
+                }
+                // A site's check that loads the page it stands in front of
+                // once passed, and one that only changes its title.
+                "/check" => {
+                    "<!doctype html><title>Just a moment...</title><p>Checking\
+                     <script>setTimeout(() => location.href = '/two', 2500)</script>"
+                }
+                "/puzzle" => {
+                    "<!doctype html><title>Checking your browser</title><p>Pick the boats\
+                     <script>setTimeout(() => document.title = 'Shop', 2500)</script>"
+                }
                 // A sign-in window, which closes itself when done.
                 "/closes" => {
                     "<!doctype html><title>Signing in</title>\
@@ -8916,6 +9502,38 @@ mod tests {
             let refused =
                 browse(json!({"action": "open", "url": format!("http://{closed}/")})).unwrap_err();
             assert!(refused.contains("ERR_CONNECTION_REFUSED"), "{refused}");
+
+            // Only a puzzle in view, neither hidden nor see-through, and as
+            // big as one, is read as shown.
+            browse(json!({"action": "open", "url": format!("{site}/challenges")})).unwrap();
+            let signs = format!(
+                "JSON.stringify(({CHECK_SIGNS})({}, {CHALLENGE_SIZE}).frames)",
+                Value::from(CHALLENGE_FRAMES)
+            );
+            let shown = use_page(json!({"action": "eval", "script": signs})).unwrap();
+            assert_eq!(shown, format!("[\"{site}/recaptcha/api2/bframe?k=1\"]"));
+            // A site's check is waited on until it goes, the window told
+            // meanwhile: whether it loads the page it stood in front of, or
+            // only changes its title.
+            let watching = crate::watch::watch();
+            std::thread::sleep(Duration::from_millis(300));
+            let check = |watching: &Watching| {
+                sight(watching, |sight| match sight {
+                    Sight::Check(since) => Some(since),
+                    _ => None,
+                })
+            };
+            for (path, now) in [("/check", "Two"), ("/puzzle", "Shop")] {
+                let open = json!({"action": "open", "url": format!("{site}{path}")});
+                let page = timed("wait for a check", || browse(open)).unwrap();
+                println!("{page}\n");
+                let went =
+                    format!("s for the site's check, which is gone; the page is now {now} at");
+                assert!(page.contains(&went), "{page}");
+                assert!(check(&watching).is_some());
+                assert!(check(&watching).is_none());
+            }
+            drop(watching);
 
             // Each conversation has a browser of its own: a cookie one sets,
             // as a sign-in does, another never sees, and one let go of is
