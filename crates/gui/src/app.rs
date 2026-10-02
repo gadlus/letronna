@@ -1252,16 +1252,16 @@ impl Chat {
     }
 
     pub(crate) fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // A new session usually continues on the same project.
-        let workspace = self.store.conversations[self.store.active]
-            .workspace
-            .clone();
+        // A new session usually continues on the same project. There may
+        // be no session at all: the last one was just deleted.
+        let workspace = (self.store.conversations.get(self.store.active))
+            .and_then(|conversation| conversation.workspace.clone());
         // One nothing was written in yet is opened again rather than another
         // piled up beside it: the one on screen, otherwise the newest.
         let conversations = &self.store.conversations;
         let index = std::iter::once(self.store.active)
             .chain((0..conversations.len()).rev())
-            .find(|&ix| untouched(&conversations[ix]))
+            .find(|&ix| conversations.get(ix).is_some_and(untouched))
             .unwrap_or(conversations.len());
         self.leave_for(index);
         if index == self.store.conversations.len() {
@@ -3809,8 +3809,10 @@ impl Chat {
     /// Stops the memory review of the session on screen when the user goes
     /// to the one at `index` instead.
     pub(crate) fn leave_for(&self, index: usize) {
-        if index != self.store.active {
-            self.stop_review(self.store.conversations[self.store.active].id);
+        if index != self.store.active
+            && let Some(leaving) = self.store.conversations.get(self.store.active)
+        {
+            self.stop_review(leaving.id);
         }
     }
 
