@@ -31,6 +31,9 @@ crossterm = { version = "0.29", default-features = false, features = [
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
 
+[build-dependencies]
+embed-resource = "3"
+
 [dev-dependencies]
 # The SHA-256 of an update staged by hand, which the updater checks before it
 # installs one. Already in the build for core.

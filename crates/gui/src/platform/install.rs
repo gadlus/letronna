@@ -77,23 +77,25 @@ mod windows_impl {
     /// REG_EXPAND_SZ and broadcasts the change itself, and getting either of
     /// those wrong by hand damages an environment variable people depend on.
     fn install_cli(current: &Path, dir: &Path) {
-        let Some(beside) = current.parent().map(|d| d.join("letronna.exe")) else {
-            return;
-        };
-        if !beside.exists() {
-            return;
-        }
+        // Beside the installed window, `letronna.exe` is the window itself,
+        // for the same reason as below.
+        let beside = current
+            .parent()
+            .map(|d| d.join("letronna.exe"))
+            .filter(|beside| beside.exists() && !same_file(beside, current));
         // A `bin` subfolder, not beside the window: Windows compares file
         // names without case, so `letronna.exe` and `Letronna.exe` are one
         // file and the terminal binary would land on top of the window. It is
         // also the shape everything else on PATH here already uses.
         let bin = dir.join("bin");
-        if std::fs::create_dir_all(&bin).is_err() {
+        if beside.is_some() && std::fs::create_dir_all(&bin).is_err() {
             return;
         }
-        let cli = bin.join("letronna.exe");
-        if !same_file(&beside, &cli) {
-            let _ = std::fs::copy(&beside, &cli);
+        // With no new terminal here, a terminal an older install left is
+        // still renamed.
+        let _ = letronna_core::update::install_terminal(&bin, beside.as_deref());
+        if !bin.join(letronna_core::update::TERMINAL_EXE).exists() {
+            return;
         }
         // Append only, and only when it is not already there.
         powershell(&format!(

@@ -5,6 +5,8 @@
 //! window goes in the folder itself and the terminal in `bin`, which is what
 //! goes on PATH, because Windows filenames do not care about case and
 //! `letronna.exe` beside `Letronna.exe` is one file overwriting the other.
+//! On Windows the terminal is `letronnacli.exe` there, so Task Manager tells
+//! the two apart, and small shims keep the command `letronna`.
 //!
 //! Signing in comes first. Not because anything here needs a token -- it does
 //! not -- but because an install that asks afterwards is an install people
@@ -122,8 +124,11 @@ fn place(parts: Parts) -> Result<Vec<String>, String> {
         let bin = root.join("bin");
         std::fs::create_dir_all(&bin).map_err(|e| e.to_string())?;
         let target = bin.join(terminal_name());
+        #[cfg(windows)]
+        letronna_core::update::install_terminal(&bin, Some(here.as_path()))?;
         // Copying onto a running program fails on Windows, and the one place
         // that happens is installing over the copy that is doing the asking.
+        #[cfg(not(windows))]
         if target != here {
             std::fs::copy(&here, &target)
                 .map_err(|e| format!("Cannot write {}: {e}", target.display()))?;
@@ -196,7 +201,7 @@ fn on_path(dir: &std::path::Path) -> Result<bool, String> {
 
 fn terminal_name() -> &'static str {
     if cfg!(windows) {
-        "letronna.exe"
+        letronna_core::update::TERMINAL_EXE
     } else {
         "letronna"
     }
