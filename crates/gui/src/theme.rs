@@ -26,39 +26,43 @@ pub(crate) const MONO_FONT: &str = "DejaVu Sans Mono";
 
 pub(crate) const WORDMARK_FONT: &str = "Georgia";
 
-// letronna.ai's Night palette: the site's deep blue frames the window and a
-// calm near-black page holds the work. The colours are plain numbers so the
-// test below can check each text colour against the surface it is drawn on.
+// letronna.ai's Night palette, Paper turned over: Paper lays a little blue
+// over its page for the frame, and Night frames a dark ink page in the
+// brand's deep blue dimmed to just below the page's depth, so the work leads
+// and electric blue is left to the things you press. The colours are plain
+// numbers so the test below can check each text colour against the surface
+// it is drawn on.
 
-/// The page, the site's near-black moved to the brand's 230° hue.
-const NIGHT: u32 = 0x0a0d1a;
-/// Body text, a paper-toned white: 15.5:1 on night without pure white's glare.
+/// The page, a dark ink in the brand's 230° hue, lifted off black so text does not glare.
+const NIGHT: u32 = 0x11141f;
+/// Body text, a paper-toned white: 14.7:1 on night without pure white's glare.
 const TEXT: u32 = 0xe3e6f0;
-/// Quieter text, 6.35:1 on night where the old grey reached 5.10.
+/// Quieter text, 6.0:1 on night.
 const MUTED: u32 = 0x8c93ad;
 /// Code blocks and menus, one step lighter than night; inputs stay on night.
-const RAISED: u32 = 0x121729;
+const RAISED: u32 = 0x181c2b;
 /// Borders, a blue hairline like the site's `--hair-blue`.
-const HAIRLINE: u32 = 0x1f2745;
-/// The sidebar and title bar, the brand's deep blue.
-const DEEP: u32 = 0x000b66;
-/// Sidebar text, on-blue at 85% over deep, as the dashboard draws its links.
+const HAIRLINE: u32 = 0x272c42;
+/// The sidebar and title bar, the brand's deep blue dimmed a shade below night,
+/// so the page sits a step forward of its frame even under the grain.
+const MIDNIGHT: u32 = 0x080b1e;
+/// Sidebar text, on-blue at 85% over deep blue, as the dashboard draws its links.
 const SIDEBAR_TEXT: u32 = 0xced1e8;
-/// The selected sidebar row, on-blue at 10% over deep, as the dashboard marks its page.
-const SIDEBAR_ON: u32 = 0x182275;
-/// The brand's electric blue, for fills only: as text on night it reads at 2.9:1.
+/// The selected sidebar row, blue at 16% and on-blue at 8% over midnight.
+const SIDEBAR_ON: u32 = 0x1a2551;
+/// The brand's electric blue, for fills only: as text on night it reads at 2.8:1.
 const BLUE: u32 = 0x0040ff;
 /// Pressed blue, the fill at 80% brightness.
 const BLUE_PRESSED: u32 = 0x0033cc;
 /// Text on a blue fill, the site's on-blue: 6.03:1 on blue.
 const ON_BLUE: u32 = 0xf2f4ff;
-/// Blue that is read as text (links, the focus ring, the caret): 6.28:1 on night.
+/// Blue that is read as text (links, the focus ring, the caret): 6.0:1 on night.
 const SIGNAL: u32 = 0x6b8cff;
 /// One "selected" colour for menus, lists and tabs: blue at 18% over night.
-const SELECTED: u32 = 0x081643;
-/// Errors and destructive buttons: 7.0:1 on night, and night text on it reads the same.
+const SELECTED: u32 = 0x0e1c47;
+/// Errors and destructive buttons: 6.7:1 on night, and midnight text on it reads 7.1:1.
 const DANGER: u32 = 0xff6b7a;
-/// Pressed danger, the fill at 80% brightness like blue's: night text on it reads at 4.7:1.
+/// Pressed danger, the fill at 80% brightness like blue's: midnight text on it reads at 4.7:1.
 const DANGER_PRESSED: u32 = 0xcc5662;
 /// Success, gpui-component's own dark green, named so a palette can carry it.
 const GREEN: u32 = 0x22c55e;
@@ -138,7 +142,7 @@ const NIGHT_PALETTE: Palette = Palette {
     raised: RAISED,
     code: RAISED,
     hairline: HAIRLINE,
-    frame: DEEP,
+    frame: MIDNIGHT,
     frame_text: SIDEBAR_TEXT,
     frame_on: SIDEBAR_ON,
     link: SIGNAL,
@@ -146,7 +150,7 @@ const NIGHT_PALETTE: Palette = Palette {
     selection: 0.4,
     danger: DANGER,
     danger_pressed: DANGER_PRESSED,
-    on_danger: NIGHT,
+    on_danger: MIDNIGHT,
     green: GREEN,
 };
 
@@ -287,8 +291,8 @@ pub(crate) fn apply(appearance: &str, window: &mut Window, cx: &mut App) {
     t.danger = rgb(p.danger).into();
     t.danger_active = rgb(p.danger_pressed).into();
     // gpui-component's near-white danger text reads at 2.5:1 on this lighter
-    // red; night reads at 7:1, on the title bar's close button too, as paper
-    // does on crimson.
+    // red; midnight reads at 7.1:1, on the title bar's close button too, as
+    // paper does on crimson.
     t.danger_foreground = rgb(p.on_danger).into();
     t.green = rgb(p.green).into();
     // A hover colour equal to its base draws no hover: list rows and blue
@@ -298,7 +302,7 @@ pub(crate) fn apply(appearance: &str, window: &mut Window, cx: &mut App) {
     // draws its own as `plain` and `framed` (ui::NoHover); menu items and
     // gpui-component's own ghost buttons still hover. On Windows and Linux
     // the title bar's minimise and maximise hover to secondary_hover, a
-    // darker raised square on deep behind a white glyph, and close hovers to
+    // raised square on midnight behind a white glyph, and close hovers to
     // danger.
     t.primary_hover = t.primary;
     t.secondary_hover = t.secondary;
@@ -321,7 +325,7 @@ mod tests {
     // Deliberately not `use super::*`: the prelude re-exports gpui, whose own
     // `test` macro would shadow the built-in attribute here.
     use super::{
-        BLUE, BLUE_PRESSED, DANGER, DANGER_PRESSED, DEEP, MUTED, NIGHT, NIGHT_PALETTE, ON_BLUE,
+        BLUE, BLUE_PRESSED, DANGER, DANGER_PRESSED, MIDNIGHT, MUTED, NIGHT, NIGHT_PALETTE, ON_BLUE,
         PAPER_PALETTE, RAISED, SELECTED, SIDEBAR_ON, SIDEBAR_TEXT, SIGNAL, TEXT, follows_system,
         palette_for, paper_highlight, pinned_dark,
     };
@@ -362,13 +366,14 @@ mod tests {
             ("signal on raised", SIGNAL, RAISED),
             ("on-blue on blue", ON_BLUE, BLUE),
             ("on-blue on pressed blue", ON_BLUE, BLUE_PRESSED),
-            ("sidebar text on deep", SIDEBAR_TEXT, DEEP),
+            ("sidebar text on midnight", SIDEBAR_TEXT, MIDNIGHT),
             ("sidebar text on its selected row", SIDEBAR_TEXT, SIDEBAR_ON),
-            ("muted on deep", MUTED, DEEP),
+            ("muted on midnight", MUTED, MIDNIGHT),
             ("muted on the selected sidebar row", MUTED, SIDEBAR_ON),
-            ("text on deep, the title bar's glyphs", TEXT, DEEP),
-            ("danger on night, and night on danger", DANGER, NIGHT),
-            ("night on pressed danger", NIGHT, DANGER_PRESSED),
+            ("text on midnight, the title bar's glyphs", TEXT, MIDNIGHT),
+            ("danger on night", DANGER, NIGHT),
+            ("midnight on danger", MIDNIGHT, DANGER),
+            ("midnight on pressed danger", MIDNIGHT, DANGER_PRESSED),
         ];
         for (what, text, surface) in pairs {
             let ratio = contrast(text, surface);
