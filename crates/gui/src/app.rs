@@ -389,11 +389,13 @@ pub(crate) struct Chat {
     /// Set by Stop for the `finish` it causes, so stopping does not start a
     /// turn for notices in the same moment.
     pub(crate) stopping: bool,
-    /// The helpers as last read, for the Activity page, the status bar's pill
-    /// and the sidebar's dots.
+    /// The helpers as last read, for the Activity page, the strip over the
+    /// composer, the status bar's pill and the sidebar's dots.
     pub(crate) helpers: Vec<crate::ui::activity::Helper>,
     /// Whether the helpers are being read again on a timer.
     pub(crate) helper_tick: bool,
+    /// Whether the strip over the composer has its list open.
+    pub(crate) running_open: bool,
     /// The helper whose transcript the Activity page shows.
     pub(crate) viewing: Option<crate::ui::activity::Viewing>,
     /// The helper the steer box is open for, and the box.
@@ -945,6 +947,7 @@ impl Chat {
             stopping: false,
             helpers: Vec::new(),
             helper_tick: false,
+            running_open: false,
             viewing: None,
             steering: None,
             steer,
@@ -4109,6 +4112,7 @@ impl Render for Chat {
                         .children(self.busy_note(cx))
                         .children(self.todo_panel(cx))
                         .children(self.goal_line(cx))
+                        .children(self.running_strip(cx))
                         .children(self.crew_chip(cx))
                         .child(self.composer(pane < px(600.), cx)),
                 )

@@ -5,21 +5,34 @@
 //! nothing tells the window when one moves on. The window reads them four
 //! times a second while a turn runs, since only a turn starts one, or while
 //! one works, and not at all otherwise, so an idle window runs no timer. The
-//! page, the status bar's pill and the sidebar's dots all draw from that last
-//! read. Core knows when a run started but not when it ended, so a helper's
-//! clock stops at the first read that finds it ended, and one never seen
-//! working shows no time at all.
+//! page, the strip over the composer, the status bar's pill and the sidebar's
+//! dots all draw from that last read. Core knows when a run started but not
+//! when it ended, so a helper's clock stops at the first read that finds it
+//! ended, and one never seen working shows no time at all.
+//!
+//! The strip says, where the next message is written, what still works out
+//! of sight once a reply is done: the session's helpers and workflow runs,
+//! and helpers working for other sessions. It names the session's first two
+//! helpers rather than counting them, and its clocks move only while its
+//! list is open, once a second, so a closed strip costs a redraw only as one
+//! starts or ends.
 
 use crate::prelude::*;
+use crate::ui::workflows::{Ask, asked, standing};
 use letronna_core::agents::{self, Seen};
 use letronna_core::driver::AgentId;
 use letronna_core::tools;
+use letronna_core::workflow::{self, RunState, RunView};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 /// Four reads a second: a count a person can watch move, and a helper that
 /// ends shows it within a quarter of a second.
 const TICK: Duration = Duration::from_millis(250);
+
+/// The strip's open list redraws every fourth tick: its clocks count whole
+/// seconds, and the rest of the window need not be drawn four times for one.
+const CLOCK_TICKS: u32 = 4;
 
 /// How near its bottom an open transcript still follows what the helper
 /// adds: a line or two, as the chat does.
@@ -58,15 +71,19 @@ impl Chat {
         }
         self.helper_tick = true;
         cx.spawn(async move |this, cx| {
+            let mut ticks = 0u32;
             loop {
                 cx.background_executor().timer(TICK).await;
+                ticks = ticks.wrapping_add(1);
                 let going = this.update(cx, |this, cx| {
                     let moved = this.read_helpers();
                     let reloaded = this.reload_transcript();
-                    // Away from the page only the pill and the dots show
-                    // helpers, and they change only as one starts or ends.
+                    // Away from the page only the strip, the pill and the
+                    // dots show helpers, and they change only as one starts
+                    // or ends, but for the clocks of the strip's open list.
                     let ticking = this.page == Page::Activity && this.helpers_working() > 0;
-                    if moved || reloaded || ticking {
+                    let clocks = ticks.is_multiple_of(CLOCK_TICKS) && this.strip_clocks();
+                    if moved || reloaded || ticking || clocks {
                         cx.notify();
                     }
                     // Read once more after the turn ends, which catches a
@@ -91,9 +108,20 @@ impl Chat {
     }
 
     /// Whether a helper could start or end: a turn is running, which is all
-    /// that starts one, or one is working.
+    /// that starts one, or one is working. Or the strip's open list has a
+    /// workflow run's clock to move.
     fn helpers_may_move(&self) -> bool {
-        self.busy || self.helpers_working() > 0
+        self.busy || self.helpers_working() > 0 || self.strip_clocks()
+    }
+
+    /// Whether the strip's open list shows a clock that moves: a working
+    /// helper's, or a running workflow's.
+    fn strip_clocks(&self) -> bool {
+        self.page == Page::Chat
+            && self.running_open
+            && (self.helpers_working() > 0
+                || (workflow::runs(self.session_on_screen()).iter())
+                    .any(|run| run.state == RunState::Running))
     }
 
     /// How many helpers are working now.
@@ -230,8 +258,13 @@ impl Chat {
         if self.steering == Some(id) {
             self.steering = None;
         }
-        // Its Steer and Stop go once it has ended.
-        self.focus_activity(window);
+        // Its Steer and Stop go once it has ended. Stopped from the strip,
+        // the keys go back where the next message is written.
+        if self.page == Page::Chat {
+            self.focus_composer(window, cx);
+        } else {
+            self.focus_activity(window);
+        }
         cx.notify();
     }
 
@@ -240,6 +273,161 @@ impl Chat {
         (self.helpers.iter())
             .find(|helper| helper.seen.id == id)
             .map_or("The helper".to_owned(), |helper| helper.seen.name.clone())
+    }
+
+    /// The line over the composer while anything works out of sight of the
+    /// chat; a click opens the list of them above it, each with Open and Stop.
+    pub(crate) fn running_strip(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let session = self.session_on_screen();
+        let (here, elsewhere): (Vec<&Helper>, Vec<&Helper>) = (self.helpers.iter())
+            .filter(|helper| helper.seen.ended.is_none())
+            .partition(|helper| helper.seen.session == session);
+        let runs: Vec<RunView> = (workflow::runs(session).into_iter())
+            .filter(|run| run.state == RunState::Running)
+            .collect();
+        if here.is_empty() && elsewhere.is_empty() && runs.is_empty() {
+            return None;
+        }
+        let names: Vec<&str> = (here.iter())
+            .map(|helper| helper.seen.name.as_str())
+            .collect();
+        let open = self.running_open;
+        // Above the line, so the line stays under the pointer that opened
+        // the list and closes it again.
+        let list = open.then(|| {
+            let mut rows: Vec<AnyElement> = (here.iter())
+                .map(|helper| self.strip_helper(helper, cx).into_any_element())
+                .collect();
+            rows.extend(
+                (runs.iter().enumerate())
+                    .map(|(index, run)| self.strip_run(index, run, cx).into_any_element()),
+            );
+            rows.extend(
+                (elsewhere.iter()).map(|helper| self.strip_helper(helper, cx).into_any_element()),
+            );
+            v_flex()
+                .id("running-list")
+                .w_full()
+                .max_h(px(152.))
+                .overflow_y_scroll()
+                .mb_1()
+                .py_1()
+                .rounded(cx.theme().radius)
+                .border_1()
+                .border_color(cx.theme().border)
+                .bg(cx.theme().secondary.opacity(0.3))
+                .children(rows)
+        });
+        let header = Button::new("running")
+            .plain(cx)
+            .xsmall()
+            .text_color(cx.theme().muted_foreground)
+            .tooltip(if open {
+                "Hide the list"
+            } else {
+                "See each one, to open or stop it"
+            })
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .items_center()
+                    .child(div().size(px(6.)).rounded_full().bg(cx.theme().green))
+                    .child(summary(&names, runs.len(), elsewhere.len()))
+                    .child(
+                        Icon::new(if open {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size_3(),
+                    ),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.running_open = !this.running_open;
+                cx.notify();
+            }));
+        Some(
+            v_flex()
+                .w_full()
+                .pb_1()
+                .children(list)
+                // In by its rows' dots, so the dots line up.
+                .child(h_flex().pl_1().child(header)),
+        )
+    }
+
+    /// A working helper as the strip lists it, with the session it works for
+    /// when that is not the one on screen.
+    fn strip_helper(&self, helper: &Helper, cx: &mut Context<Self>) -> impl IntoElement {
+        let seen = &helper.seen;
+        let id = seen.id;
+        let mut about = Vec::new();
+        if seen.session != self.session_on_screen() {
+            let title = (self.store.index_of(seen.session))
+                .map_or("another session", |ix| &self.store.conversations[ix].title);
+            about.push(format!("in \u{201c}{title}\u{201d}"));
+        }
+        if !seen.description.is_empty() {
+            about.push(seen.description.clone());
+        }
+        strip_row(
+            seen.name.clone(),
+            about.join(" · "),
+            progress_of(helper),
+            cx,
+        )
+        .child(
+            Button::new(("strip-open", id as usize))
+                .ghost()
+                .xsmall()
+                .label("Open")
+                .tooltip("Read what it has done so far")
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.page = Page::Activity;
+                    this.open_transcript(id, window, cx);
+                })),
+        )
+        .child(
+            Button::new(("strip-stop", id as usize))
+                .ghost()
+                .xsmall()
+                .label("Stop")
+                .tooltip("Stop it for good: nothing picks it back up")
+                .on_click(cx.listener(move |this, _, window, cx| this.stop_helper(id, window, cx))),
+        )
+    }
+
+    /// A running workflow of the session on screen as the strip lists it.
+    fn strip_run(&self, index: usize, run: &RunView, cx: &mut Context<Self>) -> impl IntoElement {
+        let session = self.session_on_screen();
+        let (open, stop) = (run.name.clone(), run.name.clone());
+        let about = format!("workflow {}", run.name);
+        strip_row(run.title.clone(), about, standing(run), cx)
+            .child(
+                Button::new(("strip-run-open", index))
+                    .ghost()
+                    .xsmall()
+                    .label("Open")
+                    .tooltip("See its phases and agents")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.page = Page::Workflows;
+                        this.show_run(Some(open.clone()), window, cx);
+                    })),
+            )
+            .child(
+                Button::new(("strip-run-stop", index))
+                    .ghost()
+                    .xsmall()
+                    .label("Stop")
+                    .tooltip("Stop the run and its agents")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if let Err(error) = asked(session, &stop, Ask::Stop) {
+                            this.error = Some(error);
+                        }
+                        this.focus_composer(window, cx);
+                        cx.notify();
+                    })),
+            )
     }
 
     pub(crate) fn activity_page(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -612,6 +800,73 @@ fn state_dot(seen: &Seen, cx: &App) -> impl IntoElement {
     div().size(px(8.)).rounded_full().flex_shrink_0().bg(color)
 }
 
+/// A row of the strip's list: a green dot, a name, what it is about and how
+/// it is getting on, then the buttons the caller adds.
+fn strip_row(name: String, about: String, progress: String, cx: &App) -> Div {
+    let muted = cx.theme().muted_foreground;
+    h_flex()
+        .w_full()
+        .h(px(26.))
+        .pl_2()
+        .pr_1()
+        .gap_2()
+        .items_center()
+        .text_xs()
+        .child(
+            div()
+                .size(px(6.))
+                .rounded_full()
+                .flex_shrink_0()
+                .bg(cx.theme().green),
+        )
+        .child(
+            div()
+                .flex_shrink_0()
+                .max_w(px(200.))
+                .truncate()
+                .font_weight(FontWeight::MEDIUM)
+                .child(name),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_color(muted)
+                .child(about),
+        )
+        .child(div().flex_shrink_0().text_color(muted).child(progress))
+}
+
+/// What the strip's line says works: the session's helpers by name, the
+/// first two of them, then its workflow runs and the helpers of other
+/// sessions by count, as in "explore and review working · 1 workflow running".
+fn summary(names: &[&str], runs: usize, elsewhere: usize) -> String {
+    let mut parts = Vec::new();
+    match names {
+        [] => {}
+        [one] => parts.push(format!("{one} working")),
+        [one, two] => parts.push(format!("{one} and {two} working")),
+        [one, two, rest @ ..] => {
+            parts.push(format!("{one}, {two} and {} more working", rest.len()))
+        }
+    }
+    match runs {
+        0 => {}
+        1 => parts.push("1 workflow running".to_owned()),
+        n => parts.push(format!("{n} workflows running")),
+    }
+    // Alone, it says what they are; after the session's own, only how many.
+    match (elsewhere, parts.is_empty()) {
+        (0, _) => {}
+        (1, true) => parts.push("1 helper working in another session".to_owned()),
+        (n, true) => parts.push(format!("{n} helpers working in other sessions")),
+        (1, false) => parts.push("1 helper elsewhere".to_owned()),
+        (n, false) => parts.push(format!("{n} helpers elsewhere")),
+    }
+    parts.join(" · ")
+}
+
 /// The helpers that are working, by id.
 fn working(helpers: &[Helper]) -> Vec<AgentId> {
     (helpers.iter())
@@ -706,7 +961,7 @@ fn lines(n: usize) -> String {
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
-    use super::{Helper, count, progress, refreshed, took};
+    use super::{Helper, count, progress, refreshed, summary, took};
     use letronna_core::agents::Seen;
     use std::time::{Duration, Instant};
 
@@ -740,6 +995,34 @@ mod tests {
             "stopped by the user · 2h05m · 1 round · 950 in · 0 out"
         );
         assert_eq!(progress(Some("failed"), None, 0, 0, 0), "failed");
+    }
+
+    #[test]
+    fn the_strip_names_two_helpers_and_counts_the_rest() {
+        assert_eq!(summary(&["explore"], 0, 0), "explore working");
+        assert_eq!(
+            summary(&["explore", "review"], 0, 0),
+            "explore and review working"
+        );
+        assert_eq!(
+            summary(&["explore", "review", "plan", "test"], 0, 0),
+            "explore, review and 2 more working"
+        );
+    }
+
+    #[test]
+    fn the_strip_counts_workflows_and_helpers_elsewhere() {
+        assert_eq!(
+            summary(&["explore"], 2, 1),
+            "explore working · 2 workflows running · 1 helper elsewhere"
+        );
+        assert_eq!(summary(&[], 1, 0), "1 workflow running");
+        assert_eq!(summary(&[], 0, 1), "1 helper working in another session");
+        assert_eq!(
+            summary(&[], 1, 3),
+            "1 workflow running · 3 helpers elsewhere"
+        );
+        assert_eq!(summary(&[], 0, 3), "3 helpers working in other sessions");
     }
 
     #[test]
