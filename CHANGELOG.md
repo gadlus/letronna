@@ -13,6 +13,14 @@ This file is also the App tab of https://letronna.ai/changelog.
 
 ## [Unreleased]
 
+### Highlights
+- **All** — Helpers that work side by side, fork, wait for more work and share a task list, plus workflows that run many agents from a script you approve.
+- **All** — Auto mode: a judge on your own model decides what would otherwise ask, and on macOS and Linux commands can run confined by the OS instead.
+- **All** — MCP servers over HTTP and OAuth, plugins from a git repository, and Zed or JetBrains running Letronna over ACP.
+- **App** — Files, Changes and Jobs tabs beside the chat, a Ctrl+K palette, and every part of the window reachable from the keyboard.
+- **Chat apps** — Slack, pairing by code, files and voice notes both ways, and `letronna serve` to answer with no window open.
+- **All** — Schedules in a mode of their own, memory you can review and edit, and much lower memory use in the window.
+
 ### Added
 - **All** — `letronna doctor` checks the setup, and a local log and crash files help find out what went wrong.
 - **App** — The window wears letronna.ai's colours; Settings choose its colours and whether it shows film grain.
@@ -115,8 +123,12 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — Inline think blocks stream as reasoning; `read_file` shows notebooks as cells.
 - **App** — The window reads a session in only when it is opened, follows what the terminal writes to sessions, and highlights eight languages instead of twenty-seven.
 - **App** — Session search skips sessions that cannot hold the words, and a reply that moves the window no longer waits for its summary.
+- **App** — The window uses far less memory: pictures are read no larger than shown and let go of after, sessions read in by runs, chat apps or the terminal are let go of too, and switching profile reads only the session it opens.
+- **Terminal** — The installed terminal is `letronnacli.exe`, with the logo; `letronna` still starts it.
 
 ### Fixed
+- **App** — Closing settings or the browser panel gives their pictures back to the GPU.
+- **App** — New session opens the empty one instead of piling up more, the last session in the sidebar scrolls fully into view, and right-clicking a session no longer draws a black halo.
 - **All** — Catastrophic commands, such as deleting your home folder, are refused whatever the approval setting.
 - **All** — Two copies of Letronna never mix their writes to one session, and a crash part way through a save costs one line, not the session.
 - **All** — Keys, settings and memory files are never silently reset or wiped by a read that failed, and a broken skills.json is never replaced by the defaults.
