@@ -1174,6 +1174,8 @@ fn body_hashed(
         }
         // Every tool call must be answered or providers reject the whole
         // request. A call can be left dangling if the app closed on the card.
+        // Results are saved only once the whole batch is done, so it may well
+        // have run: saying it never did invites doing it twice.
         for call in &m.tool_calls {
             let answered = window[i + 1..]
                 .iter()
@@ -1181,7 +1183,7 @@ fn body_hashed(
                 .any(|n| n.tool_call_id == call.id);
             if !answered {
                 context.push(json!({"role": "tool", "tool_call_id": call.id,
-                    "content": "Interrupted before this ran; no result."}));
+                    "content": "No result was recorded for this call; it may have run. Check before running it again, and repeat it only if doing so twice is harmless."}));
             }
         }
     }
@@ -4040,6 +4042,42 @@ mod tests {
             .map(|m| m["tool_call_id"].as_str().unwrap())
             .collect();
         assert_eq!(tools, ["a", "b"]);
+    }
+    #[test]
+    fn a_dangling_call_is_said_to_maybe_have_run() {
+        let messages = vec![
+            Message {
+                role: "user".into(),
+                content: "push it".into(),
+                ..Default::default()
+            },
+            Message {
+                role: "assistant".into(),
+                tool_calls: vec![ToolCall {
+                    id: "a".into(),
+                    name: "run_command".into(),
+                    arguments: r#"{"command":"git push"}"#.into(),
+                }],
+                ..Default::default()
+            },
+            Message {
+                role: "user".into(),
+                content: "did it go?".into(),
+                ..Default::default()
+            },
+        ];
+        let payload = body(&connection(), &messages, None, None);
+        let context = payload["messages"].as_array().unwrap();
+        let placeholder = context
+            .iter()
+            .find(|m| m["role"] == "tool" && m["tool_call_id"] == "a")
+            .unwrap();
+        let said = placeholder["content"].as_str().unwrap();
+        // The app may have closed after the push went out, so the model is
+        // told to look, not that it never ran.
+        assert!(said.contains("it may have run"), "{said}");
+        assert!(said.contains("Check before running it again"), "{said}");
+        assert!(!said.to_lowercase().contains("before this ran"), "{said}");
     }
     #[test]
     fn streams_from_local_http_server() {
