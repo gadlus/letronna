@@ -13,13 +13,28 @@
 //! the composer still under it. The other tabs dock beside the chat in a
 //! wide window, where the edge drags them wider or narrower, and float in a
 //! narrow one's corner, where they cover the least.
+//!
+//! While the agent browses, the browser first shows as a preview: a small
+//! picture of the page at the chat's corner, above the composer, which
+//! takes none of the conversation's room. A click or Enter shows it beside
+//! the chat, and the bar there shrinks it back.
 
 use crate::prelude::*;
-use crate::ui::browser::{Drawn, PointComment};
+use crate::ui::browser::{Drawn, PointComment, ToPreview};
 use gpui_component::tab::{Tab, TabBar};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-actions!(panel, [TogglePanel, BrowserTab, WideBrowser]);
+actions!(
+    panel,
+    [
+        TogglePanel,
+        BrowserTab,
+        WideBrowser,
+        PreviewBrowser,
+        ExpandBrowserPreview,
+        CloseBrowserPreview
+    ]
+);
 
 /// A window at least this wide docks the panel beside the chat -- Letronna's
 /// own window opens this wide -- and a narrower one floats it in a corner.
@@ -51,6 +66,19 @@ const BROWSER_LEAST: Pixels = px(400.);
 /// The least the chat keeps beside the browser, however wide that is made:
 /// a line of the conversation, and the composer with its controls under it.
 const CHAT_LEAST: Pixels = px(420.);
+/// How wide the browser's preview is: the page's shape still reads, and the
+/// conversation keeps most of the pane. Narrower in a chat pane under
+/// PREVIEW_NARROW, so the pane keeps over half.
+const PREVIEW_WIDTH: Pixels = px(300.);
+const PREVIEW_SMALL: Pixels = px(220.);
+const PREVIEW_NARROW: Pixels = px(640.);
+/// How far the preview sits from the chat pane's right edge, and above the
+/// composer.
+const PREVIEW_INSET: Pixels = px(12.);
+/// The preview's header, with the page's name, and its footer, with what
+/// the agent is doing there: a line of small text each.
+const PREVIEW_HEADER: Pixels = px(26.);
+const PREVIEW_FOOTER: Pixels = px(22.);
 
 /// A tab of the panel. A new one is a variant here and its arms in the
 /// matches below.
@@ -92,10 +120,11 @@ pub(crate) struct Panel {
     /// The browser's share of the room beside the sidebar, once its edge
     /// has been dragged: a share, so it suits the window at any size.
     share: Option<f32>,
-    /// The window's width, kept for what is decided away from a draw.
-    window_width: Pixels,
     /// The tab each session had open last, by session id.
     tabs: HashMap<u64, PanelTab>,
+    /// The sessions whose browser shows as the preview at the chat's corner
+    /// rather than beside the chat, by session id.
+    previews: HashSet<u64>,
 }
 
 impl Panel {
@@ -109,9 +138,15 @@ impl Panel {
             .or_else(|| shown.first().copied())
     }
 
-    /// Drop the tab a deleted session had open.
+    /// Drop the tab a deleted session had open, and its preview.
     pub(crate) fn forget(&mut self, session: u64) {
         self.tabs.remove(&session);
+        self.previews.remove(&session);
+    }
+
+    /// Drop every session's preview, for a profile whose sessions are others.
+    pub(crate) fn forget_previews(&mut self) {
+        self.previews.clear();
     }
 }
 
@@ -172,6 +207,15 @@ fn dock_width(window: Pixels, sidebar: Pixels, dragged: Option<Pixels>) -> Optio
         None => (window * DOCK_SHARE, most.min(DOCK_MAX)),
     };
     Some(width.max(DOCK_MIN).min(most))
+}
+
+/// How wide the browser's preview is over a chat pane this wide.
+fn preview_width(pane: Pixels) -> Pixels {
+    if pane < PREVIEW_NARROW {
+        PREVIEW_SMALL
+    } else {
+        PREVIEW_WIDTH
+    }
 }
 
 /// The tabs that show, with how many things in each wait on the user,
@@ -315,6 +359,10 @@ impl Chat {
         self.page = Page::Chat;
         self.panel.open = true;
         self.panel.tabs.insert(self.session_on_screen(), tab);
+        // Beside the chat now, not at its corner.
+        if tab == PanelTab::Browser {
+            self.panel.previews.remove(&self.session_on_screen());
+        }
         // An open browser is left as it is: asking again would reload it
         // and take the keys from wherever they were.
         if tab == PanelTab::Browser && !self.browser.read(cx).is_open() {
@@ -330,34 +378,254 @@ impl Chat {
     }
 
     /// Hide the panel. The browser stops sending pictures, and stays closed
-    /// for the rest of this turn.
+    /// for the rest of this turn -- unless it shows as the preview, which
+    /// stays.
     fn hide_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.panel.open = false;
-        self.browser.update(cx, |view, cx| view.close(cx));
+        if !self.panel.previews.contains(&self.session_on_screen()) {
+            self.browser.update(cx, |view, cx| view.close(cx));
+        }
         self.focus_composer(window, cx);
         cx.notify();
     }
 
-    /// Show the browser when a call is about to use it: before it runs, or
-    /// while it waits to be allowed, so the page can be seen first -- unless
-    /// the agent is to browse unseen, the panel was hidden this turn, or
-    /// there is no room for it beside the chat.
+    /// Show the browser when a call is about to use it, before it runs or
+    /// while it waits to be allowed: as the preview at the chat's corner,
+    /// which takes none of the conversation's room, or beside the chat where
+    /// it is already -- unless the agent is to browse unseen, or the browser
+    /// was closed this turn.
     pub(crate) fn show_browser(&mut self, tool: &str, cx: &mut Context<Self>) {
         if !matches!(tool, "browse" | "use_page") || self.store.settings.browse_unseen {
             return;
         }
-        // Not over the conversation, which would hide the replies, and the
-        // card asking to allow this very call.
-        if too_narrow(self.panel.window_width - self.sidebar_width()) {
+        self.browser.update(cx, |view, cx| view.open(cx));
+        if !self.browser.read(cx).is_open() {
             return;
         }
-        let was_open = self.browser.read(cx).is_open();
-        self.browser.update(cx, |view, cx| view.open(cx));
-        if !was_open && self.browser.read(cx).is_open() {
-            self.panel.open = true;
-            let session = self.streaming_id.unwrap_or(self.session_on_screen());
-            self.panel.tabs.insert(session, PanelTab::Browser);
+        let session = self.streaming_id.unwrap_or(self.session_on_screen());
+        let beside = self.panel.open && self.panel.tabs.get(&session) == Some(&PanelTab::Browser);
+        if !beside {
+            self.panel.previews.insert(session);
         }
+    }
+
+    /// Whether the browser shows as the preview now: the session on screen
+    /// has it so, its conversation is on screen, the browser is not beside
+    /// it already, and no card waits on the user there, which the preview
+    /// could cover.
+    pub(crate) fn browser_preview_shown(&self, cx: &App) -> bool {
+        let session = self.session_on_screen();
+        self.page == Page::Chat
+            && !self.settings_open
+            && self.panel.previews.contains(&session)
+            && self.browser.read(cx).is_open()
+            && self
+                .panel_view(cx)
+                .is_none_or(|(_, open)| open != PanelTab::Browser)
+            && self.transcript_shown()
+            && !self.needs_you(session)
+    }
+
+    /// How much the end of the conversation keeps clear, footer and all, so
+    /// its newest lines show above the preview: none without one, or where
+    /// the column's text stops short of it.
+    pub(crate) fn browser_preview_room(&self, column: Pixels, window: &Window, cx: &App) -> Pixels {
+        if !self.browser_preview_shown(cx) {
+            return px(0.);
+        }
+        let pane =
+            window.viewport_size().width - self.sidebar_width() - self.panel_width(window, cx);
+        let width = preview_width(pane);
+        // The column is centred in the pane, its text inside a 24px margin.
+        let text_right = (pane + column) / 2. - px(24.);
+        if text_right <= pane - PREVIEW_INSET - width {
+            return px(0.);
+        }
+        let picture = self.browser.read(cx).thumbnail_height(width - px(2.));
+        PREVIEW_HEADER + picture + PREVIEW_FOOTER + px(2.)
+    }
+
+    /// Show the browser of the session on screen as the preview at the
+    /// chat's corner, unless it is beside the chat already.
+    pub(crate) fn open_browser_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab_on_screen(window, cx) == Some(PanelTab::Browser) {
+            return;
+        }
+        self.page = Page::Chat;
+        self.panel.previews.insert(self.session_on_screen());
+        if !self.browser.read(cx).is_open() {
+            self.browser.update(cx, |view, cx| view.reopen(cx));
+        }
+        cx.notify();
+    }
+
+    /// Show the browser beside the chat in place of its preview, the keys
+    /// the preview had going to the composer.
+    pub(crate) fn expand_browser_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let had_keys = self.browser.read(cx).preview_focus.is_focused(window);
+        self.show_tab(PanelTab::Browser, window, cx);
+        if had_keys {
+            self.focus_composer(window, cx);
+        }
+    }
+
+    /// Close the preview: as when the panel is hidden, the browser stops
+    /// sending pictures and stays closed for the rest of this turn.
+    pub(crate) fn close_browser_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let had_keys = self.browser.read(cx).preview_focus.is_focused(window);
+        self.panel.previews.remove(&self.session_on_screen());
+        self.browser.update(cx, |view, cx| view.close(cx));
+        if had_keys {
+            self.focus_composer(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Shrink the browser beside the chat to its preview, or show the
+    /// preview, or a browser not shown at all, beside the chat.
+    pub(crate) fn toggle_browser_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab_on_screen(window, cx) != Some(PanelTab::Browser) {
+            return self.expand_browser_preview(window, cx);
+        }
+        // The panel goes with it; keys it had go to the composer.
+        let had_keys = self.panel_focus.contains_focused(window, cx);
+        self.panel.open = false;
+        self.open_browser_preview(window, cx);
+        if had_keys {
+            self.focus_composer(window, cx);
+        }
+    }
+
+    /// The browser's preview at the chat's corner, while it shows: the page
+    /// as a small picture under its name, which a click or Enter shows
+    /// beside the chat, and what the agent does there while it does.
+    pub(crate) fn browser_preview(
+        &self,
+        pane: Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.browser_preview_shown(cx) {
+            return None;
+        }
+        let width = preview_width(pane);
+        // Inside its 1px edge.
+        let picture = self
+            .browser
+            .update(cx, |view, cx| view.thumbnail(width - px(2.), cx));
+        let browser = self.browser.read(cx);
+        let name = browser.page_name();
+        let streaming_here = self.busy && self.streaming_id == Some(self.session_on_screen());
+        let doing = browser.doing().filter(|_| streaming_here);
+        let focus = browser.preview_focus.clone();
+        let focused = focus.is_focused(window);
+        let theme = cx.theme();
+        let header = h_flex()
+            .h(PREVIEW_HEADER)
+            .flex_shrink_0()
+            .pl_2()
+            .pr_1()
+            .gap_1p5()
+            .items_center()
+            .border_b_1()
+            .border_color(theme.border)
+            .text_xs()
+            .child(
+                Icon::new(IconName::Globe)
+                    .size_3p5()
+                    .text_color(theme.muted_foreground),
+            )
+            .child(div().flex_1().min_w_0().truncate().map(|title| match name {
+                Some(name) => title.child(name),
+                None => title.text_color(theme.muted_foreground).child("Browser"),
+            }))
+            .child(
+                Button::new("preview-expand")
+                    .plain(cx)
+                    .xsmall()
+                    .icon(Icon::new(IconName::PanelRight))
+                    .tooltip_with_action("Show beside the chat", &PreviewBrowser, Some("Chat"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        // Not the card's own click as well.
+                        cx.stop_propagation();
+                        this.expand_browser_preview(window, cx);
+                    })),
+            )
+            .child(
+                Button::new("preview-close")
+                    .plain(cx)
+                    .xsmall()
+                    .icon(Icon::new(IconName::Close))
+                    .tooltip_with_action(
+                        "Close the preview",
+                        &CloseBrowserPreview,
+                        Some("BrowserPreview"),
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.close_browser_preview(window, cx);
+                    })),
+            );
+        let footer = doing.map(|doing| {
+            h_flex()
+                .h(PREVIEW_FOOTER)
+                .flex_shrink_0()
+                .px_2()
+                .items_center()
+                .border_t_1()
+                .border_color(theme.border)
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(div().min_w_0().truncate().child(doing))
+        });
+        Some(
+            v_flex()
+                .id("browser-preview")
+                .absolute()
+                .right(PREVIEW_INSET)
+                .bottom(PREVIEW_INSET)
+                .w(width)
+                .overflow_hidden()
+                .occlude()
+                .track_focus(&focus)
+                .key_context("BrowserPreview")
+                .rounded(theme.radius)
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.background)
+                .cursor_pointer()
+                // As on a folded run: a press leaves the keys where they
+                // were, and Tab is what picks the preview out.
+                .on_any_mouse_down(|_, window, _| window.prevent_default())
+                // gpui also clicks a focused element when Enter comes back
+                // up, which after ExpandBrowserPreview would come to nothing.
+                .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
+                    if !event.is_keyboard() {
+                        this.expand_browser_preview(window, cx);
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &ExpandBrowserPreview, window, cx| {
+                    this.expand_browser_preview(window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &CloseBrowserPreview, window, cx| {
+                    this.close_browser_preview(window, cx)
+                }))
+                .child(header)
+                .child(picture)
+                .children(footer)
+                // Over it, so nothing moves, as F6's ring is.
+                .when(focused, |card| {
+                    card.child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .rounded(theme.radius)
+                            .border_2()
+                            .border_color(theme.ring),
+                    )
+                })
+                .into_any_element(),
+        )
     }
 
     /// Give the browser all the room but the chat's, or put it back beside
@@ -389,6 +657,7 @@ impl Chat {
                     _ => Drawn::Beside,
                 })
             }
+            _ if self.browser_preview_shown(cx) => Some(Drawn::Preview),
             _ => None,
         };
         if self.browser.read(cx).is_drawn_as(drawn) {
@@ -506,17 +775,17 @@ impl Chat {
             .children(self.ring(crate::ui::keys::Region::Panel, cx))
     }
 
-    /// Keep the window's width for `show_browser`, which is not given the
-    /// window.
-    pub(crate) fn follow_window_width(
-        &mut self,
+    /// Shrink the browser to its preview when its bar asks.
+    pub(crate) fn follow_browser_shrink(
+        &self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Subscription {
-        self.panel.window_width = window.viewport_size().width;
-        cx.observe_window_bounds(window, |this, window, _| {
-            this.panel.window_width = window.viewport_size().width;
-        })
+        cx.subscribe_in(
+            &self.browser,
+            window,
+            |this, _, _: &ToPreview, window, cx| this.toggle_browser_preview(window, cx),
+        )
     }
 
     /// Put what Point mode found, with its comment, in the composer.
@@ -577,7 +846,9 @@ fn edge(open: PanelTab, cx: &mut Context<Chat>) -> impl IntoElement {
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
-    use super::{Panel, PanelTab, browser_width, dock_width, share_of, shown_tabs, title};
+    use super::{
+        Panel, PanelTab, browser_width, dock_width, preview_width, share_of, shown_tabs, title,
+    };
     use gpui::px;
 
     #[test]
@@ -693,6 +964,24 @@ mod tests {
         );
         assert_eq!(browser_width(px(1500.), None, true), Some(px(1080.)));
         assert_eq!(browser_width(px(1500.), None, false), Some(px(750.)));
+    }
+
+    #[test]
+    fn the_preview_is_narrower_over_a_narrow_chat() {
+        assert_eq!(preview_width(px(900.)), px(300.));
+        assert_eq!(preview_width(px(640.)), px(300.));
+        assert_eq!(preview_width(px(639.)), px(220.));
+    }
+
+    #[test]
+    fn a_forgotten_session_keeps_no_preview() {
+        let mut panel = Panel::default();
+        panel.previews.insert(1);
+        panel.previews.insert(2);
+        panel.forget(1);
+        assert!(!panel.previews.contains(&1) && panel.previews.contains(&2));
+        panel.forget_previews();
+        assert!(panel.previews.is_empty());
     }
 
     #[test]
