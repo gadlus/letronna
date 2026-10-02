@@ -739,7 +739,8 @@ pub(crate) fn uploads(name: &str, args: &Value) -> bool {
 /// from another origin than its page's, as `frame` says; the browser makes
 /// sure the element is in a frame from that origin before acting.
 pub(crate) fn in_frame(name: &str, args: &Value) -> bool {
-    let acts = name == "use_page" || (name == crate::browser::BROWSE && args["action"] == "hover");
+    let pointer = matches!(args["action"].as_str(), Some("hover" | "scroll"));
+    let acts = name == "use_page" || (name == crate::browser::BROWSE && pointer);
     acts && args["frame"]
         .as_str()
         .is_some_and(|frame| !frame.is_empty())
@@ -2774,8 +2775,8 @@ mod tests {
                 assert!(matches!(decide(&paying, &gate(mode)), Outcome::Refuse(_)));
             }
         }
-        // A hover there is asked about too; a look that names a frame is not
-        // an action in it.
+        // A hover or a scroll there is asked about too; a look that names a
+        // frame is not an action in it.
         let gate = Gate {
             ctx: &ctx,
             mode: Mode::Default,
@@ -2789,6 +2790,7 @@ mod tests {
             call(crate::browser::BROWSE, args)
         };
         assert_eq!(decide(&browse("hover"), &gate), Outcome::Ask);
+        assert_eq!(decide(&browse("scroll"), &gate), Outcome::Ask);
         assert_eq!(decide(&browse("look"), &gate), Outcome::Run);
         let args = |call: &ToolCall| serde_json::from_str::<Value>(&call.arguments).unwrap();
         assert!(grants_for_session("use_page", &args(&typing(None))));
