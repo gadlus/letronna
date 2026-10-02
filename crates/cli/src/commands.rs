@@ -273,10 +273,17 @@ pub fn command(
             skills(runner, rest, workspace);
             Flow::Handled
         }
-        "/mcp" => {
-            mcp_servers(runner, rest);
-            Flow::Handled
-        }
+        "/mcp" => match rest.split_once(char::is_whitespace).unwrap_or((rest, "")) {
+            // A prompt by its name under /mcp, as the menu offers it: none of
+            // what /mcp does to a server has `__` in it.
+            (prompt, args) if prompt.contains("__") => {
+                send_prompt(runner, &format!("/mcp__{prompt}"), args.trim())
+            }
+            _ => {
+                mcp_servers(runner, rest);
+                Flow::Handled
+            }
+        },
         "/plugins" => {
             plugins(runner, rest);
             Flow::Handled
@@ -395,16 +402,22 @@ pub fn command(
             insights(rest);
             Flow::Handled
         }
-        name if name.starts_with("/mcp__") => match mcp_prompt(runner, name, rest) {
-            Some(Ok(text)) => Flow::Send(text),
-            Some(Err(error)) => {
-                render::blank();
-                render::line(&render::red(&error));
-                Flow::Handled
-            }
-            None => Flow::Handled,
-        },
+        name if name.starts_with("/mcp__") => send_prompt(runner, name, rest),
         _ => added(runner, whole, workspace),
+    }
+}
+
+/// Send the MCP server's prompt behind `command`, filled in with `rest`, or
+/// say why not.
+fn send_prompt(runner: &mut Runner, command: &str, rest: &str) -> Flow {
+    match mcp_prompt(runner, command, rest) {
+        Some(Ok(text)) => Flow::Send(text),
+        Some(Err(error)) => {
+            render::blank();
+            render::line(&render::red(&error));
+            Flow::Handled
+        }
+        None => Flow::Handled,
     }
 }
 
@@ -514,20 +527,39 @@ fn added(runner: &mut Runner, line: &str, workspace: Option<&std::path::Path>) -
 }
 
 /// Offer the added commands in the `/` menu, read afresh, so a file made or
-/// changed shows from the next command on.
+/// changed shows from the next command on. Skills go apart from the rest,
+/// to be offered once their name is typed and under `/skills`.
 pub fn offer_added(runner: &mut Runner, workspace: Option<&std::path::Path>) {
-    let offered = listed(workspace)
+    let (skills, commands): (Vec<_>, Vec<_>) = listed(workspace)
         .into_iter()
         .filter(|c| c.hidden_by.is_none())
-        .map(|c| {
-            let blurb = match c.hint.as_str() {
-                "" => c.description,
-                hint => format!("{hint} · {}", c.description),
+        .partition(|c| c.origin == Origin::Skill);
+    let row = |c: slash::Command| {
+        let blurb = match c.hint.as_str() {
+            "" => c.description,
+            hint => format!("{hint} · {}", c.description),
+        };
+        (format!("/{}", c.name), blurb)
+    };
+    // The ones switched off too, so a whole name typed under /skills is
+    // never taken for a longer one that is on.
+    let shelf = letronna_core::skills::list(workspace)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|skill| {
+            let blurb = if skill.enabled {
+                skill.description
+            } else {
+                format!("off · {}", skill.description)
             };
-            (format!("/{}", c.name), blurb)
+            (skill.name, blurb)
         })
         .collect();
-    runner.bar.offer(offered);
+    runner.bar.offer(bar::Added {
+        commands: commands.into_iter().map(row).collect(),
+        skills: skills.into_iter().map(row).collect(),
+        shelf,
+    });
 }
 
 /// An added command's line in `/help`: where it comes from and what it does,
@@ -840,11 +872,13 @@ const KEYS: &[(&str, &str)] = &[
 ];
 
 /// The commands, then the added ones, then the keys, each in one column so
-/// it reads straight down.
+/// it reads straight down. Skills are left to `/skills`: there can be
+/// dozens, and each is a line there already.
 fn help(workspace: Option<&std::path::Path>) {
     render::blank();
     let added: Vec<(String, String)> = listed(workspace)
         .iter()
+        .filter(|c| c.origin != Origin::Skill)
         .map(|c| (format!("/{}", c.name), about(c)))
         .collect();
     let width = bar::name_width(&added);
@@ -866,6 +900,11 @@ fn help(workspace: Option<&std::path::Path>) {
             row(name, about);
         }
     }
+    render::blank();
+    render::line(&render::dim(
+        "Skills are under /skills and MCP servers' prompts under /mcp; \
+         type / and the start of a name to find one.",
+    ));
     render::blank();
     let width = KEYS
         .iter()
@@ -1972,6 +2011,21 @@ fn mcp_servers(runner: &mut Runner, rest: &str) {
             render::dim(server.transport),
             crate::mcp::health(server)
         ));
+    }
+    // What the servers offer to send, by the name /mcp takes them by.
+    let prompts = mcp::prompts();
+    if rest.is_empty() && !prompts.is_empty() {
+        render::said(&render::blue("●"), &render::bold("Prompts"));
+        for (command, blurb) in &prompts {
+            let prompt = command.strip_prefix("/mcp__").unwrap_or(command);
+            let room = render::width().saturating_sub(prompt.chars().count() + 2);
+            render::line(&format!(
+                "{}  {}",
+                render::bold(prompt),
+                render::dim(&render::fit(blurb, room))
+            ));
+        }
+        render::line(&render::dim("/mcp <prompt> to send one"));
     }
     render::line(&render::dim(
         "/mcp reconnect|enable|disable|login|logout|log <name>, or /mcp reload after editing mcp.json",
