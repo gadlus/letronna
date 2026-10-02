@@ -131,7 +131,8 @@ pub(crate) struct Jobs {
     listed: Vec<(u64, bool)>,
     /// The Run line, which starts a job of your own.
     run_line: Entity<InputState>,
-    /// The list's, which the Jobs tab's key and a job chip hand the keys to.
+    /// The list's, which the Jobs tab's key and a job's row in the strip
+    /// over the composer hand the keys to.
     list_focus: FocusHandle,
     log_focus: FocusHandle,
     scroll: ScrollHandle,
@@ -173,8 +174,8 @@ impl Chat {
     }
 
     /// Note that the jobs moved on, and redraw what shows it: the tab while
-    /// it is on screen, and the status bar's chips when a job started or
-    /// ended. A job printing with the tab hidden redraws nothing.
+    /// it is on screen, and the strip over the composer when a job started
+    /// or ended. A job printing with the tab hidden redraws nothing.
     fn jobs_rang(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.jobs.stale = true;
         let listed: Vec<(u64, bool)> = jobs::list()
@@ -258,7 +259,7 @@ impl Chat {
         }
     }
 
-    /// Show a job's output in the Jobs tab, as a status bar chip does.
+    /// Show a job's output in the Jobs tab, as its row in the strip does.
     pub(crate) fn show_job(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         self.choose_job(id, cx);
         self.show_tab(PanelTab::Jobs, window, cx);

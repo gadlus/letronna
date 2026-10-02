@@ -512,6 +512,16 @@ pub(crate) struct Chat {
     /// to be transcribed. `None` the rest of the time; nothing runs then.
     pub(crate) mic: Option<crate::ui::voice::Voice>,
     pub(crate) _subscriptions: Vec<Subscription>,
+    /// The line of the strip over the composer, which F6 and Tab stop at.
+    pub(crate) strip_focus: FocusHandle,
+    /// The whole strip, which holds the keys while its line or a row has them.
+    pub(crate) strip_area: FocusHandle,
+    /// Set by the key that shows what is running, for the strip's first row
+    /// to take the keys as it is drawn, since it has no focus before then.
+    pub(crate) strip_focus_first: bool,
+    /// Sessions whose plan's list was closed by hand, which then rests as the
+    /// strip's one line rather than opening by itself.
+    pub(crate) plan_folded: std::collections::HashSet<u64>,
 }
 
 impl Chat {
@@ -1004,6 +1014,10 @@ impl Chat {
             drawn: false,
             mic: None,
             _subscriptions: subscriptions,
+            strip_focus: cx.focus_handle().tab_stop(true),
+            strip_area: cx.focus_handle(),
+            strip_focus_first: false,
+            plan_folded: std::collections::HashSet::new(),
         };
         let resized = this.follow_window_width(window, cx);
         this._subscriptions.push(resized);
@@ -4100,6 +4114,7 @@ impl Render for Chat {
                 .into_any_element()
         };
 
+        let strip = self.running_strip(window, cx);
         let main = v_flex()
             .relative()
             .flex_1()
@@ -4125,9 +4140,8 @@ impl Render for Chat {
                         .px_6()
                         .pb_2()
                         .children(self.busy_note(cx))
-                        .children(self.todo_panel(cx))
                         .children(self.goal_line(cx))
-                        .children(self.running_strip(cx))
+                        .children(strip)
                         .children(self.crew_chip(cx))
                         .child(self.composer(pane < px(600.), cx)),
                 )
@@ -4212,6 +4226,11 @@ impl Render for Chat {
             )
             .on_action(
                 cx.listener(|this, _: &OpenActivity, window, cx| this.open_activity(window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::ui::activity::ShowRunning, window, cx| {
+                    this.show_running(window, cx)
+                }),
             )
             .on_action(
                 cx.listener(|this, _: &crate::ui::palette::OpenPalette, window, cx| {

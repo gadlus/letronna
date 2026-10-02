@@ -10,6 +10,8 @@ pub(crate) enum Region {
     Sidebar,
     /// The conversation, or the page shown in its place.
     Transcript,
+    /// The strip over the composer, while it shows.
+    Strip,
     Composer,
     Panel,
 }
@@ -24,6 +26,9 @@ impl Chat {
         // The browser over the conversation hides it.
         if self.page != Page::Chat || (self.transcript_shown() && !self.panel_covers(window, cx)) {
             shown.push(Region::Transcript);
+        }
+        if self.strip_shown() {
+            shown.push(Region::Strip);
         }
         if self.page == Page::Chat {
             shown.push(Region::Composer);
@@ -45,6 +50,7 @@ impl Chat {
                     || self.question_focus.is_focused(window)
             }
             Region::Transcript => self.page_focus.contains_focused(window, cx),
+            Region::Strip => self.strip_area.contains_focused(window, cx),
             Region::Composer => self.composer.focus_handle(cx).contains_focused(window, cx),
             Region::Panel => self.panel_focus.contains_focused(window, cx),
         }
@@ -78,6 +84,7 @@ impl Chat {
                 Some(&stop) => self.go_to_stop(stop, false, window),
                 None => window.focus(&self.transcript_focus),
             },
+            Region::Strip => window.focus(&self.strip_focus),
             Region::Composer => self.focus_composer(window, cx),
             Region::Panel => window.focus(&self.panel_focus),
         }

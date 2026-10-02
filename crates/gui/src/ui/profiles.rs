@@ -286,6 +286,7 @@ impl Chat {
         self.agent_asks.clear();
         self.thinking_open.clear();
         self.runs_open.clear();
+        self.plan_folded.clear();
         self.unseen.clear();
         self.found.clear();
         self.editing_message = None;
