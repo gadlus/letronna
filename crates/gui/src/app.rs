@@ -1254,11 +1254,14 @@ impl Chat {
                 ..Default::default()
             });
         } else {
-            let conversation = &mut self.store.conversations[index];
+            // To the top of the list, as a session made now would be, rather
+            // than left below the sessions listed since it was made.
+            let mut conversation = self.store.conversations.remove(index);
             conversation.updated = backend::now();
             conversation.workspace = workspace;
+            self.store.conversations.push(conversation);
         }
-        self.store.active = index;
+        self.store.active = self.store.conversations.len() - 1;
         self.error = None;
         self.page = Page::Chat;
         self.swap_draft(window, cx);
