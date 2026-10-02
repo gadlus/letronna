@@ -1107,30 +1107,29 @@ impl Chat {
                     // copied, not copied out at every frame.
                     .when(open, |row| {
                         let chat = cx.weak_entity();
-                        row.child(
-                            gpui_component::clipboard::Clipboard::new(("copy-tool", index))
-                                .value_fn(move |_, cx| {
-                                    if let Some(text) = &copied {
-                                        return text.clone();
-                                    }
-                                    chat.upgrade()
-                                        .and_then(|chat| {
-                                            let store = &chat.read(cx).store;
-                                            let ix = store.index_of(session)?;
-                                            let said =
-                                                store.conversations[ix].messages.get(index)?;
-                                            Some(
-                                                letronna_core::untrusted::shown(
-                                                    &said.name,
-                                                    &said.content,
-                                                )
-                                                .0,
+                        row.child(crate::ui::copy_button(
+                            ("copy-tool", index),
+                            move |cx| {
+                                if let Some(text) = &copied {
+                                    return text.to_string();
+                                }
+                                chat.upgrade()
+                                    .and_then(|chat| {
+                                        let store = &chat.read(cx).store;
+                                        let ix = store.index_of(session)?;
+                                        let said = store.conversations[ix].messages.get(index)?;
+                                        Some(
+                                            letronna_core::untrusted::shown(
+                                                &said.name,
+                                                &said.content,
                                             )
-                                        })
-                                        .unwrap_or_default()
-                                        .into()
-                                }),
-                        )
+                                            .0,
+                                        )
+                                    })
+                                    .unwrap_or_default()
+                            },
+                            cx,
+                        ))
                     })
                     // A call that used the browser: the page it left, small,
                     // in the corner, as the agent's browsing shows it.

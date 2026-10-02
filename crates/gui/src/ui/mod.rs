@@ -589,6 +589,30 @@ pub(crate) fn more_row(
         .on_action(move |_: &crate::ui::messages::ToggleRun, window, cx| on_key(window, cx))
 }
 
+/// A small Copy button that stays still under the pointer, unlike
+/// gpui-component's `Clipboard`: a press copies what `text` gives then and
+/// says so.
+pub(crate) fn copy_button(
+    id: impl Into<ElementId>,
+    text: impl Fn(&mut App) -> String + 'static,
+    cx: &App,
+) -> Button {
+    Button::new(id)
+        .plain(cx)
+        .xsmall()
+        .icon(IconName::Copy)
+        .tooltip("Copy")
+        .on_click(move |_, window, cx| {
+            cx.stop_propagation();
+            let text = text(cx);
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            window.push_notification(
+                gpui_component::notification::Notification::success("Copied."),
+                cx,
+            );
+        })
+}
+
 #[cfg(test)]
 mod tests {
     // Not `use super::*`: the prelude's gpui `test` macro would shadow the
