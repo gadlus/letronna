@@ -303,6 +303,8 @@ impl BrowserView {
                 self.history = (false, false);
                 self.dialog = None;
             }
+            // The panel has no card for it yet.
+            Sight::Check(_) => {}
         }
     }
 
