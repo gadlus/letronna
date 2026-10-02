@@ -21,7 +21,7 @@
 use crate::browser::{follow_opened_tab, follow_remaining_tab, key, key_events};
 use crate::cdp::{Event, Ignored, Reach, Tab};
 use serde_json::{Value, json};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -108,6 +108,10 @@ pub enum Sight {
     /// The tab or the whole browser was closed; the agent opens it again
     /// when it next uses it.
     Closed,
+    /// Since when the agent has waited for the user to get past a site's
+    /// check on the page, carrying on by itself once it has gone -- or that
+    /// it no longer waits.
+    Check(Option<Instant>),
 }
 
 /// What the window receives while it watches. Dropping it stops the
@@ -277,6 +281,8 @@ struct Watch {
     scale: Option<f64>,
     /// What the user did that has not gone to the page yet, oldest first.
     controls: VecDeque<Control>,
+    /// The tabs whose site's check the agent waits on, and since when.
+    checks: HashMap<String, Instant>,
 }
 
 impl Watch {
@@ -284,6 +290,12 @@ impl Watch {
         self.to
             .as_ref()
             .is_some_and(|(frames, sights)| !frames.is_closed() && !sights.is_closed())
+    }
+
+    /// Since when the agent has waited on a site's check in the tab followed.
+    fn check(&self) -> Option<Instant> {
+        let tab = self.tab.as_ref()?;
+        self.checks.get(&tab.id).copied()
     }
 }
 
@@ -298,6 +310,10 @@ pub fn watch() -> Watching {
     let (sights_to, sights) = async_channel::unbounded();
     let (lock, wake) = state();
     if let Ok(mut watch) = lock.lock() {
+        // A wait that began before the window watched.
+        if let Some(since) = watch.check() {
+            let _ = sights_to.try_send(Sight::Check(Some(since)));
+        }
         watch.to = Some((frames_to, sights_to));
         if !watch.running {
             watch.running = true;
@@ -361,11 +377,38 @@ pub(crate) fn watched() -> bool {
 pub(crate) fn follow(reach: &Reach, id: &str) {
     let (lock, wake) = state();
     if let Ok(mut watch) = lock.lock() {
+        let before = watch.check();
         watch.tab = Some(Followed {
             reach: reach.clone(),
             id: id.to_owned(),
         });
+        // A wait on a site's check comes into view with its tab, and goes
+        // with it.
+        let now = watch.check();
+        if now != before
+            && let Some((_, sights)) = watch.to.as_ref()
+        {
+            let _ = sights.try_send(Sight::Check(now));
+        }
         wake.notify_all();
+    }
+}
+
+/// Say that the agent waits for the user to get past a site's check in tab
+/// `id`, since `since`, or with `None` that it no longer does. The window is
+/// told while it follows that tab, and whenever it comes to.
+pub(crate) fn waiting_on_check(id: &str, since: Option<Instant>) {
+    let Ok(mut watch) = state().0.lock() else {
+        return;
+    };
+    match since {
+        Some(since) => watch.checks.insert(id.to_owned(), since),
+        None => watch.checks.remove(id),
+    };
+    if watch.tab.as_ref().is_some_and(|tab| tab.id == id)
+        && let Some((_, sights)) = watch.to.as_ref()
+    {
+        let _ = sights.try_send(Sight::Check(since));
     }
 }
 
@@ -1167,6 +1210,22 @@ mod tests {
         // The page is named as the watching starts.
         let named = watching.sights.recv_blocking().unwrap();
         assert!(matches!(named, Sight::Page { title, .. } if title == "Fake page"));
+
+        // The agent waiting on a site's check in this tab is shown, and so
+        // is its end; a wait in another tab is not.
+        let check = |watching: &Watching| loop {
+            if let Sight::Check(since) = watching.sights.recv_blocking().unwrap() {
+                break since;
+            }
+        };
+        let elsewhere = Instant::now();
+        waiting_on_check("W2", Some(elsewhere));
+        let since = elsewhere + Duration::from_secs(1);
+        waiting_on_check("W1", Some(since));
+        assert_eq!(check(&watching), Some(since));
+        waiting_on_check("W2", None);
+        waiting_on_check("W1", None);
+        assert_eq!(check(&watching), None);
 
         // The room the window has: the page is laid out in it, at the
         // screen's sharpness, and pictures come that size.
