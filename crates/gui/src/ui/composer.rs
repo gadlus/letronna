@@ -9,6 +9,14 @@ pub(crate) fn offered() -> impl Iterator<Item = Mode> {
     Mode::OFFERED.into_iter()
 }
 
+/// A media kind as the model menu's tab names it: "Image" for `image`.
+pub(crate) fn kind_label(kind: &str) -> &str {
+    letronna_core::media::KINDS
+        .into_iter()
+        .find(|(k, _)| *k == kind)
+        .map_or(kind, |(_, label)| label)
+}
+
 impl Chat {
     /// The (gateway, model) pairs the picker shows for what is typed in its
     /// search box.
@@ -39,7 +47,16 @@ impl Chat {
     pub(crate) fn model_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (on, current) = self.store.model(self.store.active);
         let (on, current) = (on.to_owned(), current.to_owned());
-        let short = current.rsplit('/').next().unwrap_or(&current).to_string();
+        let here = self.store.conversations[self.store.active].id;
+        let making = self.media_kinds.get(&here).copied();
+        // What answers the next message is what the trigger names.
+        let short = match making {
+            Some(kind) => match self.media_choices.get(kind) {
+                Some(model) => model.rsplit('/').next().unwrap_or(model).to_string(),
+                None => format!("{} · Auto", kind_label(kind)),
+            },
+            None => current.rsplit('/').next().unwrap_or(&current).to_string(),
+        };
         let mut list = v_flex()
             .id("model-list")
             .max_h(px(320.))
@@ -70,7 +87,7 @@ impl Chat {
             );
         }
         for (i, (gw, id)) in matches.into_iter().enumerate() {
-            let active = gw == on && id == current;
+            let active = making.is_none() && gw == on && id == current;
             let (pick_gw, pick) = (gw.clone(), id.clone());
             list = list.child(
                 Button::new(("model", i))
@@ -121,9 +138,11 @@ impl Chat {
                             .child(div().max_w(px(160.)).truncate().child(short))
                             .child(Icon::new(IconName::ChevronDown).size_3()),
                     )
-                    .on_click(cx.listener(|this, _, window, cx| {
+                    .on_click(cx.listener(move |this, _, window, cx| {
                         this.model_open = !this.model_open;
                         if this.model_open {
+                            // On the tab of what answers now.
+                            this.model_kind = making.unwrap_or("chat");
                             this.model_search.update(cx, |s, cx| {
                                 s.set_value("", window, cx);
                                 s.focus(window, cx);
@@ -189,10 +208,11 @@ impl Chat {
     /// Text, and each kind of media model there is, as tabs over the list.
     fn kind_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let there = |kind: &str| self.media_models.iter().any(|o| o.kind == kind);
+        // Not transcription: a message is never made into a transcript.
         let kinds = std::iter::once(("chat", "Text")).chain(
             letronna_core::media::KINDS
                 .into_iter()
-                .filter(|(k, _)| there(k)),
+                .filter(|(k, _)| *k != "transcription" && there(k)),
         );
         let mut tabs = h_flex()
             .p_1()
