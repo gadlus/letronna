@@ -43,6 +43,7 @@ use crate::approvals;
 use crate::budget::Budget;
 use crate::cancel::Cancel;
 use crate::chat::{self, Connection, Event, Extra, Message, ToolCall};
+use crate::contract::{self, Contract};
 use crate::gate::{self, Gate, Grants, Layer};
 use crate::inbox::{self, Notice, When};
 use crate::judge;
@@ -207,6 +208,9 @@ pub struct Report {
     pub files: Vec<String>,
     /// Jobs it left running, which are its owner's now.
     pub jobs: Vec<u64>,
+    /// What was still wrong, as the run ended, with the files its request
+    /// asked for: none for a helper, which is not held to them.
+    pub contract: Vec<String>,
 }
 
 /// Why a run ended.
@@ -250,8 +254,10 @@ pub fn run_keeping(mut spec: Spec) -> (Report, Transcript) {
         seconds: 0,
         files: Vec::new(),
         jobs: Vec::new(),
+        contract: Vec::new(),
     };
-    let status = steps(&mut spec, &mut turn, &mut report)
+    let contract = required(&spec);
+    let status = steps(&mut spec, &mut turn, &mut report, &contract)
         .and_then(|status| {
             // Calls that ran before a stop keep their results, so
             // whoever resumes the transcript knows what they did.
@@ -271,6 +277,9 @@ pub fn run_keeping(mut spec: Spec) -> (Report, Transcript) {
         .collect();
     forward_unread(&spec);
     report.status = status;
+    if let Some(workspace) = &spec.connection.workspace {
+        report.contract = contract::problems(&contract, workspace);
+    }
     // Only what it said: a fork's transcript opens with its parent's words.
     let messages = &spec.transcript.conversation.messages;
     report.text = last_said(messages.get(spec.from..).unwrap_or_default());
@@ -291,8 +300,14 @@ pub fn spawn(spec: Spec, then: impl FnOnce(&Report) + Send + 'static) -> Result<
         .map_err(|e| format!("Could not start the helper: {e}"))
 }
 
-/// Calls the model and works through what it asks for, round after round, until the run ends.
-fn steps(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result<Outcome, String> {
+/// Calls the model and works through what it asks for, round after round,
+/// until the run ends, sending it back once while `contract` is not met.
+fn steps(
+    spec: &mut Spec,
+    turn: &mut Turn,
+    report: &mut Report,
+    contract: &Contract,
+) -> Result<Outcome, String> {
     let mut sent_back = 0;
     // Before any call, since a schema that strays turns down every answer
     // with problems no agent can fix.
@@ -311,6 +326,7 @@ fn steps(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result<Outcom
         ));
     }
     let mut reminded = false;
+    let mut checked = false;
     loop {
         if spec.cancel.is_set() {
             return Ok(Outcome::Stopped);
@@ -364,6 +380,30 @@ fn steps(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result<Outcom
             save(&mut spec.transcript)?;
             if !answered {
                 continue;
+            }
+            // Before the Stop hooks, so they judge the files once put right;
+            // and once only, since a model sent back again starts rewriting
+            // what it had right. With no round or budget left, going back
+            // could only end an answered run at its limit.
+            if !checked
+                && report.rounds < spec.rounds
+                && (spec.budget.as_ref()).is_none_or(|budget| budget.check().is_ok())
+                && let Some(workspace) = &spec.connection.workspace
+            {
+                let problems = contract::problems(contract, workspace);
+                if !problems.is_empty() {
+                    checked = true;
+                    // A notice, so nothing takes it for the user's words.
+                    spec.transcript.conversation.messages.push(Message {
+                        role: "user".into(),
+                        content: contract::notice(&problems),
+                        folded: true,
+                        notice: true,
+                        ..Default::default()
+                    });
+                    save(&mut spec.transcript)?;
+                    continue;
+                }
             }
             // A session's own agent, as `-p` runs it, hears its Stop hooks as a
             // turn in the terminal does; a helper's answer is its parent's to judge.
@@ -743,6 +783,30 @@ fn context(spec: &Spec) -> ToolContext {
 /// it began, as `off_thread` does.
 fn made(own: &Call, call: &ToolCall, cancel: &Cancel) -> Option<Result<String, String>> {
     (!cancel.is_set()).then(|| own(call))
+}
+
+/// What a session's own run must leave in its workspace, as the request it
+/// was started with names it; nothing for a helper, whose work is its
+/// parent's to judge, for a run that may not write, or for one mail started.
+fn required(spec: &Spec) -> Contract {
+    let (0, Some(workspace)) = (spec.depth, &spec.connection.workspace) else {
+        return Contract::default();
+    };
+    // Sent back, a run in Plan mode or with no tools could only be pointed
+    // at calls it may not make.
+    if spec.connection.plan || !spec.connection.tools {
+        return Contract::default();
+    }
+    let messages = &spec.transcript.conversation.messages;
+    let own = messages.get(spec.from..).unwrap_or_default();
+    let Some(request) = own.iter().rfind(|m| chat::opens_turn(m)) else {
+        return Contract::default();
+    };
+    // Mail, such as a job's output or a helper's report, is no request.
+    if request.notice {
+        return Contract::default();
+    }
+    contract::from_request(&request.content, workspace)
 }
 
 /// Runs a tool on a thread of its own, so a stop ends the wait even for a
@@ -3206,5 +3270,121 @@ pub(crate) mod tests {
         let refused = results(sent.last().unwrap())[1];
         assert!(refused.contains("nobody is here to decide"), "{refused}");
         assert!(requests.try_recv().is_err(), "a card with nobody there");
+    }
+
+    /// A session's own run in `dir`, asked to leave `out/summary.json`.
+    fn asked_for_a_summary(endpoint: String, dir: &Path, id: AgentId) -> Spec {
+        let mut spec = spec(endpoint, dir, id);
+        spec.depth = 0;
+        spec.transcript.conversation.messages[0].content =
+            "Read notes.txt and write what it says to out/summary.json.".into();
+        spec
+    }
+
+    #[test]
+    fn a_missing_required_output_sends_the_run_back_once() {
+        let dir = scratch("contract-missing");
+        let (endpoint, provider) = provider(vec![reply("Done.", &[]), reply("Still done.", &[])]);
+        let report = finished(asked_for_a_summary(endpoint, &dir, AGENTS + 490));
+        // A third request would find no provider and fail the run.
+        assert_eq!(report.status, Outcome::Done);
+        let sent = provider.sent();
+
+        let last = messages(&sent[1]).last().unwrap();
+        assert_eq!(last["role"], "user");
+        assert_eq!(
+            last["content"],
+            "[Letronna check] Before ending, compare these with the request:\n\
+             - `out/summary.json` does not exist.\n\
+             Fix the ones it asked for, in place; ignore any it did not ask for. \
+             Only your last message is passed on as your answer, so end with your \
+             whole answer again, not only what changed."
+        );
+        assert_eq!(report.contract, ["`out/summary.json` does not exist."]);
+        // Folded in as a notice, so neither the window nor the judge takes
+        // it for something the user typed.
+        let saved: Vec<Value> = written(&dir.join("helper.jsonl"))
+            .into_iter()
+            .filter(|record| record["type"] == "message")
+            .collect();
+        let check = &saved[saved.iter().position(|m| m["role"] == "assistant").unwrap() + 1];
+        assert_eq!(
+            (&check["role"], &check["notice"], &check["folded"]),
+            (&json!("user"), &json!(true), &json!(true))
+        );
+    }
+
+    #[test]
+    fn a_run_started_by_mail_is_not_held_to_the_files_the_mail_names() {
+        let dir = scratch("contract-mail");
+        let (endpoint, provider) = provider(vec![reply("Noted.", &[])]);
+        let mut spec = asked_for_a_summary(endpoint, &dir, AGENTS + 520);
+        let mail = &mut spec.transcript.conversation.messages[0];
+        mail.content =
+            "[Letronna notice: not from the user]\n- job 3: cannot write out/x.json".into();
+        mail.notice = true;
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(provider.sent().len(), 1);
+        assert!(report.contract.is_empty());
+    }
+
+    #[test]
+    fn a_run_whose_outputs_are_right_ends_without_a_check_notice() {
+        let dir = scratch("contract-right");
+        let summary = json!({"path": "out/summary.json", "content": r#"{"said": "hello"}"#});
+        let (endpoint, provider) = provider(vec![
+            reply("", &[("write_file", summary)]),
+            reply("Done.", &[]),
+        ]);
+        let mut spec = asked_for_a_summary(endpoint, &dir, AGENTS + 500);
+        // Edits in the project run, with nobody there to approve them.
+        spec.connection.mode = crate::gate::Mode::AcceptEdits;
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(provider.sent().len(), 2);
+        assert!(dir.join("out/summary.json").exists());
+        assert!(report.contract.is_empty());
+    }
+
+    #[test]
+    fn a_run_in_plan_mode_is_not_sent_back_for_a_missing_output() {
+        let dir = scratch("contract-plan");
+        let (endpoint, provider) = provider(vec![reply("Here is the plan.", &[])]);
+        let mut spec = asked_for_a_summary(endpoint, &dir, AGENTS + 510);
+        spec.connection.plan = true;
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(provider.sent().len(), 1);
+        assert!(report.contract.is_empty());
+    }
+
+    #[test]
+    fn a_run_with_no_round_or_budget_left_is_not_sent_back_for_a_missing_output() {
+        // Its one round went on reading the notes.
+        let dir = scratch("contract-last-round");
+        let (endpoint, last_round) = provider(vec![
+            reply("", &[read_notes()]),
+            reply("The notes say hello.", &[]),
+        ]);
+        let mut spec = asked_for_a_summary(endpoint, &dir, AGENTS + 900);
+        spec.rounds = 1;
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(report.text, "The notes say hello.");
+        assert_eq!(last_round.sent().len(), 2);
+        assert_eq!(report.contract, ["`out/summary.json` does not exist."]);
+
+        // Each reply costs 1,050 tokens, so the answer spends the last of it.
+        let dir = scratch("contract-spent");
+        let (endpoint, spent) = provider(vec![
+            reply("", &[read_notes()]),
+            reply("The notes say hello.", &[]),
+        ]);
+        let mut spec = asked_for_a_summary(endpoint, &dir, AGENTS + 910);
+        spec.budget = Some(Arc::new(Budget::new(2_000, None)));
+        let report = finished(spec);
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(spent.sent().len(), 2);
     }
 }

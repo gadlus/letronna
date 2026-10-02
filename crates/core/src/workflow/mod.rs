@@ -1218,6 +1218,7 @@ mod tests {
             seconds: 0,
             files: Vec::new(),
             jobs: Vec::new(),
+            contract: Vec::new(),
             value: None,
         }
     }

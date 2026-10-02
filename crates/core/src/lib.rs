@@ -24,6 +24,7 @@ pub mod commit;
 pub mod compact;
 pub mod complete;
 pub mod computer;
+mod contract;
 #[cfg(feature = "workflows")]
 pub mod crew;
 pub mod diag;
