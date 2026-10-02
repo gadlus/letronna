@@ -1283,6 +1283,10 @@ fn usage_line(message: &Message) -> String {
     parts.join(" · ")
 }
 
+/// The longest side a picture a tool made is decoded at: twice as wide as
+/// it is shown, for a screen up to twice as sharp.
+const MADE_SIDE: u32 = 720;
+
 /// What a media tool made, shown as itself: a picture, a video by its first
 /// frame until it plays here, a sound with a button to play it. Each gets
 /// buttons to open the file or find it. `frame` is the video's newest frame
@@ -1341,12 +1345,14 @@ fn made_file(
                     .relative()
                     .cursor_pointer()
                     .child(
-                        img(still)
-                            .h(px(220.))
-                            .max_w(px(360.))
-                            .object_fit(ObjectFit::Contain)
-                            .rounded(radius)
-                            .when(video, |img| img.with_loading(blank).with_fallback(blank)),
+                        crate::ui::pictures::held_while_shown(&path, MADE_SIDE).child(
+                            img(still)
+                                .h(px(220.))
+                                .max_w(px(360.))
+                                .object_fit(ObjectFit::Contain)
+                                .rounded(radius)
+                                .when(video, |img| img.with_loading(blank).with_fallback(blank)),
+                        ),
                     )
                     .when(video, |this| {
                         // Big in the middle to start it; small in the corner
