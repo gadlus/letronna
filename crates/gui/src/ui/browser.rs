@@ -216,6 +216,9 @@ impl BrowserView {
         if self.watching.is_some() || self.dismissed || self.unseen {
             return;
         }
+        // A wait on a site's check that ended while nothing watched was
+        // never told; one still going is told again as watching starts.
+        self.check = None;
         let Watching { frames, sights } = watch::watch();
         let pictures = cx.spawn(async move |this, cx| {
             // When the last picture went up, which the preview's next waits on.

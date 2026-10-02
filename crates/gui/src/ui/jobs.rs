@@ -691,9 +691,14 @@ impl Chat {
                     .filter_map(|n| {
                         let line = this.jobs.lines.get(n)?;
                         let chosen = picked.is_some_and(|picked| picked.range().contains(&n));
+                        // The font is on each row as well as the list: the
+                        // list measures a row before its own style applies,
+                        // and every row is placed that measured row apart.
                         Some(
                             div()
                                 .px_3()
+                                .font_family(MONO_FONT)
+                                .text_xs()
                                 .whitespace_nowrap()
                                 .when(chosen, |row| row.bg(cx.theme().selection))
                                 .child(drawn(line))

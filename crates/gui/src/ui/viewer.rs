@@ -368,7 +368,7 @@ impl Render for Viewer {
         // it is let go of again once zoomed back.
         let wanted = shown.0.max(shown.1) * window.scale_factor();
         let longest = self.size.0.max(self.size.1);
-        if wanted > self.base_side as f32 && longest > self.base_side {
+        if sharper(wanted, longest, self.base_side) {
             if self.sharp.is_none() {
                 self.sharp = Some(Shrunk::new(MAX_SIDE, cx));
             }
@@ -514,6 +514,13 @@ fn fit_scale(size: (u32, u32), room: (f32, f32)) -> f32 {
     (room.0 / width).min(room.1 / height).clamp(0.001, 1.)
 }
 
+/// Whether a picture `longest` pixels a side, drawn `wanted` pixels a side,
+/// needs a copy sharper than the screen-sized one `base_side` a side: not
+/// when that holds all of it, nor when it is already as large as any copy.
+fn sharper(wanted: f32, longest: u32, base_side: u32) -> bool {
+    wanted > base_side as f32 && longest > base_side && base_side < MAX_SIDE
+}
+
 /// The zoom a step from `scale` in or out goes to: the next of `STEPS`,
 /// and from the first one out, fitted (`None`) again.
 fn stepped(scale: f32, fit: f32, zoom_in: bool) -> Option<f32> {
@@ -552,7 +559,7 @@ fn clamped(pan: (f32, f32), shown: (f32, f32), room: (f32, f32)) -> (f32, f32) {
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
-    use super::{anchored, clamped, fit_scale, stepped};
+    use super::{MAX_SIDE, anchored, clamped, fit_scale, sharper, stepped};
 
     #[test]
     fn a_big_picture_fits_the_room_and_a_small_one_is_not_blown_up() {
@@ -594,5 +601,16 @@ mod tests {
         assert_eq!(clamped((50., 20.), (400., 300.), room), (0., 0.));
         // Wider than the room but not taller: it moves across only.
         assert_eq!(clamped((-90., 90.), (1_000., 300.), room), (-90., 0.));
+    }
+
+    #[test]
+    fn a_screen_sized_copy_at_the_largest_size_is_never_read_twice() {
+        // A 6000px photo zoomed past a 4K screen's copy is read again larger.
+        assert!(sharper(6_000., 6_000, 3_840));
+        // On a 5K screen the screen's copy is already the largest there is.
+        assert!(!sharper(6_000., 6_000, MAX_SIDE));
+        // Nor past a picture the screen's copy holds whole.
+        assert!(!sharper(3_000., 2_000, 2_560));
+        assert!(!sharper(2_000., 6_000, 2_560));
     }
 }

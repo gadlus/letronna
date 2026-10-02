@@ -67,8 +67,10 @@ pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Opti
             KeyBinding::new("secondary-shift-a", OpenActivity, Some("Chat")),
             Some("Open activity"),
         ),
+        // Not Shift+I: off macOS that is gpui-component's inspector in a
+        // debug build, bound window-wide and so tried before this.
         (
-            KeyBinding::new("secondary-shift-i", ui::activity::ShowRunning, Some("Chat")),
+            KeyBinding::new("secondary-shift-t", ui::activity::ShowRunning, Some("Chat")),
             Some("Show what is running"),
         ),
         // Nearer than the chat's own escape, which would stop the reply.
@@ -824,5 +826,17 @@ mod tests {
             .map(|(binding, _)| binding.keystrokes()[0].unparse())
             .collect();
         assert_eq!(window_wide.len(), 3, "{window_wide:?}");
+    }
+
+    #[test]
+    fn no_key_is_the_one_the_inspector_takes_in_a_debug_build() {
+        // gpui-component binds Ctrl+Shift+I with no context in a debug
+        // build, which outranks any of ours; Cmd is Ctrl off macOS.
+        let taken: Vec<String> = keys(&gpui::DummyKeyboardMapper)
+            .iter()
+            .map(|(binding, _)| binding.keystrokes()[0].unparse())
+            .filter(|key| matches!(key.as_str(), "ctrl-shift-i" | "cmd-shift-i"))
+            .collect();
+        assert!(taken.is_empty(), "{taken:?}");
     }
 }

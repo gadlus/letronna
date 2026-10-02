@@ -411,17 +411,17 @@ impl Chat {
 
     /// Whether the browser shows as the preview now: the session on screen
     /// has it so, its conversation is on screen, the browser is not beside
-    /// it already, and no card waits on the user there, which the preview
-    /// could cover.
-    pub(crate) fn browser_preview_shown(&self, cx: &App) -> bool {
+    /// it already, no tab floats over the corner it would be at, and no
+    /// card waits on the user there, which the preview could cover.
+    pub(crate) fn browser_preview_shown(&self, window: &Window, cx: &App) -> bool {
         let session = self.session_on_screen();
         self.page == Page::Chat
             && !self.settings_open
             && self.panel.previews.contains(&session)
             && self.browser.read(cx).is_open()
-            && self
-                .panel_view(cx)
-                .is_none_or(|(_, open)| open != PanelTab::Browser)
+            && self.panel_view(cx).is_none_or(|(_, open)| {
+                open != PanelTab::Browser && self.place_of(open, window, cx) != Place::Floating
+            })
             && self.transcript_shown()
             && !self.needs_you(session)
     }
@@ -430,7 +430,7 @@ impl Chat {
     /// its newest lines show above the preview: none without one, or where
     /// the column's text stops short of it.
     pub(crate) fn browser_preview_room(&self, column: Pixels, window: &Window, cx: &App) -> Pixels {
-        if !self.browser_preview_shown(cx) {
+        if !self.browser_preview_shown(window, cx) {
             return px(0.);
         }
         let pane =
@@ -463,10 +463,16 @@ impl Chat {
             return;
         }
         self.page = Page::Chat;
-        self.panel.previews.insert(self.session_on_screen());
-        if !self.browser.read(cx).is_open() {
-            self.browser.update(cx, |view, cx| view.reopen(home, cx));
+        // A tab floating over the corner the preview is drawn at makes way.
+        if let Some(tab) = self.tab_on_screen(window, cx)
+            && self.place_of(tab, window, cx) == Place::Floating
+        {
+            self.panel.open = false;
         }
+        self.panel.previews.insert(self.session_on_screen());
+        // Even when open: one not drawn just now, as after a switch of
+        // session, may find this session's page gone, and opens `home`.
+        self.browser.update(cx, |view, cx| view.reopen(home, cx));
         cx.notify();
     }
 
@@ -516,7 +522,7 @@ impl Chat {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if !self.browser_preview_shown(cx) {
+        if !self.browser_preview_shown(window, cx) {
             return None;
         }
         let width = preview_width(pane);
@@ -668,7 +674,7 @@ impl Chat {
                     _ => Drawn::Beside,
                 })
             }
-            _ if self.browser_preview_shown(cx) => Some(Drawn::Preview),
+            _ if self.browser_preview_shown(window, cx) => Some(Drawn::Preview),
             _ => None,
         };
         if self.browser.read(cx).is_drawn_as(drawn) {
