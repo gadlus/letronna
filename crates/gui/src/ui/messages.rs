@@ -147,6 +147,10 @@ impl Chat {
                 .font_weight(FontWeight::MEDIUM)
                 .line_height(leading)
                 .into_any_element()
+        } else if message.content.is_empty() && !streaming {
+            // Stored with nothing said, by a run elsewhere -- the window keeps
+            // no such reply of its own -- and long done thinking.
+            div().into_any_element()
         } else if message.content.is_empty() {
             h_flex()
                 .gap_2()
