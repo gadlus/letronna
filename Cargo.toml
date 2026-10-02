@@ -3,6 +3,8 @@
 # driving it, and the two binaries are the ways of driving it.
 [workspace]
 members = ["crates/core", "crates/gui", "crates/cli"]
+# Third-party code kept here as published: not ours to lint or format.
+exclude = ["vendor"]
 resolver = "3"
 
 [workspace.package]
@@ -25,6 +27,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # - list item content flexes instead of shrink-to-fit, so items are not
 #   clipped to one character and do not widen the chat column
 gpui-component = { git = "https://github.com/wweziza/gpui-kit", branch = "v0.5.1-heading-gap" }
+# gpui 0.2.2 as published on crates.io, less its examples, so the renderer
+# can be changed without a fork of all of zed.
+gpui = { path = "vendor/gpui" }
 
 [profile.release]
 opt-level = 2
