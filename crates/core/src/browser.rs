@@ -214,12 +214,12 @@ const OPTION_ROLES: &[&str] = &["option", "menuitem", "menuitemradio", "treeitem
 const OPTIONS_LOOK: Duration = Duration::from_millis(100);
 /// Picks a dropdown's option by its text or value, as choosing it by hand
 /// would, and says what went wrong otherwise; `false` for a dropdown the
-/// site drew itself -- a combobox, or an element with a popup -- whose
-/// option is picked as a person would, by clicking.
+/// site drew itself -- a combobox, or an element whose popup is a list,
+/// not a dialog -- whose option is picked as a person would, by clicking.
 const CHOOSE: &str = "function(choice) {
   if (!(this instanceof HTMLSelectElement)) {
     const popup = this.getAttribute?.('aria-haspopup');
-    const drawn = this.getAttribute?.('role') === 'combobox' || (popup && popup !== 'false');
+    const drawn = this.getAttribute?.('role') === 'combobox' || ['true', 'listbox', 'menu', 'tree', 'grid'].includes(popup);
     return drawn ? false : 'That is not a dropdown; click it, then click the option.';
   }
   const option = [...this.options].find(o => o.label.trim() === choice || o.value === choice);
@@ -538,7 +538,7 @@ impl UsePage {
                 with_downloads(&saving, |session| {
                     let node = target(session)?;
                     session.act(agree, Some(&saving), after, |session| {
-                        session.choose(node, choice)
+                        session.choose(node, choice, frame)
                     })
                 })
             }
@@ -4550,7 +4550,7 @@ impl Session {
         Ok(())
     }
 
-    fn choose(&mut self, node: i64, choice: &str) -> Result<(), String> {
+    fn choose(&mut self, node: i64, choice: &str, frame: Option<&str>) -> Result<(), String> {
         self.point(node, format!("Choosing \"{}\" in", cut(choice, 40)), None);
         let object = self.object(node)?;
         let answer: Value = self.on_node(
@@ -4559,7 +4559,7 @@ impl Session {
                    "arguments": [{"value": choice}], "returnByValue": true}),
         )?;
         if answer["result"]["value"] == false {
-            return self.pick_drawn(node, &object, choice);
+            return self.pick_drawn(node, &object, choice, frame);
         }
         match answer["result"]["value"].as_str() {
             Some("") => Ok(()),
@@ -4577,9 +4577,16 @@ impl Session {
     /// Pick `choice` in `node`, a dropdown the site drew itself, whose
     /// handle is `object`, as a person would: open it with a click unless it
     /// says it is open, then click the one option of that name it shows.
-    /// Otherwise it is closed with Escape and the options it showed are
-    /// named; with several of that name it is left open to click one.
-    fn pick_drawn(&mut self, node: i64, object: &str, choice: &str) -> Result<(), String> {
+    /// Otherwise it is closed with Escape, sent only where `frame` says, and
+    /// the options it showed are named; with several of that name it is
+    /// left open to click one.
+    fn pick_drawn(
+        &mut self,
+        node: i64,
+        object: &str,
+        choice: &str,
+        frame: Option<&str>,
+    ) -> Result<(), String> {
         let found: Value = self.on_node(
             "Runtime.callFunctionOn",
             json!({"objectId": object, "functionDeclaration": DOCUMENT_OF}),
@@ -4590,12 +4597,18 @@ impl Session {
             .to_owned();
         let open = self.ax_said(node, "expanded")?["value"] == true;
         // What the page offered before it opened is not what it shows.
-        let before: Vec<i64> = match open {
-            true => Vec::new(),
-            false => (self.options_in(json!({"objectId": document}))?.into_iter())
-                .map(|(option, _)| option)
-                .collect(),
-        };
+        let before: Vec<i64> = (self.options_in(json!({"objectId": document}))?.into_iter())
+            .map(|(option, _)| option)
+            .collect();
+        // Open already, only a list it names tells its options from the
+        // rest of the page's.
+        if open && self.options_shown(node, &document, &before)?.is_empty() {
+            return Err(
+                "It is open already and does not say which options are its own, so nothing \
+                 was picked. Look at what it shows, then click the option meant."
+                    .into(),
+            );
+        }
         if !open {
             self.click(node)?;
         }
@@ -4625,6 +4638,7 @@ impl Session {
                 ));
             }
         }
+        self.keys_go_to(frame)?;
         self.press(&key("Escape").ok_or("There is no Escape key.")?)?;
         if shown.is_empty() {
             return Err(
@@ -6385,8 +6399,8 @@ mod tests {
     /// A page with a dropdown of its own, node 5, `open` or not, that shows
     /// `options` once pressed -- in list 20 when it `controls` one -- on a
     /// page that already has a "Canada", node 3, and a hidden one, node 4.
-    /// Node n is drawn n tens of pixels down; what the mouse and keys did
-    /// is kept in `seen`.
+    /// Node n is drawn n tens of pixels down, and focus stays on the page;
+    /// what the mouse and keys did is kept in `seen`.
     fn drawn_dropdown(
         options: &'static [(i64, &'static str)],
         controls: bool,
@@ -6446,6 +6460,8 @@ mod tests {
                     seen.lock().unwrap().push(pressed);
                     json!({})
                 }
+                "Page.createIsolatedWorld" => json!({"executionContextId": 1}),
+                "Runtime.evaluate" => json!({"result": {"type": "object", "subtype": "null"}}),
                 "Input.dispatchKeyEvent" => {
                     if params["key"] == "Escape" {
                         open.store(false, Ordering::Relaxed);
@@ -6472,7 +6488,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let page = drawn_dropdown(OPTIONS, false, false, seen.clone());
         let (mut session, server) = fake_session(page);
-        assert_eq!(session.choose(5, "Canada"), Ok(()));
+        assert_eq!(session.choose(5, "Canada", None), Ok(()));
         assert_eq!(
             *seen.lock().unwrap(),
             [pressed("55.0"), pressed("75.0")].concat()
@@ -6487,7 +6503,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let page = drawn_dropdown(OPTIONS, true, true, seen.clone());
         let (mut session, _server) = fake_session(page);
-        assert_eq!(session.choose(5, "Canada"), Ok(()));
+        assert_eq!(session.choose(5, "Canada", None), Ok(()));
         assert_eq!(*seen.lock().unwrap(), pressed("75.0"));
     }
 
@@ -6497,7 +6513,7 @@ mod tests {
         let page = drawn_dropdown(&[(7, "Canada"), (8, "Chile")], true, false, seen.clone());
         let (mut session, _server) = fake_session(page);
         let started = Instant::now();
-        let missing = session.choose(5, "Peru").unwrap_err();
+        let missing = session.choose(5, "Peru", None).unwrap_err();
         // Its options were waited for before it was given up on.
         assert!(started.elapsed() >= SETTLE);
         assert!(
@@ -6511,10 +6527,48 @@ mod tests {
         // One that shows nothing at all says so.
         let (mut session, _server) =
             fake_session(drawn_dropdown(&[], false, false, Arc::default()));
-        let empty = session.choose(5, "Peru").unwrap_err();
+        let empty = session.choose(5, "Peru", None).unwrap_err();
         assert!(
             empty.starts_with("It showed no options to pick from"),
             "{empty}"
+        );
+    }
+
+    #[test]
+    fn an_open_dropdown_naming_no_list_is_not_picked_from_the_whole_page() {
+        // Open already with no list of its own named, so the page's other
+        // "Canada" cannot be told from one it shows.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let page = drawn_dropdown(&[(8, "Chile")], false, true, seen.clone());
+        let (mut session, _server) = fake_session(page);
+        let refused = session.choose(5, "Canada", None).unwrap_err();
+        assert!(
+            refused.starts_with("It is open already and does not say which options"),
+            "{refused}"
+        );
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_dropdown_left_open_sends_no_escape_into_a_frame_not_listed() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let page = drawn_dropdown(&[(7, "Canada")], true, false, seen.clone());
+        // Opening it put focus in a frame the page's tree does not have.
+        let (mut session, _server) = fake_session(move |method, params| {
+            let answer = match method {
+                "Page.getFrameTree" => json!({"frameTree": {"frame": {"id": "TOP"}}}),
+                "Runtime.evaluate" => json!({"result": {"type": "object", "objectId": "A"}}),
+                "DOM.describeNode" => json!({"node": {"nodeName": "IFRAME", "frameId": "F9"}}),
+                _ => return page(method, params),
+            };
+            (Vec::new(), answer)
+        });
+        let refused = session.choose(5, "Peru", None).unwrap_err();
+        assert!(refused.contains("not listed"), "{refused}");
+        let seen = seen.lock().unwrap();
+        assert!(
+            !seen.iter().any(|done| done.ends_with("Escape")),
+            "{seen:?}"
         );
     }
 
@@ -6523,7 +6577,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let page = drawn_dropdown(&[(7, "Canada"), (9, "Canada")], false, false, seen.clone());
         let (mut session, _server) = fake_session(page);
-        let refused = session.choose(5, "Canada").unwrap_err();
+        let refused = session.choose(5, "Canada", None).unwrap_err();
         assert!(
             refused.starts_with("2 of its options are named \"Canada\", so none was picked."),
             "{refused}"
@@ -6544,7 +6598,7 @@ mod tests {
             };
             (Vec::new(), answer)
         });
-        assert_eq!(session.choose(5, "Green"), Ok(()));
+        assert_eq!(session.choose(5, "Green", None), Ok(()));
         drop(session);
         let heard = server.join().unwrap();
         assert!(
