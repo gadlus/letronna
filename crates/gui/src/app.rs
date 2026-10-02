@@ -1013,8 +1013,8 @@ impl Chat {
             mic: None,
             _subscriptions: subscriptions,
         };
-        let widen = this.follow_browser_layout(window, cx);
-        this._subscriptions.push(widen);
+        let resized = this.follow_window_width(window, cx);
+        this._subscriptions.push(resized);
         let front = cx.observe_window_activation(window, |this, window, _| {
             this.in_front = window.is_window_active();
         });
@@ -4040,6 +4040,7 @@ impl Render for Chat {
         // this one if the list draws it; if not, the transcript keeps them.
         self.focusing = self.focus_turn.take();
         self.keep_jobs_current(window, cx);
+        self.keep_browser_seen(window, cx);
         // What a stopped or failed reply did not take goes back in the box,
         // ahead of anything typed since.
         if let Some(text) = self.returned_follow_ups.take() {
@@ -4142,6 +4143,11 @@ impl Render for Chat {
             self.activity_page(window, cx)
         } else if self.page != Page::Chat {
             self.page_view(self.page, cx).into_any_element()
+        } else if let Some(panel) = self.covering_panel(window, cx) {
+            // The browser, in a room too narrow for it beside the chat, in
+            // place of the conversation as the setup page is: the composer
+            // stays under it.
+            panel
         } else if self.show_setup == Some(conversation.id) {
             self.setup_page(window, cx).into_any_element()
         } else if !self.transcript_shown() {
@@ -4269,6 +4275,13 @@ impl Render for Chat {
                 cx.listener(|this, _: &crate::ui::panel::BrowserTab, window, cx| {
                     if !window.has_active_dialog(cx) && !this.settings_open {
                         this.show_tab(crate::ui::panel::PanelTab::Browser, window, cx)
+                    }
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::ui::panel::WideBrowser, window, cx| {
+                    if !window.has_active_dialog(cx) && !this.settings_open {
+                        this.toggle_wide(window, cx)
                     }
                 }),
             )

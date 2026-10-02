@@ -21,7 +21,8 @@ impl Chat {
         if self.sidebar_open {
             shown.push(Region::Sidebar);
         }
-        if self.page != Page::Chat || self.transcript_shown() {
+        // The browser over the conversation hides it.
+        if self.page != Page::Chat || (self.transcript_shown() && !self.panel_covers(window, cx)) {
             shown.push(Region::Transcript);
         }
         if self.page == Page::Chat {

@@ -7,19 +7,23 @@
 //! drag tabs into and nothing to arrange or break. A tab shows only while
 //! it has something to show, only the open tab is drawn -- the others keep
 //! their state in their own entities -- and each session remembers its
-//! tab. A wide window docks the panel beside the chat, where its edge
-//! drags it wider or narrower; a narrow one floats it in the corner, where
-//! it covers the least.
+//! tab. The browser takes half the room beside the sidebar, or the share
+//! its edge is dragged to, or all of it but the chat's when made wide; in
+//! a room too narrow for both it is drawn over the conversation instead,
+//! the composer still under it. The other tabs dock beside the chat in a
+//! wide window, where the edge drags them wider or narrower, and float in a
+//! narrow one's corner, where they cover the least.
 
 use crate::prelude::*;
-use crate::ui::browser::{PointComment, Widen};
+use crate::ui::browser::{Drawn, PointComment};
 use gpui_component::tab::{Tab, TabBar};
 use std::collections::HashMap;
 
-actions!(panel, [TogglePanel, BrowserTab]);
+actions!(panel, [TogglePanel, BrowserTab, WideBrowser]);
 
 /// A window at least this wide docks the panel beside the chat -- Letronna's
 /// own window opens this wide -- and a narrower one floats it in a corner.
+/// The browser goes by the room beside the sidebar instead.
 const DOCK_WIDTH: Pixels = px(1100.);
 /// How much of the window the docked panel takes until its edge is dragged,
 /// and its bounds: less, and a page's words are too small to follow; more,
@@ -38,6 +42,15 @@ const FLOAT_TOP: Pixels = px(48.);
 /// What a floating panel leaves clear under it in the window, however
 /// short: the title bar, its gap above and the composer at a few lines.
 const FLOAT_CLEAR: Pixels = px(240.);
+/// How much of the room beside the sidebar the browser takes until its
+/// edge is dragged: half, the page and the conversation alike.
+const BROWSER_SHARE: f32 = 0.5;
+/// The least the browser is given beside the chat: about a phone's width,
+/// which a page still has a layout for.
+const BROWSER_LEAST: Pixels = px(400.);
+/// The least the chat keeps beside the browser, however wide that is made:
+/// a line of the conversation, and the composer with its controls under it.
+const CHAT_LEAST: Pixels = px(420.);
 
 /// A tab of the panel. A new one is a variant here and its arms in the
 /// matches below.
@@ -74,10 +87,13 @@ impl PanelTab {
 pub(crate) struct Panel {
     /// Shown or hidden by its keys and the title bar's toggle.
     open: bool,
-    /// The docked panel's width, once its edge has been dragged, and what
-    /// it was before the browser's page was turned on its side.
+    /// The docked panel's width, once its edge has been dragged.
     width: Option<Pixels>,
-    upright_width: Option<Pixels>,
+    /// The browser's share of the room beside the sidebar, once its edge
+    /// has been dragged: a share, so it suits the window at any size.
+    share: Option<f32>,
+    /// The window's width, kept for what is decided away from a draw.
+    window_width: Pixels,
     /// The tab each session had open last, by session id.
     tabs: HashMap<u64, PanelTab>,
 }
@@ -97,23 +113,50 @@ impl Panel {
     pub(crate) fn forget(&mut self, session: u64) {
         self.tabs.remove(&session);
     }
+}
 
-    /// Widen the docked panel as far as the chat allows, for a page laid
-    /// out as a desktop's, or go back to its width before.
-    fn widen(&mut self, wide: bool, window: Pixels) {
-        match wide {
-            true => {
-                self.upright_width = self.width;
-                self.width = Some(window - CHAT_ROOM);
-            }
-            false => self.width = self.upright_width.take(),
-        }
-    }
+/// Where the panel is drawn, for the tab open in it.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Place {
+    /// Beside the chat, this wide.
+    Docked(Pixels),
+    /// In a corner, over the chat.
+    Floating,
+    /// In place of the conversation, above the composer.
+    Over,
 }
 
 /// Whether a window this wide docks the panel beside the chat.
 pub(crate) fn docks(window: Pixels) -> bool {
     window >= DOCK_WIDTH
+}
+
+/// Whether a room this wide, the window's beside the sidebar, is too narrow
+/// for the browser and the chat side by side.
+fn too_narrow(room: Pixels) -> bool {
+    room < BROWSER_LEAST + CHAT_LEAST
+}
+
+/// How wide the browser is beside the chat in a room this wide: at its
+/// share of it, half until its edge is dragged, or with all of it but the
+/// chat's when wide; None when the room is too narrow for both.
+fn browser_width(room: Pixels, share: Option<f32>, wide: bool) -> Option<Pixels> {
+    if too_narrow(room) {
+        return None;
+    }
+    let most = room - CHAT_LEAST;
+    Some(match wide {
+        true => most,
+        false => (room * share.unwrap_or(BROWSER_SHARE))
+            .max(BROWSER_LEAST)
+            .min(most),
+    })
+}
+
+/// The share of a room this wide that the browser's edge dragged to this
+/// width gives it, as far as the browser and the chat each can go.
+fn share_of(width: Pixels, room: Pixels) -> f32 {
+    width.max(BROWSER_LEAST).min(room - CHAT_LEAST) / room
 }
 
 /// How wide the docked panel is in a window this wide, beside a sidebar
@@ -154,11 +197,11 @@ struct Edge;
 impl Chat {
     /// What a tab has for this draw: None when it has nothing to show, or
     /// how many things in it wait on the user.
-    fn tab_state(&self, tab: PanelTab, docked: bool, cx: &App) -> Option<usize> {
+    fn tab_state(&self, tab: PanelTab, cx: &App) -> Option<usize> {
         match tab {
             PanelTab::Browser => {
                 let browser = self.browser.read(cx);
-                browser.has_content(docked).then(|| browser.waiting())
+                browser.is_open().then(|| browser.waiting())
             }
             // Or while it is the tab asked for, so the status bar's chip
             // opens it even with nothing to list.
@@ -188,8 +231,8 @@ impl Chat {
 
     /// The tabs that show for this draw, with their counts, and the one the
     /// session has open among them.
-    fn tabs_now(&self, docked: bool, cx: &App) -> (Vec<(PanelTab, usize)>, Option<PanelTab>) {
-        let shown = shown_tabs(|tab| self.tab_state(tab, docked, cx));
+    fn tabs_now(&self, cx: &App) -> (Vec<(PanelTab, usize)>, Option<PanelTab>) {
+        let shown = shown_tabs(|tab| self.tab_state(tab, cx));
         let tabs: Vec<PanelTab> = shown.iter().map(|&(tab, _)| tab).collect();
         let open = self.panel.tab(self.session_on_screen(), &tabs);
         (shown, open)
@@ -201,31 +244,51 @@ impl Chat {
 
     /// The panel as it is drawn now: the tabs that show, with their counts,
     /// and the open one; None while it is hidden or has nothing to show.
-    fn panel_view(&self, docked: bool, cx: &App) -> Option<(Vec<(PanelTab, usize)>, PanelTab)> {
+    fn panel_view(&self, cx: &App) -> Option<(Vec<(PanelTab, usize)>, PanelTab)> {
         if !self.panel.open || self.page != Page::Chat {
             return None;
         }
-        let (shown, open) = self.tabs_now(docked, cx);
+        let (shown, open) = self.tabs_now(cx);
         Some((shown, open?))
     }
 
     /// The tab drawn now, if the panel is.
-    pub(crate) fn tab_on_screen(&self, window: &Window, cx: &App) -> Option<PanelTab> {
-        let docked = docks(window.viewport_size().width);
-        self.panel_view(docked, cx).map(|(_, open)| open)
+    pub(crate) fn tab_on_screen(&self, _window: &Window, cx: &App) -> Option<PanelTab> {
+        self.panel_view(cx).map(|(_, open)| open)
+    }
+
+    /// Where the panel goes with this tab open, in the window as it is now.
+    fn place_of(&self, open: PanelTab, window: &Window, cx: &App) -> Place {
+        let (width, sidebar) = (window.viewport_size().width, self.sidebar_width());
+        match open {
+            PanelTab::Browser => {
+                let wide = self.browser.read(cx).wide;
+                browser_width(width - sidebar, self.panel.share, wide)
+                    .map_or(Place::Over, Place::Docked)
+            }
+            _ => {
+                dock_width(width, sidebar, self.panel.width).map_or(Place::Floating, Place::Docked)
+            }
+        }
     }
 
     /// How much of the window the docked panel takes from the chat: none
-    /// while it floats or is not drawn.
+    /// while it floats, is drawn over the conversation, or is not drawn.
     pub(crate) fn panel_width(&self, window: &Window, cx: &App) -> Pixels {
-        match dock_width(
-            window.viewport_size().width,
-            self.sidebar_width(),
-            self.panel.width,
-        ) {
-            Some(width) if self.panel_view(true, cx).is_some() => width,
-            _ => px(0.),
+        match self.panel_view(cx) {
+            Some((_, open)) => match self.place_of(open, window, cx) {
+                Place::Docked(width) => width,
+                _ => px(0.),
+            },
+            None => px(0.),
         }
+    }
+
+    /// Whether the panel is drawn in place of the conversation: the browser
+    /// in a room too narrow for it and the chat side by side.
+    pub(crate) fn panel_covers(&self, window: &Window, cx: &App) -> bool {
+        self.panel_view(cx)
+            .is_some_and(|(_, open)| self.place_of(open, window, cx) == Place::Over)
     }
 
     /// How much of the window the sidebar takes.
@@ -240,11 +303,10 @@ impl Chat {
     /// Show the panel on the session's tab, or hide it. With nothing else
     /// to show, it opens on the browser, ready for an address.
     pub(crate) fn toggle_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let docked = docks(window.viewport_size().width);
-        if self.panel_view(docked, cx).is_some() {
+        if self.panel_view(cx).is_some() {
             return self.hide_panel(window, cx);
         }
-        let (_, tab) = self.tabs_now(docked, cx);
+        let (_, tab) = self.tabs_now(cx);
         self.show_tab(tab.unwrap_or(PanelTab::Browser), window, cx);
     }
 
@@ -278,9 +340,15 @@ impl Chat {
 
     /// Show the browser when a call is about to use it: before it runs, or
     /// while it waits to be allowed, so the page can be seen first -- unless
-    /// the agent is to browse unseen, or the panel was hidden this turn.
+    /// the agent is to browse unseen, the panel was hidden this turn, or
+    /// there is no room for it beside the chat.
     pub(crate) fn show_browser(&mut self, tool: &str, cx: &mut Context<Self>) {
         if !matches!(tool, "browse" | "use_page") || self.store.settings.browse_unseen {
+            return;
+        }
+        // Not over the conversation, which would hide the replies, and the
+        // card asking to allow this very call.
+        if too_narrow(self.panel.window_width - self.sidebar_width()) {
             return;
         }
         let was_open = self.browser.read(cx).is_open();
@@ -292,19 +360,120 @@ impl Chat {
         }
     }
 
-    /// The panel, docked beside the chat or floating over it, with a tab
-    /// bar over the open tab, which alone is drawn.
+    /// Give the browser all the room but the chat's, or put it back beside
+    /// the chat at its share; from anywhere else, show it so.
+    pub(crate) fn toggle_wide(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab_on_screen(window, cx) != Some(PanelTab::Browser) {
+            self.browser.update(cx, |view, _| view.wide = true);
+            return self.show_tab(PanelTab::Browser, window, cx);
+        }
+        // Over the conversation it has all the room there is already.
+        if self.panel_covers(window, cx) {
+            return;
+        }
+        self.browser.update(cx, |view, cx| {
+            view.wide = !view.wide;
+            cx.notify();
+        });
+    }
+
+    /// Tell the browser how it is drawn now -- beside the chat, over it, or
+    /// not at all -- once this draw is done: it watches only while drawn.
+    /// Not from the draw itself, which would not be drawn again for it.
+    pub(crate) fn keep_browser_seen(&self, window: &Window, cx: &mut Context<Self>) {
+        let drawn = match self.panel_view(cx) {
+            // Settings covers the whole window, the browser too.
+            Some((_, PanelTab::Browser)) if !self.settings_open => {
+                Some(match self.place_of(PanelTab::Browser, window, cx) {
+                    Place::Over => Drawn::Over,
+                    _ => Drawn::Beside,
+                })
+            }
+            _ => None,
+        };
+        if self.browser.read(cx).is_drawn_as(drawn) {
+            return;
+        }
+        let browser = self.browser.clone();
+        cx.defer(move |cx| browser.update(cx, |view, cx| view.set_drawn(drawn, cx)));
+    }
+
+    /// The panel, docked beside the chat or floating over it; None while it
+    /// is hidden, or drawn in place of the conversation.
     pub(crate) fn right_panel(
         &self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let width = dock_width(
-            window.viewport_size().width,
-            self.sidebar_width(),
-            self.panel.width,
-        );
-        let (shown, open) = self.panel_view(width.is_some(), cx)?;
+        let (shown, open) = self.panel_view(cx)?;
+        let place = self.place_of(open, window, cx);
+        if place == Place::Over {
+            return None;
+        }
+        let panel = self.panel(shown, open, window, cx);
+        Some(match place {
+            Place::Docked(width) => panel
+                .relative()
+                .h_full()
+                .w(width)
+                .flex_shrink_0()
+                .border_l_1()
+                .on_drag_move(
+                    cx.listener(move |this, event: &DragMoveEvent<Edge>, window, cx| {
+                        let right = window.viewport_size().width;
+                        let width = right - event.event.position.x;
+                        match open {
+                            // As a share of the room, so it suits the window
+                            // at any size; no longer wide, once dragged.
+                            PanelTab::Browser => {
+                                let room = right - this.sidebar_width();
+                                this.panel.share = Some(share_of(width, room));
+                                this.browser.update(cx, |view, _| view.wide = false);
+                            }
+                            _ => this.panel.width = Some(width),
+                        }
+                        cx.notify();
+                    }),
+                )
+                .child(edge(open, cx))
+                .into_any_element(),
+            _ => panel
+                .absolute()
+                // Top right, clear of the composer and the newest messages.
+                .top(FLOAT_TOP)
+                .right(px(16.))
+                .w(FLOAT_WIDTH)
+                .max_h(window.viewport_size().height - FLOAT_CLEAR)
+                .rounded(cx.theme().radius_lg)
+                .border_1()
+                .overflow_hidden()
+                .occlude()
+                .into_any_element(),
+        })
+    }
+
+    /// The panel in place of the conversation, when it is drawn there.
+    pub(crate) fn covering_panel(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let (shown, open) = self.panel_view(cx)?;
+        if self.place_of(open, window, cx) != Place::Over {
+            return None;
+        }
+        let panel = self.panel(shown, open, window, cx);
+        Some(panel.relative().flex_1().min_h_0().into_any_element())
+    }
+
+    /// The tab bar over the open tab, which alone is drawn.
+    fn panel(
+        &self,
+        shown: Vec<(PanelTab, usize)>,
+        open: PanelTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let selected = shown.iter().position(|&(tab, _)| tab == open);
         let tabs = shown.into_iter().map(|(tab, waiting)| {
             Tab::new()
@@ -326,7 +495,7 @@ impl Chat {
                     .tooltip_with_action("Hide the panel", &TogglePanel, Some("Chat"))
                     .on_click(cx.listener(|this, _, window, cx| this.hide_panel(window, cx))),
             );
-        let panel = v_flex()
+        v_flex()
             .track_focus(&self.panel_focus)
             // As on the sidebar: a click leaves the keys where they were.
             .on_any_mouse_down(|_, window, _| window.prevent_default())
@@ -334,48 +503,19 @@ impl Chat {
             .border_color(cx.theme().border)
             .child(bar)
             .child(self.tab_body(open, window, cx))
-            .children(self.ring(crate::ui::keys::Region::Panel, cx));
-        Some(match width {
-            Some(width) => panel
-                .relative()
-                .h_full()
-                .w(width)
-                .flex_shrink_0()
-                .border_l_1()
-                .on_drag_move(
-                    cx.listener(|this, event: &DragMoveEvent<Edge>, window, cx| {
-                        let right = window.viewport_size().width;
-                        this.panel.width = Some(right - event.event.position.x);
-                        cx.notify();
-                    }),
-                )
-                .child(edge(cx))
-                .into_any_element(),
-            None => panel
-                .absolute()
-                // Top right, clear of the composer and the newest messages.
-                .top(FLOAT_TOP)
-                .right(px(16.))
-                .w(FLOAT_WIDTH)
-                .max_h(window.viewport_size().height - FLOAT_CLEAR)
-                .rounded(cx.theme().radius_lg)
-                .border_1()
-                .overflow_hidden()
-                .occlude()
-                .into_any_element(),
-        })
+            .children(self.ring(crate::ui::keys::Region::Panel, cx))
     }
 
-    /// Widen the panel when the browser's page is turned on its side, and
-    /// narrow it back.
-    pub(crate) fn follow_browser_layout(
-        &self,
+    /// Keep the window's width for `show_browser`, which is not given the
+    /// window.
+    pub(crate) fn follow_window_width(
+        &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Subscription {
-        cx.subscribe_in(&self.browser, window, |this, _, Widen(wide), window, cx| {
-            this.panel.widen(*wide, window.viewport_size().width);
-            cx.notify();
+        self.panel.window_width = window.viewport_size().width;
+        cx.observe_window_bounds(window, |this, window, _| {
+            this.panel.window_width = window.viewport_size().width;
         })
     }
 
@@ -405,8 +545,8 @@ impl Chat {
 }
 
 /// The docked panel's left edge, which drags it wider or narrower, and
-/// back to its own width when clicked twice.
-fn edge(cx: &mut Context<Chat>) -> impl IntoElement {
+/// back to its own width when clicked twice: the browser to half.
+fn edge(open: PanelTab, cx: &mut Context<Chat>) -> impl IntoElement {
     div()
         .id("panel-edge")
         .absolute()
@@ -418,9 +558,15 @@ fn edge(cx: &mut Context<Chat>) -> impl IntoElement {
         .on_drag(Edge, |_, _, _, cx| cx.new(|_| Empty))
         .on_mouse_down(
             MouseButton::Left,
-            cx.listener(|this, event: &MouseDownEvent, _, cx| {
+            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                 if event.click_count == 2 {
-                    this.panel.width = None;
+                    match open {
+                        PanelTab::Browser => {
+                            this.panel.share = None;
+                            this.browser.update(cx, |view, _| view.wide = false);
+                        }
+                        _ => this.panel.width = None,
+                    }
                     cx.notify();
                 }
             }),
@@ -431,7 +577,7 @@ fn edge(cx: &mut Context<Chat>) -> impl IntoElement {
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
-    use super::{Panel, PanelTab, dock_width, shown_tabs, title};
+    use super::{Panel, PanelTab, browser_width, dock_width, share_of, shown_tabs, title};
     use gpui::px;
 
     #[test]
@@ -491,11 +637,6 @@ mod tests {
             dock_width(px(1600.), sidebar, Some(px(1200.))),
             Some(px(790.))
         );
-        // A page on its side asks for the room the whole window allows.
-        assert_eq!(
-            dock_width(px(1600.), sidebar, Some(px(1600. - 560.))),
-            Some(px(790.))
-        );
         // In the narrowest docking window the panel's minimum comes first.
         assert_eq!(dock_width(px(1100.), sidebar, None), Some(px(340.)));
         assert_eq!(
@@ -515,14 +656,55 @@ mod tests {
     }
 
     #[test]
-    fn a_page_on_its_side_widens_the_panel_and_upright_again_narrows_it_back() {
-        let mut panel = Panel {
-            width: Some(px(400.)),
-            ..Panel::default()
-        };
-        panel.widen(true, px(1500.));
-        assert_eq!(panel.width, Some(px(940.)));
-        panel.widen(false, px(1500.));
-        assert_eq!(panel.width, Some(px(400.)));
+    fn the_browser_takes_half_the_room_beside_the_sidebar() {
+        // Letronna's own window, 1100 wide, with the sidebar open and shut.
+        assert_eq!(browser_width(px(850.), None, false), Some(px(425.)));
+        assert_eq!(browser_width(px(1100.), None, false), Some(px(550.)));
+    }
+
+    #[test]
+    fn the_browser_and_the_chat_each_keep_their_least() {
+        // Half of 820 would leave the chat 410.
+        assert_eq!(browser_width(px(820.), None, false), Some(px(400.)));
+        assert_eq!(browser_width(px(1000.), Some(0.1), false), Some(px(400.)));
+        assert_eq!(browser_width(px(1000.), Some(0.9), false), Some(px(580.)));
+    }
+
+    #[test]
+    fn a_dragged_share_is_kept_and_suits_the_window_at_any_size() {
+        let share = share_of(px(1000.), px(1600.));
+        assert_eq!(share, 0.625);
+        assert_eq!(
+            browser_width(px(1600.), Some(share), false),
+            Some(px(1000.))
+        );
+        assert_eq!(browser_width(px(1200.), Some(share), false), Some(px(750.)));
+        // Dragged past what either side can give, it keeps what was seen.
+        assert_eq!(share_of(px(100.), px(1000.)), 0.4);
+        assert_eq!(share_of(px(990.), px(1000.)), 0.58);
+    }
+
+    #[test]
+    fn wide_leaves_the_chat_its_least_and_goes_back_to_the_share() {
+        assert_eq!(browser_width(px(1500.), Some(0.625), true), Some(px(1080.)));
+        assert_eq!(
+            browser_width(px(1500.), Some(0.625), false),
+            Some(px(937.5))
+        );
+        assert_eq!(browser_width(px(1500.), None, true), Some(px(1080.)));
+        assert_eq!(browser_width(px(1500.), None, false), Some(px(750.)));
+    }
+
+    #[test]
+    fn a_narrow_room_has_the_browser_over_the_chat_and_the_other_tabs_as_before() {
+        // A window 1000 wide leaves 750 beside the sidebar: too little for
+        // 400 and 420 side by side, wide or not.
+        assert_eq!(browser_width(px(750.), None, false), None);
+        assert_eq!(browser_width(px(819.), None, true), None);
+        // The other tabs still go by the window, and float under 1100,
+        // where the browser beside a closed sidebar docks at half.
+        assert_eq!(dock_width(px(1000.), px(250.), None), None);
+        assert_eq!(dock_width(px(1000.), px(0.), None), None);
+        assert_eq!(browser_width(px(1000.), None, false), Some(px(500.)));
     }
 }
