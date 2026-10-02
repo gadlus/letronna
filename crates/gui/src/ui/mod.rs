@@ -362,6 +362,14 @@ pub(crate) fn more_lines(hidden: usize) -> String {
     }
 }
 
+/// The words on the row over a tail, whose hidden lines came before it.
+fn earlier_lines(hidden: usize) -> String {
+    match hidden {
+        1 => "⋯ 1 earlier line".to_owned(),
+        n => format!("⋯ {n} earlier lines"),
+    }
+}
+
 /// At most `OPEN_LINES` lines of `text` from its `cut` end, with a line
 /// saying how many more there are at the other.
 fn clamped(text: &str, cut: Cut) -> String {
@@ -456,28 +464,33 @@ pub(crate) fn preview_block(
             }
             toggle_it(window, cx)
         });
-        return v_flex()
-            .w_full()
-            .child(
-                // Clipped to the rows, as a long line can still wrap past
-                // the guess; a tail is held to the bottom of its box.
-                div()
-                    .flex()
-                    .flex_col()
-                    .when(cut == Cut::Tail, |this| this.justify_end())
-                    .max_h(CODE_LINE * PREVIEW_ROWS as f32)
-                    .overflow_hidden()
-                    .child(inked(rest.shown, cut, ink, cx)),
-            )
-            .child(more_row(
-                ElementId::NamedChild(Box::new(id), "more".into()),
-                more_lines(rest.hidden),
-                false,
-                open_it,
-                window,
-                cx,
-            ))
-            .into_any_element();
+        let shown = div()
+            // Clipped to the rows, as a long line can still wrap past the
+            // guess; a tail is held to the bottom of its box.
+            .flex()
+            .flex_col()
+            .when(cut == Cut::Tail, |this| this.justify_end())
+            .max_h(CODE_LINE * PREVIEW_ROWS as f32)
+            .overflow_hidden()
+            .child(inked(rest.shown, cut, ink, cx));
+        // The row stands where the hidden lines are: over a tail, under a head.
+        let more = more_row(
+            ElementId::NamedChild(Box::new(id), "more".into()),
+            match cut {
+                Cut::Tail => earlier_lines(rest.hidden),
+                Cut::Head => more_lines(rest.hidden),
+            },
+            false,
+            open_it,
+            window,
+            cx,
+        );
+        let column = v_flex().w_full();
+        return match cut {
+            Cut::Tail => column.child(more).child(shown),
+            Cut::Head => column.child(shown).child(more),
+        }
+        .into_any_element();
     }
     let whole = clamped(text, cut);
     let rows = rows(&whole, per_row);
@@ -580,7 +593,7 @@ pub(crate) fn more_row(
 mod tests {
     // Not `use super::*`: the prelude's gpui `test` macro would shadow the
     // built-in attribute.
-    use super::{Cut, Rest, clamped, more_lines, rest, rows};
+    use super::{Cut, Rest, clamped, earlier_lines, more_lines, rest, rows};
 
     #[test]
     fn a_long_line_still_counts_as_many_rows() {
@@ -642,6 +655,8 @@ mod tests {
     fn the_more_row_counts_in_words() {
         assert_eq!(more_lines(1), "⋯ 1 more line");
         assert_eq!(more_lines(42), "⋯ 42 more lines");
+        assert_eq!(earlier_lines(1), "⋯ 1 earlier line");
+        assert_eq!(earlier_lines(42), "⋯ 42 earlier lines");
     }
 
     #[test]
