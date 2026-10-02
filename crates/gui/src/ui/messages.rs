@@ -13,8 +13,8 @@ const INSET: Pixels = px(22.);
 /// question.
 const PROMPT_LINES: usize = 8;
 
-/// A prompt of more bytes than this rests folded too: about ten lines of
-/// the column, run together.
+/// A prompt of more characters than this rests folded too: about ten lines
+/// of the column, run together.
 const PROMPT_CHARS: usize = 800;
 
 /// Rows a folded prompt shows.
@@ -180,12 +180,10 @@ impl Chat {
                 None => letronna_core::untrusted::shown("", content).0,
             };
             // A long paste rests as its first rows, the rest a key away.
-            let long = said.lines().count() > PROMPT_LINES || said.len() > PROMPT_CHARS;
-            let shown_whole = !long || self.previews_open.contains(&self.open_key(index));
             let per_row = (self.text_width(px(0.)) / PROMPT_CHAR) as usize;
-            let cut = (!shown_whole)
-                .then(|| crate::ui::rest(&said, crate::ui::Cut::Head, per_row, PROMPT_ROWS))
-                .flatten();
+            let rest = prompt_rest(&said, per_row);
+            let long = rest.is_some();
+            let cut = rest.filter(|_| !self.previews_open.contains(&self.open_key(index)));
             if long {
                 let label = match &cut {
                     Some(cut) => crate::ui::more_lines(cut.hidden),
@@ -271,7 +269,12 @@ impl Chat {
                 let cap = px(12.) + leading * FENCE_ROWS as f32 + px(4.);
                 style.code_block(StyleRefinement::default().max_h(cap).overflow_hidden())
             };
-            let per_row = crate::ui::per_row(self.text_width(px(24.)), window);
+            // At the size the block draws its code, less a little, as a row
+            // breaks before a word that does not fit: an estimate short of
+            // the real rows would cut a fence with no way to open it.
+            let size = cx.theme().mono_font_size;
+            let per_row = crate::ui::per_row(self.text_width(px(24.)), size, window);
+            let per_row = per_row - per_row / 8;
             let chat = cx.weak_entity();
             TextView::markdown(md, message.content.clone(), window, cx)
                 .selectable(selectable)
@@ -1107,30 +1110,29 @@ impl Chat {
                     // copied, not copied out at every frame.
                     .when(open, |row| {
                         let chat = cx.weak_entity();
-                        row.child(
-                            gpui_component::clipboard::Clipboard::new(("copy-tool", index))
-                                .value_fn(move |_, cx| {
-                                    if let Some(text) = &copied {
-                                        return text.clone();
-                                    }
-                                    chat.upgrade()
-                                        .and_then(|chat| {
-                                            let store = &chat.read(cx).store;
-                                            let ix = store.index_of(session)?;
-                                            let said =
-                                                store.conversations[ix].messages.get(index)?;
-                                            Some(
-                                                letronna_core::untrusted::shown(
-                                                    &said.name,
-                                                    &said.content,
-                                                )
-                                                .0,
+                        row.child(crate::ui::copy_button(
+                            ("copy-tool", index),
+                            move |cx| {
+                                if let Some(text) = &copied {
+                                    return text.to_string();
+                                }
+                                chat.upgrade()
+                                    .and_then(|chat| {
+                                        let store = &chat.read(cx).store;
+                                        let ix = store.index_of(session)?;
+                                        let said = store.conversations[ix].messages.get(index)?;
+                                        Some(
+                                            letronna_core::untrusted::shown(
+                                                &said.name,
+                                                &said.content,
                                             )
-                                        })
-                                        .unwrap_or_default()
-                                        .into()
-                                }),
-                        )
+                                            .0,
+                                        )
+                                    })
+                                    .unwrap_or_default()
+                            },
+                            cx,
+                        ))
                     })
                     // A call that used the browser: the page it left, small,
                     // in the corner, as the agent's browsing shows it.
@@ -1156,7 +1158,14 @@ impl Chat {
                             toggle(this, cx);
                         }
                     }))
-                    .on_action(cx.listener(move |this, _: &ToggleRun, _, cx| toggle(this, cx))),
+                    // Only the row's own: Enter on its Copy or page button
+                    // presses that button.
+                    .on_action(cx.listener(move |this, _: &ToggleRun, window, cx| {
+                        if !focus.is_focused(window) {
+                            return cx.propagate();
+                        }
+                        toggle(this, cx)
+                    })),
             )
             // What let the call run in Auto mode, lined up with its name.
             .when_some(self.row_tag(index), |this, tag| {
@@ -1544,9 +1553,14 @@ impl Chat {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let key = self.open_key(index);
-        // Thinking is live until the reply says anything; the window stays
-        // open then unless closed, and shut afterwards unless opened.
-        let live = streaming && message.content.is_empty();
+        // Thinking is live until the reply says anything or starts writing
+        // a call; the window stays open then unless closed, and shut
+        // afterwards unless opened.
+        let drafting = self
+            .turn
+            .as_ref()
+            .is_some_and(|turn| !turn.live.drafts.is_empty());
+        let live = streaming && message.content.is_empty() && !drafting;
         let open = live != self.thinking_open.contains(&key);
         let focus = window
             .use_keyed_state(self.row_id("think-focus", index), cx, |_, cx| {
@@ -1670,8 +1684,7 @@ impl Chat {
             Event::Reasoning(_) if !thinking && !self.thought_for.contains_key(&key) => {
                 self.thinking_since = Some((key, std::time::Instant::now()));
             }
-            Event::Delta(text) if text.is_empty() => {}
-            Event::Delta(_) | Event::ToolCalls(_) | Event::Finished(_) if thinking => {
+            event if thinking && ends_thinking(event) => {
                 if let Some((at, since)) = self.thinking_since.take() {
                     self.thought_for.insert(at, since.elapsed());
                     // Closed while it came in is not opened once it is done.
@@ -2096,10 +2109,34 @@ fn took_for(time: std::time::Duration) -> String {
     }
 }
 
+/// What your prompt `said` shows at rest when it is long enough to fold
+/// and does not fit `PROMPT_ROWS` rows of `per_row` characters anyway.
+fn prompt_rest(said: &str, per_row: usize) -> Option<crate::ui::Rest> {
+    let long = said.lines().count() > PROMPT_LINES || said.chars().count() > PROMPT_CHARS;
+    long.then(|| crate::ui::rest(said, crate::ui::Cut::Head, per_row, PROMPT_ROWS))
+        .flatten()
+}
+
+/// Whether `event` ends a reply's thinking: its first words, a call it
+/// starts writing, which is the reply under way, its calls or its end.
+fn ends_thinking(event: &Event) -> bool {
+    match event {
+        Event::Delta(text) => !text.is_empty(),
+        Event::Drafting(drafts) => !drafts.is_empty(),
+        Event::ToolCalls(_) | Event::Finished(_) => true,
+        _ => false,
+    }
+}
+
 /// What a call to `tool` with `args` changes, when it is an edit: an
 /// edit_file's replacements compared line by line as the files card does,
 /// a written file's lines all added, a patch's own `+` and `-` lines.
 fn edited_by(tool: &str, args: &str) -> Option<Edited> {
+    // Asked again at every frame of a call that is no edit, which is then
+    // not worth parsing.
+    if !matches!(tool, "edit_file" | "write_file" | "apply_patch") {
+        return None;
+    }
     let args: serde_json::Value = serde_json::from_str(args).ok()?;
     let mut lines: Vec<String> = Vec::new();
     let (mut added, mut removed) = (0, 0);
@@ -2361,8 +2398,11 @@ fn open_made(path: PathBuf, picture: bool, window: &mut Window, cx: &mut App) {
 mod tests {
     // Deliberately not `use super::*`: the prelude re-exports gpui, whose own
     // `test` macro would shadow the built-in attribute here.
-    use super::{countdown, edited_by, exit_code, retry_due, took_for, usage_line, without_exit};
-    use letronna_core::chat::Message;
+    use super::{
+        countdown, edited_by, ends_thinking, exit_code, prompt_rest, retry_due, took_for,
+        usage_line, without_exit,
+    };
+    use letronna_core::chat::{Draft, Event, Message};
 
     #[test]
     fn a_command_that_exits_badly_says_its_code() {
@@ -2469,5 +2509,33 @@ mod tests {
             usage_line(&message),
             "16 out · 76000 in · 38% of 200K · 95% cached"
         );
+    }
+
+    #[test]
+    fn a_call_being_written_ends_the_thinking() {
+        let draft = Draft {
+            name: "write_file".into(),
+            subject: "notes.md".into(),
+        };
+        assert!(ends_thinking(&Event::Drafting(vec![draft])));
+        assert!(ends_thinking(&Event::Delta("Here".into())));
+        assert!(!ends_thinking(&Event::Drafting(Vec::new())));
+        assert!(!ends_thinking(&Event::Delta(String::new())));
+        assert!(!ends_thinking(&Event::Reasoning("hmm".into())));
+    }
+
+    #[test]
+    fn a_prompt_folds_only_when_it_does_not_fit_its_rows() {
+        // Over 800 bytes, but 450 characters: five rows of a wide column.
+        let cyrillic = "я".repeat(450);
+        assert_eq!(prompt_rest(&cyrillic, 102), None);
+        let pasted: Vec<String> = (1..=20).map(|n| format!("line {n}")).collect();
+        let Some(rest) = prompt_rest(&pasted.join("\n"), 102) else {
+            panic!("twenty lines do not fit in six rows");
+        };
+        assert_eq!(rest.hidden, 14);
+        assert!(prompt_rest(&"x".repeat(900), 102).is_some());
+        // Short, however narrow: a question, not a paste.
+        assert_eq!(prompt_rest("why does this fail?", 10), None);
     }
 }

@@ -1282,6 +1282,9 @@ impl Chat {
                 .is_none_or(|ix| self.store.conversations[ix].unload());
             if gone {
                 self.open.remove(at);
+                // What its edits changed goes with its messages, and is
+                // worked out again if it is opened.
+                self.edited.retain(|&(session, _), _| session != id);
             }
         }
     }
@@ -3612,6 +3615,14 @@ impl Chat {
         self.streaming_id = None;
         self.turn = None;
         self.judging = None;
+        // A retried or rewound reply can come back at the same place, and
+        // must not number its cards on from this turn's.
+        self.card_for = None;
+        // Nor be timed from this turn's thinking; thinking closed while it
+        // came in rests shut.
+        if let Some((at, _)) = self.thinking_since.take() {
+            self.thinking_open.remove(&at);
+        }
         // Calls a stop left running come back to a generation that is gone,
         // so the next turn must not wait for them.
         self.outstanding = 0;
@@ -4177,7 +4188,10 @@ impl Render for Chat {
                 .into_any_element()
         };
 
-        let strip = self.running_strip(window, cx);
+        // Built only where it shows: another page pays nothing for it.
+        let strip = (self.page == Page::Chat)
+            .then(|| self.running_strip(window, cx))
+            .flatten();
         let main = v_flex()
             .relative()
             .flex_1()

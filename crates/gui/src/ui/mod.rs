@@ -449,7 +449,8 @@ pub(crate) fn preview_block(
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
-    let per_row = per_row(width, window);
+    // Its rows are text_xs.
+    let per_row = per_row(width, window.rem_size() * 0.75, window);
     let Some(rest) = rest(text, cut, per_row, PREVIEW_ROWS) else {
         return inked(text.trim_end().to_owned(), cut, ink, cx).into_any_element();
     };
@@ -517,9 +518,8 @@ pub(crate) fn preview_block(
         .into_any_element()
 }
 
-/// How many characters of code fit on a row `width` wide.
-pub(crate) fn per_row(width: Pixels, window: &Window) -> usize {
-    let size = window.rem_size() * 0.75;
+/// How many characters of code at `size` fit on a row `width` wide.
+pub(crate) fn per_row(width: Pixels, size: Pixels, window: &Window) -> usize {
     let system = window.text_system();
     let font = system.resolve_font(&font(MONO_FONT));
     let advance = system
@@ -587,6 +587,30 @@ pub(crate) fn more_row(
             }
         })
         .on_action(move |_: &crate::ui::messages::ToggleRun, window, cx| on_key(window, cx))
+}
+
+/// A small Copy button that stays still under the pointer, unlike
+/// gpui-component's `Clipboard`: a press copies what `text` gives then and
+/// says so.
+pub(crate) fn copy_button(
+    id: impl Into<ElementId>,
+    text: impl Fn(&mut App) -> String + 'static,
+    cx: &App,
+) -> Button {
+    Button::new(id)
+        .plain(cx)
+        .xsmall()
+        .icon(IconName::Copy)
+        .tooltip("Copy")
+        .on_click(move |_, window, cx| {
+            cx.stop_propagation();
+            let text = text(cx);
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            window.push_notification(
+                gpui_component::notification::Notification::success("Copied."),
+                cx,
+            );
+        })
 }
 
 #[cfg(test)]
