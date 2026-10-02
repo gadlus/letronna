@@ -17,9 +17,9 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — Helpers that work side by side, fork, wait for more work and share a task list, plus workflows that run many agents from a script you approve.
 - **All** — Auto mode: a judge on your own model decides what would otherwise ask, and on macOS and Linux commands can run confined by the OS instead.
 - **All** — MCP servers over HTTP and OAuth, plugins from a git repository, and Zed or JetBrains running Letronna over ACP.
-- **App** — Files, Changes and Jobs tabs beside the chat, a Ctrl+K palette, and every part of the window reachable from the keyboard.
+- **App** — The browser opens beside the chat at half the room; long output rests as short previews; live work sits in one line over the box; Files, Changes and Jobs tabs, a Ctrl+K palette, and the whole window reachable from the keyboard.
 - **Chat apps** — Slack, pairing by code, files and voice notes both ways, and `letronna serve` to answer with no window open.
-- **All** — Schedules in a mode of their own, memory you can review and edit, and much lower memory use in the window.
+- **All** — Schedules in a mode of their own, memory you can review and edit, and a window that uses far less memory and processor while it works or sits idle.
 
 ### Added
 - **All** — `letronna doctor` checks the setup, and a local log and crash files help find out what went wrong.
@@ -91,6 +91,15 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **All** — A command still running at its time limit keeps running as a background job.
 - **App** — Every part of the window can be reached from the keyboard; a run of tool calls folds into one line; a finished turn lists the files it changed; a Jobs tab shows background jobs live; a status-bar popover shows what fills the context.
 
+- **App** — The browser opens beside the chat at half the room, and can take it all; while the agent browses, the page shows small in the corner of the chat.
+- **App** — Long output rests as short previews: a command's last lines (a failed one in red, kept open), a file's first lines, an edit as +a −b with its diff, thinking as "Thought for 12s"; pictures open in the window's own viewer.
+- **App** — Helpers, workflow runs and jobs still working, and the plan's steps, sit in one line over the box; while the model writes a long call the reply says "Writing app.rs…".
+- **App** — Approval cards: Enter allows and Escape denies, and "2 of 3" shows when a reply asks about several calls.
+- **App** — The sidebar gives the sessions the room, with the other pages under More; Ctrl+Tab switches between recent sessions; the empty chat lists recent sessions.
+- **App** — Picking an image, speech or video model makes what you send with it.
+- **All** — When a site's check stops the agent, it waits while you get past it and carries on by itself.
+- **All** — The browser works on a site's own dropdowns, scrolls a panel by its ref, types into date, time, colour and range fields, names what a click hit, and waits for what a click set off before reading the page.
+- **Terminal** — Skills and MCP prompts no longer crowd the `/` menu: they come up as you type, and under `/skills` and `/mcp`.
 ### Changed
 - **All** — A failed model request says what went wrong: the key, credit, a rate limit, a busy provider, a conversation too long, and so on.
 - **All** — OpenAI's reasoning models work, and a server that turns down a field is sent the request again without it.
@@ -126,7 +135,14 @@ This file is also the App tab of https://letronna.ai/changelog.
 - **App** — The window uses far less memory: pictures are read no larger than shown and let go of after, sessions read in by runs, chat apps or the terminal are let go of too, and switching profile reads only the session it opens.
 - **Terminal** — The installed terminal is `letronnacli.exe`, with the logo; `letronna` still starts it.
 
+- **App** — The window uses far less processor: a running reply redraws at 25 frames a second, not 120; a hidden or minimized window and the tray stay quiet; the browser panel decodes only pictures it shows; the approval card and the model list are worked out once.
+- **App** — Selecting text no longer leaves 40–80 MB with the window, and video stills and a helper's transcript are let go of once not shown.
+- **App** — Night is calmer: a midnight frame around a dark ink page.
+- **All** — A command that exits non-zero counts as a failed step, and a web search row shows what was searched for.
+- **All** — A workflow's tokens count up while its agents' replies stream.
 ### Fixed
+- **App** — Deleting the last session no longer crashes the window, a new session no longer inherits a deleted one's pictures, and a finished empty reply no longer shows Thinking forever.
+- **App** — New session goes to the top, even when it reuses an empty one.
 - **App** — Closing settings or the browser panel gives their pictures back to the GPU.
 - **App** — New session opens the empty one instead of piling up more, the last session in the sidebar scrolls fully into view, and right-clicking a session no longer draws a black halo.
 - **All** — Catastrophic commands, such as deleting your home folder, are refused whatever the approval setting.
