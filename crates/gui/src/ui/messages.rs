@@ -280,10 +280,23 @@ impl Chat {
                         .items_center()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
+                        // Read when copied, not copied out at every frame.
                         .when(!streaming, |row| {
+                            let chat = cx.weak_entity();
                             row.child(
                                 gpui_component::clipboard::Clipboard::new(("copy-reply", index))
-                                    .value(message.content.clone()),
+                                    .value_fn(move |_, cx| {
+                                        chat.upgrade()
+                                            .and_then(|chat| {
+                                                let store = &chat.read(cx).store;
+                                                let ix = store.index_of(session)?;
+                                                let said =
+                                                    store.conversations[ix].messages.get(index)?;
+                                                Some(said.content.clone())
+                                            })
+                                            .unwrap_or_default()
+                                            .into()
+                                    }),
                             )
                         })
                         .when(message.tokens > 0, |row| row.child(usage_line(message)))
@@ -1055,7 +1068,6 @@ impl Chat {
     ) -> impl IntoElement {
         let key = self.open_key(index);
         let open = streaming || self.thinking_open.contains(&key);
-        let reasoning = message.reasoning.clone();
         v_flex()
             .w_full()
             .gap_1()
@@ -1104,7 +1116,7 @@ impl Chat {
                         .child(
                             TextView::markdown(
                                 self.text_id("reason", index),
-                                reasoning,
+                                message.reasoning.clone(),
                                 window,
                                 cx,
                             )
