@@ -9,31 +9,36 @@ use crate::prelude::*;
 use std::future::Future;
 use std::sync::Arc;
 
-/// The still, loaded once per file and kept by gpui's asset cache.
-pub(crate) struct Poster;
-
-impl Asset for Poster {
-    type Source = PathBuf;
-    type Output = Result<Arc<RenderImage>, ImageCacheError>;
-
-    fn load(path: PathBuf, _: &mut App) -> impl Future<Output = Self::Output> + Send + 'static {
-        // A thread of its own: the shell wants its COM apartment set up just
-        // so, which a thread shared with other work may already have done
-        // differently.
-        let (sender, receiver) = async_channel::bounded(1);
-        std::thread::spawn(move || {
-            let _ = sender.send_blocking(first_frame(&path));
-        });
-        async move {
-            receiver
-                .recv()
-                .await
-                .ok()
-                .flatten()
-                .map(Arc::new)
-                .ok_or_else(|| ImageCacheError::Asset("no still for this video".into()))
-        }
+/// The still of the video at `path`. Read through the picture cache, which
+/// keeps it only while it is shown.
+pub(crate) fn still(
+    path: PathBuf,
+) -> impl Future<Output = Result<Arc<RenderImage>, ImageCacheError>> + Send + 'static {
+    // A thread of its own: the shell wants its COM apartment set up just so,
+    // which a thread shared with other work may already have done
+    // differently.
+    let (sender, receiver) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        let _ = sender.send_blocking(first_frame(&path));
+    });
+    async move {
+        receiver
+            .recv()
+            .await
+            .ok()
+            .flatten()
+            .map(Arc::new)
+            .ok_or_else(|| ImageCacheError::Asset("no still for this video".into()))
     }
+}
+
+/// Whether `path` is a video the chat shows a still of.
+pub(crate) fn is_video(path: &std::path::Path) -> bool {
+    path.extension().is_some_and(|extension| {
+        ["mp4", "webm", "mov"]
+            .iter()
+            .any(|known| extension.eq_ignore_ascii_case(known))
+    })
 }
 
 #[cfg(windows)]

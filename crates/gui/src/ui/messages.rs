@@ -1313,13 +1313,10 @@ fn made_file(
         theme.background.opacity(0.75),
         theme.foreground,
     );
+    // A video's still is read by the picture cache around it, as a
+    // picture is, and let go of with it.
     let still: ImageSource = if let Some(frame) = frame {
         frame.into()
-    } else if video {
-        let source = path.clone();
-        ImageSource::from(move |window: &mut Window, cx: &mut App| {
-            window.use_asset::<crate::platform::poster::Poster>(&source, cx)
-        })
     } else {
         path.clone().into()
     };

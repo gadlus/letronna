@@ -3917,6 +3917,11 @@ impl Render for Chat {
         if self.page == Page::Chat {
             self.unseen.remove(&on_screen);
         }
+        // A helper's transcript is read in for the Activity page only, and
+        // read again whenever the page is opened.
+        if self.page != Page::Activity {
+            self.viewing = None;
+        }
         self.open_on_screen(cx);
         self.lay_out_turns();
         self.watch_turn_files(cx);
