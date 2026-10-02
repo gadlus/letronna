@@ -133,6 +133,9 @@ pub struct Live {
     /// Why the cache served far less of the request than of the last one.
     pub cache_miss: Option<crate::cache_miss::Reason>,
     pub calls: Vec<ToolCall>,
+    /// The calls the reply has begun, the newest last, while it streams
+    /// them; `calls` has them whole once it ends.
+    pub drafts: Vec<crate::chat::Draft>,
     pub replay: Option<Replay>,
     /// The try about to be made again after a failure, while it waits.
     pub retrying: Option<crate::retry::Retry>,
@@ -277,6 +280,7 @@ impl Turn {
             Event::SummaryUsage(usage) => self.live.summary_usage = Some(*usage),
             Event::CacheMiss(reason) => self.live.cache_miss = Some(*reason),
             Event::ToolCalls(calls) => self.live.calls = calls.clone(),
+            Event::Drafting(drafts) => self.live.drafts = drafts.clone(),
             Event::Replay(replay) => self.live.replay = Some(replay.clone()),
             Event::Retrying(retry) => self.live.retrying = Some(*retry),
             Event::Switched(switch) => self.live.switched = Some(switch.clone()),
@@ -1089,6 +1093,20 @@ mod tests {
         let not_run = "Not run: stopped before it started.";
         assert_eq!(answers, [not_run, not_run]);
         assert!(kept.iter().all(|m| m.is_error));
+    }
+
+    #[test]
+    fn calls_being_written_show_in_the_live_reply_and_are_not_kept_with_it() {
+        let mut turn = turn();
+        let draft = crate::chat::Draft {
+            name: "write_file".into(),
+            subject: "src/app.rs".into(),
+        };
+        turn.absorb(&Event::Drafting(vec![draft.clone()]));
+        assert_eq!(turn.live.drafts, [draft]);
+        let reply = turn.take_reply("some-model");
+        assert!(reply.tool_calls.is_empty());
+        assert!(turn.live.drafts.is_empty());
     }
 
     #[test]
