@@ -481,7 +481,12 @@ fn existing(
     path: &Path,
     raw: &str,
 ) -> Result<(String, Mark), String> {
-    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    let meta = std::fs::metadata(path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => {
+            format!("`{raw}` does not exist; to create it, use write_file.")
+        }
+        _ => e.to_string(),
+    })?;
     // Opening a pipe would wait for a writer, holding up every other change.
     if !meta.is_file() {
         return Err(format!("`{raw}` is not a regular file."));
@@ -648,6 +653,24 @@ mod tests {
         std::fs::write(dir.join("empty.txt"), "").unwrap();
         run("write_file", r#"{"path":"empty.txt","content":"x"}"#, &ctx).unwrap();
         run("write_file", r#"{"path":"new/b.txt","content":"x"}"#, &ctx).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn editing_a_missing_file_points_to_write_file() {
+        let (dir, ctx) = project("missing", 112);
+        std::fs::write(dir.join("tools.rs"), "").unwrap();
+        let edit = r#"{"path":"notes.txt","old":"a","new":"b"}"#;
+        let refused = run("edit_file", edit, &ctx).unwrap_err();
+        assert_eq!(
+            refused,
+            "`notes.txt` does not exist; to create it, use write_file."
+        );
+        // A name like one there is may be a slip rather than a new file.
+        let edit = r#"{"path":"tool.rs","old":"a","new":"b"}"#;
+        let refused = run("edit_file", edit, &ctx).unwrap_err();
+        assert!(refused.ends_with(" Did you mean `tools.rs`?"), "{refused}");
+        assert!(!dir.join("notes.txt").exists() && !dir.join("tool.rs").exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

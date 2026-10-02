@@ -472,7 +472,7 @@ fn ladder(
     layer: &mut Option<Layer>,
 ) -> Outcome {
     let Some(tool) = tools::find(&call.name) else {
-        return Outcome::Refuse(format!("Unknown tool `{}`.", call.name));
+        return Outcome::Refuse(tools::unknown(&call.name));
     };
     let args = match tools::parse_args(&call.arguments) {
         Ok(args) => args,

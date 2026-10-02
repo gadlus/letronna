@@ -344,6 +344,62 @@ pub fn find(name: &str) -> Option<Arc<dyn Tool>> {
     all().into_iter().find(|t| t.name() == name)
 }
 
+/// Tools named in the answer to a call of one there is not: the one meant
+/// is nearly always among the first few, and a longer list is read past.
+const NEAREST: usize = 3;
+
+/// The refusal of a call to `name`, which is no tool, naming the `NEAREST`
+/// tools fewest edits from it, a shared start counting against the edits.
+pub(crate) fn unknown(name: &str) -> String {
+    let wanted = name.to_lowercase();
+    let mut known: Vec<(usize, &'static str)> = all()
+        .iter()
+        .map(|tool| {
+            let other = tool.name().to_lowercase();
+            let shared = wanted
+                .chars()
+                .zip(other.chars())
+                .take_while(|(a, b)| a == b)
+                .count();
+            (
+                distance(&wanted, &other).saturating_sub(shared),
+                tool.name(),
+            )
+        })
+        .collect();
+    // Stable, so of names as near as each other the one listed first wins.
+    known.sort_by_key(|(edits, _)| *edits);
+    let nearest: Vec<String> = known
+        .iter()
+        .take(NEAREST)
+        .map(|(_, name)| format!("`{name}`"))
+        .collect();
+    format!(
+        "Unknown tool `{name}`. The nearest tools by name are {}.",
+        nearest.join(", ")
+    )
+}
+
+/// Letters to add, drop or change to turn `a` into `b`.
+fn distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, x) in a.chars().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, y) in b.iter().enumerate() {
+            let above = row[j + 1];
+            row[j + 1] = if x == *y {
+                diagonal
+            } else {
+                1 + diagonal.min(above).min(row[j])
+            };
+            diagonal = above;
+        }
+    }
+    row[b.len()]
+}
+
 pub fn parse_args(args: &str) -> Result<Value, String> {
     if args.trim().is_empty() {
         return Ok(json!({}));
@@ -604,7 +660,7 @@ pub(crate) fn spec(tool: &dyn Tool) -> Value {
 }
 
 pub fn run(name: &str, args: &str, ctx: &ToolContext) -> Result<String, String> {
-    let tool = find(name).ok_or_else(|| format!("Unknown tool `{name}`."))?;
+    let tool = find(name).ok_or_else(|| unknown(name))?;
     let started = Instant::now();
     let hooks = crate::hooks::current();
     let result = run_found(tool.as_ref(), args, ctx, &hooks);
@@ -1890,7 +1946,10 @@ impl Tool for EditFile {
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         let path = resolve_write(path_arg(args), ctx)?;
         let edits = edits(args)?;
-        let change = crate::filestate::edit(ctx.conversation, &path, path_arg(args))?;
+        // A mistyped path is told apart from a new file before the error
+        // sends the model to write_file for one.
+        let change = crate::filestate::edit(ctx.conversation, &path, path_arg(args))
+            .map_err(|e| e + &similar(path_arg(args), ctx))?;
         let text = change.before().unwrap_or_default();
         let marker = crate::redact::MARKER;
         if !text.contains(marker) && edits.iter().any(|edit| edit.old.contains(marker)) {
@@ -2805,11 +2864,23 @@ impl Tool for ReadFile {
         let path = resolve(raw, ctx).map_err(|e| e + &similar(raw, ctx))?;
         let offset = args["offset"].as_u64().unwrap_or(1).max(1) as usize;
         let limit = args["limit"].as_u64().unwrap_or(u64::MAX).max(1) as usize;
+        // Opening a folder fails only on Windows; elsewhere the read does,
+        // and either way with the system's words, which name no path.
+        if path.is_dir() {
+            return Err(format!("`{raw}` is a folder; list it with list_dir."));
+        }
         if let Some(copy) = open_picture(&path, raw)? {
             return Ok(copy);
         }
         let before = crate::filestate::stat(&path);
-        let (mut text, cut) = open_text(&path)?;
+        let (mut text, cut) = open_text(&path).map_err(|e| match e.as_str() {
+            NOT_TEXT => format!(
+                "`{raw}` is not a text file. Read it with a command made for its format, \
+                 such as `pdftotext` for a PDF or `unzip -l` for an archive, or convert a \
+                 picture to PNG and read that."
+            ),
+            _ => e,
+        })?;
         let (shown, whole) = if crate::notebook::is_notebook(&path) {
             page_notebook(text, offset, limit, cut)?
         } else {
@@ -2852,6 +2923,10 @@ fn open_picture(path: &Path, raw: &str) -> Result<Option<String>, String> {
     )))
 }
 
+/// What `open_text` refuses a binary file with, which read_file swaps for
+/// a sentence naming the file and how to read it.
+const NOT_TEXT: &str = "Not a text file.";
+
 /// A file's text as UTF-8, without a byte order mark and with UTF-16 decoded,
 /// and whether it stops at `UTF16_BYTES`; a NUL byte near the start marks a
 /// binary file, which is refused.
@@ -2866,7 +2941,7 @@ pub(crate) fn open_text(path: &Path) -> Result<(Box<dyn BufRead>, bool), String>
             reader.consume(3);
             return Ok((Box::new(reader), false));
         }
-        _ if start.contains(&0) => return Err("Not a text file.".into()),
+        _ if start.contains(&0) => return Err(NOT_TEXT.into()),
         _ => return Ok((Box::new(reader), false)),
     };
     reader.consume(2);
@@ -3110,6 +3185,12 @@ impl Tool for ListDir {
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         let path = resolve(path_arg(args), ctx)?;
+        if path.is_file() {
+            return Err(format!(
+                "`{}` is a file; read it with read_file.",
+                path_arg(args)
+            ));
+        }
         let mut names: Vec<String> = std::fs::read_dir(&path)
             .map_err(|e| e.to_string())?
             .filter_map(Result::ok)
@@ -3509,7 +3590,11 @@ mod tests {
         let latin1 = read("latin1.txt").unwrap();
         assert!(latin1.starts_with("1|caf\u{FFFD}\n\n["), "{latin1}");
         std::fs::write(dir.join("bin.dat"), b"a\0b").unwrap();
-        assert_eq!(read("bin.dat").unwrap_err(), "Not a text file.");
+        let binary = read("bin.dat").unwrap_err();
+        assert!(
+            binary.starts_with("`bin.dat` is not a text file."),
+            "{binary}"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -3644,6 +3729,57 @@ mod tests {
     }
 
     #[test]
+    fn reading_a_folder_points_to_list_dir() {
+        let dir = std::env::temp_dir().join(format!("letronna-read-folder-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src").join("main.rs"), "").unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let read = ReadFile.run(&json!({"path": "src"}), &ctx).unwrap_err();
+        assert_eq!(read, "`src` is a folder; list it with list_dir.");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn listing_a_file_points_to_read_file() {
+        let dir = std::env::temp_dir().join(format!("letronna-list-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("notes.txt"), "a").unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let listed = ListDir
+            .run(&json!({"path": "notes.txt"}), &ctx)
+            .unwrap_err();
+        assert_eq!(listed, "`notes.txt` is a file; read it with read_file.");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_binary_file_names_itself_and_a_way_to_read_it() {
+        let dir = std::env::temp_dir().join(format!("letronna-read-binary-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("report.pdf"), b"%PDF-1.7\n\0\x01").unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let read = ReadFile
+            .run(&json!({"path": "report.pdf"}), &ctx)
+            .unwrap_err();
+        assert_eq!(
+            read,
+            "`report.pdf` is not a text file. Read it with a command made for its format, \
+             such as `pdftotext` for a PDF or `unzip -l` for an archive, or convert a \
+             picture to PNG and read that."
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn read_file_saves_a_copy_of_a_picture_and_names_it() {
         let (_turn, data) = data_folder("picture");
         // Outside the data folder, whose files read_file refuses.
@@ -3677,7 +3813,7 @@ mod tests {
         assert!(big.contains("a picture of 3.8 MB"), "{big}");
         std::fs::write(dir.join("blob.bin"), b"\0\x01\x02").unwrap();
         let blob = run("read_file", r#"{"path":"blob.bin"}"#, &ctx).unwrap_err();
-        assert_eq!(blob, "Not a text file.");
+        assert!(blob.starts_with("`blob.bin` is not a text file."), "{blob}");
         std::fs::remove_dir_all(dir).unwrap();
         std::fs::remove_dir_all(data).unwrap();
     }
@@ -5489,5 +5625,37 @@ mod tests {
         crate::permissions::switch(&file, &tools, true).unwrap();
         assert!(offered_names().contains(&tools[0]));
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn an_unknown_tool_is_answered_with_the_nearest_names() {
+        let ctx = ToolContext::default();
+        let refused = run("readfile", "{}", &ctx).unwrap_err();
+        assert_eq!(
+            refused,
+            "Unknown tool `readfile`. The nearest tools by name are `read_file`, \
+             `read_job`, `read_chat`."
+        );
+        // Compared without case, so a name typed in another case finds its tool.
+        assert!(unknown("Edit-File").contains("are `edit_file`,"));
+        assert!(unknown("list_files").contains("are `list_dir`,"));
+        // The gate meets the call first in a turn, and answers it the same.
+        let gate = crate::gate::Gate {
+            ctx: &ctx,
+            mode: crate::gate::Mode::Default,
+            grants: &Default::default(),
+            human: true,
+            rules: &[],
+            broken: None,
+        };
+        let call = crate::chat::ToolCall {
+            id: "1".into(),
+            name: "readfile".into(),
+            arguments: "{}".into(),
+        };
+        assert_eq!(
+            crate::gate::decide(&call, &gate),
+            crate::gate::Outcome::Refuse(refused)
+        );
     }
 }

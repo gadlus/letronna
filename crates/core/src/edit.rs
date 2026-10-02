@@ -114,9 +114,10 @@ fn replace(
     };
     if spans.len() > 1 && !edit.all {
         return Err(format!(
-            "`old` matches {} times; include more context, or set replace_all to change \
-             every one.",
-            spans.len()
+            "`old` matches {} times, at {}; include more context, or set replace_all to \
+             change every one.",
+            spans.len(),
+            lines_of(text, &spans)
         ));
     }
     if spans.len() > 1 && strategy == Strategy::Quotes {
@@ -142,6 +143,35 @@ fn replace(
     }
     out.push_str(&text[last..]);
     Ok(Some((out, spans.len())))
+}
+
+/// Lines named for an `old` found in more places, enough to pick the one
+/// meant out of a few while a word found all over a file stays one line.
+const NAMED_LINES: usize = 10;
+
+/// The lines `spans` start on in `text`, counting from 1, as `line 4` or
+/// `lines 4, 9 and 15`, the first `NAMED_LINES` places named and the rest
+/// counted.
+fn lines_of(text: &str, spans: &[Range<usize>]) -> String {
+    let mut lines: Vec<usize> = spans
+        .iter()
+        .take(NAMED_LINES)
+        .map(|span| text[..span.start].matches('\n').count() + 1)
+        .collect();
+    // Two places on one line are one line to look at.
+    lines.dedup();
+    let mut named: Vec<String> = lines.iter().map(usize::to_string).collect();
+    let more = spans.len().saturating_sub(NAMED_LINES);
+    if more > 0 {
+        named.push(format!("{more} more places"));
+    }
+    let Some((last, rest)) = named.split_last() else {
+        return String::new();
+    };
+    match rest {
+        [] => format!("line {last}"),
+        _ => format!("lines {} and {last}", rest.join(", ")),
+    }
 }
 
 /// Replace the whole lines `old` with `new` at the one place in `file` past
@@ -631,6 +661,24 @@ mod tests {
         assert!(error.contains("matches 2 times"), "{error}");
         // A closer match wins outright, never counted with looser ones.
         assert_eq!(one("a  \na\n", "a\n", "b\n").unwrap(), "a  \nb\n");
+    }
+
+    #[test]
+    fn an_old_text_matching_twice_says_where() {
+        let error = one("a\nx = 1;\nb\nx = 1;\n", "x = 1;", "x = 2;").unwrap_err();
+        assert_eq!(
+            error,
+            "`old` matches 2 times, at lines 2 and 4; include more context, or set \
+             replace_all to change every one."
+        );
+        let error = one("x x x", "x", "y").unwrap_err();
+        assert!(error.contains("3 times, at line 1;"), "{error}");
+        let many = "x\n".repeat(NAMED_LINES + 2);
+        let error = one(&many, "x", "y").unwrap_err();
+        assert!(
+            error.contains("at lines 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 and 2 more places;"),
+            "{error}"
+        );
     }
 
     #[test]
