@@ -273,6 +273,14 @@ impl Chat {
                     // Nor show its helpers' cards; dropped, they are declined.
                     let id = this.store.conversations[index].id;
                     this.agent_asks.retain(|request| request.root != id);
+                    // Nor the pictures waiting to go with its next message,
+                    // Auto mode's tags or which of its rows were open.
+                    this.attachments.remove(&id);
+                    this.tags.remove(&id);
+                    this.unseen.remove(&id);
+                    this.kept_own.remove(&id);
+                    this.thinking_open.retain(|&(session, _)| session != id);
+                    this.runs_open.retain(|&(session, _)| session != id);
                     this.store.remove(index);
                     if this.store.conversations.is_empty() {
                         this.new_chat(window, cx);
