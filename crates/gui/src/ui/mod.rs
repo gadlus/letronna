@@ -4,8 +4,8 @@ pub(crate) mod activity;
 pub(crate) mod approval;
 pub(crate) mod artifacts;
 pub(crate) mod auto;
-pub(crate) mod busy;
 pub(crate) mod browser;
+pub(crate) mod busy;
 pub(crate) mod capabilities;
 pub(crate) mod changes;
 pub(crate) mod chrome;
@@ -35,6 +35,7 @@ pub(crate) mod sidebar;
 pub(crate) mod skills;
 pub(crate) mod update;
 pub(crate) mod usage;
+pub(crate) mod viewer;
 pub(crate) mod voice;
 pub(crate) mod workflows;
 
