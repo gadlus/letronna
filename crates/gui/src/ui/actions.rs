@@ -109,7 +109,7 @@ type Act = fn(&mut Chat, Span, &mut Window, &mut Context<Chat>);
 pub(crate) enum Stop {
     /// A turn with a menu, by its first message.
     Turn(usize),
-    /// The question waiting on its card, at the end.
+    /// The question or the permission card waiting on the user, at the end.
     Question,
 }
 
@@ -646,7 +646,7 @@ impl Chat {
     pub(crate) fn stops(&self) -> Vec<Stop> {
         let conversation = &self.store.conversations[self.store.active];
         let streaming_here = self.busy && self.streaming_id == Some(conversation.id);
-        let asking = streaming_here && self.question_options().is_some();
+        let asking = streaming_here && self.card_takes_keys();
         stops(&self.turns, &conversation.messages, streaming_here, asking)
     }
 

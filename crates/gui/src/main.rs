@@ -515,6 +515,27 @@ pub(crate) fn keys(mapper: &dyn PlatformKeyboardMapper) -> Vec<(KeyBinding, Opti
         .into_iter()
         .flatten(),
     );
+    // Enter and Escape answer a permission card from the card itself or
+    // from an empty composer. Bound after the input's own keys, so they are
+    // tried first and hand the key back when there is no card to answer.
+    keys.extend([
+        (
+            KeyBinding::new("enter", approval::AllowCall, Some("Permission")),
+            Some("On a call waiting for a yes, or in an empty composer: allow it once"),
+        ),
+        (
+            KeyBinding::new("escape", approval::DenyCall, Some("Permission")),
+            Some("On a call waiting for a yes, or in an empty composer: deny it"),
+        ),
+        (
+            KeyBinding::new("enter", approval::AllowCall, Some("Composer > Input")),
+            None,
+        ),
+        (
+            KeyBinding::new("escape", approval::DenyCall, Some("Composer > Input")),
+            None,
+        ),
+    ]);
     // One binding per letter, so the list says it once.
     keys.extend(('a'..='z').enumerate().map(|(n, letter)| {
         (
