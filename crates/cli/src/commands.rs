@@ -864,6 +864,8 @@ const KEYS: &[(&str, &str)] = &[
     ("enter", "send"),
     ("shift+enter", "a new line"),
     ("↑ ↓", "step through what you said before"),
+    ("ctrl+a/e", "go to the start or end of the line"),
+    ("ctrl+u/k", "delete to the start or end of the line"),
     ("esc", "stop an answer, or clear the line"),
     ("ctrl+c", "copy what is selected, clear the line, or leave"),
     ("page up/down", "scroll back through the conversation"),

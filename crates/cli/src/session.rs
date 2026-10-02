@@ -1290,6 +1290,7 @@ impl Runner {
         if let Some(conversation) = self.store.conversations.get_mut(index) {
             letronna_core::store::fill(conversation);
             self.bar.set_plan(&conversation.todos);
+            self.bar.set_history(&conversation.messages);
         }
         self.show_goal();
         // Each session has its own model, and the footer names it.

@@ -21,6 +21,7 @@ use crossterm::event::{
 };
 use crossterm::terminal;
 use letronna_core::approvals::{self, Request};
+use letronna_core::chat::Message;
 use letronna_core::store::Todo;
 use std::collections::VecDeque;
 use std::sync::mpsc::Receiver;
@@ -527,6 +528,23 @@ pub fn unescaped(line: &str) -> &str {
     }
 }
 
+/// What was typed to send the prompt `content`, so sending it again sends
+/// the same: `/init` and a saved workflow's command as typed, `@` references
+/// without what they attached, and a slash that stood for one put back.
+fn as_typed(content: &str) -> String {
+    let content = letronna_core::references::typed(content);
+    if let Some(command) = letronna_core::init::typed(content) {
+        return command.to_owned();
+    }
+    if let Some(command) = letronna_core::workflow::saved::typed(content) {
+        return command;
+    }
+    if is_command(content) {
+        return format!("/{content}");
+    }
+    content.to_owned()
+}
+
 /// Where the menu's shown rows start. It only moves as far as it has to for
 /// the highlighted row to be one of them: the list held more commands than
 /// it drew, and the arrows walked all of them, so a highlight could sit on a
@@ -880,6 +898,20 @@ impl Bar {
     pub fn set_goal(&mut self, line: Option<String>) {
         self.goal = line;
         self.settle();
+    }
+
+    /// Put what was typed into an opened session under up, so a restart or a
+    /// /resume does not leave up with nothing to bring back.
+    pub fn set_history(&mut self, messages: &[Message]) {
+        self.line.set_history(
+            messages
+                .iter()
+                // A notice, a chat app's message, and a follow-up folded into
+                // a turn -- which is also how a Stop hook's word goes in, so
+                // the two cannot be told apart -- were not typed here.
+                .filter(|m| m.role == "user" && !m.notice && !m.remote && !m.folded)
+                .map(|m| as_typed(&m.content)),
+        );
     }
 
     /// Let the inbox's doorbell end a wait at the prompt, only with the box
@@ -1644,6 +1676,12 @@ impl Bar {
             KeyCode::Backspace if control => self.line.backspace_word(),
             KeyCode::Char('h') if control => self.line.backspace_word(),
             KeyCode::Char('w') if control => self.line.backspace_word(),
+            // A shell's line keys, which fingers reach for anyway; in a box of
+            // several lines they keep to the row the cursor is on.
+            KeyCode::Char('a') if control => self.line.row_start(),
+            KeyCode::Char('e') if control => self.line.row_end(),
+            KeyCode::Char('u') if control => self.line.backspace_to_row_start(),
+            KeyCode::Char('k') if control => self.line.delete_to_row_end(),
             KeyCode::Delete if control => self.line.delete_word(),
             KeyCode::Backspace => {
                 self.line.backspace();
@@ -2484,6 +2522,7 @@ mod tests {
     };
     use crate::render::{MARGIN, plain, visible};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use letronna_core::chat::Message;
     use letronna_core::store::Todo;
     use std::time::Instant;
 
@@ -3162,6 +3201,100 @@ mod tests {
         hit(&mut bar, KeyCode::Up, KeyModifiers::NONE);
         assert_eq!(bar.line.text(), "and the tests");
         assert_eq!(bar.queued, ["check the docs"]);
+    }
+
+    #[test]
+    fn a_resumed_session_s_prompts_come_back_under_up() {
+        let said = |role: &str, content: &str| Message {
+            role: role.into(),
+            content: content.into(),
+            ..Default::default()
+        };
+        let messages = [
+            said("user", "first prompt"),
+            said("assistant", "an answer"),
+            Message {
+                notice: true,
+                ..said("user", "a job finished")
+            },
+            Message {
+                folded: true,
+                ..said("user", "a stop hook's word")
+            },
+            Message {
+                remote: true,
+                ..said("user", "from the chat")
+            },
+            said(
+                "user",
+                &letronna_core::workflow::saved::prompt("tidy", "src"),
+            ),
+            said("user", "/tmp is full"),
+            said("user", "last prompt"),
+        ];
+        let mut bar = Bar::new(String::new());
+        bar.set_history(&messages);
+
+        // What has not gone in yet still comes back first.
+        bar.queued.push_back("queued".into());
+        hit(&mut bar, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(bar.line.text(), "queued");
+        bar.line.clear();
+
+        let mut recalled = Vec::new();
+        for _ in 0..5 {
+            hit(&mut bar, KeyCode::Up, KeyModifiers::NONE);
+            recalled.push(bar.line.text().to_owned());
+        }
+        // As typed, so each sends what it sent before; nothing anyone else
+        // wrote among them.
+        assert_eq!(
+            recalled,
+            [
+                "last prompt",
+                "//tmp is full",
+                "/tidy src",
+                "first prompt",
+                "first prompt"
+            ]
+        );
+    }
+
+    #[test]
+    fn ctrl_a_and_ctrl_e_go_to_the_ends_of_the_line() {
+        let mut bar = Bar::new(String::new());
+        bar.line.set("top row\nbottom row");
+        hit(&mut bar, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert_eq!(bar.line.line_of_cursor(), (1, 0));
+        hit(&mut bar, KeyCode::Up, KeyModifiers::NONE);
+        hit(&mut bar, KeyCode::Char('e'), KeyModifiers::CONTROL);
+        assert_eq!(bar.line.line_of_cursor(), (0, 7));
+        // Nothing was typed by them.
+        assert_eq!(bar.line.text(), "top row\nbottom row");
+    }
+
+    #[test]
+    fn ctrl_u_clears_to_the_start_of_the_line() {
+        let mut bar = Bar::new(String::new());
+        bar.line.set("keep\ndrop this, keep that");
+        for _ in 0.."keep that".len() {
+            hit(&mut bar, KeyCode::Left, KeyModifiers::NONE);
+        }
+        hit(&mut bar, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert_eq!(bar.line.text(), "keep\nkeep that");
+        assert_eq!(bar.line.line_of_cursor(), (1, 0));
+    }
+
+    #[test]
+    fn ctrl_k_clears_to_the_end_of_the_line() {
+        let mut bar = Bar::new(String::new());
+        bar.line.set("keep this, drop that\nkeep");
+        hit(&mut bar, KeyCode::Up, KeyModifiers::NONE);
+        hit(&mut bar, KeyCode::Char('k'), KeyModifiers::CONTROL);
+        assert_eq!(bar.line.text(), "keep\nkeep");
+        hit(&mut bar, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        hit(&mut bar, KeyCode::Char('k'), KeyModifiers::CONTROL);
+        assert_eq!(bar.line.text(), "\nkeep");
     }
 
     #[test]
