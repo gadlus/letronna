@@ -78,7 +78,7 @@ impl Chat {
         let c = &self.store.conversations[index];
         let active = index == self.store.active && self.page == Page::Chat;
         let menu = self.session_menu(index, cx);
-        h_flex()
+        let row = h_flex()
             .id(("session", index))
             .relative()
             .h(px(26.))
@@ -180,7 +180,10 @@ impl Chat {
                 this.save();
                 cx.notify();
             }))
-            .context_menu(menu)
+            .context_menu(menu);
+        // Its own id, so each row's menu keeps its own state: sharing one,
+        // every row drew the open menu, their shadows stacked into black.
+        div().id(("session-menu", index)).child(row)
     }
 
     /// The sessions the search and the filter let through, by index, the
