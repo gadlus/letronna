@@ -4165,6 +4165,9 @@ impl Render for Chat {
                 .min_h_0()
                 .min_w_0()
                 .w_full()
+                // The browser's preview at its corner is cut short in a
+                // short window, rather than drawn over the title bar.
+                .overflow_hidden()
                 .track_focus(&self.transcript_focus)
                 // As on the sidebar: a click leaves the keys where they
                 // were, in the composer most often.
