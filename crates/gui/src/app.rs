@@ -1282,6 +1282,9 @@ impl Chat {
                 .is_none_or(|ix| self.store.conversations[ix].unload());
             if gone {
                 self.open.remove(at);
+                // What its edits changed goes with its messages, and is
+                // worked out again if it is opened.
+                self.edited.retain(|&(session, _), _| session != id);
             }
         }
     }
