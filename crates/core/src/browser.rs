@@ -380,7 +380,7 @@ impl Tool for UsePage {
         "use_page"
     }
     fn description(&self) -> &'static str {
-        "Act on the page open in browse, the way a person would: `click` an element, `type` into a field (it replaces what is there; `submit` presses Enter after), `press` a key such as Enter, Tab, Escape or ArrowDown, `select` a dropdown's option by its text, `upload` files from the project into a file field, `drag` an element onto another (`to`) or to a point, or `eval` a JavaScript expression and get its value back. Elements are named by the refs browse lists, such as e12; one listed under a frame's header marked cross-origin or opaque origin also needs `frame`, the origin that header names after \"frame\", and each such action is asked about on its own. `click` also takes a point instead of a ref, and names what was there: `x` and `y` in CSS pixels from the top left of the view, which is as big as the latest screenshot's result says -- not the picture's own pixels, which may have been shrunk on the way to you, and read off a screenshot of the view, not of the whole page. It is refused once the page has changed or scrolled since it was last seen, and inside a frame from another origin than the page's. `batch` runs `steps`, a list of these actions and browse's hover, wait and scroll, each written as its own call would be, in order in one call, stopping at the first that fails (a wait whose text does not come counts), and gives each step's short result; each step is asked about as it would be alone. Returns what changed on the page afterwards: the lines that are new (`>`) or gone (`<`), with the lines around them and where they are, measured against the page as you last saw it listed in this tab; the whole page instead after it loaded another page, when there is no earlier listing to measure against, or with `listing` set to `full`. It names any file an action downloaded, saved in the project's media/downloads folder (one the page starts a little later is named in the next result). A question the page asks, such as \"Are you sure?\", is answered Cancel unless `confirm` is true."
+        "Act on the page open in browse, the way a person would: `click` an element, `type` into a field (it replaces what is there; `submit` presses Enter after), `press` a key such as Enter, Tab, Escape or ArrowDown, `select` a dropdown's option by its text, `upload` files from the project into a file field, `drag` an element onto another (`to`) or to a point, or `eval` a JavaScript expression and get its value back. Elements are named by the refs browse lists, such as e12; one listed under a frame's header marked cross-origin or opaque origin also needs `frame`, the origin that header names after \"frame\", and each such action is asked about on its own. `click` also takes a point instead of a ref, and names what was there: `x` and `y` in CSS pixels from the top left of the view, which is as big as the latest screenshot's result says -- not the picture's own pixels, which may have been shrunk on the way to you, and read off a screenshot of the view, not of the whole page. It is refused once the page has changed or scrolled since it was last seen, and inside a frame from another origin than the page's. `batch` runs `steps`, a list of these actions and browse's hover, wait and scroll, each written as its own call would be, in order in one call, stopping at the first that fails (a wait whose text does not come counts), and gives each step's short result; each step is asked about as it would be alone. Returns what changed on the page afterwards: the lines that are new (`>`) or gone (`<`), with the lines around them and where they are, measured against the page as you last saw it listed in this tab; the whole page instead after it loaded another page, when there is no earlier listing to measure against, or with `listing` set to `full`. It names any file an action downloaded, saved in the project's media/downloads folder (one the page starts a little later is named in the next result). A question the page asks, such as \"Are you sure?\", is answered Cancel unless `confirm` is true. Close a cookie banner or popup before acting on what it covers. Use a site's own search, filters and sort before paging through its results. After typing into a field that suggests as you type, click the suggestion that fits from what changed -- or wait for it with browse's wait if none shows yet -- rather than pressing Enter or using `submit`. Fill a form with one batch that ends with the click that sends it. Read a long page with browse's look and `find` before asking for `full`. Before saying a task on the web is done, check that the page shows it done, and give the user only names, prices and addresses the pages showed, saying so when something asked for was not there."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -5078,6 +5078,29 @@ mod tests {
         assert!(!Browse.judge_input(&look, &ctx).contains("May save"));
         let plan = ToolContext { plan: true, ..ctx };
         assert_eq!(Browse.preview(&open, &plan), "GET https://example.com");
+    }
+
+    #[test]
+    fn the_acting_tool_says_how_to_get_through_a_site() {
+        let said = UsePage.description();
+        for advice in [
+            "cookie banner or popup before acting on what it covers",
+            "own search, filters and sort before paging",
+            "click the suggestion that fits",
+            "one batch that ends with the click that sends it",
+            "`find` before asking for `full`",
+            "check that the page shows it done",
+            "only names, prices and addresses the pages showed",
+        ] {
+            assert!(said.contains(advice), "{advice} is not in: {said}");
+        }
+    }
+
+    #[test]
+    fn the_acting_tools_description_stays_short() {
+        // It is sent with every request, so advice must not grow it unchecked.
+        let length = UsePage.description().chars().count();
+        assert!(length < 3_500, "{length} characters");
     }
 
     #[test]
