@@ -179,6 +179,12 @@ impl Chat {
             .retain(|&(session, at)| session != id || at < keep);
         self.runs_open
             .retain(|&(session, at)| session != id || at < keep);
+        self.previews_open
+            .retain(|&(session, at)| session != id || at < keep);
+        self.thought_for
+            .retain(|&(session, at), _| session != id || at < keep);
+        self.edited
+            .retain(|&(session, at), _| session != id || at < keep);
         self.save();
     }
 
