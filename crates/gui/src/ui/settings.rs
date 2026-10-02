@@ -1,5 +1,7 @@
 use crate::prelude::*;
 
+actions!(settings, [PreviousSettingsPage, NextSettingsPage]);
+
 type ApplyMode = std::rc::Rc<dyn Fn(plugins::PresenceMode, &mut App)>;
 
 pub(crate) const PAGES: &[(&str, AppIcon)] = &[
@@ -450,7 +452,38 @@ impl Chat {
         let gap = px(44.);
         let height = vp.height - gap * 2.;
         let current_page = *page.read(cx);
-        let nav = PAGES.iter().fold(
+        // A tab stop a row, so Tab reaches the pages, and Up and Down step
+        // through them from the one with the keys.
+        let handles: std::rc::Rc<[FocusHandle]> = PAGES
+            .iter()
+            .map(|(name, _)| {
+                window
+                    .use_keyed_state(
+                        SharedString::from(format!("settings-nav-{name}")),
+                        cx,
+                        |_, cx| cx.focus_handle().tab_stop(true),
+                    )
+                    .read(cx)
+                    .clone()
+            })
+            .collect();
+        let step = {
+            let (page, chat, handles) = (page.clone(), chat.clone(), handles.clone());
+            move |down: bool, window: &mut Window, cx: &mut App| {
+                let Some(at) = handles.iter().position(|handle| handle.is_focused(window)) else {
+                    return;
+                };
+                let next = if down {
+                    (at + 1).min(PAGES.len() - 1)
+                } else {
+                    at.saturating_sub(1)
+                };
+                show_page(PAGES[next].0, &page, &chat, cx);
+                window.focus(&handles[next]);
+            }
+        };
+        let back = step.clone();
+        let nav = PAGES.iter().zip(handles.iter()).fold(
             v_flex()
                 .w(px(210.))
                 .h_full()
@@ -459,24 +492,33 @@ impl Chat {
                 .p_3()
                 .bg(cx.theme().sidebar)
                 .border_r_1()
-                .border_color(cx.theme().border),
-            |nav, (name, icon)| {
+                .border_color(cx.theme().border)
+                .key_context("SettingsNav")
+                .on_action(move |_: &PreviousSettingsPage, window, cx| back(false, window, cx))
+                .on_action(move |_: &NextSettingsPage, window, cx| step(true, window, cx)),
+            |nav, ((name, icon), focus)| {
                 let page = page.clone();
                 let chat = chat.clone();
                 let active = *name == current_page;
                 nav.child(
                     h_flex()
                         .id(*name)
+                        .track_focus(focus)
                         .h(px(30.))
                         .px_2()
                         .gap_2()
                         .items_center()
                         .rounded(cx.theme().radius)
+                        // Always there, so the ring the keys bring moves
+                        // nothing.
+                        .border_1()
+                        .border_color(cx.theme().transparent)
                         .cursor_pointer()
                         .text_sm()
                         .font_family(HEADING_FONT)
                         .font_weight(FontWeight::MEDIUM)
                         .when(active, |this| this.bg(cx.theme().sidebar_accent))
+                        .focus(|s| s.border_color(cx.theme().ring))
                         .active(|s| s.bg(cx.theme().sidebar_accent.opacity(0.6)))
                         .child(
                             Icon::new(*icon)
@@ -484,15 +526,7 @@ impl Chat {
                                 .text_color(cx.theme().muted_foreground),
                         )
                         .child(*name)
-                        .on_click(move |_, _, cx| {
-                            page.update(cx, |p, cx| {
-                                *p = name;
-                                cx.notify();
-                            });
-                            if *name == "Usage" {
-                                chat.update(cx, |this, cx| this.load_usage(cx));
-                            }
-                        }),
+                        .on_click(move |_, _, cx| show_page(name, &page, &chat, cx)),
                 )
             },
         );
@@ -584,6 +618,17 @@ impl Chat {
                             ),
                     ),
             )
+    }
+}
+
+/// Show settings page `name`, reading usage afresh for its page.
+fn show_page(name: &'static str, page: &Entity<&'static str>, chat: &Entity<Chat>, cx: &mut App) {
+    page.update(cx, |p, cx| {
+        *p = name;
+        cx.notify();
+    });
+    if name == "Usage" {
+        chat.update(cx, |this, cx| this.load_usage(cx));
     }
 }
 
@@ -905,7 +950,7 @@ fn privacy_page(
         )
         .child(
             Button::new("default-mode")
-                .ghost()
+                .plain(cx)
                 .small()
                 .child(
                     h_flex()

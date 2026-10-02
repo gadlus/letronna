@@ -340,7 +340,7 @@ impl Chat {
                             .when(!plugin.source.is_empty(), |this| {
                                 this.child(
                                     Button::new(("update-plugin", index))
-                                        .ghost()
+                                        .plain(cx)
                                         .xsmall()
                                         .icon(Icon::new(AppIcon::Reload))
                                         .tooltip("Update")
@@ -352,7 +352,7 @@ impl Chat {
                             })
                             .child(
                                 Button::new(("remove-plugin", index))
-                                    .ghost()
+                                    .plain(cx)
                                     .xsmall()
                                     .icon(Icon::new(AppIcon::Trash))
                                     .tooltip("Remove")
@@ -507,7 +507,7 @@ impl Chat {
                     )
                     .child(
                         Button::new(("remove-market", index))
-                            .ghost()
+                            .plain(cx)
                             .xsmall()
                             .icon(Icon::new(AppIcon::Trash))
                             .tooltip("Stop listing this marketplace")
@@ -613,7 +613,7 @@ impl Chat {
                     )
                     .child(
                         Button::new("read-markets")
-                            .ghost()
+                            .plain(cx)
                             .small()
                             .icon(Icon::new(AppIcon::Reload))
                             .label("Read lists")

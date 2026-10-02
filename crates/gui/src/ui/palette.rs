@@ -25,6 +25,12 @@ enum Pick {
     Skill(String),
     Model(String, String),
     Folder(PathBuf),
+    /// An appearance setting's value: "" Night, "paper" or "system".
+    Look(&'static str),
+    /// Pick the project folder of the session on screen.
+    ChooseFolder,
+    /// Sign in to a Letronna account in the browser.
+    SignIn,
 }
 
 #[derive(Clone)]
@@ -37,7 +43,7 @@ struct Row {
     /// what picking a skill does.
     note: SharedString,
     key: Option<Keystroke>,
-    /// The session's own model, ticked.
+    /// The session's own model, or the appearance in use, ticked.
     current: bool,
     pick: Pick,
 }
@@ -83,6 +89,7 @@ fn folder_row(folder: PathBuf) -> Row {
 fn commands() -> Vec<(&'static str, Rc<dyn Action>)> {
     vec![
         ("New session", Rc::new(NewSession)),
+        ("Focus the composer", Rc::new(FocusComposer)),
         ("Show or hide the sidebar", Rc::new(ToggleSidebar)),
         ("Show or hide the panel", Rc::new(super::panel::TogglePanel)),
         ("Show the browser", Rc::new(super::panel::BrowserTab)),
@@ -94,6 +101,10 @@ fn commands() -> Vec<(&'static str, Rc<dyn Action>)> {
             "Browser: shrink to preview / show beside the chat",
             Rc::new(super::panel::PreviewBrowser),
         ),
+        ("Show the files", Rc::new(super::files::FilesTab)),
+        ("Show the changes", Rc::new(super::changes::ChangesTab)),
+        ("Show the jobs", Rc::new(super::jobs::JobsTab)),
+        ("Switch Crew on or off", Rc::new(ToggleCrew)),
         ("Open settings", Rc::new(OpenSettings)),
         ("Open usage", Rc::new(super::usage::OpenUsage)),
         ("Open activity", Rc::new(OpenActivity)),
@@ -101,6 +112,7 @@ fn commands() -> Vec<(&'static str, Rc<dyn Action>)> {
             "Show what is running",
             Rc::new(super::activity::ShowRunning),
         ),
+        ("Show the keys", Rc::new(ShowKeys)),
         ("Send now, into the reply", Rc::new(SendNow)),
         // Escape's action: it stops the reply only once nothing else is
         // open to back out of, such as Settings or an edit.
@@ -115,11 +127,30 @@ fn commands() -> Vec<(&'static str, Rc<dyn Action>)> {
 /// The pages the sidebar goes to, with its icons.
 const PAGES: &[(Page, AppIcon)] = &[
     (Page::Capabilities, AppIcon::Sparkles),
+    (Page::Plugins, AppIcon::Puzzle),
     (Page::Messaging, AppIcon::MessageSquare),
     (Page::Artifacts, AppIcon::File),
     (Page::Activity, AppIcon::Robot),
     (Page::Jobs, AppIcon::Clock),
+    (Page::Workflows, AppIcon::Workflow),
 ];
+
+/// The appearances the palette offers, as the setting stores them.
+const LOOKS: [(&str, &str); 3] = [
+    ("", "Night appearance"),
+    ("paper", "Paper appearance"),
+    ("system", "Follow the system's appearance"),
+];
+
+/// The action that opens `page` from anywhere, for the pages that have a
+/// key.
+fn page_action(page: Page) -> Option<Rc<dyn Action>> {
+    match page {
+        Page::Capabilities => Some(Rc::new(super::capabilities::OpenCapabilities)),
+        Page::Activity => Some(Rc::new(OpenActivity)),
+        _ => None,
+    }
+}
 
 /// The groups with rows that answer `query`, the group of the best answer
 /// first, each with those rows best first.
@@ -367,7 +398,7 @@ impl Chat {
     fn palette_groups(&self, cx: &App) -> Vec<(&'static str, Vec<Row>)> {
         let keymap = cx.key_bindings();
         let keymap = keymap.borrow();
-        let actions = commands()
+        let mut actions: Vec<Row> = commands()
             .into_iter()
             .map(|(label, action)| {
                 // The last bound takes precedence, as when the key is pressed.
@@ -382,10 +413,33 @@ impl Chat {
                 }
             })
             .collect();
+        actions.push(Row {
+            detail: "Attach a folder to this session".into(),
+            ..Row::new(
+                AppIcon::Folder,
+                "Choose a project folder",
+                Pick::ChooseFolder,
+            )
+        });
+        actions.extend(LOOKS.iter().map(|&(value, label)| Row {
+            current: self.store.settings.appearance == value,
+            ..Row::new(AppIcon::Palette, label, Pick::Look(value))
+        }));
+        // Only while it would do something: signed in, the account menu
+        // signs out, and a sign-in already waiting is the account page's.
+        if self.account.is_none() && self.sign_in_url.is_none() {
+            actions.push(Row {
+                detail: "Letronna account".into(),
+                ..Row::new(AppIcon::User, "Sign in", Pick::SignIn)
+            });
+        }
 
         let mut places: Vec<Row> = PAGES
             .iter()
-            .map(|&(page, icon)| Row::new(icon, page.title(), Pick::Page(page)))
+            .map(|&(page, icon)| Row {
+                key: page_action(page).and_then(|action| crate::ui::keys::bound_key(&*action, cx)),
+                ..Row::new(icon, page.title(), Pick::Page(page))
+            })
             .collect();
         places.extend(super::settings::PAGES.iter().map(|&(name, icon)| Row {
             detail: "Settings".into(),
@@ -464,13 +518,7 @@ impl Chat {
         }
         match pick {
             Pick::Action(action) => window.dispatch_action(action.boxed_clone(), cx),
-            Pick::Page(Page::Activity) => self.open_activity(window, cx),
-            Pick::Page(Page::Capabilities) => self.open_capabilities(window, cx),
-            Pick::Page(Page::Jobs) => self.open_jobs(window, cx),
-            Pick::Page(page) => {
-                self.page = page;
-                self.focus_composer(window, cx);
-            }
+            Pick::Page(page) => self.open_page(page, window, cx),
             Pick::Settings(name) => {
                 self.settings_page.update(cx, |page, cx| {
                     *page = name;
@@ -482,29 +530,54 @@ impl Chat {
                     self.load_usage(cx);
                 }
             }
-            Pick::Session(id) => {
-                let Some(ix) = self.store.index_of(id) else {
-                    return;
-                };
-                self.leave_for(ix);
-                self.store.active = ix;
-                self.error = None;
-                self.page = Page::Chat;
-                self.follow();
-                self.focus_composer(window, cx);
-                self.save();
-            }
+            Pick::Session(id) => self.go_to_session(id, window, cx),
             Pick::Skill(name) => self.use_skill(&name, window, cx),
             Pick::Model(gateway, id) => self.choose_model(gateway, id, window, cx),
             Pick::Folder(folder) => self.open_folder(folder, window, cx),
+            Pick::Look(value) => {
+                self.store.settings.appearance = value.to_owned();
+                self.save();
+                // The blurred snapshot behind settings still wears the old
+                // colours, as when it is picked there.
+                self.drop_backdrop(cx);
+                crate::theme::apply(value, window, cx);
+            }
+            Pick::ChooseFolder => self.attach_workspace(window, cx),
+            // On the Account page, where the wait for the browser shows,
+            // as the account menu does it.
+            Pick::SignIn => {
+                self.open_account(window, cx);
+                self.sign_in(cx);
+            }
         }
+        cx.notify();
+    }
+
+    /// Show session `id` in the chat, at its newest message, with the keys
+    /// in the composer.
+    pub(crate) fn go_to_session(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.store.index_of(id) else {
+            return;
+        };
+        self.leave_for(ix);
+        self.store.active = ix;
+        self.error = None;
+        self.page = Page::Chat;
+        self.follow();
+        self.focus_composer(window, cx);
+        self.save();
         cx.notify();
     }
 
     /// Work in `folder`: in the session on screen while nothing has been
     /// said in it, or else in a new one, so a conversation keeps the
     /// project it was about.
-    fn open_folder(&mut self, folder: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_folder(
+        &mut self,
+        folder: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.store.conversations[self.store.active].length() > 0 {
             self.new_chat(window, cx);
         }
@@ -519,8 +592,25 @@ impl Chat {
 mod tests {
     // Not `use super::*`: the prelude re-exports gpui, whose `test` macro
     // would shadow the built-in attribute.
-    use super::{FOLDERS, Pick, Row, folder_row, sift};
+    use super::{FOLDERS, PAGES, Pick, Row, folder_row, sift};
     use crate::{app::Page, assets::AppIcon};
+
+    #[test]
+    fn every_page_the_sidebar_opens_can_be_gone_to_from_here() {
+        let pages = [
+            Page::Capabilities,
+            Page::Plugins,
+            Page::Messaging,
+            Page::Artifacts,
+            Page::Jobs,
+            Page::Activity,
+            Page::Workflows,
+        ];
+        for page in pages {
+            let listed = PAGES.iter().any(|&(p, _)| p == page);
+            assert!(listed, "{} is not in the palette", page.title());
+        }
+    }
 
     fn labels(shown: &[(&'static str, Vec<Row>)]) -> Vec<(&'static str, Vec<String>)> {
         shown

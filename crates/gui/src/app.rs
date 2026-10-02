@@ -545,6 +545,9 @@ pub(crate) struct Chat {
     /// Sessions whose plan's list was closed by hand, which then rests as the
     /// strip's one line rather than opening by itself.
     pub(crate) plan_folded: std::collections::HashSet<u64>,
+    /// Whether the sidebar's More row is open on the pages under it, kept
+    /// for the window's life.
+    pub(crate) nav_more: bool,
 }
 
 impl Chat {
@@ -1049,6 +1052,7 @@ impl Chat {
             strip_area: cx.focus_handle(),
             strip_focus_first: false,
             plan_folded: std::collections::HashSet::new(),
+            nav_more: false,
         };
         let shrink = this.follow_browser_shrink(window, cx);
         this._subscriptions.push(shrink);

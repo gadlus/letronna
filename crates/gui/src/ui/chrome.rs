@@ -3,6 +3,9 @@ use gpui_component::popover::Popover;
 
 /// The user guide on the website, opened from the account menu.
 const GUIDE: &str = "https://letronna.ai/docs";
+/// The window width from which the palette's button says what it does:
+/// below it, its words would take the session name's room.
+const COMMAND_WORDS: Pixels = px(960.);
 
 impl Chat {
     pub(crate) fn title_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -24,27 +27,31 @@ impl Chat {
                     .gap_2()
                     // Nothing follows the chip on macOS, so keep it off the edge.
                     .when(cfg!(target_os = "macos"), |bar| bar.pr_3())
+                    // Both sides grow alike from nothing, so the name sits
+                    // in the middle of the bar, not of what the buttons
+                    // leave; a side wider than its half only pushes it over.
                     .child(
-                        Button::new("toggle-sidebar")
-                            .plain(cx)
-                            .small()
-                            .icon(
-                                Icon::new(if self.sidebar_open {
-                                    IconName::PanelLeftClose
-                                } else {
-                                    IconName::PanelLeftOpen
-                                })
-                                .size_4(),
-                            )
-                            .tooltip_with_action("Toggle sidebar", &ToggleSidebar, None)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.sidebar_open = !this.sidebar_open;
-                                cx.notify();
-                            })),
+                        h_flex().flex_1().items_center().child(
+                            Button::new("toggle-sidebar")
+                                .plain(cx)
+                                .small()
+                                .icon(
+                                    Icon::new(if self.sidebar_open {
+                                        IconName::PanelLeftClose
+                                    } else {
+                                        IconName::PanelLeftOpen
+                                    })
+                                    .size_4(),
+                                )
+                                .tooltip_with_action("Toggle sidebar", &ToggleSidebar, None)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.sidebar_open = !this.sidebar_open;
+                                    cx.notify();
+                                })),
+                        ),
                     )
                     .child(
                         h_flex()
-                            .flex_1()
                             .min_w_0()
                             .justify_center()
                             .when(self.page == Page::Chat, |this| {
@@ -52,27 +59,61 @@ impl Chat {
                             }),
                     )
                     .child(
-                        Button::new("toggle-panel")
-                            .plain(cx)
-                            .small()
-                            .icon(Icon::new(IconName::PanelRight).size_4())
-                            .tooltip_with_action(
-                                "Toggle right panel",
-                                &crate::ui::panel::TogglePanel,
-                                Some("Chat"),
+                        h_flex()
+                            .flex_1()
+                            .items_center()
+                            .justify_end()
+                            .gap_2()
+                            .child(self.command_button(window, cx))
+                            .child(
+                                Button::new("toggle-panel")
+                                    .plain(cx)
+                                    .small()
+                                    .icon(Icon::new(IconName::PanelRight).size_4())
+                                    .tooltip_with_action(
+                                        "Toggle right panel",
+                                        &crate::ui::panel::TogglePanel,
+                                        Some("Chat"),
+                                    )
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.toggle_panel(window, cx)
+                                    })),
                             )
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.toggle_panel(window, cx)),
-                            ),
-                    )
-                    .children(self.profile_label.clone().map(|name| {
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(name)
-                    }))
-                    .child(self.account_chip(cx)),
+                            .children(self.profile_label.clone().map(|name| {
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(name)
+                            }))
+                            .child(self.account_chip(cx)),
+                    ),
             )
+    }
+
+    /// A quiet field that opens the palette, so the palette, and the key
+    /// for it, can be found without knowing it is there.
+    fn command_button(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
+        let key = crate::ui::keys::bound_key(&crate::ui::palette::OpenPalette, cx);
+        // In a narrow window the words go first, so the session's name
+        // keeps its room; the glass and the key say enough.
+        let words = window.viewport_size().width >= COMMAND_WORDS;
+        Button::new("command")
+            .framed(cx)
+            .xsmall()
+            .px_2()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(Icon::new(AppIcon::Search).size_3())
+                    .when(words, |this| this.child("Search or run a command"))
+                    .children(key.map(|key| Kbd::format(&key))),
+            )
+            .when(!words, |this| this.tooltip("Search or run a command"))
+            .on_click(cx.listener(|this, _, window, cx| this.open_palette(window, cx)))
     }
 
     /// The open session's name, so it is clear which one this is; click

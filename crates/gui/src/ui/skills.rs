@@ -334,7 +334,7 @@ impl Chat {
                     .when(yours, |this| {
                         this.child(
                             Button::new(("edit-skill", index))
-                                .ghost()
+                                .plain(cx)
                                 .xsmall()
                                 .icon(Icon::new(AppIcon::Pencil))
                                 .tooltip("Edit")
@@ -344,7 +344,7 @@ impl Chat {
                         )
                         .child(
                             Button::new(("delete-skill", index))
-                                .ghost()
+                                .plain(cx)
                                 .xsmall()
                                 .icon(Icon::new(AppIcon::Trash))
                                 .tooltip("Delete")
@@ -387,7 +387,7 @@ impl Chat {
             )
             .child(
                 Button::new("choose-skills")
-                    .ghost()
+                    .plain(cx)
                     .small()
                     .icon(Icon::new(AppIcon::Folder))
                     .label("Choose folder…")
