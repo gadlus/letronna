@@ -3615,6 +3615,9 @@ impl Chat {
         self.streaming_id = None;
         self.turn = None;
         self.judging = None;
+        // A retried or rewound reply can come back at the same place, and
+        // must not number its cards on from this turn's.
+        self.card_for = None;
         // Calls a stop left running come back to a generation that is gone,
         // so the next turn must not wait for them.
         self.outstanding = 0;
