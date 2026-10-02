@@ -88,7 +88,9 @@ impl Runner {
             effort: self.store.effort(session).to_owned(),
             search: settings.search,
             conversation: self.store.conversations[session].id,
-            unattended: false,
+            // A piped `-p` has nobody to tell of a long wait, so it waits out
+            // a busy provider as a schedule does rather than give up.
+            unattended: !self.human,
             wrap_up: false,
             mode: self.mode,
             human: self.human && self.helpers_answered,
@@ -2068,5 +2070,29 @@ mod tests {
         drop(deciding);
         // The judge's thread finishes into a channel nobody reads.
         assert!(judge.send(gate::Outcome::Run).is_err());
+    }
+
+    #[test]
+    fn a_runner_nobody_watches_makes_unattended_connections() {
+        let mut runner = Runner {
+            store: Default::default(),
+            allowed: Default::default(),
+            mode: Mode::Default,
+            human: false,
+            helpers_answered: false,
+            trouble: None,
+            bar: Bar::new(String::new()),
+            stopped: false,
+            images: Vec::new(),
+            notices: letronna_core::notify::Notices::new(Box::new(crate::notify::Silent)),
+            ended: None,
+            voice: None,
+            review: Default::default(),
+        };
+        runner.store.conversations.push(Conversation::default());
+        assert!(runner.connection(0).unattended);
+        // Someone at the terminal would rather be told than wait minutes.
+        runner.human = true;
+        assert!(!runner.connection(0).unattended);
     }
 }
