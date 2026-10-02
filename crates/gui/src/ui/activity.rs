@@ -19,6 +19,7 @@
 //! its clocks move only while its list is open, once a second, so a closed
 //! strip costs a redraw only as something starts or ends.
 
+use super::PageColumn;
 use crate::prelude::*;
 use crate::ui::workflows::{Ask, asked, standing};
 use gpui_component::tooltip::Tooltip;
@@ -847,7 +848,7 @@ impl Chat {
             .track_focus(&self.activity_focus)
             .flex_1()
             .min_h_0()
-            .px_8()
+            .page_column()
             .py_6()
             .gap_4()
             .child(
@@ -1025,7 +1026,7 @@ impl Chat {
             .track_focus(&self.activity_focus)
             .flex_1()
             .min_h_0()
-            .px_8()
+            .page_column()
             .py_6()
             .gap_4()
             .child(

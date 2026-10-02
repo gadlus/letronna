@@ -12,6 +12,7 @@
 //! of a run, where the window can read them, so Open shows the run's result
 //! and the page has no log.
 
+use super::PageColumn;
 use crate::prelude::*;
 use letronna_core::agents::took;
 use letronna_core::budget::short;
@@ -296,7 +297,7 @@ impl Chat {
             }))
             .flex_1()
             .min_h_0()
-            .px_8()
+            .page_column()
             .py_6()
             .gap_4()
             .child(body)
