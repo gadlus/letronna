@@ -28,7 +28,7 @@ pub const MAX_ROUNDS: usize = 25;
 const MAX_CONTINUATIONS: usize = 3;
 
 /// The notice that asks a reply cut off at the output limit to go on.
-const CONTINUE: &str =
+pub(crate) const CONTINUE: &str =
     "Your last reply was cut off at the output limit; continue exactly where it stopped.";
 
 /// The notice for a reply cut off inside a tool call, which was not run.
