@@ -470,9 +470,9 @@ impl Chat {
             self.panel.open = false;
         }
         self.panel.previews.insert(self.session_on_screen());
-        if !self.browser.read(cx).is_open() {
-            self.browser.update(cx, |view, cx| view.reopen(home, cx));
-        }
+        // Even when open: one not drawn just now, as after a switch of
+        // session, may find this session's page gone, and opens `home`.
+        self.browser.update(cx, |view, cx| view.reopen(home, cx));
         cx.notify();
     }
 
