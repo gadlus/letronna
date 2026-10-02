@@ -169,6 +169,31 @@ pub struct Draft {
     pub subject: String,
 }
 
+impl Draft {
+    /// What a frontend says while the call is written, as in "Writing app.rs…".
+    pub fn label(&self) -> String {
+        let file = || {
+            std::path::Path::new(&self.subject)
+                .file_name()
+                .map_or(self.subject.clone(), |name| {
+                    name.to_string_lossy().into_owned()
+                })
+        };
+        let known = !self.subject.is_empty();
+        match self.name.as_str() {
+            "write_file" if known => format!("Writing {}…", file()),
+            "write_file" => "Writing a file…".to_owned(),
+            "edit_file" if known => format!("Editing {}…", file()),
+            "edit_file" | "apply_patch" => "Editing files…".to_owned(),
+            "run_command" if known => format!("Running {}…", self.subject),
+            "run_command" => "Writing a command…".to_owned(),
+            "web_fetch" if known => format!("Fetching {}…", self.subject),
+            "web_fetch" => "Fetching a page…".to_owned(),
+            name => format!("Calling {name}…"),
+        }
+    }
+}
+
 /// What a provider wants sent back unchanged with a reply on later requests:
 /// the thinking behind it, which it may have signed or encrypted and
 /// otherwise has to work out again or refuses the tool calls that followed.
@@ -7708,6 +7733,26 @@ mod tests {
             name: name.into(),
             subject: subject.into(),
         }
+    }
+
+    #[test]
+    fn a_call_being_written_is_named_by_what_it_does_and_its_file() {
+        let draft = |name: &str, subject: &str| Draft {
+            name: name.into(),
+            subject: subject.into(),
+        };
+        assert_eq!(draft("write_file", "src/app.rs").label(), "Writing app.rs…");
+        assert_eq!(draft("write_file", "").label(), "Writing a file…");
+        assert_eq!(
+            draft("edit_file", "crates/gui/src/ui/mod.rs").label(),
+            "Editing mod.rs…"
+        );
+        assert_eq!(draft("apply_patch", "").label(), "Editing files…");
+        assert_eq!(
+            draft("run_command", "cargo test").label(),
+            "Running cargo test…"
+        );
+        assert_eq!(draft("browse", "").label(), "Calling browse…");
     }
 
     #[test]
