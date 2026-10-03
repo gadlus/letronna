@@ -2099,7 +2099,12 @@ impl Tool for WriteFile {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        let note = crate::write::csv_note(Path::new(path_arg(args)), change.before(), &text);
+        let mut note = crate::write::csv_note(Path::new(path_arg(args)), change.before(), &text);
+        note.push_str(&crate::write::syntax_note(
+            Path::new(path_arg(args)),
+            change.before(),
+            &text,
+        ));
         let lsp = crate::lsp::before_write(ctx, &path, change.before());
         let new = change.before().is_none();
         change.write(text.as_bytes(), &ctx.files)?;
@@ -2237,7 +2242,12 @@ impl Tool for EditFile {
             return Err(crate::redact::refused("`new`"));
         }
         crate::write::check_syntax(&path, Some(text.as_bytes()), &done.text)?;
-        let note = crate::write::csv_note(Path::new(path_arg(args)), Some(text), &done.text);
+        let mut note = crate::write::csv_note(Path::new(path_arg(args)), Some(text), &done.text);
+        note.push_str(&crate::write::syntax_note(
+            Path::new(path_arg(args)),
+            Some(text),
+            &done.text,
+        ));
         let lsp = crate::lsp::before_write(ctx, &path, Some(text));
         change.write(done.text.as_bytes(), &ctx.files)?;
         crate::lsp::wrote(lsp, &done.text);
@@ -4317,6 +4327,45 @@ mod tests {
             "\u{FEFF}fn b(x) {\r\n    two(x);\r\n}\r\n"
         );
         assert!(edit(json!({"path": "a.rs"})).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(feature = "syntax")]
+    #[test]
+    fn a_python_edit_that_breaks_indentation_is_reported() {
+        let (dir, ctx) = workspace_with("syntax-edit", "");
+        let file = "def f(x):\n    if x:\n        return 1\n    return 2\n";
+        std::fs::write(dir.join("a.py"), file).unwrap();
+        let edit = r#"{"path":"a.py","old":"        return 1","new":"    return 1"}"#;
+        let said = run("edit_file", edit, &ctx).unwrap();
+        assert!(
+            said.starts_with(
+                "Edited `a.py`.\nNote: `a.py` line 2 no longer parses as Python, with \
+                 nothing indented under it: `    if x:`. Fix it before moving on"
+            ),
+            "{said}"
+        );
+        // Said, not refused: the next edit may be the one that finishes it.
+        let written = "def f(x):\n    if x:\n    return 1\n    return 2\n";
+        assert_eq!(std::fs::read_to_string(dir.join("a.py")).unwrap(), written);
+        let edit = r#"{"path":"a.py","old":"    if x:\n    return 1","new":"    if x:\n        return 3"}"#;
+        assert_eq!(run("edit_file", edit, &ctx).unwrap(), "Edited `a.py`.");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(feature = "syntax")]
+    #[test]
+    fn a_new_python_file_with_an_error_is_reported_and_written() {
+        let (dir, ctx) = workspace_with("syntax-write", "");
+        let content = "def f(x):\n    return x +\n";
+        let write = json!({"path": "b.py", "content": content}).to_string();
+        assert_eq!(
+            run("write_file", &write, &ctx).unwrap(),
+            "Wrote `b.py` (25 bytes, 2 lines).\nNote: `b.py` line 2 does not parse as Python: \
+             `    return x +`. Fix it before moving on, unless the language's own tools \
+             accept it."
+        );
+        assert_eq!(std::fs::read_to_string(dir.join("b.py")).unwrap(), content);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

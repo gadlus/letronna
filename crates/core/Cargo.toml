@@ -39,6 +39,16 @@ toml = { version = "1", default-features = false, features = ["std", "parse", "s
 # too big to send, and reading a mask's size; already in the lock file under
 # the window, which takes more of its formats.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+# Saying when a write leaves code that no longer parses: tree-sitter and the
+# grammars the window already links for highlighting, at its versions, so a
+# build of both compiles them once. Not bash, whose grammar rejects 8% of
+# scripts bash runs.
+tree-sitter = { version = "0.25", optional = true }
+tree-sitter-python = { version = "0.23", optional = true }
+tree-sitter-rust = { version = "0.24", optional = true }
+tree-sitter-javascript = { version = "0.23", optional = true }
+tree-sitter-typescript = { version = "0.23", optional = true }
+tree-sitter-yaml = { version = "0.7", optional = true }
 
 # Stopping a background job ends everything it started: a Job Object on
 # Windows, a process group elsewhere; a Ctrl-C is heard by a console handler
@@ -80,7 +90,18 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 landlock = "0.4"
 
 [features]
-default = ["workflows"]
+default = ["workflows", "syntax"]
 # Orchestration scripts that run many agents at once. On by default, so CI
 # builds, lints and tests it; a build without it leaves the runtime out.
 workflows = ["dep:rquickjs"]
+# The note a write's result carries when code no longer parses. On by
+# default; a build without it leaves out the grammars, about 5 MB of the
+# terminal's binary as estimated from their compiled objects.
+syntax = [
+    "dep:tree-sitter",
+    "dep:tree-sitter-python",
+    "dep:tree-sitter-rust",
+    "dep:tree-sitter-javascript",
+    "dep:tree-sitter-typescript",
+    "dep:tree-sitter-yaml",
+]

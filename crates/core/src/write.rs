@@ -241,6 +241,17 @@ pub fn check_syntax(path: &Path, before: Option<&[u8]>, after: &str) -> Result<(
     }
 }
 
+/// What to add to a write's result when the code it leaves no longer
+/// parses; see `syntax`, which a build without the grammars leaves out.
+#[cfg(feature = "syntax")]
+pub(crate) use crate::syntax::note as syntax_note;
+
+/// Nothing, in a build without the grammars.
+#[cfg(not(feature = "syntax"))]
+pub(crate) fn syntax_note(_: &Path, _: Option<&str>, _: &str) -> String {
+    String::new()
+}
+
 /// Parse `text` as JSON or TOML, less a byte order mark, which neither parser
 /// takes and which the file may well have.
 fn parse(kind: &str, text: &str) -> Result<(), String> {
