@@ -16,8 +16,15 @@
 //! "Always" is a grant, which the floor's own questions still come before.
 //!
 //! A session is an ordinary Letronna session, in the same listing, so one
-//! begun in an editor can be carried on in the terminal or the window. The
-//! editor's own MCP servers are not started: Letronna's are.
+//! begun in an editor can be carried on in the terminal or the window, and
+//! the editor can list the sessions of its folder and reopen any of them,
+//! wherever it was begun. Reopened, a session is told to the editor as the
+//! updates that showed it live, before the reply. A session stays on the
+//! model it started on, which the editor can change between turns through
+//! the protocol's model option. The models offered come from every gateway
+//! over the network, so they follow the reply that opens a session rather
+//! than hold it up. The editor's own MCP servers are not started: Letronna's
+//! are.
 
 use crate::session::Runner;
 use letronna_core::approvals::{self, Decision, Request};
@@ -25,9 +32,9 @@ use letronna_core::cancel::Cancel;
 use letronna_core::chat::{self, Connection, Message, ToolCall};
 use letronna_core::driver::{self, Allow, Decide, Outcome, Spec, Step, Watch};
 use letronna_core::gate::{self, Gate, Grants, Mode};
-use letronna_core::store::{self, Conversation, Todo, Transcript};
+use letronna_core::store::{self, Conversation, Summary, Todo, Transcript};
 use letronna_core::tools::ToolContext;
-use letronna_core::{agent, hooks, permissions, tools, untrusted};
+use letronna_core::{agent, gateway, hooks, permissions, tools, untrusted};
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashMap};
 use std::io::{BufRead, Write};
@@ -51,8 +58,25 @@ const LABEL: &str = "Letronna";
 /// since the editor would otherwise show it running for ever.
 const NEVER_RAN: &str = "It did not run: the turn ended first.";
 
-/// Where a new session's conversation comes from, given the folder it works in.
-pub type Open = Box<dyn FnMut(&Path) -> Result<(Connection, Transcript), String>>;
+/// How many sessions a page of `session/list` holds: more than an editor's
+/// history shows at once, and few enough to send in one frame.
+const PAGE: usize = 50;
+
+/// The id of the one option of a session the editor can change.
+const MODEL: &str = "model";
+
+/// What the agent asks of the Letronna it serves, which the tests stand in for.
+pub trait Home {
+    /// Starts a session working in `cwd`, in the listing like any other, and
+    /// hands over its connection and the file its conversation is written to.
+    fn start(&mut self, cwd: &Path) -> Result<(Connection, Transcript), String>;
+    /// Holds `conversation` to the model it is on, its own or else the
+    /// settings', and gives the way to that model.
+    fn connect(&mut self, conversation: &mut Conversation) -> Result<Connection, String>;
+    /// The work of asking every set-up gateway for its models, as (gateway,
+    /// model), which is done off the reader's thread.
+    fn models(&self) -> Box<dyn FnOnce() -> Vec<(String, String)> + Send>;
+}
 
 /// Where frames go, a whole line at a time, from the reader and every turn alike.
 type Out = Arc<Mutex<Box<dyn Write + Send>>>;
@@ -60,6 +84,8 @@ type Out = Arc<Mutex<Box<dyn Write + Send>>>;
 /// A session the editor opened.
 struct Session {
     connection: Connection,
+    /// The gateway the connection's model is on, which the model option names.
+    gateway: String,
     /// The conversation, away with its turn while one runs.
     transcript: Option<Transcript>,
     /// Stops the turn running now, if there is one.
@@ -69,8 +95,10 @@ struct Session {
 /// The agent end of one connection to an editor.
 struct Agent {
     out: Out,
-    open: Open,
+    home: Box<dyn Home>,
     sessions: Arc<Mutex<HashMap<u64, Session>>>,
+    /// The models the gateways offered when last asked, by name then gateway.
+    models: Arc<Mutex<Vec<(String, String)>>>,
     /// Permission requests the editor has not answered yet, by the id each went out with.
     asked: Arc<Mutex<HashMap<u64, Request>>>,
     /// The tools the editor said to allow always, by session.
@@ -94,7 +122,7 @@ pub fn run() -> i32 {
         return 1;
     }
     letronna_core::mcp::start();
-    let mut runner = Runner {
+    let runner = Runner {
         store,
         allowed: Default::default(),
         mode: letronna_core::gate::Mode::Default,
@@ -109,9 +137,12 @@ pub fn run() -> i32 {
         voice: None,
         review: Default::default(),
     };
-    let open: Open = Box::new(move |cwd| open_session(&mut runner, cwd));
     let stdin = std::io::stdin();
-    serve(stdin.lock().lines(), Box::new(std::io::stdout()), open);
+    serve(
+        stdin.lock().lines(),
+        Box::new(std::io::stdout()),
+        Box::new(runner),
+    );
     letronna_core::jobs::stop_all();
     letronna_core::mcp::stop_all();
     letronna_core::browser::close_hidden();
@@ -119,32 +150,61 @@ pub fn run() -> i32 {
     0
 }
 
+impl Home for Runner {
+    fn start(&mut self, cwd: &Path) -> Result<(Connection, Transcript), String> {
+        open_session(self, cwd)
+    }
+
+    fn connect(&mut self, conversation: &mut Conversation) -> Result<Connection, String> {
+        // Worked out as the terminal does for a session, then taken back
+        // out, so the conversation has one writer: its transcript.
+        self.store.conversations.push(std::mem::take(conversation));
+        let index = self.store.conversations.len() - 1;
+        // Held there as the terminal holds a session once it sends, so the
+        // editor reopens it on the model it was on.
+        self.store.pin(index);
+        let mut connection = self.connection(index);
+        *conversation = self.store.conversations.remove(index);
+        // An editor always has someone to answer its helpers' cards too.
+        connection.human = true;
+        // And someone watching the turn, who would rather be told of a long
+        // wait than sit through it, as at a terminal.
+        connection.unattended = false;
+        chat::validate(&connection)?;
+        Ok(connection)
+    }
+
+    fn models(&self) -> Box<dyn FnOnce() -> Vec<(String, String)> + Send> {
+        let custom = self.store.settings.custom_endpoint.clone();
+        Box::new(move || {
+            let (models, errors) = gateway::all_models(&store::load_keys(), &custom);
+            for error in errors {
+                eprintln!("{error}");
+            }
+            models
+        })
+    }
+}
+
 /// Starts a session working in `cwd`, in the listing like any other, and
 /// hands over its connection and the file its conversation is written to.
 fn open_session(runner: &mut Runner, cwd: &Path) -> Result<(Connection, Transcript), String> {
     let id = runner.store.reserve_id();
-    runner.store.conversations.push(Conversation {
+    let mut conversation = Conversation {
         id,
         updated: chat::now(),
         workspace: Some(cwd.to_owned()),
         ..Default::default()
-    });
-    // Worked out as the terminal does for a new session, then taken back
-    // out, so the conversation has one writer: its transcript.
-    let index = runner.store.conversations.len() - 1;
-    let mut connection = runner.connection(index);
-    // An editor always has someone to answer its helpers' cards too.
-    connection.human = true;
-    // And someone watching the turn, who would rather be told of a long
-    // wait than sit through it, as at a terminal.
-    connection.unattended = false;
-    let conversation = runner.store.conversations.remove(index);
+    };
     let path = store::sessions_dir().join(format!("{id}.jsonl"));
-    if let Err(error) = chat::validate(&connection) {
-        // The id was claimed with an empty file, which no session will fill.
-        let _ = std::fs::remove_file(&path);
-        return Err(error);
-    }
+    let connection = match runner.connect(&mut conversation) {
+        Ok(connection) => connection,
+        Err(error) => {
+            // The id was claimed with an empty file, which no session will fill.
+            let _ = std::fs::remove_file(&path);
+            return Err(error);
+        }
+    };
     let mut transcript = Transcript { path, conversation };
     transcript
         .save()
@@ -157,12 +217,13 @@ fn open_session(runner: &mut Runner, cwd: &Path) -> Result<(Connection, Transcri
 pub fn serve(
     input: impl Iterator<Item = std::io::Result<String>>,
     output: Box<dyn Write + Send>,
-    open: Open,
+    home: Box<dyn Home>,
 ) {
     let mut agent = Agent {
         out: Arc::new(Mutex::new(output)),
-        open,
+        home,
         sessions: Arc::default(),
+        models: Arc::default(),
         asked: Arc::default(),
         grants: Arc::default(),
         next_id: Arc::new(AtomicU64::new(0)),
@@ -266,6 +327,9 @@ impl Agent {
         let reply = match method {
             "initialize" => Ok(initialized()),
             "session/new" => self.new_session(params),
+            "session/load" => self.load_session(params),
+            "session/list" => list_sessions(params),
+            "session/set_config_option" => self.set_option(params),
             "session/prompt" => match self.prompt(id.clone(), params) {
                 // The turn replies when it ends.
                 Ok(()) => return,
@@ -276,35 +340,157 @@ impl Agent {
                 format!("There is no method `{method}` here."),
             )),
         };
+        let opened = match (&reply, method) {
+            (Ok(result), "session/new") => session_id(result).ok(),
+            (Ok(_), "session/load") => session_id(params).ok(),
+            _ => None,
+        };
         let frame = match reply {
             Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
             Err((code, error)) => failure(id, code, &error),
         };
         send(&self.out, &frame);
+        // Asked after the reply, so the editor knows the session before it
+        // hears of its models.
+        if let Some(session) = opened {
+            self.offer_models(session);
+        }
     }
 
     /// Opens a session working in the folder the editor names.
     fn new_session(&mut self, params: &Value) -> Result<Value, (i64, String)> {
-        let Some(cwd) = params["cwd"].as_str().map(PathBuf::from) else {
-            return Err((INVALID_PARAMS, "`cwd` is required.".into()));
+        let cwd = folder(params)?;
+        let (connection, transcript) = self.home.start(&cwd).map_err(|e| (INTERNAL_ERROR, e))?;
+        let id = transcript.conversation.id;
+        let options = self.keep(connection, transcript);
+        Ok(json!({"sessionId": id.to_string(), "configOptions": options}))
+    }
+
+    /// Reopens a saved session working in the folder the editor names,
+    /// telling the editor what was said in it before the reply.
+    fn load_session(&mut self, params: &Value) -> Result<Value, (i64, String)> {
+        let session = session_id(params)?;
+        let cwd = folder(params)?;
+        // Its turn would carry on into a conversation no longer held here.
+        let running = lock(&self.sessions)
+            .get(&session)
+            .is_some_and(|open| open.transcript.is_none());
+        if running {
+            return Err((INVALID_REQUEST, "A turn is running in this session.".into()));
+        }
+        let Some(mut conversation) = store::saved(session) else {
+            return Err((INVALID_PARAMS, format!("There is no session {session}.")));
         };
-        if !cwd.is_absolute() || !cwd.is_dir() {
+        let elsewhere = (conversation.workspace.as_deref())
+            .is_none_or(|workspace| !same_folder(workspace, &cwd));
+        if elsewhere {
             return Err((
                 INVALID_PARAMS,
-                format!("`{}` is not a folder given in full.", cwd.display()),
+                format!("Session {session} does not work in `{}`.", cwd.display()),
             ));
         }
-        let (connection, transcript) = (self.open)(&cwd).map_err(|e| (INTERNAL_ERROR, e))?;
+        let connection = (self.home.connect(&mut conversation)).map_err(|e| (INTERNAL_ERROR, e))?;
+        for update_of in replay(&conversation) {
+            send(&self.out, &update(session, update_of));
+        }
+        let path = store::sessions_dir().join(format!("{session}.jsonl"));
+        let options = self.keep(connection, Transcript { path, conversation });
+        Ok(json!({"configOptions": options}))
+    }
+
+    /// Holds a session the editor opened or reopened, and gives its options.
+    fn keep(&self, connection: Connection, transcript: Transcript) -> Value {
         let id = transcript.conversation.id;
-        lock(&self.sessions).insert(
-            id,
-            Session {
-                connection,
-                transcript: Some(transcript),
-                cancel: Cancel::default(),
-            },
+        let open = Session {
+            gateway: (transcript.conversation.gateway.clone()).unwrap_or_default(),
+            connection,
+            transcript: Some(transcript),
+            cancel: Cancel::default(),
+        };
+        let options = options(&open, &lock(&self.models));
+        lock(&self.sessions).insert(id, open);
+        options
+    }
+
+    /// Puts the session the editor names on the model it picked, from its
+    /// next turn, and gives the options as they stand then.
+    fn set_option(&mut self, params: &Value) -> Result<Value, (i64, String)> {
+        let session = session_id(params)?;
+        let option = params["configId"].as_str().unwrap_or_default();
+        if option != MODEL {
+            return Err((
+                INVALID_PARAMS,
+                format!("There is no option `{option}` here."),
+            ));
+        }
+        let picked = params["value"].as_str().unwrap_or_default();
+        let models = lock(&self.models).clone();
+        let mut sessions = lock(&self.sessions);
+        let Some(open) = sessions.get_mut(&session) else {
+            return Err((INVALID_PARAMS, format!("There is no session {session}.")));
+        };
+        let current = (open.gateway.clone(), open.connection.model.clone());
+        let found = (models.iter().chain([&current]))
+            .find(|(gateway, model)| choice(gateway, model) == picked);
+        let Some((gateway, model)) = found.cloned() else {
+            return Err((INVALID_PARAMS, format!("No gateway offers `{picked}`.")));
+        };
+        // A turn's requests go on the model it began on, so a switch in the
+        // middle of one would only be half of one.
+        let Some(transcript) = open.transcript.as_mut() else {
+            return Err((
+                INVALID_REQUEST,
+                "A turn is running in this session; pick the model once it ends.".into(),
+            ));
+        };
+        let conversation = &mut transcript.conversation;
+        let was = (
+            conversation.gateway.replace(gateway.clone()),
+            conversation.model.replace(model),
         );
-        Ok(json!({"sessionId": id.to_string()}))
+        let connection = match self.home.connect(conversation) {
+            Ok(connection) => connection,
+            Err(error) => {
+                (conversation.gateway, conversation.model) = was;
+                return Err((INVALID_PARAMS, error));
+            }
+        };
+        // Only where its requests go: its mode and the rest stay the session's.
+        open.connection.endpoint = connection.endpoint;
+        open.connection.key = connection.key;
+        open.connection.model = connection.model;
+        open.gateway = gateway;
+        // Written now, so the session reopens on it even before its next turn.
+        if let Err(e) = transcript.save() {
+            eprintln!("Could not save the model picked for session {session}: {e}");
+        }
+        Ok(json!({"configOptions": options(open, &models)}))
+    }
+
+    /// Asks the gateways for their models off this thread, then offers them
+    /// in session `session`.
+    fn offer_models(&self, session: u64) {
+        let ask = self.home.models();
+        let (out, sessions, models) =
+            (self.out.clone(), self.sessions.clone(), self.models.clone());
+        std::thread::spawn(move || {
+            let mut answered = ask();
+            // None answering is no news: the list known before still holds.
+            if answered.is_empty() {
+                return;
+            }
+            // As the terminal's `/model` lists them.
+            answered.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+            *lock(&models) = answered.clone();
+            let Some(options) =
+                (lock(&sessions).get(&session)).map(|open| options(open, &answered))
+            else {
+                return;
+            };
+            let changed =
+                json!({"sessionUpdate": "config_option_update", "configOptions": options});
+            send(&out, &update(session, changed));
+        });
     }
 
     /// Starts a turn on the prompt, which replies to `id` when it ends.
@@ -455,8 +641,9 @@ fn initialized() -> Value {
     json!({
         "protocolVersion": PROTOCOL_VERSION,
         "agentCapabilities": {
-            "loadSession": false,
+            "loadSession": true,
             "promptCapabilities": {"image": false, "audio": false, "embeddedContext": true},
+            "sessionCapabilities": {"list": {}},
         },
         "agentInfo": {
             "name": "letronna",
@@ -476,6 +663,173 @@ fn session_id(params: &Value) -> Result<u64, (i64, String)> {
             INVALID_PARAMS,
             "`sessionId` does not name a session.".into(),
         ))
+}
+
+/// The folder a request names as `cwd`, which must be one given in full.
+fn folder(params: &Value) -> Result<PathBuf, (i64, String)> {
+    let Some(cwd) = params["cwd"].as_str().map(PathBuf::from) else {
+        return Err((INVALID_PARAMS, "`cwd` is required.".into()));
+    };
+    if !cwd.is_absolute() || !cwd.is_dir() {
+        return Err((
+            INVALID_PARAMS,
+            format!("`{}` is not a folder given in full.", cwd.display()),
+        ));
+    }
+    Ok(cwd)
+}
+
+/// Whether `a` and `b` are one folder, however each is spelled.
+fn same_folder(a: &Path, b: &Path) -> bool {
+    let full = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    full(a) == full(b)
+}
+
+/// A page of the saved sessions working in the folder the editor names, or
+/// in any, newest first, with where the next page starts when there is one.
+fn list_sessions(params: &Value) -> Result<Value, (i64, String)> {
+    let cwd = params["cwd"].as_str().map(PathBuf::from);
+    let after = match params["cursor"].as_str() {
+        None => None,
+        Some(cursor) => Some(
+            (cursor.split_once('-'))
+                .and_then(|(updated, id)| Some((updated.parse().ok()?, id.parse().ok()?)))
+                .ok_or((
+                    INVALID_PARAMS,
+                    format!("`{cursor}` is not a cursor given here."),
+                ))?,
+        ),
+    };
+    let (sessions, next) = page(store::summaries(), cwd.as_deref(), after, PAGE);
+    let sessions: Vec<Value> = sessions.iter().filter_map(info).collect();
+    let mut reply = json!({"sessions": sessions});
+    if let Some((updated, id)) = next {
+        reply["nextCursor"] = format!("{updated}-{id}").into();
+    }
+    Ok(reply)
+}
+
+/// The first `size` of `sessions` with something said in them, working in
+/// `cwd` or in any folder, newest first from just after `after`, and the
+/// place of the last of them when more follow.
+fn page(
+    mut sessions: Vec<Summary>,
+    cwd: Option<&Path>,
+    after: Option<(u64, u64)>,
+    size: usize,
+) -> (Vec<Summary>, Option<(u64, u64)>) {
+    // One with nothing said has nothing to reopen, and one in no folder
+    // cannot be reopened in one.
+    sessions.retain(|session| {
+        let place = (session.updated, session.id);
+        let here = (session.workspace.as_deref())
+            .is_some_and(|workspace| cwd.is_none_or(|cwd| same_folder(workspace, cwd)));
+        session.messages > 0 && here && after.is_none_or(|after| place < after)
+    });
+    // By id too, so sessions saved in the same second each have one place.
+    sessions.sort_by_key(|session| std::cmp::Reverse((session.updated, session.id)));
+    let more = sessions.len() > size;
+    sessions.truncate(size);
+    let next = (sessions.last())
+        .filter(|_| more)
+        .map(|session| (session.updated, session.id));
+    (sessions, next)
+}
+
+/// A saved session as `session/list` describes it.
+fn info(session: &Summary) -> Option<Value> {
+    let cwd = session.workspace.as_deref()?;
+    let mut info = json!({"sessionId": session.id.to_string(), "cwd": cwd.display().to_string()});
+    if !session.title.is_empty() {
+        info["title"] = session.title.clone().into();
+    }
+    let updated = i64::try_from(session.updated).ok();
+    if let Some(at) = updated.and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0)) {
+        info["updatedAt"] = at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true).into();
+    }
+    Some(info)
+}
+
+/// The options of `open` the editor can change: its model, among `models`.
+fn options(open: &Session, models: &[(String, String)]) -> Value {
+    let current = (open.gateway.clone(), open.connection.model.clone());
+    let mut offered = models.to_vec();
+    // Its own is offered too, before the gateways have answered, or when
+    // none of them offers it any more.
+    if !offered.contains(&current) {
+        offered.insert(0, current.clone());
+    }
+    let choices: Vec<Value> = offered
+        .iter()
+        .map(|(gateway, model)| {
+            json!({"value": choice(gateway, model), "name": format!("{model} · {gateway}")})
+        })
+        .collect();
+    json!([{
+        "id": MODEL,
+        "name": "Model",
+        "category": "model",
+        "type": "select",
+        "currentValue": choice(&current.0, &current.1),
+        "options": choices,
+    }])
+}
+
+/// A model as the option's value names it: its gateway, whose name has no
+/// `:`, then the model's id, which may.
+fn choice(gateway: &str, model: &str) -> String {
+    format!("{gateway}:{model}")
+}
+
+/// What was said in `conversation` as the updates that showed it live: the
+/// user's words, the replies, each call and how it ended, and the checklist.
+fn replay(conversation: &Conversation) -> Vec<Value> {
+    let said = |kind: &str, text: &str| json!({"sessionUpdate": kind, "content": {"type": "text", "text": text}});
+    let (mut updates, mut calls) = (Vec::new(), BTreeSet::new());
+    for message in &conversation.messages {
+        match message.role.as_str() {
+            // What came meanwhile went to the model, and never to the editor.
+            "user" if message.notice => {}
+            "user" => updates.push(said("user_message_chunk", &typed(&message.content))),
+            "assistant" => {
+                if !message.reasoning.is_empty() {
+                    updates.push(said("agent_thought_chunk", &message.reasoning));
+                }
+                if !message.content.is_empty() {
+                    updates.push(said("agent_message_chunk", &message.content));
+                }
+                for call in &message.tool_calls {
+                    calls.insert(call.id.clone());
+                    let mut announced = tool_call(&call.id, &call.name, &call.arguments);
+                    announced["sessionUpdate"] = "tool_call".into();
+                    updates.push(announced);
+                }
+            }
+            "tool" => {
+                calls.remove(&message.tool_call_id);
+                let id = &message.tool_call_id;
+                updates.push(finished(id, &message.content, message.is_error));
+            }
+            _ => {}
+        }
+    }
+    // Closed as a turn that ended before them closes its own.
+    updates.extend(calls.iter().map(|id| finished(id, NEVER_RAN, true)));
+    if !conversation.todos.is_empty() {
+        updates.push(plan(&conversation.todos));
+    }
+    updates
+}
+
+/// A message of the user's as they typed it, as the terminal puts one back:
+/// `/init`, a saved workflow's command and `@` references as written, and a
+/// chat app's quoting without its fence.
+fn typed(content: &str) -> String {
+    let content = letronna_core::references::typed(content);
+    let typed = letronna_core::init::typed(content).map(str::to_owned);
+    typed
+        .or_else(|| letronna_core::workflow::saved::typed(content))
+        .unwrap_or_else(|| untrusted::shown("", content).0)
 }
 
 /// A prompt's content blocks as the text of one message: words as they
@@ -712,12 +1066,18 @@ mod tests {
 
     /// A provider that answers one request with each of `replies` in turn.
     fn provider(replies: Vec<String>) -> String {
+        listening(replies).0
+    }
+
+    /// `provider`, handing on the body of each request it answers.
+    fn listening(replies: Vec<String>) -> (String, mpsc::Receiver<Value>) {
         let server = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}/v1", server.local_addr().unwrap());
+        let (heard, bodies) = mpsc::channel();
         std::thread::spawn(move || {
             for reply in replies {
                 let (mut socket, _) = server.accept().unwrap();
-                request(&mut socket);
+                let _ = heard.send(request(&mut socket));
                 let _ = write!(
                     socket,
                     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
@@ -725,7 +1085,7 @@ mod tests {
                 );
             }
         });
-        endpoint
+        (endpoint, bodies)
     }
 
     /// A streamed reply that says `text` in two pieces and makes `calls`.
@@ -867,30 +1227,59 @@ mod tests {
         }
     }
 
-    /// Opens sessions numbered from `first`, each asking the provider at
-    /// `endpoint` and written into the folder it works in.
-    fn opener(endpoint: String, first: u64) -> Open {
-        let mut next = first;
-        Box::new(move |cwd| {
-            let id = next;
-            next += 1;
-            let connection = Connection {
-                endpoint: endpoint.clone(),
-                model: "test-model".into(),
-                tools: true,
+    /// Sessions that ask the provider at `endpoint`, new ones numbered from
+    /// `next` and written into the folder each works in.
+    struct Test {
+        endpoint: String,
+        next: u64,
+    }
+
+    impl Home for Test {
+        fn start(&mut self, cwd: &Path) -> Result<(Connection, Transcript), String> {
+            let id = self.next;
+            self.next += 1;
+            let mut conversation = Conversation {
+                id,
                 workspace: Some(cwd.to_owned()),
-                conversation: id,
                 ..Default::default()
             };
-            let transcript = Transcript {
-                path: cwd.join(".session.jsonl"),
-                conversation: Conversation {
-                    id,
-                    workspace: Some(cwd.to_owned()),
-                    ..Default::default()
-                },
-            };
-            Ok((connection, transcript))
+            let connection = self.connect(&mut conversation)?;
+            let path = cwd.join(".session.jsonl");
+            Ok((connection, Transcript { path, conversation }))
+        }
+
+        fn connect(&mut self, conversation: &mut Conversation) -> Result<Connection, String> {
+            // Held to a model, as the runner holds a session.
+            let model = (conversation.model)
+                .get_or_insert_with(|| "test-model".into())
+                .clone();
+            conversation.gateway.get_or_insert_with(|| "Custom".into());
+            Ok(Connection {
+                endpoint: self.endpoint.clone(),
+                model,
+                tools: true,
+                workspace: conversation.workspace.clone(),
+                conversation: conversation.id,
+                ..Default::default()
+            })
+        }
+
+        fn models(&self) -> Box<dyn FnOnce() -> Vec<(String, String)> + Send> {
+            Box::new(|| {
+                vec![
+                    ("Custom".into(), "test-model".into()),
+                    ("Custom".into(), "other-model".into()),
+                ]
+            })
+        }
+    }
+
+    /// Opens sessions numbered from `first`, each asking the provider at
+    /// `endpoint` and written into the folder it works in.
+    fn opener(endpoint: String, first: u64) -> Box<dyn Home> {
+        Box::new(Test {
+            endpoint,
+            next: first,
         })
     }
 
@@ -1226,6 +1615,242 @@ mod tests {
             text.contains("https://example.com/\n<untrusted-content-"),
             "{text}"
         );
+    }
+
+    /// Saves session `id`, on the model "old-model" and working in `dir`,
+    /// into the data folder the editor's agent reads, saying `messages`.
+    fn saved(id: u64, dir: &Path, updated: u64, messages: Vec<Message>) {
+        std::fs::create_dir_all(store::sessions_dir()).unwrap();
+        let path = store::sessions_dir().join(format!("{id}.jsonl"));
+        let _ = std::fs::remove_file(&path);
+        let conversation = Conversation {
+            id,
+            title: format!("Session {id}"),
+            updated,
+            workspace: Some(dir.to_owned()),
+            gateway: Some("Custom".into()),
+            model: Some("old-model".into()),
+            messages,
+            ..Default::default()
+        };
+        Transcript { path, conversation }.save().unwrap();
+    }
+
+    fn said(role: &str, content: &str) -> Message {
+        Message {
+            role: role.into(),
+            content: content.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn load_replays_a_session_before_replying() {
+        let dir = scratch("load");
+        let (endpoint, heard) = listening(vec![reply("Still fixed.", &[])]);
+        let mut editor = Editor::connect(endpoint, SESSIONS + 130);
+        let id = SESSIONS + 130;
+        let call = ToolCall {
+            id: "call-0".into(),
+            name: "read_file".into(),
+            arguments: json!({"path": "main.rs"}).to_string(),
+        };
+        let notice = Message {
+            notice: true,
+            ..said("user", "A job ended.")
+        };
+        let result = Message {
+            tool_call_id: "call-0".into(),
+            name: "read_file".into(),
+            ..said("tool", "fn main() {}")
+        };
+        let messages = vec![
+            said("user", "Fix the bug."),
+            Message {
+                tool_calls: vec![call],
+                ..said("assistant", "Looking.")
+            },
+            result,
+            notice,
+            said("assistant", "Fixed it."),
+        ];
+        saved(id, &dir, 100, messages);
+
+        let other = scratch("load-other");
+        let elsewhere = editor.ask(
+            "session/load",
+            json!({"sessionId": id.to_string(), "cwd": other, "mcpServers": []}),
+        );
+        let (_, refused) = editor.reply(elsewhere);
+        assert_eq!(refused["error"]["code"], INVALID_PARAMS);
+
+        let load = editor.ask(
+            "session/load",
+            json!({"sessionId": id.to_string(), "cwd": dir, "mcpServers": []}),
+        );
+        let (told, loaded) = editor.reply(load);
+        let told: Vec<&Value> = told
+            .iter()
+            .map(|frame| &frame["params"]["update"])
+            .collect();
+        let kinds: Vec<&str> = told
+            .iter()
+            .map(|update| update["sessionUpdate"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "user_message_chunk",
+                "agent_message_chunk",
+                "tool_call",
+                "tool_call_update",
+                "agent_message_chunk"
+            ]
+        );
+        assert_eq!(told[0]["content"]["text"], "Fix the bug.");
+        assert_eq!(told[2]["toolCallId"], "call-0");
+        assert_eq!(told[3]["status"], "completed");
+        assert_eq!(told[3]["content"][0]["content"]["text"], "fn main() {}");
+        assert_eq!(told[4]["content"]["text"], "Fixed it.");
+        let model = &loaded["result"]["configOptions"][0];
+        assert_eq!(model["category"], "model");
+        assert_eq!(model["currentValue"], "Custom:old-model");
+
+        // The session carries on where it was, on its own model.
+        let prompt = start(&mut editor, &id.to_string(), "Is it still fixed?");
+        let (_, ended) = editor.reply(prompt);
+        assert_eq!(ended["result"]["stopReason"], "end_turn");
+        let asked = heard.recv_timeout(WAIT).unwrap();
+        assert_eq!(asked["model"], "old-model");
+        assert!(asked["messages"].to_string().contains("Fix the bug."));
+        assert_eq!(store::saved(id).unwrap().messages.len(), 7);
+    }
+
+    #[test]
+    fn list_filters_by_working_folder() {
+        let (here, there) = (scratch("list-here"), scratch("list-there"));
+        let mut editor = Editor::connect(provider(Vec::new()), SESSIONS + 140);
+        let first = SESSIONS + 140;
+        saved(first, &here, 100, vec![said("user", "First.")]);
+        saved(first + 1, &here, 200, vec![said("user", "Second.")]);
+        saved(first + 2, &there, 300, vec![said("user", "Elsewhere.")]);
+        // Nothing said, so nothing to reopen.
+        saved(first + 3, &here, 400, Vec::new());
+
+        let initialize = editor.ask("initialize", json!({"protocolVersion": 1}));
+        let (_, initialized) = editor.reply(initialize);
+        let can = &initialized["result"]["agentCapabilities"];
+        assert_eq!(can["loadSession"], true);
+        assert!(can["sessionCapabilities"]["list"].is_object());
+
+        let list = editor.ask("session/list", json!({"cwd": here}));
+        let (_, listed) = editor.reply(list);
+        let sessions = listed["result"]["sessions"].as_array().unwrap();
+        let ids: Vec<&str> = sessions
+            .iter()
+            .map(|session| session["sessionId"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, [(first + 1).to_string(), first.to_string()]);
+        assert_eq!(sessions[0]["cwd"], here.display().to_string());
+        assert_eq!(sessions[0]["title"], format!("Session {}", first + 1));
+        assert_eq!(sessions[0]["updatedAt"], "1970-01-01T00:03:20Z");
+        assert!(listed["result"].get("nextCursor").is_none());
+
+        // A full page says where the next starts, which holds the rest.
+        let (page_one, next) = page(store::summaries(), Some(&here), None, 1);
+        assert_eq!(page_one[0].id, first + 1);
+        let (page_two, last) = page(store::summaries(), Some(&here), next, 1);
+        assert_eq!(page_two[0].id, first);
+        assert_eq!(last, None);
+        let bad = editor.ask("session/list", json!({"cursor": "somewhere"}));
+        let (_, refused) = editor.reply(bad);
+        assert_eq!(refused["error"]["code"], INVALID_PARAMS);
+    }
+
+    /// Asks for session `session` to be put on `value` and gives the request's id.
+    fn pick_model(editor: &mut Editor, session: &str, value: &str) -> u64 {
+        editor.ask(
+            "session/set_config_option",
+            json!({"sessionId": session, "configId": "model", "value": value}),
+        )
+    }
+
+    #[test]
+    fn a_model_switch_mid_turn_is_refused() {
+        let dir = scratch("switch");
+        let (endpoint, heard) = listening(vec![
+            reply("", &[write("held.txt")]),
+            reply("Left it.", &[]),
+            reply("On the other model.", &[]),
+        ]);
+        let mut editor = Editor::connect(endpoint, SESSIONS + 150);
+        let session = editor.open(&dir);
+        // The gateways' models follow the reply that opened the session.
+        let (_, offered) = editor
+            .until(|frame| frame["params"]["update"]["sessionUpdate"] == "config_option_update");
+        let values: Vec<&str> = offered["params"]["update"]["configOptions"][0]["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|option| option["value"].as_str().unwrap())
+            .collect();
+        assert_eq!(values, ["Custom:other-model", "Custom:test-model"]);
+
+        let prompt = start(&mut editor, &session, "Write a file.");
+        let (_, asked) = editor.until(is_permission);
+        let during = pick_model(&mut editor, &session, "Custom:other-model");
+        let (_, refused) = editor.reply(during);
+        assert_eq!(refused["error"]["code"], INVALID_REQUEST);
+        choose(&editor, &asked, "reject-once");
+        let (_, ended) = editor.reply(prompt);
+        assert_eq!(ended["result"]["stopReason"], "end_turn");
+
+        let between = pick_model(&mut editor, &session, "Custom:other-model");
+        let (_, switched) = editor.reply(between);
+        let model = &switched["result"]["configOptions"][0];
+        assert_eq!(model["currentValue"], "Custom:other-model");
+        let again = start(&mut editor, &session, "Carry on.");
+        let (_, ended) = editor.reply(again);
+        assert_eq!(ended["result"]["stopReason"], "end_turn");
+        let models: Vec<Value> = (0..3)
+            .map(|_| heard.recv_timeout(WAIT).unwrap()["model"].clone())
+            .collect();
+        assert_eq!(models, ["test-model", "test-model", "other-model"]);
+    }
+
+    #[test]
+    fn an_editor_session_is_held_to_its_model_and_reopens_on_it() {
+        let _serving = lock(&SERVING);
+        let data = std::env::temp_dir().join(format!("letronna-acp-{}-data", std::process::id()));
+        // Only this module's tests look here, and all of them set the same.
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &data) };
+        let mut runner = Runner {
+            store: Default::default(),
+            allowed: Default::default(),
+            mode: Mode::Default,
+            human: false,
+            helpers_answered: false,
+            trouble: None,
+            bar: crate::bar::Bar::new(String::new()),
+            stopped: false,
+            images: Vec::new(),
+            notices: letronna_core::notify::Notices::new(Box::new(crate::notify::Silent)),
+            ended: None,
+            voice: None,
+            review: Default::default(),
+        };
+        runner.store.settings.gateway = "Ollama".into();
+        runner.store.settings.model = "test-model".into();
+        let (_, transcript) = open_session(&mut runner, &scratch("held")).unwrap();
+        let _ = std::fs::remove_file(&transcript.path);
+        assert_eq!(transcript.conversation.model.as_deref(), Some("test-model"));
+
+        // New sessions move on to another model; the one saved stays.
+        runner.store.settings.model = "newer-model".into();
+        let mut reopened = transcript.conversation;
+        let connection = runner.connect(&mut reopened).unwrap();
+        assert_eq!(connection.model, "test-model");
+        assert!(connection.human);
     }
 
     #[test]
