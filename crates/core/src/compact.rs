@@ -868,7 +868,7 @@ fn jobs(messages: &[Message]) -> Vec<String> {
         .filter(|(_, call)| call.name == "run_command")
         .filter_map(|(at, call)| {
             let args = crate::tools::parse_args_for(&call.name, &call.arguments).ok()?;
-            if !args["background"].as_bool().unwrap_or(false) {
+            if !crate::tools::backgrounded(&args) {
                 return None;
             }
             let command = line(args["command"].as_str()?);

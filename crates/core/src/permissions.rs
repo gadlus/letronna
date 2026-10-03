@@ -192,12 +192,15 @@ pub fn check(rules: &[Rule], tool: &dyn Tool, args: &Value, ctx: &ToolContext) -
 /// Whether `rule` holds for a call of the tool `name`: its own rules, and for
 /// `apply_patch` the deny and ask rules of write_file and edit_file too, or a
 /// patch would get around them. Their allow rules stay theirs, since a patch
-/// can reach further than the one file they were given for.
+/// can reach further than the one file they were given for. So too for
+/// send_job and run_command's, as a line typed into a shell runs as one.
 fn holds_for(rule: &Rule, name: &str) -> bool {
-    rule.tool == name
-        || (name == crate::patch::APPLY_PATCH
-            && rule.effect != Effect::Allow
-            && matches!(rule.tool.as_str(), "write_file" | "edit_file"))
+    let borrowed = match name {
+        crate::patch::APPLY_PATCH => matches!(rule.tool.as_str(), "write_file" | "edit_file"),
+        "send_job" => rule.tool == "run_command",
+        _ => false,
+    };
+    rule.tool == name || (borrowed && rule.effect != Effect::Allow)
 }
 
 /// The deny and ask rules in `<workspace>/.letronna/permissions.json`, each
@@ -447,10 +450,19 @@ fn has_path(tool: &dyn Tool) -> bool {
 
 /// What rule patterns are matched against in the call of `tool` with `args`.
 fn target(tool: &dyn Tool, args: &Value, ctx: &ToolContext) -> Target {
+    let dir = ctx.workspace.as_deref();
     if tool.name() == "run_command" {
         let line = args["command"].as_str().unwrap_or_default();
-        let line = command::assess(line, Dialect::here(), ctx.workspace.as_deref());
+        let line = command::assess(line, Dialect::here(), dir);
         return Target::Commands(line.commands);
+    }
+    // Each line the typing could run, the whole of one typed in parts too.
+    if tool.name() == "send_job" {
+        let lines = crate::tools::typed(args, ctx).lines;
+        let commands = (lines.iter())
+            .flat_map(|line| command::assess(line, Dialect::here(), dir).commands)
+            .collect();
+        return Target::Commands(commands);
     }
     if tool.name() == crate::computer::COMPUTER {
         return Target::App(crate::computer::rule_names(args));

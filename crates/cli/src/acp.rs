@@ -954,7 +954,7 @@ fn kind(name: &str) -> &'static str {
     match name {
         "read_file" | "list_dir" | "read_job" | "list_sessions" => "read",
         "write_file" | "edit_file" => "edit",
-        "run_command" | "stop_job" => "execute",
+        "run_command" | "stop_job" | "send_job" => "execute",
         "search" | "search_sessions" | "search_web" => "search",
         "browse" | "use_page" | "fetch" => "fetch",
         tools::TODO => "think",
