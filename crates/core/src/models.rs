@@ -157,6 +157,18 @@ fn known() -> &'static Mutex<Known> {
 
 /// What is known about `model` at `endpoint`, put together from memory.
 pub fn facts(endpoint: &str, model: &str) -> Facts {
+    facts_or(endpoint, model, None, None)
+}
+
+/// What is known about `model` at `endpoint`, with `window` and `output`
+/// standing in for limits neither its list nor its family gives, which a
+/// limit learned from an error still lowers.
+pub(crate) fn facts_or(
+    endpoint: &str,
+    model: &str,
+    window: Option<u64>,
+    output: Option<u64>,
+) -> Facts {
     let key = (host(endpoint), model.to_owned());
     let (listed, learned) = known()
         .lock()
@@ -169,8 +181,14 @@ pub fn facts(endpoint: &str, model: &str) -> Facts {
         .unwrap_or_default();
     let family = family(model);
     Facts {
-        context: lowest(listed.context.or(family.context), learned.context),
-        max_output: lowest(listed.max_output.or(family.max_output), learned.max_output),
+        context: lowest(
+            listed.context.or(family.context).or(window),
+            learned.context,
+        ),
+        max_output: lowest(
+            listed.max_output.or(family.max_output).or(output),
+            learned.max_output,
+        ),
         inputs: listed.inputs,
         parameters: listed.parameters,
         efforts: listed.efforts,
