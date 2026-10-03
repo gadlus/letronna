@@ -371,6 +371,19 @@ pub struct Settings {
     /// terminal saves over it.
     #[serde(default)]
     pub context_cap: u64,
+    /// The window, in tokens, assumed for a model whose list and family say
+    /// nothing of one, such as a model behind vLLM or a LiteLLM proxy; 0
+    /// keeps the small window of 6,000, a limit an error gives away still
+    /// lowers it, and `LETRONNA_CONTEXT_WINDOW` sets it for one run. Edited
+    /// by hand with Letronna closed, as `context_cap` is.
+    #[serde(default)]
+    pub context_window: u64,
+    /// The longest reply, in tokens, asked of a model whose output limit is
+    /// not known; 0 keeps the usual 8,192, which is also the most it gets
+    /// while its window is not known or set, and `LETRONNA_MAX_OUTPUT` sets
+    /// it for one run. Edited by hand with Letronna closed.
+    #[serde(default)]
+    pub max_output: u64,
     /// The model helpers use when neither the call nor their type names one;
     /// empty for the model of the agent that starts them.
     #[serde(default)]
@@ -451,6 +464,8 @@ impl Default for Settings {
             endpoint: String::new(),
             model: String::new(),
             context_cap: 0,
+            context_window: 0,
+            max_output: 0,
             helper_model: String::new(),
             helpers_at_once: 0,
             helper_depth: 0,
@@ -3037,9 +3052,39 @@ pub(crate) fn current_settings() -> Settings {
     settings().0
 }
 
-/// The context cap the settings file sets, 0 for the default.
-pub(crate) fn context_cap() -> u64 {
-    settings().0.context_cap
+/// What sizes a request beyond the model's own limits, in tokens.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Sizing {
+    /// The context cap, 0 for the default.
+    pub cap: u64,
+    /// The window assumed for a model whose own is not known.
+    pub window: Option<u64>,
+    /// The output limit assumed for a model whose own is not known.
+    pub output: Option<u64>,
+}
+
+/// The sizing the settings file sets, with `LETRONNA_CONTEXT_WINDOW` and
+/// `LETRONNA_MAX_OUTPUT` in place of its window and output limit.
+pub(crate) fn sizing() -> Sizing {
+    let settings = settings().0;
+    let set = |tokens: u64| Some(tokens).filter(|&tokens| tokens > 0);
+    Sizing {
+        cap: settings.context_cap,
+        window: set(overridden(
+            settings.context_window,
+            "LETRONNA_CONTEXT_WINDOW",
+        )),
+        output: set(overridden(settings.max_output, "LETRONNA_MAX_OUTPUT")),
+    }
+}
+
+/// The number of tokens the environment variable `name` holds, or `saved`
+/// when it holds none; a 0 there unsets the saved one for the run.
+fn overridden(saved: u64, name: &str) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(saved)
 }
 
 /// The tools the settings file switches off, read again each time so a hand
@@ -7506,5 +7551,25 @@ pub(crate) mod tests {
         names.sort();
         assert_eq!(names, ["1.jsonl", "1.lock", "1.terms"]);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_number_in_the_environment_stands_in_for_a_saved_size() {
+        let saved =
+            br#"{"endpoint": "", "model": "", "context_window": 65536, "max_output": 16384}"#;
+        let saved = super::read_settings(saved).unwrap();
+        assert_eq!((saved.context_window, saved.max_output), (65_536, 16_384));
+        // A name no other test reads, so setting it races nothing.
+        let name = "LETRONNA_TEST_SIZE";
+        assert_eq!(super::overridden(65_536, name), 65_536);
+        unsafe { std::env::set_var(name, " 131072 ") };
+        assert_eq!(super::overridden(65_536, name), 131_072);
+        // A 0 unsets the saved size for the run, and what is no number is
+        // passed over.
+        unsafe { std::env::set_var(name, "0") };
+        assert_eq!(super::overridden(65_536, name), 0);
+        unsafe { std::env::set_var(name, "128k") };
+        assert_eq!(super::overridden(65_536, name), 65_536);
+        unsafe { std::env::remove_var(name) };
     }
 }

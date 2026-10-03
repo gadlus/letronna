@@ -83,6 +83,8 @@ The Letronna gateway's address follows `LETRONNA_API`, for working against a loc
 
 Model lists come from `GET {base}/models`. Streaming uses SSE chat completions.
 
+A model whose list says nothing of its limits and that Letronna does not know, as behind vLLM or a LiteLLM proxy, gets 6,000 tokens of the conversation and replies of 8,192. `"context_window"` and `"max_output"` in `settings.json`, set with Letronna closed, or `LETRONNA_CONTEXT_WINDOW` and `LETRONNA_MAX_OUTPUT` for one run, give it its real ones; a limit the provider's error names still lowers them.
+
 ## Web search
 
 The Web toggle is the gateway's own search, and only some gateways have one. A search service of your own works with any of them: set one up in Settings under Search, or with `/search services` in the terminal, and the agent gets a `search_web` tool that asks before each search.

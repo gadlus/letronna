@@ -583,11 +583,17 @@ impl Budget {
 }
 
 /// The budget for the next request over `connection`: its model's window as
-/// far as it is known, the user's cap of `cap` tokens (0 for the default),
-/// and what the system prompt, the tools and subfolders' instructions take.
-fn budget(connection: &Connection, cap: u64) -> Budget {
-    let facts = crate::models::facts(&connection.endpoint, connection.model.trim());
-    let cap = match cap {
+/// far as it is known or `sizing` assumes it, the user's cap (0 for the
+/// default), and what the system prompt, the tools and subfolders'
+/// instructions take.
+fn budget(connection: &Connection, sizing: crate::store::Sizing) -> Budget {
+    let facts = crate::models::facts_or(
+        &connection.endpoint,
+        connection.model.trim(),
+        sizing.window,
+        sizing.output,
+    );
+    let cap = match sizing.cap {
         0 => CAP_TOKENS,
         cap => cap as usize,
     };
@@ -666,7 +672,7 @@ fn context_parts(connection: &Connection, messages: &[Message], floor: usize) ->
     } else {
         (0, 0)
     };
-    let request_budget = budget(connection, crate::store::context_cap());
+    let request_budget = budget(connection, crate::store::sizing());
     let start = window_from(messages, &request_budget, floor);
     let sums = token_sums(&messages[start..], request_budget.tool_chars);
     let conversation = *sums.last().unwrap_or(&0) as u64;
@@ -2288,7 +2294,7 @@ fn begin(
     extra: Extra,
     ahead: bool,
 ) -> async_channel::Receiver<Event> {
-    let budget = budget(&connection, crate::store::context_cap());
+    let budget = budget(&connection, crate::store::sizing());
     // Before the reply exists, so every call it makes is stamped with it.
     let window = window_from(&messages, &budget, extra.floor);
     crate::filestate::asked(connection.conversation, messages.len(), window);
@@ -2378,7 +2384,7 @@ fn budget_for(connection: &Connection, primary: &Connection, own: Budget) -> Bud
     if connection.endpoint == primary.endpoint && connection.model == primary.model {
         return own;
     }
-    budget(connection, crate::store::context_cap())
+    budget(connection, crate::store::sizing())
 }
 
 /// The place claimed for the summary of what the window drops at its next
@@ -2474,7 +2480,7 @@ pub fn compact(
         return Err("Nothing to summarize: no turn comes before it.".into());
     }
     validate(connection)?;
-    let budget = budget(connection, crate::store::context_cap());
+    let budget = budget(connection, crate::store::sizing());
     let start = window_from(messages, &budget, floor);
     if end <= start {
         return Err("Nothing to summarize: the turns before it are summarized already.".into());
@@ -2556,7 +2562,7 @@ fn refit(connection: &Connection, failure: &Failure, sent: &Budget) -> Option<Bu
     }
     let mut next = Budget {
         squeezed: true,
-        ..budget(connection, crate::store::context_cap())
+        ..budget(connection, crate::store::sizing())
     };
     let left = overflow
         .context
@@ -3153,6 +3159,7 @@ impl Reply {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::Sizing;
     fn connection() -> Connection {
         Connection {
             endpoint: "http://localhost:11434/v1/".into(),
@@ -6478,7 +6485,7 @@ mod tests {
         );
         assert_eq!(sized(Some(200_000), None, 1_000, 2_000), Budget::SMALL);
         // Ollama's list says nothing and its models are in no table.
-        assert_eq!(budget(&connection(), 0), Budget::SMALL);
+        assert_eq!(budget(&connection(), Sizing::default()), Budget::SMALL);
     }
 
     #[test]
@@ -6490,12 +6497,80 @@ mod tests {
         };
         // The family table's output limit, and its window under the default
         // cap less what the prompt takes.
-        let default = budget(&gpt, 0);
+        let default = budget(&gpt, Sizing::default());
         assert_eq!(default.reply, 16_384);
         assert_eq!(default.step, CAP_TOKENS / 2);
         assert!(default.tokens < CAP_TOKENS, "{default:?}");
         // Or under the user's own cap.
-        assert_eq!(budget(&gpt, 20_000).step, 10_000);
+        let capped = Sizing {
+            cap: 20_000,
+            ..Sizing::default()
+        };
+        assert_eq!(budget(&gpt, capped).step, 10_000);
+    }
+
+    #[test]
+    fn a_window_set_in_settings_sizes_an_unknown_model() {
+        // A model behind a proxy whose list names it and says nothing more.
+        let model = |name: &str| Connection {
+            endpoint: "https://assumed.test/v1".into(),
+            model: name.into(),
+            ..connection()
+        };
+        let proxied = model("qwen3.6-plus");
+        assert_eq!(budget(&proxied, Sizing::default()), Budget::SMALL);
+        let set = Sizing {
+            window: Some(131_072),
+            output: Some(32_768),
+            ..Sizing::default()
+        };
+        // Sized as a listed window would be, under the default cap.
+        let sized_up = budget(&proxied, set);
+        assert_eq!(sized_up.reply, MAX_REPLY_TOKENS);
+        assert_eq!(
+            sized_up.messages,
+            MAX_MESSAGES * CAP_TOKENS / CONTEXT_TOKENS
+        );
+        assert!(sized_up.tokens > 4 * CONTEXT_TOKENS, "{sized_up:?}");
+        // An output limit without a window asks for no longer a reply than
+        // every model is asked for, which the window may not hold.
+        let output_only = Sizing {
+            output: Some(32_768),
+            ..Sizing::default()
+        };
+        assert_eq!(budget(&proxied, output_only), Budget::SMALL);
+        // A model whose family is known keeps its own limits, and one whose
+        // list gives its window alone takes the set output limit.
+        let gpt = model("gpt-4o");
+        assert_eq!(budget(&gpt, set), budget(&gpt, Sizing::default()));
+        let entry = serde_json::json!({"id": "lists-its-window", "context_length": 200_000});
+        crate::models::remember(&proxied.endpoint, &[entry]);
+        let listed = model("lists-its-window");
+        assert_eq!(budget(&listed, Sizing::default()).reply, REPLY_TOKENS);
+        assert_eq!(budget(&listed, set).reply, MAX_REPLY_TOKENS);
+    }
+
+    #[test]
+    fn a_learned_overflow_still_lowers_a_set_window() {
+        // A reply of a quarter of the window at most shows which one counts.
+        let set = Sizing {
+            window: Some(40_000),
+            output: Some(32_768),
+            ..Sizing::default()
+        };
+        let endpoint = "https://lowered.test/v1";
+        let model = |name: &str| Connection {
+            endpoint: endpoint.into(),
+            model: name.into(),
+            ..connection()
+        };
+        assert_eq!(budget(&model("glm-5.1"), set).reply, 10_000);
+        crate::models::learn(endpoint, "glm-5.1", Limit::Context(20_000));
+        assert_eq!(budget(&model("glm-5.1"), set).reply, 5_000);
+        // An error that names a bigger window than the one set does not
+        // raise it.
+        crate::models::learn(endpoint, "kimi-k2.5", Limit::Context(60_000));
+        assert_eq!(budget(&model("kimi-k2.5"), set).reply, 10_000);
     }
 
     #[test]
@@ -7278,7 +7353,7 @@ mod tests {
         // are sized by it: a reply of a quarter of the window at most.
         let facts = crate::models::facts(&endpoint, "names-its-limit");
         assert_eq!(facts.context, Some(16_000));
-        assert_eq!(budget(&c, 0).reply, 4_000);
+        assert_eq!(budget(&c, Sizing::default()).reply, 4_000);
         // Sent again sized by it, with all but the newest five results cleared.
         assert_eq!(cleared_and_asked(&bodies[0]), (0, 8_192));
         assert_eq!(cleared_and_asked(&bodies[1]), (7, 4_000));
@@ -7351,12 +7426,12 @@ mod tests {
         let failure = classify(Some(400), &reqwest::header::HeaderMap::new(), &body);
         let sent = Budget {
             reply: 21_333,
-            ..budget(&c, 0)
+            ..budget(&c, Sizing::default())
         };
         let next = refit(&c, &failure, &sent).unwrap();
         // The window stays as it was; only the reply is cut.
         assert_eq!(next.reply, 4_000);
-        assert_eq!(next.tokens, budget(&c, 0).tokens);
+        assert_eq!(next.tokens, budget(&c, Sizing::default()).tokens);
         assert!(next.squeezed);
         // Once squeezed, a request is not sent again.
         assert!(refit(&c, &failure, &next).is_none());
@@ -7443,13 +7518,13 @@ mod tests {
         assert!(failure.to_string().contains("rewind"), "{failure}");
         // Only the first went out; the next is refused before it is sent.
         assert_eq!(worker.join().unwrap().len(), 1);
-        assert!(doomed(&c, &long, &budget(&c, 0)).is_some());
+        assert!(doomed(&c, &long, &budget(&c, Sizing::default())).is_some());
         let short = [Message {
             role: "user".into(),
             content: "Hi".into(),
             ..Default::default()
         }];
-        assert!(doomed(&c, &short, &budget(&c, 0)).is_none());
+        assert!(doomed(&c, &short, &budget(&c, Sizing::default())).is_none());
     }
 
     /// The reply a turn keeps from `stream`, sent by a provider serving
