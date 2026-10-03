@@ -7,6 +7,7 @@ use letronna_core::chat::{self, Connection, Message};
 use letronna_core::fallback::Fallback;
 use letronna_core::gate::Mode;
 use letronna_core::inbox::{self, Notice, When};
+use letronna_core::memory::{Saving, Scope};
 use letronna_core::skills::{Skill, Source};
 use letronna_core::slash::{self, Origin};
 use letronna_core::tools::{Tool, ToolContext};
@@ -258,8 +259,17 @@ pub fn command(
             } else {
                 "Memory reviews off.".into()
             }));
+            // Otherwise each save is the user's to ask for or say yes to.
+            let saving = runner.store.memory_saving(*session);
+            if on && saving != Saving::Auto {
+                render::line(&render::dim(&format!(
+                    "They run only while memory is saved Automatically; this chat saves {}. /remember changes that.",
+                    saving.label().to_lowercase()
+                )));
+            }
             Flow::Handled
         }
+        "/remember" => remember(runner, *session, rest),
         "/jobs" => {
             jobs(runner, rest);
             Flow::Handled
@@ -2366,6 +2376,123 @@ fn pick_mode(runner: &mut Runner) -> Option<&'static str> {
     Mode::OFFERED.get(picked).map(|mode| mode.name())
 }
 
+/// `/remember`: with words, a turn asking the model to keep them, in the
+/// project's memory or this chat's notes after `--project` or `--chat`;
+/// bare, when this chat saves memory and where it keeps it, picked from a
+/// list on a keyboard.
+fn remember(runner: &mut Runner, session: usize, rest: &str) -> Flow {
+    let (flag, words) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    let (place, text) = match flag {
+        "--project" => (Some("for this project"), words.trim()),
+        "--chat" => (Some("for this chat only"), words.trim()),
+        _ => (None, rest),
+    };
+    // Asked in the user's own words, so the turn counts as asking whatever
+    // the chat chose, and a place named there holds for this save.
+    if !text.is_empty() {
+        return Flow::Send(format!("Remember {}: {text}", place.unwrap_or("this")));
+    }
+    render::blank();
+    if place.is_some() {
+        render::line(&render::red(&format!("Say what to remember after {flag}.")));
+        return Flow::Handled;
+    }
+    if runner.bar.steered() {
+        pick_remembering(runner, session);
+    }
+    let workspace = runner.store.conversations[session].workspace.is_some();
+    let (saving, scope) = (
+        runner.store.memory_saving(session),
+        runner.store.memory_scope(session),
+    );
+    render::line(&render::dim(&format!(
+        "This chat saves to memory {}, and keeps it {}.",
+        saving.label().to_lowercase(),
+        scope.label().to_lowercase()
+    )));
+    if scope == Scope::Project && !workspace {
+        render::line(&render::dim(
+            "With no project folder attached, that is this chat's own notes.",
+        ));
+    }
+    if !runner.bar.steered() {
+        render::line(&render::dim(
+            "/remember <text> keeps something; --project or --chat before it keeps it there.",
+        ));
+    }
+    Flow::Handled
+}
+
+/// Offers when this chat saves memory and where it keeps it, with the
+/// chat's own choices marked, and does what was picked.
+fn pick_remembering(runner: &mut Runner, session: usize) {
+    /// What a row of the list does.
+    enum Row {
+        Private,
+        Save(Option<Saving>),
+        Keep(Option<Scope>),
+        MakeDefault,
+    }
+    let conversation = &runner.store.conversations[session];
+    let (own_saving, own_scope) = (conversation.memory_saving, conversation.memory_scope);
+    let settings = &runner.store.settings;
+    let marked = |text: String, chosen: bool| {
+        if chosen {
+            format!("{text}  (in use)")
+        } else {
+            text
+        }
+    };
+    let mut rows = vec![(
+        Row::Private,
+        "Private chat  ·  only this chat's own notes, saved when you ask".to_owned(),
+    )];
+    for saving in Saving::OFFERED {
+        let label = marked(
+            format!("Save: {}", saving.label()),
+            own_saving == Some(saving),
+        );
+        rows.push((Row::Save(Some(saving)), label));
+    }
+    let default = format!("Save: use my default ({})", settings.memory_saving.label());
+    rows.push((Row::Save(None), marked(default, own_saving.is_none())));
+    for scope in Scope::OFFERED {
+        let label = marked(
+            format!("Keep in: {}", scope.label()),
+            own_scope == Some(scope),
+        );
+        rows.push((Row::Keep(Some(scope)), label));
+    }
+    let default = format!(
+        "Keep in: use my default ({})",
+        settings.memory_scope.label()
+    );
+    rows.push((Row::Keep(None), marked(default, own_scope.is_none())));
+    rows.push((
+        Row::MakeDefault,
+        "Make this chat's choices the default for new chats".to_owned(),
+    ));
+    let mut options: Vec<&str> = rows.iter().map(|(_, label)| label.as_str()).collect();
+    options.push("Leave them as they are");
+    let picked = runner.bar.pick_from("Remember me", Vec::new(), &options);
+    let Some((row, _)) = picked.and_then(|at| rows.get(at)) else {
+        render::line(&render::dim("Left as it was."));
+        return;
+    };
+    let store = &mut runner.store;
+    match row {
+        Row::Private => store.make_private(session),
+        Row::Save(saving) => store.choose_memory_saving(session, *saving),
+        Row::Keep(scope) => store.choose_memory_scope(session, *scope),
+        Row::MakeDefault => {
+            store.settings.memory_saving = store.memory_saving(session);
+            store.settings.memory_scope = store.memory_scope(session);
+            render::line(&render::dim("New chats start with these."));
+        }
+    }
+    runner.persist();
+}
+
 /// A name picked in the box for a command given none, from `rows` of a name
 /// and how it is listed, which typing narrows. `None` when it was turned
 /// down, saying so; the caller asks only on a keyboard and with rows to show.
@@ -4268,5 +4395,45 @@ mod tests {
         assert_eq!(runner.mode, Mode::Auto);
         command(&mut runner, "/mode fast", &mut 0, None);
         assert_eq!(runner.mode, Mode::Auto);
+    }
+
+    #[test]
+    fn slash_remember_with_words_asks_in_them_and_bare_off_a_keyboard_only_says() {
+        let mut runner = Runner {
+            store: Default::default(),
+            allowed: Default::default(),
+            mode: Mode::Default,
+            human: true,
+            helpers_answered: true,
+            trouble: None,
+            bar: crate::bar::Bar::new(String::new()),
+            stopped: false,
+            images: Vec::new(),
+            notices: letronna_core::notify::Notices::new(Box::new(crate::notify::Silent)),
+            ended: None,
+            voice: None,
+            review: Default::default(),
+        };
+        runner.store.conversations.push(Default::default());
+        let sent = |runner: &mut Runner, line: &str| match command(runner, line, &mut 0, None) {
+            Flow::Send(text) => Some(text),
+            _ => None,
+        };
+        assert_eq!(
+            sent(&mut runner, "/remember I use pnpm").as_deref(),
+            Some("Remember this: I use pnpm")
+        );
+        assert_eq!(
+            sent(&mut runner, "/remember --project build with make").as_deref(),
+            Some("Remember for this project: build with make")
+        );
+        assert_eq!(
+            sent(&mut runner, "/remember --chat the flight is at 9").as_deref(),
+            Some("Remember for this chat only: the flight is at 9")
+        );
+        // Nothing to keep after the flag, and nothing chosen with no keyboard.
+        assert_eq!(sent(&mut runner, "/remember --chat"), None);
+        assert_eq!(sent(&mut runner, "/remember"), None);
+        assert_eq!(runner.store.conversations[0].memory_saving, None);
     }
 }

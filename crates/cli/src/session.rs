@@ -11,6 +11,7 @@ use letronna_core::cancel::Cancel;
 use letronna_core::chat::{self, Connection, Event, Message, ToolCall};
 use letronna_core::gate::{self, Gate, Grants, Layer, Mode, Outcome};
 use letronna_core::inbox;
+use letronna_core::memory::{self, Scope};
 use letronna_core::notify::{self, Why};
 use letronna_core::permissions::Rule;
 use letronna_core::review;
@@ -296,6 +297,7 @@ impl Runner {
     fn run(&mut self, mut connection: Connection, session: usize) -> Result<String, String> {
         // What the user asked for, for the judge that decides its helpers' calls.
         connection.typed = self.typed(session).into();
+        self.hold_memory(session);
         // The review read the conversation as it was; this turn goes first.
         review::stop(&self.review);
         self.bar.show_helpers_of(connection.conversation);
@@ -344,6 +346,14 @@ impl Runner {
             self.look_back(session);
         }
         answer
+    }
+
+    /// Has the session at `session` save and keep memory as it chose, or as
+    /// the settings say, from its next call on.
+    pub fn hold_memory(&self, session: usize) {
+        let conversation = &self.store.conversations[session];
+        memory::choose(conversation.id, conversation.memory_saving);
+        memory::choose_scope(conversation.id, conversation.memory_scope);
     }
 
     /// Call the user back about session `id`, when they have looked away
@@ -711,13 +721,13 @@ impl Runner {
                 }
                 Next::Run(call) if call.name == tools::TODO => self.apply_todo(turn, session, call),
                 Next::Run(call) => {
-                    if !self.run_call(turn, call, false, false, tag) {
+                    if !self.run_call(turn, call, false, false, tag, None) {
                         self.keep_stopped(turn, session);
                         return Ok(false);
                     }
                 }
                 Next::Sandboxed(call) => {
-                    if !self.run_call(turn, call, false, true, tag) {
+                    if !self.run_call(turn, call, false, true, tag, None) {
                         self.keep_stopped(turn, session);
                         return Ok(false);
                     }
@@ -775,8 +785,9 @@ impl Runner {
 
     /// Runs `call` and shows what came of it, with `tag` naming what let it
     /// run; `approved` when the user said yes to it just now, `sandboxed`
-    /// when the gate let it run only inside the OS sandbox. False when the
-    /// user stopped it, which ends the turn.
+    /// when the gate let it run only inside the OS sandbox, and `keep_in`
+    /// where the user chose on its card to keep a memory save. False when
+    /// the user stopped it, which ends the turn.
     fn run_call(
         &mut self,
         turn: &mut Turn,
@@ -784,10 +795,12 @@ impl Runner {
         approved: bool,
         sandboxed: bool,
         tag: Option<String>,
+        keep_in: Option<Scope>,
     ) -> bool {
         let mut ctx = turn.tool_context();
         ctx.approved = approved;
         ctx.sandboxed = sandboxed;
+        ctx.keep_in = keep_in;
         let summary = tools::summary(&call.name, &call.arguments);
         let ran = self.run_off_the_loop(&call, ctx, &summary);
         let stopped = ran.is_none();
@@ -1109,7 +1122,18 @@ impl Runner {
         let here = rule
             .as_ref()
             .map(|rule| format!("Yes, and always allow `{}` here", rule.pattern));
-        let mut choices = vec!["Yes"];
+        // A memory save can be kept somewhere else than its card says it
+        // goes, which is the first place offered.
+        let places = match call.name.as_str() {
+            "memory" => memory::places(&ctx),
+            _ => Vec::new(),
+        };
+        let kept: Vec<&str> = places.iter().map(|place| keep_words(*place)).collect();
+        let mut choices = if kept.is_empty() {
+            vec!["Yes"]
+        } else {
+            kept.clone()
+        };
         // An upload is asked about each time, so there is no stopping that.
         let args = tools::parse_args_for(&call.name, &call.arguments).unwrap_or_default();
         if gate::grants_for_session(&call.name, &args) && !each_time {
@@ -1118,16 +1142,21 @@ impl Runner {
         choices.extend(here.as_deref());
         choices.extend(["No, tell it why not", "No, and stop here"]);
         let picked = self.bar.choose(&question, detail, &choices);
+        let picked = picked.and_then(|at| choices.get(at).copied());
+        if let Some(at) = picked.and_then(|choice| kept.iter().position(|&k| k == choice)) {
+            let place = places[at];
+            return Ok(self.run_call(turn, call, true, false, None, Some(place)));
+        }
 
-        match picked.and_then(|at| choices.get(at).copied()) {
-            Some("Yes") => Ok(self.run_call(turn, call, true, false, None)),
+        match picked {
+            Some("Yes") => Ok(self.run_call(turn, call, true, false, None, None)),
             Some("Yes, and stop asking for this") => {
                 self.allowed
                     .entry(turn.connection.conversation)
                     .or_default()
                     .insert(gate::grant(&call));
                 approvals::allow_for_session(turn.connection.conversation, &call, &ctx);
-                Ok(self.run_call(turn, call, true, false, None))
+                Ok(self.run_call(turn, call, true, false, None, None))
             }
             Some("No, and stop here") | None => Ok(false),
             Some("No, tell it why not") => {
@@ -1147,7 +1176,7 @@ impl Runner {
                 if let Some(Err(error)) = kept {
                     render::line(&render::red(&error));
                 }
-                Ok(self.run_call(turn, call, true, false, None))
+                Ok(self.run_call(turn, call, true, false, None, None))
             }
         }
     }
@@ -1653,7 +1682,17 @@ pub fn intent(name: &str, summary: &str) -> String {
         "run_command" => "run a command".to_owned(),
         "browse" | "use_page" => summary.to_owned(),
         "search_web" => "search the web".to_owned(),
+        "memory" => "change what it remembers".to_owned(),
         other => format!("use {other}"),
+    }
+}
+
+/// The answer on a memory save's card that keeps it in `place`.
+fn keep_words(place: Scope) -> &'static str {
+    match place {
+        Scope::Auto => "Save everywhere",
+        Scope::Project => "Save for this project only",
+        Scope::Chat => "Save for this chat only",
     }
 }
 

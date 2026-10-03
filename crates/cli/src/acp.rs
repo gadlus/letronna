@@ -163,6 +163,8 @@ impl Home for Runner {
         // Held there as the terminal holds a session once it sends, so the
         // editor reopens it on the model it was on.
         self.store.pin(index);
+        // Saving and keeping memory as the session chose, as the terminal does.
+        self.hold_memory(index);
         let mut connection = self.connection(index);
         *conversation = self.store.conversations.remove(index);
         // An editor always has someone to answer its helpers' cards too.
