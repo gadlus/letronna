@@ -2907,9 +2907,15 @@ pub(crate) fn private(path: &Path, data: &Path) -> bool {
 }
 
 /// Folders and files that hold keys, passwords or tokens (package
-/// registries, the GitHub CLI, Docker, Kubernetes, other agents' sign-in),
-/// matched as a run of names anywhere in a path so that a folder covers
-/// everything in it; `_netrc` is what curl and Git read on Windows.
+/// registries, the GitHub CLI, Docker, Kubernetes, the clouds, GnuPG,
+/// Postgres, Vault, other agents' sign-in), matched as a run of names
+/// anywhere in a path so that a folder covers everything in it; `_netrc` is
+/// what curl and Git read on Windows. Each is a store a program keeps in the
+/// home folder, under a name few projects use: `.azure` is one they do, as
+/// the Azure Developer CLI keeps an environment's settings and `.env` there,
+/// out of git, and it is guarded in a project too. A project's own
+/// certificates and keys are not here, and stay as readable as the rest of
+/// the files it is being worked on.
 pub(crate) const SECRETS: &[&str] = &[
     ".ssh",
     ".aws",
@@ -2918,6 +2924,11 @@ pub(crate) const SECRETS: &[&str] = &[
     ".git-credentials",
     ".npmrc",
     ".pypirc",
+    ".gnupg",
+    ".pgpass",
+    ".vault-token",
+    ".azure",
+    ".config/gcloud",
     ".config/gh/hosts.yml",
     ".docker/config.json",
     ".kube/config",
@@ -4895,6 +4906,30 @@ mod tests {
             "1|hello"
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_credential_stores_a_program_keeps_in_the_home_folder_count_as_secret() {
+        for path in [
+            "/home/user_a/.gnupg",
+            "/home/user_a/.gnupg/secring.gpg",
+            "/home/user_a/.pgpass",
+            "/home/user_a/.vault-token",
+            "/home/user_a/.azure/accessTokens.json",
+            "/home/user_a/.config/gcloud/credentials.db",
+            "C:/Users/user_a/.Azure/msal_token_cache.json",
+        ] {
+            assert!(secret(Path::new(path)), "{path}");
+        }
+        // A project's own certificates, keys and state are not a store.
+        for path in [
+            "/home/user_a/code/app/server.pem",
+            "/home/user_a/code/app/test/client.key",
+            "/home/user_a/code/app/terraform.tfstate",
+            "/home/user_a/code/app/config/gcloud/settings.json",
+        ] {
+            assert!(!secret(Path::new(path)), "{path}");
+        }
     }
 
     #[test]
