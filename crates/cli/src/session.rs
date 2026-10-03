@@ -1259,10 +1259,15 @@ impl Runner {
         self.persist();
     }
 
-    /// Start a session, reusing the most recent one when asked to resume.
+    /// Start a session, reusing this folder's most recent one when asked to
+    /// resume.
     pub fn open(&mut self, resume: bool, workspace: Option<std::path::PathBuf>) -> usize {
-        if resume && !self.store.conversations.is_empty() {
-            let last = self.store.conversations.len() - 1;
+        // Only this folder's: the newest anywhere can be another project's,
+        // or another run's that shares the data folder.
+        let newest = workspace
+            .as_deref()
+            .and_then(|folder| newest_in(&self.store.conversations, folder));
+        if resume && let Some(last) = newest {
             self.enter(last);
             return last;
         }
@@ -1319,6 +1324,14 @@ impl Runner {
         self.bar.set_footer(note);
         index
     }
+}
+
+/// Where the newest of `conversations` working in `folder` is, given they are
+/// listed oldest first.
+fn newest_in(conversations: &[Conversation], folder: &std::path::Path) -> Option<usize> {
+    conversations
+        .iter()
+        .rposition(|c| c.workspace.as_deref() == Some(folder))
 }
 
 /// Why a wait on another thread ended with nothing from it.
@@ -2054,6 +2067,59 @@ mod tests {
         }
         // Nothing is left to run or to send back, so no model round follows.
         assert_eq!(turn.next(|_| gate::Outcome::Run), Next::Done);
+    }
+
+    /// Sessions listed oldest first, each in the folder given, or in none,
+    /// with nothing on disk to read.
+    fn listed(folders: &[Option<&str>]) -> Vec<Conversation> {
+        let session = |folder: &Option<&str>| Conversation {
+            workspace: folder.map(std::path::PathBuf::from),
+            ..Default::default()
+        };
+        folders.iter().map(session).collect()
+    }
+
+    #[test]
+    fn continue_opens_the_newest_session_of_this_folder() {
+        let mut runner = Runner {
+            store: Store {
+                conversations: listed(&[
+                    Some("/work/site"),
+                    Some("/work/site"),
+                    Some("/work/api"),
+                    None,
+                ]),
+                ..Default::default()
+            },
+            allowed: Default::default(),
+            mode: Mode::Default,
+            human: false,
+            helpers_answered: false,
+            trouble: None,
+            bar: Bar::new(String::new()),
+            stopped: false,
+            images: Vec::new(),
+            notices: notify::Notices::new(Box::new(crate::notify::Silent)),
+            ended: None,
+            voice: None,
+            review: Default::default(),
+        };
+        // Newer sessions in another folder, and one in none, are passed over.
+        let opened = runner.open(true, Some("/work/site".into()));
+        assert_eq!(opened, 1);
+        assert_eq!(runner.store.active, 1);
+        assert_eq!(
+            newest_in(&runner.store.conversations, "/work/api".as_ref()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn continue_in_a_folder_with_no_sessions_finds_none_to_open() {
+        // `open` starts one when there is nothing here to go on with.
+        let sessions = listed(&[Some("/work/site"), None]);
+        assert_eq!(newest_in(&sessions, "/work/docs".as_ref()), None);
+        assert_eq!(newest_in(&[], "/work/site".as_ref()), None);
     }
 
     #[test]
