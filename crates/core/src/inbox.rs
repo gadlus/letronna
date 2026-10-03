@@ -45,6 +45,9 @@ pub enum When {
     Next,
     /// Only once the agent is idle, never in the middle of a turn.
     Later,
+    /// Only with a turn that starts for something else: it rings for none
+    /// of its own.
+    Quiet,
 }
 
 /// Something that happened meanwhile, for one session or helper.
@@ -93,9 +96,10 @@ fn doorbell() -> &'static (Sender<()>, Receiver<()>) {
 /// for as long as it runs.
 static LISTENED: AtomicBool = AtomicBool::new(false);
 
-/// Leave a notice for a session or helper and ring the doorbell, merging it
-/// into a waiting one from the same source.
+/// Leave a notice for a session or helper and, unless it is quiet, ring the
+/// doorbell, merging it into a waiting one from the same source.
 pub fn push(to: u64, notice: Notice) {
+    let quiet = notice.when == When::Quiet;
     let mut wake = None;
     if let Ok(mut inbox) = inbox().lock() {
         inbox.arrivals += 1;
@@ -115,9 +119,13 @@ pub fn push(to: u64, notice: Notice) {
                 mailbox.dropped += 1;
             }
         }
-        wake = inbox.wakes.remove(&to);
+        if !quiet {
+            wake = inbox.wakes.remove(&to);
+        }
     }
-    ring();
+    if !quiet {
+        ring();
+    }
     // Unlocked, since what it wakes may take or leave mail of its own.
     if let Some(wake) = wake {
         wake();
@@ -266,7 +274,8 @@ fn framed(notice: &Notice) -> String {
     }
 }
 
-/// The sessions and helpers with notices waiting, the one waiting longest first.
+/// The sessions and helpers with notices waiting that start a turn, the one
+/// waiting longest first.
 pub fn pending() -> Vec<u64> {
     let Ok(inbox) = inbox().lock() else {
         return Vec::new();
@@ -274,7 +283,11 @@ pub fn pending() -> Vec<u64> {
     let mut waiting: Vec<(u64, u64)> = inbox
         .mailboxes
         .iter()
-        .filter_map(|(to, mailbox)| mailbox.waiting.front().map(|(arrival, _)| (*arrival, *to)))
+        .filter_map(|(to, mailbox)| {
+            (mailbox.waiting.iter())
+                .find(|(_, notice)| notice.when != When::Quiet)
+                .map(|(arrival, _)| (*arrival, *to))
+        })
         .collect();
     waiting.sort_unstable();
     waiting.into_iter().map(|(_, to)| to).collect()
@@ -379,6 +392,21 @@ pub(crate) mod tests {
         assert!(pending().contains(&13), "what can wait was lost");
         assert_eq!(texts(&take(13, true)), ["the hour is up"]);
         assert!(!pending().contains(&13));
+    }
+
+    #[test]
+    fn a_quiet_notice_starts_no_turn_but_goes_with_the_next() {
+        let _turn = DOORBELL.lock().unwrap_or_else(|e| e.into_inner());
+        let bell = listen();
+        // A ring from an earlier test, kept because the inbox holds a receiver.
+        let _ = bell.try_recv();
+        push(16, notice("wake-up", When::Quiet, "a day late"));
+        assert!(bell.try_recv().is_err(), "a quiet notice rang");
+        assert!(!pending().contains(&16));
+        assert!(take(16, false).is_empty());
+        push(16, notice("job 1", When::Later, "job #1 exited"));
+        assert!(pending().contains(&16));
+        assert_eq!(texts(&take(16, true)), ["a day late", "job #1 exited"]);
     }
 
     #[test]
