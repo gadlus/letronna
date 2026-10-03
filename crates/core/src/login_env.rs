@@ -93,10 +93,15 @@ fn from_shell(shell: Option<OsString>, limit: Duration) -> Vec<(OsString, OsStri
 /// not in tests, not when opted out, and not when started from a terminal.
 fn wanted() -> bool {
     use std::io::IsTerminal;
+    // Asked first: on Windows, a look at a stdin pipe that another thread
+    // is reading from waits for that read, so `-p` over stream-json hung.
+    if !cfg!(unix) {
+        return false;
+    }
     let from_terminal = std::io::stdin().is_terminal()
         || std::io::stdout().is_terminal()
         || std::io::stderr().is_terminal();
-    cfg!(unix) && !cfg!(test) && std::env::var_os(OPT_OUT).is_none() && !from_terminal
+    !cfg!(test) && std::env::var_os(OPT_OUT).is_none() && !from_terminal
 }
 
 /// Run `shell` as an interactive login shell and read back its variables,

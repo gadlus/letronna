@@ -280,7 +280,7 @@ pub fn open_in_editor(path: &Path) -> Result<bool, String> {
 }
 
 /// Where the program `name` is on PATH, as the login shell sets it.
-fn on_path(name: &str) -> Option<PathBuf> {
+pub(crate) fn on_path(name: &str) -> Option<PathBuf> {
     let login = crate::login_env::vars();
     let path = login
         .iter()
