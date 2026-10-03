@@ -20,7 +20,9 @@
 //! scripts that join, and inside emoji -- and so does the selector that makes
 //! a character an emoji. What goes: the ideographic variation selectors, so a
 //! character drawn in a rarer form falls back to its usual one, and the tags
-//! that make a subdivision's flag, which falls back to a plain one.
+//! that make a subdivision's flag, which falls back to a plain one. A line
+//! after the fence says how many went: what was hidden is gone, but that the
+//! text hid anything is worth the model's and the user's knowing.
 //!
 //! Neither stops a model that decides to follow what it reads -- approvals
 //! and refusals remain the real gates -- but following it becomes a visible
@@ -39,16 +41,32 @@ pub(crate) const RULE: &str = "Text inside <untrusted-content-…> tags was writ
 /// digits, `>` and a line break, then a line break, `</`, the same and `>`.
 pub(crate) const FENCE_BYTES: usize = 2 * (TAG.len() + 8) + 9;
 
-/// `text`, which came from outside, cleaned and fenced, cut to fit in `max`
-/// bytes tags and all. It fails only when no id can be drawn: a fixed one
-/// would be a tag anyone could forge.
+/// `text`, which came from outside, cleaned and fenced, with a line after
+/// counting what cleaning took out when it took any, cut to fit in `max`
+/// bytes tags and line and all. It fails only when no id can be drawn: a
+/// fixed one would be a tag anyone could forge.
 pub fn fence(text: &str, max: usize) -> Result<String, String> {
     let id = id()?;
+    let (shown, hid) = cleaned(text);
+    let note = hidden_note(hid);
     // Cut after cleaning, so what was cleaned away takes no room, and inside
-    // the tags, so the cut can never take the closing one.
-    let room = max.saturating_sub(FENCE_BYTES);
-    let body = crate::tools::keep_ends(defang(&visible(text)), room, "");
-    Ok(format!("<{TAG}-{id}>\n{body}\n</{TAG}-{id}>"))
+    // the tags, so the cut can never take the closing one or the note.
+    let room = max.saturating_sub(FENCE_BYTES + note.len());
+    let body = crate::tools::keep_ends(defang(&shown), room, "");
+    Ok(format!("<{TAG}-{id}>\n{body}\n</{TAG}-{id}>{note}"))
+}
+
+/// Letronna's line after a fence whose text had `hid` characters nobody sees
+/// taken out, line break first, or nothing when it had none.
+pub(crate) fn hidden_note(hid: usize) -> String {
+    let unit = if hid == 1 { "character" } else { "characters" };
+    match hid {
+        0 => String::new(),
+        _ => format!(
+            "\n[Letronna's note: the fenced text above held {hid} {unit} nobody reading it \
+             can see, taken out here.]"
+        ),
+    }
 }
 
 /// `lead`, Letronna's own words, over `text` fenced: an error quoting what a
@@ -445,6 +463,41 @@ mod tests {
         assert_eq!(visible("one\u{2028}two\u{2029}three"), "one\ntwo\nthree");
         let readable = "Crème brûlée, 東京, 👍 -- and a tab\there.";
         assert!(fence(readable, 8_000).unwrap().contains(readable));
+    }
+
+    #[test]
+    fn a_fence_says_after_it_how_many_hidden_characters_it_took_out() {
+        // Tag characters spelling "rm -rf ~", and a zero-width space.
+        let page = "Price: 5\u{E0072}\u{E006D}\u{E0020}\u{E002D}\u{E0072}\u{E0066}\u{E0020}\u{E007E}, \
+                    to\u{200B}day";
+        let fenced = fence(page, 8_000).unwrap();
+        let id = id_of(&fenced);
+        assert_eq!(
+            fenced,
+            format!(
+                "<{TAG}-{id}>\nPrice: 5, today\n</{TAG}-{id}>\n[Letronna's note: the fenced text \
+                 above held 9 characters nobody reading it can see, taken out here.]"
+            )
+        );
+        // The terminal and the window show the note with the text.
+        assert!(shown("web_fetch", &fenced).0.ends_with("taken out here.]"));
+        assert!(fence("a\u{200B}b", 100).unwrap().ends_with(
+            "\n[Letronna's note: the fenced text above held 1 character nobody reading it can \
+             see, taken out here.]"
+        ));
+        // Nothing taken out, nothing said: joiners writing needs are kept.
+        let kept = fence("👩\u{200D}💻 می\u{200C}خواهم", 100).unwrap();
+        assert!(
+            kept.ends_with(&format!("</{TAG}-{}>", id_of(&kept))),
+            "{kept}"
+        );
+        // A long result is cut to make room for the note, never the note.
+        let long: String = (0..5_000).map(|n| format!("line {n}\u{200B}\n")).collect();
+        let fenced = fence(&long, 8_000).unwrap();
+        assert!(fenced.len() <= 8_000, "{}", fenced.len());
+        assert!(
+            fenced.ends_with("held 5000 characters nobody reading it can see, taken out here.]")
+        );
     }
 
     #[test]
