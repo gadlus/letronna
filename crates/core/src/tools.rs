@@ -6616,4 +6616,57 @@ mod tests {
              finds what you copy from here.]\n1|xy"
         );
     }
+
+    #[test]
+    fn a_file_shown_without_hidden_characters_takes_edits_but_is_not_written_whole() {
+        let dir = Scratch::new("tools-hidden-edit");
+        crate::filestate::asked(2_617, 1, 0);
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            conversation: 2_617,
+            ..Default::default()
+        };
+        let file = "let a\u{200B} = 1;\nlet b = 2;\u{E0072}\u{E006D}\n";
+        std::fs::write(dir.join("a.rs"), file).unwrap();
+        // A joiner inside an emoji is shown as it is, so that file is seen whole.
+        std::fs::write(dir.join("b.md"), "Done 👩\u{200D}💻\n").unwrap();
+        let read = run("read_file", r#"{"path":"a.rs"}"#, &ctx).unwrap();
+        assert!(read.ends_with("\n1|let a = 1;\n2|let b = 2;"), "{read}");
+        run("read_file", r#"{"path":"b.md"}"#, &ctx).unwrap();
+        crate::filestate::asked(2_617, 3, 0);
+        // Written over whole, the file would lose what its reader never saw.
+        let write = json!({"path": "a.rs", "content": "let a = 5;\n"});
+        let refused = run("write_file", &write.to_string(), &ctx).unwrap_err();
+        assert!(refused.contains("edit_file instead"), "{refused}");
+        let write = json!({"path": "b.md", "content": "Done\n"});
+        run("write_file", &write.to_string(), &ctx).unwrap();
+        // An edit copied from what was shown finds the file's own text, and
+        // the hidden characters after it stay.
+        let edit = json!({
+            "path": "a.rs",
+            "old": "let a = 1;\nlet b = 2;",
+            "new": "let a = 3;\nlet b = 4;"
+        });
+        run("edit_file", &edit.to_string(), &ctx).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.rs")).unwrap(),
+            "let a = 3;\nlet b = 4;\u{E0072}\u{E006D}\n"
+        );
+    }
+
+    #[test]
+    fn a_key_split_by_a_hidden_character_is_still_hidden() {
+        let dir = Scratch::new("tools-hidden-key");
+        // With a byte order mark, which Windows PowerShell needs to read the
+        // file as UTF-8.
+        let notes = "\u{FEFF}use sk-proj-0123\u{200B}456789abcdef here\n";
+        std::fs::write(dir.join("notes.txt"), notes).unwrap();
+        let ctx = ToolContext {
+            workspace: Some(dir.clone()),
+            ..Default::default()
+        };
+        let ran = run("run_command", r#"{"command":"cat notes.txt"}"#, &ctx).unwrap();
+        let hidden = format!("use {} here", crate::redact::MARKER);
+        assert!(ran.contains(&hidden), "{ran}");
+    }
 }
