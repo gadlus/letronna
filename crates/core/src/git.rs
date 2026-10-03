@@ -10,7 +10,8 @@
 //! a tool created is as much a change as one it edited. What git prints is
 //! cut at a size, with a line saying so, rather than read whole.
 
-use std::io::{BufRead, Read};
+use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -305,18 +306,358 @@ fn base(folder: &Path) -> Result<String, String> {
     Ok(tree.trim().to_owned())
 }
 
+/// The most of a listing of changed files kept, past which it counts as
+/// more than any caller looks through: thousands of names of a few dozen
+/// bytes each.
+const LISTED_CAP: usize = 4 * 1024 * 1024;
+
+/// A repository as a command found it, for telling what the command
+/// changed: its top folder, the commit checked out, and the config that
+/// turns its own filters off.
+pub(crate) struct Checkout {
+    pub top: PathBuf,
+    /// `None` in a repository with no commit yet.
+    pub head: Option<String>,
+    /// The way down from the top to the folder it was found from, ending
+    /// in `/`, or empty when that is the top itself.
+    pub prefix: String,
+    off: Vec<(String, String)>,
+}
+
+/// One file `git status` lists, by its path from the repository's top.
+pub(crate) struct Listed {
+    pub path: String,
+    /// Git tracks no such file, in the commit or the index.
+    pub untracked: bool,
+}
+
+/// What the commit checked out holds at a path, as `git ls-tree` says.
+pub(crate) struct Entry {
+    /// Git's mode for it: [`PLAIN`] or [`PROGRAM`] for a file, [`LINK`], or
+    /// a submodule's.
+    pub mode: u32,
+    /// Its object, which [`Checkout::committed`] reads.
+    pub id: String,
+    /// Its size; `None` for a submodule.
+    pub size: Option<u64>,
+}
+
+/// Git's mode for a plain file, for one marked as a program, and for a link.
+pub(crate) const PLAIN: u32 = 0o100644;
+pub(crate) const PROGRAM: u32 = 0o100755;
+pub(crate) const LINK: u32 = 0o120000;
+
+/// Bytes of paths one `ls-tree` is given, so hundreds of long ones stay
+/// well inside what a command line may hold.
+const PATHS_PER_CALL: usize = 64 * 1024;
+
+impl Checkout {
+    /// The repository `folder` is in, or an error outside one.
+    pub(crate) fn of(folder: &Path) -> Result<Checkout, String> {
+        let args = ["rev-parse", "--show-toplevel", "--show-prefix"];
+        let (out, cut) = git(folder, &args, 64 * 1024)?;
+        // The top, then the way down from it to `folder`, empty at the top.
+        let mut lines = out.lines();
+        let top = lines.next().unwrap_or_default();
+        if cut || top.is_empty() {
+            return Err(format!("{} is not in a git work tree.", folder.display()));
+        }
+        Ok(Checkout {
+            top: PathBuf::from(top),
+            head: head(folder),
+            prefix: lines.next().unwrap_or_default().to_owned(),
+            off: filters_off(folder)?,
+        })
+    }
+
+    /// Whether the repository ignores `folder`, the one it was found from:
+    /// a project kept in a repository that leaves it out, as a home
+    /// folder's may, has none of its files listed.
+    pub(crate) fn ignores(&self, folder: &Path) -> Result<bool, String> {
+        // Asked about its top, git says a `*` ignores it, when that leaves
+        // out only the untracked files below.
+        if self.prefix.is_empty() {
+            return Ok(false);
+        }
+        // An ignored path is printed; none is exit status 1. check-ignore
+        // refuses literal paths, and `.` is the same either way.
+        let patterns = [("GIT_LITERAL_PATHSPECS".to_owned(), "0".to_owned())];
+        let args = ["check-ignore", "--", "."];
+        let (out, _) = run(folder, &args, 1024, &[0, 1], &patterns)?;
+        Ok(!out.is_empty())
+    }
+
+    /// The files under `folder` that differ from the commit or are not
+    /// tracked, leaving out what git ignores, or `None` when there are
+    /// more than `most`.
+    pub(crate) fn listed(&self, folder: &Path, most: usize) -> Result<Option<Vec<Listed>>, String> {
+        // Renames are a removal and an addition, so each entry is one name.
+        // A submodule is listed when it is gone or on another commit, so
+        // that can be said, but not for work inside it, which is its own.
+        let args = [
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--no-renames",
+            "--ignore-submodules=dirty",
+            "--",
+            ".",
+        ];
+        let (out, cut) = run_raw(folder, &args, LISTED_CAP, &[0], &self.off, None)?;
+        if cut {
+            return Ok(None);
+        }
+        let listed: Vec<Listed> = out
+            .split(|&b| b == 0)
+            .filter_map(|entry| {
+                // Two letters of status and a space come before the name.
+                let path = String::from_utf8_lossy(entry.get(3..)?).into_owned();
+                Some(Listed {
+                    path,
+                    untracked: entry.starts_with(b"??"),
+                })
+            })
+            .collect();
+        Ok((listed.len() <= most).then_some(listed))
+    }
+
+    /// Of `paths`, from the repository's top, those the commit checked out
+    /// holds, each with what it holds there; a path it holds nothing at is
+    /// left out.
+    pub(crate) fn in_commit(&self, paths: &[&str]) -> Result<HashMap<String, Entry>, String> {
+        let mut found = HashMap::new();
+        let Some(head) = &self.head else {
+            return Ok(found);
+        };
+        let mut rest = paths;
+        while !rest.is_empty() {
+            // As many as fit on one command line, and always one.
+            let mut bytes = 0;
+            let mut take = 0;
+            while take < rest.len() && (take == 0 || bytes + rest[take].len() < PATHS_PER_CALL) {
+                bytes += rest[take].len() + 1;
+                take += 1;
+            }
+            let (asked, more) = rest.split_at(take);
+            rest = more;
+            let args: Vec<&str> = ["ls-tree", "-z", "-l", head.as_str(), "--"]
+                .into_iter()
+                .chain(asked.iter().copied())
+                .collect();
+            let (out, cut) = run_raw(&self.top, &args, LISTED_CAP, &[0], &self.off, None)?;
+            if cut {
+                return Err("git listed more than is read".into());
+            }
+            // Each is its mode, kind, object and size, then a tab and its
+            // path; a submodule's size is `-`.
+            for listed in out.split(|&b| b == 0) {
+                let Some(tab) = listed.iter().position(|&b| b == b'\t') else {
+                    continue;
+                };
+                let fields = String::from_utf8_lossy(&listed[..tab]);
+                let [mode, _, id, size] = fields.split_whitespace().collect::<Vec<_>>()[..] else {
+                    continue;
+                };
+                let Ok(mode) = u32::from_str_radix(mode, 8) else {
+                    continue;
+                };
+                let entry = Entry {
+                    mode,
+                    id: id.to_owned(),
+                    size: size.parse().ok(),
+                };
+                let path = String::from_utf8_lossy(&listed[tab + 1..]).into_owned();
+                found.insert(path, entry);
+            }
+        }
+        Ok(found)
+    }
+
+    /// Of `paths`, from the repository's top, those a `filter` attribute
+    /// names a filter for: what checking one out writes is that filter's
+    /// to say, and the repository's own filters are off here.
+    pub(crate) fn filtered(&self, paths: &[&str]) -> Result<HashSet<String>, String> {
+        let input: Vec<u8> = paths
+            .iter()
+            .flat_map(|path| path.bytes().chain([0]))
+            .collect();
+        let args = ["check-attr", "--stdin", "-z", "filter"];
+        let (out, cut) = run_raw(&self.top, &args, LISTED_CAP, &[0], &self.off, Some(&input))?;
+        if cut {
+            return Err("git listed more than is read".into());
+        }
+        // Each path comes with the attribute's name and its value.
+        let fields: Vec<&[u8]> = out.split(|&b| b == 0).collect();
+        Ok(fields
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .filter(|entry| !matches!(entry[2], b"unspecified" | b"unset"))
+            .map(|entry| String::from_utf8_lossy(entry[0]).into_owned())
+            .collect())
+    }
+
+    /// What each of `files`, plain files from the repository's top, holds
+    /// in the commit checked out, as checking it out writes it when no
+    /// `filter` attribute names it (see [`Checkout::filtered`]):
+    /// end-of-line and encoding changes made, filters not. Reading stops at
+    /// `cap` bytes in all, and a file past that is left out.
+    pub(crate) fn committed(
+        &self,
+        files: &[(&str, &Entry)],
+        cap: usize,
+    ) -> Result<HashMap<String, Vec<u8>>, String> {
+        let Some(head) = &self.head else {
+            return Ok(HashMap::new());
+        };
+        let paths: Vec<&str> = files.iter().map(|(path, _)| *path).collect();
+        let converted = self.converted(&paths)?;
+        // Those written out as stored come in one go. A batch that converts
+        // heads each file with its stored size but gives its converted
+        // bytes, so it cannot be read apart: those take a git each.
+        let (each, stored): (Vec<_>, Vec<_>) = files
+            .iter()
+            .partition(|(path, _)| converted.contains(*path));
+        let mut found = self.stored(&stored, cap)?;
+        let mut left = cap.saturating_sub(found.values().map(Vec::len).sum());
+        for (path, _) in each {
+            let object = format!("{head}:{path}");
+            let args = ["cat-file", "--filters", object.as_str()];
+            let Ok((bytes, false)) = run_raw(&self.top, &args, left, &[0], &self.off, None) else {
+                continue;
+            };
+            left -= bytes.len();
+            found.insert((*path).to_owned(), bytes);
+        }
+        Ok(found)
+    }
+
+    /// What each of `files` holds as the commit stores it, read in one go
+    /// until `cap` bytes; a file past that is left out.
+    fn stored(
+        &self,
+        files: &[&(&str, &Entry)],
+        cap: usize,
+    ) -> Result<HashMap<String, Vec<u8>>, String> {
+        let mut found = HashMap::new();
+        if files.is_empty() {
+            return Ok(found);
+        }
+        let input: String = files
+            .iter()
+            .map(|(_, entry)| format!("{}\n", entry.id))
+            .collect();
+        let args = ["cat-file", "--batch"];
+        let input = Some(input.as_bytes());
+        let (out, _) = run_raw(&self.top, &args, cap, &[0], &self.off, input)?;
+        // Each comes as a line of its object, kind and size, then that many
+        // bytes and a line break; one cut short is left out.
+        let mut rest = out.as_slice();
+        for (path, _) in files {
+            let Some(end) = rest.iter().position(|&b| b == b'\n') else {
+                break;
+            };
+            let header = String::from_utf8_lossy(&rest[..end]).into_owned();
+            rest = &rest[end + 1..];
+            let size = match header.split(' ').collect::<Vec<_>>()[..] {
+                [_, "blob", size] => size.parse::<usize>().ok(),
+                _ => None,
+            };
+            let Some(size) = size else {
+                continue;
+            };
+            let Some(bytes) = rest.get(..size) else {
+                break;
+            };
+            found.insert((*path).to_owned(), bytes.to_vec());
+            rest = rest.get(size + 1..).unwrap_or_default();
+        }
+        Ok(found)
+    }
+
+    /// Of `paths`, from the repository's top, those checking out may write
+    /// otherwise than the commit stores them: with `ident` or an encoding
+    /// of their own, or with line endings turned into CR LF, as an `eol`
+    /// or `crlf` attribute, the config or Windows may ask, unless marked as
+    /// not text. Checking out changes a file in no other way but a filter.
+    fn converted(&self, paths: &[&str]) -> Result<HashSet<String>, String> {
+        // A key with no value is true. Nothing found is exit status 1.
+        let listing = ["config", "-z", "--get-regexp", r"^core\.(autocrlf|eol)$"];
+        let (config, _) = run(&self.top, &listing, STAT_CAP, &[0, 1], &self.off)?;
+        let crlf_config = config
+            .split('\0')
+            .filter(|entry| !entry.is_empty())
+            .any(|entry| {
+                let (key, value) = entry.split_once('\n').unwrap_or((entry, "true"));
+                let value = value.to_ascii_lowercase();
+                match key {
+                    "core.autocrlf" => {
+                        !matches!(value.as_str(), "false" | "no" | "off" | "0" | "input")
+                    }
+                    _ => value == "crlf",
+                }
+            });
+        let input: Vec<u8> = paths
+            .iter()
+            .flat_map(|path| path.bytes().chain([0]))
+            .collect();
+        let names = ["text", "eol", "crlf", "ident", "working-tree-encoding"];
+        let args: Vec<&str> = ["check-attr", "--stdin", "-z"]
+            .into_iter()
+            .chain(names)
+            .collect();
+        let (out, cut) = run_raw(&self.top, &args, LISTED_CAP, &[0], &self.off, Some(&input))?;
+        if cut {
+            return Err("git listed more than is read".into());
+        }
+        // Each path comes with each attribute's name and its value.
+        let mut set: HashMap<&[u8], HashMap<&[u8], &[u8]>> = HashMap::new();
+        let fields: Vec<&[u8]> = out.split(|&b| b == 0).collect();
+        for entry in fields.as_chunks::<3>().0 {
+            set.entry(entry[0]).or_default().insert(entry[1], entry[2]);
+        }
+        let as_stored = |path: &str| {
+            let Some(set) = set.get(path.as_bytes()) else {
+                return false;
+            };
+            let value = |name: &str| set.get(name.as_bytes()).copied().unwrap_or(b"unspecified");
+            let not_text = value("text") == b"unset" || value("crlf") == b"unset";
+            let crlf = value("eol") == b"crlf" || value("crlf") == b"set" || crlf_config;
+            matches!(value("ident"), b"unspecified" | b"unset")
+                && value("working-tree-encoding") == b"unspecified"
+                && (not_text || !(crlf || cfg!(windows)))
+        };
+        Ok(paths
+            .iter()
+            .filter(|path| !as_stored(path))
+            .map(|path| (*path).to_owned())
+            .collect())
+    }
+}
+
+/// The commit checked out in `folder`'s repository, or `None` when it has
+/// none yet or there is no repository.
+pub(crate) fn head(folder: &Path) -> Option<String> {
+    let args = ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"];
+    let (out, _) = git(folder, &args, 1024).ok()?;
+    Some(out.trim().to_owned()).filter(|head| !head.is_empty())
+}
+
 /// The config that turns off each filter the repository's own config
 /// names, as `GIT_CONFIG_*` pairs to follow the guards': a clean filter
-/// runs on every changed file a diff reads, and a repository must not pick
-/// a program for a look at its changes to run. The user's own filters,
-/// Git LFS's among them, are left to run as they would for `git diff`.
+/// runs on every changed file a diff reads, a smudge filter on every file
+/// read out of a commit, and a repository must not pick a program for a
+/// look at its changes to run. The user's own filters, Git LFS's among
+/// them, are left to run as they would for `git diff`.
 fn filters_off(folder: &Path) -> Result<Vec<(String, String)>, String> {
     let listing = [
         "config",
         "--show-scope",
         "-z",
         "--get-regexp",
-        r"^filter\..*\.(clean|process)$",
+        r"^filter\..*\.(clean|smudge|process)$",
     ];
     // Nothing found is exit status 1.
     let (text, cut) = run(folder, &listing, STAT_CAP, &[0, 1], &[])?;
@@ -345,7 +686,8 @@ fn filters_off(folder: &Path) -> Result<Vec<(String, String)>, String> {
         .unwrap_or(0);
     let mut pairs = Vec::new();
     let keys = names.iter().flat_map(|name| {
-        ["clean", "process", "required"].map(|part| (format!("filter.{name}.{part}"), part))
+        ["clean", "smudge", "process", "required"]
+            .map(|part| (format!("filter.{name}.{part}"), part))
     });
     for (at, (key, part)) in keys.enumerate() {
         let value = if part == "required" { "false" } else { "" };
@@ -405,10 +747,31 @@ fn run(
     fine: &[i32],
     off: &[(String, String)],
 ) -> Result<(String, bool), String> {
+    let (bytes, cut) = run_raw(folder, args, cap, fine, off, None)?;
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if cut {
+        // End on a whole line, or a whole name of a `-z` listing, rather
+        // than halfway through one.
+        let end = text.rfind(['\n', '\0']).map_or(0, |at| at + 1);
+        text.truncate(end);
+    }
+    Ok((text, cut))
+}
+
+/// `run`, giving back the bytes git printed as they are: a file read out
+/// of a commit need not be text. What `input` holds is given to git to
+/// read; without it git reads nothing.
+fn run_raw(
+    folder: &Path,
+    args: &[&str],
+    cap: usize,
+    fine: &[i32],
+    off: &[(String, String)],
+    input: Option<&[u8]>,
+) -> Result<(Vec<u8>, bool), String> {
     let mut cmd = Command::new("git");
     cmd.args([
         "--no-pager",
-        "--literal-pathspecs",
         "-c",
         "core.fsmonitor=false",
         "-c",
@@ -417,9 +780,15 @@ fn run(
     .args(args)
     .current_dir(folder)
     .envs(crate::command::GUARDS.iter().copied())
+    // Paths are names, never patterns: `--literal-pathspecs`, said where
+    // `off` can still take it back for a command that refuses it.
+    .env("GIT_LITERAL_PATHSPECS", "1")
     .envs(off.iter().map(|(key, value)| (key, value)))
     .env_remove("GIT_EXTERNAL_DIFF")
-    .stdin(Stdio::null())
+    .stdin(match input {
+        Some(_) => Stdio::piped(),
+        None => Stdio::null(),
+    })
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
     #[cfg(windows)]
@@ -436,6 +805,13 @@ fn run(
         let _ = child.wait();
         return Err("git gave no output to read.".into());
     };
+    // Written beside the reading too: git prints as it reads, and would
+    // stop reading once its output filled the pipe. Write errors are left
+    // to git's status, as git stopping early is what causes them.
+    let feed = child.stdin.take().zip(input).map(|(mut stdin, input)| {
+        let input = input.to_vec();
+        std::thread::spawn(move || stdin.write_all(&input))
+    });
     // Read beside the output, not after it: git can warn a line per file
     // before it prints anything, and would wait on a full pipe for ever.
     let errors = std::thread::spawn(move || why_failed(stderr));
@@ -449,6 +825,9 @@ fn run(
     let status = child
         .wait()
         .map_err(|e| format!("git did not finish: {e}"))?;
+    if let Some(feed) = feed {
+        let _ = feed.join();
+    }
     let why = errors.join().unwrap_or_default();
     read.map_err(|e| format!("git's output could not be read: {e}"))?;
     if !cut && !status.code().is_some_and(|code| fine.contains(&code)) {
@@ -458,14 +837,7 @@ fn run(
         return Err(format!("git {} failed: {why}", command.unwrap_or(&"")));
     }
     bytes.truncate(cap);
-    let mut text = String::from_utf8_lossy(&bytes).into_owned();
-    if cut {
-        // End on a whole line, or a whole name of a `-z` listing, rather
-        // than halfway through one.
-        let end = text.rfind(['\n', '\0']).map_or(0, |at| at + 1);
-        text.truncate(end);
-    }
-    Ok((text, cut))
+    Ok((bytes, cut))
 }
 
 /// The line of what git printed to `stderr` that says why it stopped: its

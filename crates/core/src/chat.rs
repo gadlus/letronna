@@ -80,6 +80,13 @@ pub struct Message {
     /// back. Left out of the saved line when there are none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<crate::history::FileChange>,
+    /// For a `run_command` result: what of the command's changes a rewind
+    /// cannot put back, for a rewind past it to say; empty when it can put
+    /// back all it found, and `None` when nothing was looked for, as for a
+    /// job left in the background or a session saved before commands were
+    /// watched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unkept: Option<String>,
     /// For `role: "user"`: the pictures attached, saved under `media/`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<PathBuf>,

@@ -574,6 +574,7 @@ impl Turn {
             args: call.arguments,
             is_error,
             files: self.files.take(),
+            unkept: self.files.unkept(),
             ..Default::default()
         };
         self.track_edits(&result);

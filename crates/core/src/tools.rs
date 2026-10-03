@@ -1440,6 +1440,10 @@ fn run_shell_saving(
 /// What each pipe's output is streamed to, next to the file it ends up in.
 const PIPE_NAMES: [&str; 2] = ["stdout", "stderr"];
 
+/// What the first line of a command's result says, as `run_shell_into`
+/// words it, when the command carried on in the background at its limit.
+const MOVED: &str = "so it carries on in the background as job #";
+
 fn run_shell_into(
     mut cmd: std::process::Command,
     command: &str,
@@ -2367,6 +2371,8 @@ impl Tool for RunCommand {
                 path,
                 cap: PIPE_SPILL_BYTES,
             });
+            // Last before it runs, so as little as can be falls between.
+            let watch = crate::snapshot::watch(command, &dir, cwd, ctx);
             let out = if ctx.sandboxed {
                 run_sandboxed(command, cwd, &dir, &ctx.cancel, save, limit)
             } else {
@@ -2374,6 +2380,10 @@ impl Tool for RunCommand {
                 let cmd = shell(command, Some(&dir));
                 run_shell_saving(cmd, command, &ctx.cancel, save, limit, owner)
             };
+            if let Some(watch) = watch {
+                let first = out.as_ref().ok().and_then(|text| text.lines().next());
+                watch.after(first.is_some_and(|line| line.contains(MOVED)));
+            }
             let note = crate::filestate::note(ctx.conversation, before, cwd);
             // The note goes first, so cutting long output short cannot drop it.
             return match out {
