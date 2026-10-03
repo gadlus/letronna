@@ -905,7 +905,10 @@ fn ask_of(
         Some(earlier) => format!("Earlier summary:\n{earlier}\n\nNew messages:\n{transcript}"),
         None => format!("Messages:\n{transcript}"),
     };
-    let mut request = post(endpoint)?.json(&body(connection, &input));
+    let body = body(connection, &input);
+    let (endpoint, body) =
+        crate::chat::to_responses(connection, &endpoint, &body).unwrap_or((endpoint, body));
+    let mut request = post(endpoint)?.json(&body);
     if !connection.key.trim().is_empty() {
         request = request.bearer_auth(connection.key.trim());
     }
@@ -914,6 +917,7 @@ fn ask_of(
         .and_then(|r| r.error_for_status())
         .and_then(|r| r.json())
         .map_err(|e| crate::side::Failed::sending(&e, e.to_string()))?;
+    let value = crate::wire_responses::reply(value);
     let reply = crate::chat::unwrap_response(&value)?;
     let text = reply
         .pointer("/choices/0/message/content")

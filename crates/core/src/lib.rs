@@ -108,6 +108,7 @@ pub mod vault;
 pub mod wake;
 pub mod watch;
 pub mod web;
+mod wire_responses;
 #[cfg(feature = "workflows")]
 pub mod workflow;
 pub mod worktree;

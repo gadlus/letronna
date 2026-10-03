@@ -595,6 +595,8 @@ fn ask(connection: &Connection, prompt: &str) -> Result<String, String> {
         "max_tokens": VERDICT_TOKENS + THINKING_TOKENS,
         "reasoning_effort": "low",
     });
+    let (endpoint, body) =
+        crate::chat::to_responses(connection, &endpoint, &body).unwrap_or((endpoint, body));
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(20))
@@ -610,6 +612,7 @@ fn ask(connection: &Connection, prompt: &str) -> Result<String, String> {
         .and_then(|r| r.error_for_status())
         .and_then(|r| r.json())
         .map_err(|e| e.to_string())?;
+    let value = crate::wire_responses::reply(value);
     crate::chat::unwrap_response(&value)?
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)
