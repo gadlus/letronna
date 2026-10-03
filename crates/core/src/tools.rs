@@ -715,8 +715,8 @@ fn fit(out: String, ctx: &ToolContext) -> String {
     keep_ends(out, MAX_OUTPUT, &note)
 }
 
-/// Where the outputs cut in `conversation` are saved whole: readable from
-/// its own calls only, and removed with its session.
+/// Where the outputs cut in `conversation` are saved whole, and the PDFs it
+/// fetches: readable from its own calls only, and removed with its session.
 pub(crate) fn results_dir(conversation: u64) -> PathBuf {
     crate::chat::data_dir()
         .join("results")

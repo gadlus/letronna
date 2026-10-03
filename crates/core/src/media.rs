@@ -1073,7 +1073,17 @@ pub(crate) fn save(
         .clone()
         .unwrap_or_else(crate::chat::data_dir)
         .join("media");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("Cannot make {}: {e}", dir.display()))?;
+    save_in(&dir, about, extension, bytes)
+}
+
+/// Save `bytes` in `dir`, named after what they show and when.
+pub(crate) fn save_in(
+    dir: &Path,
+    about: &str,
+    extension: &str,
+    bytes: &[u8],
+) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("Cannot make {}: {e}", dir.display()))?;
     let name = format!(
         "{}-{}",
         slug(about),
