@@ -439,6 +439,12 @@ pub struct Settings {
     /// time, as some benchmarks' graders require.
     #[serde(default = "yes")]
     pub parallel_tool_calls: bool,
+    /// Ends each request of a turn that has made fifteen tool rounds with
+    /// the rules still in force, such as checking edits before saying done;
+    /// off until paired runs on long tasks show it costs nothing. Edited by
+    /// hand.
+    #[serde(default)]
+    pub remind_rules: bool,
     /// Models to carry a task on with, in order, when the chosen one is
     /// overloaded, out of credit or gone: `model` on the session's gateway,
     /// or `Gateway:model`; see `fallback`.
@@ -512,6 +518,7 @@ impl Default for Settings {
             voice: false,
             verify_edits: true,
             parallel_tool_calls: true,
+            remind_rules: false,
             session_filter: String::new(),
             group_by_project: false,
             quick_entry_hotkey: String::new(),
@@ -3130,6 +3137,12 @@ pub(crate) fn parallel_tool_calls() -> bool {
     settings().0.parallel_tool_calls
 }
 
+/// Whether the settings file has long turns reminded of the rules in force,
+/// read again each time as `disabled_tools` is.
+pub(crate) fn remind_rules() -> bool {
+    settings().0.remind_rules
+}
+
 /// The settings file. A file that will not read at all is kept aside by
 /// `state::read` as before.
 fn read_settings_file() -> Settings {
@@ -5379,6 +5392,18 @@ pub(crate) mod tests {
         assert!(read("").parallel_tool_calls);
         assert!(super::Settings::default().parallel_tool_calls);
         assert!(!read(r#", "parallel_tool_calls": false"#).parallel_tool_calls);
+    }
+
+    #[test]
+    fn long_turns_are_reminded_of_the_rules_only_when_the_file_says_so() {
+        let read = |extra: &str| {
+            let text = format!(r#"{{"endpoint": "", "model": "m"{extra}}}"#);
+            super::read_settings(text.as_bytes()).unwrap()
+        };
+        // A file from before the setting leaves it off, as a first run does.
+        assert!(!read("").remind_rules);
+        assert!(!super::Settings::default().remind_rules);
+        assert!(read(r#", "remind_rules": true"#).remind_rules);
     }
 
     #[test]

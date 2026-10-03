@@ -1663,7 +1663,10 @@ pub(crate) mod tests {
         commit(&repo, "Twelve");
 
         assert_eq!(made.apply().unwrap().clean, ["list.txt"]);
-        let list = std::fs::read_to_string(repo.join("list.txt")).unwrap();
+        // A checkout with core.autocrlf, as on Windows, writes CRLF.
+        let list = std::fs::read_to_string(repo.join("list.txt"))
+            .unwrap()
+            .replace("\r\n", "\n");
         assert!(list.contains("9\nten\n11\ntwelve\n13\n"), "{list}");
     }
 

@@ -1615,7 +1615,8 @@ fn checklist(messages: &[Message]) -> Option<String> {
 }
 
 /// What rides on the end of a request and is never stored, if anything: the
-/// checklist first as it always has, then `lsp`, the language servers' news,
+/// checklist first as it always has, then the rules in force on a long turn,
+/// then `lsp`, the language servers' news,
 /// then the MCP servers not ready, for a run that may call their tools.
 fn ending(
     connection: &Connection,
@@ -1626,12 +1627,63 @@ fn ending(
     let mcp = (!extra.no_mcp)
         .then(|| crate::mcp::note(connection))
         .flatten();
+    // Off unless chosen, until paired runs on long tasks show it costs none.
+    let reminder = crate::store::remind_rules()
+        .then(|| standing(messages, connection, crate::styles::chosen().is_some()))
+        .flatten();
     let ending: Vec<String> = checklist(messages)
         .into_iter()
+        .chain(reminder)
         .chain(lsp.map(str::to_owned))
         .chain(mcp)
         .collect();
     ending.join("\n\n")
+}
+
+/// Replies with tool calls one turn makes before its requests restate the
+/// rules in force: past what most tasks take, so a short turn never pays for
+/// it, with ten rounds left before `agent::MAX_ROUNDS` ends a watched turn.
+const LONG_TURN: usize = 15;
+
+/// The rules the system prompt holds, the reply style among them when
+/// `styled`, as a note to end the request with once the latest turn of
+/// `messages` has made `LONG_TURN` rounds; none when no rule applies.
+// Only rules that request's prompt carries, restated: a new rule here would
+// reach the model without the user ever seeing it. Checking edits is left
+// out where nothing could run a check, and in a turn that changed no code.
+fn standing(messages: &[Message], connection: &Connection, styled: bool) -> Option<String> {
+    let start = messages.iter().rposition(opens_turn).unwrap_or(0);
+    let turn = &messages[start..];
+    let rounds = turn
+        .iter()
+        .filter(|m| m.role == "assistant" && !m.tool_calls.is_empty())
+        .count();
+    if rounds < LONG_TURN {
+        return None;
+    }
+    let shared = connection.remote.as_ref().is_some_and(|r| r.shared);
+    let checks = connection.tools
+        && !shared
+        && !connection.plan
+        && !connection.wrap_up
+        && connection.workspace.is_some()
+        && turn
+            .iter()
+            .any(|m| m.role == "tool" && crate::agent::changes_code(m));
+    let rules: Vec<&str> = [
+        checks.then_some("verify changes before reporting done"),
+        styled.then_some("reply in the chosen style"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if rules.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "(From Letronna, not part of the above: still in force: {}.)",
+        rules.join("; ")
+    ))
 }
 
 /// A picture a request shows the model.
@@ -3990,6 +4042,114 @@ mod tests {
             context.last().unwrap()["content"],
             "Checklist updated: 1 of 1 done."
         );
+    }
+
+    /// A turn that makes `rounds` calls of `tool` on `path`, each answered.
+    fn long_turn(rounds: usize, tool: &str, path: &str) -> Vec<Message> {
+        let mut messages = vec![said("user", "fix the parser")];
+        for round in 0..rounds {
+            let id = format!("call-{round}");
+            let arguments = json!({"path": path, "content": "x"}).to_string();
+            messages.push(Message {
+                tool_calls: vec![call(&id, tool, &arguments)],
+                ..said("assistant", "")
+            });
+            messages.push(Message {
+                tool_call_id: id,
+                name: tool.into(),
+                args: arguments,
+                ..said("tool", "Done.")
+            });
+        }
+        messages
+    }
+
+    /// A connection that can edit and run commands in a project folder.
+    fn working() -> Connection {
+        Connection {
+            tools: true,
+            workspace: Some("project".into()),
+            ..connection()
+        }
+    }
+
+    #[test]
+    fn a_long_turn_with_edits_carries_the_reminder() {
+        let c = working();
+        let short = long_turn(LONG_TURN - 1, "write_file", "src/main.rs");
+        assert_eq!(standing(&short, &c, true), None);
+        let messages = long_turn(LONG_TURN, "write_file", "src/main.rs");
+        let verify = "(From Letronna, not part of the above: still in force: verify changes \
+                      before reporting done.)";
+        assert_eq!(standing(&messages, &c, false).as_deref(), Some(verify));
+        assert_eq!(
+            standing(&messages, &c, true).as_deref(),
+            Some(
+                "(From Letronna, not part of the above: still in force: verify changes \
+                 before reporting done; reply in the chosen style.)"
+            )
+        );
+        // On the wire only, after the last result, as the checklist rides.
+        let payload = body(
+            &c,
+            &messages,
+            None,
+            standing(&messages, &c, false).as_deref(),
+        );
+        let context = payload["messages"].as_array().unwrap();
+        let last = context.last().unwrap()["content"].as_str().unwrap();
+        assert!(last.ends_with(&format!("\n\n{verify}")), "{last}");
+        assert_eq!(messages.last().unwrap().content, "Done.");
+        // The user's next message starts the count again.
+        let mut next = messages;
+        next.push(said("user", "and the tests?"));
+        assert_eq!(standing(&next, &c, true), None);
+    }
+
+    #[test]
+    fn a_read_only_long_turn_does_not() {
+        let c = working();
+        let reading = long_turn(LONG_TURN, "read_file", "src/main.rs");
+        assert_eq!(standing(&reading, &c, false), None);
+        // Writing a report is not code a build or test would check.
+        let noting = long_turn(LONG_TURN, "write_file", "notes.md");
+        assert_eq!(standing(&noting, &c, false), None);
+        // Nor is it told to check where nothing could run a check.
+        let edits = long_turn(LONG_TURN, "write_file", "src/main.rs");
+        let folderless = Connection {
+            workspace: None,
+            ..working()
+        };
+        assert_eq!(standing(&edits, &folderless, false), None);
+        let shared = Connection {
+            remote: Some(Remote {
+                place: "#general in a Discord server".into(),
+                shared: true,
+                history: None,
+            }),
+            ..working()
+        };
+        assert_eq!(standing(&edits, &shared, false), None);
+        let wrapping_up = Connection {
+            wrap_up: true,
+            ..working()
+        };
+        assert_eq!(standing(&edits, &wrapping_up, false), None);
+        // The style still holds, as it does in every request.
+        assert!(
+            standing(&reading, &c, true)
+                .is_some_and(|note| note.ends_with("still in force: reply in the chosen style.)"))
+        );
+    }
+
+    #[test]
+    fn a_plan_mode_turn_does_not() {
+        let edits = long_turn(LONG_TURN, "write_file", "src/main.rs");
+        let planning = Connection {
+            plan: true,
+            ..working()
+        };
+        assert_eq!(standing(&edits, &planning, false), None);
     }
     #[test]
     fn a_starting_server_is_named_on_the_wire() {
