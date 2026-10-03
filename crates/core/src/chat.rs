@@ -945,7 +945,11 @@ fn body_with(
     budget: &Budget,
     extra: &[Value],
 ) -> Value {
-    body_hashed(connection, window, summary, plan, budget, extra, None)
+    let extra = Extra {
+        tools: extra.to_vec(),
+        ..Default::default()
+    };
+    body_hashed(connection, window, summary, plan, budget, &extra, None)
 }
 
 /// The system message of a request, and where in it lie the parts its
@@ -962,6 +966,11 @@ struct SystemPrompt {
     model: usize,
 }
 
+/// What a run nobody watches is told in place of approvals and `ask_user`,
+/// neither of which it has.
+// Inputs may change when the task says so, since a repair has to edit them.
+const HEADLESS: &str = "Nobody is watching this run and nobody will answer questions: decide for yourself and write any assumption into your answer or deliverables. Write each required output at the exact path the task names; make a first version early and update it in place. Change input files only when the task says to edit them. Use the URL, service, repository or test command the task gives. Compute numbers with a script, not in your head. When the task says to stop after a step, stop.";
+
 /// The system message for a request over `connection`, with what a shorter
 /// window already dropped folded in as `summary` at the end. Apart from
 /// `body_hashed` so `context_parts` prices the prompt a request sends
@@ -975,7 +984,17 @@ fn system_prompt(connection: &Connection, summary: Option<&str>) -> SystemPrompt
         if connection.remote.is_none() {
             system.push_str(" You are Letronna, running in the user's terminal or desktop window; you are not any other assistant, and commands from other tools do not apply here. The user's earlier conversations are sessions: list_sessions shows them, and the user picks one up with the /resume command or `letronna --resume <id>`.");
         }
-        system.push_str(" You have tools to read, search, write and edit files and to run commands in the user's project; use them instead of guessing. Writes and commands are shown to the user for approval; a denial is final for that action. Ask with ask_user when a decision is the user's to make, such as a project name. After changing code, verify it (build, test, or run) before reporting done.");
+        system.push_str(" You have tools to read, search, write and edit files and to run commands in the user's project; use them instead of guessing.");
+        // A watched session's text stays byte for byte as it was, and with it
+        // the prefix its provider has cached.
+        if connection.human || connection.remote.is_some() {
+            system.push_str(" Writes and commands are shown to the user for approval; a denial is final for that action. Ask with ask_user when a decision is the user's to make, such as a project name.");
+        } else {
+            system.push_str(&format!(" {HEADLESS}"));
+        }
+        system.push_str(
+            " After changing code, verify it (build, test, or run) before reporting done.",
+        );
         match &connection.workspace {
             Some(w) => system.push_str(&format!(" The project folder is `{}`.", w.display())),
             None => system.push_str(" No project folder is attached: you can only read under the home folder. Ask the user to attach one before writing or running anything."),
@@ -1065,7 +1084,7 @@ fn body_hashed(
     summary: Option<&str>,
     plan: Option<&str>,
     budget: &Budget,
-    extra: &[Value],
+    extra: &Extra,
     mut prefix: Option<&mut crate::cache_miss::Prefix>,
 ) -> Value {
     let system = system_prompt(connection, summary);
@@ -1221,9 +1240,18 @@ fn body_hashed(
     });
     if connection.tools {
         let mut tools = offered(connection, &every, on_demand);
+        let hidden = |tool: &Value| {
+            let name = &tool["function"]["name"];
+            extra.hide.iter().any(|left_out| name == left_out.as_str())
+        };
+        // Some providers turn down an empty array, so a run refused every
+        // tool is offered them all, and refused at the call as before.
+        if !tools.iter().all(hidden) {
+            tools.retain(|tool| !hidden(tool));
+        }
         // Last, so the tools before them go out byte for byte as they would
         // without them, and a provider's cached prefix holds up to here.
-        tools.extend_from_slice(extra);
+        tools.extend_from_slice(&extra.tools);
         body["tools"] = Value::Array(tools);
         if connection.wrap_up {
             body["tool_choice"] = "none".into();
@@ -2269,6 +2297,9 @@ pub fn list_models(base: &str, key: &str) -> Result<Vec<String>, String> {
 pub struct Extra {
     /// Offered after the connection's own tools, and not at all where it offers none.
     pub tools: Vec<Value>,
+    /// Names of the connection's own tools to leave out of the request, where
+    /// naming every one it offers leaves out none.
+    pub hide: Vec<String>,
     /// Once set, ends the call before its next request or at the next line it receives.
     pub cancel: Cancel,
     /// Held until the stream is over, so whatever it carries lasts as long as the call.
@@ -2657,7 +2688,7 @@ fn stream(
         summary.as_deref(),
         Some(ending.as_str()).filter(|ending| !ending.is_empty()),
         budget,
-        &extra.tools,
+        extra,
         Some(&mut prefix),
     );
     let ticket = crate::cache_miss::sent(connection.conversation, prefix);
@@ -3916,6 +3947,75 @@ mod tests {
         assert!(dm.contains("Plan mode is on"), "{dm}");
         assert!(!dm.contains("exit_plan"), "{dm}");
     }
+
+    /// The system message a request over `connection` with tools sends.
+    fn system_with_tools(connection: Connection) -> String {
+        let with_tools = Connection {
+            tools: true,
+            ..connection
+        };
+        let payload = body(&with_tools, &[], None, None);
+        payload["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    #[test]
+    fn a_run_nobody_watches_is_told_nobody_will_answer() {
+        let unwatched = system_with_tools(connection());
+        assert!(unwatched.contains(HEADLESS), "{unwatched}");
+        assert!(!unwatched.contains("for approval"), "{unwatched}");
+        assert!(!unwatched.contains("Ask with ask_user"), "{unwatched}");
+        // A chat app's run is answered through the chat, watched or not.
+        let chat = system_with_tools(Connection {
+            remote: Some(Remote {
+                place: "a Telegram chat".into(),
+                ..Default::default()
+            }),
+            ..connection()
+        });
+        assert!(!chat.contains(HEADLESS), "{chat}");
+    }
+
+    #[test]
+    fn a_watched_run_keeps_its_approval_text() {
+        let watched = system_with_tools(Connection {
+            human: true,
+            ..connection()
+        });
+        // Word for word as it was, so the prefix a provider cached still holds.
+        let before = " You have tools to read, search, write and edit files and to run commands in the user's project; use them instead of guessing. Writes and commands are shown to the user for approval; a denial is final for that action. Ask with ask_user when a decision is the user's to make, such as a project name. After changing code, verify it (build, test, or run) before reporting done.";
+        assert!(watched.contains(before), "{watched}");
+        assert!(!watched.contains(HEADLESS), "{watched}");
+    }
+
+    #[test]
+    fn hiding_every_tool_offered_hides_none() {
+        let with_tools = Connection {
+            tools: true,
+            ..connection()
+        };
+        let offered = |hide: Vec<String>| {
+            let extra = Extra {
+                hide,
+                ..Default::default()
+            };
+            let budget = Budget::SMALL;
+            let body = body_hashed(&with_tools, &[], None, None, &budget, &extra, None);
+            body["tools"].as_array().unwrap().clone()
+        };
+        let every = offered(Vec::new());
+        let names = every
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str());
+        let names: Vec<String> = names.map(str::to_owned).collect();
+
+        assert_eq!(offered(vec!["read_file".into()]).len(), every.len() - 1);
+        // Some providers turn an empty array down.
+        assert_eq!(offered(names), every);
+    }
+
     #[test]
     fn window_holds_still_so_the_cache_prefix_survives() {
         // Providers cache on an exact prefix, so the front of the request must
@@ -6653,7 +6753,16 @@ mod tests {
         let hashed = |connection: &Connection| {
             let mut prefix = crate::cache_miss::Prefix::default();
             let budget = Budget::SMALL;
-            body_hashed(connection, &[], None, None, &budget, &[], Some(&mut prefix));
+            let extra = Extra::default();
+            body_hashed(
+                connection,
+                &[],
+                None,
+                None,
+                &budget,
+                &extra,
+                Some(&mut prefix),
+            );
             prefix
         };
         let here = connection();

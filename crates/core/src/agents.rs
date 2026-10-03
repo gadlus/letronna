@@ -3908,7 +3908,13 @@ mod tests {
         let session = Session::new("fork-prefix");
         let (endpoint, stub) = Stub::start(vec![reply("", None), reply("Forked and done.", None)]);
         let ctx = session.context(endpoint);
-        let parent = ctx.caller.connection.as_deref().unwrap().clone();
+        // Watched, as a turn sent this way is: a run nobody watches goes
+        // through the driver, whose forks the driver's own tests compare.
+        let parent = Connection {
+            human: true,
+            ..ctx.caller.connection.as_deref().unwrap().clone()
+        };
+        let ctx = ToolContext::of(&parent);
         let mut messages = vec![said("user", "What does notes.txt say? Check it two ways.")];
         // The parent's own request, which the reply that forks answered.
         let events = crate::chat::start(parent, messages.clone());

@@ -71,6 +71,10 @@ pub(crate) const DENY: [&str; 5] = [tools::ASK_USER, "memory", "wake_me", "sched
 /// What a helper is told when it asks the user something.
 const NO_QUESTIONS: &str = "Questions are not available to helpers. Decide for yourself, or end with the open question in your report.";
 
+/// What a session's own run nobody watches is told when it asks the user
+/// something.
+const NOBODY_HERE: &str = "Nobody will answer questions in this run. Decide, record what you assumed, and finish the task.";
+
 /// What a scheduled run is told when it asks the user something.
 const NOBODY_TO_ASK: &str = "Nobody is there to answer in a scheduled run. Decide for yourself and say in your answer what you assumed.";
 
@@ -732,9 +736,15 @@ pub(crate) fn refusal(allow: &Allow, name: &str) -> Option<String> {
 }
 
 /// Why this agent may not call `name`, when it may not: a scheduled run's
-/// own agent as such, any other as `refusal` says.
+/// own agent as such, another nobody watches as such when it asks the user,
+/// any other as `refusal` says.
 fn refused(spec: &Spec, name: &str) -> Option<String> {
     if spec.depth > 0 || crate::schedule::running(spec.root).is_none() {
+        // Not a helper, so not told to end on the open question: with
+        // nobody to read it, that ends the run with the task undone.
+        if name == tools::ASK_USER && unwatched(spec) {
+            return Some(NOBODY_HERE.into());
+        }
         return refusal(&spec.allow, name);
     }
     // It may remember things as a chat may, but has nobody to ask and no
@@ -746,6 +756,47 @@ fn refused(spec: &Spec, name: &str) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Whether this is a session's own run with nobody there to answer it, as
+/// `letronna -p` with no terminal or a schedule is.
+fn unwatched(spec: &Spec) -> bool {
+    spec.depth == 0 && !spec.connection.human
+}
+
+/// The tools a run nobody watches may not call that its requests and its
+/// forks' leave out; none for any other run.
+fn hidden(spec: &Spec) -> Vec<String> {
+    // A fork the agent tool starts begins with its parent's bytes and holds
+    // its parent's Allow, so one of the session's own run leaves out what
+    // that run does, and the two still share a cached prefix. A watched run
+    // is told to ask with ask_user, and any other helper is offered the
+    // whole array, though an unwatched parent's is shorter: those are
+    // refused at the call instead.
+    let own = spec.depth == 0 || (spec.fork && spec.depth == 1);
+    if spec.connection.human || !own {
+        return Vec::new();
+    }
+    // Every run with tools is told to keep what will matter with memory, and
+    // a provider that checks a reply's calls against the array fails a call
+    // of one it left out, where a refusal at the call costs a round.
+    let told = |name: &&str| *name == "memory";
+    // On demand, an MCP tool that --tools allows is reached only through
+    // this pair, as a helper's is (`agents::usable`).
+    let mcp = match &spec.allow {
+        Allow::Only(names) => names.iter().any(|name| crate::mcp_find::is_mcp(name)),
+        _ => false,
+    };
+    let reaching = |name: &&str| {
+        mcp && [crate::mcp_find::FIND_TOOLS, crate::mcp_find::CALL_MCP_TOOL].contains(name)
+    };
+    tools::all()
+        .iter()
+        .map(|tool| tool.name())
+        .filter(|name| !told(name) && !reaching(name))
+        .filter(|name| refused(spec, name).is_some())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Why this agent may not make `call`, when it may not: its tool, or for a
@@ -856,6 +907,7 @@ fn ask_in_line(spec: &Spec, turn: &mut Turn) -> Result<Option<Message>, String> 
 fn ask(spec: &Spec, turn: &mut Turn, permit: Permit) -> Result<Option<Message>, String> {
     let extra = Extra {
         tools: spec.schema.iter().map(answer_tool).collect(),
+        hide: hidden(spec),
         cancel: spec.cancel.clone(),
         guard: Some(Box::new(permit)),
         // A fork's is its parent's, so its requests start as the parent's do.
@@ -1557,6 +1609,115 @@ pub(crate) mod tests {
                 "Questions are not available to helpers. Decide for yourself, or end with the open question in your report."
             ]
         );
+    }
+
+    #[test]
+    fn a_depth_zero_ask_user_is_told_nobody_will_answer() {
+        let dir = scratch("nobody-here");
+        let (endpoint, provider) = provider(vec![
+            reply("", &[("ask_user", json!({"question": "Which framework?"}))]),
+            reply("I kept the one already in use.", &[]),
+        ]);
+        let mut spec = spec(endpoint, &dir, AGENTS + 700);
+        spec.depth = 0;
+        assert_eq!(finished(spec).status, Outcome::Done);
+        let sent = provider.sent();
+
+        assert_eq!(results(&sent[1]), [NOBODY_HERE]);
+    }
+
+    /// The names of the tools the first request of `spec`'s run offers once
+    /// `change` has been made to it, the run answered at once.
+    fn first_offered(dir: &Path, id: AgentId, change: impl FnOnce(&mut Spec)) -> Vec<String> {
+        let (endpoint, provider) = provider(vec![reply("Nothing to do.", &[])]);
+        let mut spec = spec(endpoint, dir, id);
+        change(&mut spec);
+        assert_eq!(finished(spec).status, Outcome::Done);
+        let sent = provider.sent();
+        let tools = sent[0]["tools"].as_array().unwrap();
+        let names = tools
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str());
+        names.map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn ask_user_is_not_offered_to_a_run_nobody_watches() {
+        let dir = scratch("unwatched");
+        let offers = |names: &[String], name: &str| names.iter().any(|n| n == name);
+        let unwatched = first_offered(&dir, AGENTS + 710, |spec| spec.depth = 0);
+        let watched = first_offered(&dir, AGENTS + 720, |spec| {
+            spec.depth = 0;
+            spec.connection.human = true;
+        });
+        let helper = first_offered(&dir, AGENTS + 730, |_| ());
+
+        assert!(offers(&unwatched, "read_file"), "{unwatched:?}");
+        for name in DENY.into_iter().filter(|name| *name != "memory") {
+            assert!(!offers(&unwatched, name), "{name}: {unwatched:?}");
+        }
+        // The prompt tells it to keep things with memory, so it stays.
+        assert!(offers(&unwatched, "memory"), "{unwatched:?}");
+        // Someone is there to be asked, so it goes out as it always has.
+        assert!(offers(&watched, tools::ASK_USER), "{watched:?}");
+        // A helper that is no fork is offered them all, refused at the call.
+        assert!(offers(&helper, tools::ASK_USER), "{helper:?}");
+        assert!(offers(&helper, "memory"), "{helper:?}");
+    }
+
+    #[test]
+    fn a_fork_of_a_run_nobody_watches_is_offered_what_its_parent_is() {
+        let dir = scratch("unwatched-fork");
+        let session = AGENTS + 760;
+        let _listed = crate::schedule::Listed::new(session, &job(&dir, gate::Mode::Default));
+        let only = Allow::Only(vec!["read_file".into(), "list_dir".into()]);
+        // A -p run with and without --tools, and a scheduled run.
+        let runs = [(Allow::All, 7), (only, 7), (Allow::All, session)];
+        for (n, (allow, root)) in runs.into_iter().enumerate() {
+            let id = AGENTS + 770 + 10 * n as AgentId;
+            let parent = first_offered(&dir, id, |spec| {
+                spec.depth = 0;
+                spec.root = root;
+                spec.allow = allow.clone();
+            });
+            let fork = first_offered(&dir, id + 5, |spec| {
+                spec.fork = true;
+                spec.root = root;
+                spec.allow = allow;
+            });
+
+            assert!(!parent.iter().any(|name| name == tools::ASK_USER));
+            // Its first request starts as its parent's do, tools first.
+            assert_eq!(fork, parent, "{root}");
+        }
+    }
+
+    #[test]
+    fn only_the_tools_named_by_allow_only_are_offered() {
+        let dir = scratch("allow-only");
+        let only = |names: &[&str]| Allow::Only(names.iter().map(|n| n.to_string()).collect());
+        let offered = first_offered(&dir, AGENTS + 740, |spec| {
+            spec.depth = 0;
+            spec.allow = only(&["read_file", "list_dir"]);
+        });
+        assert_eq!(offered, ["read_file", "list_dir", "memory"]);
+    }
+
+    #[test]
+    fn an_mcp_tool_allow_only_names_keeps_the_pair_that_reaches_it() {
+        let dir = scratch("allow-mcp");
+        let mut spec = spec(String::new(), &dir, AGENTS + 750);
+        spec.depth = 0;
+        let pair = [crate::mcp_find::FIND_TOOLS, crate::mcp_find::CALL_MCP_TOOL];
+        let hides = |hidden: &[String], name: &str| hidden.iter().any(|n| n == name);
+        spec.allow = Allow::Only(vec!["read_file".into()]);
+        let no_mcp = hidden(&spec);
+        spec.allow = Allow::Only(vec!["read_file".into(), "mcp__big__tool_1".into()]);
+        let mcp = hidden(&spec);
+
+        assert!(pair.iter().all(|name| hides(&no_mcp, name)), "{no_mcp:?}");
+        assert!(hides(&mcp, "write_file"), "{mcp:?}");
+        assert!(!pair.iter().any(|name| hides(&mcp, name)), "{mcp:?}");
     }
 
     #[test]
