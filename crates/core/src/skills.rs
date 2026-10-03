@@ -430,6 +430,27 @@ impl Tool for UseSkill {
     }
 }
 
+/// The skill whose instructions `result` holds a page of, by the name it was
+/// loaded with, and the offset that page starts at; None for any other
+/// result, such as the listing, a file beside the instructions or an error.
+pub(crate) fn instructions_in(result: &backend::Message) -> Option<(String, usize)> {
+    if result.role != "tool" || result.name != UseSkill.name() || result.is_error {
+        return None;
+    }
+    // Read as the call ran them, so a page is known by where it really starts.
+    let args = crate::tools::parse_args_for(&result.name, &result.args).ok()?;
+    let name = args["name"].as_str()?.trim();
+    let file = args["file"].as_str().map(str::trim);
+    if name.is_empty() || name == "?" || file.is_some_and(|f| !f.is_empty()) {
+        return None;
+    }
+    let offset = args["offset"]
+        .as_u64()
+        .and_then(|o| usize::try_from(o).ok())
+        .unwrap_or(0);
+    Some((name.to_owned(), offset))
+}
+
 /// A page of the skill called `name`: where it lives, what is beside it and
 /// its instructions, or with `file`, that file. A skill switched off is out
 /// of reach, and the error says which ones are on.
