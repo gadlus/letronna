@@ -15,6 +15,9 @@ path = "src/main.rs"
 letronna-core.workspace = true
 serde_json.workspace = true
 async-channel.workspace = true
+# When an editor's list of sessions says each was last used; already in the
+# build for core.
+chrono.workspace = true
 # Raw keyboard input and cursor control, on both a Windows console and a
 # terminal that speaks ANSI. Doing it by hand means SetConsoleMode on one and
 # termios on the other, plus decoding key sequences.
