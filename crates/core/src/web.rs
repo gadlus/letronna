@@ -118,7 +118,7 @@ impl Tool for WebFetch {
             "fresh": {"type": "boolean", "description": "Fetch it again even if it was read in the last 15 minutes, for a page that has changed since."}
         }, "required": ["url"]})
     }
-    fn run(&self, args: &Value, _: &ToolContext) -> Result<String, String> {
+    fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         let page = fetch(
             args["url"].as_str().unwrap_or_default(),
             &crate::redact::secrets(),
@@ -126,9 +126,7 @@ impl Tool for WebFetch {
         )?;
         match page {
             Page::Text(text) => Ok(text),
-            // Letronna's own media folder rather than the project's, as for a
-            // browse screenshot: reading a page should not change the project.
-            Page::Pdf { address, bytes } => save_pdf(&ToolContext::default(), &address, &bytes),
+            Page::Pdf { address, bytes } => save_pdf(ctx, &address, &bytes),
         }
     }
     fn needs_approval(&self) -> bool {
@@ -321,7 +319,8 @@ fn pdf(response: reqwest::blocking::Response, address: String) -> Result<Page, S
     Ok(Page::Pdf { address, bytes })
 }
 
-/// Saves a PDF read from `address` under `ctx`'s media folder, saying where
+/// Saves a PDF read from `address` with the outputs kept for `ctx`'s
+/// conversation, or in Letronna's own media folder outside one, saying where
 /// and what it is.
 fn save_pdf(ctx: &ToolContext, address: &str, bytes: &[u8]) -> Result<String, String> {
     // Named for the file the address ends in, else for the site.
@@ -333,7 +332,14 @@ fn save_pdf(ctx: &ToolContext, address: &str, bytes: &[u8]) -> Result<String, St
     let about = file
         .or_else(|| url.as_ref().and_then(|url| url.host_str()))
         .unwrap_or("page");
-    let path = crate::media::save(ctx, about, "pdf", bytes)?;
+    // With the conversation's outputs, which read_file may open and which go
+    // with its session, rather than in the project: reading a page should not
+    // change it. Outside a session read_file may open nothing in Letronna's
+    // own folder, so it goes in the media folder there.
+    let path = match ctx.conversation {
+        0 => crate::media::save(&ToolContext::default(), about, "pdf", bytes)?,
+        n => crate::media::save_in(&crate::tools::results_dir(n), about, "pdf", bytes)?,
+    };
     let pages = match pages(bytes) {
         Some(1) => "1 page, ".to_owned(),
         Some(n) => format!("{n} pages, "),
@@ -1216,13 +1222,15 @@ or <a data-href="/x" href=/top#part>the top</a>.</p>
             panic!("not a PDF: {page:?}");
         };
         assert_eq!(bytes, PDF.as_bytes());
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("letronna-web-pdf-{}", std::process::id()));
-        let ctx = ToolContext {
-            workspace: Some(dir.clone()),
-            ..Default::default()
-        };
-        let said = save_pdf(&ctx, &address, &bytes).unwrap();
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        // Outside a conversation, in Letronna's own media folder.
+        let said = save_pdf(&ToolContext::default(), &address, &bytes).unwrap();
         let path = crate::media::saved(&said).unwrap();
+        assert!(path.starts_with(dir.join("media")), "{path:?}");
         assert_eq!(std::fs::read(&path).unwrap(), PDF.as_bytes());
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         assert!(
@@ -1230,10 +1238,39 @@ or <a data-href="/x" href=/top#part>the top</a>.</p>
             "{name}"
         );
         assert!(said.contains("A PDF of 2 pages, 1 KB, from http"), "{said}");
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
         std::fs::remove_dir_all(dir).unwrap();
 
         let why = fetch(&format!("{base}/scan.pdf"), &[], false).unwrap_err();
         assert!(why.contains("larger than 20 MB"), "{why}");
+    }
+
+    #[test]
+    fn a_fetched_pdf_is_saved_where_read_file_may_open_it() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = crate::store::tests::Scratch::new("web-pdf-read");
+        std::fs::create_dir_all(dir.join("project")).unwrap();
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &*dir) };
+        let in_conversation = |conversation| ToolContext {
+            workspace: Some(dir.join("project")),
+            conversation,
+            ..Default::default()
+        };
+        let (base, _) = serve(papers);
+        let url = json!({"url": format!("{base}/papers/2401.12345v2.pdf")});
+        let said = WebFetch.run(&url, &in_conversation(7)).unwrap();
+        let path = crate::media::saved(&said).unwrap();
+        assert!(path.starts_with(crate::tools::results_dir(7)), "{path:?}");
+
+        let read = json!({"path": path}).to_string();
+        let page = crate::tools::run("read_file", &read, &in_conversation(7)).unwrap();
+        assert!(page.contains("/Type /Pages /Kids [3 0 R 4 0 R]"), "{page}");
+        // It stays this conversation's, and the project is left as it was.
+        assert!(crate::tools::run("read_file", &read, &in_conversation(8)).is_err());
+        assert!(!dir.join("project").join("media").exists());
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 
     #[test]
