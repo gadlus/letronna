@@ -66,6 +66,10 @@ pub struct Conversation {
     /// What the session keeps working toward after each turn, if anything.
     #[serde(default)]
     pub goal: Option<crate::goal::Goal>,
+    /// When the model saves to memory in this session; `None` follows the
+    /// settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_saving: Option<crate::memory::Saving>,
     /// Messages already on disk. Everything past this is appended on save.
     /// Only `flush` and `rewind` should touch it; it is visible because
     /// callers build a Conversation with `..Default::default()`.
@@ -178,6 +182,8 @@ pub struct Meta {
     pub imported_from: Option<crate::import::Source>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<crate::worktree::Worktree>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_saving: Option<crate::memory::Saving>,
 }
 
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -477,9 +483,15 @@ pub struct Settings {
     pub keep_days: u32,
     /// Every few of the user's messages, look back over the session and add
     /// what is worth keeping to memory. Off unless chosen, since each look is
-    /// a model call on the user's account.
+    /// a model call on the user's account, and only while memory is saved
+    /// automatically.
     #[serde(default)]
     pub memory_review: bool,
+    /// When the model saves to memory in a session that has not chosen for
+    /// itself. A file from before the choice reads as only when asked, so an
+    /// update stops the saves nobody asked for.
+    #[serde(default)]
+    pub memory_saving: crate::memory::Saving,
 }
 
 // Written out rather than derived so the film grain, notifications and
@@ -504,6 +516,7 @@ impl Default for Settings {
             keys_in: String::new(),
             fallbacks: Vec::new(),
             memory_review: false,
+            memory_saving: crate::memory::Saving::WhenAsked,
             gateway: String::new(),
             custom_endpoint: String::new(),
             presence: String::new(),
@@ -827,6 +840,25 @@ impl Store {
             .unwrap_or(&self.settings.effort)
     }
 
+    /// When the model saves to memory in the session at `index`: its own
+    /// choice, or the settings' when it has none.
+    pub fn memory_saving(&self, index: usize) -> crate::memory::Saving {
+        self.conversations
+            .get(index)
+            .and_then(|c| c.memory_saving)
+            .unwrap_or(self.settings.memory_saving)
+    }
+
+    /// Have the session at `index` save memory as `chosen` says from its next
+    /// call on, or as the settings say for `None`.
+    pub fn choose_memory_saving(&mut self, index: usize, chosen: Option<crate::memory::Saving>) {
+        let Some(conversation) = self.conversations.get_mut(index) else {
+            return;
+        };
+        conversation.memory_saving = chosen;
+        crate::memory::choose(conversation.id, chosen);
+    }
+
     /// Put the session at `index` on `model` at `gateway`, and start new
     /// sessions there too. Sessions with a model of their own keep it.
     pub fn choose_model(&mut self, index: usize, gateway: &str, model: &str) {
@@ -978,6 +1010,7 @@ fn erase(id: u64, lock: Option<Lock>) {
     crate::history::forget(id);
     crate::lsp::forget(id);
     crate::tasklist::forget(id);
+    crate::memory::forget(id);
 }
 
 /// The file marking when old sessions were last looked for.
@@ -1087,6 +1120,7 @@ impl Conversation {
             goal: self.goal.clone(),
             imported_from: self.imported_from.clone(),
             worktree: self.worktree.clone(),
+            memory_saving: self.memory_saving,
         }
     }
 
@@ -1323,6 +1357,7 @@ impl Conversation {
                 self.goal = meta.goal;
                 self.imported_from = meta.imported_from;
                 self.worktree = meta.worktree;
+                self.memory_saving = meta.memory_saving;
             }
             Record::Message(message) => self.messages.push(message),
             Record::Rewind { to } => {
@@ -1784,6 +1819,8 @@ pub struct Summary {
     pub imported_from: Option<crate::import::Source>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<crate::worktree::Worktree>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_saving: Option<crate::memory::Saving>,
 }
 
 /// The sessions on disk, newest first, without loading what is in them.
@@ -1996,6 +2033,7 @@ fn tally(summary: &mut Summary, bytes: &[u8]) {
                 summary.goal = meta.goal;
                 summary.imported_from = meta.imported_from;
                 summary.worktree = meta.worktree;
+                summary.memory_saving = meta.memory_saving;
             }
             Ok(Record::Message(_)) => summary.messages += 1,
             Ok(Record::Rewind { to }) => summary.messages = summary.messages.min(to),
@@ -3044,6 +3082,7 @@ fn listed(s: Summary) -> Conversation {
         goal: s.goal,
         imported_from: s.imported_from,
         worktree: s.worktree,
+        memory_saving: s.memory_saving,
         counted: s.messages,
         ..Default::default()
     };
@@ -5498,6 +5537,46 @@ pub(crate) mod tests {
             let after = std::fs::read_to_string(sessions.join("1.jsonl")).unwrap();
             assert_eq!(before, after);
         }
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_sessions_memory_choice_is_read_back_and_the_others_follow_the_settings() {
+        use crate::memory::Saving;
+        let _turn = DATA_DIR.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("session-memory");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &dir) };
+        // Settings from before the choice save memory only when asked.
+        let old = super::read_settings(br#"{"endpoint": "", "model": "m"}"#).unwrap();
+        assert_eq!(old.memory_saving, Saving::WhenAsked);
+
+        // Ids no other test's session has, as what a session chose is kept
+        // for the whole process.
+        let (chose, follows) = (9_300_001, 9_300_002);
+        let mut store = Store::default();
+        for id in [chose, follows] {
+            store.conversations.push(Conversation { id, ..numbered(1) });
+        }
+        store.choose_memory_saving(0, Some(Saving::Ask));
+        assert_eq!(crate::memory::saving(chose), Saving::Ask);
+        store.settings.memory_saving = Saving::Auto;
+        store.save().unwrap();
+        let file = dir.join("sessions").join(format!("{follows}.jsonl"));
+        let line = std::fs::read_to_string(file).unwrap();
+        assert!(!line.contains("memory_saving"), "{line}");
+
+        for back in [load(), load_listing()] {
+            let (chose, follows) = (
+                back.index_of(chose).unwrap(),
+                back.index_of(follows).unwrap(),
+            );
+            assert_eq!(back.memory_saving(chose), Saving::Ask);
+            assert_eq!(back.memory_saving(follows), Saving::Auto);
+        }
+        // "Use my default" lets it follow the settings again.
+        store.choose_memory_saving(0, None);
+        assert_eq!(store.memory_saving(0), Saving::Auto);
+        store.remove(0);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 

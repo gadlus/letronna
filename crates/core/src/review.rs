@@ -2,11 +2,11 @@
 //!
 //! The model saves to memory only when it thinks to in the middle of a task,
 //! and a smaller model seldom does, so a preference or a correction the user
-//! gave can be gone by the next session. When the user opts in, a review runs
-//! after every [`EVERY`] of their messages: the session's conversation with
-//! one request added, sent over the session's own connection so the provider
-//! serves the prefix from its cache, on the driver, so the window or the
-//! terminal never waits for it.
+//! gave can be gone by the next session. When the user opts in, and memory is
+//! saved automatically, a review runs after every [`EVERY`] of their messages:
+//! the session's conversation with one request added, sent over the session's
+//! own connection so the provider serves the prefix from its cache, on the
+//! driver, so the window or the terminal never waits for it.
 //!
 //! It may only add, since nobody watches it replace or remove what the user
 //! kept. Each of its calls is put to the session's gate with nobody there to
@@ -98,6 +98,10 @@ pub fn spawn(
     cancel: Cancel,
 ) -> Result<async_channel::Receiver<String>, String> {
     let session = connection.conversation;
+    // In any other mode each save is the user's to ask for or say yes to.
+    if memory::saving(session) != memory::Saving::Auto {
+        return Err("A memory review runs only while memory is saved automatically.".into());
+    }
     let id = crate::agents::fresh_id();
     let from = messages.len();
     let mut conversation = Conversation {
@@ -415,13 +419,20 @@ mod tests {
     }
 
     /// A data folder of its own while the guard is held, since memory is
-    /// written where `AGENT_DATA_DIR` points.
+    /// written where `AGENT_DATA_DIR` points, with memory saved automatically,
+    /// the only way a review runs.
     fn data_folder(name: &str) -> (std::sync::MutexGuard<'static, ()>, Scratch) {
         let turn = crate::store::tests::DATA_DIR
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let dir = Scratch::new(&format!("review-{name}"));
         unsafe { std::env::set_var("AGENT_DATA_DIR", &*dir) };
+        let settings = crate::store::Settings {
+            memory_saving: memory::Saving::Auto,
+            ..Default::default()
+        };
+        let settings = serde_json::to_string(&settings).unwrap();
+        std::fs::write(dir.join("settings.json"), settings).unwrap();
         (turn, dir)
     }
 
@@ -712,6 +723,24 @@ mod tests {
         assert!(results[0].contains("nobody is here"), "{results:?}");
         assert_eq!(results[1], ONLY_ADD);
         assert!(!data.join("made.txt").exists());
+    }
+
+    #[test]
+    fn a_review_starts_only_while_memory_is_saved_automatically() {
+        let (_turn, data) = data_folder("chosen");
+        // Nowhere to send to: one that started would fail rather than hang.
+        let connection = Connection {
+            conversation: 9_400_001,
+            ..connection(String::new())
+        };
+        for saving in [memory::Saving::WhenAsked, memory::Saving::Ask] {
+            memory::choose(9_400_001, Some(saving));
+            let refused = spawn(connection.clone(), exchanges(1), Cancel::default());
+            assert!(refused.is_err(), "{saving:?}");
+        }
+        memory::forget(9_400_001);
+        assert!(!data.join("USER.md").exists());
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 
     #[test]

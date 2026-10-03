@@ -23,6 +23,7 @@
 use crate::chat::{Connection, ToolCall};
 use crate::command::{self, Dialect, Risk};
 use crate::judge::{self, Verdict};
+use crate::memory::Saving;
 use crate::permissions::{self, Rule};
 use crate::tools::{self, Tool, ToolContext};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -541,6 +542,14 @@ fn ladder(
     if let Some(why) = secret(tool.as_ref(), &args, gate.ctx) {
         return sensitive(&why, gate);
     }
+    // When memory is saved is the user's choice, above every mode, grant and
+    // judge: a save they did not ask for is refused, and while they say yes
+    // to each one a person looks at its card, as at a workflow's.
+    if tool.name() == "memory"
+        && let Some(outcome) = remembering(gate)
+    {
+        return outcome;
+    }
     if let Some(rule) = &ruling.ask {
         return asked(rule, gate);
     }
@@ -696,6 +705,19 @@ fn ladder(
          Carry on without it and say what was left undone.",
         tool.name()
     ))
+}
+
+/// What the user's choice of when memory is saved makes of a memory call
+/// under `gate`, or None to decide it as any other call.
+fn remembering(gate: &Gate) -> Option<Outcome> {
+    let session = crate::memory::session_of(gate.ctx);
+    match crate::memory::saving(session) {
+        Saving::Auto => None,
+        Saving::WhenAsked if crate::memory::asked(session) => None,
+        Saving::WhenAsked => Some(Outcome::Refuse(crate::memory::UNASKED.into())),
+        Saving::Ask if gate.human => Some(Outcome::Ask),
+        Saving::Ask => Some(Outcome::Refuse(crate::memory::NOBODY_TO_SAY_YES.into())),
+    }
 }
 
 /// Whether a grant of `call`'s tool lets `call` run on its own arguments,
@@ -3850,5 +3872,65 @@ mod tests {
         let unheld = decide_with(&upload, &gate, Some(&block), false);
         assert!(matches!(unheld, Outcome::Refuse(_)), "{unheld:?}");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_memory_save_waits_for_the_users_word_as_they_chose() {
+        let save = call(
+            "memory",
+            serde_json::json!({"action": "add", "target": "user", "content": "Uses pnpm."}),
+        );
+        let said = |text: &str| crate::chat::Message {
+            role: "user".into(),
+            content: text.into(),
+            ..Default::default()
+        };
+        let none = Grants::new();
+        // A grant for memory is no yes to the next save.
+        let granted = Grants::from([(9_200_001, HashSet::from(["memory".to_owned()]))]);
+        let ctx = ToolContext {
+            conversation: 9_200_001,
+            ..Default::default()
+        };
+        let decided = |mode: Mode, human: bool, grants: &Grants| {
+            let gate = Gate {
+                ctx: &ctx,
+                mode,
+                grants,
+                rules: &[],
+                broken: None,
+                human,
+            };
+            decide(&save, &gate)
+        };
+        crate::memory::choose(9_200_001, Some(Saving::WhenAsked));
+        crate::memory::heard(9_200_001, &[said("Fix the build.")]);
+        for mode in [Mode::Default, Mode::Bypass] {
+            assert_eq!(
+                decided(mode, true, &granted),
+                Outcome::Refuse(crate::memory::UNASKED.into())
+            );
+        }
+        crate::memory::heard(9_200_001, &[said("Remember that I use pnpm.")]);
+        assert_eq!(decided(Mode::Default, false, &none), Outcome::Run);
+
+        crate::memory::choose(9_200_001, Some(Saving::Ask));
+        for mode in [Mode::Default, Mode::Bypass, Mode::Auto] {
+            assert_eq!(decided(mode, true, &granted), Outcome::Ask, "{mode:?}");
+        }
+        // Nobody can say yes in a scheduled run or `-p`, which never waits.
+        assert_eq!(
+            decided(Mode::Bypass, false, &none),
+            Outcome::Refuse(crate::memory::NOBODY_TO_SAY_YES.into())
+        );
+        assert!(matches!(
+            decided(Mode::DontAsk, true, &none),
+            Outcome::Refuse(_)
+        ));
+
+        crate::memory::choose(9_200_001, Some(Saving::Auto));
+        crate::memory::heard(9_200_001, &[said("Fix the build.")]);
+        assert_eq!(decided(Mode::Default, false, &none), Outcome::Run);
+        crate::memory::forget(9_200_001);
     }
 }

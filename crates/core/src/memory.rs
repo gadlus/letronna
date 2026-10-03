@@ -36,13 +36,14 @@
 //! and put any of the last fifty back. It never enters the prompt, and an
 //! entry holding a key is never copied into it.
 
-use crate::chat::Connection;
+use crate::chat::{Connection, Message};
 use crate::tools::{Tool, ToolContext};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 /// The line between entries, as Hermes Agent writes it.
 const SEPARATOR: &str = "\n§\n";
@@ -79,8 +80,307 @@ const KEY_HELD: &str = "[an entry that held a key]";
 /// answers.
 pub(crate) const ALREADY_KEPT: &str = "Already kept.";
 
-/// How the model is told to use its memory, when it has the tool to.
-const GUIDANCE: &str = " You have a memory that outlasts this session: what you know about the user (USER.md), your own notes (MEMORY.md) and, when a project folder is attached, your notes on that project (Project memory), shown below when there is anything in them, and kept with the memory tool. Save what will still matter in a later session -- the user's name and preferences, their setup, corrections they gave you -- and not the progress of the task at hand. Keep what is true of one project alone, such as how to build and test it, in its project memory. Write facts, not instructions to yourself.";
+/// How the model is told to use its memory, when it has the tool to: this,
+/// then the sentence on when to save that `Saving::told` gives, then
+/// `GUIDANCE_ENDS`, so a change of mode moves one sentence of the prompt.
+const GUIDANCE: &str = " You have a memory that outlasts this session: what you know about the user (USER.md), your own notes (MEMORY.md) and, when a project folder is attached, your notes on that project (Project memory), shown below when there is anything in them, and kept with the memory tool.";
+
+/// The guidance's last sentences, the same whenever the model may save.
+const GUIDANCE_ENDS: &str = " Keep what is true of one project alone, such as how to build and test it, in its project memory. Write facts, not instructions to yourself.";
+
+/// What a memory call is told when the user saves memory only when they ask
+/// and the message that opened the turn did not.
+pub(crate) const UNASKED: &str = "Not saved: memory is saved only when the user asks. If this will still matter in a later session, you may offer in one line, such as \"Want me to remember that?\", and save it once they say yes.";
+
+/// What a memory call is told when each save needs the user's yes and nobody
+/// is there to give it, as in a scheduled run or `-p`.
+pub(crate) const NOBODY_TO_SAY_YES: &str = "Not saved: each memory save needs the user's yes, and nobody is here to give it. Say in your answer what you would have kept.";
+
+/// Words that ask to keep or drop something in memory, as words of the
+/// user's message, in English and Indonesian; "remember" also begins one,
+/// as in "remembered".
+const ASKING_WORDS: [&str; 9] = [
+    "ingat",
+    "ingatlah",
+    "diingat",
+    "simpan",
+    "simpanlah",
+    "disimpan",
+    "lupakan",
+    "lupakanlah",
+    "dilupakan",
+];
+
+/// Runs of words that ask to keep or drop something in memory, written as
+/// `words` writes them.
+const ASKING_PHRASES: [&str; 14] = [
+    "to memory",
+    "to your memory",
+    "in your memory",
+    "from your memory",
+    "dont forget",
+    "do not forget",
+    "forget that",
+    "forget this",
+    "forget it",
+    "forget about",
+    "forget my",
+    "keep in mind",
+    "keep that in mind",
+    "jangan lupa",
+];
+
+/// First words that say yes to an offer to remember something, in English
+/// and Indonesian; "save" too, as in "save it".
+const YES: [&str; 16] = [
+    "yes", "yeah", "yep", "yup", "y", "sure", "ok", "okay", "please", "save", "ya", "iya", "boleh",
+    "oke", "sip", "silakan",
+];
+
+/// Openings of a message that say yes in more than a word, written as
+/// `words` writes them.
+const YES_PHRASES: [&str; 2] = [" go ahead ", " do it "];
+
+/// When the model may save to memory, as the user chose for every chat or
+/// for one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Saving {
+    /// Only when the user's message asks it to: what new installs start in,
+    /// and those from before the choice.
+    #[default]
+    WhenAsked,
+    /// Each save waits for the user's yes on a card.
+    Ask,
+    /// Whenever the model sees fit, as before there was a choice; the only
+    /// one the background memory review runs in.
+    Auto,
+}
+
+impl Saving {
+    /// The choices, in the order they are listed.
+    pub const OFFERED: [Saving; 3] = [Saving::WhenAsked, Saving::Ask, Saving::Auto];
+
+    /// The name the saved files use.
+    pub fn name(self) -> &'static str {
+        match self {
+            Saving::WhenAsked => "when_asked",
+            Saving::Ask => "ask",
+            Saving::Auto => "auto",
+        }
+    }
+
+    /// The choice as a person reads it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Saving::WhenAsked => "Only when I ask",
+            Saving::Ask => "Ask each time",
+            Saving::Auto => "Automatically",
+        }
+    }
+
+    /// The choice `text` names: its saved name, with a hyphen for the
+    /// underscore as a flag is written, or its label.
+    pub fn parse(text: &str) -> Result<Saving, String> {
+        let text = text.trim();
+        let named = |saving: &Saving| {
+            text.replace('-', "_").eq_ignore_ascii_case(saving.name())
+                || text.eq_ignore_ascii_case(saving.label())
+        };
+        if let Some(saving) = Saving::OFFERED.into_iter().find(named) {
+            return Ok(saving);
+        }
+        Err(format!(
+            "There is no `{text}` way to save memory; pick when-asked, ask or auto."
+        ))
+    }
+
+    /// The guidance's sentence on when to save.
+    fn told(self) -> &'static str {
+        match self {
+            Saving::WhenAsked => {
+                " Save to it only when the user asks you to remember or forget something; when they say something that will still matter in a later session, such as a preference or a correction, you may offer in one line: \"Want me to remember that?\""
+            }
+            Saving::Ask => {
+                " Save what will still matter in a later session -- the user's name and preferences, their setup, corrections they gave you -- and not the progress of the task at hand; the user says yes to each save."
+            }
+            Saving::Auto => {
+                " Save what will still matter in a later session -- the user's name and preferences, their setup, corrections they gave you -- and not the progress of the task at hand."
+            }
+        }
+    }
+}
+
+impl Serialize for Saving {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.name())
+    }
+}
+
+impl<'de> Deserialize<'de> for Saving {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // A name from a newer Letronna reads as the default rather than
+        // failing the whole file it is in, which would be started afresh.
+        let name = Option::<String>::deserialize(deserializer)?.unwrap_or_default();
+        Ok(Saving::OFFERED
+            .into_iter()
+            .find(|saving| saving.name() == name)
+            .unwrap_or_default())
+    }
+}
+
+/// What decides memory saves in one session's turns.
+#[derive(Clone, Copy, Default)]
+struct Session {
+    /// The session's own choice, which wins over the settings'.
+    chosen: Option<Saving>,
+    /// The user asked in the turn to remember or forget something, or said
+    /// yes to the offer to that came before it.
+    asked: bool,
+}
+
+/// Each session's, by its id. Kept in memory: a frontend says each turn
+/// what the session chose, and each request what its turn asked.
+fn sessions() -> MutexGuard<'static, HashMap<u64, Session>> {
+    static SESSIONS: OnceLock<Mutex<HashMap<u64, Session>>> = OnceLock::new();
+    // Nothing that can panic runs under this lock, so a poisoned one is
+    // still whole.
+    SESSIONS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Has session `session` save memory as `chosen` says from its next call on,
+/// or as the settings say for `None`. A frontend calls it as each turn
+/// starts and when the user picks, with the session's own choice.
+pub fn choose(session: u64, chosen: Option<Saving>) {
+    sessions().entry(session).or_default().chosen = chosen;
+}
+
+/// When session `session` saves memory: its own choice, or the settings'.
+pub fn saving(session: u64) -> Saving {
+    let chosen = sessions().get(&session).and_then(|kept| kept.chosen);
+    chosen.unwrap_or_else(|| crate::store::current_settings().memory_saving)
+}
+
+/// Whether the turn session `session` is in asked to remember or forget
+/// something.
+pub(crate) fn asked(session: u64) -> bool {
+    sessions().get(&session).is_some_and(|kept| kept.asked)
+}
+
+/// Notes whether the turn whose request carries `messages` asked to remember
+/// or forget something, for the calls its reply makes in session `session`.
+pub(crate) fn heard(session: u64, messages: &[Message]) {
+    let asked = asked_in(messages);
+    let mut sessions = sessions();
+    // None is made for a session whose turn asked nothing, as a helper's.
+    match sessions.get_mut(&session) {
+        Some(kept) => kept.asked = asked,
+        None if asked => {
+            sessions.insert(
+                session,
+                Session {
+                    asked,
+                    ..Session::default()
+                },
+            );
+        }
+        None => {}
+    }
+}
+
+/// Forgets what was kept for session `session`, whose id a new session can
+/// be given.
+pub(crate) fn forget(session: u64) {
+    sessions().remove(&session);
+}
+
+/// The session a call in `ctx` is made for: the one its helper works for,
+/// or its own.
+pub(crate) fn session_of(ctx: &ToolContext) -> u64 {
+    match ctx.caller.root {
+        0 => ctx.conversation,
+        root => root,
+    }
+}
+
+/// Whether the user's message that opened the last turn in `messages`, or
+/// one they sent into that turn since, asks to remember or forget something,
+/// or the opening one says yes to an offer to that ended the answer before.
+fn asked_in(messages: &[Message]) -> bool {
+    let Some(at) = messages.iter().rposition(crate::chat::opens_turn) else {
+        return false;
+    };
+    if messages[at..].iter().filter_map(typed).any(asks) {
+        return true;
+    }
+    let Some(opening) = typed(&messages[at]) else {
+        return false;
+    };
+    let answered = messages[..at]
+        .iter()
+        .rfind(|message| message.role == "assistant" && !message.content.trim().is_empty());
+    answered.is_some_and(|answer| offers(&answer.content)) && agrees(opening)
+}
+
+/// What the user typed of `message`, without the files it attached, or None
+/// for a message they did not write.
+fn typed(message: &Message) -> Option<&str> {
+    // A job's output or a helper's report is posted as the user's too, and
+    // asks nothing.
+    (message.role == "user" && !message.notice).then(|| crate::references::typed(&message.content))
+}
+
+/// Whether `text` asks to remember, save or forget something.
+fn asks(text: &str) -> bool {
+    if text.trim_start().starts_with("/remember") {
+        return true;
+    }
+    let words = words(text);
+    words.contains(" remember")
+        || ASKING_WORDS
+            .iter()
+            .any(|word| words.contains(&format!(" {word} ")))
+        || ASKING_PHRASES
+            .iter()
+            .any(|phrase| words.contains(&format!(" {phrase} ")))
+}
+
+/// Whether `answer` ends by offering to remember something, as the model is
+/// told it may.
+fn offers(answer: &str) -> bool {
+    // Its last line, where the model is told to make it.
+    let last = answer.trim_end().lines().last().unwrap_or_default();
+    let words = words(last);
+    last.contains('?')
+        && [" remember", " memor", " save", " ingat", " simpan"]
+            .iter()
+            .any(|word| words.contains(word))
+}
+
+/// Whether `text` starts by saying yes.
+fn agrees(text: &str) -> bool {
+    let words = words(text);
+    let first = words.split_whitespace().next();
+    first.is_some_and(|first| YES.contains(&first))
+        || YES_PHRASES.iter().any(|phrase| words.starts_with(phrase))
+}
+
+/// `text` in lower case as its words, each with a space either side, an
+/// apostrophe dropped so "don't" reads as "dont".
+fn words(text: &str) -> String {
+    let spaced: String = text
+        .to_lowercase()
+        .chars()
+        .filter(|c| !matches!(c, '\'' | '\u{2019}'))
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect();
+    format!(
+        " {} ",
+        spaced.split_whitespace().collect::<Vec<_>>().join(" ")
+    )
+}
 
 /// Who Letronna is, from SOUL.md, when the user has written one.
 pub fn soul() -> Option<String> {
@@ -101,6 +401,8 @@ fn context_in(dir: &Path, connection: &Connection) -> String {
     let mut out = String::new();
     if connection.tools {
         out.push_str(GUIDANCE);
+        out.push_str(saving(connection.conversation).told());
+        out.push_str(GUIDANCE_ENDS);
     }
     let project_notes = connection
         .workspace
@@ -1430,6 +1732,28 @@ impl Tool for Remember {
                 }, "required": ["action"]
             }}
         }, "required": ["target"]})
+    }
+    /// Each change is asked about on its own: a yes to one save is not one
+    /// to the next, and "Automatically" is how to stop being asked.
+    fn asked_each_time(&self) -> bool {
+        true
+    }
+    /// The store and each change, the entry's words as they would be kept.
+    fn preview(&self, args: &Value, _: &ToolContext) -> String {
+        let target = Target::parse(args["target"].as_str().unwrap_or_default());
+        let (Ok(target), Ok(ops)) = (target, operations(args)) else {
+            return args.to_string();
+        };
+        let mut out = format!("Save to {}", target.name());
+        for op in &ops {
+            out.push_str(&match op.action {
+                "add" => format!("\nAdd: {}", op.content),
+                "replace" => format!("\nReplace: {}\nWith: {}", op.old_text, op.content),
+                "remove" => format!("\nRemove: {}", op.old_text),
+                other => format!("\n{other}: {}", op.content),
+            });
+        }
+        out
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         let target = Target::parse(args["target"].as_str().unwrap_or_default())?;
@@ -3283,5 +3607,164 @@ mod tests {
             readable(entry),
             "Red [31mtext]52;c;aGk=2J and olleh\nnext\tline"
         );
+    }
+
+    /// Messages said in turn, the user's first, each a turn of its own.
+    fn talk(said: &[&str]) -> Vec<Message> {
+        let role = |at: usize| {
+            if at.is_multiple_of(2) {
+                "user"
+            } else {
+                "assistant"
+            }
+        };
+        (said.iter().enumerate())
+            .map(|(at, text)| Message {
+                role: role(at).into(),
+                content: (*text).into(),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn asking_to_remember_or_forget_is_heard_in_english_and_indonesian() {
+        for said in [
+            "Remember that I take my coffee black.",
+            "please don't forget my sister's birthday is in May",
+            "Forget that I said I live in Bandung.",
+            "keep in mind I'm on Windows",
+            "Save this to memory: the staging server is staging-2.",
+            "Ingat ya, saya suka teh manis.",
+            "tolong simpan bahwa saya pakai Linux",
+            "Jangan lupa saya vegetarian.",
+            "lupakan alamat lama saya",
+            "/remember I use pnpm",
+        ] {
+            assert!(asked_in(&talk(&[said])), "{said}");
+        }
+        for said in [
+            "Fix the failing test.",
+            "I forgot my password; how do I reset it?",
+            "Save the file as notes.txt.",
+        ] {
+            assert!(!asked_in(&talk(&[said])), "{said}");
+        }
+    }
+
+    #[test]
+    fn a_yes_counts_as_asking_only_after_an_offer_to_remember() {
+        let offered = "Noted, no meat in the recipes.\n\nWant me to remember that?";
+        assert!(asked_in(&talk(&["I'm vegetarian.", offered, "yes please"])));
+        assert!(asked_in(&talk(&["I'm vegetarian.", offered, "Go ahead."])));
+        assert!(asked_in(&talk(&[
+            "Saya vegetarian.",
+            "Mau saya ingat?",
+            "iya"
+        ])));
+        assert!(!asked_in(&talk(&["I'm vegetarian.", offered, "no thanks"])));
+        assert!(!asked_in(&talk(&["Is it done?", "Yes, it builds.", "ok"])));
+        // The yes has to be the turn after the offer.
+        let later = talk(&["I'm vegetarian.", offered, "Make lunch.", "Done.", "yes"]);
+        assert!(!asked_in(&later));
+    }
+
+    #[test]
+    fn a_notice_asks_nothing_and_what_the_user_sent_into_a_turn_does() {
+        let notice = |content: &str| Message {
+            role: "user".into(),
+            content: content.into(),
+            notice: true,
+            ..Default::default()
+        };
+        let mut messages = talk(&["Remember I use pnpm.", "Saved."]);
+        messages.push(notice("Job 3 ended."));
+        assert!(!asked_in(&messages));
+        messages.push(Message {
+            folded: true,
+            ..notice("Remember to check the build.")
+        });
+        assert!(!asked_in(&messages));
+        let mut messages = talk(&["Run the tests."]);
+        messages.push(Message {
+            role: "user".into(),
+            content: "and remember that I use cargo nextest".into(),
+            folded: true,
+            ..Default::default()
+        });
+        assert!(asked_in(&messages));
+    }
+
+    #[test]
+    fn a_saving_choice_reads_by_its_name_or_label_and_a_newer_one_as_the_default() {
+        assert_eq!(Saving::parse("when-asked"), Ok(Saving::WhenAsked));
+        assert_eq!(Saving::parse("Ask each time"), Ok(Saving::Ask));
+        assert_eq!(Saving::parse(" AUTO "), Ok(Saving::Auto));
+        assert!(Saving::parse("sometimes").is_err());
+        assert_eq!(
+            serde_json::to_string(&Saving::WhenAsked).unwrap(),
+            "\"when_asked\""
+        );
+        let read = |text: &str| serde_json::from_str::<Saving>(text).unwrap();
+        assert_eq!(read("\"ask\""), Saving::Ask);
+        assert_eq!(read("\"weekly\""), Saving::WhenAsked);
+        assert_eq!(read("null"), Saving::WhenAsked);
+    }
+
+    #[test]
+    fn the_guidance_changes_only_its_sentence_on_when_to_save() {
+        let dir = scratch("guidance");
+        let said = |session: u64, saving: Saving| {
+            choose(session, Some(saving));
+            let connection = Connection {
+                tools: true,
+                conversation: session,
+                ..Default::default()
+            };
+            let text = context_in(&dir, &connection);
+            forget(session);
+            text
+        };
+        let auto = said(9_100_001, Saving::Auto);
+        // Word for word what every session was told before there was a choice.
+        assert_eq!(
+            auto,
+            " You have a memory that outlasts this session: what you know about the user (USER.md), your own notes (MEMORY.md) and, when a project folder is attached, your notes on that project (Project memory), shown below when there is anything in them, and kept with the memory tool. Save what will still matter in a later session -- the user's name and preferences, their setup, corrections they gave you -- and not the progress of the task at hand. Keep what is true of one project alone, such as how to build and test it, in its project memory. Write facts, not instructions to yourself."
+        );
+        for saving in [Saving::WhenAsked, Saving::Ask] {
+            let text = said(9_100_002, saving);
+            assert_eq!(text.replace(saving.told(), Saving::Auto.told()), auto);
+        }
+        assert!(said(9_100_003, Saving::WhenAsked).contains("\"Want me to remember that?\""));
+    }
+
+    #[test]
+    fn a_session_saves_as_it_chose_and_otherwise_as_the_settings_do() {
+        let session = 9_100_004;
+        choose(session, Some(Saving::Ask));
+        assert_eq!(saving(session), Saving::Ask);
+        heard(session, &talk(&["Remember I use pnpm."]));
+        assert!(asked(session));
+        heard(session, &talk(&["Run the tests."]));
+        assert!(!asked(session));
+        forget(session);
+        assert!(!asked(session));
+    }
+
+    #[test]
+    fn the_card_shows_the_store_and_each_change_word_for_word() {
+        let card = Remember.preview(
+            &json!({"target": "user", "operations": [
+                {"action": "replace", "old_text": "tea", "content": "Drinks coffee, black."},
+                {"action": "add", "content": "Lives in Bandung."},
+                {"action": "remove", "old_text": "Works late"}
+            ]}),
+            &ToolContext::default(),
+        );
+        assert_eq!(
+            card,
+            "Save to USER.md\nReplace: tea\nWith: Drinks coffee, black.\nAdd: Lives in Bandung.\nRemove: Works late"
+        );
+        assert!(Remember.asked_each_time());
     }
 }
