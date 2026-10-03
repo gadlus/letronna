@@ -337,6 +337,8 @@ impl Turn {
             at: crate::chat::now(),
             tool_calls: live.calls,
             replay: live.replay.map(Box::new),
+            // As its request told it, so a later one tells only of a change.
+            mode: self.connection.told_mode(),
             ..Default::default()
         };
         let usage = crate::usage::Usage::of(&reply).priced(endpoint, model);

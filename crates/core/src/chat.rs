@@ -90,6 +90,11 @@ pub struct Message {
     /// For `role: "assistant"`: the user stopped this reply part way.
     #[serde(default)]
     pub interrupted: bool,
+    /// For `role: "assistant"`: the mode the model knew the session was in
+    /// as it replied, as `Connection::told_mode` gives it; None where it
+    /// was told of none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<Mode>,
     /// For `role: "assistant"`: what the provider wants back with this reply.
     // Boxed, since few messages have one and every message is kept in memory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -285,6 +290,23 @@ impl Connection {
     pub fn switch_to(&mut self, mode: Mode) {
         self.mode = mode;
         self.plan = mode == Mode::Plan;
+    }
+
+    /// The mode the model is told its calls are decided in, or None where
+    /// it is told of none: in plan mode, which the system prompt describes,
+    /// and with no tools of this computer to call.
+    pub fn told_mode(&self) -> Option<Mode> {
+        let shared = self.remote.as_ref().is_some_and(|r| r.shared);
+        if !self.tools || shared || self.plan || self.mode == Mode::Plan {
+            return None;
+        }
+        // With nobody to answer, as in a schedule, whatever would ask is
+        // refused. A Default run nobody watches is told of none, as every
+        // Default session is: the system prompt already says it is alone.
+        if !self.human && self.mode != Mode::Default {
+            return Some(Mode::DontAsk);
+        }
+        Some(self.mode)
     }
 
     /// The model Auto mode's judge runs on for calls made on this connection.
@@ -1267,6 +1289,82 @@ fn listed_name(name: &str) -> String {
     format!("{start}…{end}")
 }
 
+/// What the model is told as the session goes into `mode`.
+fn mode_note(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Default => {
+            "Mode: Ask. Writes and commands wait for the user's approval unless they only read or a rule allows them."
+        }
+        Mode::AcceptEdits => {
+            "Mode: Edits. Edits to the project's files run without asking; other actions may wait for approval."
+        }
+        // `told_mode` never gives it, as the system prompt tells plan mode;
+        // these words are only so that every mode has some.
+        Mode::Plan => {
+            "Mode: Plan. Only reading, searching and asking run; nothing that changes the project does."
+        }
+        Mode::Auto => {
+            "Mode: Auto. A safety check decides what no rule settles; its block is final."
+        }
+        Mode::DontAsk => {
+            "Mode: Don't ask. What would need approval is refused instead of asked. Still try what the task needs; if refused, carry on and say what was left undone."
+        }
+        Mode::Bypass => {
+            "Mode: Bypass. Almost everything runs without asking, so check the exact path or target yourself before deleting or overwriting anything."
+        }
+    }
+}
+
+/// The mode note as a request carries it: a notice in the user's turn, so
+/// it never reads as something the user said.
+fn mode_notice(mode: Mode) -> Value {
+    let notice = crate::inbox::Notice {
+        from: "mode".into(),
+        when: crate::inbox::When::Next,
+        text: mode_note(mode).into(),
+    };
+    let content = crate::inbox::fold(&[notice]).map(|folded| folded.content);
+    json!({"role": "user", "content": content.unwrap_or_default()})
+}
+
+/// The mode note a request over `connection` sends before each message of
+/// `window`, or at `window.len()` after them all.
+// Each reply keeps the mode its request told, so every later request puts
+// the note back where that one had it and the cached prefix holds; one more
+// goes out when the connection's mode is not the last told. Kept out of the
+// system prompt, so a switch leaves its bytes alone, and sent only on a
+// change, so a session that stays in Default is told nothing.
+fn mode_notes(connection: &Connection, window: &[Message]) -> Vec<Option<Mode>> {
+    let mut notes = vec![None; window.len() + 1];
+    // Ahead of whatever came after the reply, so the user's words are still
+    // read last, but never between a call and its results.
+    let place = |from: usize, to: usize| {
+        (from..to)
+            .find(|&at| window[at].role != "tool")
+            .unwrap_or(to)
+    };
+    let mut told = Mode::Default;
+    let mut since = 0;
+    for (at, message) in window.iter().enumerate() {
+        if message.role != "assistant" {
+            continue;
+        }
+        if let Some(mode) = message.mode
+            && mode != told
+        {
+            notes[place(since, at)] = Some(mode);
+            told = mode;
+        }
+        since = at + 1;
+    }
+    if let Some(mode) = connection.told_mode()
+        && mode != told
+    {
+        notes[place(since, window.len())] = Some(mode);
+    }
+    notes
+}
+
 /// `body_with`, keeping the hashes of its cached prefix in `prefix` when
 /// given one: only a request that is sent needs them.
 fn body_hashed(
@@ -1322,7 +1420,11 @@ fn body_hashed(
         Vec::new()
     };
     let on_demand = connection.tools && crate::mcp_find::on_demand(&every);
+    let notes = mode_notes(connection, window);
     for (i, m) in window.iter().enumerate() {
+        if let Some(mode) = notes[i] {
+            context.push(mode_notice(mode));
+        }
         // Kept for the user to read; to a provider it is a role it rejects.
         if m.role == crate::failure::ROLE {
             continue;
@@ -1403,6 +1505,9 @@ fn body_hashed(
                     "content": "No result was recorded for this call; it may have run. Check before running it again, and repeat it only if doing so twice is harmless."}));
             }
         }
+    }
+    if let Some(mode) = notes[window.len()] {
+        context.push(mode_notice(mode));
     }
     if marks_cache(connection) {
         mark_cache(&mut context);
@@ -9081,5 +9186,122 @@ mod tests {
                 "{value:?}"
             );
         }
+    }
+
+    /// A session with tools in `mode`, with someone there to answer.
+    fn in_mode(mode: Mode) -> Connection {
+        let mut session = Connection {
+            tools: true,
+            human: true,
+            ..connection()
+        };
+        session.switch_to(mode);
+        session
+    }
+
+    /// The messages a request over `connection` sends for `window`.
+    fn sent_for(connection: &Connection, window: &[Message]) -> Vec<Value> {
+        body(connection, window, None, None)["messages"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
+    /// The mode notes among `sent`, in order.
+    fn mode_notes_in(sent: &[Value]) -> Vec<String> {
+        sent.iter()
+            .filter_map(|message| message["content"].as_str())
+            .filter(|content| content.contains("\n- Mode: "))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The reply a turn over `connection` keeps once "Done." has streamed.
+    fn replied(connection: &Connection) -> Message {
+        let mut turn = crate::agent::Turn::new(connection.clone());
+        turn.absorb(&Event::Delta("Done.".into()));
+        turn.take_reply("test-model")
+    }
+
+    #[test]
+    fn system_prompt_bytes_are_identical_across_default_edits_auto_dont_ask_and_bypass() {
+        let modes = [
+            Mode::Default,
+            Mode::AcceptEdits,
+            Mode::Auto,
+            Mode::DontAsk,
+            Mode::Bypass,
+        ];
+        let asked = [said("user", "tidy the tests")];
+        let system = |mode| sent_for(&in_mode(mode), &asked)[0].clone();
+        for mode in modes {
+            assert_eq!(system(mode), system(Mode::Default), "{mode:?}");
+        }
+        // The mode is told in the conversation instead, as a notice ahead
+        // of what the user said, and Default is told nothing.
+        assert!(mode_notes_in(&sent_for(&in_mode(Mode::Default), &asked)).is_empty());
+        for mode in &modes[1..] {
+            let sent = sent_for(&in_mode(*mode), &asked);
+            assert_eq!(mode_notes_in(&sent).len(), 1, "{mode:?}");
+            let note = sent[1]["content"].as_str().unwrap();
+            assert!(
+                note.starts_with("[Letronna notice: not from the user"),
+                "{note}"
+            );
+            assert!(note.ends_with(mode_note(*mode)), "{note}");
+            assert_eq!(sent[2]["content"], "tidy the tests");
+        }
+    }
+
+    #[test]
+    fn one_note_is_sent_per_mode_change_and_none_repeated() {
+        let mut session = in_mode(Mode::Default);
+        let mut window = vec![said("user", "look around")];
+        window.push(replied(&session));
+        window.push(said("user", "now clean up"));
+        assert!(mode_notes_in(&sent_for(&session, &window)).is_empty());
+
+        session.switch_to(Mode::Bypass);
+        let switched = sent_for(&session, &window);
+        assert_eq!(mode_notes_in(&switched).len(), 1);
+        window.push(replied(&session));
+        window.push(said("user", "and the docs"));
+        let next = sent_for(&session, &window);
+        // Told once, and sent again where it was, so the cached prefix holds.
+        assert_eq!(mode_notes_in(&next).len(), 1);
+        assert_eq!(next[..switched.len()], switched[..]);
+
+        session.switch_to(Mode::Default);
+        let notes = mode_notes_in(&sent_for(&session, &window));
+        assert_eq!(notes.len(), 2);
+        assert!(notes[1].ends_with(mode_note(Mode::Default)), "{notes:?}");
+        // Plan mode is told by the system prompt, and leaves the last note standing.
+        session.switch_to(Mode::Plan);
+        assert_eq!(mode_notes_in(&sent_for(&session, &window)).len(), 1);
+    }
+
+    #[test]
+    fn a_switch_while_tools_run_is_told_after_their_results() {
+        let mut session = in_mode(Mode::Default);
+        let mut window = vec![
+            said("user", "fix the build"),
+            Message {
+                tool_calls: vec![call("c1", "read_file", r#"{"path":"a.rs"}"#)],
+                ..replied(&session)
+            },
+            Message {
+                tool_call_id: "c1".into(),
+                ..said("tool", "fn main() {}")
+            },
+        ];
+        session.switch_to(Mode::AcceptEdits);
+        let sent = sent_for(&session, &window);
+        assert_eq!(sent[3]["role"], "tool");
+        let note = sent[4]["content"].as_str().unwrap();
+        assert!(note.ends_with(mode_note(Mode::AcceptEdits)), "{note}");
+        window.push(replied(&session));
+        let next = sent_for(&session, &window);
+        assert_eq!(next[..sent.len()], sent[..]);
+        assert_eq!(next[5]["role"], "assistant");
     }
 }

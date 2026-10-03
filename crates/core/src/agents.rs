@@ -3255,6 +3255,65 @@ mod tests {
     }
 
     #[test]
+    fn a_bypass_parents_helper_is_told_auto() {
+        let parent = |mode| Connection {
+            endpoint: "http://localhost:11434/v1".into(),
+            model: "test".into(),
+            tools: true,
+            mode,
+            human: true,
+            conversation: 7,
+            ..Default::default()
+        };
+        // The parent's last reply, as its turn kept it, starts a helper.
+        let started = |parent: &Connection| {
+            let mut turn = crate::agent::Turn::new(parent.clone());
+            turn.absorb(&crate::chat::Event::Delta("Handing it over.".into()));
+            let reply = turn.take_reply("test");
+            let asked = Message {
+                role: "user".into(),
+                content: "tidy the docs".into(),
+                ..Default::default()
+            };
+            let call = crate::chat::ToolCall {
+                id: "a1".into(),
+                name: "agent".into(),
+                arguments: r#"{"prompt": "look"}"#.into(),
+            };
+            vec![
+                asked,
+                Message {
+                    tool_calls: vec![call],
+                    ..reply
+                },
+            ]
+        };
+        let told = |helper: &Connection, messages: &[Message]| -> Vec<String> {
+            let sent = crate::chat::body(helper, messages, None, None);
+            sent["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|message| message["content"].as_str())
+                .filter_map(|content| content.split_once("\n- Mode: "))
+                .map(|(_, note)| note.split('.').next().unwrap_or_default().to_owned())
+                .collect()
+        };
+        let bypass = parent(Mode::Bypass);
+        let helper = child(&bypass, &AgentDef::default(), None, &usual(), FIRST_ID);
+        let fork = forked(started(&bypass), None, directive("look"));
+        assert_eq!(told(&helper, &fork), ["Bypass", "Auto"]);
+        // One started afresh hears its own mode with its task.
+        let task = task(&AgentDef::default(), &[], "look");
+        assert_eq!(told(&helper, &[task]), ["Auto"]);
+        // A helper in its parent's own mode hears nothing more of it.
+        let edits = parent(Mode::AcceptEdits);
+        let helper = child(&edits, &AgentDef::default(), None, &usual(), FIRST_ID);
+        let fork = forked(started(&edits), None, directive("look"));
+        assert_eq!(told(&helper, &fork), ["Edits"]);
+    }
+
+    #[test]
     fn a_helper_reaches_the_mcp_tools_its_type_allows_when_they_go_out_on_demand() {
         use crate::mcp_find::tests::{fake, server, wrapped};
         let mut served = server(40, 30);
