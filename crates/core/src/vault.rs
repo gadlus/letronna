@@ -448,12 +448,17 @@ fn what(name: &str) -> String {
         .strip_prefix("messaging.")
         .and_then(|rest| rest.split_once('.'))
     {
-        Some((app, _)) => {
+        Some((app, field)) => {
             let mut app = app.to_owned();
             if let Some(first) = app.get_mut(..1) {
                 first.make_ascii_uppercase();
             }
-            format!("your {app} token")
+            let kind = if field == "password" {
+                "password"
+            } else {
+                "token"
+            };
+            format!("your {app} {kind}")
         }
         None => name.to_owned(),
     }
@@ -967,7 +972,7 @@ mod wincred {
 pub(crate) mod tests {
     use super::{
         FAKE, Index, KEYS, Open, RETRY, SERVICE, Vault, claim, keep, move_in, move_out, service,
-        trouble,
+        trouble, what,
     };
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1493,6 +1498,45 @@ pub(crate) mod tests {
         fn drop(&mut self) {
             let _ = self.0.delete("key");
         }
+    }
+
+    #[test]
+    fn a_mail_app_password_is_kept_in_the_vault_and_hidden_like_a_token() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = data("mail");
+        let vault = fake();
+        let chats = crate::messaging::Config {
+            email: crate::messaging::Email {
+                enabled: true,
+                password: "abcd-efgh-ijkl-mnop".into(),
+                to: "reports@example.com".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        crate::messaging::save(&chats).unwrap();
+        assert_eq!(
+            vault.holds("messaging.email.password").as_deref(),
+            Some("abcd-efgh-ijkl-mnop")
+        );
+        let file = read(dir.join("messaging.json"));
+        assert_eq!(file["email"]["password"], "");
+        assert_eq!(file["email"]["to"], "reports@example.com");
+
+        restart(&vault);
+        assert_eq!(
+            crate::messaging::load().email.password,
+            "abcd-efgh-ijkl-mnop"
+        );
+        assert!(
+            crate::redact::secrets()
+                .iter()
+                .any(|secret| secret == "abcd-efgh-ijkl-mnop")
+        );
+        assert_eq!(what("messaging.email.password"), "your Email password");
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 
     #[cfg(target_os = "macos")]
