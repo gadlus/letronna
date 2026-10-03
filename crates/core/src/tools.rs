@@ -1370,6 +1370,23 @@ fn run_shell_into(
             Ok(None) => {}
             Err(e) => break Err(e.to_string()),
         }
+        // Stopped, it would sit until the limit and then move to the
+        // background still stopped, a job nothing can ever answer.
+        #[cfg(unix)]
+        if stopped_at_terminal(&child) {
+            if let Some(tree) = &tree {
+                tree.kill();
+            }
+            let _ = child.kill();
+            break Err(
+                "It stopped to wait for input at the terminal, which nobody can \
+                 answer, and was ended. Run it so that it asks nothing: pipe the \
+                 answers in, or use a flag such as --yes, ssh -o BatchMode=yes or \
+                 DEBIAN_FRONTEND=noninteractive. A password prompt, such as sudo's, \
+                 is the user's to answer: ask them to run that step."
+                    .into(),
+            );
+        }
         if started.elapsed() > limit {
             if owner.is_some() && tree.is_some() {
                 break Ok(None);
@@ -1510,6 +1527,30 @@ fn run_shell_into(
         }
     }
     Ok(cut_around(text, &gaps, &note))
+}
+
+/// Whether `child`, not yet reaped, is stopped for reading from or setting up
+/// the terminal, as a password or host key prompt does.
+#[cfg(unix)]
+fn stopped_at_terminal(child: &std::process::Child) -> bool {
+    // A command runs in a process group of its own, outside the terminal's
+    // foreground group, so a read from /dev/tty stops that whole group with
+    // SIGTTIN, and changing its settings, as hiding a password does, with
+    // SIGTTOU. Only those two stops mean it waits on the terminal.
+    let pid = child.id() as libc::pid_t;
+    // SAFETY: an all-zero siginfo_t is valid, and its pid stays zero unless
+    // waitid reports the child.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // WNOWAIT leaves the stop to be seen again, and only stops are asked
+    // for, so an exit is still reaped by `try_wait`.
+    let flags = libc::WSTOPPED | libc::WNOHANG | libc::WNOWAIT;
+    // SAFETY: `info` is a valid siginfo_t to write to.
+    let asked = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags) };
+    // SAFETY: waitid filled in the pid and, for a stop, the signal.
+    asked == 0
+        && unsafe { info.si_pid() } == pid
+        && info.si_code == libc::CLD_STOPPED
+        && matches!(unsafe { info.si_status() }, libc::SIGTTIN | libc::SIGTTOU)
 }
 
 /// `text` cut to `MAX_OUTPUT` around the output left out at `gaps`, with
@@ -4933,6 +4974,53 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
         }
         assert!(!alive(), "process {pid} outlived the stop");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_command_stopped_by_the_terminal_is_ended_at_once_and_says_why() {
+        let dir = std::env::temp_dir().join(format!("letronna-tty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Reading /dev/tty from outside the terminal's foreground group stops
+        // the reader's whole group with SIGTTIN; sending it here does the same
+        // without a terminal, which a test run may not have.
+        let command = "sleep 60 & echo $! > grandchild; kill -TTIN 0; echo x > after";
+        // With an owner, so one left stopped would come back as a job at the
+        // limit rather than as an error.
+        let started = Instant::now();
+        let out = run_shell_saving(
+            shell(command, Some(&dir)),
+            command,
+            &Cancel::default(),
+            None,
+            Duration::from_secs(20),
+            Some(7_704),
+        );
+        let out = out.unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "it waited for the limit: {out}"
+        );
+        assert!(
+            out.starts_with("It stopped to wait for input at the terminal"),
+            "{out}"
+        );
+        assert!(out.contains("--yes"), "{out}");
+        let pid: libc::pid_t = std::fs::read_to_string(dir.join("grandchild"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: signal 0 only asks whether the process is there.
+        let alive = || unsafe { libc::kill(pid, 0) == 0 };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while alive() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(!alive(), "process {pid} was left stopped");
+        assert!(!dir.join("after").exists(), "it ran on after the stop");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
