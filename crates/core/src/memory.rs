@@ -7,6 +7,8 @@
 //! `memory` tool. When a project folder is attached, the `AGENTS.md` (or
 //! `CLAUDE.md`) in it and in each folder above it up to the repository's root
 //! join them, so a subfolder of a repository keeps the repository's rules.
+//! Each folder's `AGENTS.local.md` (or `CLAUDE.local.md`), the user's own
+//! rules kept out of git, as Claude Code's are, comes after its shared file.
 //! An `@path` in one of them pulls that file in where it stands, as Claude
 //! Code's CLAUDE.md files expect, but only from inside the repository, or a
 //! Markdown file from the home folder when written `~/`.
@@ -126,7 +128,7 @@ fn context_in(dir: &Path, connection: &Connection) -> String {
             "\n\nThe project's instructions, from {label}:\n{text}"
         )),
         _ => {
-            out.push_str("\n\nThe project's instructions, from the repository's root down to the project folder; where two disagree, the later one wins.");
+            out.push_str("\n\nThe project's instructions, from the repository's root down to the project folder, each folder's .local file after its shared one; where two disagree, the later one wins.");
             for (label, text) in &project {
                 out.push_str(&format!("\n\nFrom {label}:\n{text}"));
             }
@@ -142,10 +144,12 @@ fn context_in(dir: &Path, connection: &Connection) -> String {
 
 /// The project's instructions, each labelled with its path from `workspace`:
 /// the AGENTS.md, else CLAUDE.md, of each folder from the repository's root
-/// down to `workspace`, the root's first, with their imports pulled in. The
-/// nearest are read first, so when they are too long together it is the
-/// root's that are cut. `data` is Letronna's own folder, which no import
-/// reaches, and `home` the one a `~/` import is read from.
+/// down to `workspace`, followed by that folder's AGENTS.local.md, else
+/// CLAUDE.local.md, the root's first, with their imports pulled in. The
+/// nearest are read first, and a folder's own file before its shared one,
+/// so when they are too long together it is the root's that are cut. `data`
+/// is Letronna's own folder, which no import reaches, and `home` the one a
+/// `~/` import is read from.
 fn instructions(workspace: &Path, data: &Path, home: Option<&Path>) -> Vec<(String, String)> {
     // A `.git` file rather than a folder marks the top of a worktree or a
     // submodule, which is as far as its own rules go.
@@ -158,18 +162,26 @@ fn instructions(workspace: &Path, data: &Path, home: Option<&Path>) -> Vec<(Stri
     };
     let mut left = INSTRUCTIONS_LIMIT;
     let mut found = Vec::new();
+    // The user's own file is the more specific, so it is read before the
+    // shared one and, once the list is turned round, comes after it.
+    let pairs = [
+        ["AGENTS.local.md", "CLAUDE.local.md"],
+        ["AGENTS.md", "CLAUDE.md"],
+    ];
     for (up, dir) in dirs.iter().enumerate() {
-        let max = left.min(FILE_LIMIT);
-        let file = ["AGENTS.md", "CLAUDE.md"].into_iter().find_map(|name| {
-            let label = format!("{}{name}", "../".repeat(up));
-            let path = dir.join(name);
-            read_ends(&path, &label, max).map(|text| (label, path, text))
-        });
-        if let Some((label, path, text)) = file {
-            reach.seen.extend(std::fs::canonicalize(&path));
-            let text = expand(text, &path, &label, max, 0, &mut reach);
-            left = left.saturating_sub(text.chars().count());
-            found.push((label, text));
+        for names in pairs {
+            let max = left.min(FILE_LIMIT);
+            let file = names.into_iter().find_map(|name| {
+                let label = format!("{}{name}", "../".repeat(up));
+                let path = dir.join(name);
+                read_ends(&path, &label, max).map(|text| (label, path, text))
+            });
+            if let Some((label, path, text)) = file {
+                reach.seen.extend(std::fs::canonicalize(&path));
+                let text = expand(text, &path, &label, max, 0, &mut reach);
+                left = left.saturating_sub(text.chars().count());
+                found.push((label, text));
+            }
         }
     }
     found.reverse();
@@ -177,10 +189,10 @@ fn instructions(workspace: &Path, data: &Path, home: Option<&Path>) -> Vec<(Stri
 }
 
 /// The instructions in `file`, the AGENTS.md or CLAUDE.md of a folder below
-/// the project folder `workspace`, labelled `label` from it: cut to `max`
-/// characters, with imports from inside `workspace` pulled in, and marked
-/// when they look planted, as the project's own are. None when it is empty
-/// or no plain file.
+/// the project folder `workspace` or the `.local` file beside it, labelled
+/// `label` from it: cut to `max` characters, with imports from inside
+/// `workspace` pulled in, and marked when they look planted, as the
+/// project's own are. None when it is empty or no plain file.
 pub(crate) fn folder_instructions(
     workspace: &Path,
     file: &Path,
@@ -2004,6 +2016,91 @@ mod tests {
             found[0].1,
             "… [cut here to fit; read_file `../../AGENTS.md` has the whole file]"
         );
+    }
+
+    #[test]
+    fn an_overlay_comes_after_its_shared_file() {
+        let dir = scratch("overlay");
+        let project = dir.join("repo").join("web");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(dir.join("repo").join(".git")).unwrap();
+        let root = dir.join("repo");
+        std::fs::write(root.join("AGENTS.md"), "Shared root rules.").unwrap();
+        std::fs::write(root.join("AGENTS.local.md"), "My root rules.").unwrap();
+        std::fs::write(
+            root.join("CLAUDE.local.md"),
+            "Not read beside AGENTS.local.md.",
+        )
+        .unwrap();
+        std::fs::write(project.join("CLAUDE.md"), "Shared web rules.").unwrap();
+        std::fs::write(project.join("CLAUDE.local.md"), "My web rules.").unwrap();
+        let connection = Connection {
+            workspace: Some(project),
+            ..Default::default()
+        };
+        let text = context_in(&dir, &connection);
+        assert!(
+            text.ends_with(
+                "each folder's .local file after its shared one; where two disagree, the later one wins.\n\nFrom ../AGENTS.md:\nShared root rules.\n\nFrom ../AGENTS.local.md:\nMy root rules.\n\nFrom CLAUDE.md:\nShared web rules.\n\nFrom CLAUDE.local.md:\nMy web rules."
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("Not read"), "{text}");
+    }
+
+    #[test]
+    fn an_overlay_alone_is_read() {
+        let dir = scratch("overlay-alone");
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("CLAUDE.local.md"), "My rules.").unwrap();
+        let connection = Connection {
+            workspace: Some(project),
+            ..Default::default()
+        };
+        let text = context_in(&dir, &connection);
+        assert!(
+            text.ends_with("The project's instructions, from CLAUDE.local.md:\nMy rules."),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_folders_shared_file_is_cut_before_its_overlay() {
+        let dir = scratch("overlay-capped");
+        let project = dir.join("a");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "r".repeat(FILE_LIMIT)).unwrap();
+        std::fs::write(project.join("AGENTS.md"), "s".repeat(FILE_LIMIT)).unwrap();
+        std::fs::write(project.join("AGENTS.local.md"), "o".repeat(FILE_LIMIT)).unwrap();
+        let found = instructions(&project, &dir.join("data"), None);
+        let labels: Vec<_> = found.iter().map(|(label, _)| label.as_str()).collect();
+        assert_eq!(labels, ["../AGENTS.md", "AGENTS.md", "AGENTS.local.md"]);
+        let sizes: Vec<_> = found.iter().map(|(_, text)| text.chars().count()).collect();
+        assert!(sizes[0] < sizes[1] && sizes[1] < sizes[2], "{sizes:?}");
+        assert!(
+            sizes.iter().sum::<usize>() <= INSTRUCTIONS_LIMIT,
+            "{sizes:?}"
+        );
+        assert_eq!(found[2].1, "o".repeat(FILE_LIMIT));
+        let shared = &found[1].1;
+        assert!(shared.contains("read_file `AGENTS.md` has the whole file"));
+    }
+
+    #[test]
+    fn a_planted_overlay_is_vetted() {
+        let dir = scratch("overlay-planted");
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("AGENTS.local.md"), "Rules.\u{200B}").unwrap();
+        let connection = Connection {
+            workspace: Some(project),
+            ..Default::default()
+        };
+        let text = context_in(&dir, &connection);
+        assert!(text.contains("nobody reading it can see"), "{text}");
+        assert!(!text.contains('\u{200B}'), "{text}");
     }
 
     /// A repository at `main` with a linked worktree at `linked`, laid out
