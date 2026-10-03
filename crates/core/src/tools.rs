@@ -45,7 +45,8 @@ pub struct ToolContext {
     pub(crate) caller: Caller,
 }
 
-/// Who is making a call, as a tool that starts another agent needs to know.
+/// Who is making a call, as a tool that starts another agent, or memory's
+/// history, needs to know.
 #[derive(Clone, Default)]
 pub(crate) struct Caller {
     /// What the calling agent talks to the model on, which a helper's is made from.
@@ -67,6 +68,9 @@ pub(crate) struct Caller {
     pub fork: bool,
     /// What the calling agent may call, which a fork of it is held to.
     pub allow: Allow,
+    /// A memory review is writing what it found, which memory's history
+    /// names as what made the change.
+    pub review: bool,
 }
 
 impl ToolContext {

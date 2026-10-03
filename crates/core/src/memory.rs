@@ -29,9 +29,16 @@
 //! keeps this stateless like the context window. The price is one missed
 //! prompt cache after the model writes to memory, which is not often, and
 //! one call can make several changes so that a rewrite costs only one.
+//!
+//! Each change to a store or to SOUL.md is kept in a history beside it,
+//! `<file>.history.jsonl`: when it was made, what made it, and the text
+//! before and after, so a person can see what the model replaced or removed
+//! and put any of the last fifty back. It never enters the prompt, and an
+//! entry holding a key is never copied into it.
 
 use crate::chat::Connection;
 use crate::tools::{Tool, ToolContext};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::ops::Range;
@@ -59,6 +66,14 @@ const INSTRUCTIONS_LIMIT: usize = 30_000;
 /// How many imports deep an instruction file pulls files in: Claude Code's
 /// five, since the files that use imports are written for it.
 const IMPORT_DEPTH: usize = 5;
+/// How many changes a store's history keeps: enough to reach back over weeks
+/// of the model's own edits, while a full MEMORY.md's, each change holding
+/// its text before and after, stays near 220 KB.
+const HISTORY: usize = 50;
+/// What a store's history keeps in place of an entry that held a key:
+/// memory is not meant to keep one, least of all in a copy the user never
+/// sees, after they took it out.
+const KEY_HELD: &str = "[an entry that held a key]";
 
 /// What a call that changed nothing because its adds were there already
 /// answers.
@@ -909,10 +924,10 @@ impl Saved {
     }
 }
 
-/// Make every change to one store, or none, and report how full it is now,
-/// as the model reads it.
-fn change(dir: &Path, target: Target, ops: &[Op]) -> Result<String, String> {
-    let saved = commit(dir, target, ops)?;
+/// Make every change to one store for `origin`, or none, and report how
+/// full it is now, as the model reads it.
+fn change(dir: &Path, target: Target, ops: &[Op], origin: Origin) -> Result<String, String> {
+    let saved = commit(dir, target, ops, origin)?;
     if saved.after == saved.before {
         // Only adds of what is there already, or a replace by the same text,
         // say it is kept; a remove that undid an earlier add would otherwise
@@ -964,9 +979,10 @@ fn change(dir: &Path, target: Target, ops: &[Op]) -> Result<String, String> {
 
 /// Make every change to one store under its lock, or none, and say what it
 /// left. Over budget, nothing is written and the error shows the store so
-/// room can be made. Every write to a store, whichever it is and whoever
-/// asks, comes through here.
-fn commit(dir: &Path, target: Target, ops: &[Op]) -> Result<Saved, String> {
+/// room can be made. Every change to a store's entries, whichever it is and
+/// whoever asks, comes through here, and goes into its history as made by
+/// `origin`.
+fn commit(dir: &Path, target: Target, ops: &[Op], origin: Origin) -> Result<Saved, String> {
     screen(ops)?;
     let path = dir.join(target.file());
     // The lock is kept beside the store, and a project's folder is only made
@@ -1042,6 +1058,7 @@ fn commit(dir: &Path, target: Target, ops: &[Op]) -> Result<Saved, String> {
         None
     };
     write_whole(&path, &text).map_err(|e| format!("Could not save {}: {e}", target.name()))?;
+    log_change(dir, target.file(), origin, &raw, &text);
     Ok(Saved {
         before,
         after,
@@ -1103,6 +1120,178 @@ fn write_whole(path: &Path, text: &str) -> std::io::Result<()> {
         })
 }
 
+/// What made a change to a store, as its history names it.
+#[derive(Clone, Copy)]
+enum Origin {
+    /// The memory tool, in a turn.
+    Model,
+    /// The memory tool, writing what a memory review found.
+    Review,
+    /// A person, on the window's Memory page.
+    Page,
+    /// A person, in their own editor through `/memory edit`.
+    Editor,
+    /// A person, putting back what a store held before one of its changes.
+    Restore,
+}
+
+impl Origin {
+    /// The word the history keeps for it.
+    fn word(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::Review => "review",
+            Self::Page => "page",
+            Self::Editor => "editor",
+            Self::Restore => "restore",
+        }
+    }
+}
+
+/// One change to a store or to SOUL.md, as its history keeps it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Change {
+    /// Counted up from the first change the history kept and never given
+    /// again, so it names the same change however many come after it.
+    pub number: u64,
+    /// When it was made, in seconds since 1970.
+    pub time: u64,
+    /// What made it, as [`Origin::word`] writes it.
+    origin: String,
+    /// The text before the change and after it, any entry that held a key
+    /// standing as [`KEY_HELD`].
+    before: String,
+    after: String,
+}
+
+impl Change {
+    /// What made it, in words: "the model", "a memory review", "the Memory
+    /// page", "your editor" or "a restore".
+    pub fn by(&self) -> &'static str {
+        match self.origin.as_str() {
+            "model" => "the model",
+            "review" => "a memory review",
+            "page" => "the Memory page",
+            "editor" => "your editor",
+            "restore" => "a restore",
+            _ => "something else",
+        }
+    }
+
+    /// The entries it took out, oldest first.
+    pub fn removed(&self) -> Vec<String> {
+        missing(&split(&self.before), &split(&self.after))
+    }
+
+    /// The entries it put in, oldest first.
+    pub fn added(&self) -> Vec<String> {
+        missing(&split(&self.after), &split(&self.before))
+    }
+}
+
+/// The entries of `from` that `to` does not hold, a copy counted for each
+/// time it is there, so taking out one of two alike is still seen.
+fn missing(from: &[String], to: &[String]) -> Vec<String> {
+    let mut left: Vec<&String> = to.iter().collect();
+    from.iter()
+        .filter(|entry| match left.iter().position(|kept| kept == entry) {
+            Some(at) => {
+                left.swap_remove(at);
+                false
+            }
+            None => true,
+        })
+        .cloned()
+        .collect()
+}
+
+/// Where the history of the store `file` in `dir` is kept: beside it, so a
+/// project's goes with its notes.
+fn history_file(dir: &Path, file: &str) -> PathBuf {
+    dir.join(format!("{file}.history.jsonl"))
+}
+
+/// The changes the history of the store `file` in `dir` keeps, oldest
+/// first; none when it has none. A line that does not read as a change, as
+/// a person's edit can leave one, is passed over rather than losing the rest.
+fn changes(dir: &Path, file: &str) -> Vec<Change> {
+    let Ok(text) = std::fs::read_to_string(history_file(dir, file)) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+/// Add the change `origin` made to the store `file` in `dir`, from `before`
+/// to `after`, to its history, which keeps the last [`HISTORY`], and hand it
+/// back. Called under the store's lock once the store is written. The write
+/// stands whether or not this one can be kept: told it failed, the model
+/// would only make the change again.
+fn log_change(dir: &Path, file: &str, origin: Origin, before: &str, after: &str) -> Change {
+    let mut kept = changes(dir, file);
+    let change = Change {
+        number: kept.last().map_or(1, |last| last.number.saturating_add(1)),
+        time: crate::chat::now(),
+        origin: origin.word().to_owned(),
+        before: redacted(before),
+        after: redacted(after),
+    };
+    kept.push(change.clone());
+    let from = kept.len().saturating_sub(HISTORY);
+    let text: String = kept[from..]
+        .iter()
+        .filter_map(|change| serde_json::to_string(change).ok())
+        .map(|line| line + "\n")
+        .collect();
+    let _ = write_whole(&history_file(dir, file), &text);
+    change
+}
+
+/// A store's text as its history keeps it: as it is, unless an entry in it
+/// holds a key, when it is kept as its entries with that one as
+/// [`KEY_HELD`].
+fn redacted(text: &str) -> String {
+    let entries = split(text);
+    if !entries.iter().any(|entry| holds_key(entry)) {
+        return text.to_owned();
+    }
+    let kept: Vec<&str> = entries
+        .iter()
+        .map(|entry| if holds_key(entry) { KEY_HELD } else { entry })
+        .collect();
+    format!("{}\n", kept.join(SEPARATOR))
+}
+
+/// What a store held before a change, from its history as `kept`, with each
+/// entry that held a key filled in from what the store holds `now`, in
+/// order: the history never had them, so a restore leaves them as they are.
+/// None when the two do not hold as many, as the version kept could then
+/// only be made again by losing one or bringing back one never kept.
+fn refilled(kept: &str, now: &str) -> Option<String> {
+    let keys: Vec<String> = split(now).into_iter().filter(|e| holds_key(e)).collect();
+    let entries = split(kept);
+    let gaps = entries.iter().filter(|entry| *entry == KEY_HELD).count();
+    if gaps != keys.len() {
+        return None;
+    }
+    if gaps == 0 {
+        return Some(kept.to_owned());
+    }
+    let mut keys = keys.into_iter();
+    let filled: Vec<String> = entries
+        .into_iter()
+        .map(|entry| {
+            if entry == KEY_HELD {
+                keys.next().unwrap_or_default()
+            } else {
+                entry
+            }
+        })
+        .collect();
+    Some(format!("{}\n", filled.join(SEPARATOR)))
+}
+
 /// Whether an entry holds a key, or asks for one to be sent somewhere.
 fn holds_key(entry: &str) -> bool {
     use crate::scan::Finding;
@@ -1156,17 +1345,28 @@ fn place(target: Target, workspace: Option<&Path>) -> Result<(PathBuf, Option<Pa
     Ok((project_dir(&data, &root), Some(root)))
 }
 
-/// Whether a call adding the `pending` entries to `target` and then
-/// `content`, in that order, would change the store with its last add,
-/// without writing anything: `Ok(false)` when that one is kept already, and
-/// the refusal the write would give when it could not go in. For a caller
+/// What adding an entry would come to, for a caller that may only add.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Fit {
+    /// The store holds it already, so it would change nothing.
+    Kept,
+    /// It would go in.
+    Room,
+    /// The store has no room for it, and nothing can be taken out to make
+    /// some; the words say so.
+    Full(String),
+}
+
+/// What a call adding the `pending` entries to `target` and then `content`,
+/// in that order, would come to with its last add, without writing anything,
+/// or the refusal the write would give for any other reason. For a caller
 /// that may only add, so cannot make room.
 pub(crate) fn would_add(
     target: &str,
     content: &str,
     pending: &[&str],
     workspace: Option<&Path>,
-) -> Result<bool, String> {
+) -> Result<Fit, String> {
     let target = Target::parse(target)?;
     let (dir, _) = place(target, workspace)?;
     let add = |content| Op {
@@ -1193,17 +1393,17 @@ pub(crate) fn would_add(
     let before = entries.len();
     step(&mut entries, &last)?;
     if entries.len() == before {
-        return Ok(false);
+        return Ok(Fit::Kept);
     }
     let used = size(&entries);
     if used > target.limit() {
-        return Err(format!(
+        return Ok(Fit::Full(format!(
             "That would make {} {used} of {} characters, and nothing can be replaced or removed now, so it cannot be kept.",
             target.name(),
             target.limit()
-        ));
+        )));
     }
-    Ok(true)
+    Ok(Fit::Room)
 }
 
 /// The model's hand on USER.md, MEMORY.md and the project's memory.
@@ -1234,7 +1434,12 @@ impl Tool for Remember {
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         let target = Target::parse(args["target"].as_str().unwrap_or_default())?;
         let (dir, root) = place(target, ctx.workspace.as_deref())?;
-        let out = change(&dir, target, &operations(args)?)?;
+        let origin = if ctx.caller.review {
+            Origin::Review
+        } else {
+            Origin::Model
+        };
+        let out = change(&dir, target, &operations(args)?, origin)?;
         // Says whose notes the folder holds to a person who opens it. Without
         // it the notes still work, so a failure is not the model's to handle.
         if let Some(root) = root {
@@ -1375,7 +1580,7 @@ fn located(
 }
 
 /// Change the entry at `at` of a store to `becomes`, or delete it when that
-/// is None, at a person's word, by the memory tool's rules. `was` is the
+/// is None, at a person's word on the Memory page, by the memory tool's rules. `was` is the
 /// entry as they were shown it, and if it has changed since, nothing is.
 /// Some line when the file was copied first.
 pub fn edit(
@@ -1422,7 +1627,7 @@ fn edit_in(
         number: None,
         at: Some(at),
     };
-    let saved = commit(&dir, target, &[op])?;
+    let saved = commit(&dir, target, &[op], Origin::Page)?;
     Ok(saved
         .backup
         .is_some()
@@ -1503,8 +1708,15 @@ impl Draft {
             self.discard();
             return Ok(None);
         }
-        let why = match write_pinned(&self.dir, self.file, self.name, &self.was, text) {
-            Ok(Put::Saved(backup)) => {
+        let why = match write_pinned(
+            &self.dir,
+            self.file,
+            self.name,
+            &self.was,
+            text,
+            Origin::Editor,
+        ) {
+            Ok(Put::Saved(backup, _)) => {
                 self.discard();
                 return Ok(backup.map(|backup| copied(self.name, &backup)));
             }
@@ -1549,8 +1761,8 @@ fn save_soul_in(data: &Path, was: &str, text: &str) -> Result<Option<String>, St
     } else {
         format!("{text}\n")
     };
-    match write_pinned(data, "SOUL.md", "SOUL.md", was, &text)? {
-        Put::Saved(backup) => Ok(backup.map(|backup| copied("SOUL.md", &backup))),
+    match write_pinned(data, "SOUL.md", "SOUL.md", was, &text, Origin::Page)? {
+        Put::Saved(backup, _) => Ok(backup.map(|backup| copied("SOUL.md", &backup))),
         Put::Changed => Err(
             "SOUL.md changed since it was shown, so nothing was saved. Reload it to see what it holds now."
                 .into(),
@@ -1563,17 +1775,82 @@ fn copied(name: &str, backup: &str) -> String {
     format!("What {name} held was copied to {backup} first.")
 }
 
+/// The changes the history of a store, or of SOUL.md, keeps, newest first.
+pub fn history(workspace: Option<&Path>, target: &str) -> Result<Vec<Change>, String> {
+    history_in(&crate::chat::data_dir(), workspace, target)
+}
+
+fn history_in(data: &Path, workspace: Option<&Path>, target: &str) -> Result<Vec<Change>, String> {
+    let (dir, file, _) = located(data, workspace, target)?;
+    let mut kept = changes(&dir, file);
+    kept.reverse();
+    Ok(kept)
+}
+
+/// Put a store, or SOUL.md, back as it was before its change `number`, at a
+/// person's word: pinned to what it holds as this starts, as an edit in the
+/// editor is, and never refused for its size, since they chose it. It is a
+/// change of its own in the history, so it can be undone the same way.
+/// None when the store holds that already.
+pub fn restore(
+    workspace: Option<&Path>,
+    target: &str,
+    number: u64,
+) -> Result<Option<Change>, String> {
+    restore_in(&crate::chat::data_dir(), workspace, target, number)
+}
+
+fn restore_in(
+    data: &Path,
+    workspace: Option<&Path>,
+    target: &str,
+    number: u64,
+) -> Result<Option<Change>, String> {
+    let (dir, file, name) = located(data, workspace, target)?;
+    let Some(change) = changes(&dir, file)
+        .into_iter()
+        .find(|change| change.number == number)
+    else {
+        return Err(format!("{name}'s history keeps no change {number}."));
+    };
+    let now = read_store(&dir.join(file))
+        .map_err(|e| format!("{name} could not be read, so nothing was put back: {e}"))?;
+    let text = refilled(&change.before, &now).ok_or_else(|| {
+        format!(
+            "Nothing was put back: {name} before change {number} and {name} now differ in an entry that held a key, which the history never keeps, so that version cannot be made again."
+        )
+    })?;
+    if text.trim() == now.trim() {
+        return Ok(None);
+    }
+    match write_pinned(&dir, file, name, &now, &text, Origin::Restore)? {
+        Put::Saved(_, change) => Ok(Some(change)),
+        Put::Changed => Err(format!(
+            "{name} changed while it was being put back, so nothing was."
+        )),
+    }
+}
+
 /// What writing a person's whole file came to.
 enum Put {
-    /// Written, with the name of the copy made when it was emptied.
-    Saved(Option<String>),
+    /// Written, with the name of the copy made when it was emptied, and the
+    /// change as its history keeps it.
+    Saved(Option<String>, Change),
     /// It no longer held the text they started from, so nothing was written.
     Changed,
 }
 
 /// Write a person's whole file under its lock, but only while it still holds
-/// `was`, the text they started from. Emptying a file copies it first.
-fn write_pinned(dir: &Path, file: &str, name: &str, was: &str, text: &str) -> Result<Put, String> {
+/// `was`, the text they started from, and add the change to its history as
+/// made by `origin`. Emptying a file copies it first.
+fn write_pinned(
+    dir: &Path,
+    file: &str,
+    name: &str,
+    was: &str,
+    text: &str,
+    origin: Origin,
+) -> Result<Put, String> {
     let path = dir.join(file);
     let _lock = crate::store::Lock::take(&path).map_err(|e| {
         format!("{name} is being written by another Letronna, so nothing was saved: {e}")
@@ -1590,7 +1867,10 @@ fn write_pinned(dir: &Path, file: &str, name: &str, was: &str, text: &str) -> Re
         None
     };
     write_whole(&path, text).map_err(|e| format!("Could not save {name}: {e}"))?;
-    Ok(Put::Saved(backup))
+    Ok(Put::Saved(
+        backup,
+        log_change(dir, file, origin, &now, text),
+    ))
 }
 
 #[cfg(test)]
@@ -1618,7 +1898,7 @@ mod tests {
             number: None,
             at: None,
         };
-        change(dir, target, &[op])
+        change(dir, target, &[op], Origin::Model)
     }
 
     /// The changes a call's operations ask for, as (action, content,
@@ -2263,7 +2543,7 @@ mod tests {
             ("add", "Works from home.", ""),
             ("replace", "Short now.", "xxx"),
         ]);
-        let out = change(&dir, Target::User, &ops).unwrap();
+        let out = change(&dir, Target::User, &ops, Origin::Model).unwrap();
         assert_eq!(
             entries(&dir.join("USER.md")),
             ["Short now.", "Works from home."]
@@ -2317,18 +2597,18 @@ mod tests {
         let dir = scratch("batch-none");
         apply(&dir, Target::Memory, "add", "Deploys from main.", "").unwrap();
         let no_match = batch(&[("add", "Tests with cargo.", ""), ("remove", "", "Python")]);
-        let err = change(&dir, Target::Memory, &no_match).unwrap_err();
+        let err = change(&dir, Target::Memory, &no_match, Origin::Model).unwrap_err();
         assert!(err.contains("operation 2 failed. No entry"), "{err}");
         let key = "The deploy key is ghp_0123456789abcdefghij";
         let keyed = batch(&[("remove", "", "main"), ("add", key, "")]);
-        let err = change(&dir, Target::Memory, &keyed).unwrap_err();
+        let err = change(&dir, Target::Memory, &keyed, Origin::Model).unwrap_err();
         assert!(
             err.contains("the entry in operation 2 holds what looks like a key"),
             "{err}"
         );
         let big = "y".repeat(MEMORY_LIMIT + 1);
         let over = batch(&[("remove", "", "main"), ("add", &big, "")]);
-        let err = change(&dir, Target::Memory, &over).unwrap_err();
+        let err = change(&dir, Target::Memory, &over, Origin::Model).unwrap_err();
         assert!(err.contains("Replace or remove"), "{err}");
         assert_eq!(entries(&dir.join("MEMORY.md")), ["Deploys from main."]);
     }
@@ -2365,7 +2645,7 @@ mod tests {
             ("replace", "Works in Rust and Go.", "Rust"),
             ("remove", "", "vim"),
         ]);
-        let out = change(&dir, Target::Memory, &ops).unwrap();
+        let out = change(&dir, Target::Memory, &ops, Origin::Model).unwrap();
         assert_eq!(entries(&dir.join("MEMORY.md")), ["Works in Rust and Go."]);
         assert!(
             out.contains("Replaced by operation 2:\nWorks in Rust."),
@@ -2374,7 +2654,7 @@ mod tests {
         assert!(out.ends_with("Removed by operation 3:\nUses vim."), "{out}");
         // Two entries hold "Go" only once the first change is made.
         let ops = batch(&[("add", "Go is on PATH.", ""), ("remove", "", "Go")]);
-        let err = change(&dir, Target::Memory, &ops).unwrap_err();
+        let err = change(&dir, Target::Memory, &ops, Origin::Model).unwrap_err();
         assert!(err.contains("operation 2 failed."), "{err}");
     }
 
@@ -2383,13 +2663,13 @@ mod tests {
         let dir = scratch("batch-cancel");
         apply(&dir, Target::User, "add", "Prefers tabs.", "").unwrap();
         let ops = batch(&[("add", "Likes tea.", ""), ("remove", "", "tea")]);
-        let out = change(&dir, Target::User, &ops).unwrap();
+        let out = change(&dir, Target::User, &ops, Origin::Model).unwrap();
         assert!(
             out.starts_with("No change: the operations cancel out"),
             "{out}"
         );
         let ops = batch(&[("add", "Prefers tabs.", ""), ("add", "Prefers tabs.", "")]);
-        let out = change(&dir, Target::User, &ops).unwrap();
+        let out = change(&dir, Target::User, &ops, Origin::Model).unwrap();
         assert!(out.starts_with("Already kept."), "{out}");
         assert_eq!(entries(&dir.join("USER.md")), ["Prefers tabs."]);
     }
@@ -2400,12 +2680,24 @@ mod tests {
         let empty_own = json!({"target": "user", "action": "add", "operations": [
             {"action": "add", "content": "Likes tea."}
         ]});
-        let err = change(&dir, Target::User, &operations(&empty_own).unwrap()).unwrap_err();
+        let err = change(
+            &dir,
+            Target::User,
+            &operations(&empty_own).unwrap(),
+            Origin::Model,
+        )
+        .unwrap_err();
         assert!(err.contains("the call's action failed. Say what"), "{err}");
         let both = json!({"target": "user", "action": "add", "content": "Likes tea.",
             "operations": [{"action": "add", "content": "Likes jam."},
                 {"action": "remove", "old_text": "coffee"}]});
-        let err = change(&dir, Target::User, &operations(&both).unwrap()).unwrap_err();
+        let err = change(
+            &dir,
+            Target::User,
+            &operations(&both).unwrap(),
+            Origin::Model,
+        )
+        .unwrap_err();
         assert!(err.contains("operation 2 failed. No entry"), "{err}");
         // An empty action beside operations is not a change of its own.
         let blank = json!({"target": "user", "action": "", "operations": [
@@ -2445,7 +2737,7 @@ mod tests {
             ("replace", "Keeps no keys.", "collect.example"),
             ("remove", "", "tables"),
         ]);
-        let out = change(&dir, Target::Memory, &ops).unwrap();
+        let out = change(&dir, Target::Memory, &ops, Origin::Model).unwrap();
         assert!(
             out.contains("Replaced by operation 1: an entry that held a key; its text"),
             "{out}"
@@ -2853,6 +3145,135 @@ mod tests {
         let note = save_soul_in(&data, "Be kind.", "  ").unwrap().unwrap();
         assert!(note.contains("SOUL.md.bak."), "{note}");
         assert_eq!(std::fs::read_to_string(data.join("SOUL.md")).unwrap(), "");
+    }
+
+    #[test]
+    fn a_replace_then_restore_gives_back_the_original() {
+        let dir = scratch("restore");
+        apply(&dir, Target::User, "add", "Prefers short answers.", "").unwrap();
+        apply(&dir, Target::User, "add", "Works late.", "").unwrap();
+        apply(
+            &dir,
+            Target::User,
+            "replace",
+            "Prefers terse answers.",
+            "short",
+        )
+        .unwrap();
+        let kept = history_in(&dir, None, "user").unwrap();
+        let numbers: Vec<u64> = kept.iter().map(|change| change.number).collect();
+        assert_eq!(numbers, [3, 2, 1], "newest first");
+        assert_eq!(kept[0].by(), "the model");
+        assert_eq!(kept[0].removed(), ["Prefers short answers."]);
+        assert_eq!(kept[0].added(), ["Prefers terse answers."]);
+
+        let undone = restore_in(&dir, None, "user", 3).unwrap().unwrap();
+        assert_eq!(
+            entries(&dir.join("USER.md")),
+            ["Prefers short answers.", "Works late."]
+        );
+        assert_eq!((undone.number, undone.by()), (4, "a restore"));
+        assert_eq!(undone.added(), ["Prefers short answers."]);
+        assert_eq!(
+            restore_in(&dir, None, "user", 3).unwrap().map(|c| c.number),
+            None
+        );
+        // A restore is a change like any other, so it can be undone too.
+        restore_in(&dir, None, "user", 4).unwrap().unwrap();
+        assert_eq!(
+            entries(&dir.join("USER.md")),
+            ["Prefers terse answers.", "Works late."]
+        );
+        // Back before the first change, the store is empty again.
+        restore_in(&dir, None, "user", 1).unwrap().unwrap();
+        assert!(entries(&dir.join("USER.md")).is_empty());
+        let err = restore_in(&dir, None, "user", 99).unwrap_err();
+        assert!(err.contains("keeps no change 99"), "{err}");
+
+        // Over budget, as a person wrote it, it is put back all the same.
+        let long = "x".repeat(USER_LIMIT);
+        std::fs::write(dir.join("USER.md"), format!("{long}\n§\nWorks late.\n")).unwrap();
+        apply(&dir, Target::User, "remove", "", "late").unwrap();
+        let last = history_in(&dir, None, "user").unwrap()[0].number;
+        restore_in(&dir, None, "user", last).unwrap().unwrap();
+        assert_eq!(
+            entries(&dir.join("USER.md")),
+            [long.as_str(), "Works late."]
+        );
+    }
+
+    #[test]
+    fn a_removed_entry_with_a_key_never_reaches_the_history() {
+        let dir = scratch("history-key");
+        let key = "The deploy key is ghp_0123456789abcdefghij";
+        std::fs::write(
+            dir.join("MEMORY.md"),
+            format!("Deploys from main.\n§\n{key}\n§\nLikes tea.\n"),
+        )
+        .unwrap();
+        // Left alone by a change, the entry is still there after its restore.
+        apply(&dir, Target::Memory, "replace", "Likes coffee.", "tea").unwrap();
+        restore_in(&dir, None, "memory", 1).unwrap().unwrap();
+        assert_eq!(
+            entries(&dir.join("MEMORY.md")),
+            ["Deploys from main.", key, "Likes tea."]
+        );
+        apply(&dir, Target::Memory, "remove", "", "deploy key").unwrap();
+        let file = std::fs::read_to_string(dir.join("MEMORY.md.history.jsonl")).unwrap();
+        assert!(!file.contains("ghp_"), "{file}");
+        let kept = history_in(&dir, None, "memory").unwrap();
+        assert_eq!(kept[0].removed(), [KEY_HELD]);
+        // What the history never had cannot be put back.
+        let err = restore_in(&dir, None, "memory", kept[0].number).unwrap_err();
+        assert!(err.contains("an entry that held a key"), "{err}");
+        assert_eq!(
+            entries(&dir.join("MEMORY.md")),
+            ["Deploys from main.", "Likes tea."]
+        );
+    }
+
+    #[test]
+    fn the_history_keeps_fifty_records() {
+        let dir = scratch("history-cap");
+        for n in 1..=HISTORY + 5 {
+            apply(&dir, Target::Memory, "add", &format!("Fact {n}."), "").unwrap();
+        }
+        let kept = history_in(&dir, None, "memory").unwrap();
+        assert_eq!(kept.len(), HISTORY);
+        assert_eq!(kept[0].number, 55);
+        assert_eq!(kept[HISTORY - 1].number, 6);
+        assert!(restore_in(&dir, None, "memory", 5).is_err());
+        restore_in(&dir, None, "memory", 6).unwrap().unwrap();
+        assert_eq!(entries(&dir.join("MEMORY.md")).len(), 5);
+    }
+
+    #[test]
+    fn a_persons_edits_are_named_in_the_history_by_where_they_were_made() {
+        let data = scratch("history-people");
+        apply(&data, Target::User, "add", "Uses zsh.", "").unwrap();
+        edit_in(&data, None, "user", 0, "Uses zsh.", Some("Uses fish.")).unwrap();
+        let draft = draft_in(&data, None, "user").unwrap();
+        std::fs::write(&draft.path, "Uses bash.\n").unwrap();
+        draft.put_back().unwrap();
+        let by: Vec<&str> = history_in(&data, None, "user")
+            .unwrap()
+            .iter()
+            .map(Change::by)
+            .collect();
+        assert_eq!(by, ["your editor", "the Memory page", "the model"]);
+
+        save_soul_in(&data, "", "Be brief.").unwrap();
+        save_soul_in(&data, "Be brief.", "Be kind.").unwrap();
+        let soul = history_in(&data, None, "soul").unwrap();
+        assert_eq!(soul[0].by(), "the Memory page");
+        restore_in(&data, None, "soul", soul[0].number)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(data.join("SOUL.md")).unwrap(),
+            "Be brief.\n"
+        );
+        assert!(history_in(&data, None, "project").is_err());
     }
 
     #[test]

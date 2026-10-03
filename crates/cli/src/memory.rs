@@ -8,8 +8,14 @@
 //! the file meanwhile, as `crontab -e` does. What the file holds afterwards
 //! is only reported on, never refused, since it is the user's own; the
 //! memory tool still keeps the model to the budgets.
+//!
+//! `/memory log` lists what changed each store, the model's replaces and
+//! removes among it, and `/memory restore` puts a store back as it was
+//! before one of those changes. A restore is a change of its own, so it can
+//! be undone the same way.
 
-use letronna_core::memory::{self, Store};
+use letronna_core::chat;
+use letronna_core::memory::{self, Change, Store};
 use std::path::{Path, PathBuf};
 
 use crate::render;
@@ -18,20 +24,116 @@ use crate::session::Runner;
 /// What `/memory edit` takes, as the listing shows the stores.
 const TARGETS: [&str; 4] = ["user", "memory", "project", "soul"];
 
-/// `/memory`, or `/memory edit` and the store to open.
+/// How many changes of each store `/memory log` shows when it lists them
+/// all: what changed lately fits on a screen, and one store's log has the
+/// rest.
+const LATEST: usize = 5;
+
+/// `/memory`, or `/memory edit` and the store to open, `/memory log` and the
+/// store whose changes to list, or `/memory restore`, the store and the
+/// change to put it back before.
 pub fn memory(runner: &mut Runner, rest: &str, workspace: Option<&Path>) {
     render::blank();
-    let (word, target) = rest.split_once(' ').unwrap_or((rest, ""));
-    let target = match target.trim() {
+    let (word, given) = rest.split_once(' ').unwrap_or((rest, ""));
+    let given = given.trim();
+    let target = match given {
         "" => "memory",
         target => target,
     };
-    match word {
-        "" => list(workspace),
-        "edit" if TARGETS.contains(&target) => edit(runner, target, workspace),
+    match (word, change_named(given)) {
+        ("", _) => list(workspace),
+        ("edit", _) if TARGETS.contains(&target) => edit(runner, target, workspace),
+        ("log", _) if given.is_empty() => {
+            for target in TARGETS {
+                // Without a project folder there is no project memory, so
+                // nothing it changed to show.
+                if target != "project" || workspace.is_some() {
+                    log(target, workspace, LATEST);
+                }
+            }
+        }
+        ("log", _) if TARGETS.contains(&target) => log(target, workspace, usize::MAX),
+        ("restore", Some((target, number))) => restore(target, number, workspace),
         _ => render::line(&render::red(
-            "Usage: /memory, or /memory edit user|memory|project|soul.",
+            "Usage: /memory, /memory edit or log user|memory|project|soul, or /memory restore user|memory|project|soul and a change's number.",
         )),
+    }
+}
+
+/// The store and the number of the change `/memory restore` names, as
+/// `user 12`.
+fn change_named(given: &str) -> Option<(&'static str, u64)> {
+    let (target, number) = given.split_once(' ')?;
+    let target = TARGETS.into_iter().find(|known| *known == target)?;
+    Some((target, number.trim().parse().ok()?))
+}
+
+/// A store's changes, newest first and at most `most` of them, each with
+/// what it took out and put in.
+fn log(target: &str, workspace: Option<&Path>, most: usize) {
+    let changes = match memory::history(workspace, target) {
+        Ok(changes) => changes,
+        Err(error) => return render::line(&render::red(&error)),
+    };
+    let name = memory::store(workspace, target).map_or(target, |store| store.name);
+    render::line(&render::bold(name));
+    if changes.is_empty() {
+        render::line(&render::dim("  no changes kept yet"));
+    }
+    for change in changes.iter().take(most) {
+        render::line(&format!(
+            "{}  {}",
+            render::bold(&format!("{:>4}", change.number)),
+            render::dim(&format!("{}, by {}", chat::ago(change.time), change.by()))
+        ));
+        changed(change);
+    }
+    if changes.len() > most {
+        render::line(&render::dim(&format!(
+            "  {} earlier: /memory log {target}",
+            changes.len() - most
+        )));
+    }
+    render::blank();
+}
+
+/// Each entry a change took out and put in, on a line of its own, cut to
+/// the screen and with nothing in it that acts on the terminal.
+fn changed(change: &Change) {
+    let (removed, added) = (change.removed(), change.added());
+    if removed.is_empty() && added.is_empty() {
+        render::line(&render::dim("        the same entries, laid out anew"));
+    }
+    let room = render::width().saturating_sub(8);
+    let marked = |mark: String, entry: &str| {
+        let entry = render::fit(&memory::readable(entry), room);
+        render::line(&format!("      {mark} {entry}"));
+    };
+    for entry in &removed {
+        marked(render::red("-"), entry);
+    }
+    for entry in &added {
+        marked(render::green("+"), entry);
+    }
+}
+
+/// Put a store back as it was before one of its changes, and say what that
+/// took out and put back, and how to undo it.
+fn restore(target: &str, number: u64, workspace: Option<&Path>) {
+    let name = memory::store(workspace, target).map_or(target, |store| store.name);
+    match memory::restore(workspace, target, number) {
+        Err(error) => render::line(&render::red(&error)),
+        Ok(None) => render::line(&render::dim(&format!(
+            "{name} already holds what it did before change {number}."
+        ))),
+        Ok(Some(change)) => {
+            render::line(&format!("{name} is as it was before change {number}."));
+            changed(&change);
+            render::line(&render::dim(&format!(
+                "This is change {0}; /memory restore {target} {0} undoes it.",
+                change.number
+            )));
+        }
     }
 }
 
@@ -66,7 +168,7 @@ fn list(workspace: Option<&Path>) {
         }
     }
     render::line(&render::dim(
-        "Change one in your editor with /memory edit user|memory|project|soul.",
+        "Change one in your editor with /memory edit user|memory|project|soul, and see what changed with /memory log.",
     ));
 }
 
@@ -285,6 +387,16 @@ mod tests {
             split("'my editor' -f ''"),
             ("my editor".into(), "-f|".into())
         );
+    }
+
+    #[test]
+    fn a_restore_names_a_known_store_and_a_change_number() {
+        assert_eq!(change_named("user 12"), Some(("user", 12)));
+        assert_eq!(change_named("soul  3 "), Some(("soul", 3)));
+        assert_eq!(change_named("user"), None);
+        assert_eq!(change_named("notes 3"), None);
+        assert_eq!(change_named("user twelve"), None);
+        assert_eq!(change_named(""), None);
     }
 
     #[test]

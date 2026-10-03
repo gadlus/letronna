@@ -161,7 +161,7 @@ pub const COMMANDS: &[Command<'static>] = &[
     },
     Command {
         name: "/memory",
-        blurb: "what is kept between sessions; /memory edit user|memory|project|soul",
+        blurb: "what is kept between sessions; /memory edit, log or restore user|memory|project|soul",
     },
     Command {
         name: "/resume",
