@@ -622,7 +622,8 @@ pub fn offers_plan(connection: &Connection) -> bool {
 /// where other people read the replies, so is everything that touches this
 /// computer; `read_chat` exists only where there is a chat to read, and
 /// `exit_plan` only where there is a plan to hand over and someone to take it.
-/// The tools the user switched off are never offered.
+/// A scheduled run's own turn with nobody to answer it goes without what such
+/// a run is refused. The tools the user switched off are never offered.
 /// MCP tools too many to send go out on demand, through `find_tools` and
 /// `call_mcp_tool` (see `mcp_find`).
 pub fn specs(connection: &Connection) -> Vec<Value> {
@@ -643,9 +644,16 @@ pub(crate) fn specs_of(
         .as_ref()
         .is_some_and(|r| r.history.is_some());
     let disabled = turned_off();
+    // A scheduled run's own turn that nobody answers is told so by the
+    // system prompt, whether the driver or the window runs it, so its array
+    // leaves out what the run would be refused.
+    let scheduled = !connection.human
+        && connection.remote.is_none()
+        && crate::schedule::running(connection.conversation).is_some();
     tools
         .iter()
         .filter(|t| !switched_off(t.name(), &disabled))
+        .filter(|t| !scheduled || !crate::schedule::NOT_AVAILABLE.contains(&t.name()))
         .filter(|t| crate::mcp_find::in_array(t.name(), on_demand))
         .filter(|t| !connection.plan || !t.mutates() || t.name() == "run_command")
         .filter(|t| t.name() != EXIT_PLAN || offers_plan(connection))

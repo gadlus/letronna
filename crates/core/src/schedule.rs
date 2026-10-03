@@ -460,6 +460,10 @@ impl Running {
     }
 }
 
+/// The tools a scheduled run's own turn is refused, and with nobody there to
+/// answer it not offered either, whichever frontend runs the turn.
+pub(crate) const NOT_AVAILABLE: [&str; 4] = [tools::ASK_USER, "wake_me", "schedule", "workflow"];
+
 /// The scheduled run going on in session `session` here, if there is one. A
 /// call from it or from one of its helpers is decided in its schedule's mode,
 /// never in the mode of the frontend answering it.
@@ -2174,6 +2178,42 @@ mod tests {
         }
         let alone = act(None, &list, &ToolContext::default()).unwrap_err();
         assert!(alone.contains("not run by this Letronna"), "{alone}");
+    }
+
+    #[test]
+    fn a_window_turn_in_a_scheduled_run_nobody_answers_is_offered_what_the_run_may_call() {
+        // A session number no other test lists a run in.
+        let session = 9_000_002;
+        let offered = |human: bool| -> Vec<String> {
+            let connection = crate::chat::Connection {
+                tools: true,
+                conversation: session,
+                human,
+                ..Default::default()
+            };
+            let specs = crate::tools::specs(&connection);
+            let names = specs.iter().filter_map(|t| t["function"]["name"].as_str());
+            names.map(str::to_owned).collect()
+        };
+        let offers = |names: &[String], name: &str| names.iter().any(|n| n == name);
+        let listed = Listed::new(session, &every(1, 60, 0));
+        // The window sets `human` from the run's mode: false where the run
+        // decides without the user, true in Default, where a call waits.
+        let unanswered = offered(false);
+        let answered = offered(true);
+        drop(listed);
+        let ended = offered(false);
+
+        for name in [crate::tools::ASK_USER, "schedule"] {
+            assert!(!offers(&unanswered, name), "{name}: {unanswered:?}");
+            assert!(offers(&answered, name), "{name}: {answered:?}");
+            // Any other run nobody watches goes through the driver, which
+            // leaves out its own.
+            assert!(offers(&ended, name), "{name}: {ended:?}");
+        }
+        // The prompt tells it to keep what will matter with memory.
+        assert!(offers(&unanswered, "memory"), "{unanswered:?}");
+        assert!(offers(&unanswered, "read_file"), "{unanswered:?}");
     }
 
     #[test]
