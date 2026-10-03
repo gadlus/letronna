@@ -40,9 +40,11 @@
 //! answer again, since only its last message is printed or sent. A list an
 //! earlier turn left is not counted, since the new prompt may be about
 //! something else, nor is a `todo` call the run was refused, which set
-//! nothing. A run someone watches live, as an editor's turn over ACP is, and
-//! a chat app's are not sent back at all: a person answers what they end
-//! with, as in the window.
+//! nothing. So is one that would end with a file changed or gone that its
+//! request seems to say to leave unchanged, to put it back if it does. A run
+//! someone watches live, as an editor's turn over ACP is, and a chat app's
+//! are not sent back at all: a person answers what they end with, as in the
+//! window.
 //! A session's own run that would end without touching a file its request
 //! names under `in/` is told so once, as a notice, to read it or say why not.
 //! A run someone answers as it ends, an editor's turn over ACP or a chat
@@ -70,6 +72,7 @@ use crate::store::{Todo, Transcript};
 use crate::structured;
 use crate::tasks::{self, Key};
 use crate::tools::{self, Caller, ToolContext};
+use crate::unchanged::{self, Unchanged};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::path::Path;
@@ -384,6 +387,9 @@ fn steps(
     let inputs = asked_to_read(spec);
     let mut pointed = false;
     let mut verified = false;
+    // Before the first call, so a change any call makes shows.
+    let kept = left_alone(spec);
+    let mut put_back = false;
     loop {
         if spec.cancel.is_set() {
             return Ok(Outcome::Stopped);
@@ -523,17 +529,25 @@ fn steps(
                 continue;
             }
             // Before the Stop hooks, so they judge the files once put right;
-            // and once only, since a model sent back again starts rewriting
-            // what it had right. With no round or budget left, going back
-            // could only end an answered run at its limit.
-            if !checked
-                && report.rounds < spec.rounds
+            // and each kind once only, since a model sent back again starts
+            // rewriting what it had right, and a file to leave alone that is
+            // still changed was changed on purpose. With no round or budget
+            // left, going back could only end an answered run at its limit.
+            if report.rounds < spec.rounds
                 && (spec.budget.as_ref()).is_none_or(|budget| budget.check().is_ok())
                 && let Some(workspace) = &spec.connection.workspace
             {
-                let problems = contract::problems(contract, workspace);
+                let mut problems = Vec::new();
+                if !checked {
+                    problems = contract::problems(contract, workspace);
+                    checked = !problems.is_empty();
+                }
+                if !put_back {
+                    let changed = unchanged::changed(&kept);
+                    put_back = !changed.is_empty();
+                    problems.extend(changed);
+                }
                 if !problems.is_empty() {
-                    checked = true;
                     // A notice, so nothing takes it for the user's words.
                     spec.transcript.conversation.messages.push(Message {
                         role: "user".into(),
@@ -1045,6 +1059,27 @@ fn asked_to_read(spec: &Spec) -> Vec<String> {
     }
     let typed = crate::references::typed(&request.content);
     inputs::named(typed, workspace)
+}
+
+/// The files the request of a session's own run nobody watches says to leave
+/// unchanged, hashed now; none for a helper, whose work is its parent's to
+/// judge, for a run a person follows or answers, or for one that may not
+/// write, or that mail started.
+fn left_alone(spec: &Spec) -> Unchanged {
+    let Some(workspace) = &spec.connection.workspace else {
+        return Unchanged::default();
+    };
+    let followed = spec.watch.is_some() || spec.connection.remote.is_some();
+    let writes = spec.connection.tools && !spec.connection.plan;
+    if spec.depth > 0 || followed || !writes {
+        return Unchanged::default();
+    }
+    let messages = &spec.transcript.conversation.messages;
+    let own = messages.get(spec.from..).unwrap_or_default();
+    match own.iter().rfind(|message| chat::opens_turn(message)) {
+        Some(request) if !request.notice => unchanged::from_request(&request.content, workspace),
+        _ => Unchanged::default(),
+    }
 }
 
 /// Runs a tool on a thread of its own, so a stop ends the wait even for a
@@ -4843,5 +4878,104 @@ pub(crate) mod tests {
         // A command the user would not allow is not to be asked for again.
         messages.push(tool("run_command", pytest, NOT_APPROVED, true));
         assert!(unchecked(&messages, &dir).is_empty());
+    }
+
+    /// A session's own run in `dir`, in a mode that lets it edit, asked to
+    /// leave `notes.txt` as it is.
+    fn told_to_leave_the_notes(endpoint: String, dir: &Path, id: AgentId) -> Spec {
+        let mut spec = spec(endpoint, dir, id);
+        spec.depth = 0;
+        spec.connection.mode = gate::Mode::AcceptEdits;
+        spec.transcript.conversation.messages[0].content =
+            "Read notes.txt and say what it says. Do not modify `notes.txt`.".into();
+        spec
+    }
+
+    /// The replies of a model that reads the notes, writes over them and ends.
+    fn overwriting_the_notes() -> Vec<String> {
+        let overwrite = (
+            "write_file",
+            json!({"path": "notes.txt", "content": "rewritten"}),
+        );
+        vec![
+            reply("", &[read_notes()]),
+            reply("", &[overwrite]),
+            reply("Done.", &[]),
+        ]
+    }
+
+    #[test]
+    fn a_changed_protected_file_is_named_before_the_run_ends() {
+        let dir = scratch("unchanged");
+        let mut replies = overwriting_the_notes();
+        replies.push(reply("Put the notes back. Done.", &[]));
+        let (endpoint, provider) = provider(replies);
+        let report = finished(told_to_leave_the_notes(endpoint, &dir, AGENTS + 930));
+        // A fifth request would find no provider and fail the run.
+        assert_eq!(report.status, Outcome::Done);
+        let sent = provider.sent();
+
+        let last = messages(&sent[3]).last().unwrap();
+        assert_eq!(last["role"], "user");
+        let notice = last["content"].as_str().unwrap();
+        assert!(notice.starts_with("[Letronna check]"), "{notice}");
+        assert!(
+            notice.contains(
+                "\n- `notes.txt` was changed, though the request seems to say to leave it as it was; if it does, put it back.\n"
+            ),
+            "{notice}"
+        );
+        // Folded in as a notice, so neither the window nor the judge takes
+        // it for something the user typed.
+        let saved = written(&dir.join("helper.jsonl"));
+        let check = saved
+            .iter()
+            .find(|record| record["content"] == notice)
+            .unwrap();
+        assert_eq!(
+            (&check["notice"], &check["folded"]),
+            (&json!(true), &json!(true))
+        );
+    }
+
+    #[test]
+    fn a_missing_output_and_a_changed_protected_file_share_one_notice() {
+        let dir = scratch("unchanged-contract");
+        let mut replies = overwriting_the_notes();
+        replies.push(reply("Still done.", &[]));
+        let (endpoint, provider) = provider(replies);
+        let mut spec = told_to_leave_the_notes(endpoint, &dir, AGENTS + 935);
+        spec.transcript.conversation.messages[0].content =
+            "Read notes.txt and write what it says to out/summary.json. Do not modify `notes.txt`."
+                .into();
+        let report = finished(spec);
+        // A fifth request would find no provider and fail the run.
+        assert_eq!(report.status, Outcome::Done);
+        let sent = provider.sent();
+
+        let last = messages(&sent[3]).last().unwrap();
+        let notice = last["content"].as_str().unwrap();
+        assert!(
+            notice.contains("\n- `out/summary.json` does not exist.\n- `notes.txt` was changed"),
+            "{notice}"
+        );
+    }
+
+    #[test]
+    fn a_helper_or_a_watched_run_is_not_sent_back_for_a_protected_file() {
+        for (n, watched) in [false, true].into_iter().enumerate() {
+            let dir = scratch(&format!("unchanged-followed-{n}"));
+            let (endpoint, provider) = provider(overwriting_the_notes());
+            let mut spec = told_to_leave_the_notes(endpoint, &dir, AGENTS + 940 + n as u64);
+            if watched {
+                spec.watch = Some(Arc::new(|_| ()));
+            } else {
+                spec.depth = 1;
+            }
+            assert_eq!(finished(spec).status, Outcome::Done);
+            assert_eq!(provider.sent().len(), 3);
+            let notes = std::fs::read_to_string(dir.join("notes.txt")).unwrap();
+            assert_eq!(notes, "rewritten");
+        }
     }
 }

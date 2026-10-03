@@ -843,7 +843,7 @@ fn write_checked(
     Ok(())
 }
 
-fn sha256_file(path: &Path) -> std::io::Result<String> {
+pub(crate) fn sha256_file(path: &Path) -> std::io::Result<String> {
     let mut file = std::fs::File::open(path)?;
     let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
     let mut block = vec![0; 64 * 1024];
