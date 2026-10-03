@@ -19,13 +19,14 @@
 //! one call, all or none, and so through its scan. The next turn stops it,
 //! as do taking back what it read and leaving the session, and a review
 //! stopped before it ends writes nothing, so nothing lands under a turn
-//! already on its way; what it found waits for the next.
+//! already on its way; what it found waits for the next. A store too full to
+//! take what it found is named in its note, as only the user can make room.
 
 use crate::cancel::Cancel;
 use crate::chat::{self, Connection, Message, ToolCall};
 use crate::driver::{self, Allow, Outcome, Spec};
 use crate::gate::{self, Gate, Grants, Mode};
-use crate::memory;
+use crate::memory::{self, Fit};
 use crate::permissions;
 use crate::store::{Conversation, Transcript};
 use crate::tools::{self, ToolContext};
@@ -59,6 +60,23 @@ const RULED_OUT: &str = "Memory review skipped: your rules ask or deny memory";
 /// Held while a review checks it was not stopped and writes what it found, so
 /// a stop waits for those writes and none lands after it.
 static WRITING: Mutex<()> = Mutex::new(());
+
+/// What a review found to keep, held until it ends.
+#[derive(Default)]
+struct Found {
+    /// The adds the gate let through, as (target, content).
+    adds: Vec<(String, String)>,
+    /// What a full store had no room for, as (target, content).
+    full: Vec<(String, String)>,
+}
+
+/// What became of the facts a review found.
+struct Kept {
+    /// Each that went in, as its text and store.
+    added: Vec<String>,
+    /// Each a full store had no room for, as (target, content).
+    full: Vec<(String, String)>,
+}
 
 /// Whether a review is due after the turn that ended on `messages`: the user
 /// started it, and it brought their messages to a multiple of [`EVERY`].
@@ -97,11 +115,13 @@ pub fn spawn(
         folded: true,
         ..Default::default()
     });
-    let held = Arc::new(Mutex::new(Vec::new()));
+    let held = Arc::new(Mutex::new(Found::default()));
     let holding = held.clone();
     let refused = Arc::new(AtomicBool::new(false));
     let refusing = refused.clone();
-    let context = ToolContext::of(&connection);
+    let mut context = ToolContext::of(&connection);
+    // So memory's history says the review made what it keeps.
+    context.caller.review = true;
     let workspace = context.workspace.clone();
     let spec = Spec {
         connection: Connection {
@@ -155,8 +175,8 @@ pub fn spawn(
         let kept = if refused.load(Ordering::Relaxed) {
             Err(RULED_OUT.into())
         } else {
-            let held = std::mem::take(&mut *held.lock().unwrap_or_else(PoisonError::into_inner));
-            keep(&held, &context)
+            let found = std::mem::take(&mut *held.lock().unwrap_or_else(PoisonError::into_inner));
+            keep(found, &context)
         };
         let _ = sender.send_blocking(note(kept, report));
     })?;
@@ -188,12 +208,8 @@ fn unattended(call: &ToolCall, ctx: &ToolContext) -> gate::Outcome {
 
 /// Holds back an add to memory that the gate let through until the review
 /// ends, telling the model whether it will go in, and refuses every other
-/// call.
-fn hold(
-    call: &ToolCall,
-    held: &Mutex<Vec<(String, String)>>,
-    workspace: Option<&Path>,
-) -> Result<String, String> {
+/// call. One a full store has no room for is noted for the review's note.
+fn hold(call: &ToolCall, held: &Mutex<Found>, workspace: Option<&Path>) -> Result<String, String> {
     if call.name != "memory" {
         return Err(ONLY_ADD.into());
     }
@@ -213,24 +229,40 @@ fn hold(
     }
     let mut held = held.lock().unwrap_or_else(PoisonError::into_inner);
     let pending: Vec<&str> = held
+        .adds
         .iter()
         .filter(|(to, _)| to == target)
         .map(|(_, entry)| entry.as_str())
         .collect();
+    let fact = (target.to_owned(), content.to_owned());
     // Told now, so the model can say it another way while it still can.
-    if !memory::would_add(target, content, &pending, workspace)? {
-        return Ok("Already kept: memory says this already.".into());
+    match memory::would_add(target, content, &pending, workspace)? {
+        Fit::Kept => Ok("Already kept: memory says this already.".into()),
+        Fit::Full(why) => {
+            // Asked again, the same fact is still one the user lost.
+            if !held.full.contains(&fact) {
+                held.full.push(fact);
+            }
+            Err(why)
+        }
+        Fit::Room => {
+            held.adds.push(fact);
+            Ok("Noted: it is written to memory when this review ends.".into())
+        }
     }
-    held.push((target.to_owned(), content.to_owned()));
-    Ok("Noted: it is written to memory when this review ends.".into())
 }
 
 /// Writes the held adds through the memory tool, one call for each store
 /// with the adds as its operations, all or none, and gives each that went in
-/// as its text and store; nothing when the gate now refuses memory.
-fn keep(held: &[(String, String)], context: &ToolContext) -> Result<Vec<String>, String> {
+/// as its text and store, and each a full store had no room for; nothing
+/// when the gate now refuses memory.
+fn keep(found: Found, context: &ToolContext) -> Result<Kept, String> {
+    let Found {
+        adds: held,
+        mut full,
+    } = found;
     let mut stores: Vec<(&str, Vec<&str>)> = Vec::new();
-    for (target, content) in held {
+    for (target, content) in &held {
         match stores.iter_mut().find(|(to, _)| to == target) {
             Some((_, adds)) => adds.push(content),
             None => stores.push((target, vec![content])),
@@ -260,8 +292,14 @@ fn keep(held: &[(String, String)], context: &ToolContext) -> Result<Vec<String>,
     let mut kept = Vec::new();
     for ((target, adds), call) in stores.iter().zip(&calls) {
         // A store that filled meanwhile refuses the call, so none of its
-        // adds is said to be kept.
+        // adds is said to be kept, and the note says why.
         let Ok(out) = tools::run(&call.name, &call.arguments, context) else {
+            let workspace = context.workspace.as_deref();
+            if let Some((last, earlier)) = adds.split_last()
+                && let Ok(Fit::Full(_)) = memory::would_add(target, last, earlier, workspace)
+            {
+                full.extend(adds.iter().map(|add| (target.to_string(), add.to_string())));
+            }
             continue;
         };
         if out.starts_with(memory::ALREADY_KEPT) {
@@ -275,15 +313,23 @@ fn keep(held: &[(String, String)], context: &ToolContext) -> Result<Vec<String>,
                 .map(|text| format!("\"{}\" in {store}", one_line(text))),
         );
     }
-    Ok(kept)
+    Ok(Kept { added: kept, full })
 }
 
-/// The line that says what a review added, so the user can undo it, or why
-/// it added nothing, and what it cost, in the words a reply's usage line uses.
-fn note(kept: Result<Vec<String>, String>, report: &driver::Report) -> String {
+/// The line that says what a review added, so the user can undo it, what a
+/// full store had no room for, or why it added nothing, and what it cost, in
+/// the words a reply's usage line uses.
+fn note(kept: Result<Kept, String>, report: &driver::Report) -> String {
     let said = match kept {
-        Ok(added) if added.is_empty() => "Memory review kept nothing new".to_owned(),
-        Ok(added) => format!("Memory review kept {}", added.join(", ")),
+        Ok(kept) => {
+            let added = kept.added.join(", ");
+            match (added.is_empty(), no_room(&kept.full)) {
+                (true, None) => "Memory review kept nothing new".to_owned(),
+                (true, Some(full)) => format!("Memory review {full}"),
+                (false, None) => format!("Memory review kept {added}"),
+                (false, Some(full)) => format!("Memory review kept {added}, but {full}"),
+            }
+        }
         Err(why) => why,
     };
     let mut line = format!("{said} · {} out · {} in", report.output, report.input);
@@ -292,6 +338,39 @@ fn note(kept: Result<Vec<String>, String>, report: &driver::Report) -> String {
         line.push_str(&format!(" · {cached}% cached"));
     }
     line
+}
+
+/// What a note says of the facts full stores had no room for, as (target,
+/// content): how many, which stores, and where the user makes room, since
+/// the review cannot. None when there were none.
+fn no_room(full: &[(String, String)]) -> Option<String> {
+    let mut targets: Vec<&str> = Vec::new();
+    for (target, _) in full {
+        if !targets.contains(&target.as_str()) {
+            targets.push(target);
+        }
+    }
+    let names: Vec<&str> = targets
+        .iter()
+        .filter_map(|target| memory::store_name(target))
+        .collect();
+    let (names, are) = match names.as_slice() {
+        [] => return None,
+        [one] => (one.to_string(), "is"),
+        [rest @ .., last] => (format!("{} and {last}", rest.join(", ")), "are"),
+    };
+    let facts = match full.len() {
+        1 => "1 fact".to_owned(),
+        n => format!("{n} facts"),
+    };
+    let edits: Vec<String> = targets
+        .iter()
+        .map(|target| format!("/memory edit {target}"))
+        .collect();
+    Some(format!(
+        "could not keep {facts}: {names} {are} full. Make room on the Memory page or with {}",
+        edits.join(" or ")
+    ))
 }
 
 /// An entry whole on one line, any control character in it written out, so
@@ -400,7 +479,7 @@ mod tests {
     #[test]
     fn only_an_add_to_memory_is_held_and_a_planted_one_is_refused() {
         let (_turn, _data) = data_folder("held");
-        let held = Mutex::new(Vec::new());
+        let held = Mutex::new(Found::default());
         let call = |name: &str, args: Value| ToolCall {
             id: "call-0".into(),
             name: name.into(),
@@ -432,13 +511,13 @@ mod tests {
         );
         let planted = hold(&call(name, args), &held, None).unwrap_err();
         assert!(planted.starts_with("Nothing was changed"), "{planted}");
-        assert_eq!(held.lock().unwrap().len(), 1);
+        assert_eq!(held.lock().unwrap().adds.len(), 1);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 
     #[test]
     fn an_add_carrying_other_operations_or_any_other_key_is_refused() {
-        let held = Mutex::new(Vec::new());
+        let held = Mutex::new(Found::default());
         let removal = json!([{"action": "remove", "target": "user", "old_text": "short"}]);
         let add = json!({"action": "add", "target": "user", "content": "Prefers short answers."});
         for (key, value) in [
@@ -455,7 +534,7 @@ mod tests {
             };
             assert_eq!(hold(&call, &held, None).unwrap_err(), ONLY_ADD, "{args}");
         }
-        assert!(held.lock().unwrap().is_empty());
+        assert!(held.lock().unwrap().adds.is_empty());
     }
 
     #[test]
@@ -508,14 +587,21 @@ mod tests {
         ]
         .map(|(target, content)| (target.to_owned(), content.to_owned()));
         let context = ToolContext::of(&connection(String::new()));
-        let kept = keep(&held, &context).unwrap();
+        let found = Found {
+            adds: held.to_vec(),
+            ..Found::default()
+        };
+        let kept = keep(found, &context).unwrap();
         assert_eq!(
-            kept,
+            kept.added,
             [
                 "\"Builds with make.\" in MEMORY.md",
                 "\"Tests with make test.\" in MEMORY.md"
             ]
         );
+        // So the note says the store was full rather than that nothing was new.
+        let lost: Vec<&str> = kept.full.iter().map(|(_, fact)| fact.as_str()).collect();
+        assert_eq!(lost, ["Prefers short answers.", "Works late."]);
         let notes = std::fs::read_to_string(data.join("MEMORY.md")).unwrap();
         assert_eq!(notes, "Builds with make.\n§\nTests with make test.\n");
         assert_eq!(std::fs::read_to_string(data.join("USER.md")).unwrap(), full);
@@ -558,7 +644,7 @@ mod tests {
     fn an_add_is_told_truly_whether_it_will_go_in() {
         let (_turn, data) = data_folder("truly");
         std::fs::write(data.join("USER.md"), "Works in Rust.\n").unwrap();
-        let held = Mutex::new(Vec::new());
+        let held = Mutex::new(Found::default());
         let hold_add = |target: &str, content: &str| {
             let (name, args) = add(target, content);
             let call = ToolCall {
@@ -577,7 +663,8 @@ mod tests {
         assert!(hold_add("project", "Builds with make.").is_err());
         let full = hold_add("user", &"Likes long words. ".repeat(80)).unwrap_err();
         assert!(full.contains("cannot be kept"), "{full}");
-        assert_eq!(held.lock().unwrap().len(), 1);
+        assert_eq!(held.lock().unwrap().adds.len(), 1);
+        assert_eq!(held.lock().unwrap().full.len(), 1);
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
     }
 
@@ -635,6 +722,51 @@ mod tests {
         let note = note_of(notes).expect("the review said what it cost");
         assert_eq!(note, "Memory review kept nothing new · 50 out · 1000 in");
         unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+    }
+
+    #[test]
+    fn a_review_against_a_full_store_says_it_was_full() {
+        let (_turn, data) = data_folder("full");
+        let full = format!("{}\n", "Likes long words. ".repeat(76).trim_end());
+        std::fs::write(data.join("USER.md"), &full).unwrap();
+        let calls = [
+            add("user", "Prefers short answers."),
+            add("memory", "Builds with make."),
+        ];
+        // Asked again after the refusal, which is still the one fact lost.
+        let again = [add("user", "Prefers short answers.")];
+        let (endpoint, _stub) = provider(vec![
+            reply("", &calls),
+            reply("", &again),
+            reply("Saved.", &[]),
+        ]);
+        let notes = spawn(connection(endpoint), exchanges(1), Cancel::default()).unwrap();
+        let note = note_of(notes).expect("the review said what it kept");
+        assert_eq!(
+            note,
+            "Memory review kept \"Builds with make.\" in MEMORY.md, but could not keep 1 fact: \
+             USER.md is full. Make room on the Memory page or with /memory edit user · 150 out · 3000 in"
+        );
+        assert_eq!(std::fs::read_to_string(data.join("USER.md")).unwrap(), full);
+        // Its write is named in the history as the review's.
+        let made = memory::history(None, "memory").unwrap();
+        assert_eq!(made[0].by(), "a memory review");
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+
+        let lost = |targets: &[&str]| {
+            let full: Vec<(String, String)> = targets
+                .iter()
+                .zip(1..)
+                .map(|(target, n)| (target.to_string(), format!("fact {n}")))
+                .collect();
+            no_room(&full).unwrap()
+        };
+        assert_eq!(
+            lost(&["memory", "project", "memory"]),
+            "could not keep 3 facts: MEMORY.md and Project memory are full. \
+             Make room on the Memory page or with /memory edit memory or /memory edit project"
+        );
+        assert_eq!(no_room(&[]), None);
     }
 
     #[test]
