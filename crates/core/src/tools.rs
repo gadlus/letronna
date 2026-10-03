@@ -1273,6 +1273,31 @@ fn run_shell(command: &str, cwd: Option<&Path>, cancel: &Cancel) -> Result<Strin
     )
 }
 
+/// Runs `command` in `cwd` as `run_command` runs it unsandboxed in `ctx`,
+/// with `limit` in place of the two minutes.
+#[cfg(test)]
+pub(crate) fn run_shell_in(
+    command: &str,
+    cwd: &Path,
+    ctx: &ToolContext,
+    limit: Duration,
+) -> Result<String, String> {
+    let cmd = shell(command, Some(cwd));
+    run_shell_saving(cmd, command, &ctx.cancel, None, limit, owner_at_limit(ctx))
+}
+
+/// The conversation a foreground command run in `ctx` becomes a job of when
+/// it is still running at the limit, or None when it is stopped there.
+fn owner_at_limit(ctx: &ToolContext) -> Option<u64> {
+    // A helper's command is stopped at the limit instead, since its report
+    // would come back before the command had finished, as is one run for no
+    // conversation, which no exit notice would reach. A session's own agent
+    // on the driver, as `-p`, an editor or a chat app runs it, hears its
+    // jobs' notices between steps as the window's does.
+    let own = ctx.caller.depth == 0 && ctx.conversation != 0;
+    own.then_some(ctx.conversation)
+}
+
 /// Where a command's output is saved whole when it is too long to keep, and
 /// how many bytes of it at most.
 struct SaveTo {
@@ -2249,11 +2274,7 @@ impl Tool for RunCommand {
             let out = if ctx.sandboxed {
                 run_sandboxed(command, cwd, &dir, &ctx.cancel, save, limit)
             } else {
-                // A helper's command is stopped at the limit instead, since its
-                // report would come back before the command had finished, as is
-                // one run for no conversation, which no exit notice would reach.
-                let own = ctx.caller.agent.is_none() && ctx.conversation != 0;
-                let owner = own.then_some(ctx.conversation);
+                let owner = owner_at_limit(ctx);
                 let cmd = shell(command, Some(&dir));
                 run_shell_saving(cmd, command, &ctx.cancel, save, limit, owner)
             };
@@ -6402,7 +6423,8 @@ mod tests {
         let judged = RunCommand.judge_input(&json!({"command": "ls", "workdir": "sub"}), &ctx);
         let said = format!("Command, run in {}:", dir.join("sub").display());
         assert!(judged.starts_with(&said), "{judged}");
-        std::fs::remove_dir_all(dir).unwrap();
+        // The background job may still hold the folder open on Windows.
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -4431,4 +4431,78 @@ pub(crate) mod tests {
             spec.connection.remote = Some(Default::default());
         });
     }
+
+    #[test]
+    fn a_long_command_in_a_print_run_moves_to_the_background_and_reports_back() {
+        let _bell = crate::inbox::tests::DOORBELL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("long-command");
+        let id = AGENTS + 500;
+        // As `-p` runs a prompt: the session's own agent, whose mail is its own.
+        let mut top = spec(String::new(), &dir, id);
+        (top.depth, top.owner) = (0, id);
+        // It prints `after` well past the limit, which it could not do if it
+        // had been stopped there.
+        let command = if cfg!(windows) {
+            "Write-Output before; Start-Sleep 3; Write-Output after"
+        } else {
+            "echo before; sleep 3; echo after"
+        };
+        let limit = Duration::from_secs(1);
+        let said = tools::run_shell_in(command, &dir, &context(&top), limit).unwrap();
+        let job: u64 = said
+            .strip_prefix("Still running after 1s, so it carries on in the background as job #")
+            .and_then(|rest| rest.split_once(' '))
+            .and_then(|(job, _)| job.parse().ok())
+            .unwrap_or_else(|| panic!("{said}"));
+        // In before the run starts, so where the run reads it is known.
+        let deadline = Instant::now() + WAIT;
+        while !inbox::pending().contains(&id) {
+            assert!(Instant::now() < deadline, "no exit notice for job #{job}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let (endpoint, provider) = provider(vec![
+            reply("", &[("wait", json!({"job": job, "seconds": 5}))]),
+            reply("The build printed after.", &[]),
+        ]);
+        top.connection.endpoint = endpoint;
+        let report = finished(top);
+        assert_eq!(report.status, Outcome::Done);
+        let sent = provider.sent();
+
+        let waited = results(&sent[1]);
+        let exited = format!("job #{job} exited with code 0");
+        assert!(
+            waited[0].starts_with(&format!("Job #{job} exited")),
+            "{waited:?}"
+        );
+        let mail = messages(&sent[1]).last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert!(mail.contains(&exited) && mail.contains("after"), "{mail}");
+    }
+
+    #[test]
+    fn a_helpers_long_command_is_still_stopped_at_the_limit() {
+        let dir = scratch("long-command-helper");
+        // The command is this test's own, so no other test's job can pass for it.
+        let command = if cfg!(windows) {
+            "Start-Sleep 30; Write-Output driver-helper"
+        } else {
+            "sleep 30; echo driver-helper"
+        };
+        let helper = spec(String::new(), &dir, AGENTS + 510);
+        let limit = Duration::from_secs(1);
+        let out = tools::run_shell_in(command, &dir, &context(&helper), limit).unwrap_err();
+        assert!(
+            out.starts_with("Timed out after 1s and was stopped."),
+            "{out}"
+        );
+        let jobs = crate::jobs::list();
+        assert!(
+            jobs.iter().all(|job| job.command != command),
+            "it became a job"
+        );
+    }
 }
