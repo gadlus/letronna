@@ -231,7 +231,9 @@ impl Runner {
                 return answer;
             }
             let (notice, message) = match step {
-                goal::Step::Continue { notice, message } => (notice, Some(message)),
+                goal::Step::Continue {
+                    notice, message, ..
+                } => (notice, Some(message)),
                 goal::Step::Done(notice)
                 | goal::Step::Pause { notice, .. }
                 | goal::Step::Deferred(notice) => (notice, None),

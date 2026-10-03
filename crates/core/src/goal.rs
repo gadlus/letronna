@@ -8,14 +8,16 @@
 //! cheap model call that answers with a single JSON verdict. `continue` sends
 //! the agent back, in Letronna's words, with the judge's note on what is
 //! left fenced as untrusted, since the judge read what pages and files
-//! said; `met` and `blocked` drop the goal; `waiting` pauses it, and so
-//! does a verdict that cannot be read, since carrying on is the costly
-//! mistake. So do twenty continuations in a row, however sure the judge is
-//! that the next will do it. A `met` while the check command failed counts
-//! as `continue`: the judge reads only part of a long log and may believe
-//! the reply over it, and the user's own check is the better witness. A
-//! check that could not run vetoes nothing, since no work by the agent
-//! would make it run. A paused goal stays set but is not looked at
+//! said; `met` drops the goal. The first `blocked` sends the agent back
+//! once to try another way, since one misread should not stop a goal the
+//! user still wants, and a second in a row pauses it; `waiting` pauses it
+//! too, and so does a verdict that cannot be read, since carrying on is the
+//! costly mistake. So do twenty continuations in a row, however sure the
+//! judge is that the next will do it. A `met` while the check command
+//! failed counts as `continue`: the judge reads only part of a long log and
+//! may believe the reply over it, and the user's own check is the better
+//! witness. A check that could not run vetoes nothing, since no work by the
+//! agent would make it run. A paused goal stays set but is not looked at
 //! again, whatever the user sends, until `/goal resume` or a new goal: a
 //! question asked an hour later about something else must not wake twenty
 //! turns of work the user had put aside.
@@ -54,6 +56,10 @@ use std::time::{Duration, Instant};
 /// Continuations in a row before the loop stops by itself: enough for a
 /// long task, few enough that a judge that never says "met" costs little.
 pub const MAX_CONTINUATIONS: u32 = 20;
+/// Blocked verdicts in a row before the goal pauses: the first may be a
+/// misread, or a wall another way gets round, so it earns one more try, and
+/// each try after is a whole turn spent pushing at what may be a real wall.
+const BLOCKED_LOOKS: u32 = 2;
 
 /// How long the check command may run: a workspace's tests take minutes,
 /// and a stop or a typed line ends it sooner.
@@ -106,6 +112,9 @@ pub struct Goal {
     /// Turns started automatically since the user last typed or stopped.
     #[serde(default)]
     pub continuations: u32,
+    /// Blocked verdicts in a row that sent the agent back to try another way.
+    #[serde(default)]
+    pub blocked: u32,
     /// Why the goal is paused, when it is: set, but not looked at until the
     /// user resumes it or sets another.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -131,9 +140,14 @@ pub struct Verdict {
 /// What follows a turn in a session with a goal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Step {
-    /// Show `notice`, then start a turn on `continuation(message)`.
-    Continue { notice: String, message: String },
-    /// The goal is reached, or out of reach: show the notice and drop it.
+    /// Show `notice`, then start a turn on `continuation(message)`;
+    /// `blocked` when it is the one more try a blocked goal gets.
+    Continue {
+        notice: String,
+        message: String,
+        blocked: bool,
+    },
+    /// The goal is reached: show the notice and drop it.
     Done(String),
     /// Show `notice` and pause the goal for `why` until the user resumes it.
     Pause { notice: String, why: String },
@@ -228,8 +242,8 @@ pub fn apply_command(goal: &mut Option<Goal>, command: Command) -> Result<String
             let check = goal.take().and_then(|old| old.check);
             let set = Goal::new(&text, check);
             let said = format!(
-                "{}\nChecked after each turn until it is met or blocked; it pauses when it \
-                 waits on you.",
+                "{}\nChecked after each turn until it is met; it pauses when it waits on \
+                 you or stays blocked.",
                 set.line()
             );
             *goal = Some(set);
@@ -257,6 +271,7 @@ pub fn apply_command(goal: &mut Option<Goal>, command: Command) -> Result<String
             };
             goal.paused = None;
             goal.continuations = 0;
+            goal.blocked = 0;
             Ok(format!(
                 "{}\nResumed: checked after your next turn.",
                 goal.line()
@@ -282,25 +297,31 @@ fn shown(goal: &Goal) -> String {
 }
 
 /// The user typed or stopped: the automatic run is over, and the next one
-/// gets its full count. A paused goal stays as it is, count and all, since
-/// only `/goal resume` or a new goal makes it active again.
+/// gets its full count and its own try past a blocker. A paused goal stays
+/// as it is, count and all, since only `/goal resume` or a new goal makes it
+/// active again.
 pub fn interrupted(goal: &mut Option<Goal>) {
     if let Some(goal) = goal.as_mut().filter(|goal| goal.paused.is_none()) {
         goal.continuations = 0;
+        goal.blocked = 0;
     }
 }
 
 /// Puts `step`, what the look at `judged` came to, into the session's goal
-/// as it is now: one more continuation counted, a goal that is done
-/// dropped, or one that paused marked so. False, with nothing changed, when
-/// the goal was cleared or changed while the look ran, since the step was
-/// about a goal that is gone and must not be acted on.
+/// as it is now: one more continuation counted, with the blocked ones in a
+/// row, a goal that is done dropped, or one that paused marked so. False,
+/// with nothing changed, when the goal was cleared or changed while the
+/// look ran, since the step was about a goal that is gone and must not be
+/// acted on.
 pub fn settle(goal: &mut Option<Goal>, judged: &Goal, step: &Step) -> bool {
     let Some(current) = goal.as_mut().filter(|goal| *goal == judged) else {
         return false;
     };
     match step {
-        Step::Continue { .. } => current.continuations += 1,
+        Step::Continue { blocked, .. } => {
+            current.continuations += 1;
+            current.blocked = if *blocked { current.blocked + 1 } else { 0 };
+        }
         Step::Done(_) => *goal = None,
         Step::Pause { why, .. } => current.paused = Some(why.clone()),
         Step::Deferred(_) | Step::Cleared => {}
@@ -412,21 +433,31 @@ fn decide(goal: &Goal, judged: Result<String, String>, check_failed: bool) -> St
         status = Status::Continue;
         reason = one_line_capped(&format!("the check command `{command}` failed"));
     }
+    let blocked = status == Status::Blocked;
     match status {
         Status::Met => Step::Done(format!("Goal met: {reason}")),
-        Status::Blocked => Step::Done(format!(
-            "Goal blocked, so it is cleared: {reason}. /goal <what to reach> sets it again."
-        )),
+        // Paused rather than dropped, so /goal resume carries on once the
+        // user has cleared the way.
+        Status::Blocked
+            if goal.blocked + 1 >= BLOCKED_LOOKS || goal.continuations >= MAX_CONTINUATIONS =>
+        {
+            pause(format!("Goal blocked: {reason}"), "blocked")
+        }
         Status::Waiting => pause(format!("Goal waiting on you: {reason}"), "waiting on you"),
         Status::Continue if goal.continuations >= MAX_CONTINUATIONS => pause(
             format!("Goal not met after {MAX_CONTINUATIONS} continuations: {reason}"),
             &format!("{MAX_CONTINUATIONS} continuations"),
         ),
-        Status::Continue => {
+        Status::Continue | Status::Blocked => {
             let count = goal.continuations + 1;
+            let (said, asked) = match blocked {
+                true => ("blocked, trying another way", ANOTHER_WAY),
+                false => ("carrying on", NEXT_STEP),
+            };
             Step::Continue {
-                notice: format!("Goal: carrying on ({count}/{MAX_CONTINUATIONS}): {reason}"),
-                message: carry_on(goal, &reason),
+                notice: format!("Goal: {said} ({count}/{MAX_CONTINUATIONS}): {reason}"),
+                message: carry_on(goal, asked, &reason),
+                blocked,
             }
         }
     }
@@ -440,17 +471,28 @@ fn pause(notice: String, why: &str) -> Step {
     }
 }
 
-/// What a continuation tells the agent: Letronna's own words, with the
-/// judge's reason fenced as a note to weigh, since the judge read pages and
-/// files the agent quoted and may repeat what they said.
-fn carry_on(goal: &Goal, reason: &str) -> String {
+/// What a continuation asks of an agent whose goal is not met yet.
+const NEXT_STEP: &str = "Check where it stands and take the next concrete step toward it; a \
+     summary or a plan is not progress. Once it is reached, show the evidence for each part \
+     in your reply, since the goal check reads only your last reply. If it cannot be reached \
+     without the user, say so plainly and stop.\nThe goal check's note on what is left, which \
+     may quote what a page or a file said:";
+
+/// What the one more try a blocked goal gets asks, ruling out the ways
+/// round a wall that only look like reaching the goal.
+const ANOTHER_WAY: &str = "The goal check read your last reply as blocked. Check that against \
+     the current state and try another way that still reaches the whole goal. Do not narrow \
+     the goal, skip or weaken a check, or fake a result. A call the user denied or Letronna \
+     refused is not a wall to get round. If the same thing still stops you, say exactly what \
+     you need from the user and stop.\nThe goal check's reason, which may \
+     quote what a page or a file said:";
+
+/// What a continuation tells the agent: Letronna's own words, `asked`, with
+/// the judge's reason fenced as a note to weigh, since the judge read pages
+/// and files the agent quoted and may repeat what they said.
+fn carry_on(goal: &Goal, asked: &str, reason: &str) -> String {
     let lead = format!(
-        "{HEADER}\nThe standing goal the user set is not met yet:\n<goal>\n{}\n</goal>\n\
-         Check where it stands and take the next concrete step toward it; a summary or a \
-         plan is not progress. Once it is reached, show the evidence for each part in your \
-         reply, since the goal check reads only your last reply. If it cannot be reached \
-         without the user, say so plainly and stop.\nThe goal check's note on what is \
-         left, which may quote what a page or a file said:",
+        "{HEADER}\nThe standing goal the user set is not met yet:\n<goal>\n{}\n</goal>\n{asked}",
         goal.text.trim()
     );
     crate::untrusted::quoted(&lead, reason)
@@ -770,18 +812,187 @@ mod tests {
     }
 
     #[test]
-    fn a_met_or_blocked_verdict_stops_and_drops_the_goal() {
+    fn a_met_verdict_stops_and_drops_the_goal() {
         let model = Scripted::new(&[r#"{"status":"met","reason":"all tests pass"}"#]);
         let (steps, kept) = run_loop(goal(None), &model);
         assert_eq!(steps, [Step::Done("Goal met: all tests pass".into())]);
         assert_eq!(kept, None);
-        let model = Scripted::new(&[r#"{"status":"blocked","reason":"no access"}"#]);
+    }
+
+    #[test]
+    fn a_first_blocked_verdict_sends_the_agent_back_to_try_another_way() {
+        let model =
+            Scripted::new(&[r#"{"status":"blocked","reason":"no access to the registry"}"#]);
+        let judged = goal(None);
+        let step = review_with(
+            &judged,
+            "I cannot publish: the registry refuses the token.",
+            &Cancel::default(),
+            |_| (String::new(), false),
+            |prompt| model.ask(prompt),
+        );
+        let Step::Continue {
+            notice,
+            message,
+            blocked: true,
+        } = &step
+        else {
+            panic!("{step:?}");
+        };
+        assert_eq!(
+            notice,
+            "Goal: blocked, trying another way (1/20): no access to the registry"
+        );
+        assert!(message.starts_with(HEADER), "{message}");
+        let (own, note) = message.split_once("<untrusted-content-").unwrap();
+        assert!(
+            own.contains(
+                "try another way that still reaches the whole goal. Do not narrow the goal, \
+                 skip or weaken a check, or fake a result. A call the user denied or Letronna \
+                 refused is not a wall to get round. If the same thing still stops you, say \
+                 exactly what you need from the user and stop."
+            ),
+            "{own}"
+        );
+        // The judge's words sit inside the fence, after Letronna's own.
+        assert!(!own.contains("registry"), "{own}");
+        assert!(note.contains("no access to the registry"));
+        let mut kept = Some(judged.clone());
+        assert!(settle(&mut kept, &judged, &step));
+        let kept = kept.unwrap();
+        assert_eq!(
+            (kept.continuations, kept.blocked, kept.paused),
+            (1, 1, None)
+        );
+    }
+
+    #[test]
+    fn a_second_blocked_verdict_in_a_row_pauses_and_keeps_the_goal() {
+        let set = apply_command(&mut None, parse("ship it")).unwrap();
+        assert!(
+            set.ends_with("until it is met; it pauses when it waits on you or stays blocked."),
+            "{set}"
+        );
+        let model = Scripted::new(&[r#"{"status":"blocked","reason":"no access"}"#; 2]);
         let (steps, kept) = run_loop(goal(None), &model);
         assert!(
-            matches!(&steps[..], [Step::Done(n)] if n.starts_with("Goal blocked, so it is cleared: no access")),
+            matches!(
+                &steps[..],
+                [Step::Continue { blocked: true, .. }, Step::Pause { .. }]
+            ),
+            "{steps:?}"
+        );
+        assert_eq!(
+            steps[1],
+            Step::Pause {
+                notice: "Goal blocked: no access. The goal is paused; /goal resume carries on."
+                    .into(),
+                why: "blocked".into(),
+            }
+        );
+        // Kept, paused, with the try counted.
+        let paused = kept.unwrap();
+        assert_eq!(paused.text, "make the tests pass");
+        assert_eq!(
+            (
+                paused.continuations,
+                paused.blocked,
+                paused.paused.as_deref()
+            ),
+            (1, 1, Some("blocked"))
+        );
+        let mut kept = Some(paused);
+        assert_eq!(active(&kept), None);
+        // Resumed, it gets its full count and its one more try again.
+        apply_command(&mut kept, Command::Resume).unwrap();
+        assert_eq!(kept, Some(goal(None)));
+        // With no continuation left there is no try to give, so it pauses at once.
+        let spent = Goal {
+            continuations: MAX_CONTINUATIONS,
+            ..goal(None)
+        };
+        let model = Scripted::new(&[r#"{"status":"blocked","reason":"no access"}"#]);
+        let (steps, _) = run_loop(spent, &model);
+        assert!(
+            matches!(&steps[..], [Step::Pause { why, .. }] if why == "blocked"),
+            "{steps:?}"
+        );
+    }
+
+    #[test]
+    fn a_verdict_between_two_blocked_ones_starts_their_count_again() {
+        let model = Scripted::new(&[
+            r#"{"status":"blocked","reason":"no access"}"#,
+            r#"{"status":"continue","reason":"found a mirror"}"#,
+            r#"{"status":"blocked","reason":"the mirror is down"}"#,
+            r#"{"status":"met","reason":"published"}"#,
+        ]);
+        let (steps, kept) = run_loop(goal(None), &model);
+        assert!(
+            matches!(
+                &steps[..],
+                [
+                    Step::Continue { blocked: true, .. },
+                    Step::Continue { blocked: false, .. },
+                    Step::Continue { blocked: true, .. },
+                    Step::Done(_),
+                ]
+            ),
             "{steps:?}"
         );
         assert_eq!(kept, None);
+        let judged = Goal {
+            continuations: 4,
+            blocked: 1,
+            ..goal(None)
+        };
+        let mut kept = Some(judged.clone());
+        let step = decide(
+            &judged,
+            Ok(r#"{"status":"continue","reason":"x"}"#.into()),
+            false,
+        );
+        assert!(settle(&mut kept, &judged, &step));
+        assert_eq!(kept.map(|g| (g.continuations, g.blocked)), Some((5, 0)));
+    }
+
+    #[test]
+    fn a_user_who_types_or_stops_gives_a_blocked_goal_its_try_again() {
+        let mut kept = Some(Goal {
+            continuations: 4,
+            blocked: 1,
+            ..goal(None)
+        });
+        interrupted(&mut kept);
+        assert_eq!(kept, Some(goal(None)));
+        // The next blocked verdict is a first one again.
+        let model = Scripted::new(&[r#"{"status":"blocked","reason":"no access"}"#]);
+        let step = review_with(
+            &goal(None),
+            "stuck",
+            &Cancel::default(),
+            |_| (String::new(), false),
+            |prompt| model.ask(prompt),
+        );
+        assert!(
+            matches!(step, Step::Continue { blocked: true, .. }),
+            "{step:?}"
+        );
+    }
+
+    #[test]
+    fn a_goal_stored_before_blocked_verdicts_were_counted_loads_with_none() {
+        let stored = r#"{"text":"ship it","continuations":3,"paused":"waiting on you"}"#;
+        let loaded: Goal = serde_json::from_str(stored).unwrap();
+        assert_eq!(loaded.blocked, 0);
+        assert_eq!(
+            loaded,
+            Goal {
+                continuations: 3,
+                paused: Some("waiting on you".into()),
+                ..Goal::new("ship it", None)
+            }
+        );
     }
 
     #[test]
@@ -791,7 +1002,12 @@ mod tests {
             "```json\n{\"status\": \"Waiting\", \"reason\": \"needs a key\"}\n```",
         ]);
         let (steps, kept) = run_loop(goal(None), &model);
-        let Step::Continue { notice, message } = &steps[0] else {
+        let Step::Continue {
+            notice,
+            message,
+            blocked: false,
+        } = &steps[0]
+        else {
             panic!("{steps:?}");
         };
         assert_eq!(
@@ -1015,7 +1231,7 @@ mod tests {
 
     #[test]
     fn a_continuation_asks_for_the_next_concrete_step() {
-        let message = carry_on(&goal(None), "two tests still fail");
+        let message = carry_on(&goal(None), NEXT_STEP, "two tests still fail");
         let (own, note) = message.split_once("<untrusted-content-").unwrap();
         assert!(
             own.contains(
@@ -1236,6 +1452,7 @@ mod tests {
         let step = Step::Continue {
             notice: "Goal: carrying on".into(),
             message: "carry on".into(),
+            blocked: false,
         };
         let mut cleared = None;
         assert!(!settle(&mut cleared, &judged, &step));
@@ -1296,7 +1513,12 @@ mod tests {
             failing,
             |prompt| model.ask(prompt),
         );
-        let Step::Continue { notice, message } = &step else {
+        let Step::Continue {
+            notice,
+            message,
+            blocked: false,
+        } = &step
+        else {
             panic!("{step:?}");
         };
         assert_eq!(
@@ -1332,7 +1554,8 @@ mod tests {
             model.ask(prompt)
         });
         assert!(
-            matches!(&step, Step::Done(n) if n.starts_with("Goal blocked")),
+            matches!(&step, Step::Continue { notice, blocked: true, .. }
+                if notice.starts_with("Goal: blocked, trying another way")),
             "{step:?}"
         );
     }
