@@ -3,6 +3,7 @@
 .env
 .env.*
 *.log
+__pycache__/
 .CLAUDE.MD
 CLAUDE.md
 

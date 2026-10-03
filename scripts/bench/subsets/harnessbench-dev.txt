@@ -1,0 +1,20 @@
+# Harness-Bench tasks for paired runs while tuning (run.py --tasks).
+#
+# For now these are the eight tasks whose faults come from the environment:
+# a failing provider, a local API answering 429 and 503, an interruption, a
+# flaky test, async jobs and a half-done batch. A harness change to recovery
+# shows here first, and the bench's own faults measure it better than faults
+# injected into Letronna's tools would.
+#
+# Harness-Bench publishes no per-task pass rates, so rebuild this list from
+# Letronna's first full baseline run: `report.py OUT --band` lists the tasks
+# it passed 30-70% of the time. Put every other one here and keep the rest as
+# the held-out split, scored only for final numbers and never read for tuning.
+018-provider-failover-audit
+022-local-rest-api-summary
+057-interruption-resume
+078-local-api-cursor-retry-ledger
+085-flaky-test-root-cause
+088-api-contract-mock-client-compat
+104-async-ops-window-rollup
+105-partial-batch-resume-ledger
