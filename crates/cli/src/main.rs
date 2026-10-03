@@ -88,6 +88,18 @@ fn main() {
         println!("letronna {}", env!("CARGO_PKG_VERSION"));
         return;
     }
+    // Before an update goes in or the start counts, as for `--version`: a
+    // runner asks this of a build it is about to measure, and only reads.
+    if args.dump_config {
+        match dump_config(&args, &store::current_settings()) {
+            Ok(config) => println!("{config:#}"),
+            Err(error) => {
+                eprintln!("{}", render::red(&error));
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     // Before anything reads a key, so each comes from the vault and any
     // still in a file is moved there.
     letronna_core::vault::open();
@@ -551,12 +563,43 @@ fn begin(
         watch: None,
         decide: None,
         allow: args.tools.clone().map_or(Allow::All, Allow::Only),
-        rounds: args.max_rounds.unwrap_or(agent::MAX_ROUNDS),
+        rounds: rounds(args),
         cancel: Cancel::default(),
         budget,
         status: Arc::default(),
     };
     Ok((spec, context, before))
+}
+
+/// The tool rounds a `-p` run gets: what --max-rounds says, else `agent::MAX_ROUNDS`.
+fn rounds(args: &Args) -> usize {
+    args.max_rounds.unwrap_or(agent::MAX_ROUNDS)
+}
+
+/// The settings and limits a `-p` run in a new session gets from `args` over
+/// `settings`, as `--dump-config` prints them.
+fn dump_config(args: &Args, settings: &store::Settings) -> Result<Value, String> {
+    let mode = args.mode.clone()?;
+    // As `choose_by_flags` puts them on the session, which takes the
+    // settings' otherwise.
+    let gateway = match args.gateway.as_deref() {
+        Some(name) => gateway_named(name)?,
+        None => settings.gateway.as_str(),
+    };
+    let model = args.model.as_deref().unwrap_or(&settings.model);
+    Ok(json!({
+        "data_dir": chat::data_dir().display().to_string(),
+        "model": model,
+        "gateway": gateway,
+        "mode": mode.name(),
+        "max_rounds": rounds(args),
+        "tools": args.tools,
+        "budget": args.budget,
+        "context_cap": chat::cap_tokens(settings.context_cap),
+        "verify_edits": settings.verifies_edits(),
+        "command_timeout_seconds": tools::COMMAND_TIMEOUT.as_secs(),
+        "tool_output_bytes": tools::MAX_OUTPUT,
+    }))
 }
 
 /// Runs `spec` to its end on this thread, with progress lines while it runs
@@ -1114,6 +1157,82 @@ mod tests {
         ];
         assert_eq!(said_last(&session[2..]), "");
         assert_eq!(said_last(&session), "The notes say hello.");
+    }
+
+    #[test]
+    fn dump_config_prints_the_effective_limits() {
+        let asked = |words: &[&str]| parse(words.iter().map(|w| w.to_string())).unwrap();
+        let settings = store::Settings {
+            gateway: "OpenRouter".into(),
+            model: "x/y".into(),
+            ..Default::default()
+        };
+        let mut plain = dump_config(&asked(&["--dump-config"]), &settings).unwrap();
+        // Wherever the tests' data folder is, which another test can move.
+        let data_dir = plain
+            .as_object_mut()
+            .and_then(|dump| dump.remove("data_dir"));
+        assert!(data_dir.is_some_and(|dir| dir.is_string()));
+        assert_eq!(
+            plain,
+            json!({
+                "model": "x/y",
+                "gateway": "OpenRouter",
+                "mode": "default",
+                "max_rounds": 25,
+                "tools": null,
+                "budget": null,
+                "context_cap": 64_000,
+                "verify_edits": true,
+                "command_timeout_seconds": 120,
+                "tool_output_bytes": 8_000,
+            })
+        );
+        // What would stop the run stops the dump, rather than it guessing.
+        let nowhere = dump_config(
+            &asked(&["--dump-config", "--gateway", "nowhere"]),
+            &settings,
+        );
+        assert!(
+            nowhere
+                .unwrap_err()
+                .starts_with("There is no gateway called nowhere.")
+        );
+        let fast = dump_config(&asked(&["--dump-config", "--mode", "fast"]), &settings);
+        assert!(fast.unwrap_err().starts_with("There is no `fast` mode"));
+
+        // The flags win over the settings, as they do for the run.
+        let flagged = asked(&[
+            "--dump-config",
+            "--model",
+            "local-model",
+            "--gateway",
+            "ollama",
+            "--yes",
+            "--max-rounds",
+            "40",
+            "--tools",
+            "read_file,edit_file",
+            "--budget",
+            "200000",
+        ]);
+        let tight = store::Settings {
+            context_cap: 1_000,
+            disabled_tools: vec!["run_command".into()],
+            ..settings
+        };
+        let dumped = dump_config(&flagged, &tight).unwrap();
+        assert_eq!(
+            (&dumped["model"], &dumped["gateway"], &dumped["mode"]),
+            (&json!("local-model"), &json!("Ollama"), &json!("bypass"))
+        );
+        assert_eq!(dumped["max_rounds"], 40);
+        assert_eq!(dumped["tools"], json!(["read_file", "edit_file"]));
+        assert_eq!(dumped["budget"], 200_000);
+        // A cap under the floor gets the floor, and with run_command off the
+        // edits are not checked.
+        assert_eq!(dumped["context_cap"], 6_000);
+        assert_eq!(dumped["verify_edits"], false);
     }
 
     fn call(name: &str, args: Value) -> ToolCall {

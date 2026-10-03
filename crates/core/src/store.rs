@@ -3033,7 +3033,7 @@ pub fn messages(id: u64) -> Option<Contents> {
 }
 
 /// The settings as the file has them now.
-pub(crate) fn current_settings() -> Settings {
+pub fn current_settings() -> Settings {
     settings().0
 }
 
