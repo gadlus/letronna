@@ -3225,10 +3225,9 @@ fn with_files(rest: &str) -> Option<bool> {
 fn undo(runner: &mut Runner, session: usize, workspace: Option<&std::path::Path>, files: bool) {
     let conversation = &runner.store.conversations[session];
     let id = conversation.id;
-    let folder = conversation
-        .workspace
-        .clone()
-        .or_else(|| workspace.map(std::path::Path::to_path_buf));
+    // Without a project the tools wrote in the fallback folder, which the
+    // rewind finds itself, not in the folder the terminal started in.
+    let folder = conversation.workspace.clone();
     let (plan, commands) = match last_prompt(&conversation.messages) {
         Some((at, _)) => {
             let dropped = &conversation.messages[at..];

@@ -1152,7 +1152,8 @@ fn drafted(args: &Value, ctx: &ToolContext, now: DateTime<Local>) -> Result<Sche
         id: 0,
         name,
         prompt: prompt.into(),
-        workspace: ctx.workspace.clone(),
+        // The fallback folder is no project: a run with none works there anyway.
+        workspace: ctx.project().map(Path::to_path_buf),
         trigger,
         enabled: true,
         last_run: 0,
@@ -2404,5 +2405,17 @@ mod tests {
             moment("2026-03-29 02:00", &now),
             Ok(utc("2026-03-29T01:00:00"))
         );
+    }
+
+    #[test]
+    fn a_schedule_made_in_the_fallback_folder_starts_its_sessions_with_no_project() {
+        let ctx = ToolContext {
+            workspace: Some(PathBuf::from("/home/Letronna")),
+            fallback: true,
+            ..ToolContext::default()
+        };
+        let args = json!({"action": "add", "prompt": "Tidy up.", "daily_at": "9:05"});
+        let card = super::card(None, &args, &ctx);
+        assert!(card.contains("\nFolder: none\n"), "{card}");
     }
 }

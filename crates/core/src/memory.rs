@@ -1433,7 +1433,7 @@ impl Tool for Remember {
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         let target = Target::parse(args["target"].as_str().unwrap_or_default())?;
-        let (dir, root) = place(target, ctx.workspace.as_deref())?;
+        let (dir, root) = place(target, ctx.project())?;
         let origin = if ctx.caller.review {
             Origin::Review
         } else {
@@ -2491,6 +2491,27 @@ mod tests {
         let context = ToolContext::of(&Connection::default());
         let refused = Remember.run(&args, &context).unwrap_err();
         assert!(refused.contains("No project folder"), "{refused}");
+    }
+
+    #[test]
+    fn the_fallback_folder_keeps_no_project_memory() {
+        let _turn = crate::store::tests::DATA_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let data = scratch("fallback-data");
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &*data) };
+        let folder = scratch("fallback");
+        let args = json!({"action": "add", "target": "project", "content": "Build with make."});
+        let context = ToolContext {
+            workspace: Some(folder.to_path_buf()),
+            fallback: true,
+            ..Default::default()
+        };
+        let refused = Remember.run(&args, &context);
+        unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        let refused = refused.unwrap_err();
+        assert!(refused.contains("No project folder"), "{refused}");
+        assert!(!data.join("projects").exists());
     }
 
     #[test]

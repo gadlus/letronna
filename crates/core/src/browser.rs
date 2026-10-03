@@ -1209,8 +1209,8 @@ fn upload_files(args: &Value, ctx: &ToolContext) -> Result<Vec<PathBuf>, String>
 
 /// Where a tool call keeps what the page downloads.
 struct Saving<'a> {
-    /// The project, or Letronna's own folder without one; `None` in plan
-    /// mode, which changes nothing and so keeps nothing.
+    /// The folder the session works in, or Letronna's own where it has
+    /// none; `None` in plan mode, which changes nothing and so keeps nothing.
     root: Option<PathBuf>,
     conversation: u64,
     /// Set when the user stops the call, which stops a download too.

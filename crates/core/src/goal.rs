@@ -624,6 +624,11 @@ fn check(connection: &Connection, command: &str, cancel: &Cancel) -> (String, bo
         Ok(heard) => heard,
         Err(why) => return (format!("The check command was not run: {why}"), false),
     };
+    // As run_command does, so a check made before anything was written
+    // there runs, and finds nothing, rather than failing to start.
+    if let Err(why) = ctx.working_folder() {
+        return (format!("The check command was not run: {why}"), false);
+    }
     let (ran, failed) = run_check(command, &cwd, CHECK_TIME, cancel);
     let out = crate::redact::scrub(&ran, tool.hides_key_shapes());
     let said = crate::hooks::after(&hooks, &call.name, &args, &out, &ctx);
@@ -1361,5 +1366,23 @@ mod tests {
         let (said, failed) = check(&Connection::default(), "exit 1", &Cancel::default());
         assert!(said.starts_with("The check command was not run"), "{said}");
         assert!(!failed);
+    }
+
+    #[test]
+    fn a_check_in_a_fallback_folder_not_made_yet_still_runs() {
+        let mut connection = Connection {
+            tools: true,
+            ..Connection::default()
+        };
+        // So the gate lets it run without anyone to ask.
+        connection.switch_to(crate::gate::Mode::Bypass);
+        let ctx = ToolContext::of(&connection);
+        assert!(ctx.fallback);
+        let folder = ctx.workspace.unwrap();
+        let _ = std::fs::remove_dir_all(&folder);
+        let (said, failed) = check(&connection, "pwd", &Cancel::default());
+        assert!(!failed, "{said}");
+        assert!(said.contains("Letronna"), "{said}");
+        assert!(folder.is_dir());
     }
 }

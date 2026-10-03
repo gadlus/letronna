@@ -86,7 +86,7 @@ impl Tool for ManageSkill {
             // What comes back is shown, or a yes would put back text unseen.
             "undo" => {
                 let name = one_line(text("name"));
-                match earlier(&backend::data_dir(), ctx.workspace.as_deref(), &name) {
+                match earlier(&backend::data_dir(), ctx.project(), &name) {
                     Some(back) => format!("{head}, putting back:\n\n{back}"),
                     None => head,
                 }
@@ -95,7 +95,7 @@ impl Tool for ManageSkill {
         }
     }
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
-        manage(&backend::data_dir(), ctx.workspace.as_deref(), args)
+        manage(&backend::data_dir(), ctx.project(), args)
     }
 }
 

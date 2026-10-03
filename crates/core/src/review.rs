@@ -122,7 +122,8 @@ pub fn spawn(
     let mut context = ToolContext::of(&connection);
     // So memory's history says the review made what it keeps.
     context.caller.review = true;
-    let workspace = context.workspace.clone();
+    // The fallback folder keeps no project memory to add to.
+    let workspace = context.project().map(Path::to_path_buf);
     let spec = Spec {
         connection: Connection {
             // A turn that ended at its cap leaves its connection asking for
@@ -294,7 +295,7 @@ fn keep(found: Found, context: &ToolContext) -> Result<Kept, String> {
         // A store that filled meanwhile refuses the call, so none of its
         // adds is said to be kept, and the note says why.
         let Ok(out) = tools::run(&call.name, &call.arguments, context) else {
-            let workspace = context.workspace.as_deref();
+            let workspace = context.project();
             if let Some((last, earlier)) = adds.split_last()
                 && let Ok(Fit::Full(_)) = memory::would_add(target, last, earlier, workspace)
             {

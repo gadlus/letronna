@@ -2701,8 +2701,7 @@ impl Tool for McpTool {
     fn run(&self, args: &Value, ctx: &ToolContext) -> Result<String, String> {
         // A call stopped already changes no roots, and is refused below.
         if !ctx.cancel.is_set() {
-            self.server
-                .called_from(ctx.workspace.as_deref(), &ctx.cancel);
+            self.server.called_from(ctx.project(), &ctx.cancel);
         }
         let mut args = args.clone();
         if let Some(given) = args.as_object_mut() {
