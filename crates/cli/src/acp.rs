@@ -135,6 +135,9 @@ fn open_session(runner: &mut Runner, cwd: &Path) -> Result<(Connection, Transcri
     let mut connection = runner.connection(index);
     // An editor always has someone to answer its helpers' cards too.
     connection.human = true;
+    // And someone watching the turn, who would rather be told of a long
+    // wait than sit through it, as at a terminal.
+    connection.unattended = false;
     let conversation = runner.store.conversations.remove(index);
     let path = store::sessions_dir().join(format!("{id}.jsonl"));
     if let Err(error) = chat::validate(&connection) {
@@ -1220,5 +1223,34 @@ mod tests {
             text.contains("https://example.com/\n<untrusted-content-"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn an_editor_session_retries_as_one_someone_watches() {
+        let _serving = lock(&SERVING);
+        let data = std::env::temp_dir().join(format!("letronna-acp-{}-data", std::process::id()));
+        // Only this module's tests look here, and all of them set the same.
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &data) };
+        let mut runner = Runner {
+            store: Default::default(),
+            allowed: Default::default(),
+            mode: Mode::Default,
+            human: false,
+            helpers_answered: false,
+            trouble: None,
+            bar: crate::bar::Bar::new(String::new()),
+            stopped: false,
+            images: Vec::new(),
+            notices: letronna_core::notify::Notices::new(Box::new(crate::notify::Silent)),
+            ended: None,
+            voice: None,
+            review: Default::default(),
+        };
+        runner.store.settings.gateway = "Ollama".into();
+        runner.store.settings.model = "test-model".into();
+        let (connection, transcript) = open_session(&mut runner, &scratch("watched")).unwrap();
+        let _ = std::fs::remove_file(&transcript.path);
+        assert!(connection.human);
+        assert!(!connection.unattended);
     }
 }
