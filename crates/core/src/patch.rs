@@ -603,12 +603,16 @@ fn patched(file: &str, hunks: &[Hunk], raw: &str) -> Result<String, String> {
         true => format!("{body}{ending}"),
         false => body.to_owned(),
     };
+    let breaks = text.matches('\n').count();
     let mut from = 0;
     for (i, hunk) in hunks.iter().enumerate() {
         let fail = |why: &str| {
+            // A hint on the lines below stays last, so that nothing changed
+            // is read with the error, not after a block of the file.
+            let (why, hint) = why.split_at(why.find('\n').unwrap_or(why.len()));
             format!(
                 "Hunk {} of {} for `{raw}` (line {} of the patch) does not apply: {why} \
-                 Nothing was changed.",
+                 Nothing was changed.{hint}",
                 i + 1,
                 hunks.len(),
                 hunk.line
@@ -633,7 +637,8 @@ fn patched(file: &str, hunks: &[Hunk], raw: &str) -> Result<String, String> {
             from = at + new.len();
             continue;
         }
-        (text, from) = crate::edit::replace_lines(&text, from, &old, &new).map_err(|e| fail(&e))?;
+        (text, from) =
+            crate::edit::replace_lines(&text, from, breaks, &old, &new).map_err(|e| fail(&e))?;
     }
     if open && let Some(closed) = text.strip_suffix(ending) {
         text.truncate(closed.len());
@@ -868,6 +873,27 @@ mod tests {
         assert_eq!(read(&dir, "b.txt"), "beta\n");
         assert_eq!(read(&dir, "c.txt"), "gamma\n");
         assert!(!dir.join("new.txt").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_apply_patch_hunk_gets_the_same_hint() {
+        let (dir, ctx) = project("near-miss");
+        let file = "fn one() {}\n\nfn two() {\n    let total = foo_bar(1);\n}\n";
+        std::fs::write(dir.join("a.rs"), file).unwrap();
+        let text = "*** Begin Patch\n*** Update File: a.rs\n@@\n+// One.\n+// Two.\n fn one() {}\n\
+                    @@\n fn two() {\n-    let total = foo-bar(1);\n+    let total = 2;\n*** End Patch";
+        let err = patch(&ctx, text).unwrap_err();
+        // The first hunk added two lines above; the numbers are the file's.
+        assert!(
+            err.ends_with(
+                "are not in the file after the hunks before it. Nothing was changed.\n\
+                 Closest text, lines 3-4 (97% alike):\n3|fn two() {\n4|    let total = foo_bar(1);\n\
+                 Differs at 4:20: the file has `foo_bar(1);`, `old` has `foo-bar(1);`."
+            ),
+            "{err}"
+        );
+        assert_eq!(read(&dir, "a.rs"), file);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
