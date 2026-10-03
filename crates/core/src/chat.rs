@@ -2563,7 +2563,8 @@ fn begin(
     let budget = budget(&connection, crate::store::sizing());
     // Before the reply exists, so every call it makes is stamped with it.
     let window = window_from(&messages, &budget, extra.floor);
-    crate::filestate::asked(connection.conversation, messages.len(), window);
+    let cleared = window + old_before(&messages[window..], &budget);
+    crate::filestate::asked(connection.conversation, messages.len(), window, cleared);
     let (sender, receiver) = async_channel::bounded(64);
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
@@ -2696,8 +2697,10 @@ fn send_window(
     }
     let start = window_from(messages, budget, extra.floor);
     // A fallback or a refit can start later than the window stamped before
-    // the call, and a read it leaves out must not let an edit through.
-    crate::filestate::asked(connection.conversation, messages.len(), start);
+    // the call, and a read it leaves out must not let an edit through; a
+    // squeezed refit clears more results too.
+    let cleared = start + old_before(&messages[start..], budget);
+    crate::filestate::asked(connection.conversation, messages.len(), start, cleared);
     stream(connection, messages, start, budget, extra, lsp, sender)
 }
 
@@ -8380,7 +8383,7 @@ mod tests {
             ..Default::default()
         };
         // The first reply reads the file.
-        crate::filestate::asked(conversation, 1, 0);
+        crate::filestate::asked(conversation, 1, 0, 0);
         crate::tools::run("read_file", r#"{"path":"a.txt"}"#, &ctx).unwrap();
         let said = |role: &str, content: &str| Message {
             role: role.into(),
@@ -8393,7 +8396,7 @@ mod tests {
             said("user", "Now make it two."),
         ];
         // Stamped as start_with does, with the session model's roomy window.
-        crate::filestate::asked(conversation, messages.len(), 0);
+        crate::filestate::asked(conversation, messages.len(), 0, 0);
         // A fallback's window that holds only the newest turn.
         let narrow = Budget {
             step: 1,
@@ -8413,6 +8416,53 @@ mod tests {
         let refused = crate::tools::run("edit_file", edit, &ctx).unwrap_err();
         assert!(refused.contains("has left the part"), "{refused}");
         assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "one");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pages_of_a_file_cleared_to_save_room_do_not_add_up_to_all_of_it() {
+        let answer = r#"{"choices":[{"message":{"role":"assistant","content":"Done."}}]}"#;
+        let (endpoint, worker) = serve(vec![
+            ("200 OK", "application/json", answer),
+            ("200 OK", "application/json", answer),
+        ]);
+        let dir = std::env::temp_dir().join(format!("letronna-cleared-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let long: String = (1..=300)
+            .map(|n| format!("line {n:03} {}\n", "x".repeat(30)))
+            .collect();
+        std::fs::write(dir.join("long.txt"), long).unwrap();
+        let conversation = 259_002;
+        let ctx = crate::tools::ToolContext {
+            workspace: Some(dir.clone()),
+            conversation,
+            ..Default::default()
+        };
+        // Its first page read in the first round, the rest in the ninth.
+        crate::filestate::asked(conversation, 1, 0, 0);
+        let first = crate::tools::run("read_file", r#"{"path":"long.txt"}"#, &ctx).unwrap();
+        let (_, offset) = first.rsplit_once("offset=").unwrap();
+        let offset = offset.trim_end_matches('.');
+        let rest = format!(r#"{{"path":"long.txt","offset":{offset}}}"#);
+        crate::filestate::asked(conversation, 17, 0, 0);
+        crate::tools::run("read_file", &rest, &ctx).unwrap();
+        let c = Connection {
+            endpoint,
+            conversation,
+            ..connection()
+        };
+        let (sender, _receiver) = async_channel::unbounded();
+        let write = r#"{"path":"long.txt","content":"short\n"}"#;
+        // Past half the budget the first eight rounds go out cleared.
+        let heavy = reads(20, 800);
+        send_window(&c, &heavy, &Budget::SMALL, &Extra::default(), None, &sender).unwrap();
+        let refused = crate::tools::run("write_file", write, &ctx).unwrap_err();
+        assert!(refused.contains("only part"), "{refused}");
+        // Under it every page goes out whole.
+        let light = reads(20, 400);
+        send_window(&c, &light, &Budget::SMALL, &Extra::default(), None, &sender).unwrap();
+        crate::tools::run("write_file", write, &ctx).unwrap();
+        assert_eq!(worker.join().unwrap().len(), 2);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

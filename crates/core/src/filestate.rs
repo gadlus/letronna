@@ -16,8 +16,11 @@
 //! window starts, and every entry is stamped with the reply whose call
 //! made it: a read from the reply being worked through was not seen when
 //! the change was composed, and one from before the window start has been
-//! dropped or summarised. A rewind forgets the conversation's entries,
-//! since the positions they were stamped with are used again.
+//! dropped or summarised. Pages of a file add up while it stays unchanged:
+//! once they have shown every line, and the request goes out with each of
+//! them whole rather than cleared to save room, they count as one read of
+//! all of it. A rewind forgets the conversation's entries, since the
+//! positions they were stamped with are used again.
 //!
 //! The check and the write happen under one lock, on the same bytes, so
 //! two calls in this process cannot both pass and then clobber each other.
@@ -33,7 +36,9 @@ use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::SystemTime;
 
 /// Entries kept across all conversations, oldest dropped first. One is a
-/// path and a few numbers, so the cap holds well under a megabyte.
+/// path, a few numbers and 32 bytes for each part of the file a read still
+/// in the window showed; a file read whole or a few pages at a time comes
+/// to a few hundred bytes, so the cap holds around a megabyte.
 const KEEP: usize = 4096;
 
 /// Files named in the note after a command; more are counted, not named.
@@ -58,6 +63,17 @@ enum Print {
     Modified(Option<SystemTime>),
 }
 
+/// Lines one read showed, every one of them as the file holds it.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) struct Lines {
+    /// The first, counting from 1.
+    pub(crate) first: usize,
+    /// The last; one before `first` for an empty file.
+    pub(crate) last: usize,
+    /// Whether the last is the file's own last line.
+    pub(crate) end: bool,
+}
+
 /// What a conversation last saw of a file.
 #[derive(Clone)]
 struct Seen {
@@ -65,6 +81,9 @@ struct Seen {
     print: Print,
     /// Whether the model was shown all of it, which an overwrite needs.
     whole: bool,
+    /// The lines reads have shown of it as it is, each with the reply whose
+    /// call read them; empty once it was written or changed.
+    pages: Vec<(Lines, usize)>,
     /// Where in the history the reply whose call recorded it sits.
     reply: usize,
     /// Whether the model wrote it: what it sent is in that reply, so the
@@ -74,12 +93,59 @@ struct Seen {
     at: u64,
 }
 
-/// The reply a conversation is being worked through and where its window
-/// starts, both as positions in its history.
+impl Seen {
+    /// The reply the model's view of all of the file rests on in the request
+    /// `asked`; None when it cannot see all of it.
+    fn whole_since(&self, asked: Reply) -> Option<usize> {
+        if !self.whole {
+            return None;
+        }
+        // What was written carries the reply it rests on in its mark.
+        if self.pages.is_empty() {
+            return Some(self.reply);
+        }
+        covers(&self.pages, asked)
+    }
+}
+
+/// The reply the request `asked` has all of the file since: that of one
+/// read of all of it, or the earliest of pages that show every line together.
+fn covers(pages: &[(Lines, usize)], asked: Reply) -> Option<usize> {
+    // One read of all of it counts while the window holds it, cleared or
+    // not, as it always has: the model once had all of it in one request.
+    let whole = pages
+        .iter()
+        .find(|(lines, at)| lines.first <= 1 && lines.end && *at >= asked.window);
+    if let Some((_, at)) = whole {
+        return Some(*at);
+    }
+    // Pages count only while each goes out whole, or the model would write
+    // over a file it never had all of in any one request.
+    let from = asked.window.max(asked.cleared);
+    let mut seen: Vec<&(Lines, usize)> = pages.iter().filter(|(_, at)| *at >= from).collect();
+    seen.sort_by_key(|(lines, _)| lines.first);
+    let earliest = seen.iter().map(|(_, at)| *at).min()?;
+    let mut next = 1;
+    for (lines, _) in seen {
+        if lines.first > next {
+            return None;
+        }
+        if lines.end {
+            return Some(earliest);
+        }
+        next = next.max(lines.last + 1);
+    }
+    None
+}
+
+/// The reply a conversation is being worked through, where its window
+/// starts and where the results it sends whole start, all as positions in
+/// its history.
 #[derive(Clone, Copy, Default)]
 struct Reply {
     at: usize,
     window: usize,
+    cleared: usize,
 }
 
 #[derive(Default)]
@@ -195,13 +261,19 @@ fn changed(raw: &str) -> String {
 }
 
 /// Says that the model is being asked for the reply at position `at` of the
-/// conversation's history, with the window starting at `window`: the calls
-/// that come back are that reply's.
-pub(crate) fn asked(conversation: u64, at: usize, window: usize) {
+/// conversation's history, with the window starting at `window` and the
+/// long results of replies before `cleared` sent as a line saying what they
+/// were: the calls that come back are that reply's.
+pub(crate) fn asked(conversation: u64, at: usize, window: usize, cleared: usize) {
     if conversation == NONE {
         return;
     }
-    state().replies.insert(conversation, Reply { at, window });
+    let reply = Reply {
+        at,
+        window,
+        cleared,
+    };
+    state().replies.insert(conversation, reply);
 }
 
 /// Drops all the conversation has seen: after a rewind the positions its
@@ -213,11 +285,11 @@ pub(crate) fn forget(conversation: u64) {
     state.replies.remove(&conversation);
 }
 
-/// Records that the model read `path`, `whole` when one result showed all
-/// of it. `before` is the file's stat from before the read: when it moved
-/// since, the model saw bytes that are no longer there, and nothing is
-/// recorded.
-pub(crate) fn read(conversation: u64, path: &Path, before: Stat, whole: bool) {
+/// Records that the model read `path`, and the `lines` it was shown if each
+/// showed as the file holds it. `before` is the file's stat from before the
+/// read: when it moved since, the model saw bytes that are no longer there,
+/// and nothing is recorded.
+pub(crate) fn read(conversation: u64, path: &Path, before: Stat, lines: Option<Lines>) {
     if conversation == NONE {
         return;
     }
@@ -227,16 +299,31 @@ pub(crate) fn read(conversation: u64, path: &Path, before: Stat, whole: bool) {
     if before.is_none() || stat(path) != before {
         return;
     }
+    let key = key(path);
     let mut state = state();
+    let reply = state.reply(conversation);
+    // Pages of the file as it still is add up; what they showed of bytes
+    // since changed is gone. One that left the window, or that this read
+    // showed again, adds nothing more.
+    let mut pages = match state.seen.get(&(conversation, key.clone())) {
+        Some(seen) if (seen.len, seen.print) == (len, print) => seen.pages.clone(),
+        _ => Vec::new(),
+    };
+    pages.retain(|(page, at)| {
+        *at >= reply.window
+            && !lines.is_some_and(|new| new.first <= page.first && page.last <= new.last)
+    });
+    pages.extend(lines.map(|lines| (lines, reply.at)));
     let seen = Seen {
         len,
         print,
-        whole,
-        reply: state.reply(conversation).at,
+        whole: covers(&pages, reply).is_some(),
+        pages,
+        reply: reply.at,
         own: false,
         at: 0,
     };
-    state.record(conversation, key(path), seen);
+    state.record(conversation, key, seen);
 }
 
 /// The file's bytes as text, or a refusal: a file in another encoding or a
@@ -339,6 +426,7 @@ fn wrote(state: &mut State, conversation: u64, path: &Path, bytes: &[u8], mark: 
         len: bytes.len() as u64,
         print: print_of(bytes, path),
         whole: mark.whole,
+        pages: Vec::new(),
         reply: mark.reply,
         own: mark.own,
         at: 0,
@@ -440,11 +528,14 @@ pub(crate) fn overwrite(conversation: u64, path: &Path, raw: &str) -> Result<Cha
     let text = text(bytes, raw)?;
     // An empty file holds nothing to lose.
     if conversation != NONE && !text.is_empty() {
+        let asked = change.state.reply(conversation);
         let seen = seen(&change.state, conversation, path, raw, "write it again")?;
-        if !seen.whole {
+        if seen.whole_since(asked).is_none() {
             return Err(format!(
-                "You have seen only part of `{raw}`, so writing the whole file would \
-                 drop the rest. Nothing was changed. Change it with edit_file instead."
+                "You have seen only part of `{raw}`, or pages of it you read have \
+                 since been dropped or cleared to save room, so writing the whole \
+                 file would drop the rest. Nothing was changed. Read what you cannot \
+                 see of it with read_file first, or change it with edit_file instead."
             ));
         }
         if !matches(seen, text.as_bytes(), path) {
@@ -503,8 +594,12 @@ fn existing(
         if !matches(seen, text.as_bytes(), path) {
             return Err(changed(raw));
         }
+        // The result rests on the latest read, as any edit does, so it
+        // stays whole only when the view of all of it rests there too:
+        // pages read over several replies have to be read again.
+        let whole = seen.whole_since(state.reply(conversation));
         mark = Mark {
-            whole: seen.whole,
+            whole: whole == Some(seen.reply),
             reply: seen.reply,
             own: seen.own,
         };
@@ -566,6 +661,7 @@ pub(crate) fn note(conversation: u64, before: Vec<(PathBuf, Stat)>, workspace: &
                 len,
                 print,
                 whole: false,
+                pages: Vec::new(),
                 ..seen
             };
             state().record(conversation, path.clone(), part);
@@ -599,7 +695,7 @@ mod tests {
             std::env::temp_dir().join(format!("letronna-filestate-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        asked(conversation, 1, 0);
+        asked(conversation, 1, 0, 0);
         let ctx = ToolContext {
             workspace: Some(dir.clone()),
             conversation,
@@ -611,11 +707,30 @@ mod tests {
     /// Moves the session on to the reply at `at`, as the chat does before
     /// each request, with the whole history in the window.
     fn reply(ctx: &ToolContext, at: usize) {
-        asked(ctx.conversation, at, 0);
+        asked(ctx.conversation, at, 0, 0);
     }
 
     fn read_to(dir: &Path, name: &str) -> String {
         std::fs::read_to_string(dir.join(name)).unwrap()
+    }
+
+    /// The offset the page `shown` says to continue from.
+    fn next(shown: &str) -> usize {
+        let (_, offset) = shown.rsplit_once("offset=").unwrap();
+        offset.trim_end_matches('.').parse().unwrap()
+    }
+
+    /// A page of `name` from line `offset` on.
+    fn page(ctx: &ToolContext, name: &str, offset: usize) -> String {
+        let args = format!(r#"{{"path":"{name}","offset":{offset}}}"#);
+        run("read_file", &args, ctx).unwrap()
+    }
+
+    /// 300 lines of about 40 bytes, each starting with `word`: two pages.
+    fn lines(word: &str) -> String {
+        (1..=300)
+            .map(|n| format!("{word} {n:03} {}\n", "x".repeat(30)))
+            .collect()
     }
 
     #[test]
@@ -680,14 +795,14 @@ mod tests {
         std::fs::write(dir.join("a.txt"), "one").unwrap();
         run("read_file", r#"{"path":"a.txt"}"#, &ctx).unwrap();
         // The window now starts after the reply that read it.
-        asked(102, 9, 4);
+        asked(102, 9, 4, 4);
         let edit = r#"{"path":"a.txt","old":"one","new":"two"}"#;
         let refused = run("edit_file", edit, &ctx).unwrap_err();
         assert!(refused.contains("has left the part"), "{refused}");
         let write = r#"{"path":"a.txt","content":"two"}"#;
         let refused = run("write_file", write, &ctx).unwrap_err();
         assert!(refused.contains("has left the part"), "{refused}");
-        asked(102, 9, 1);
+        asked(102, 9, 1, 1);
         run("edit_file", edit, &ctx).unwrap();
         assert_eq!(read_to(&dir, "a.txt"), "two");
 
@@ -773,7 +888,7 @@ mod tests {
     #[test]
     fn each_session_needs_its_own_read_and_sees_the_others_writes() {
         let (dir, first) = project("sessions", 106);
-        asked(107, 1, 0);
+        asked(107, 1, 0, 0);
         let second = ToolContext {
             conversation: 107,
             ..first.clone()
@@ -796,21 +911,13 @@ mod tests {
     }
 
     #[test]
-    fn only_one_read_that_showed_all_of_a_file_lets_it_be_overwritten() {
+    fn only_reads_that_showed_every_line_of_a_file_let_it_be_overwritten() {
         let (dir, ctx) = project("part", 108);
-        // Two pages: together they cover it, but no one result showed it all.
-        let long: String = (1..=300)
-            .map(|n| format!("line {n:03} {}\n", "x".repeat(30)))
-            .collect();
-        std::fs::write(dir.join("long.txt"), &long).unwrap();
+        // Two pages with lines between them that neither showed.
+        std::fs::write(dir.join("long.txt"), lines("line")).unwrap();
         let first = run("read_file", r#"{"path":"long.txt"}"#, &ctx).unwrap();
-        let next = first
-            .rsplit("offset=")
-            .next()
-            .unwrap()
-            .trim_end_matches('.');
-        let rest = format!(r#"{{"path":"long.txt","offset":{next}}}"#);
-        let second = run("read_file", &rest, &ctx).unwrap();
+        assert!(next(&first) < 290, "{first}");
+        let second = page(&ctx, "long.txt", 290);
         assert!(second.contains("\n300|line 300 "), "{second}");
         // A line too long to show, and a limit short of the end.
         std::fs::write(dir.join("wide.txt"), "x".repeat(1_500)).unwrap();
@@ -840,6 +947,93 @@ mod tests {
         )
         .unwrap();
         run("write_file", r#"{"path":"page.txt","content":"z\n"}"#, &ctx).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reading_every_page_lets_the_file_be_overwritten() {
+        let (dir, ctx) = project("pages", 115);
+        std::fs::write(dir.join("long.txt"), lines("line")).unwrap();
+        let write = r#"{"path":"long.txt","content":"short\n"}"#;
+        let second = next(&page(&ctx, "long.txt", 1));
+        reply(&ctx, 3);
+        let refused = run("write_file", write, &ctx).unwrap_err();
+        assert!(refused.contains("only part"), "{refused}");
+        let last = page(&ctx, "long.txt", second);
+        assert!(last.ends_with(&format!("300|line 300 {}", "x".repeat(30))));
+        // The last page came back in the reply that would write.
+        let refused = run("write_file", write, &ctx).unwrap_err();
+        assert!(refused.contains("in this same reply"), "{refused}");
+        // A first page the window no longer holds leaves a gap, and so does
+        // one the request clears to save room.
+        for (window, cleared) in [(2, 2), (0, 2)] {
+            asked(115, 5, window, cleared);
+            let refused = run("write_file", write, &ctx).unwrap_err();
+            assert!(refused.contains("only part"), "{refused}");
+            assert!(refused.contains("Read what you cannot see"), "{refused}");
+        }
+
+        // An edit rests on the last page, so a second one goes through with
+        // the first page gone; but the file is no longer seen whole.
+        asked(115, 5, 1, 1);
+        let edit = r#"{"path":"long.txt","old":"line 300","new":"end 300"}"#;
+        run("edit_file", edit, &ctx).unwrap();
+        asked(115, 7, 2, 2);
+        let edit = r#"{"path":"long.txt","old":"line 299","new":"end 299"}"#;
+        run("edit_file", edit, &ctx).unwrap();
+        let refused = run("write_file", write, &ctx).unwrap_err();
+        assert!(refused.contains("only part"), "{refused}");
+        // Every page read in one reply keeps it whole through an edit.
+        let second = next(&page(&ctx, "long.txt", 1));
+        page(&ctx, "long.txt", second);
+        asked(115, 9, 2, 2);
+        let edit = r#"{"path":"long.txt","old":"line 298","new":"end 298"}"#;
+        run("edit_file", edit, &ctx).unwrap();
+        asked(115, 11, 2, 2);
+        run("write_file", write, &ctx).unwrap();
+        assert_eq!(read_to(&dir, "long.txt"), "short\n");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn one_read_of_all_of_a_file_counts_though_it_is_cleared_to_save_room() {
+        let (dir, ctx) = project("cleared", 114);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        run("read_file", r#"{"path":"a.txt"}"#, &ctx).unwrap();
+        asked(114, 5, 0, 3);
+        run("write_file", r#"{"path":"a.txt","content":"two\n"}"#, &ctx).unwrap();
+        assert_eq!(read_to(&dir, "a.txt"), "two\n");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_change_between_pages_resets_what_was_read() {
+        let (dir, ctx) = project("repage", 113);
+        // The same length, so only the hash tells the old bytes from the new.
+        std::fs::write(dir.join("a.txt"), lines("line")).unwrap();
+        std::fs::write(dir.join("b.txt"), lines("line")).unwrap();
+        std::fs::write(dir.join("c.txt"), lines("LINE")).unwrap();
+        let second = next(&page(&ctx, "a.txt", 1));
+        page(&ctx, "b.txt", 1);
+        reply(&ctx, 3);
+        // Changed outside, and by a command, between the first page and the
+        // second: the first showed bytes no longer there.
+        std::fs::write(dir.join("a.txt"), lines("LINE")).unwrap();
+        run("run_command", r#"{"command":"cp c.txt b.txt"}"#, &ctx).unwrap();
+        page(&ctx, "a.txt", second);
+        page(&ctx, "b.txt", second);
+        reply(&ctx, 5);
+        for name in ["a.txt", "b.txt"] {
+            let write = format!(r#"{{"path":"{name}","content":"short"}}"#);
+            let refused = run("write_file", &write, &ctx).unwrap_err();
+            assert!(refused.contains("only part"), "{name}: {refused}");
+        }
+
+        // The first page again, of the file as it is now, completes it.
+        page(&ctx, "a.txt", 1);
+        reply(&ctx, 7);
+        run("write_file", r#"{"path":"a.txt","content":"short"}"#, &ctx).unwrap();
+        assert_eq!(read_to(&dir, "a.txt"), "short");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -949,6 +1143,7 @@ mod tests {
             len: 0,
             print: Print::Hash([0; 32]),
             whole: true,
+            pages: Vec::new(),
             reply: 0,
             own: false,
             at: 0,

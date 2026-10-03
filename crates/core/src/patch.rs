@@ -875,7 +875,7 @@ mod tests {
     fn a_write_that_fails_part_way_puts_every_file_back_as_it_was_read() {
         let (dir, mut ctx) = project("undo");
         ctx.conversation = 9_102;
-        crate::filestate::asked(ctx.conversation, 1, 0);
+        crate::filestate::asked(ctx.conversation, 1, 0, 0);
         std::fs::write(dir.join("a.txt"), "a\n").unwrap();
         std::fs::write(dir.join("gone.txt"), "bye\n").unwrap();
         // A file where the last step needs a folder: found only when written.
@@ -883,7 +883,7 @@ mod tests {
         for name in ["a.txt", "gone.txt"] {
             run("read_file", &json!({ "path": name }).to_string(), &ctx).unwrap();
         }
-        crate::filestate::asked(ctx.conversation, 2, 0);
+        crate::filestate::asked(ctx.conversation, 2, 0, 0);
         let text = "*** Begin Patch\n*** Update File: a.txt\n@@\n-a\n+b\n\
                     *** Delete File: gone.txt\n*** Add File: blocker/x.txt\n+x\n*** End Patch";
         let err = patch(&ctx, text).unwrap_err();
@@ -1058,7 +1058,7 @@ mod tests {
     fn a_file_the_conversation_has_not_read_is_not_changed() {
         let (dir, mut ctx) = project("unread");
         ctx.conversation = 9_101;
-        crate::filestate::asked(ctx.conversation, 1, 0);
+        crate::filestate::asked(ctx.conversation, 1, 0, 0);
         std::fs::write(dir.join("a.txt"), "a\n").unwrap();
         let text = "*** Begin Patch\n*** Update File: a.txt\n-a\n+b\n*** End Patch";
         let err = patch(&ctx, text).unwrap_err();

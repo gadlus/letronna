@@ -204,7 +204,7 @@ mod tests {
         let read = json!({ "path": "theirs.txt" }).to_string();
         tools::run("read_file", &read, &ctx).unwrap();
         // The overwrite comes in the next reply, after the read was seen.
-        crate::filestate::asked(731_021, 1, 0);
+        crate::filestate::asked(731_021, 1, 0, 0);
         tools::run("write_file", &write("theirs.txt"), &ctx).unwrap();
         assert!(!own(&ctx, &dir.join("theirs.txt")));
         // A file the patch moves is still the user's under its new name.
