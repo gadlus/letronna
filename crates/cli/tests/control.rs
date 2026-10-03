@@ -685,7 +685,7 @@ fn a_sigterm_stops_a_print_run_and_prints_its_result() {
     let (data, work) = scratch("sigterm");
     let (endpoint, bodies) = provider(vec![None]);
     let flags = ["-p", "take your time", "--output", "json"];
-    let run = Driven::start(&data, &work, &endpoint, &flags);
+    let run = Driven::start(&data, &work, &endpoint, &flags, &[]);
     // The model has the request and is sitting on it.
     bodies
         .recv_timeout(WAIT)
@@ -735,4 +735,64 @@ fn a_print_run_with_a_schema_returns_its_value() {
     let run = Driven::start(&data, &work, &endpoint, &flags, &[]);
     assert_eq!(run.next(), json!({"count": 3}));
     assert_eq!(run.close(), 0);
+}
+
+#[test]
+fn a_run_in_a_worktree_writes_there_and_says_where_it_was_kept() {
+    let (data, work) = scratch("worktree");
+    std::fs::write(work.join("readme.txt"), "a repository").unwrap();
+    let who = [
+        "-c",
+        "user.name=tester",
+        "-c",
+        "user.email=tester@example.invalid",
+    ];
+    for args in [
+        &["init", "-q"][..],
+        &["add", "-A"],
+        &["commit", "-q", "-m", "First"],
+    ] {
+        let mut git = Command::new("git");
+        git.args(who).args(args).current_dir(&work);
+        assert!(git.output().unwrap().status.success(), "git {args:?}");
+    }
+    let write = ("write_file", json!({"path": "out.txt", "content": "hi"}));
+    // A write that runs is sent back once to be checked.
+    let (endpoint, bodies) = provider(vec![
+        reply("", &[write]),
+        reply("Wrote it.", &[]),
+        reply("Wrote it.", &[]),
+    ]);
+    let settings = json!({"endpoint": endpoint, "model": "stub-model", "gateway": "Custom",
+        "custom_endpoint": endpoint});
+    std::fs::write(data.join("settings.json"), settings.to_string()).unwrap();
+    let run = Command::new(env!("CARGO_BIN_EXE_letronna"))
+        .args(["-p", "write it", "--worktree", "--yes", "--output", "json"])
+        .current_dir(&work)
+        .env("AGENT_DATA_DIR", &data)
+        .env("HOME", &data)
+        .env("USERPROFILE", &data)
+        .env_remove("LOCALAPPDATA")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+
+    let result: Value = serde_json::from_slice(&run.stdout).unwrap();
+    assert_eq!(result["answer"], "Wrote it.", "{result}");
+    let made = std::fs::read_dir(work.join(".letronna/worktrees"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert_eq!(std::fs::read_to_string(made.join("out.txt")).unwrap(), "hi");
+    assert!(!work.join("out.txt").exists(), "it wrote in the checkout");
+    let first = bodies.recv_timeout(WAIT).unwrap();
+    let system = first["messages"][0]["content"].as_str().unwrap();
+    assert!(system.contains("You work in git worktree"), "{system}");
+    let kept = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        kept.contains("(no commits, uncommitted changes)."),
+        "{kept}"
+    );
 }

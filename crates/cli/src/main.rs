@@ -43,7 +43,7 @@ use letronna_core::chat::{self, Message};
 use letronna_core::driver::{self, Allow, Outcome, Report, Spec, Status};
 use letronna_core::gate::Mode;
 use letronna_core::store::Transcript;
-use letronna_core::{crew, hooks, inbox, store, structured, tools, update, usage};
+use letronna_core::{crew, hooks, inbox, store, structured, tools, update, usage, worktree};
 use serde_json::{Value, json};
 use session::Runner;
 use std::io::IsTerminal;
@@ -282,6 +282,23 @@ fn main() {
         },
         _ => runner.open(false, workspace.clone()),
     };
+    // Before anything runs in it: a session that cannot have its worktree
+    // must not work in the checkout instead.
+    let conversation = &mut runner.store.conversations[session];
+    let placed = if args.worktree {
+        let name = format!("session-{}", conversation.id);
+        worktree::isolate(conversation, &name)
+    } else {
+        worktree::resume(conversation)
+    };
+    if let Err(error) = placed {
+        runner.store.release_unused();
+        show(args.output, &failed(error), None);
+        std::process::exit(1);
+    }
+    // The one it opened with, whose worktree is seen to on the way out
+    // even when another session is open by then.
+    let opened = runner.store.conversations[session].id;
     choose_by_flags(&mut runner, session, gateway, &args, routed);
     letronna_core::diag::mark("session");
 
@@ -311,6 +328,10 @@ fn main() {
         letronna_core::jobs::stop_all();
         letronna_core::mcp::stop_all();
         letronna_core::lsp::stop_all();
+        // On stderr, which a script reading the answer leaves alone.
+        for kept in left_worktrees(&runner, &[opened]) {
+            eprintln!("{kept}");
+        }
         runner.store.release_unused();
         letronna_core::diag::stop();
         if interrupted.is_set() {
@@ -352,6 +373,13 @@ fn main() {
         resume(&mut runner, &mut session, workspace.as_deref(), "");
     } else if runner.store.conversations[session].length() > 0 {
         replay(&runner, session);
+    }
+    if let Some(tree) = &runner.store.conversations[session].worktree {
+        render::line(&render::dim(&format!(
+            "Working in worktree {} on branch {}; your checkout is left as it is.",
+            tree.path.display(),
+            tree.branch
+        )));
     }
 
     letronna_core::diag::mark("ready");
@@ -495,7 +523,20 @@ fn main() {
     runner.store.release_unused();
     render::title("");
     render::blank();
+    let open = (runner.store.conversations.get(session)).map_or(opened, |c| c.id);
+    for kept in left_worktrees(&runner, &[opened, open]) {
+        render::line(&render::dim(&kept));
+    }
     letronna_core::diag::stop();
+}
+
+/// Finishes the worktrees the sessions `ids` work in, now that nothing this
+/// process started runs there, giving the line for each kept for its work.
+fn left_worktrees(runner: &Runner, ids: &[u64]) -> Vec<String> {
+    (runner.store.conversations.iter())
+        .filter(|conversation| ids.contains(&conversation.id))
+        .filter_map(|conversation| conversation.worktree.as_ref()?.finish(&[]))
+        .collect()
 }
 
 /// Runs one prompt on the driver, stopped when `interrupted` is set or at
