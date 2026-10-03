@@ -579,6 +579,9 @@ impl Chat {
             model: source.model.clone(),
             gateway: source.gateway.clone(),
             effort: source.effort.clone(),
+            // A private chat's copy is private too.
+            memory_saving: source.memory_saving,
+            memory_scope: source.memory_scope,
             messages,
             ..Default::default()
         };

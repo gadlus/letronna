@@ -105,6 +105,10 @@ fn commands() -> Vec<(&'static str, Rc<dyn Action>)> {
         ("Show the changes", Rc::new(super::changes::ChangesTab)),
         ("Show the jobs", Rc::new(super::jobs::JobsTab)),
         ("Switch Crew on or off", Rc::new(ToggleCrew)),
+        (
+            "Memory: when this chat saves and where it keeps it",
+            Rc::new(super::remember::MemoryMenu),
+        ),
         ("Open settings", Rc::new(OpenSettings)),
         ("Open usage", Rc::new(super::usage::OpenUsage)),
         ("Open activity", Rc::new(OpenActivity)),
