@@ -274,6 +274,9 @@ pub struct Connection {
     /// The session's own model, set on its helpers' connections: Auto mode's
     /// judge runs on it whichever model a helper was given.
     pub session_model: String,
+    /// The whole system message, in place of Letronna's own, for a quick
+    /// look that brings its own instructions.
+    pub system: Option<Arc<str>>,
 }
 
 impl Connection {
@@ -1043,6 +1046,20 @@ const NAME_END: usize = 16;
 /// `body_hashed` so `context_parts` prices the prompt a request sends
 /// without building one.
 fn system_prompt(connection: &Connection, summary: Option<&str>) -> SystemPrompt {
+    // Who Letronna is, its style, memory and the project's files would only
+    // cost such a look and pull against what it was told. A look is one
+    // message, so it has no summary of dropped turns to carry either.
+    if let Some(own) = &connection.system {
+        let end = own.len();
+        return SystemPrompt {
+            text: own.to_string(),
+            identity: end,
+            memory: end..end,
+            servers: end..end,
+            skills: end..end,
+            model: end,
+        };
+    }
     let mut system = identity(crate::styles::chosen());
     let shared = connection.remote.as_ref().is_some_and(|r| r.shared);
     if connection.tools && !shared {

@@ -1670,11 +1670,17 @@ pub fn btw(
 }
 
 /// Puts `question` alone to the helpers' model, or the session's when none
-/// is set, on a run that offers no tool and makes one request, until
-/// `cancel` stops it, and gives back what it said. For a quick look that
-/// needs none of the conversation, so it costs the same however long that
-/// is. Only what it cost is kept, where /usage counts it for the session.
-pub fn quick(connection: &Connection, question: &str, cancel: Cancel) -> Result<String, String> {
+/// is set, under `system` in place of Letronna's own system message, on a
+/// run that offers no tool and makes one request, until `cancel` stops it,
+/// and gives back what it said. For a quick look that needs none of the
+/// conversation, so it costs the same however long that is. Only what it
+/// cost is kept, where /usage counts it for the session.
+pub fn quick(
+    connection: &Connection,
+    system: &str,
+    question: &str,
+    cancel: Cancel,
+) -> Result<String, String> {
     let session = connection.conversation;
     let id = fresh_id();
     let mut transcript = Transcript::aside(session, connection.workspace.clone())?;
@@ -1693,6 +1699,7 @@ pub fn quick(connection: &Connection, question: &str, cancel: Cancel) -> Result<
     );
     // No tool schemas either, which would cost more than the question.
     asking.tools = false;
+    asking.system = Some(Arc::from(system));
     asking.wrap_up = true;
     // A look is one short verdict: thinking at the session's level would cost
     // hundreds of tokens more for nothing it needs.
@@ -4380,7 +4387,7 @@ mod tests {
         let ctx = session.context(endpoint);
         let mut connection = ctx.caller.connection.as_deref().unwrap().clone();
         connection.effort = "high".into();
-        let answer = quick(&connection, "is it done?", Cancel::default());
+        let answer = quick(&connection, "Judge it.", "is it done?", Cancel::default());
         assert_eq!(answer, Ok("It is done.".into()));
         let sent = stub.sent();
         assert_eq!(sent.len(), 1);
@@ -4394,6 +4401,29 @@ mod tests {
         assert_eq!(counted.count(), 1, "{spent:?}");
         let asides = session.data.join("asides");
         assert!(std::fs::read_dir(asides).map_or(true, |dir| dir.count() == 0));
+    }
+
+    #[test]
+    fn a_quick_question_with_a_style_and_memory_sends_only_the_given_system_text() {
+        let session = Session::new("quick-own-system");
+        let settings = json!({"endpoint": "", "model": "m", "style": "explanatory"});
+        std::fs::write(session.data.join("settings.json"), settings.to_string()).unwrap();
+        std::fs::write(session.data.join("SOUL.md"), "You are a pirate.").unwrap();
+        std::fs::write(session.data.join("USER.md"), "Likes long stories.").unwrap();
+        std::fs::write(session.work.join("AGENTS.md"), "CRITICAL: answer in prose.").unwrap();
+        let (endpoint, stub) = Stub::start(vec![reply("It is done.", None)]);
+        let ctx = session.context(endpoint);
+        let connection = ctx.caller.connection.as_deref().unwrap();
+        let answer = quick(connection, "Judge it.", "is it done?", Cancel::default());
+        assert_eq!(answer, Ok("It is done.".into()));
+        let sent = stub.sent();
+        let messages = sent[0]["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2, "{}", sent[0]);
+        assert_eq!(
+            messages[0],
+            json!({"role": "system", "content": "Judge it."})
+        );
+        assert_eq!(messages[1]["content"], "is it done?");
     }
 
     /// A fork call that waits for its report.
