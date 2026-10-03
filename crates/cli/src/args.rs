@@ -7,7 +7,7 @@ Letronna — a small agent in your terminal
 
   letronna                 open a conversation
   letronna -p \"question\"    ask once and exit
-  letronna --continue      pick up the most recent session
+  letronna --continue      pick up this folder's most recent session
   letronna --resume        choose from the recent sessions
   letronna --resume <id>   open that session, by the id /where shows
   letronna gui             open the window instead
@@ -22,7 +22,7 @@ Letronna — a small agent in your terminal
 
 Options
   -p, --print <prompt>     ask one question, print the answer, exit
-  -c, --continue           resume the most recent session
+  -c, --continue           resume this folder's most recent session
   -r, --resume [id]        choose a session, or open the one with this id
       --mode <mode>        how much runs without asking: default, accept-edits,
                            plan, auto, dont-ask or bypass
@@ -164,21 +164,29 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
             "update" => args.update = true,
             "doctor" => args.doctor = true,
             "--offline" => args.offline = true,
-            // A flag straight after is not the question, so `-p --output
-            // json "what is this"` takes the bare word after it.
+            // A flag straight after, short or long, is not the question, so
+            // `-p --output json "what is this"` and `-p -c "what is this"`
+            // take the bare word after it. A flag is one word, so a question
+            // can still start with a dash, as in `-p "-5 or 5?"`.
             "-p" | "--print" => {
                 print = true;
-                if raw.peek().is_some_and(|next| !next.starts_with("--")) {
+                let flag = |next: &String| next.starts_with('-') && !next.contains(' ');
+                if raw.peek().is_some_and(|next| !flag(next)) {
                     args.prompt = raw.next();
                 }
             }
             "-c" | "--continue" => args.start = Start::Last,
             // `--resume` on its own offers the recent sessions; with an id it
-            // opens that one, which is what the id in `/where` is for.
+            // opens that one, which is what the id in `/where` is for. Any
+            // other word is refused rather than dropped, which left `-p` to
+            // answer in a new session as if nothing was wrong.
             "-r" | "--resume" => {
-                args.start = match raw.next().as_deref().map(str::parse::<u64>) {
-                    Some(Ok(id)) => Start::Named(id),
-                    _ => Start::Choose,
+                args.start = match raw.next_if(|next| !next.starts_with('-')) {
+                    Some(id) => Start::Named(
+                        id.parse()
+                            .map_err(|_| "--resume takes a session id, like --resume 42.")?,
+                    ),
+                    None => Start::Choose,
                 }
             }
             "--mode" => mode = Some(Mode::parse(&raw.next().unwrap_or_default())),
@@ -270,6 +278,11 @@ pub fn parse(raw: impl Iterator<Item = String>) -> Result<Args, String> {
     }
     if print && args.prompt.is_none() && !streamed {
         return Err("-p takes the question, like -p \"what is this\".".into());
+    }
+    // The list to choose from is only shown in a conversation; `-p` would
+    // answer in a new session instead.
+    if args.once() && args.start == Start::Choose {
+        return Err("With -p, --resume takes a session id, like --resume 42.".into());
     }
     let shaped = args.output != Output::Text
         || args.max_rounds.is_some()
@@ -369,9 +382,6 @@ mod tests {
         // Resume on its own asks which one; with an id it takes that one.
         assert_eq!(args(&["--resume"]).start, super::Start::Choose);
         assert_eq!(args(&["--resume", "137"]).start, super::Start::Named(137));
-        // A word that is not a number is a prompt, not a session.
-        let worded = args(&["--resume", "hello"]);
-        assert_eq!(worded.start, super::Start::Choose);
         assert!(args(&["gui"]).gui);
         assert!(args(&["serve"]).serve && args(&["serve"]).prompt.is_none());
         assert!(args(&["update"]).update && args(&["update"]).prompt.is_none());
@@ -471,6 +481,34 @@ mod tests {
             refused(&["--budget", "1000"]),
             "--output, --max-rounds, --tools and --budget only work with -p."
         );
+    }
+
+    #[test]
+    fn a_resume_word_that_is_not_an_id_is_an_error() {
+        let no_id = "--resume takes a session id, like --resume 42.";
+        assert_eq!(refused(&["--resume", "hello"]), no_id);
+        assert_eq!(refused(&["-p", "go on", "-r", "last"]), no_id);
+        // A flag after it is the next flag, and the list is offered.
+        let flagged = args(&["--resume", "--plan"]);
+        assert_eq!(flagged.start, super::Start::Choose);
+        assert_eq!(flagged.mode, Ok(Mode::Plan));
+        // Nobody sees the list under -p, so there it needs the id.
+        let listed = "With -p, --resume takes a session id, like --resume 42.";
+        assert_eq!(refused(&["-p", "go on", "--resume"]), listed);
+        assert_eq!(refused(&["go on", "-r"]), listed);
+    }
+
+    #[test]
+    fn continue_after_print_is_not_taken_as_the_question() {
+        let continued = args(&["-p", "-c", "what changed"]);
+        assert_eq!(continued.start, super::Start::Last);
+        assert_eq!(continued.prompt.as_deref(), Some("what changed"));
+        let named = args(&["-p", "-r", "42", "go on"]);
+        assert_eq!(named.start, super::Start::Named(42));
+        assert_eq!(named.prompt.as_deref(), Some("go on"));
+        // A question of more than one word that starts with a dash is still one.
+        let dashed = args(&["-p", "-5 or 5?"]);
+        assert_eq!(dashed.prompt.as_deref(), Some("-5 or 5?"));
     }
 
     #[test]
