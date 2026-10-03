@@ -20,6 +20,9 @@
 //! reads the words, not the layout, and a whole HTML engine is a lot of
 //! binary for that. Links are kept, made absolute, since a page read without
 //! them is a dead end: the model can neither follow nor cite what it read.
+//! Forms are kept for the same reason, with where they send and every field's
+//! name and value, hidden ones too: a token a form carries is what a request
+//! made by hand must send back, and a reader never sees it.
 //!
 //! A page read in the last 15 minutes is given again from memory, as a task
 //! often reads the same page twice, unless the model asks for it fresh. Pages
@@ -44,6 +47,11 @@ const MAX_PDF_BYTES: u64 = 20 * 1024 * 1024;
 /// The longest link address kept. Past this it is nearly always tracking, and
 /// it would take the room of a paragraph of the page.
 const MAX_LINK: usize = 200;
+/// The longest field value shown, in characters. A token a form sends back is
+/// well under this; past it is a framework's saved state, such as ASP.NET's
+/// view state, tens of kilobytes that would crowd the page out of what the
+/// model is shown.
+const MAX_VALUE: usize = 500;
 /// How long a page read is given again from memory: a task that reads a page
 /// twice mostly does so within minutes, and a page that changes seldom does
 /// so by the minute.
@@ -110,7 +118,7 @@ impl Tool for WebFetch {
         "web_fetch"
     }
     fn description(&self) -> &'static str {
-        "Fetch a web page (http or https) and return its text: HTML is reduced to readable markdown with its links as full addresses, plain text and JSON come back as they are, and a PDF is saved as a file. A page read in the last 15 minutes is given again from memory unless `fresh` is true. Use it to read a page the user mentions, or one a search turned up."
+        "Fetch a web page (http or https) and return its text: HTML is reduced to readable markdown with its links as full addresses and its forms' fields (hidden ones too), plain text and JSON come back as they are, and a PDF is saved as a file. A page read in the last 15 minutes is given again from memory unless `fresh` is true. Use it to read a page the user mentions, or one a search turned up."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
@@ -615,6 +623,11 @@ struct Markdown<'a> {
     code: Option<usize>,
     /// The code block being read, its spacing kept.
     pre: Option<String>,
+    /// The open dropdown: whether one of its options is written yet.
+    select: Option<bool>,
+    /// The open option of the dropdown: the words it shows so far, the value
+    /// it sends when it has one of its own, and whether it is picked.
+    option: Option<(String, Option<String>, bool)>,
 }
 
 impl<'a> Markdown<'a> {
@@ -627,14 +640,19 @@ impl<'a> Markdown<'a> {
             heading: None,
             code: None,
             pre: None,
+            select: None,
+            option: None,
         }
     }
 
     /// Adds words from between tags, entities already decoded.
     fn text(&mut self, text: &str) {
-        match &mut self.pre {
-            Some(code) => code.push_str(text),
-            None => self.out.push_str(text),
+        match (&mut self.pre, &mut self.option) {
+            (Some(code), _) => code.push_str(text),
+            (None, Some((words, _, _))) => words.push_str(text),
+            // The line breaks between a dropdown's options would part them.
+            (None, None) if self.select.is_some() && text.trim().is_empty() => {}
+            (None, None) => self.out.push_str(text),
         }
     }
 
@@ -650,6 +668,11 @@ impl<'a> Markdown<'a> {
             return;
         }
         let block = BLOCKS.contains(&name);
+        // A dropdown holds only options: a block inside one means it was left
+        // open, and the page goes on after it.
+        if block {
+            self.close_select();
+        }
         if block && !closing {
             self.out.push('\n');
             if name == "li" {
@@ -674,6 +697,31 @@ impl<'a> Markdown<'a> {
                 self.flush();
                 self.pre = Some(String::new());
             }
+            ("form", false, _) => self.form(raw),
+            ("form", true, _) => self.out.push_str(" [/form]"),
+            ("input", false, _) => {
+                self.close_select();
+                self.input(raw);
+            }
+            ("textarea", false, _) => {
+                self.close_select();
+                let name = attribute(raw, "name").map_or(String::new(), |name| format!(" {name}"));
+                self.out.push_str(&format!(" [textarea{name}] "));
+            }
+            ("select", false, _) => {
+                self.close_select();
+                let name = attribute(raw, "name").map_or(String::new(), |name| format!(" {name}"));
+                self.out.push_str(&format!(" [select{name}:"));
+                self.select = Some(false);
+            }
+            ("select", true, _) => self.close_select(),
+            ("option", false, _) if self.select.is_some() => {
+                self.close_option();
+                let picked = has_attribute(raw, "selected");
+                self.option = Some((String::new(), attribute(raw, "value"), picked));
+            }
+            // Its end, or a group of options starting or ending.
+            ("option" | "optgroup", _, _) => self.close_option(),
             // A heading inside a link, as a card of a list of posts has, is
             // left as words: the link is what it is there for.
             (_, false, Some(level)) if self.link.is_none() => {
@@ -766,6 +814,89 @@ impl<'a> Markdown<'a> {
         self.done.push(format!("{fence}\n{code}\n{fence}"));
     }
 
+    /// Writes the start of a form: how it sends, and to where.
+    fn form(&mut self, raw: &str) {
+        let method = attribute(raw, "method")
+            .map(|method| method.trim().to_ascii_uppercase())
+            .filter(|method| !method.is_empty())
+            .unwrap_or_else(|| "GET".to_owned());
+        // A form with no action sends to the page it is on.
+        let action = attribute(raw, "action").unwrap_or_default();
+        let to = self.base.join(action.trim()).map_or(action, String::from);
+        self.out.push_str(&format!("[form {method} {to}] "));
+    }
+
+    /// Writes a field as its type, then the name and value it sends.
+    fn input(&mut self, raw: &str) {
+        let kind = attribute(raw, "type")
+            .map(|kind| kind.trim().to_ascii_lowercase())
+            .filter(|kind| !kind.is_empty())
+            .unwrap_or_else(|| "text".to_owned());
+        let value = attribute(raw, "value")
+            // What a browser sends for a box ticked that says nothing else.
+            .or_else(|| matches!(kind.as_str(), "checkbox" | "radio").then(|| "on".to_owned()))
+            .map(|value| match value.chars().count() {
+                count if count > MAX_VALUE => format!("({count} characters, not shown)"),
+                _ => value,
+            });
+        let sent = match (attribute(raw, "name"), value) {
+            (Some(name), value) => format!(" {name}={}", value.unwrap_or_default()),
+            // A button's words: with no name, it sends nothing.
+            (None, Some(value)) => format!(" {value}"),
+            (None, None) => String::new(),
+        };
+        let checked = if has_attribute(raw, "checked") {
+            " checked"
+        } else {
+            ""
+        };
+        self.out
+            .push_str(&format!(" [input {kind}{sent}{checked}] "));
+    }
+
+    /// Ends the open option, written as the words it shows, then the value it
+    /// sends when that is not the same, and whether it is picked.
+    fn close_option(&mut self) {
+        let Some((words, value, picked)) = self.option.take() else {
+            return;
+        };
+        let Some(written) = &mut self.select else {
+            return;
+        };
+        let words = words.split_whitespace().collect::<Vec<_>>().join(" ");
+        // An option sends the words it shows unless it has a value of its own.
+        let value = value.unwrap_or_else(|| words.clone());
+        let value = if value.is_empty() {
+            "\"\"".to_owned()
+        } else {
+            value
+        };
+        let mut notes = Vec::new();
+        let shown = if words.is_empty() || words == value {
+            value
+        } else {
+            notes.push(value);
+            words
+        };
+        if picked {
+            notes.push("selected".to_owned());
+        }
+        self.out.push_str(if *written { ", " } else { " " });
+        *written = true;
+        self.out.push_str(&shown);
+        if !notes.is_empty() {
+            self.out.push_str(&format!(" ({})", notes.join(", ")));
+        }
+    }
+
+    /// Ends the open dropdown, whose options were written as each ended.
+    fn close_select(&mut self) {
+        self.close_option();
+        if self.select.take().is_some() {
+            self.out.push_str("] ");
+        }
+    }
+
     /// Puts what was written since `start` on one line, as `made` writes it;
     /// nothing when it has no words. Anything opened within it starts again
     /// after it, which is as much as markup opened and closed out of order
@@ -803,6 +934,7 @@ impl<'a> Markdown<'a> {
 
     /// Ends whatever is open and sets the prose so far aside, tidied.
     fn flush(&mut self) {
+        self.close_select();
         self.close_code();
         self.close_link();
         self.close_heading();
@@ -842,6 +974,19 @@ fn attribute(raw: &str, name: &str) -> Option<String> {
         return Some(decode(value.unwrap_or_default()));
     }
     None
+}
+
+/// Whether the tag `raw` has the attribute `name`, with a value or without,
+/// as `checked` and `selected` are mostly written.
+fn has_attribute(raw: &str, name: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    lower.match_indices(name).any(|(at, _)| {
+        // Neither the end of another name, such as `data-checked`, nor the
+        // start of one.
+        lower[..at].ends_with(|c: char| c.is_ascii_whitespace())
+            && !lower[at + name.len()..]
+                .starts_with(|c: char| c.is_ascii_alphanumeric() || c == '-')
+    })
 }
 
 /// The longest run of backticks in `text`, which a fence around it must
@@ -990,6 +1135,90 @@ or <a data-href="/x" href=/top#part>the top</a>.</p>
             "[one `two`](https://example.com/a) three [four](https://example.com/b) \
              [five](https://example.com/c)\n# six [seven](https://example.com/d)\neight\n\
              ```\n  nine\n```"
+        );
+    }
+
+    #[test]
+    fn a_hidden_input_is_shown_with_its_value() {
+        let base = reqwest::Url::parse("https://example.com/orders/").unwrap();
+        let page = r#"<h1>Order lookup</h1>
+<form action="/lookup" method="post">
+  <input type="hidden" name="csrf_token" value="local-csrf-742">
+  <label>Order ID <input name="order_id"></label>
+  <label>Region <select name="region">
+    <option value="">Choose one</option>
+    <option value="na">North America</option>
+    <option value="emea" selected>EMEA</option>
+    <option>APAC
+  </select></label>
+  <label><input type=checkbox name=remember checked> Remember</label>
+  <input type="submit" value="Search">
+</form>
+<p>Lookups are logged.</p>"#;
+        let text = text_of(page, &base);
+        assert_eq!(
+            text,
+            [
+                "# Order lookup",
+                "[form POST https://example.com/lookup]",
+                "[input hidden csrf_token=local-csrf-742]",
+                "Order ID [input text order_id=]",
+                "Region [select region: Choose one (\"\"), North America (na), \
+                 EMEA (emea, selected), APAC]",
+                "[input checkbox remember=on checked] Remember",
+                "[input submit Search]",
+                "[/form]",
+                "Lookups are logged.",
+            ]
+            .join("\n")
+        );
+        // Still there once keys are hidden from it, though its name says token.
+        let shapes = crate::redact::Shapes::Vendor;
+        assert_eq!(
+            crate::redact::hide(&text, &[], shapes, crate::redact::MARKER),
+            text
+        );
+    }
+
+    #[test]
+    fn a_form_with_no_action_sends_by_get_to_its_own_page() {
+        let base = reqwest::Url::parse("https://example.com/search?lang=en#top").unwrap();
+        let page = "<form><textarea name=note>Hi &amp; bye</textarea>\
+                    <input type=radio name=size value=s><input type=text value=draft></form>";
+        assert_eq!(
+            text_of(page, &base),
+            "[form GET https://example.com/search?lang=en] [textarea note] Hi & bye \
+             [input radio size=s] [input text draft] [/form]"
+        );
+    }
+
+    #[test]
+    fn a_value_too_long_to_read_is_counted_rather_than_shown() {
+        let base = reqwest::Url::parse("https://example.com/").unwrap();
+        let token = "b".repeat(MAX_VALUE);
+        let page = format!(
+            "<input type=hidden name=__VIEWSTATE value=\"{}\">\
+             <input type=hidden name=token value={token}>",
+            "A".repeat(MAX_VALUE + 1)
+        );
+        assert_eq!(
+            text_of(&page, &base),
+            format!(
+                "[input hidden __VIEWSTATE=({} characters, not shown)] \
+                 [input hidden token={token}]",
+                MAX_VALUE + 1
+            )
+        );
+    }
+
+    #[test]
+    fn a_dropdown_left_open_ends_where_the_page_goes_on() {
+        let base = reqwest::Url::parse("https://example.com/").unwrap();
+        let page = "<p>Size <select name=size><option value=1 data-selected>one\
+                    <option value=2 selected=selected>two</p><p>After</p>";
+        assert_eq!(
+            text_of(page, &base),
+            "Size [select size: one (1), two (2, selected)]\nAfter"
         );
     }
 
