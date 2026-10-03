@@ -13,7 +13,9 @@
 //! to answer it; the checklist is kept on the agent's transcript; the
 //! browser is used unseen, with no panel to open; and messages sent
 //! meanwhile are read from the inbox after each batch of results and before
-//! the run counts as done.
+//! the run counts as done. A session's own agent that changed source after
+//! its last passing build or test is sent back once to run one, since its
+//! answer is all a caller such as `-p` hands on.
 //!
 //! A frontend that shows the run as it goes, as an editor does over ACP,
 //! gives it a `Watch`, which hears each step as it is made. A run that is a
@@ -54,6 +56,7 @@ use crate::tasks::{self, Key};
 use crate::tools::{self, Caller, ToolContext};
 use serde_json::{Value, json};
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -93,6 +96,19 @@ const REMINDER: &str = "You ended without calling structured_output, so your ans
 /// What an answer cut off at the reply's token cap gets back, in place of the
 /// usual advice to send a file in parts, which would leave an answer short.
 const CUT_OFF: &str = "Your answer was cut off before it was complete, so it was not taken. Call structured_output again with the whole answer, worded more briefly: an answer cannot be sent in parts.";
+
+/// What a session's own run is told, after the files it names, when it ends
+/// with source changed since its last passing build or test; it asks for the
+/// whole answer again, since the reply after it is what `-p` prints.
+const CHECK_EDITS: &str = "Before ending, run the project's tests or build to check them, or say why that cannot be done here; then give your final answer in full.";
+
+/// Files that notice names: a usual fix touches fewer, and a longer list
+/// says no more about what to run.
+const NAMED: usize = 5;
+
+/// Extensions of files written to be read, such as a report or notes, which
+/// no build or test checks.
+const NOTES: [&str; 2] = ["md", "txt"];
 
 /// What a run did, told as it happens to a frontend that shows the run live.
 #[derive(Clone)]
@@ -311,6 +327,10 @@ fn steps(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result<Outcom
         ));
     }
     let mut reminded = false;
+    // Where this run's own messages start: a session's transcript holds its
+    // earlier turns, whose edits are not this run's to check.
+    let begun = spec.transcript.conversation.messages.len();
+    let mut checked = false;
     loop {
         if spec.cancel.is_set() {
             return Ok(Outcome::Stopped);
@@ -363,6 +383,13 @@ fn steps(spec: &mut Spec, turn: &mut Turn, report: &mut Report) -> Result<Outcom
             spec.transcript.conversation.messages.extend(mail);
             save(&mut spec.transcript)?;
             if !answered {
+                continue;
+            }
+            // Before the Stop hooks, so they judge the answer that follows.
+            if !checked && let Some(notice) = unchecked_edits(spec, turn, begun) {
+                checked = true;
+                spec.transcript.conversation.messages.push(notice);
+                save(&mut spec.transcript)?;
                 continue;
             }
             // A session's own agent, as `-p` runs it, hears its Stop hooks as a
@@ -1008,6 +1035,106 @@ pub(crate) fn last_said(messages: &[Message]) -> String {
         .find(|message| message.role == "assistant" && !message.content.is_empty())
         .map(|message| message.content.clone())
         .unwrap_or_default()
+}
+
+/// The notice sending a session's own run back once to check the source it
+/// changed after its last passing build or test, when it can run a command
+/// and the user has not switched checking edits off.
+fn unchecked_edits(spec: &Spec, turn: &Turn, begun: usize) -> Option<Message> {
+    // A helper's edits are its parent's to check, and past the round cap
+    // nothing more can run.
+    if spec.depth > 0 || turn.capped().is_some() || !turn.runs_commands() {
+        return None;
+    }
+    if refused(spec, "run_command").is_some() {
+        return None;
+    }
+    let workspace = spec.connection.workspace.as_deref()?;
+    let messages = spec.transcript.conversation.messages.get(begun..)?;
+    let files = unchecked(messages, workspace);
+    // Read last, so a run that changed no source never reads the file.
+    if files.is_empty() || !crate::store::current_settings().verifies_edits() {
+        return None;
+    }
+    let mut named: Vec<String> = files.iter().take(NAMED).map(|f| format!("`{f}`")).collect();
+    if files.len() > NAMED {
+        named.push(format!("and {} more", files.len() - NAMED));
+    }
+    Some(Message {
+        role: "user".into(),
+        content: format!(
+            "You changed these files and no build or test has passed since: {}. {CHECK_EDITS}",
+            named.join(", ")
+        ),
+        notice: true,
+        // Folded into the run, so the window keeps the task it is for.
+        folded: true,
+        ..Default::default()
+    })
+}
+
+/// The source files the tool results in `messages` changed after the last
+/// command that passed, each once and as the model named them.
+fn unchecked(messages: &[Message], workspace: &Path) -> Vec<String> {
+    let mut files: Vec<String> = Vec::new();
+    for result in messages.iter().filter(|message| message.role == "tool") {
+        let args = tools::parse_args_for(&result.name, &result.args).unwrap_or_default();
+        if result.name == "run_command" {
+            // A command the user would not allow is not to be tried again
+            // another way, as the model was told.
+            if result.content.starts_with(NOT_APPROVED) || passed(result, &args, workspace) {
+                files.clear();
+            }
+            continue;
+        }
+        // A failed edit changed nothing.
+        if result.is_error {
+            continue;
+        }
+        let changed = match result.name.as_str() {
+            "write_file" | "edit_file" => args["path"]
+                .as_str()
+                .map(str::to_owned)
+                .into_iter()
+                .collect(),
+            crate::patch::APPLY_PATCH => crate::patch::paths(&args).unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        for path in changed {
+            if !note(&path) && !files.contains(&path) {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
+/// Whether a command's result shows a build or a test that passed: it ran to
+/// its end with nothing failing, in the foreground, and did more than read,
+/// as `ls` or `git diff` only do.
+fn passed(result: &Message, args: &Value, workspace: &Path) -> bool {
+    // A failing command is still an `Ok` result, told apart only by the
+    // `[exit code N]` line it ends with.
+    if result.is_error || crate::tool_runs::exit_code(result).is_some() {
+        return false;
+    }
+    // A job left running has proved nothing yet.
+    if args["background"].as_bool().unwrap_or(false) {
+        return false;
+    }
+    let line = args["command"].as_str().unwrap_or_default();
+    let dialect = crate::command::Dialect::here();
+    crate::command::assess(line, dialect, Some(workspace)).risk != crate::command::Risk::ReadOnly
+}
+
+/// Whether `path` is a note, such as a report, rather than anything a build
+/// or test would run.
+fn note(path: &str) -> bool {
+    let extension = Path::new(path).extension().and_then(|e| e.to_str());
+    let extension = extension.unwrap_or_default();
+    NOTES
+        .iter()
+        .any(|note| extension.eq_ignore_ascii_case(note))
 }
 
 /// Tells the run's watcher about `step`, if it has one.
@@ -3206,5 +3333,161 @@ pub(crate) mod tests {
         let refused = results(sent.last().unwrap())[1];
         assert!(refused.contains("nobody is here to decide"), "{refused}");
         assert!(requests.try_recv().is_err(), "a card with nobody there");
+    }
+
+    /// A data folder of the test's own while it is held, so a session's own
+    /// run reads its settings from there rather than the user's.
+    struct Data {
+        folder: Scratch,
+        _held: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for Data {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("AGENT_DATA_DIR") };
+        }
+    }
+
+    fn data(name: &str) -> Data {
+        let held = (crate::store::tests::DATA_DIR.lock()).unwrap_or_else(|e| e.into_inner());
+        let folder = Scratch::new(&format!("driver-data-{name}"));
+        unsafe { std::env::set_var("AGENT_DATA_DIR", &*folder) };
+        Data {
+            folder,
+            _held: held,
+        }
+    }
+
+    /// A session's own run of agent `id` in `dir`, whose gate lets every call run.
+    fn own(endpoint: String, dir: &Path, id: AgentId) -> Spec {
+        let mut spec = spec(endpoint, dir, id);
+        spec.depth = 0;
+        spec.decide = Some(Arc::new(|_, _| gate::Outcome::Run));
+        spec
+    }
+
+    fn write_to(path: &str) -> (&'static str, Value) {
+        ("write_file", json!({"path": path, "content": "x = 1\n"}))
+    }
+
+    #[test]
+    fn edits_after_the_last_clean_test_are_sent_back_once() {
+        let _data = data("unchecked");
+        let dir = scratch("unchecked");
+        let ended = "Nothing here runs tests. Done: lib.py holds the fix.";
+        let (endpoint, provider) = provider(vec![
+            reply("", &[write_to("app.py")]),
+            reply("", &[command("mkdir build")]),
+            reply("", &[write_to("lib.py"), write_to("NOTES.md")]),
+            reply("Done.", &[]),
+            reply(ended, &[]),
+        ]);
+        let report = finished(own(endpoint, &dir, AGENTS + 600));
+        let sent = provider.sent();
+        assert_eq!(report.status, Outcome::Done);
+
+        // Only what changed after the build, and no notes.
+        let asked = messages(&sent[4]).last().unwrap();
+        assert_eq!(asked["role"], "user");
+        let asked = asked["content"].as_str().unwrap();
+        let named = "You changed these files and no build or test has passed since: `lib.py`. ";
+        assert_eq!(asked, format!("{named}{CHECK_EDITS}"));
+        // Once: the answer after it ends the run though nothing ran.
+        assert_eq!(report.text, ended);
+        let saved = written(&dir.join("helper.jsonl"));
+        let notice = saved
+            .iter()
+            .find(|record| record["content"] == asked)
+            .unwrap();
+        assert_eq!(
+            (&notice["notice"], &notice["folded"]),
+            (&json!(true), &json!(true))
+        );
+    }
+
+    #[test]
+    fn edits_followed_by_a_clean_test_let_the_run_end() {
+        let _data = data("checked");
+        let dir = scratch("checked");
+        let (endpoint, provider) = provider(vec![
+            reply("", &[write_to("app.py")]),
+            reply("", &[command("mkdir build")]),
+            reply("Fixed, and the build passes.", &[]),
+        ]);
+        let report = finished(own(endpoint, &dir, AGENTS + 610));
+        assert_eq!(provider.sent().len(), 3);
+        assert_eq!(report.status, Outcome::Done);
+        assert_eq!(report.text, "Fixed, and the build passes.");
+    }
+
+    #[test]
+    fn a_helper_or_a_run_with_checking_switched_off_is_not_sent_back() {
+        let data = data("unchecked-off");
+        let edited = || vec![reply("", &[write_to("app.py")]), reply("Done.", &[])];
+        let dir = scratch("unchecked-helper");
+        let (endpoint, stub) = provider(edited());
+        let mut helper = own(endpoint, &dir, AGENTS + 620);
+        helper.depth = 1;
+        assert_eq!(finished(helper).status, Outcome::Done);
+        assert_eq!(stub.sent().len(), 2);
+
+        let settings = r#"{"endpoint": "", "model": "m", "verify_edits": false}"#;
+        std::fs::write(data.folder.join("settings.json"), settings).unwrap();
+        let dir = scratch("unchecked-off");
+        let (endpoint, stub) = provider(edited());
+        assert_eq!(
+            finished(own(endpoint, &dir, AGENTS + 630)).status,
+            Outcome::Done
+        );
+        assert_eq!(stub.sent().len(), 2);
+    }
+
+    #[test]
+    fn only_a_build_or_test_that_passed_checks_the_source_changed_before_it() {
+        let dir = scratch("checks");
+        let tool = |name: &str, args: Value, content: &str, is_error: bool| Message {
+            role: "tool".into(),
+            name: name.into(),
+            args: args.to_string(),
+            content: content.into(),
+            is_error,
+            ..Default::default()
+        };
+        let ran = |args: Value, out: &str| tool("run_command", args, out, false);
+        let wrote = |path: &str| tool("write_file", json!({"path": path}), "Wrote.", false);
+        let edited = |path: &str| tool("edit_file", json!({"path": path}), "Edited.", false);
+        let pytest = json!({"command": "pytest"});
+        let mut messages = vec![edited("src/app.py")];
+        // Reading, failing, timing out or starting a job checks nothing.
+        messages.push(ran(json!({"command": "ls"}), "app.py"));
+        messages.push(ran(pytest.clone(), "1 failed\n[exit code 1]"));
+        messages.push(tool("run_command", pytest.clone(), "Timed out.", true));
+        let job = json!({"command": "pytest", "background": true});
+        messages.push(ran(job, "Started as job #3 (running)."));
+        assert_eq!(unchecked(&messages, &dir), ["src/app.py"]);
+
+        // A test that passed does; notes and a failed edit after it are no source.
+        messages.push(ran(pytest.clone(), "3 passed"));
+        messages.push(wrote("REPORT.md"));
+        messages.push(wrote("notes.TXT"));
+        let missed = tool(
+            "edit_file",
+            json!({"path": "src/app.py"}),
+            "Not found.",
+            true,
+        );
+        messages.push(missed);
+        assert!(unchecked(&messages, &dir).is_empty());
+
+        // A patch counts each file it touches, and each file counts once.
+        let patch = "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-a\n+b\n\
+                     *** Add File: src/new.rs\n+x\n*** End Patch";
+        messages.push(tool("apply_patch", json!({"patch": patch}), "Done.", false));
+        messages.push(edited("src/lib.rs"));
+        assert_eq!(unchecked(&messages, &dir), ["src/lib.rs", "src/new.rs"]);
+
+        // A command the user would not allow is not to be asked for again.
+        messages.push(tool("run_command", pytest, NOT_APPROVED, true));
+        assert!(unchecked(&messages, &dir).is_empty());
     }
 }
