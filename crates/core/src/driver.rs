@@ -1412,8 +1412,9 @@ pub(crate) mod tests {
         ("read_file", json!({"path": "notes.txt"}))
     }
 
+    /// A code file, which arms the reminder to check edits as a .txt would not.
     fn write_made() -> (&'static str, Value) {
-        ("write_file", json!({"path": "made.txt", "content": "made"}))
+        ("write_file", json!({"path": "made.rs", "content": "made"}))
     }
 
     /// A data folder of the test's own while it is held, so a run at depth 0
@@ -2381,7 +2382,7 @@ pub(crate) mod tests {
                 reply(
                     "",
                     &[
-                        ("write_file", json!({"path": "made.txt", "content": "made"})),
+                        ("write_file", json!({"path": "made.rs", "content": "made"})),
                         ("ask_user", json!({"question": "Which one?"})),
                         ("wake_me", json!({"in": "1h"})),
                     ],
@@ -2405,9 +2406,9 @@ pub(crate) mod tests {
             // to say yes. Neither asks a frontend.
             assert!(asked.lock().unwrap().is_empty(), "a frontend was asked");
             if mode == Mode::Bypass {
-                assert!(dir.join("made.txt").exists(), "{got:?}");
+                assert!(dir.join("made.rs").exists(), "{got:?}");
             } else {
-                assert!(!dir.join("made.txt").exists());
+                assert!(!dir.join("made.rs").exists());
                 assert!(got[0].contains("nobody is here"), "{got:?}");
             }
         }
@@ -4019,7 +4020,7 @@ pub(crate) mod tests {
             .as_str()
             .unwrap();
         assert!(
-            asked.contains("You changed files and have not run anything since"),
+            asked.contains("You changed files and no build or test has passed since"),
             "{asked}"
         );
         // Once: the answer after it ends the run.
@@ -4041,7 +4042,7 @@ pub(crate) mod tests {
         assert_eq!(report.status, Outcome::Done);
         provider.sent();
 
-        assert!(dir.join("made.txt").exists());
+        assert!(dir.join("made.rs").exists());
         assert_eq!(report.text, "Wrote made.txt.");
     }
 
@@ -4062,7 +4063,7 @@ pub(crate) mod tests {
         assert_eq!(report.status, Outcome::Done);
         provider.sent();
 
-        assert!(dir.join("made.txt").exists());
+        assert!(dir.join("made.rs").exists());
         assert_eq!(report.text, "Wrote made.txt.");
     }
 
