@@ -24,6 +24,11 @@
 //! name and value, hidden ones too: a token a form carries is what a request
 //! made by hand must send back, and a reader never sees it.
 //!
+//! Words a page hides in its own markup -- `hidden`, `aria-hidden`, an inline
+//! `display: none` or `visibility: hidden` -- are left out too. A reader never
+//! sees them, so they are where a page puts words meant for the model and not
+//! for the person reading it. Hiding done by a stylesheet is not seen here.
+//!
 //! A page read in the last 15 minutes is given again from memory, as a task
 //! often reads the same page twice, unless the model asks for it fresh. Pages
 //! on this machine or the local network are always fetched again: they are
@@ -105,6 +110,12 @@ const BLOCKS: &[&str] = &[
     "dd",
     "figure",
     "form",
+];
+/// Elements that never hold anything and are never closed, so hiding one
+/// hides nothing after it.
+const VOID: &[&str] = &[
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track",
+    "wbr",
 ];
 
 /// The model's way to read a page.
@@ -570,9 +581,19 @@ fn text_of(html: &str, base: &reqwest::Url) -> String {
     // found in one string cut the other.
     let lower = html.to_ascii_lowercase();
     let mut page = Markdown::new(base);
+    // The elements open inside one the page hides, that one first; while any
+    // is, nothing read is written out.
+    let mut hidden: Vec<String> = Vec::new();
+    // Whether hidden words were left out, said when they were all there was
+    // so a page that waits on a script is not taken for an empty one.
+    let mut left_out = false;
     let mut at = 0;
     while let Some(open) = html[at..].find('<').map(|i| at + i) {
-        page.text(&decode(&html[at..open]));
+        if hidden.is_empty() {
+            page.text(&decode(&html[at..open]));
+        } else {
+            left_out |= !html[at..open].trim().is_empty();
+        }
         if lower[open..].starts_with("<!--") {
             at = lower[open..]
                 .find("-->")
@@ -600,10 +621,149 @@ fn text_of(html: &str, base: &reqwest::Url) -> String {
             at = html[at..].find('>').map_or(html.len(), |i| at + i + 1);
             continue;
         }
+        if !hidden.is_empty() && still_hidden(&mut hidden, &name, closing) {
+            continue;
+        }
+        // Not `html` or `body`: a page that hides the whole of itself does so
+        // until a script shows it, and a fetch runs none.
+        if !closing && !matches!(name.as_str(), "html" | "body") && hides(tag) {
+            if !VOID.contains(&name.as_str()) {
+                hidden.push(name);
+            }
+            continue;
+        }
         page.tag(&name, closing, &html[open + 1..close]);
     }
-    page.text(&decode(&html[at..]));
-    page.finish()
+    if hidden.is_empty() {
+        page.text(&decode(&html[at..]));
+    } else {
+        left_out |= !html[at..].trim().is_empty();
+    }
+    let text = page.finish();
+    if text.is_empty() && left_out {
+        return "Every word on this page is marked hidden, as a page often is until a script \
+                shows it, and a fetch runs none."
+            .to_owned();
+    }
+    text
+}
+
+/// Whether a tag met inside a hidden element is part of it, kept track of in
+/// `open`, the elements open there; one that is not has ended it.
+fn still_hidden(open: &mut Vec<String>, name: &str, closing: bool) -> bool {
+    if name.is_empty() {
+        return true;
+    }
+    if closing {
+        // Not opened inside, so it closes something around the hidden
+        // element, which closes that too.
+        let Some(at) = open.iter().rposition(|tag| tag == name) else {
+            open.clear();
+            return false;
+        };
+        open.truncate(at);
+        return true;
+    }
+    // One start tag can end several: a new row ends the cell left open
+    // before it and then the row.
+    while open.last().is_some_and(|last| ends(last, name)) {
+        open.pop();
+        if open.is_empty() {
+            return false;
+        }
+    }
+    if !VOID.contains(&name) {
+        open.push(name.to_owned());
+    }
+    true
+}
+
+/// Whether a start tag `next` ends the open element `last` whose closing tag
+/// was left out, as a new list item ends the one before.
+fn ends(last: &str, next: &str) -> bool {
+    match last {
+        // Every block HTML lets close a paragraph, and a new cell, which
+        // closes the cell the paragraph is in.
+        "p" => {
+            next != "br" && BLOCKS.contains(&next)
+                || matches!(
+                    next,
+                    "td" | "th"
+                        | "dl"
+                        | "details"
+                        | "summary"
+                        | "dialog"
+                        | "address"
+                        | "fieldset"
+                        | "figcaption"
+                        | "menu"
+                        | "hgroup"
+                        | "center"
+                )
+        }
+        "li" | "option" | "tr" => next == last,
+        "dt" | "dd" => matches!(next, "dt" | "dd"),
+        "td" | "th" => matches!(next, "td" | "th" | "tr"),
+        _ => false,
+    }
+}
+
+/// Whether the tag `raw`, lowercased, hides its element with `hidden`,
+/// `aria-hidden="true"` or an inline `display: none` or `visibility: hidden`.
+fn hides(raw: &str) -> bool {
+    // One attribute at a time from after the tag's name, so a word in a
+    // quoted value, as in Tailwind's `class="hidden md:block"`, is not taken
+    // for an attribute of its own.
+    // The name runs to a space or a `/`, after which a browser reads
+    // attributes too, as in `<span/hidden>`.
+    let mut rest = raw.trim_start_matches(|c: char| !c.is_ascii_whitespace() && c != '/');
+    loop {
+        rest = rest.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == '/');
+        if rest.is_empty() {
+            return false;
+        }
+        let end = rest
+            .find(|c: char| c.is_ascii_whitespace() || c == '=' || c == '/')
+            .unwrap_or(rest.len());
+        let name = &rest[..end];
+        rest = rest[end..].trim_start();
+        let mut value = "";
+        if let Some(after) = rest.strip_prefix('=') {
+            let after = after.trim_start();
+            (value, rest) = match after.chars().next() {
+                Some(quote @ ('"' | '\'')) => {
+                    after[1..].split_once(quote).unwrap_or((&after[1..], ""))
+                }
+                _ => after.split_at(
+                    after
+                        .find(|c: char| c.is_ascii_whitespace())
+                        .unwrap_or(after.len()),
+                ),
+            };
+        }
+        let hidden = match name {
+            // Folded away until searched for, as a closed section of a page
+            // is, which a reader can open.
+            "hidden" => value != "until-found",
+            "aria-hidden" => value.trim() == "true",
+            "style" => decode(value).split(';').any(|rule| {
+                let Some((property, value)) = rule.split_once(':') else {
+                    return false;
+                };
+                // `!important` changes which rule wins, not what this one says.
+                let value = value.split('!').next().unwrap_or_default().trim();
+                match property.trim() {
+                    "display" => value == "none",
+                    "visibility" => matches!(value, "hidden" | "collapse"),
+                    _ => false,
+                }
+            }),
+            _ => false,
+        };
+        if hidden {
+            return true;
+        }
+    }
 }
 
 /// A page being written out as markdown by `text_of`. A link, heading or
@@ -1024,6 +1184,8 @@ fn decode(text: &str) -> String {
                 "quot" => Some('"'),
                 "apos" => Some('\''),
                 "nbsp" => Some(' '),
+                "colon" => Some(':'),
+                "semi" => Some(';'),
                 _ => numeric(),
             };
             c.map(|c| (c, semi))
@@ -1220,6 +1382,58 @@ or <a data-href="/x" href=/top#part>the top</a>.</p>
             text_of(page, &base),
             "Size [select size: one (1), two (2, selected)]\nAfter"
         );
+    }
+
+    #[test]
+    fn words_a_page_hides_in_its_markup_are_left_out() {
+        let base = reqwest::Url::parse("https://example.com/").unwrap();
+        let page = r#"<body style="visibility: hidden">
+<p>Shown <span hidden>one</span>and <span ARIA-HIDDEN="true">two</span>kept.</p>
+<div style="color: red; DISPLAY : none !important">three<div>four</div><img src=a.png>five</div>
+<p style='visibility:hidden'>six<br>seven<p>Next paragraph.
+<ul><li style="display:none">eight<ul><li>nine</li></ul><li>Second item.<li hidden>ten</ul>
+<dl><dt hidden>eleven<dd>Defined.</dl>
+<form><input type="hidden" value="twelve"><img aria-hidden="true" src="icon.png">Label</form>
+<div class="sm hidden md:block" title='hidden' aria-hidden="false" style="display: block">Wide.</div>
+<p hidden="until-found">Folded away.</p>
+<div hidden/><script>document.write("</div>")</script>thirteen</div>After.
+<table><tr hidden><td>fifteen<td>sixteen<tr><td>Row.</table>
+<ul><li hidden><p>seventeen<li>Item.</ul>
+<dl><dt hidden><p>eighteen<dd>Term.</dl>
+<table><tr><td hidden><p>nineteen<td>Cell.</table>
+<p hidden>twenty<dl><dt>Listed.</dl>
+<span/hidden>twenty-one</span><b style="display&colon;none">twenty-two</b><i style="display:none&semi;">twenty-three</i>Ends.
+<a href="/x">Read <span style="display&#58;none">fourteen</a> more"#;
+        assert_eq!(
+            text_of(page, &base),
+            [
+                "Shown and kept.",
+                "Next paragraph.",
+                "- Second item.",
+                "Defined.",
+                // A form's hidden field is shown, as forms are.
+                "[form GET https://example.com/] [input hidden twelve] Label [/form]",
+                "Wide.",
+                "Folded away.",
+                "After.",
+                "Row.",
+                "- Item.",
+                "Term.",
+                "Cell.",
+                "Listed.",
+                "Ends.",
+                "[Read](https://example.com/x) more",
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
+    fn a_page_that_hides_every_word_says_so() {
+        let base = reqwest::Url::parse("https://example.com/").unwrap();
+        let hidden = text_of("<main style='display:none'>All of it.</main>", &base);
+        assert!(hidden.starts_with("Every word on this page is marked hidden"));
+        assert_eq!(text_of("<div hidden></div><main></main>", &base), "");
     }
 
     #[test]
