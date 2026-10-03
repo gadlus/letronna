@@ -9,6 +9,10 @@
 //! finds anything decides, so a loose one never overrides a closer match, and
 //! more than one place is refused unless every place was asked for. The file
 //! keeps its byte order mark and its line ending, whatever `new` was sent with.
+//!
+//! Characters that show as nothing -- zero-width spaces, bidi controls, tag
+//! characters -- go missing too: a model cannot copy what it cannot see, and
+//! text shown to it without them has to lead back to the file's own bytes.
 
 use std::ops::Range;
 
@@ -32,6 +36,7 @@ pub struct Applied {
 enum Strategy {
     Exact,
     LineEndings,
+    Invisible,
     TrailingSpace,
     Indent,
     Quotes,
@@ -243,6 +248,7 @@ fn find_where(
     let order = [
         Strategy::Exact,
         Strategy::LineEndings,
+        Strategy::Invisible,
         Strategy::TrailingSpace,
         Strategy::Indent,
         Strategy::Quotes,
@@ -265,10 +271,11 @@ fn find_where(
                     false => spans,
                 }
             }
-            Strategy::LineEndings => folded(text, old, false),
+            Strategy::LineEndings => folded(text, old, strategy),
+            Strategy::Invisible => folded(text, old, strategy),
             Strategy::TrailingSpace => whole_lines(text, old, false),
             Strategy::Indent => whole_lines(text, old, true),
-            Strategy::Quotes => folded(text, old, true),
+            Strategy::Quotes => folded(text, old, strategy),
         };
         let spans: Vec<_> = spans.into_iter().filter(|span| keep(span)).collect();
         (!spans.is_empty()).then_some((strategy, spans))
@@ -280,19 +287,29 @@ fn splits_crlf(text: &str, at: usize) -> bool {
     text[..at].ends_with('\r') && text[at..].starts_with('\n')
 }
 
-/// Where `old` is once CRLF reads as LF in both, and with `quotes` once
-/// typographic punctuation reads as the ASCII typed for it too.
-fn folded(text: &str, old: &str, quotes: bool) -> Vec<Range<usize>> {
-    let view = View::of(text, quotes);
-    let old = View::of(old, quotes).text;
+/// Where `old` is once CRLF reads as LF in both, and, as `how` says, once
+/// typographic punctuation reads as the ASCII typed for it too, or once
+/// neither has the characters that show as nothing.
+fn folded(text: &str, old: &str, how: Strategy) -> Vec<Range<usize>> {
+    // Text copied from what the model is shown never holds a character
+    // `untrusted::visible` takes out or turns into a line break, so an `old`
+    // that does was typed and means it. Read without it, `\u{200B}\n` would
+    // be every line break in the file, and a hidden character alone nothing,
+    // found between every two characters.
+    if how == Strategy::Invisible && crate::untrusted::visible(old) != old {
+        return Vec::new();
+    }
+    let view = View::of(text, how);
+    let old = View::of(old, how).text;
     view.text
         .match_indices(&old)
         .filter_map(|(at, found)| Some(view.original(at)?..view.original(at + found.len())?))
         .collect()
 }
 
-/// A copy of some text with a few characters swapped for plainer ones, and
-/// where each swap was, so a place in the copy can be taken back to the text.
+/// A copy of some text with a few characters swapped for plainer ones or
+/// left out, and where each swap was, so a place in the copy can be taken
+/// back to the text.
 struct View {
     text: String,
     /// Each swap: the bytes it took in the copy, and the bytes it replaced.
@@ -300,24 +317,40 @@ struct View {
 }
 
 impl View {
-    fn of(text: &str, quotes: bool) -> Self {
+    fn of(text: &str, how: Strategy) -> Self {
         let mut view = View {
             text: String::with_capacity(text.len()),
             swaps: Vec::new(),
         };
+        let hiding = how == Strategy::Invisible;
+        // Where the run of hidden characters just passed began. All of them
+        // go, even a joiner `untrusted::visible` keeps, so `old` is found
+        // with it or without. The run goes with the character after it: a
+        // place found never starts inside one, and a patch's line that
+        // starts with one still starts its line.
+        let mut hidden = None;
         let mut chars = text.char_indices().peekable();
         while let Some((at, c)) = chars.next() {
+            let mut own = [0; 4];
             let (with, len) = if c == '\r' && chars.next_if(|&(_, n)| n == '\n').is_some() {
                 ("\n", 2)
-            } else if let Some(with) = plain(c).filter(|_| quotes) {
+            } else if let Some(with) = plain(c).filter(|_| how == Strategy::Quotes) {
                 (with, c.len_utf8())
+            } else if hiding && matches!(c, '\u{2028}' | '\u{2029}') {
+                ("\n", c.len_utf8())
+            } else if hiding && crate::untrusted::invisible(c) {
+                hidden.get_or_insert(at);
+                continue;
+            } else if hidden.is_some() {
+                (&*c.encode_utf8(&mut own), c.len_utf8())
             } else {
                 view.text.push(c);
                 continue;
             };
             let start = view.text.len();
             view.text.push_str(with);
-            view.swaps.push((start..view.text.len(), at..at + len));
+            let from = hidden.take().unwrap_or(at);
+            view.swaps.push((start..view.text.len(), from..at + len));
         }
         view
     }
@@ -611,6 +644,93 @@ mod tests {
     }
 
     #[test]
+    fn characters_nobody_sees_need_not_be_in_old() {
+        // A zero-width space, a right-to-left override and its pop, and tag
+        // characters, in a CRLF file; those after the match stay put.
+        let file = "let a\u{200B} = \u{202E}1\u{202C};\r\nlet b = 2;\u{E0072}\u{E006D}\r\n";
+        let old = "let a = 1;\nlet b = 2;";
+        assert_eq!(
+            find(file, old).map(|(how, _)| how),
+            Some(Strategy::Invisible)
+        );
+        assert_eq!(
+            one(file, old, "let a = 3;\nlet b = 4;").unwrap(),
+            "let a = 3;\r\nlet b = 4;\u{E0072}\u{E006D}\r\n"
+        );
+        // Separators read as the line breaks they show as, and a joiner is
+        // found whether or not `old` kept it.
+        assert_eq!(one("a\u{2028}b", "a\nb", "c").unwrap(), "c");
+        let file = "\u{1F469}\u{200D}\u{1F4BB} x\u{200B}y";
+        for old in ["\u{1F469}\u{200D}\u{1F4BB} xy", "\u{1F469}\u{1F4BB} xy"] {
+            assert_eq!(one(file, old, "z").unwrap(), "z", "{old:?}");
+        }
+    }
+
+    #[test]
+    fn hidden_characters_go_with_the_character_after_them() {
+        // Those before the first character found go with it, those after the
+        // last stay, and a place never starts between two of them.
+        let file = "x\u{200B}\u{200B}b\u{200C}c\u{200B}d";
+        assert_eq!(one(file, "bc", "BC").unwrap(), "xBC\u{200B}d");
+        // So a patch's line still starts its line when the file's starts
+        // with one.
+        let (out, end) = replace_lines("\u{200B}foo\nbar\n", 0, "foo\n", "baz\n").unwrap();
+        assert_eq!((out.as_str(), end), ("baz\nbar\n", 4));
+    }
+
+    #[test]
+    fn a_copy_missing_only_hidden_characters_beats_one_missing_spaces() {
+        // `old` is the second line exactly as `untrusted::visible` shows it.
+        assert_eq!(
+            one("ab  \na\u{200B}b\n", "ab\n", "c\n").unwrap(),
+            "ab  \nc\n"
+        );
+        // A copy found as it is wins over both.
+        assert_eq!(one("a\u{200B}b ab", "ab", "c").unwrap(), "a\u{200B}b c");
+    }
+
+    #[test]
+    fn replace_all_takes_every_place_hidden_characters_hid() {
+        let every = |file, old| {
+            apply(
+                file,
+                &[Edit {
+                    old,
+                    new: "z",
+                    all: true,
+                }],
+            )
+            .map(|done| done.text)
+        };
+        assert_eq!(every("x\u{200B}y and x\u{200D}y", "xy").unwrap(), "z and z");
+        // Hidden characters alone are nothing to find, not everywhere.
+        assert!(every("abc", "\u{200B}").is_err());
+    }
+
+    #[test]
+    fn hidden_characters_typed_into_old_are_looked_for_as_they_are() {
+        // A cleanup made twice: the first call takes the zero-width spaces,
+        // and the second must not take every line break left instead.
+        let cleanup = [Edit {
+            old: "\u{200B}\n",
+            new: "",
+            all: true,
+        }];
+        let once = apply("one\u{200B}\ntwo\nthree\u{200B}\nfour\n", &cleanup).unwrap();
+        assert_eq!(once.text, "onetwo\nthreefour\n");
+        assert!(apply(&once.text, &cleanup).is_err());
+        // Nor every space, nor every line break for a paragraph separator.
+        for old in ["\u{2060} ", "\u{2029}"] {
+            let edit = [Edit {
+                old,
+                new: "",
+                all: true,
+            }];
+            assert!(apply("let a = b + c;\nlet d;\n", &edit).is_err(), "{old:?}");
+        }
+    }
+
+    #[test]
     fn a_match_that_splits_an_ellipsis_is_not_taken() {
         assert!(one("wait…", "wait..", "x").is_err());
     }
@@ -728,6 +848,14 @@ mod tests {
         let new = "a();\nb();";
         assert_eq!(find(file, new).map(|(how, _)| how), Some(Strategy::Indent));
         let error = one(file, "c();\nd();", new).unwrap_err();
+        assert!(error.contains("was not found"), "{error}");
+
+        let file = "a\u{200B}b\n";
+        assert_eq!(
+            find(file, "ab").map(|(how, _)| how),
+            Some(Strategy::Invisible)
+        );
+        let error = one(file, "zz", "ab").unwrap_err();
         assert!(error.contains("was not found"), "{error}");
     }
 

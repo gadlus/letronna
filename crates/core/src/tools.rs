@@ -1999,7 +1999,7 @@ impl Tool for EditFile {
         "edit_file"
     }
     fn description(&self) -> &'static str {
-        "Replace `old` with `new` in a file you have read. `old` must match exactly once, unless replace_all is set to change every match. Line endings, trailing spaces, indentation and curly quotes need not match; the file keeps its own. For several changes to one file, pass `edits` instead: they are made in order, and if one fails none is made."
+        "Replace `old` with `new` in a file you have read. `old` must match exactly once, unless replace_all is set to change every match. Line endings, trailing spaces, indentation, curly quotes and invisible characters need not match; the file keeps its own. For several changes to one file, pass `edits` instead: they are made in order, and if one fails none is made."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
