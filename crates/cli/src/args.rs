@@ -48,6 +48,9 @@ With -p
       --permission-prompt-tool stdio
                            with stream-json in, ask stdin about each call
                            that needs a yes
+  LETRONNA_DEADLINE=<s>    in the environment, the seconds a question may
+                           take: at 80% it is told to write its outputs, and
+                           at the end it stops
 ";
 
 /// What to open with.
